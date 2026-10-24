@@ -659,6 +659,7 @@ while read -r name state _; do
     ((found != 3)) || continue
     if ((found == 4)); then
       lost=failed
+      mark=$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-$head
     else
       ((found == 0)) || { failed=1; continue; }
       lost=true

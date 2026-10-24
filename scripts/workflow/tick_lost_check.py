@@ -51,16 +51,17 @@ def reader(folder: Path | None) -> Callable[[str], dict[str, Any]]:
 
 def main(folder: Path, number: str) -> int:
     pull = json.load(sys.stdin)
+    # A failed check has had its say: then only the checks not completed must each be lost.
+    failed = merge_gate.failed_checks(pull)
     try:
-        # A failed check has had its say: only the checks not completed must each be lost.
-        found = merge_gate.lost_check(pull, read=reader(train_reads.tick()), failed=True)
+        found = merge_gate.lost_check(pull, read=reader(train_reads.tick()), failed=failed)
     except Unreadable as error:
         print(f"cannot read a run of pull request {number}'s checks: {error}", file=sys.stderr)
         return 2
     if not found:
         return NONE
     merge_gate.note_lost(folder, number, pull["headRefOid"], found)
-    return FAILED if merge_gate.failed_checks(pull) or found["conclusion"] != "success" else 0
+    return FAILED if failed or found["conclusion"] != "success" else 0
 
 
 if __name__ == "__main__":

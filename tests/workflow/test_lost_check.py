@@ -885,11 +885,36 @@ def test_a_lost_check_of_a_passed_run_beside_another_failed_check_wakes_as_finis
     github.save()
     _waiting_reviewer(github)
 
-    done = workflow.run_script("tick")
+    first = workflow.run_script("tick")
+    second = workflow.run_script("tick")
 
-    assert done.returncode == 0, done.stdout + done.stderr
+    assert first.returncode == second.returncode == 0, first.stdout + first.stderr
     sent = workflow.calls("tmux review-7 send-keys")
     assert len(sent) == 2, sent
     assert f"The checks on {head} have finished" in sent[0]
+    assert (workflow.repo / f".local/workflow/review-7.checks-nudged-{head}").exists()
+    assert not (workflow.repo / f".local/workflow/review-7.lost-nudged-{head}").exists()
     assert [note["run"] for note in _lost_notes(github)] == [20]
     assert _run_reads(github) == 1
+    assert _origin(github) == head
+
+
+def test_a_lost_check_beside_a_check_that_did_not_start_is_searched_as_main_before_the_gate(
+    github: GitHub,
+) -> None:
+    """Not a failure by the gate's own reading, so its gate would not run CI again either."""
+    workflow = github.workflow
+    _lose(github)
+    _run(github)
+    github.pulls["7"]["statusCheckRollup"].append(
+        {"name": "CI: web", "status": "COMPLETED", "conclusion": "STARTUP_FAILURE"}
+    )
+    github.save()
+    _waiting_reviewer(github)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("tmux review-7 send-keys") == []
+    assert _lost_notes(github) == []
+    assert _run_reads(github) == 0
