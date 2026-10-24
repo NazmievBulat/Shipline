@@ -48,7 +48,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -83,6 +83,8 @@ DEFAULTS: dict[str, Any] = {
         "hunt_cursor": None,
         "advisory_watch": None,
         "push_checkout": None,
+        # The checks the repository's pre-push hook runs (`ci_tests_for_changes.py --run`).
+        "push_checks": None,
     },
     "checks": {
         "ci_result": "CI result",
@@ -96,6 +98,7 @@ DEFAULTS: dict[str, Any] = {
         # as any other failure.
         "dependency_audit": None,
         "advisory_annotation": None,
+        "prefix_only": [],
     },
     # The titles of the annotations the CI planners write and the merge gate reads.
     "annotations": {
@@ -156,11 +159,19 @@ DEFAULTS: dict[str, Any] = {
     "answer_for_owner_after_minutes": 15,
     # Minutes without a push or a report after which the tick wakes a cloud worker; 0 never does.
     "cloud_wake_after_minutes": 30,
+    # The suites a cloud worker's push runs as CI will (`ci_tests_for_changes.py`), by name.
+    # Each is read by `_suites`, not key by key: the names are the repository's own.
+    "cloud_pre_push": {"suites": {}},
 }
 # The most such a wait may be: a day. Bash would wrap a number far larger.
 MOST_MINUTES = 24 * 60
 # The keys of one machine.
 MACHINE_KEYS = ("name", "address")
+
+# A suite's keys, and its worker count when it names none: by its name, else one.
+SUITE_KEYS = ("select", "run", "workers", "part", "probe")
+SUITE_WORKERS = {"server": 4, "browser": 2}
+_SUITE_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
@@ -180,6 +191,18 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class CheckGroup:
+    workflow: str
+    jobs: tuple[str, ...]
+    suite: str | None = None
+
+    def contains(self, name: str) -> bool:
+        # Images is a whole workflow; its repository chooses the build and test job names.
+        return any(name == job or name.startswith(job + " (") or
+                   (job.endswith(":") and name.startswith(job + " ")) for job in self.jobs)
+
+
+@dataclass(frozen=True)
 class Checks:
     ci_result: str
     ci_plan: str
@@ -187,6 +210,14 @@ class Checks:
     images: str
     dependency_audit: str | None = None
     advisory_annotation: str | None = None
+    prefix_only: list[str] = field(default_factory=list)
+
+    def groups(self) -> dict[str, CheckGroup]:
+        return {
+            "images": CheckGroup("images", (f"{self.images}:",)),
+            "browser_whole": CheckGroup("e2e", ("playwright",), "browser_suite"),
+            "server_whole": CheckGroup("ci", ("CI: server tests",), "server_tests"),
+        }
 
     @property
     def images_plan(self) -> str:
@@ -445,6 +476,27 @@ class Commands:
     hunt_cursor: str | None
     advisory_watch: str | None
     push_checkout: str | None
+    push_checks: str | None
+
+
+@dataclass(frozen=True)
+class Suite:
+    name: str
+    # The command lines, as the file names them: `select` is given the base and the changed
+    # files, `run` the selected files, `{workers}` in it the worker count.
+    select: str
+    run: str
+    workers: int
+    # Added to `run` for one part of the suite: `{shard}` of `{shards}`.
+    part: str | None = None
+    # Exits 0 when the suite's browser can start.
+    probe: str | None = None
+
+
+@dataclass(frozen=True)
+class CloudPrePush:
+    # In the order the file names them.
+    suites: tuple[Suite, ...] = ()
 
 
 # The commands run as words, not by a shell: every one but `test`.
@@ -475,6 +527,7 @@ class Config:
     review: Review
     answer_for_owner_after_minutes: int
     cloud_wake_after_minutes: int
+    cloud_pre_push: CloudPrePush
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -488,6 +541,15 @@ class Config:
         if line is None:
             return None
         words = _words(line, name)
+        script = _script(words)
+        if script is not None:
+            words[script] = str(self.main / words[script])
+        return words
+
+    def words(self, line: str) -> list[str]:
+        """The words a cloud pre-push suite's command line runs with: its script the main
+        checkout's, as a command's is."""
+        words = shlex.split(line)
         script = _script(words)
         if script is not None:
             words[script] = str(self.main / words[script])
@@ -565,6 +627,8 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
             merged[key] = _machines(given[key])
         elif name == "hunts.areas":
             merged[key] = _areas(given[key])
+        elif name == "cloud_pre_push.suites":
+            merged[key] = _suites(given[key])
         elif isinstance(default, dict):
             merged[key] = _merged(default, given[key], name + ".")
         elif isinstance(default, list):
@@ -639,6 +703,49 @@ def _areas(given: Any) -> dict[str, tuple[str, ...]]:
             )
         areas[area] = tuple(screens)
     return areas
+
+
+def _suites(given: Any) -> tuple[Suite, ...]:
+    where = "cloud_pre_push.suites"
+    if not isinstance(given, dict):
+        raise ConfigError(f"{FILE}: {where} must be an object")
+    suites = []
+    for name, suite in given.items():
+        if not _SUITE_NAME.fullmatch(name):
+            raise ConfigError(
+                f"{FILE}: {where}: a suite's name is letters, digits, - and _, not {name}"
+            )
+        if not isinstance(suite, dict):
+            raise ConfigError(f"{FILE}: {where}.{name} must be an object")
+        unknown = sorted(set(suite) - set(SUITE_KEYS))
+        if unknown:
+            raise ConfigError(
+                f"{FILE}: unknown key {', '.join(f'{where}.{name}.{key}' for key in unknown)}"
+            )
+        for key in ("select", "run", "part", "probe"):
+            if key in ("part", "probe") and key not in suite:
+                continue
+            value = suite.get(key)
+            try:
+                words = shlex.split(value) if isinstance(value, str) else []
+            except ValueError:
+                words = []
+            if not words:
+                raise ConfigError(f"{FILE}: {where}.{name}.{key} must be a command")
+            # The part is arguments only; the others name a program, as a command does.
+            script = None if key == "part" else _script(words)
+            if script is not None:
+                _relative(words[script], f"{where}.{name}.{key}")
+        workers = suite.get("workers", SUITE_WORKERS.get(name, 1))
+        if type(workers) is not int or workers < 1:
+            raise ConfigError(f"{FILE}: {where}.{name}.workers must be a whole number above 0")
+        part = suite.get("part")
+        if part is not None and not ("{shard}" in part and "{shards}" in part):
+            raise ConfigError(f"{FILE}: {where}.{name}.part must name {{shard}} and {{shards}}")
+        suites.append(
+            Suite(name, suite["select"], suite["run"], workers, part, suite.get("probe"))
+        )
+    return tuple(suites)
 
 
 def _relative(value: str, name: str) -> str:
@@ -778,6 +885,11 @@ def load(start: Path | None = None) -> Config:
     except ValueError as error:
         raise ConfigError(f"{FILE} is not JSON: {error}") from error
     values = _merged(DEFAULTS, given, "")
+    groups = values["checks"]["prefix_only"]
+    if len(set(groups)) != len(groups) or set(groups) - set(Checks("", "", "", "").groups()):
+        raise ConfigError(
+            f"{FILE}: checks.prefix_only must name distinct groups: images, browser_whole, server_whole"
+        )
     # Where the repository was read, so a refusal names that place.
     repository, source = values["repository"], FILE
     if not repository:
@@ -850,6 +962,7 @@ def load(start: Path | None = None) -> Config:
         ),
         answer_for_owner_after_minutes=values["answer_for_owner_after_minutes"],
         cloud_wake_after_minutes=values["cloud_wake_after_minutes"],
+        cloud_pre_push=CloudPrePush(tuple(values["cloud_pre_push"]["suites"])),
         given=given,
         main=main,
     )
@@ -913,6 +1026,16 @@ def as_dict(config: Config) -> dict[str, Any]:
         "review": {"high_effort_paths": list(config.review.high_effort_paths)},
         "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
         "cloud_wake_after_minutes": config.cloud_wake_after_minutes,
+        "cloud_pre_push": {
+            "suites": {
+                suite.name: {
+                    key: getattr(suite, key)
+                    for key in SUITE_KEYS
+                    if getattr(suite, key) is not None
+                }
+                for suite in config.cloud_pre_push.suites
+            }
+        },
     }
 
 
