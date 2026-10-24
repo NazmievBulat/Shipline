@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Adds the four hooks that call `notify` to the owner's Claude settings,
+# `~/.claude/settings.json`, so they apply in every worktree. Run once, by the owner:
+#
+#   scripts/workflow/install-hooks
+#
+# A hook that is already there is not added again, and every other setting and hook is left as
+# it is. The settings as they were before the first run are kept beside the file. The hooks call the script in the
+# main checkout, whichever worktree this was run from.
+set -euo pipefail
+
+# Codex workers use a per-process callback, never an owner's global notify setting.
+[[ $# == 0 ]] || { echo "usage: install-hooks" >&2; exit 2; }
+settings=$HOME/.claude/settings.json
+backup=$settings.before-workflow-hooks
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+# Through `bash`, quiet and never failing: a session is not disturbed when the main checkout
+# is on a branch that does not have the script.
+command="bash $(printf '%q' "$main/scripts/workflow/notify") 2>/dev/null || true"
+
+before='{}'
+indent=2
+if [[ -e $settings ]]; then
+  before=$(jq . "$settings" 2>/dev/null) && jq -e 'type == "object"' >/dev/null <<<"$before" || {
+    echo "$settings is not a JSON object; nothing was changed" >&2
+    exit 1
+  }
+  # Keep the file's own indentation, so the change is only the added hooks. `sed` stops at
+  # the first indented key itself: piped into `head` it is ended by a broken pipe when the
+  # file is long, and `pipefail` then ends this script without a word.
+  spaces=$(sed -n '/^\( \{1,7\}\)".*/{s//\1/p;q}' "$settings")
+  indent=${#spaces}
+  ((indent > 0)) || indent=2
+fi
+
+# shellcheck disable=SC2016  # the dollars belong to jq
+after=$(jq --indent "$indent" --arg command "$command" '
+  # Ours is a command of exactly the shape written here, whatever checkout it names: one path,
+  # in which a character the shell reads is escaped.
+  def is_ours:
+    (.command // "") | test("^bash ([^;&|\\\\]|\\\\.)*/scripts/workflow/notify 2>/dev/null \\|\\| true$");
+  def calls_notify($matcher):
+    any(.[]?; (.matcher // "") == $matcher and any(.hooks[]?; is_ours));
+  # A hook of ours that is there is pointed at this checkout, in case the checkout moved.
+  def with_hook($event; $matcher):
+    if (.hooks[$event] // []) | calls_notify($matcher) then
+      .hooks[$event] |= map(
+        if (.matcher // "") == $matcher
+        then .hooks |= map(if is_ours then .command = $command else . end)
+        else . end)
+    else .hooks[$event] = (.hooks[$event] // []) + [
+      (if $matcher == "" then {} else {matcher: $matcher} end)
+      + {hooks: [{type: "command", command: $command, timeout: 10}]}
+    ] end;
+  with_hook("Stop"; "")
+  | with_hook("UserPromptSubmit"; "")
+  | with_hook("Notification"; "permission_prompt")
+  | with_hook("PreToolUse"; "AskUserQuestion")' <<<"$before")
+
+if [[ $(jq -S . <<<"$after") == "$(jq -S . <<<"$before")" ]]; then
+  echo "the workflow hooks are already in $settings"
+  exit 0
+fi
+
+mkdir -p "$(dirname "$settings")"
+# The first copy is the one from before any of this; a later run does not replace it.
+[[ ! -e $settings || -e $backup ]] || cp "$settings" "$backup"
+# Written through the file's own name, so a settings file that is a link stays one.
+printf '%s\n' "$after" >"$settings"
+echo "added the workflow hooks to $settings"
+[[ ! -e $backup ]] || echo "the settings as they were: $backup"

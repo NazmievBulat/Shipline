@@ -12,7 +12,12 @@ inside Shipline. The first time, the launcher is run by its path:
 ```
 
 Each of the two writes the launcher of this checkout and the repository's main checkout, and
-points the link `~/.local/bin/shipline` at that launcher. The repository is the main checkout
+points the link `~/.local/bin/shipline` at that launcher. `shipline uninstall` takes it all off
+in one step: it puts back exactly the hooks and the timer the two replaced (kept in
+`~/.claude/settings.json.shipline-replaced` and as `workflow-tick.*.before-shipline`), or
+switches Shipline's timer off when there was none. A sentence that tells a session to run a
+command names the launcher by its absolute path, so a session started before the switch runs
+it too. The repository is the main checkout
 `--repo` names, else `SHIPLINE_REPO`, else the one the current folder is in; outside any
 repository, with none named, a command stops and says how to name one. A command started
 outside the repository runs in its main checkout. Every session gets `SHIPLINE_REPO` and the
