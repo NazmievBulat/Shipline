@@ -58,3 +58,13 @@ def test_ci_runs_for_pull_requests_main_and_the_merge_queue() -> None:
     assert re.search(r"^  merge_group:$", triggers, re.M)
     assert "pull_request_target" not in triggers
     assert re.search(r"^permissions:\n  contents: read$", _CI.read_text(), re.M)
+
+
+def test_the_tests_use_a_tmux_that_leaves_each_pane_where_it_was_started() -> None:
+    """A tmux built with systemd support moves each new pane into a scope of its own, racing the
+    scope a session starts its command in; the session's memory limit is then lost."""
+    text = _CI.read_text()
+
+    assert "./configure --prefix=\"$HOME/.local/tmux\" --disable-systemd" in text
+    assert 'echo "$HOME/.local/tmux/bin" >> "$GITHUB_PATH"' in text
+    assert 'if ldd "$(command -v tmux)" | grep -q libsystemd; then' in text

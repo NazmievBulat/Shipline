@@ -120,10 +120,9 @@ def test_the_gate_holds_none_of_the_helpers_a_repository_may_add() -> None:
 
 
 def test_the_gate_starts_without_the_helpers(workflow: Workflow) -> None:
-    done = _gate(workflow, "print(g.REPOSITORY)")
+    done = _gate(workflow, 'print("started")')
 
-    assert done.returncode == 0, done.stderr
-    assert done.stdout == "NazmievBulat/Shipline\n"
+    assert done.stdout == "started\n", done.stderr
 
 
 def test_a_failed_push_is_refused_with_its_last_lines(workflow: Workflow) -> None:
@@ -164,16 +163,32 @@ def test_nothing_is_installed_before_a_push(workflow: Workflow) -> None:
 
 
 def test_no_proof_is_read_or_written(workflow: Workflow) -> None:
+    """A job skipped in a run counts only as passed when it passed there itself."""
     done = _gate(
         workflow,
         """
-        parts = [{"name": "CI: server tests", "conclusion": "success"}]
+        parts = [
+            {"name": "CI: server tests", "conclusion": "success"},
+            {"name": "CI: web", "conclusion": "skipped"},
+            {"name": "Docker images: browser tests (1 of 2)", "conclusion": "success"},
+        ]
         run = {"id": 10}
-        print(repr(g.passed_jobs(parts)), repr(g.squash_proof("base", "tree", {"ci": (run, parts)})))
+        print(sorted(g.passed_jobs(parts)), repr(g.squash_proof("base", "tree", {"ci": (run, parts)})))
         """,
     )
 
-    assert done.stdout.split() == ["set()", "''"], done.stderr
+    assert done.stdout == "['CI: server tests'] ''\n", done.stderr
+
+
+@pytest.mark.parametrize("helper", [*_HELPERS, "mechanical_conflicts"])
+def test_a_helper_that_cannot_start_stops_the_gate(workflow: Workflow, helper: str) -> None:
+    """Only a helper the repository does not hold is left out; a broken one is never so."""
+    (workflow.script.parent / f"{helper}.py").write_text("import example_app_missing_package\n")
+
+    done = _gate(workflow, "g.mechanical_conflicts()")
+
+    assert done.returncode == 1
+    assert "No module named 'example_app_missing_package'" in done.stderr
 
 
 def test_a_squash_without_a_proof_carries_the_commits_alone(workflow: Workflow) -> None:
