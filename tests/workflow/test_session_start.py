@@ -788,3 +788,201 @@ def test_the_memory_limits_can_be_set_for_a_test(workflow: Workflow) -> None:
     arguments = (workflow.state / "args" / "ticket-7").read_text().splitlines()
     start = arguments.index("systemd-run")
     assert arguments[start:-1] == scope_words("ticket-7", arguments[start + 5], "64M", "0")
+
+
+_ANALYST = "analyst-day-2026-10-24"
+_ANALYSIS_RULES = "by the section Analyse the workflow of AGENTS.md in this worktree"
+
+
+def _claude_words(workflow: Workflow, name: str) -> list[str]:
+    """The words Claude is given, as the shell `tmux` runs the command through reads them."""
+    command = _session_arguments(workflow, name)[-1]
+    read = subprocess.run(
+        ["bash", "-c", f'claude() {{ printf "%s\\n" "$@"; }}\n{command}'],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert read.stderr == ""
+    return read.stdout.splitlines()
+
+
+@pytest.mark.parametrize(
+    ("days", "span"),
+    [((), "the last day"), (("1",), "the last day"), (("7",), "the last 7 days")],
+    ids=["one day by default", "one day", "a week"],
+)
+def test_an_analyst_is_an_opus_session_at_medium_effort_told_to_analyse_the_workflow(
+    workflow: Workflow, days: tuple[str, ...], span: str
+) -> None:
+    done = workflow.run("start", "analyst", "day-2026-10-24", *days)
+
+    assert done.returncode == 0, done.stderr
+    report = workflow.analysis_report("day-2026-10-24")
+    worktree = workflow.analyst_worktree("day-2026-10-24")
+    assert _session_arguments(workflow, _ANALYST)[:9] == [
+        "-d",
+        "-x",
+        "200",
+        "-y",
+        "50",
+        "-s",
+        _ANALYST,
+        "-c",
+        str(worktree),
+    ]
+    assert _claude_words(workflow, _ANALYST) == [
+        "--effort",
+        "medium",
+        "--model",
+        "opus",
+        "--add-dir",
+        str(workflow.repo / ".local" / "analyses"),
+        "--add-dir",
+        str(workflow.repo / ".local" / "workflow"),
+        "--add-dir",
+        str(workflow.root / "home" / ".local" / "state" / "workflow"),
+        "--remote-control",
+        _ANALYST,
+        f"Analyse the workflow over {span}, as {_ANALYST}, {_ANALYSIS_RULES}",
+    ]
+    assert _session_environment(workflow, _ANALYST)["WORKFLOW_ANALYSIS_REPORT"] == str(report)
+    assert _session_environment(workflow, _ANALYST)["WORKFLOW_SESSION"] == _ANALYST
+    assert report.is_dir()
+    assert (worktree / ".local" / "workflow" / f"{_ANALYST}.url").read_text() == (
+        SESSION_LINK + "\n"
+    )
+    assert (worktree / ".local" / "workflow" / f"{_ANALYST}.started").exists()
+    assert f"{_ANALYST} started: {SESSION_LINK}" in done.stdout
+
+
+def test_an_analyst_works_in_a_copy_of_main_on_no_branch_and_sets_nothing_up(
+    workflow: Workflow,
+) -> None:
+    """It reads and writes its report: nothing in its worktree is tested or pushed."""
+    done = workflow.run("start", "analyst", "day-2026-10-24")
+
+    assert done.returncode == 0, done.stderr
+    worktree = workflow.analyst_worktree("day-2026-10-24")
+    assert workflow.git("rev-parse", "HEAD", cwd=worktree) == workflow.git("rev-parse", "main")
+    assert workflow.git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree) == "HEAD"
+    assert workflow.calls("worktree-setup") == []
+
+
+def test_an_analysis_whose_report_folder_exists_is_not_started_again(workflow: Workflow) -> None:
+    workflow.analysis_report("day-2026-10-24").mkdir(parents=True)
+
+    done = workflow.run("start", "analyst", "day-2026-10-24")
+
+    assert done.returncode != 0
+    assert "has a report already" in done.stderr
+    assert not workflow.is_running(_ANALYST)
+
+
+def test_an_analyst_that_prints_no_link_is_stopped_and_leaves_no_report_folder(
+    workflow: Workflow,
+) -> None:
+    workflow.screen("Do you trust the files in this folder?\n")
+
+    done = workflow.run("start", "analyst", "day-2026-10-24")
+
+    assert done.returncode != 0
+    assert not workflow.is_running(_ANALYST)
+    assert not workflow.analysis_report("day-2026-10-24").exists()
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        ("analyst",),
+        ("analyst", "Day_1"),
+        ("analyst", "day-1", "8"),
+        ("analyst", "day-1", "0"),
+        ("analyst", "day-1", "week"),
+        ("analyst", "day-1", "1", "opus"),
+    ],
+)
+def test_an_analyst_start_with_wrong_words_is_rejected(
+    workflow: Workflow, words: tuple[str, ...]
+) -> None:
+    done = workflow.run("start", *words)
+
+    assert done.returncode == 2
+    assert "session start analyst <name> [1-7]" in done.stderr
+    assert workflow.calls("tmux") == []
+
+
+def test_an_analyst_is_listed_stopped_and_its_worktree_removed_once_it_ended(
+    workflow: Workflow,
+) -> None:
+    worktree = workflow.add_analyst("day-2026-10-24")
+    workflow.running(_ANALYST)
+    report = workflow.analysis_report("day-2026-10-24")
+    (report / "report.md").write_text("# Analysis\n")
+
+    listed = workflow.run("list")
+    stopped = workflow.run("stop", _ANALYST)
+    cleaned = workflow.run("cleanup", "hunts")
+
+    assert listed.stdout.startswith(f"{_ANALYST}  busy  0 MB held")
+    assert stopped.returncode == 0, stopped.stderr
+    assert not workflow.is_running(_ANALYST)
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert f"{_ANALYST}: removed, the analysis has ended; its report is in {report}" in (
+        cleaned.stdout
+    )
+    assert not worktree.exists()
+    assert (report / "report.md").read_text() == "# Analysis\n"
+
+
+def test_a_running_analyst_keeps_its_worktree(workflow: Workflow) -> None:
+    worktree = workflow.add_analyst("day-2026-10-24")
+    workflow.running(_ANALYST)
+
+    done = workflow.run("cleanup", "hunts")
+
+    assert done.returncode == 0, done.stderr
+    assert worktree.exists()
+
+
+def test_an_analyst_is_never_sent_its_instruction_again(workflow: Workflow) -> None:
+    """Its 40 minutes run on while the usage limit stops it."""
+    workflow.add_analyst("day-2026-10-24")
+    workflow.running(_ANALYST)
+
+    done = workflow.run("resend", _ANALYST)
+
+    assert done.returncode != 0
+    assert "an analyst is not sent its instruction again" in done.stderr
+
+
+def test_an_analyst_that_tmux_refuses_leaves_no_report_folder(workflow: Workflow) -> None:
+    (workflow.state / f"refuse-launch-{_ANALYST}").touch()
+
+    done = workflow.run("start", "analyst", "day-2026-10-24")
+
+    assert done.returncode != 0
+    assert f"{_ANALYST} could not be started" in done.stderr
+    assert not workflow.analysis_report("day-2026-10-24").exists()
+
+
+@pytest.mark.parametrize("reason", ["another start holds the lock", "the fetch fails"])
+def test_an_analyst_start_refused_for_a_passing_reason_leaves_nothing_and_says_try_later(
+    workflow: Workflow, reason: str
+) -> None:
+    """Exit 75, as a start deferred for memory: the tick tries the day's start again."""
+    lock_path = workflow.repo / ".local" / "workflow" / "start-analyst.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock:
+        if reason == "another start holds the lock":
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        else:
+            workflow.fake(
+                "git", '#!/bin/bash\n[[ $1 == fetch ]] && exit 128\nexec /usr/bin/git "$@"\n'
+            )
+        done = workflow.run("start", "analyst", "day-2026-10-24")
+
+    assert done.returncode == 75, done.stderr
+    assert not [call for call in workflow.calls("tmux") if " new-session " in call]
+    assert not workflow.analysis_report("day-2026-10-24").exists()
+    assert not workflow.analyst_worktree("day-2026-10-24").exists()
