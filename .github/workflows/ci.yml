@@ -18,8 +18,42 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # The notes the merge gate reads of a run, written as a repository using Shipline writes them
+  # (examples/ci.yml), so Shipline proves its pieces on itself.
+  plan:
+    name: "CI: what to run"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # On main, reading the runs a squash's proof names, with their jobs and notes.
+      actions: read
+      checks: read
+    outputs:
+      inherited: ${{ steps.inherited.outputs.inherited || '[]' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: The notes the merge gate reads
+        # Every run runs every test.
+        run: python3 scripts/workflow/ci_proof.py notes --whole server_tests
+      - name: The jobs main inherits from its squash's proof
+        id: inherited
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/workflow/ci_proof.py inherited ci
+
   tests:
-    name: tests (${{ matrix.shard }} of 4)
+    name: "CI: server tests (${{ matrix.shard }} of 4)"
+    needs: plan
+    # Folded: the job's name holds a colon, which a plain YAML value may not.
+    if: >-
+      ${{ !contains(fromJSON(needs.plan.outputs.inherited), 'CI: server tests') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -71,6 +105,7 @@ jobs:
             files: >-
               tests/workflow/test_checks_finished.py
               tests/workflow/test_ci_minutes.py
+              tests/workflow/test_ci_proof.py
               tests/workflow/test_independent_review.py
               tests/workflow/test_lost_check.py
               tests/workflow/test_merge_train_metrics.py
@@ -131,20 +166,33 @@ jobs:
           if ldd "$(command -v tmux)" | grep -q libsystemd; then echo "tmux uses systemd"; exit 1; fi
       - name: The test tools
         run: python -m pip install --require-hashes -r requirements-test.txt
+      # The test command shipline.json names (commands.test), with this shard's own words.
       - name: Tests
-        run: python -m pytest -rs -n 4 --dist worksteal -m "not serial" ${{ matrix.files }}
+        run: >-
+          python3 scripts/workflow/ci_proof.py test
+          -n 4 --dist worksteal -m "not serial" ${{ matrix.files }}
       # The tests that cannot run beside others, one at a time, in one shard.
       - name: Tests that run alone
         if: matrix.shard == 1
         # Exit code 5: none is marked so.
-        run: python -m pytest -rs -p no:xdist -m serial || [ $? -eq 5 ]
+        run: python3 scripts/workflow/ci_proof.py test -p no:xdist -m serial || [ $? -eq 5 ]
 
   ci:
-    # The check the merge queue requires, by this name.
+    # The check the merge queue requires, by this name: it passes only when every job that ran
+    # passed, the planner among them. Main skips the shards only when its proof shows they passed.
     name: CI
     if: always()
-    needs: tests
+    needs: [plan, tests]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Every shard passed
-        run: test "${{ needs.tests.result }}" = success
+      - name: Every job that ran passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) echo "a job ended: $result"; exit 1 ;;
+            esac
+          done
