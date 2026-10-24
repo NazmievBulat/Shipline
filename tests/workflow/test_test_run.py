@@ -236,6 +236,20 @@ def test_a_failure_without_a_kill_at_the_limit_adds_nothing(tmp_path: Path) -> N
     assert done.stderr == ""
 
 
+def test_a_command_killed_while_the_shell_is_between_commands_prints_no_job_notice(
+    tmp_path: Path,
+) -> None:
+    """Bash tells of a job killed by a signal ("<pid> Killed ( trap - INT QUIT; ...") before the
+    first command after it reaped it, wherever that is, not only in a quiet `wait`. Each command
+    of the run's shell is held back, as on a loaded machine, so the command dies between two."""
+    (tmp_path / "slow.sh").write_text("trap 'sleep 0.05' DEBUG\n")  # bash reads `BASH_ENV`
+
+    done = _run("bash", "-c", "kill -9 $$", env={"BASH_ENV": str(tmp_path / "slow.sh")})
+
+    assert done.returncode == 137
+    assert done.stderr == ""
+
+
 def test_a_stop_sent_to_the_run_reaches_the_command_and_its_children(tmp_path: Path) -> None:
     """The session ending a run it gave up on must not leave the test runner going."""
     child = tmp_path / "child"
