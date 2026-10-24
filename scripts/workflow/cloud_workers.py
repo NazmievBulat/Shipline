@@ -46,11 +46,14 @@ SCREEN = ("200", "50")
 # What Claude prints when the usage limit stopped it, as `limit-reset` reads it.
 LIMIT_LINE = re.compile(r"^\s*(?:⎿|●)?\s*You.{1,3}ve hit your (?:[A-Za-z0-9-]+ )*limit(?: |$)")
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-# How long a question marked `Owner only: no` waits before the tick answers it with its
-# recommendation, until shipline.json has `answer_for_owner_after_minutes`; 0 turns it off.
-ANSWER_AFTER_MINUTES = 15
-# A reply word on a question's last line: quoted, or a number.
-REPLY_WORD = r""""([^"\n]+)"|'([^'\n]+)'|“([^”\n]+)”|`([^`\n]+)`|\b([0-9]+)\b"""
+# A question's line `Owner only: yes` or `Owner only: no`, and the first reply word after it,
+# read as the stop hook reads a local session's question (`notify`, `question_of`).
+OWNER_ONLY = re.compile(r"[\s>*_`-]*owner only:[\s*_`]*(yes|no)[\s*_`.!]*", re.IGNORECASE)
+REPLY = re.compile(
+    r"""(?:^|[\W\d_])(?:reply|type|write|answer|say|choose)(?:\s+with)?\s+[*_]*"""
+    r"""(?:"([^"\n]+)"|“([^”\n]+)”|`([^`\n]+)`|([0-9]+)(?![^\W_]))""",
+    re.IGNORECASE,
+)
 
 
 def _write(path: Path, value: dict[str, object]) -> None:
@@ -250,57 +253,28 @@ def _may_write(comment: dict[str, object], writers: dict[str, bool]) -> bool:
     return writers[login]
 
 
-def _question(body: str) -> tuple[str | None, str, str]:
-    """A question's `Owner only:` value (None without the line), its recommended reply word and
-    the line of that choice: the one line above `Owner only:` that begins with a reply word of
-    the last lines and is marked "(recommended)". Word and line are empty when that is unclear:
-    no such line, two, or another line that recommends and names another reply word."""
+def _question(body: str) -> tuple[str, str, str]:
+    """A question's `Owner only:` value ("missing" without the line), its recommended reply and
+    the line of that choice, as the stop hook reads a local session's question: the last such
+    line, then the first reply word after it, digits or quoted words, on one line of at most 60
+    characters that starts with a letter or a digit; without one the reply is empty. The choice's
+    line is the nearest line above `Owner only:` that begins with the reply, or empty."""
     lines = _without_attribution(body).splitlines()
     owner = [
         (at, match[1].lower())
         for at, line in enumerate(lines)
-        if (match := re.fullmatch(r"[*_\s]*owner only:[*_\s]*(yes|no)[.*_\s]*", line, re.I))
+        if (match := OWNER_ONLY.fullmatch(line))
     ]
     if not owner:
-        return None, "", ""
+        return "missing", "", ""
     at, value = owner[-1]
-    words = [
-        next(group for group in match.groups() if group)
-        for match in re.finditer(REPLY_WORD, "\n".join(lines[at + 1 :]))
-    ]
-
-    def names(line: str, word: str) -> bool:
-        return bool(re.search(rf"""(?<!\w)["'“`]?{re.escape(word)}["'”`]?(?!\w)""", line))
-
-    def begins(line: str) -> str:
-        bare = re.sub(r"^[\s>*_•-]*", "", line)
-        return next(
-            (word for word in words if re.match(rf"""[("'“`]?{re.escape(word)}(?!\w)""", bare)),
-            "",
-        )
-
-    marked = [
-        (number, word)
-        for number, line in enumerate(lines[:at])
-        if (word := begins(line)) and re.search(r"\(recommended\)", line, re.I)
-    ]
-    if len(marked) != 1:
+    found = REPLY.search("\n".join(lines[at + 1 :])) if value == "no" else None
+    reply = next(group for group in found.groups() if group) if found else ""
+    if len(reply) > 60 or not re.match(r"[^\W_]", reply) or re.search(r"[\x00-\x1f\x7f]", reply):
         return value, "", ""
-    chosen, word = marked[0]
-    elsewhere = [
-        line
-        for number, line in enumerate(lines)
-        if number != chosen
-        and re.search(r"recommend", line, re.I)
-        and any(names(line, other) for other in words if other != word)
-    ]
-    return (value, "", "") if elsewhere else (value, word, lines[chosen].strip())
-
-
-def _answer_after_minutes() -> int:
-    return getattr(
-        workflow_config.current(), "answer_for_owner_after_minutes", ANSWER_AFTER_MINUTES
-    )
+    begins = re.compile(rf"""[\s>*_•-]*[("'“`]?{re.escape(reply)}(?![^\W_])""")
+    line = next((line.strip() for line in reversed(lines[:at]) if begins.match(line)), "")
+    return value, reply, line
 
 
 def _answer_for_owner(
@@ -311,34 +285,34 @@ def _answer_for_owner(
     writers: dict[str, bool],
     now: int,
 ) -> None:
-    """Answers the worker's open question with its recommendation once it has waited long enough
-    with no answer, when it says `Owner only: no`; never twice, and never one without the line.
-    The answer is recorded as the question's answer, so the wake that follows it goes at once."""
+    """Answers the worker's open question with its recommended reply once it has waited long
+    enough with no answer, when it says `Owner only: no`, as the tick answers a local session's;
+    never twice. One without the line, or without a reply word, waits for the owner and is named
+    in the wake once. The answer is recorded as the question's answer, so the wake that follows
+    an answer goes at once."""
     question = record["last_comment_id"]
-    minutes = _answer_after_minutes()
-    if record.get("answered_for_owner") == question or minutes <= 0:
+    minutes = workflow_config.current().answer_for_owner_after_minutes
+    if record.get("answered_for_owner") == question or not minutes:
         return
     asked = next((comment for comment in comments if comment["id"] == question), None)
     # Anyone can comment on a public pull request, the marker included.
     if not asked or not _may_write(asked, writers):
         return
-    owner, word, line = _question(str(asked["body"]))
-    if owner is None:
-        if record.get("missing_owner_line") != question:
-            pending = notes / "cloud-events.pending"
+    owner, reply, line = _question(str(asked["body"]))
+    if owner == "missing" or (owner == "no" and not reply):
+        if record.get("owner_question_noted") != question:
+            what = "without the Owner only line" if owner == "missing" else "without a reply word"
+            pending = notes / "stuck.pending"
             pending.mkdir(exist_ok=True)
             _write(
-                pending / f"{path.name}-{question}-owner-line",
-                {
-                    "name": path.name,
-                    "message": 'the question has no "Owner only" line; left for the owner',
-                    "url": record["comment_url"],
-                },
+                pending / f"{path.name}-owner-question-{record['last_comment_at']}.json",
+                {"line": f"owner question {what}: {path.name}"},
             )
-            record["missing_owner_line"] = question
+            record["owner_question_noted"] = question
             _write(path, record)
+            _log(f"{path.name} asks the owner {what}; it waits for him")
         return
-    if owner != "no" or not word or now - int(record["last_comment_at"]) < minutes * 60:
+    if owner != "no" or now - int(record["last_comment_at"]) < minutes * 60:
         return
     number = path.name.removeprefix("cloud-")
     # Read again just before answering: the owner may have answered, or the worker reported
@@ -348,6 +322,7 @@ def _answer_for_owner(
         comment["id"] > question and str(comment["body"]).startswith(MARKER) for comment in fresh
     ):
         return
+    text = f"{ORCHESTRATOR} answered for the owner: {reply}" + (f"\n\n> {line}" if line else "")
     posted = call(
         "cloud-workers",
         "api",
@@ -355,7 +330,7 @@ def _answer_for_owner(
         "POST",
         f"{workflow_config.current().api}/issues/{number}/comments",
         "-f",
-        f"body={ORCHESTRATOR} answered for the owner: {word}\n\n> {line}",
+        f"body={text}",
         "--jq",
         ".id",
     )
@@ -364,8 +339,12 @@ def _answer_for_owner(
     record.update(answered_for_owner=question, answer_id=int(posted.stdout), answered_at=now)
     _write(path, record)
     (notes / f"{path.name}.asking").unlink(missing_ok=True)
-    _log(f'answered for the owner: {path.name}, "{word}"')
-    print(f'{path.name}: answered for the owner: "{word}"')
+    _log(f'answered for the owner: {path.name}, "{reply}"')
+    # For the wake's check-in, which lists them so the owner can overrule them.
+    answered = notes / "answered-for-owner.pending"
+    answered.mkdir(exist_ok=True)
+    _write(answered / f"{now}-{path.name}.json", {"name": path.name, "reply": reply, "at": now})
+    print(f'{path.name}: answered for the owner: "{reply}"')
 
 
 def _poll(notes: Path, scripts: Path) -> int:

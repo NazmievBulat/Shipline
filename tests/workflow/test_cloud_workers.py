@@ -1034,7 +1034,17 @@ def _answers(workflow: Workflow) -> list[str]:
 
 
 def _answered_in_log(workflow: Workflow) -> list[str]:
-    return [line for line in _lines(workflow.wake_log) if "answered for the owner" in line]
+    """The tick's lines of its answers, among the lines of the wake's own passes."""
+    return [
+        line
+        for line in _lines(workflow.wake_log)
+        if re.fullmatch(r"[0-9]+ answered for the owner: .*", line)
+    ]
+
+
+def _set_config(workflow: Workflow, **values: int) -> None:
+    config = workflow.repo / "shipline.json"
+    config.write_text(json.dumps({**json.loads(config.read_text()), **values}))
 
 
 def test_a_question_not_owner_only_is_answered_once_after_15_minutes_then_woken(
@@ -1057,48 +1067,40 @@ def test_a_question_not_owner_only_is_answered_once_after_15_minutes_then_woken(
     assert _answered_in_log(attachable) == [f'{_NOW + 900} answered for the owner: cloud-7, "1"']
     assert _lines(attachable.state / "typed") == [_ANSWERED]
     assert _wake_log(attachable) == [f"{_NOW + 900} woke cloud-7 (question answered)"]
-    # Answered, it no longer waits for the owner.
+    # Answered, it no longer waits for the owner, and the check-in lists it for him to overrule.
     assert not (attachable.repo / ".local/workflow/cloud-7.asking").exists()
+    [told] = [message for message in attachable.sent() if "answered for the owner" in message]
+    assert 'answered for the owner: cloud-7, "1" (18:15)' in told
 
 
 @pytest.mark.parametrize(
-    ("text", "word", "line"),
+    ("text", "reply", "quoted"),
     [
         (
             "Rename the flag?\n\n"
-            '"keep it": keep the old name (recommended)\n"rename it": use the new name\n\n'
+            '"keep it": keep the old name\n"rename it": use the new name\n\n'
             'Owner only: no\nReply "keep it" or "rename it".',
             "keep it",
-            '"keep it": keep the old name (recommended)',
+            '\n\n> "keep it": keep the old name',
         ),
         (
-            "Which order?\n\n- **1** Oldest first\n- **2** Newest first (recommended)\n\n"
-            "**Owner only:** no\n1 or 2",
+            "Which order?\n\n- **2** Newest first\n- **1** Oldest first\n\n"
+            "**Owner only:** no\nReply 2 or 1.",
             "2",
-            "- **2** Newest first (recommended)",
+            "\n\n> - **2** Newest first",
         ),
         (
             "Done so far:\n1. Added the parser\n2. Tests green\n\nWhich order?\n"
-            "1. Oldest first (recommended)\n2. Newest first\n\nOwner only: no\nReply 1 or 2.",
+            "1. Oldest first\n2. Newest first\n\nOwner only: no\nReply 1 or 2.",
             "1",
-            "1. Oldest first (recommended)",
+            "\n\n> 1. Oldest first",
         ),
-        (
-            "Which retry?\n\n**1** Retry once (recommended)\n\n**2** Retry three times\n\n"
-            "Owner only: no\nReply 1 or 2.",
-            "1",
-            "**1** Retry once (recommended)",
-        ),
+        ('Rename the flag?\n\nOwner only: no\nReply "go ahead" or "wait".', "go ahead", ""),
     ],
-    ids=[
-        "quoted words",
-        "marked, in bold",
-        "a numbered list above the choices",
-        "a blank line between the choices",
-    ],
+    ids=["quoted words", "in bold", "a numbered list above the choices", "no choice line"],
 )
-def test_the_answer_is_the_recommended_choice(
-    attachable: Workflow, text: str, word: str, line: str
+def test_the_answer_is_the_first_reply_word_after_the_line(
+    attachable: Workflow, text: str, reply: str, quoted: str
 ) -> None:
     attachable.add_pull_request(7)
     _record(attachable)
@@ -1106,55 +1108,30 @@ def test_the_answer_is_the_recommended_choice(
 
     _tick_at(attachable, 15)
 
-    assert _answers(attachable) == [f"{_ORCHESTRATOR} answered for the owner: {word}\n\n> {line}"]
+    assert _answers(attachable) == [f"{_ORCHESTRATOR} answered for the owner: {reply}{quoted}"]
     assert _answered_in_log(attachable) == [
-        f'{_NOW + 900} answered for the owner: cloud-7, "{word}"'
+        f'{_NOW + 900} answered for the owner: cloud-7, "{reply}"'
     ]
+    # The wake's check-in reads it, and moves it once told.
+    [answer] = (attachable.repo / ".local/workflow").glob("answered-for-owner.*/*.json")
+    assert json.loads(answer.read_text()) == {"name": "cloud-7", "reply": reply, "at": _NOW + 900}
 
 
 @pytest.mark.parametrize(
-    "text",
+    ("owner", "text", "named"),
     [
-        'I recommend "2".\n\n1. Oldest first (recommended)\n2. Newest first\n\n'
-        "Owner only: no\nReply 1 or 2.",
-        "1. Oldest first (recommended)\n2. Newest first\nI recommend 2 after all.\n\n"
-        "Owner only: no\nReply 1 or 2.",
-        "1. Oldest first (recommended)\n2. Newest first\n\nOwner only: no\n"
-        "Reply 1 or 2 (I recommend 2).",
-        "Which order?\n\n1. Oldest first (recommended)\n2. Newest first (recommended)\n\n"
-        "Owner only: no\nReply 1 or 2.",
-        "Which order?\n\n1. Oldest first\n2. Newest first\n\nOwner only: no\nReply 1 or 2.",
-        "1. Retry once\n2. Retry three times\n3. Never retry (not recommended)\n\n"
-        "Owner only: no\nReply 1, 2 or 3.",
-        "Which order? Oldest or newest first.\n\nOwner only: no\nReply 1 or 2.",
+        ("yes", _QUESTION, None),
+        ("missing", _QUESTION.replace("Owner only: {owner}\n", ""), "without the Owner only line"),
+        ("no", _QUESTION.replace("Reply 1, 2 or 3.", "1, 2 or 3?"), "without a reply word"),
+        ("no", _QUESTION.replace("Reply 1, 2 or 3.", 'Reply "/clear".'), "without a reply word"),
     ],
-    ids=[
-        "recommended above",
-        "recommended below the choices",
-        "recommended in the reply words",
-        "two marked",
-        "none marked",
-        "not recommended",
-        "no choice lines",
-    ],
+    ids=["owner only", "no line", "no reply word", "a command"],
 )
-def test_an_unclear_recommendation_is_left_for_the_owner(attachable: Workflow, text: str) -> None:
-    attachable.add_pull_request(7)
-    _record(attachable)
-    _comments(attachable, _question(attachable, text=text))
-
-    _tick_at(attachable, 60)
-
-    assert _answers(attachable) == []
-
-
-@pytest.mark.parametrize("owner", ["yes", "missing"])
-def test_an_owner_only_question_or_one_without_the_line_is_left(
-    attachable: Workflow, owner: str
+def test_a_question_kept_for_the_owner_or_unclear_is_left(
+    attachable: Workflow, owner: str, text: str, named: str | None
 ) -> None:
     attachable.add_pull_request(7)
     _record(attachable)
-    text = _QUESTION if owner == "yes" else _QUESTION.replace("Owner only: {owner}\n", "")
     _comments(attachable, _question(attachable, owner=owner, text=text))
 
     for minutes in (15, 60, 95):
@@ -1163,12 +1140,12 @@ def test_an_owner_only_question_or_one_without_the_line_is_left(
     assert _answers(attachable) == []
     assert _answered_in_log(attachable) == []
     assert not (attachable.state / "attached").exists()
-    named = [message for message in attachable.sent() if '"Owner only"' in message]
-    if owner == "yes":
-        assert named == []
+    told = [message for message in attachable.sent() if "owner question" in message]
+    if named is None:
+        assert told == []
     else:
-        [message] = named
-        assert 'cloud-7: the question has no "Owner only" line; left for the owner' in message
+        [message] = told
+        assert f"owner question {named}: cloud-7" in message
 
 
 @pytest.mark.parametrize("answerer", ["owner", "orchestrator"])
@@ -1254,20 +1231,26 @@ def test_a_failed_answer_is_tried_again_and_posted_once(attachable: Workflow) ->
     assert len(_answered_in_log(attachable)) == 1
 
 
-def test_zero_minutes_in_the_config_turns_answering_off(attachable: Workflow) -> None:
+@pytest.mark.parametrize(("minutes", "answered_at"), [(0, None), (40, 40)])
+def test_the_configured_wait_moves_or_turns_off_the_answer(
+    attachable: Workflow, minutes: int, answered_at: int | None
+) -> None:
+    _set_config(attachable, answer_for_owner_after_minutes=minutes)
     attachable.add_pull_request(7)
     _record(attachable)
-    # The config key comes from another change; until then the stand-in is its default.
-    module = attachable.script.with_name("cloud_workers.py")
-    text = module.read_text()
-    assert text.count("ANSWER_AFTER_MINUTES = 15\n") == 1
-    module.write_text(text.replace("ANSWER_AFTER_MINUTES = 15\n", "ANSWER_AFTER_MINUTES = 0\n"))
     _comments(attachable, _question(attachable))
 
-    _tick_at(attachable, 600)
+    for at in (15, 39, 40, 600):
+        _tick_at(attachable, at)
 
-    assert _answers(attachable) == []
-    assert not (attachable.state / "attached").exists()
+    if answered_at is None:
+        assert _answers(attachable) == []
+        assert not (attachable.state / "attached").exists()
+        return
+    assert len(_answers(attachable)) == 1
+    assert _answered_in_log(attachable) == [
+        f'{_NOW + answered_at * 60} answered for the owner: cloud-7, "1"'
+    ]
 
 
 def test_the_rules_give_a_cloud_workers_question_the_shape_the_tick_answers() -> None:
