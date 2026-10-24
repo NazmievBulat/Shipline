@@ -2,8 +2,8 @@
 # Install the same call limiter for interactive sessions and installed host services.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-# One for the machine, whatever repositories it runs runners for: its budget is the machine's.
-installed=$HOME/.local/share/shipline-github
+# Named by the pool's prefix, which install.sh gives it.
+installed=$HOME/.local/share/${prefix:?install-github-budget.sh needs the prefix}-github
 link=$HOME/.local/bin/gh
 if { [ -e "$link" ] || [ -L "$link" ]; } &&
    [ "$(readlink -f "$link")" != "$installed/github-gh.sh" ]; then

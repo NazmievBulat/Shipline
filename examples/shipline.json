@@ -39,7 +39,7 @@
       "example-app-home-docker",
       "example-app-home-planner"
     ],
-    "identity_folder": "~/.config/example-app-runner",
+    "identity_folder": "~/.config/shipline-runner",
     "prefix": "example-app",
     "label": "example-app-home",
     "planner_label": "example-app-home-planner",

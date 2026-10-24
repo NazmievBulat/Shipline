@@ -253,3 +253,88 @@ def test_a_machine_is_never_taken_to_be_one_it_was_not_named(machine: Path) -> N
 
     assert done.returncode != 0
     assert "installed as home, not desk" in done.stderr
+
+
+def test_a_command_of_many_lines_is_read_whole(machine: Path) -> None:
+    _repository(machine, {"prefix": "example-app", "image_build": 'set -e\necho built >> "$BUILT"'})
+    _settings(machine)
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert (machine / "built").read_text() == "built\n"
+
+
+def test_no_value_of_the_file_runs_as_code(machine: Path) -> None:
+    config = {
+        "repository": "example-owner/example-app",
+        "annotations": {"web_suite": "x\nSHIPLINE_REPOSITORY=$(touch injected) #\ny"},
+        "runner": _RUNNER,
+    }
+    (machine / "checkout/shipline.json").write_text(json.dumps(config))
+    _git(machine, "add", "--all")
+    _git(machine, "commit", "--quiet", "-m", "main")
+    _git(machine, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _settings(machine)
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert not (machine / "checkout/injected").exists()
+    assert "repository='example-owner/example-app'" in (
+        _installed(machine) / "pool-settings.sh"
+    ).read_text()
+
+
+def test_a_checkout_whose_file_is_not_main_s_is_refused(machine: Path) -> None:
+    """The pool runs main's commands: the names it installs by are main's too."""
+    _repository(machine, _RUNNER)
+    _settings(machine)
+    config = {"repository": "example-owner/example-app", "runner": {**_RUNNER, "hub_cache": "x"}}
+    (machine / "checkout/shipline.json").write_text(json.dumps(config))
+
+    done = _install(machine)
+
+    assert done.returncode != 0
+    assert "origin/main" in done.stderr
+    assert not _calls(machine, "systemctl")
+
+
+def test_a_cache_the_repository_no_longer_runs_is_switched_off(machine: Path) -> None:
+    (machine / "kvm").touch()
+    _settings(machine, "machine=office\nroles='docker'\ndocker_runners=1\n")
+    _repository(machine, {**_RUNNER, "hub_cache": "tools/hub-cache"})
+    assert _install(machine).returncode == 0
+    (machine / "calls.log").unlink()
+    _repository(machine, _RUNNER)
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    units = machine / "home/.config/systemd/user"
+    assert not list(units.glob("example-app-hub-cache*"))
+    assert (
+        "--user disable --now example-app-hub-cache.service example-app-hub-cache-watch.timer"
+        in _calls(machine, "systemctl")
+    )
+
+
+def test_the_github_budget_wrapper_is_installed_by_the_prefix(machine: Path) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine)
+
+    assert _install(machine).returncode == 0
+
+    wrapper = machine / "home/.local/share/example-app-github/github-gh.sh"
+    assert wrapper.is_file()
+    assert (machine / "home/.local/bin/gh").resolve() == wrapper.resolve()
+
+
+def test_a_count_that_is_not_a_number_is_refused(machine: Path) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine, _SETTINGS + "ordinary_blacksmith_jobs=' 1; touch x'\n")
+
+    done = _install(machine)
+
+    assert done.returncode != 0
+    assert not _installed(machine).exists()

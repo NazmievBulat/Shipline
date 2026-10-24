@@ -720,6 +720,51 @@ def test_bash_reads_every_value_once_quoted_for_eval(tmp_path: Path) -> None:
     assert not (repo / "built").exists()
 
 
+def test_sh_reads_every_value_once_whatever_lines_a_value_holds(tmp_path: Path) -> None:
+    """`workflow_config.py sh` is the same for a plain sh (dash): no array, and a value of many
+    lines, or one that holds what looks like another assignment, stays one value."""
+    repo = _repository(tmp_path)
+    _write(
+        repo,
+        {
+            "annotations": {"web_suite": "x\nSHIPLINE_REPOSITORY=$(touch injected) #\ny"},
+            "runner": {
+                "prefix": "example-app",
+                "image_build": "set -e\ndocker build .\ndocker build vm",
+                "labels": ["home one", "home-two"],
+            },
+        },
+    )
+
+    done = subprocess.run(
+        [
+            "sh",
+            "-c",
+            'config=$(python3 "$1" sh "$2") || exit 1; eval "$config"; '
+            'printf "%s\\n" "$SHIPLINE_REPOSITORY" "$SHIPLINE_RUNNER_IMAGE_BUILD" '
+            '"$SHIPLINE_RUNNER_LABELS" "$SHIPLINE_REPO"',
+            "sh",
+            str(_WORKFLOW / "workflow_config.py"),
+            str(repo),
+        ],
+        cwd=repo,
+        env=_GIT_ENV,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert done.stdout.splitlines() == [
+        "example-owner/example-app",
+        "set -e",
+        "docker build .",
+        "docker build vm",
+        "'home one' home-two",
+        str(repo),
+    ]
+    assert not (repo / "injected").exists()
+
+
 def test_bash_without_a_file_reads_the_defaults(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
 

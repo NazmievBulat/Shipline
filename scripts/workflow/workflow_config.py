@@ -26,8 +26,9 @@ Python scripts import it (`current()`, once per run). A Bash script reads every 
     eval "$config"
 
 which prints `SHIPLINE_<KEY>=value` lines quoted for `eval`, the file itself among them as
-`SHIPLINE_CONFIG` for jq (`priority.jq`). Node (`codex-bridge.mjs`) and jq read the JSON with
-the same defaults.
+`SHIPLINE_CONFIG` for jq (`priority.jq`). A plain sh (`runner/install.sh`) reads
+`workflow_config.py sh`, the same with each list as one value. Node (`codex-bridge.mjs`) and jq
+read the JSON with the same defaults.
 """
 
 import json
@@ -36,6 +37,7 @@ import re
 import shlex
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path, PurePosixPath
@@ -591,9 +593,11 @@ def as_dict(config: Config) -> dict[str, Any]:
     }
 
 
-def shell(config: Config) -> str:
+def shell(config: Config, *, posix: bool = False) -> str:
     """`KEY=value` lines for a Bash script's `eval`: every value, and the file for jq. The
-    repository is empty when nothing names it, and a script that needs it stops on that."""
+    repository is empty when nothing names it, and a script that needs it stops on that. With
+    `posix`, for a plain sh (`workflow_config.py sh`): each list is one value, its names quoted
+    for sh and joined by spaces, as Bash would write its array."""
     values = {
         "REPOSITORY": config.found_repository or "",
         "STATE_FOLDER": config.state_folder,
@@ -619,29 +623,32 @@ def shell(config: Config) -> str:
         "CONFIG": json.dumps(config.given, separators=(",", ":")),
     }
     lines = [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]
-    labels = " ".join(shlex.quote(label) for label in config.runner.labels)
-    lines.append(f"SHIPLINE_RUNNER_LABELS=({labels})")
+
+    def listed(name: str, items: Iterable[str]) -> str:
+        words = " ".join(shlex.quote(item) for item in items)
+        return f"{name}={shlex.quote(words)}" if posix else f"{name}=({words})"
+
+    lines.append(listed("SHIPLINE_RUNNER_LABELS", config.runner.labels))
     # The main checkout, exported: every program the script starts works on the same repository,
     # whatever folder it starts in.
     lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")
     # The hunt areas, and at the same place in the other array the screens of each, joined.
     areas = config.hunts.areas
-    lines.append(f"SHIPLINE_HUNT_AREAS=({' '.join(shlex.quote(area) for area in areas)})")
-    screens = " ".join(shlex.quote(", ".join(paths)) for paths in areas.values())
-    lines.append(f"SHIPLINE_HUNT_SCREENS=({screens})")
+    lines.append(listed("SHIPLINE_HUNT_AREAS", areas))
+    lines.append(listed("SHIPLINE_HUNT_SCREENS", (", ".join(paths) for paths in areas.values())))
     return "\n".join(lines) + "\n"
 
 
 def main() -> int:
-    if len(sys.argv) not in (2, 3) or sys.argv[1] != "shell":
-        print("usage: workflow_config.py shell [folder]", file=sys.stderr)
+    if len(sys.argv) not in (2, 3) or sys.argv[1] not in ("shell", "sh"):
+        print("usage: workflow_config.py shell|sh [folder]", file=sys.stderr)
         return 2
     try:
         config = load(Path(sys.argv[2]) if len(sys.argv) == 3 else None)
     except ConfigError as error:
         print(error, file=sys.stderr)
         return 1
-    sys.stdout.write(shell(config))
+    sys.stdout.write(shell(config, posix=sys.argv[1] == "sh"))
     return 0
 
 
