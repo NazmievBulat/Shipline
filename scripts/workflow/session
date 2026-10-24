@@ -1238,14 +1238,38 @@ cmd_nudge_idle() {
   send_prompt "$name" "Pull request ${name#ticket-} is ready, but you have not finished. Finish by the rules: when nothing is left to do, name each ticket pull request this session opened and say that it waits for the owner's start, then say \`worker finished\` on a line of its own."
 }
 
+# Whether a busy screen shows a message typed while Claude works: Claude draws it as a line of
+# its own, `❯ ` and the text (on a grey ground), under the spinner and above the box. A prompt
+# already sent has the same mark, so only such a line after the last line Claude draws itself
+# (its spinner, or the time a turn took) counts; without one, after the last reply.
+shows_queued_message() {
+  strip_ansi <<<"$1" | LC_ALL=C awk '
+    /^─/ { above = last; last = NR }
+    { line[NR] = $0 }
+    END {
+      top = above ? above : (last ? last : NR + 1)
+      for (i = 1; i < top; i++) {
+        if (line[i] ~ /^[[:space:]]*(·|✢|✳|✶|✻|✽)[[:space:]]/) { from = i; drawn = 1 }
+        else if (!drawn && line[i] ~ /^[[:space:]]*●/) from = i
+      }
+      for (i = from + 1; i < top; i++) if (line[i] ~ /^❯[[:space:]]+[^[:space:]]/) exit 0
+      exit 1
+    }'
+}
+
 # The tick's two messages to a busy Claude worker or reviewer that does not move: its screen has
 # not changed for 45 minutes, or its wait loop finds its own command line. Escape interrupts
 # what it runs, and the message tells it why. A session that waits for the owner, ended its
-# turn, shows a permission dialog (Escape would answer it) or has any text in its box exits 3
-# with nothing pressed. When Escape puts a message queued while it worked back into the box,
-# nothing is typed after it: exit 4, the session interrupted.
+# turn, shows a permission dialog (Escape would answer it), a message queued under the spinner
+# (Escape would put it back unsent) or text in its box exits 3 with nothing pressed. The one text let through is this message itself, typed by an earlier call
+# whose Enter was not taken: Escape was pressed then, so it is only sent again. When Escape puts
+# a message queued while it worked back into the box, nothing is typed after it: exit 4, the
+# session interrupted.
 cmd_nudge_busy() {
-  local name=$1 kind=$2 notes typed poll screen
+  local name=$1 kind=$2 notes typed poll screen message
+  message="That loop finds its own command line and never ends. Check the process by its number."
+  [[ $kind != still ]] ||
+    message="The command has produced nothing for 45 minutes. Check whether it is still running and go on."
   notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
   require_running "$name"
   [[ ! -e $notes.codex ]] || die "$name is a Codex worker; its bridge relays"
@@ -1263,8 +1287,16 @@ cmd_nudge_busy() {
     echo "$name shows a permission dialog; nothing was pressed" >&2
     exit 3
   fi
+  if shows_queued_message "$screen"; then
+    echo "$name has a message queued; nothing was pressed" >&2
+    exit 3
+  fi
   read_prompt_box
   if [[ -n $typed ]]; then
+    if [[ -r $notes.typed && $(cat "$notes.typed") == "$message" ]] && holds_own_text "$name"; then
+      send_prompt "$name" "$message"
+      return
+    fi
     echo "$name has text in its box that was not sent; nothing was pressed" >&2
     exit 3
   fi
@@ -1278,11 +1310,7 @@ cmd_nudge_busy() {
       exit 4
     fi
   done
-  if [[ $kind == still ]]; then
-    send_prompt "$name" "The command has produced nothing for 45 minutes. Check whether it is still running and go on."
-  else
-    send_prompt "$name" "That loop finds its own command line and never ends. Check the process by its number."
-  fi
+  send_prompt "$name" "$message"
 }
 
 # What the session's Bash tool runs, as JSON (`running_command.py`).

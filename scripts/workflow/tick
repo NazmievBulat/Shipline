@@ -79,6 +79,8 @@ KEEP_ALIVE_AFTER_SECONDS=$((50 * 60))
 READY_UNFINISHED_SECONDS=$((15 * 60))
 # A busy session whose screen has not changed for this long is nudged and named in the wake, once.
 STUCK_AFTER_SECONDS=$((45 * 60))
+# A busy session's wait loop that finds itself is nudged once its screen has stood still this long.
+LOOP_STILL_SECONDS=$((5 * 60))
 # An idle session that no rule covers is named in the wake after this long, once per head.
 IDLE_NO_RULE_SECONDS=$((50 * 60))
 # The line a session ends with, WORDS standing for its words. `notify` reads it the same way.
@@ -736,13 +738,16 @@ asks_permission() {
   LC_ALL=C grep -qE '^[[:space:]│]*Do you want to [^?]*\?' <<<"$screen"
 }
 
-# The last line of words above the box, without the mark Claude draws before it.
+# The last line of words above the box, without the mark Claude draws before it. The lines
+# Claude draws itself, its spinner and the time a turn took ("✻ Worked for 3m 2s"), are not
+# words of the session.
 last_line() {
   local screen top
   screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 1
   top=$(LC_ALL=C awk '/^─/ { above = last; last = NR }
     END { print above ? above : (last ? last : NR + 1) }' <<<"$screen")
   LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" |
+    { LC_ALL=C grep -vE '^[[:space:]]*(·|✢|✳|✶|✻|✽)[[:space:]]' || true; } |
     LC_ALL=C sed -E 's/^[[:space:]]*((●|⎿)[[:space:]]*)*//; s/[[:space:]]+$//' |
     LC_ALL=C awk 'NF { line = $0 } END { print line }'
 }
@@ -751,7 +756,8 @@ last_line() {
 # outcome to what the wake line says of it: "; nudge sent", "; nudge failed", "; interrupted,
 # text left in its box" when Escape put a queued message back, or nothing when the session was
 # left alone. Escape is never pressed on a dialog, a question to the owner or text in the box.
-# One try per stretch or loop: after a failure Escape may already have been pressed.
+# A nudge that failed after Escape leaves a `.nudge-retry` note: the session it stopped gets
+# the same message at the next passes (`retry_nudge`), never a second Escape.
 nudge_busy() {
   local name=$1 kind=$2 delivery sent
   outcome=""
@@ -766,11 +772,43 @@ nudge_busy() {
     nudged+="$name "
     outcome="; interrupted, text left in its box"
   elif ((sent != 3)); then
+    nudged+="$name "
     echo "$delivery" >&2
     wake_log "$name $3 nudge failed: $delivery"
     outcome="; nudge failed"
+    echo "$kind" >"$main/$SHIPLINE_STATE_FOLDER/$name.nudge-retry" || true
     failed=1
   fi
+}
+
+# Sends again a nudge whose Enter was not taken, while the box still holds exactly it. Anything
+# else in the box, or a session that went on, ends the retry.
+retry_nudge() {
+  local name=$1 note=$main/$SHIPLINE_STATE_FOLDER/$1.nudge-retry kind delivery sent
+  { read -r kind <"$note"; } 2>/dev/null || return 0
+  if [[ ! $kind =~ ^(still|loop)$ ]] || ! holds_own_nudge "$name"; then
+    rm -f "$note"
+    return 0
+  fi
+  delivery=$(session nudge-busy "$name" "$kind" 2>&1)
+  sent=$?
+  nudged+="$name "
+  if ((sent == 0)); then
+    rm -f "$note"
+    wake_log "$name $kind nudge sent again after its Enter was not taken" || failed=1
+  elif ((sent == 3)); then
+    rm -f "$note"
+  else
+    echo "$delivery" >&2
+    wake_log "$name $kind nudge failed again: $delivery"
+    failed=1
+  fi
+}
+
+# Whether the session's box holds a message of the tick's own (its `.typed` note).
+holds_own_nudge() {
+  [[ -e $main/.claude/worktrees/ticket-${1#*-}/$SHIPLINE_STATE_FOLDER/$1.typed ]] &&
+    ! bash "$here/bridge-empty" "$1" 9>&-
 }
 
 running=$(session list) || failed=1
@@ -856,6 +894,11 @@ while read -r name state _; do
   # The commit the session's work stands on: a new one is news even on a screen that is still.
   head=$(git -C "$main/.claude/worktrees/ticket-$number" rev-parse HEAD 2>/dev/null 9>&-) ||
     head=""
+  # Since when its screen has not changed (the note the pass above keeps).
+  last_since=""
+  { read -r _ last_since <"$main/$SHIPLINE_STATE_FOLDER/$name.screen-seen"; } 2>/dev/null || true
+  [[ $last_since =~ ^[0-9]+$ ]] || last_since=$NOW
+  [[ ! -e $main/$SHIPLINE_STATE_FOLDER/$name.nudge-retry ]] || retry_nudge "$name"
 
   # What it runs: a wait loop that finds its own shell never ends, whatever its screen shows.
   if activity=$(session running "$name" 2>/dev/null); then
@@ -864,13 +907,23 @@ while read -r name state _; do
       mark=$main/$SHIPLINE_STATE_FOLDER/$name.loop-noted
       if [[ ! -r $mark || $(<"$mark") != "$loop" ]]; then
         outcome=""
-        # Only when the loop is what it runs now: Escape would stop another command, not a loop
-        # left in the background.
-        if [[ $busy == true && $(jq -r '.running // ""' <<<"$activity") == "$loop" ]]; then
-          nudge_busy "$name" loop loop
+        later=false
+        # Only when the loop is the command it started last and its screen stands still: Escape
+        # would stop other work, not a loop left in the background. While the screen moves, the
+        # loop is named when it stands still or the session ends its turn. One the tick may not
+        # type into is named at once.
+        if [[ $busy == true && $(jq -r '.running // ""' <<<"$activity") == "$loop" &&
+              $nudged != *" $name "* ]] && ! asks_permission "$name" && quiet "$name"; then
+          if ((NOW - last_since >= LOOP_STILL_SECONDS)); then
+            nudge_busy "$name" loop loop
+          else
+            later=true
+          fi
         fi
         line="wait loop finds itself? $name (running: $loop)$outcome"
-        if note_for_wake "$name-loop-$NOW" "$line"; then
+        if [[ $later == true ]]; then
+          :
+        elif note_for_wake "$name-loop-$NOW" "$line"; then
           printf '%s\n' "$loop" >"$mark" || failed=1
           wake_log "$line" || failed=1
         else
@@ -903,9 +956,7 @@ while read -r name state _; do
 
   # A session given a message in this tick has a new screen at the next.
   [[ $busy == true && $nudged != *" $name "* ]] || continue
-  { read -r last_sum last_since <"$main/$SHIPLINE_STATE_FOLDER/$name.screen-seen"; } 2>/dev/null ||
-    continue
-  [[ $last_since =~ ^[0-9]+$ ]] && ((NOW - last_since >= STUCK_AFTER_SECONDS)) || continue
+  ((NOW - last_since >= STUCK_AFTER_SECONDS)) || continue
   asks_permission "$name" && continue
   mark=$main/$SHIPLINE_STATE_FOLDER/$name.stuck-noted
   [[ ! -r $mark || $(<"$mark") != "$last_since $head" ]] || continue

@@ -649,13 +649,16 @@ two cases, a still screen and a wait loop that finds itself (below); the full ta
   its own shell, which never ends, is nudged once per loop the same way, with "That loop finds
   its own command line and never ends. Check the process by its number." It is named as
   `wait loop finds itself? ticket-N (running: ...); nudge sent`.
-- Neither nudge goes to a session with text in its box or a question to the owner on its
-  screen: it is named without `; nudge sent`. A permission prompt waits for the owner and is
-  not called stuck. When Escape puts back into the box a message queued while the command ran,
-  nothing is typed after it, and the line ends `; interrupted, text left in its box`. A wait
-  loop is nudged only while it is the command running; one left in the background is only
-  named. A session stopped on the usage limit, a hunt, an audit, an analyst and a Codex
-  bridge are left alone. Each nudge is tried once: after a failure the line ends `; nudge failed`.
+- Neither nudge goes to a session with text in its box, a message queued under its spinner
+  (a `❯ ` line between the spinner and the box) or a question to the owner on its screen: it
+  is named without `; nudge sent`. A permission prompt waits for the owner and is not called
+  stuck. Should Escape still put a message back into the box, nothing is typed after it, and
+  the line ends `; interrupted, text left in its box`. A wait loop is nudged only when it is
+  the command started last and the screen has stood still for 5 minutes; while the screen
+  moves, it is named when it stands still or the turn ends. A session stopped on the usage
+  limit, a hunt, an audit, an analyst and a Codex bridge are left alone. A nudge whose Enter
+  was not taken ends its line with `; nudge failed`, and is sent again at the next passes,
+  without another Escape, for as long as the box holds exactly it.
 - An idle session that none of these rules covers for 50 minutes is named in the wake once per
   head, as `idle, no rule: ticket-N (<min> min, last line: <line>)`. The tick types nothing it
   has no rule for; the orchestrator decides.

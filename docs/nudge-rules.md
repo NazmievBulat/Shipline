@@ -30,11 +30,11 @@ key that sends it follows only when the box holds exactly that text. Each one is
 | Merged in a batch | a reviewer or audit | another member's gate call merged its pull request, once | "Pull request N was merged by the merge train, in a batch (commit `<squash>`). Do not call the gate again. ..." | |
 | Waiting for its own job or turn | Claude workers and reviewers | idle 50 minutes after `notify waiting`, or a reviewer idle for its turn in the line; once per idle stretch | "Status check: if what you were waiting for is done, carry on; if not, run `scripts/workflow/notify waiting` and end your turn." | one with an asking note |
 | Ready but not finished | Claude workers | idle 15 minutes on a pull request ready as long, without `worker finished`; once per ready stretch | "Pull request N is ready, but you have not finished. Finish by the rules: ..." | a draft pull request |
-| Still screen | busy Claude workers and reviewers | the screen, without the box, the status line, the spinner and its clock, unchanged for 45 minutes since it last changed or the session turned busy; once per stretch and head | Escape, then "The command has produced nothing for 45 minutes. Check whether it is still running and go on." | a permission prompt; a session that ended its turn to wait (idle, job-wait or check-wait note); any text in the box, its own old message included; after Escape, a queued message it put back into the box (nothing is typed) |
-| Wait loop finds itself | busy Claude workers and reviewers | the `pgrep -f` or `ps \| grep` loop it runs now matches its own shell; once per loop | Escape, then "That loop finds its own command line and never ends. Check the process by its number." | the same as a still screen; a loop left in the background while another command runs |
+| Still screen | busy Claude workers and reviewers | the screen, without the box, the status line, the spinner and its clock, unchanged for 45 minutes since it last changed or the session turned busy; once per stretch and head | Escape, then "The command has produced nothing for 45 minutes. Check whether it is still running and go on." | a permission prompt; a session that ended its turn to wait (idle, job-wait or check-wait note); a message queued under the spinner (a `❯ ` line after the spinner, above the box); any text in the box; after Escape, a message it put back into the box (nothing is typed) |
+| Wait loop finds itself | busy Claude workers and reviewers | the `pgrep -f` or `ps \| grep` loop it started last matches its own shell, and the screen has stood still for 5 minutes; once per loop | Escape, then "That loop finds its own command line and never ends. Check the process by its number." | the same as a still screen; a loop while another command runs, or while the screen moves (it is named when the screen stands still or the turn ends) |
 
-Each of these two is tried once per stretch or loop, even when typing fails: Escape may already
-have been pressed.
+A nudge whose Enter was not taken is sent again at the next passes, without another Escape,
+for as long as the box holds exactly that message. Anything else in the box ends the retry.
 
 Codex bridges, hunts, audits and analysts get none of the last four.
 
@@ -44,7 +44,7 @@ Codex bridges, hunts, audits and analysts get none of the last four.
 | --- | --- | --- | --- |
 | Still screen | as above, not on a permission prompt | as above | `stuck? <session> (<min> min, running: <first line of the command>)`, ending `; nudge sent` when it was nudged, `; interrupted, text left in its box` when Escape put a message back, `; nudge failed` when typing failed |
 | Wait loop finds itself | as above, busy or idle | once per loop | `wait loop finds itself? <session> (running: <loop>)`, with the same ending |
-| Idle, no rule | Claude workers and reviewers | idle 50 minutes, with no wait note, no asking note, not a worker on a ready pull request; once per head | `idle, no rule: <session> (<min> min, last line: <line>)` |
+| Idle, no rule | Claude workers and reviewers | idle 50 minutes, with no wait note, no asking note, not a worker on a ready pull request; once per head | `idle, no rule: <session> (<min> min, last line: <line>)`, the line being the last words above the box, not the spinner or the time a turn took |
 | Rule break | reviewers | said `review finished` without handing its merge to the tick; once per head | `rule break: review-N said review finished without a merge handoff` |
 | Asking the owner | any session whose stop rang the phone with a question | until he answers | `asking the owner: <session> (<min> min)` |
 
