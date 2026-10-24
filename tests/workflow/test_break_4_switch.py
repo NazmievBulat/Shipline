@@ -158,6 +158,51 @@ def test_the_old_installer_after_going_back_still_leaves_one_hook_per_event(
     assert _hooks(switched) == {event: [old] for event in EVENTS}
 
 
+def test_going_back_after_the_old_installer_ran_again_still_leaves_one_hook_per_event(
+    switched: Workflow,
+) -> None:
+    """The way back before `shipline uninstall` was the repository's own installer, which adds
+    its hook beside Shipline's. Uninstall afterwards must not put back a second one."""
+    _owner_settings(switched)
+    assert _old(switched, "install-hooks").returncode == 0
+    assert switched.shipline("install-hooks").returncode == 0
+    assert _old(switched, "install-hooks").returncode == 0
+
+    back = switched.shipline("uninstall")
+
+    assert back.returncode == 0, back.stderr
+    old = f"bash {switched.repo}/scripts/workflow/notify 2>/dev/null || true"
+    assert _hooks(switched) == {
+        "Stop": ["true # mine", old],
+        **{event: [old] for event in EVENTS[1:]},
+    }
+
+
+def test_uninstall_twice_and_without_shipline_s_hooks_changes_nothing(switched: Workflow) -> None:
+    path = Path(switched.env["HOME"]) / ".claude" / "settings.json"
+    assert _old(switched, "install-hooks").returncode == 0
+    assert switched.shipline("install-hooks").returncode == 0
+    assert switched.shipline("uninstall").returncode == 0
+    once = path.read_text()
+
+    again = switched.shipline("uninstall")
+
+    assert again.returncode == 0, again.stderr
+    assert path.read_text() == once
+    # The owner's own empty and odd entries are theirs: nothing of them changes either.
+    odd = (
+        '{\n  "model": "m",\n  "hooks": {\n    "SessionStart": [],\n    "Stop": [{"matcher": "x"}],\n'
+        '    "Other": null,\n    "Notification": [{"hooks": []}]\n  }\n}\n'
+    )
+    path.write_text(odd)
+
+    done = switched.shipline("uninstall")
+
+    assert done.returncode == 0, done.stderr
+    assert path.read_text() == odd
+    assert done.stdout == ""
+
+
 def test_going_back_without_hooks_before_takes_out_only_shipline_s(switched: Workflow) -> None:
     _owner_settings(switched)
     assert switched.shipline("install-hooks").returncode == 0
@@ -201,12 +246,15 @@ def test_going_back_with_shipline_uninstall_restores_the_timer(switched: Workflo
     units = Path(switched.env["HOME"]) / ".config" / "systemd" / "user"
     assert _old(switched, "install-timer").returncode == 0
     before = (units / "workflow-tick.service").read_text()
+    timer = (units / "workflow-tick.timer").read_text()
     assert switched.shipline("install-timer").returncode == 0
 
     back = switched.shipline("uninstall")
 
     assert back.returncode == 0, back.stderr
     assert (units / "workflow-tick.service").read_text() == before
+    assert (units / "workflow-tick.timer").read_text() == timer
+    assert list(units.glob("*.before-shipline")) == []
     assert switched.calls("systemctl")[-2:] == [
         "systemctl --user daemon-reload",
         "systemctl --user enable --now workflow-tick.timer",
