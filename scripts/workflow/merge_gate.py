@@ -4173,9 +4173,19 @@ def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
                 pending.append(waits)
                 continue
         if state == "red":
+            waits = check_repair.runner_wait(folder, found[0], parts)
+            if waits:
+                pending.append(waits)
+                continue
+        if state == "red":
+            failure = (
+                "failed again after its runner retry"
+                if check_repair.repeated(folder, found[0]["id"])
+                else "failed"
+            )
             return Prefix(
                 "red",
-                f"{workflow} run {found[0]['id']} of {whose} failed ({', '.join(failing)})",
+                f"{workflow} run {found[0]['id']} of {whose} {failure} ({', '.join(failing)})",
                 evidence,
                 workflow,
                 found[0],
@@ -4571,11 +4581,20 @@ def _whole_suite_run(
             if waits:
                 return _batch_wait(f"merge train: {waits}")
         if state == "red":
+            waits = check_repair.runner_wait(train.path.parent, found[0], parts)
+            if waits:
+                return _batch_wait(f"merge train: {waits}")
+        if state == "red":
             # Blocked like a failed check, and kept: a rerun of this same run, once green,
             # restores its place and lets the next call merge.
             train.fail(number, head)
+            failure = (
+                "failed again after its runner retry"
+                if check_repair.repeated(train.path.parent, found[0]["id"])
+                else "failed"
+            )
             raise Refused(
-                f"{WHOLE[workflow]}, run {found[0]['id']}, failed on this pull request's "
+                f"{WHOLE[workflow]}, run {found[0]['id']}, {failure} on this pull request's "
                 f"tested merge ({', '.join(failing)}); treat it as a failed check: fix and push, "
                 "or rerun that run and call this gate again"
             )
@@ -5209,4 +5228,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Shared diagnosis imports this module. Keep the CLI's exception classes and cached
+    # reads: loading a second copy would turn an expected wait into an uncaught error.
+    sys.modules["merge_gate"] = sys.modules[__name__]
     sys.exit(main())
