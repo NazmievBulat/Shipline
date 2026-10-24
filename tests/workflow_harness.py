@@ -625,6 +625,23 @@ class Workflow:
         self.hunt_report(name).mkdir(parents=True)
         return path
 
+    def analyst_worktree(self, name: str) -> Path:
+        """The worktree of the analyst `analyst-<name>`: a copy of `main`, on no branch."""
+        return self.repo / ".claude" / "worktrees" / f"analyst-{name}"
+
+    def analysis_report(self, name: str) -> Path:
+        """Where the analyst `analyst-<name>` leaves its report: in the main checkout, kept."""
+        return self.repo / ".local" / "analyses" / name
+
+    def add_analyst(self, name: str) -> Path:
+        """An analyst whose worktree and report folder already exist, as after `start analyst`."""
+        path = self.analyst_worktree(name)
+        self.git("worktree", "add", "--quiet", "--detach", str(path), "origin/main")
+        (path / ".local" / "workflow").mkdir(parents=True)
+        (path / ".local" / "workflow" / f"analyst-{name}.started").touch()
+        self.analysis_report(name).mkdir(parents=True)
+        return path
+
     def add_pull_request(
         self,
         number: int,
@@ -833,6 +850,8 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
         # The tick's daily metrics run reads GitHub in the background; a test that wants it names
         # its time.
         "WORKFLOW_METRICS_DAILY_AT": "",
+        # Nor does the tick start its daily analyst unless a test names the time.
+        "WORKFLOW_ANALYST_DAILY_AT": "",
     }
     made = Workflow(root=tmp_path, repo=tmp_path / "repo", state=state, bin=bin_folder, env=env)
     made.fake("gh", _FAKE_GH)

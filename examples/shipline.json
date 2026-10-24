@@ -35,5 +35,8 @@
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app-runner"
   },
-  "cloud_wake_after_minutes": 45
+  "cloud_wake_after_minutes": 45,
+  "commands": {
+    "test": "tools/run-tests"
+  }
 }
