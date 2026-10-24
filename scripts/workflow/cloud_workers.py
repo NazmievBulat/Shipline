@@ -118,8 +118,8 @@ def _status(body: str) -> str:
     if re.fullmatch(r"[*_]*worker finished[.!]?[*_]*", last, re.IGNORECASE):
         return "finished"
     if re.search(
-        r"""\?[\s"”)]*$|\b(write|type|reply|say|answer|choose)\b\s*:?\s+"""
-        r"""("|'|“|`|[0-9]|(?-i:[A-Z])\b)""",
+        r"""\?[\s"”)]*$|\b(write|type|reply|say|answer|choose|recommend(?:ed|ation)?)\b\s*:?\s+"""
+        r"""[*_]*("|'|“|`|[0-9]|(?-i:[A-Z])\b)""",
         last,
         re.IGNORECASE,
     ):
@@ -308,9 +308,10 @@ def _question(body: str) -> tuple[str, str, str]:
 
 
 def _recommends_other(body: str, reply: str) -> bool:
-    """Whether a line above the question's `Owner only:` line recommends another reply word than
-    `reply`: a choice marked recommended, or another line naming a reply word with its
-    recommendation. A choice marked "not recommended" recommends nothing."""
+    """Whether a line of the question other than its `Owner only:` line recommends another reply
+    word than `reply`: a choice marked recommended, or another line, the reply words' own line
+    included, with a recommendation next to a reply word (`Recommended: 2`, `2 (recommended)`) or,
+    with none next to it, naming any. "Not recommended" recommends nothing."""
     lines = _without_attribution(body).split("\n")
     at = next(number for number, line in enumerate(lines) if OWNER_ONLY.fullmatch(line))
     end = max(n for n, line in enumerate(lines) if re.search(rf"(?!{SPACE}).", line))
@@ -326,13 +327,37 @@ def _recommends_other(body: str, reply: str) -> bool:
         bare = re.sub(rf"^(?:{SPACE}|[>*_•-])*", "", line)
         return [w for w in words if re.match(rf"""[("'“`]?{re.escape(w)}(?![^\W_])""", bare)]
 
-    for line in lines[:at]:
-        if not re.search(r"recommend", line, re.IGNORECASE) or re.search(
-            r"\bnot\s+recommend", line, re.IGNORECASE
-        ):
+    def beside(before: str, after: str) -> set[str]:
+        """The reply words just before a recommendation or just after it."""
+        return {
+            word
+            for word in words
+            if re.search(
+                rf"""(?<![^\W_])["“`*_]*{re.escape(word)}["”`*_]*(?:{SPACE}|[(:,-])*$""", before
+            )
+            or re.match(
+                rf"""(?:{SPACE}|[:,(*_-])*(?:(?:option|choice|reply|answer){SPACE}+)?"""
+                rf"""["“`*_]*{re.escape(word)}(?![^\W_])""",
+                after,
+                re.IGNORECASE,
+            )
+        }
+
+    for number, line in enumerate(lines):
+        found = [
+            match
+            for match in re.finditer(r"recommend\w*", line, re.IGNORECASE)
+            if not re.search(r"\bnot\s+$", line[: match.start()], re.IGNORECASE)
+        ]
+        if number == at or not found:
             continue
-        choice = begins(line)
-        marked = set(choice[:1]) if choice else {word for word in words if names(line, word)}
+        # The reply words' own line is no choice, whatever word it begins with.
+        choice = begins(line) if number != end else []
+        if choice:
+            marked = set(choice[:1])
+        else:
+            marked = set().union(*(beside(line[: m.start()], line[m.end() :]) for m in found))
+            marked = marked or {word for word in words if names(line, word)}
         if marked - {reply}:
             return True
     return False

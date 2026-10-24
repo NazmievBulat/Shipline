@@ -359,12 +359,12 @@ line when it has one, and its worker is woken as after any answer. An answer fro
 the orchestrator that comes first wins, the same words asked again after any answer wait for the
 owner, and only a question from an account that may write to the repository is answered. One
 without the line, without a reply word, or with a recommendation other than its first reply word
-(a choice marked recommended, or a sentence above `Owner only:` that recommends another), waits
-for the owner and is named in the wake once; the morning check-in lists the answers. A final
-`worker finished` removes the record only once the pull request is ready, letting the normal
-independent review start. Reports and failed deliveries are remembered locally. The workflow
-does not read cloud transcripts or stop cloud sessions; the owner answers in the cloud session
-or on the pull request.
+(a choice marked recommended, or a sentence that recommends another), waits for the owner and
+is named in the wake once; the morning check-in lists the answers. A final `worker finished`
+removes the record only once the pull request is ready, letting the normal independent review
+start. Reports and failed deliveries are remembered locally. The workflow does not read cloud
+transcripts or stop cloud sessions; the owner answers in the cloud session or on the pull
+request.
 
 A cloud worker's push also runs the tests CI will run for its change: its machine is its own,
 so the slower suites cost no local machine anything. It exports `SHIPLINE_CLOUD_WORKER=1` in

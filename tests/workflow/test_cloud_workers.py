@@ -1670,7 +1670,9 @@ def test_a_recommendation_that_agrees_with_the_first_reply_word_is_answered(
     ]
 
 
-@pytest.mark.parametrize("ending", ["Reply: 1 or 2", "Choose 1 or 2.", "Reply A or B."])
+@pytest.mark.parametrize(
+    "ending", ["Reply: 1 or 2", "Choose 1 or 2.", "Reply A or B.", "Reply **1** or **2**."]
+)
 def test_common_closing_lines_ask_the_owner(workflow: Workflow, ending: str) -> None:
     workflow.add_pull_request(7, labels=())
     _record(workflow)
@@ -1708,3 +1710,78 @@ def test_the_same_question_asked_again_after_the_owner_answered_waits(
         _tick_at(attachable, minutes)
 
     assert _answers(attachable) == []
+
+
+@pytest.mark.parametrize(
+    "ending",
+    [
+        "Owner only: no\nRecommended: 2\nReply 1 or 2.",
+        "Owner only: no\nReply 1 or 2 (recommended: 2).",
+        "Owner only: no\nAnswer 1 or 2. I recommend 2.",
+        "Owner only: no\nReply 1 (not recommended) or 2 (recommended).",
+    ],
+    ids=["below the line", "on the reply line", "after the reply words", "beside another"],
+)
+def test_a_recommendation_below_the_owner_only_line_is_not_overruled(
+    attachable: Workflow, ending: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    text = f"Which order?\n\n1. Oldest first\n2. Newest first\n\n{ending}"
+    _comments(attachable, _question(attachable, text=text))
+
+    for minutes in (15, 30, 60):
+        _tick_at(attachable, minutes)
+
+    assert _answers(attachable) == []
+    told = [message for message in attachable.sent() if "owner question" in message]
+    assert len(told) == 1
+    assert (
+        "owner question with a recommendation other than its first reply word: cloud-7"
+        in told[0]
+    )
+
+
+@pytest.mark.parametrize(
+    ("ending", "reply"),
+    [
+        ("Owner only: no\nRecommended: 1\nAnswer 1 or 2.", "1"),
+        ("Owner only: no\nAnswer 1 or 2. Recommended: 1", "1"),
+        ("Owner only: no\nReply **2** (recommended) or **1**.", "2"),
+    ],
+    ids=["below the line", "after the reply words", "beside the first reply word"],
+)
+def test_a_recommendation_of_the_first_reply_word_below_the_line_is_answered(
+    attachable: Workflow, ending: str, reply: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    text = f"Which order?\n\n1. Oldest first\n2. Newest first\n\n{ending}"
+    _comments(attachable, _question(attachable, text=text))
+
+    _tick_at(attachable, 15)
+
+    assert [answer.split("\n", 1)[0] for answer in _answers(attachable)] == [
+        f"{_ORCHESTRATOR} answered for the owner: {reply}"
+    ]
+
+
+def test_a_question_ending_with_its_recommendation_asks_the_owner(workflow: Workflow) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    _keys(workflow)
+    _comments(
+        workflow,
+        _comment(
+            4,
+            "Which order?\n\n1. Oldest first\n2. Newest first\n\nOwner only: no\n"
+            "Answer 1 or 2\nRecommended: 1",
+        ),
+    )
+
+    done = workflow.run_script("tick", env=_ENV)
+
+    assert done.returncode == 0, done.stderr
+    assert (workflow.repo / ".local/workflow/cloud-7.asking").exists()
+    [push] = workflow.pushes()
+    assert push.title == "cloud-7 needs you"
