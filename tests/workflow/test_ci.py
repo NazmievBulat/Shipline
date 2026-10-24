@@ -1,11 +1,25 @@
 """CI runs every test file in exactly one of its shards, on GitHub's own runners, and its last job,
-`CI`, passes only when every shard passed."""
+`CI`, passes only when every job that ran passed. It writes the merge gate's notes with
+`ci_proof.py`, as the example CI of a repository using Shipline does (examples/ci.yml)."""
 
+import json
 import re
+import subprocess
 from pathlib import Path
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CI = _ROOT / ".github/workflows/ci.yml"
+_EXAMPLE = _ROOT / "examples/ci.yml"
+
+
+def _job(path: Path, job: str) -> str:
+    """The lines of one job of a workflow, up to the next job."""
+    jobs = path.read_text().split("\njobs:\n", 1)[1]
+    found = re.search(rf"^  {job}:\n.*?(?=^  [\w-]+:$|\Z)", jobs, re.M | re.S)
+    assert found, job
+    return found[0]
 
 
 def _shards() -> dict[int, list[str]]:
@@ -74,21 +88,98 @@ def test_pytest_collects_the_runner_pool_s_tests() -> None:
     assert re.search(r'^testpaths = \["tests/workflow", "tests/runner"\]$', text, re.M)
 
 
-def test_ci_runs_only_on_github_s_own_runners() -> None:
-    runners = re.findall(r"^\s+runs-on: (.+)$", _CI.read_text(), re.M)
+@pytest.mark.parametrize("path", [_CI, _EXAMPLE], ids=["own", "example"])
+def test_ci_runs_only_on_github_s_own_runners(path: Path) -> None:
+    runners = re.findall(r"^\s+runs-on: (.+)$", path.read_text(), re.M)
 
     assert runners and set(runners) == {"ubuntu-latest"}
-    assert "self-hosted" not in _CI.read_text()
+    assert "self-hosted" not in path.read_text()
 
 
-def test_the_check_the_merge_queue_requires_needs_every_shard() -> None:
-    text = _CI.read_text()
-    job = text[text.index("\n  ci:\n") :]
+# The step that fails the summing-up job when any job that ran did not pass.
+_EVERY_JOB_PASSED = """\
+      - name: Every job that ran passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) echo "a job ended: $result"; exit 1 ;;
+            esac
+          done
+"""
 
-    assert re.search(r"^    name: CI$", job, re.M)
-    assert re.search(r"^    needs: tests$", job, re.M)
-    assert re.search(r"^    if: always\(\)$", job, re.M)
-    assert 'test "${{ needs.tests.result }}" = success' in job
+
+@pytest.mark.parametrize(
+    "path,job,name", [(_CI, "ci", "CI"), (_EXAMPLE, "result", "CI result")], ids=["own", "example"]
+)
+def test_the_summing_up_check_needs_every_job(path: Path, job: str, name: str) -> None:
+    text = _job(path, job)
+
+    assert re.search(rf"^    name: {name}$", text, re.M)
+    assert re.search(r"^    needs: \[plan, tests\]$", text, re.M)
+    assert re.search(r"^    if: always\(\)$", text, re.M)
+    assert _EVERY_JOB_PASSED in text
+
+
+@pytest.mark.parametrize("ended", ["success skipped", "success failure", "cancelled success"])
+def test_the_summing_up_check_passes_only_when_every_job_that_ran_passed(ended: str) -> None:
+    script = _EVERY_JOB_PASSED.split("run: |\n", 1)[1]
+    done = subprocess.run(
+        ["bash", "-c", "\n".join(line.removeprefix(" " * 10) for line in script.splitlines())],
+        env={"PATH": "/usr/bin:/bin", "RESULTS": ended},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode == (0 if ended == "success skipped" else 1), done.stdout
+
+
+@pytest.mark.parametrize("path", [_CI, _EXAMPLE], ids=["own", "example"])
+def test_the_planner_writes_the_gate_s_notes_and_main_s_inheritance(path: Path) -> None:
+    plan = _job(path, "plan")
+
+    assert re.search(r'^    name: "CI: what to run"$', plan, re.M)
+    assert "run: python3 scripts/workflow/ci_proof.py notes --whole server_tests\n" in plan
+    assert "        if: github.event_name == 'push'\n" in plan
+    assert "run: python3 scripts/workflow/ci_proof.py inherited ci\n" in plan
+    assert "inherited: ${{ steps.inherited.outputs.inherited || '[]' }}" in plan
+    # The only job that reads more than the repository, and only what main's inheritance reads.
+    assert re.search(r"^    permissions:\n      contents: read\n(?:      #.*\n)*"
+                     r"      actions: read\n      checks: read\n", plan, re.M)
+
+
+@pytest.mark.parametrize("path", [_CI, _EXAMPLE], ids=["own", "example"])
+def test_the_test_job_runs_the_config_s_command_unless_main_inherited_it(path: Path) -> None:
+    tests = _job(path, "tests")
+
+    assert re.search(r'^    name: "CI: server tests[" (]', tests, re.M)
+    assert re.search(r"^    needs: plan$", tests, re.M)
+    assert (
+        "    if: >-\n"
+        "      ${{ !contains(fromJSON(needs.plan.outputs.inherited), 'CI: server tests') }}\n"
+        in tests
+    )
+    assert "python3 scripts/workflow/ci_proof.py test" in tests
+
+
+def test_shipline_names_its_own_test_command() -> None:
+    config = json.loads((_ROOT / "shipline.json").read_text())
+
+    assert config["commands"]["test"] == "python -m pytest -rs"
+
+
+def test_the_example_s_jobs_carry_the_config_s_default_names() -> None:
+    text = _EXAMPLE.read_text()
+    names = re.findall(r"^    name: (.+)$", text, re.M)
+
+    assert names == ['"CI: what to run"', '"CI: server tests"', "CI result"]
+    assert re.search(r"^  pull_request:\n  push:\n    branches: \[main\]\n", text, re.M)
+    assert re.search(r"^  workflow_dispatch:$", text, re.M)
+    assert "pull_request_target" not in text
+    assert re.search(r"^permissions:\n  contents: read$", text, re.M)
 
 
 def test_ci_runs_for_pull_requests_main_and_the_merge_queue() -> None:

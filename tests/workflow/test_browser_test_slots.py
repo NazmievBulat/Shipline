@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts/workflow/browser_test_slots.py"
+# The runs are in folders of no repository: the slots read the state folder of this checkout's.
+_REPO = {"SHIPLINE_REPO": str(_SCRIPT.parents[2])}
 
 
 def _wait(path: Path) -> None:
@@ -27,6 +29,7 @@ def test_waiter_runs_after_a_killed_run_releases_its_slot(tmp_path: Path, slots:
     processes: list[subprocess.Popen[str]] = []
     env = {
         **os.environ,
+        **_REPO,
         "XDG_STATE_HOME": str(tmp_path / "state"),
         "WORKFLOW_BROWSER_SLOTS": str(slots),
     }
@@ -87,7 +90,12 @@ def test_waiter_runs_after_a_killed_run_releases_its_slot(tmp_path: Path, slots:
 
 def test_fifo_skips_dead_waiters_and_retains_a_surviving_child_slot(tmp_path: Path) -> None:
     processes: list[subprocess.Popen[str]] = []
-    env = {**os.environ, "XDG_STATE_HOME": str(tmp_path / "state"), "WORKFLOW_BROWSER_SLOTS": "1"}
+    env = {
+        **os.environ,
+        **_REPO,
+        "XDG_STATE_HOME": str(tmp_path / "state"),
+        "WORKFLOW_BROWSER_SLOTS": "1",
+    }
     queue = tmp_path / "state/workflow/browser-tests"
     try:
         for number in range(4):

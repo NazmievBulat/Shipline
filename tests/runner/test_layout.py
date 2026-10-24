@@ -24,6 +24,8 @@ _FILES = [
     "runner-container.sh",
     "check-docker-runner.sh",
     "sample-usage.sh",
+    "render-units.sh",
+    "build-images.sh",
     "README.md",
 ]
 
@@ -43,3 +45,40 @@ def test_shipline_s_own_ci_registers_and_uses_no_runner_of_its_own() -> None:
         text = workflow.read_text()
         assert "self-hosted" not in text, workflow.name
         assert set(re.findall(r"^\s+runs-on: (.+)$", text, re.M)) <= {"ubuntu-latest"}
+
+
+def _words(text: str) -> str:
+    """The text with its line wrapping undone, so a phrase may break across lines."""
+    return " ".join(text.split())
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        # How a repository sets the prefix and its image build.
+        '"prefix": "example-app"',
+        "`runner.prefix`",
+        "`runner.image_build`",
+        "`runner.labels`",
+        # How a machine holds its own settings, outside any repository.
+        "`~/.config/shipline/runner.sh`",
+        "`SHIPLINE_RUNNER_SETTINGS`",
+        "machine=home",
+        "other_machines=(office)",
+        "runner_count=",
+        # Never Shipline's own.
+        "never registers a runner to Shipline itself",
+    ],
+)
+def test_the_readme_says_how_a_repository_sets_the_prefix_and_a_machine_its_settings(
+    said: str,
+) -> None:
+    assert said in _words((_RUNNER / "README.md").read_text())
+
+
+def test_the_readme_names_every_unit_the_templates_hold() -> None:
+    text = (_RUNNER / "README.md").read_text()
+
+    for template in sorted((_RUNNER / "units").iterdir()):
+        name = template.name.replace("@PREFIX@", "<prefix>")
+        assert f"`{name}`" in text, name
