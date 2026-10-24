@@ -7,12 +7,13 @@
 #      "worker finished", unless its pull request is still a draft, and an idle hunt that said
 #      "hunt finished". A hunt that still runs 65 minutes after its start is stopped too. An
 #      analyst that said "analysis finished", idle or not, or that still runs 40 minutes after
-#      its start, is stopped, and its report noted for the wake's next check-in. A
+#      its start, is stopped. A
 #      Codex completion is read regardless of its bridge state; a bridge that ended or
 #      failed to parse a tool call gets its bridge again while Codex works. A reviewer that
 #      said "review finished" on an open, ready pull request based on main without handing
 #      its merge to the tick is noted as a rule break for the wake.
-#   2. `session cleanup`: the worktrees of merged pull requests and of ended hunts are removed.
+#   2. `session cleanup`: the worktrees of merged pull requests and of ended hunts and analysts
+#      are removed; an ended analysis is noted for the wake's next check-in first.
 #   3. A session that is idle or stopped on the usage limit and holds more than 300 MB is
 #      squeezed.
 #   4. A worker, independent reviewer or audit that the usage limit stopped is sent its instruction again when
@@ -228,28 +229,6 @@ is_over_its_time() {
   [[ -n $(find "$started" -mmin "+$2" 2>/dev/null) ]]
 }
 
-# What the wake tells the orchestrator of an analysis that ended: its report, the link it was
-# published at, and the first line of each of its proposals (the numbered lines under its
-# heading "Proposals", at most three). Without a link it ended before it published its report,
-# and the wake says so.
-note_analysis() {
-  local analysis=${1#analyst-} pending=$main/$SHIPLINE_STATE_FOLDER/analyses.pending url=""
-  local folder=$main/.local/analyses/${1#analyst-} proposals
-  [[ ! -r $folder/report.url ]] || IFS= read -r url <"$folder/report.url" || true
-  [[ $url =~ ^https://[^[:space:]]+$ ]] || url=""
-  proposals=$(LC_ALL=C awk '
-    /^#+[[:space:]]+Proposals[[:space:]]*$/ { inside = 1; next }
-    /^#/ { inside = 0 }
-    inside && /^[1-9][.)][[:space:]]/ && count < 3 { sub(/[[:space:]]+$/, ""); print; count++ }
-  ' "$folder/report.md" 2>/dev/null | jq -R . | jq -sc .)
-  mkdir -p "$pending" &&
-    jq -n --arg name "$analysis" --arg report ".local/analyses/$analysis/report.md" \
-      --arg url "$url" --argjson proposals "${proposals:-[]}" \
-      '{name: $name, report: $report, url: $url, proposals: $proposals}' \
-      >"$pending/.$analysis.json.tmp" &&
-    mv -- "$pending/.$analysis.json.tmp" "$pending/$analysis.json"
-}
-
 # Whether the 5-hour usage window allows a start: not above the ceiling, unless it resets
 # within the hour. A window that cannot be read allows none. Says why not.
 usage_allows_start() {
@@ -266,9 +245,11 @@ usage_allows_start() {
 
 # One analyst a day, from ANALYST_DAILY_AT, once the day's metrics report is written: it reads
 # that report. Its report folder says it started; a start that waits for memory is left for the
-# next tick, as is one the usage window holds.
+# next tick, as is one the usage window holds and one within 5 minutes of another start, whose
+# memory and load have not shown yet. A start that failed otherwise is not tried again that day:
+# its session is noted for the wake as an analysis without its report.
 start_daily_analyst() {
-  local day name=day days=1 why
+  local day name=day days=1 why last=0 failed_mark
   [[ $ANALYST_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] || return 0
   ((10#$(date -u -d "@$NOW" +%H%M) >= 10#${BASH_REMATCH[1]}${BASH_REMATCH[2]})) || return 0
   day=$(date -u -d "@$NOW" +%F)
@@ -278,7 +259,15 @@ start_daily_analyst() {
     days=7
   fi
   name=$name-$day
-  [[ ! -e $main/.local/analyses/$name ]] || return 0
+  failed_mark=$main/$SHIPLINE_STATE_FOLDER/analyst-$name.failed
+  [[ ! -e $main/.local/analyses/$name && ! -e $failed_mark ]] || return 0
+  [[ ! -r $main/$SHIPLINE_STATE_FOLDER/last-start ]] ||
+    read -r last _ <"$main/$SHIPLINE_STATE_FOLDER/last-start" || true
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  if ((NOW - last < 5 * 60)); then
+    echo "the daily analyst waits: a session started in the last 5 minutes"
+    return 0
+  fi
   if ! why=$(usage_allows_start); then
     echo "the daily analyst waits: $why"
     return 0
@@ -286,7 +275,10 @@ start_daily_analyst() {
   session start analyst "$name" "$days"
   case $? in
     0 | 75) ;;
-    *) return 1 ;;
+    *)
+      touch "$failed_mark"
+      return 1
+      ;;
   esac
 }
 
@@ -413,8 +405,7 @@ bash "$here/workflow-metrics" --sample --sessions "$listed" <<<"$running" 9>&- |
 
 # Before GitHub is asked anything: a hunt or an analyst has no pull request, and its time runs
 # out whether or not GitHub answers. An analyst's closing line is read whatever its state: it
-# asks nobody anything, and its stop hook marks nothing. It is noted once it is stopped, so one
-# that could not be stopped is noted when a later tick stops it.
+# asks nobody anything, and its stop hook marks nothing. `session cleanup` notes its report.
 while read -r name _; do
   if [[ $name == hunt-* ]] && is_over_its_time "$name" "$HUNT_STOPPED_AFTER_MINUTES"; then
     echo "$name is over its time"
@@ -425,7 +416,7 @@ while read -r name _; do
     else
       said_finished "$name" || continue
     fi
-    { session stop "$name" && note_analysis "$name"; } || failed=1
+    session stop "$name" || failed=1
   fi
 done <<<"$running"
 
@@ -485,7 +476,7 @@ while read -r name state _; do
     fi
   fi
   [[ $state == idle ]] || continue
-  # An analyst is stopped above, and only there, where its report is noted.
+  # An analyst is stopped above, whatever its state.
   [[ $name != analyst-* ]] || continue
   # A Codex worker whose bridge ended is listed idle, and nobody would read its end or relay
   # its question. Its bridge is started again; it shows Codex's last turn.

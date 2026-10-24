@@ -951,3 +951,13 @@ def test_an_analyst_is_never_sent_its_instruction_again(workflow: Workflow) -> N
 
     assert done.returncode != 0
     assert "an analyst is not sent its instruction again" in done.stderr
+
+
+def test_an_analyst_that_tmux_refuses_leaves_no_report_folder(workflow: Workflow) -> None:
+    (workflow.state / f"refuse-launch-{_ANALYST}").touch()
+
+    done = workflow.run("start", "analyst", "day-2026-10-24")
+
+    assert done.returncode != 0
+    assert f"{_ANALYST} could not be started" in done.stderr
+    assert not workflow.analysis_report("day-2026-10-24").exists()

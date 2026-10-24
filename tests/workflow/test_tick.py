@@ -1108,8 +1108,8 @@ def test_an_analyst_that_said_analysis_finished_is_stopped_and_its_report_told(
         "report": ".local/analyses/day-2026-10-24/report.md",
         "url": "https://docs.example.com/analysis-1",
         "proposals": [
-            "1. The tick starts tickets by itself: one start a day was by hand.",
-            "2. A lost check is re-run by the gate.",
+            "1. The tick starts tickets by itself: one start a day was by hand",
+            "2. A lost check is re-run by the gate",
         ],
     }
 
@@ -1175,3 +1175,109 @@ def test_an_analyst_is_stopped_on_its_time_while_github_cannot_be_asked(
     workflow.run_script("tick")
 
     assert not workflow.is_running("analyst-day-2026-10-24")
+
+
+def test_at_most_three_proposals_are_noted_each_cut_short_and_a_link_only_if_it_is_one(
+    workflow: Workflow,
+) -> None:
+    worktree = workflow.add_analyst("day-2026-10-24")
+    workflow.running("analyst-day-2026-10-24")
+    workflow.screen(_ANALYST_SAID_FINISHED, "analyst-day-2026-10-24")
+    report = workflow.analysis_report("day-2026-10-24")
+    long = "1. " + "x" * 400
+    (report / "report.md").write_text(f"## Proposals\n\n{long}\n2. Two\x07.\n3) Three\n4. Four\n")
+    (report / "report.url").write_text("javascript:alert(1) https://docs.example.com/x\n")
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stderr
+    assert not worktree.exists()
+    pending = workflow.repo / ".local" / "workflow" / "analyses.pending" / "day-2026-10-24.json"
+    noted = json.loads(pending.read_text())
+    assert noted["url"] == ""
+    assert noted["proposals"] == [long[:300], "2. Two", "3) Three"]
+
+
+def test_an_analyst_that_ended_by_itself_is_noted_once_as_its_worktree_goes(
+    workflow: Workflow,
+) -> None:
+    worktree = workflow.add_analyst("day-2026-10-24")
+    report = workflow.analysis_report("day-2026-10-24")
+    (report / "report.url").write_text("https://docs.example.com/analysis-3\n")
+    pending = workflow.repo / ".local" / "workflow" / "analyses.pending" / "day-2026-10-24.json"
+
+    done = workflow.run_script("tick")
+    told = json.loads(pending.read_text())
+    pending.unlink()  # the wake told it
+    again = workflow.run_script("tick")
+
+    assert done.returncode == again.returncode == 0, done.stderr
+    assert not worktree.exists()
+    assert told["url"] == "https://docs.example.com/analysis-3"
+    assert not pending.exists()
+
+
+def test_an_analyst_whose_worktree_cannot_be_removed_is_noted_once(workflow: Workflow) -> None:
+    worktree = workflow.add_analyst("day-2026-10-24")
+    pending = workflow.repo / ".local" / "workflow" / "analyses.pending" / "day-2026-10-24.json"
+    workflow.fake(
+        "git", '#!/bin/bash\n[ "$1 $2" != \'worktree remove\' ] || exit 1\nexec /usr/bin/git "$@"\n'
+    )
+
+    workflow.run_script("tick")
+    assert pending.exists()
+    pending.unlink()  # the wake told it
+    workflow.run_script("tick")
+
+    assert worktree.exists()
+    assert not pending.exists()
+
+
+def test_an_analyst_start_that_failed_is_not_tried_again_that_day(workflow: Workflow) -> None:
+    _metrics_report(workflow, "2026-10-24")
+    _usage(workflow, 40, 3 * 3600)
+    workflow.screen("Do you trust the files in this folder?\n")
+
+    failed = workflow.run_script("tick", env=_at(_EIGHT + 60))
+    again = workflow.run_script("tick", env=_at(_EIGHT + 600))
+
+    assert failed.returncode != 0
+    assert again.returncode == 0, again.stderr
+    assert _started(workflow) == ["analyst-day-2026-10-24"]
+    pending = workflow.repo / ".local" / "workflow" / "analyses.pending" / "day-2026-10-24.json"
+    assert json.loads(pending.read_text())["url"] == ""
+
+
+def test_the_analyst_waits_five_minutes_after_another_start(workflow: Workflow) -> None:
+    _metrics_report(workflow, "2026-10-24")
+    _usage(workflow, 40, 3 * 3600)
+    workflow.add_pull_request(7)
+
+    done = workflow.run_script("tick", env=_at(_EIGHT + 60))
+
+    assert done.returncode == 0, done.stderr
+    assert _started(workflow) == ["ticket-7"]
+    assert "the daily analyst waits: a session started in the last 5 minutes" in done.stdout
+    _usage(workflow, 40, 3 * 3600, now=_EIGHT + 420)
+    later = workflow.run_script("tick", env=_at(_EIGHT + 420))
+    assert later.returncode == 0, later.stderr
+    assert _started(workflow) == ["ticket-7", "analyst-day-2026-10-24"]
+
+
+def test_an_analyst_start_that_waits_for_memory_is_left_for_a_later_tick(
+    workflow: Workflow,
+) -> None:
+    _metrics_report(workflow, "2026-10-24")
+    _usage(workflow, 40, 3 * 3600)
+    workflow.pressure_file.write_text("some avg10=30.00 avg60=10.01 avg300=1.00 total=1\n")
+
+    held = workflow.run_script("tick", env=_at(_EIGHT + 60))
+
+    assert held.returncode == 0, held.stderr
+    assert _started(workflow) == []
+    assert not workflow.analysis_report("day-2026-10-24").exists()
+    assert not workflow.analyst_worktree("day-2026-10-24").exists()
+    workflow.pressure_file.write_text("some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n")
+    started = workflow.run_script("tick", env=_at(_EIGHT + 240))
+    assert started.returncode == 0, started.stderr
+    assert _started(workflow) == ["analyst-day-2026-10-24"]

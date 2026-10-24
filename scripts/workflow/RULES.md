@@ -512,7 +512,8 @@ it is doing.
 1. It is read-only. It opens no ticket and no pull request, commits and pushes nothing,
    changes no label, comments nowhere, starts, stops and types into no session, and asks the
    owner nothing. The one thing it writes is its report folder, `$WORKFLOW_ANALYSIS_REPORT`:
-   `.local/analyses/<name>/` in the main checkout.
+   `.local/analyses/<name>/` in the main checkout. Its permission prompts reach nobody: what it
+   cannot read without asking, it leaves out and names in the report.
 2. It reads, for the days its sentence names: the day's metrics report,
    `.local/analyses/metrics-<date>.md` in the main checkout, and last week's for comparison;
    the wake log, `~/.local/state/workflow/wake.log`, and the metrics log beside it; the tick's
@@ -582,8 +583,9 @@ and nothing waits for one. It never starts a hunt either. It stops an idle hunt 
 has the line "hunt finished" and any hunt that still runs 65 minutes after its start, and
 `session cleanup` then removes the hunt's worktree; the report stays. It starts the daily
 analyst (see "Analyse the workflow"), stops it on the line "analysis finished", idle or not,
-or 40 minutes after its start, and notes its report for the wake, which tells the orchestrator
-once, at any hour and busy or not; `session cleanup` then removes its worktree.
+or 40 minutes after its start. `session cleanup` notes its report for the wake, however the
+analyst ended, and removes its worktree; the wake tells the orchestrator once, at any hour and
+busy or not. A daily start that failed is not tried again that day.
 
 Every reviewer hands its passed review to the tick with `merge-when-current --handoff N`,
 then ends with `review finished` and is stopped as usual. When the tick stops a reviewer
@@ -797,7 +799,8 @@ adds to `~/.claude/settings.json` (the owner runs it once).
 - A hunt that ends its turn rings the phone unless the last line of its last message is
   "hunt finished". A hunt asks the owner nothing, so a ring means it could not go on. A Codex or Cursor
   hunter has no hooks and never rings.
-- An analyst never rings: it asks nobody anything, and the tick reads its closing line.
+- An analyst never rings, not even on a permission prompt: it asks nobody anything, and the
+  tick reads its closing line and stops it on its time.
 - A Claude worker, reviewer or audit that stops on the usage limit, in its own words (see "For the
   orchestrator session"), does not ring: it waits for the reset, not for the owner.
 - Claude's own weekly-limit line also waits for the reset without ringing when the usage
@@ -805,7 +808,7 @@ adds to `~/.claude/settings.json` (the owner runs it once).
   use a full usage window under the same check. The tick resends after the saved reset once,
   and the wake tells the orchestrator; unreadable or disagreeing figures leave it waiting
   for the orchestrator as before. Hunts are never resent.
-- A permission prompt always rings.
+- A permission prompt always rings, except an analyst's.
 - A question to the owner is plain text at the end of a turn (see "Asking the owner"), so it
   rings as that stop does. The question tool is not used; its hook stays, so that a session
   which used it anyway still rings.

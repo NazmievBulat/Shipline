@@ -781,7 +781,7 @@ def _analysis(workflow: Workflow, url: str, proposals: list[str]) -> Path:
         )
     )
     # A note the tick is still writing is not read.
-    (pending / ".day-2026-10-14.json.tmp").write_text("{")
+    (pending / ".day-2026-10-14.json").write_text("{")
     return event
 
 
@@ -792,7 +792,7 @@ def test_a_finished_analysis_is_told_once_by_day_with_its_link_and_proposals(
     event = _analysis(
         night,
         "https://docs.example.com/analysis-1",
-        ["1. The tick starts tickets by itself.", "2. A lost check is re-run by the gate."],
+        ["1. The tick starts tickets by itself", "2. A lost check is re-run by the gate"],
     )
     (night.state / "send-fails").touch()
 
@@ -807,7 +807,7 @@ def test_a_finished_analysis_is_told_once_by_day_with_its_link_and_proposals(
     [_, prompt] = night.sent()  # one failed attempt, then one delivered message
     assert (
         " Workflow analysis day-2026-10-13 (report https://docs.example.com/analysis-1): "
-        "1. The tick starts tickets by itself.; 2. A lost check is re-run by the gate." in prompt
+        "1. The tick starts tickets by itself; 2. A lost check is re-run by the gate." in prompt
     )
     assert not event.exists()
 

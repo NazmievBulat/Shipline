@@ -26,7 +26,7 @@
 #                               name: as a hunt's; it names the report. The number is the days
 #                               of logs it reads, 1 when left out. By Claude Opus at medium
 #                               effort; the tick stops it after 40 minutes.
-#   session list               one line for each running session: its name, its state, its
+#   session list                one line for each running session: its name, its state, its
 #                               memory and its memory limit. The state is `busy`, `idle` (it ended its turn) or
 #                               `limit` (the usage limit stopped it; the line then ends with
 #                               which limit and when it resets, as the screen says it, or
@@ -838,6 +838,9 @@ cmd_start_analyst() {
   report=$(report_of "$name")
   [[ ! -e $report ]] || die "an analysis named $analysis has a report already, in $report"
 
+  # Before the worktree is made: a start the tick defers is tried again by a later tick, and
+  # `cleanup` would remove a worktree made for nothing in between.
+  wait_for_resources
   worktree=$(worktree_of "$name")
   git worktree prune
   if [[ -z $(list_worktrees | awk -F '\t' -v path="$worktree" '$1 == path') ]]; then
@@ -846,13 +849,15 @@ cmd_start_analyst() {
     git worktree add --quiet --detach "$worktree" "$HUNT_REF" >&2 ||
       die "cannot make a worktree of $HUNT_REF"
   fi
-  wait_for_resources
 
-  mkdir -p "$report"
+  mkdir -p "$report" "$WORKFLOW_LOGS"
   printf -v command 'claude --effort %q --model %q --add-dir %q --add-dir %q --add-dir %q --remote-control %q %q' \
     "$ANALYST_EFFORT" "$ANALYST_MODEL" "$main/.local/analyses" "$main/$SHIPLINE_STATE_FOLDER" \
     "$WORKFLOW_LOGS" "$name" "$prompt"
-  launch "$name" "$worktree" "$command" "WORKFLOW_ANALYSIS_REPORT=$report"
+  if ! launch "$name" "$worktree" "$command" "WORKFLOW_ANALYSIS_REPORT=$report"; then
+    rmdir "$report" 2>/dev/null || true
+    die "$name could not be started"
+  fi
   touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
   if ! wait_for_link "$name"; then
     stop_session "$name"
@@ -1266,7 +1271,9 @@ cmd_stop() {
 # the main checkout. It goes once the hunt has ended. While a hunt is being started its
 # worktree exists and its session does not yet, so nothing is removed while a start holds the
 # lock; and the lock is held here until the worktree is gone, so no start makes it again in
-# between. An analyst's worktree goes the same way, under the lock of its own starts.
+# between. An analyst's worktree goes the same way, under the lock of its own starts, once its
+# analysis is noted for the wake: this is the one place every ended analysis passes, whether the
+# tick stopped it, someone else did or it ended by itself.
 cleanup_hunt() {
   local name=$1 path=$2 kind=hunt what="the hunt"
   [[ $name != analyst-* ]] || { kind=analyst what="the analysis"; }
@@ -1274,6 +1281,10 @@ cleanup_hunt() {
     flock --nonblock 7 || exit 0
     ! is_running "$name" || exit 0
     [[ $kind != hunt ]] || stop_hunted_application "$name"
+    if [[ $kind == analyst && ! -e $path/$SHIPLINE_STATE_FOLDER/$name.noted ]]; then
+      note_analysis "$name" || { echo "$name: kept, its analysis could not be noted"; exit 0; }
+      mkdir -p "$path/$SHIPLINE_STATE_FOLDER" && touch "$path/$SHIPLINE_STATE_FOLDER/$name.noted"
+    fi
     if git worktree remove --force "$path" >&2; then
       remove_scratch "$path"
       echo "$name: removed, $what has ended; its report is in $(report_of "$name")"
@@ -1281,6 +1292,36 @@ cleanup_hunt() {
       echo "$name: kept, git could not remove it"
     fi
   ) 7>>"$main/$SHIPLINE_STATE_FOLDER/start-$kind.lock"
+}
+
+# What the wake tells the orchestrator of an analysis that ended: its report, the link it was
+# published at, and the first line of each of its proposals (the numbered lines under its
+# heading "Proposals", at most three, each cut to 300 characters, without control characters
+# or a closing full stop): the analyst wrote them, so they reach the orchestrator as text and
+# no further. Without a link it ended before it published its report, and the wake says so.
+note_analysis() {
+  local analysis=${1#analyst-} pending=$main/$SHIPLINE_STATE_FOLDER/analyses.pending url=""
+  local folder proposals
+  folder=$(report_of "$1")
+  [[ ! -r $folder/report.url ]] || IFS= read -r url <"$folder/report.url" || true
+  [[ $url =~ ^https://[^[:space:]]+$ ]] || url=""
+  proposals=$(LC_ALL=C awk '
+    /^#+[[:space:]]+Proposals[[:space:]]*$/ { inside = 1; next }
+    /^#/ { inside = 0 }
+    inside && /^[1-9][.)][[:space:]]/ && count < 3 {
+      gsub(/[[:cntrl:]]/, "")
+      line = substr($0, 1, 300)
+      sub(/[[:space:].]+$/, "", line)
+      print line
+      count++
+    }
+  ' "$folder/report.md" 2>/dev/null | jq -R . | jq -sc .) || true
+  mkdir -p "$pending" &&
+    jq -n --arg name "$analysis" --arg report "${folder#"$main/"}/report.md" \
+      --arg url "$url" --argjson proposals "${proposals:-[]}" \
+      '{name: $name, report: $report, url: $url, proposals: $proposals}' \
+      >"$pending/.$analysis.json.tmp" &&
+    mv -- "$pending/.$analysis.json.tmp" "$pending/$analysis.json"
 }
 
 # Claude names a project's temporary folder by replacing each non-ASCII-alphanumeric path
