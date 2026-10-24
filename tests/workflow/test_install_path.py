@@ -563,6 +563,41 @@ def test_the_flow_page_units_escape_spaces_percent_and_dollar_signs(workflow: Wo
         assert f'ExecStart="{launcher}" --repo "{command_repo}" flow-page{arguments}' in lines
 
 
+def test_uninstall_switches_off_the_flow_page_units_that_run_shipline(workflow: Workflow) -> None:
+    settings = workflow.repo / ".github" / "runner" / "settings.sh"
+    settings.write_text(settings.read_text() + "flow_page_port=8800\n")
+    assert workflow.shipline("install-flow-page-timer").returncode == 0
+    units = Path(workflow.env["HOME"]) / ".config" / "systemd" / "user"
+
+    done = workflow.shipline("uninstall")
+
+    assert done.returncode == 0, done.stderr
+    assert sorted(path.name for path in units.glob("flow-page*")) == []
+    assert workflow.calls("systemctl")[-3:] == [
+        "systemctl --user disable --now flow-page.timer",
+        "systemctl --user disable --now flow-page-serve.service",
+        "systemctl --user daemon-reload",
+    ]
+
+
+def test_uninstall_leaves_flow_page_units_of_the_owner_s_own(workflow: Workflow) -> None:
+    units = Path(workflow.env["HOME"]) / ".config" / "systemd" / "user"
+    units.mkdir(parents=True)
+    own = {
+        "flow-page.service": "[Service]\nExecStart=/usr/bin/true\n",
+        "flow-page.timer": "[Timer]\nOnCalendar=hourly\n",
+        "flow-page-serve.service": "[Service]\nExecStart=/usr/bin/true --serve 8800\n",
+    }
+    for name, text in own.items():
+        (units / name).write_text(text)
+
+    done = workflow.shipline("uninstall")
+
+    assert done.returncode == 0, done.stderr
+    assert {name: (units / name).read_text() for name in own} == own
+    assert workflow.calls("systemctl") == []
+
+
 # The SHA-256 of each sentence that names a command, as the scripts wrote it when the scripts
 # were in the repository and the sentence named the command by its path there.
 _SENTENCES_BEFORE = {
