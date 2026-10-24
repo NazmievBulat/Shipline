@@ -1861,6 +1861,43 @@ def test_a_refreshable_handoff_is_kept_and_refreshed_at_its_turn(handed: GitHub)
     assert not (workflow.state / "merged").exists()
 
 
+def test_a_refreshable_handoff_survives_a_dropped_read_of_its_runs(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _stale_note(handed)
+    _blocked_on_its_head(handed, refreshable=True)
+    # The connection drops while the line reads this pull request's CI runs.
+    (workflow.bin / "gh").rename(workflow.bin / "gh-stand-in")
+    workflow.fake(
+        "gh",
+        """#!/bin/bash
+if [[ "$1" == api && "$*" == *"ci.yml/runs?"*"event=pull_request"* &&
+      -e "@STATE@/github-down" ]]; then
+  echo 'Get "https://api.github.com/repos": read tcp: connection reset by peer' >&2
+  exit 1
+fi
+exec "$(dirname "$0")/gh-stand-in" "$@"
+""",
+    )
+    (workflow.state / "github-down").touch()
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "merge hand-back 7" not in done.stdout
+    train = json.loads((_folder(workflow) / "merge-train.json").read_text())
+    assert train["refreshable"] == ["7"], train
+    (workflow.state / "github-down").unlink()
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "merge hand-back 7" not in done.stdout
+    assert _started(workflow) == []
+    refreshed = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
+    assert workflow.git("rev-parse", "HEAD^2", cwd=workflow.worktree(7)) == handed.base
+    assert json.loads(_note(workflow).read_text())["head"] == refreshed
+
+
 def test_a_blocked_handoff_that_is_not_refreshable_is_handed_back(handed: GitHub) -> None:
     workflow = handed.workflow
     _stale_note(handed)
