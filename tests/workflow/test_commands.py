@@ -307,8 +307,10 @@ def test_pre_train_checks_named_but_missing_stop_the_gate(workflow: Workflow) ->
 
 def _changes(workflow: Workflow, *paths: str) -> None:
     for path in paths:
+        (workflow.repo / path).parent.mkdir(parents=True, exist_ok=True)
         (workflow.repo / path).write_text("changed\n")
-    workflow.git("add", "-A")
+    if paths:
+        workflow.git("add", "--", *paths)
     workflow.git("commit", "--quiet", "--allow-empty", "-m", "feat: a change")
 
 
@@ -1287,8 +1289,8 @@ def test_function_checkout_converts_paths_and_orders_refusal_arguments(workflow:
             return "lockfile is broken" if (checkout / "broken-install").exists() else None
         def refusal(output, checkout):
             assert isinstance(checkout, Path)
-            assert (checkout / "shared.txt").exists()
-            return "step: " + output.splitlines()[-1]
+            assert (checkout / "scripts").is_dir()
+            return "step: " + next(line for line in output.splitlines() if line == "check failed")
     ''')
     _configure(workflow, push_checkout={
         "run": module, "form": "functions",
