@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Switches the workflow on. Run once by the owner, from any checkout, and again after the
-# `PATH` or the place of the main checkout changes.
+# Switches the workflow on. Run once by the owner, in any checkout of the repository Shipline
+# works on (or with it named, `--repo`), and again after the `PATH`, the place of its main
+# checkout or the place of Shipline's checkout changes:
 #
-# Writes a systemd user service and timer, `workflow-tick`, that run `scripts/workflow/tick` of
-# the main checkout every 3 minutes, and creates the labels `workflow` and `audited` on GitHub
-# when they are missing.
+#   shipline install-timer
+#
+# Writes a systemd user service and timer, `workflow-tick`, that run `shipline tick` of this
+# Shipline checkout on the repository's main checkout every 3 minutes, points the link
+# `~/.local/bin/shipline` at that launcher (`launcher-link`), and creates the labels `workflow`
+# and `audited` on GitHub when they are missing.
 #
 #   systemctl --user list-timers workflow-tick.timer     when it runs next
 #   journalctl --user -u workflow-tick.service           what each tick did
@@ -12,14 +16,17 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$here/launcher-link"
+find_launcher
+# The repository (`workflow_config.py`): SHIPLINE_REPO, else the one of the current folder.
+config=$(python3 "$here/workflow_config.py" shell)
+eval "$config"
+main=$SHIPLINE_REPO
 # The runner's installer of the shared GitHub budget's `gh`, where the repository holds one.
-budget_installer=$here/../../.github/runner/install-github-budget.sh
+budget_installer=$main/.github/runner/install-github-budget.sh
 if [[ -f $budget_installer ]]; then
   sh "$budget_installer"
 fi
-main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
-config=$(python3 "$here/workflow_config.py" shell)
-eval "$config"
 units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 
 create_label() {
@@ -48,9 +55,11 @@ mkdir -p "$units"
 # KillMode=process: the `tmux` servers the tick starts stay in this service's control group.
 # By default systemd ends everything left in it when the tick exits, the sessions included.
 #
-# The path of the checkout is written so that systemd reads it as it is: a `%` doubled, and in
-# the command also a `\$` doubled and quotation marks around a path that may hold a space.
+# The paths of the checkouts are written so that systemd reads them as they are: a `%` doubled,
+# and in the command also a `\$` doubled and quotation marks around a path that may hold a
+# space. The repository is named to the tick, not only its folder.
 escaped=${main//%/%%}
+escaped_launcher=${launcher//%/%%}
 cat >"$units/workflow-tick.service" <<UNIT
 [Unit]
 Description=Workflow tick: starts workers, squeezes idle sessions, removes what is finished
@@ -59,8 +68,9 @@ Description=Workflow tick: starts workers, squeezes idle sessions, removes what 
 Type=oneshot
 WorkingDirectory=$escaped
 Environment="PATH=${PATH//%/%%}"
+Environment="SHIPLINE_REPO=$escaped"
 ${TMUX_TMPDIR:+Environment=\"TMUX_TMPDIR=${TMUX_TMPDIR//%/%%}\"}
-ExecStart="${escaped//\$/\$\$}/scripts/workflow/tick"
+ExecStart="${escaped_launcher//\$/\$\$}" tick
 KillMode=process
 UNIT
 
@@ -79,4 +89,5 @@ UNIT
 
 systemctl --user daemon-reload
 systemctl --user enable --now workflow-tick.timer
-echo "workflow-tick runs $main/scripts/workflow/tick every 3 minutes"
+link_launcher
+echo "workflow-tick runs $launcher tick on $main every 3 minutes"
