@@ -2766,7 +2766,13 @@ def _sweep_scratch(folder: Path) -> None:
         before = json.dumps(train.dropped, sort_keys=True)
         kept = set(train.scratch_records())
         listed = git("ls-remote", "origin", f"refs/heads/{SCRATCH_PREFIX}*")
-        branches = [line.split()[1].removeprefix("refs/heads/") for line in listed.splitlines()]
+        # `ls-remote` also lists a branch that only ends like one of the gate's: only a branch
+        # the gate named is ever deleted.
+        branches = [
+            branch
+            for line in listed.splitlines()
+            if _is_scratch(branch := line.split()[1].removeprefix("refs/heads/"))
+        ]
     except (Refused, OSError, KeyError, IndexError, TypeError, ValueError) as error:
         print(f"could not delete old batch branches: {error}", flush=True)
         return
@@ -2841,12 +2847,17 @@ def _seen(entry: dict[str, Any], found: list[dict[str, Any]]) -> None:
     entry["seen"] = sorted(seen)
 
 
+def _is_scratch(branch: str) -> bool:
+    """Whether the gate named the branch: its scratch prefix, then a random name."""
+    return bool(re.fullmatch(rf"{re.escape(SCRATCH_PREFIX)}[0-9a-f]{{32}}", branch))
+
+
 def _scratch_runs(branch: str) -> list[dict[str, Any]]:
     """Every run of a scratch branch the gate made, across every workflow, read fresh from GitHub.
 
     A branch of another name in the gate's namespace, and a pull request's own run, are never
     the gate's to cancel."""
-    if not re.fullmatch(rf"{re.escape(SCRATCH_PREFIX)}[0-9a-f]{{32}}", branch):
+    if not _is_scratch(branch):
         return []
     return [
         run

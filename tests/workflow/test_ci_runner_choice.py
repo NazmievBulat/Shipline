@@ -55,7 +55,7 @@ def _runs_on(path: Path) -> dict[str, str]:
 
 def _github(event: str, ref: str, switch: str | None) -> dict[str, Any]:
     return {
-        "github": {"event_name": event, "ref": ref, "head_ref": ""},
+        "github": {"event_name": event, "ref": ref},
         "vars": {} if switch is None else {"CI_MAIN_RUNNER": switch},
     }
 
@@ -107,13 +107,14 @@ def test_each_job_runs_where_its_run_belongs(path: Path, case: str) -> None:
 
 
 @pytest.mark.parametrize("path", _EXAMPLES, ids=lambda path: path.name)
-def test_a_pull_request_from_a_branch_of_the_prefix_s_name_stays_hosted(path: Path) -> None:
-    """A fork may name its branch anything: only the gate's dispatch reaches main's runners."""
-    context = _github("pull_request", "refs/pull/7/merge", "on")
-    context["github"]["head_ref"] = f"{PREFIX}0123456789abcdef0123456789abcdef"
+def test_github_reads_the_scratch_prefix_without_its_case(path: Path) -> None:
+    """So the examples tell a repository to keep every case of it to the gate's identity."""
+    ref = "refs/heads/" + _BATCH.removeprefix("refs/heads/").upper()
+    context = _github("workflow_dispatch", ref, "on")
 
     for job, runner in _runs_on(path).items():
-        assert value(runner, context) == HOSTED, job
+        assert value(runner, context) == MAIN, job
+    assert "in any case" in path.read_text()
 
 
 @pytest.mark.parametrize("path", _EXAMPLES, ids=lambda path: path.name)
@@ -142,6 +143,16 @@ def test_the_rules_say_where_the_gate_s_scratch_runs_run() -> None:
         ("!(1 == 2) && fromJSON('[\"a\", \"b\"]')", {}, ["a", "b"]),
         ("'it''s'", {}, "it's"),
         ("github['event_name'] != 'push'", {"github": {"event_name": "push"}}, False),
+        # GitHub reads a property's name without its case.
+        ("github.EVENT_NAME", {"github": {"event_name": "push"}}, "push"),
+        ("vars.ci_main_runner", {"vars": {"CI_MAIN_RUNNER": "on"}}, "on"),
+        # Two kinds of value are compared as numbers.
+        ("vars.SWITCH == 'on'", {"vars": {}}, False),
+        ("'1' == 1", {}, True),
+        ("null == 0", {}, True),
+        ("null == ''", {}, True),
+        ("'on' == 0", {}, False),
+        ("true == 1", {}, True),
     ],
 )
 def test_expressions_are_worked_out_as_github_does(
@@ -150,7 +161,17 @@ def test_expressions_are_worked_out_as_github_does(
     assert evaluate(expression, context) == expected
 
 
-@pytest.mark.parametrize("expression", ["github.ref ~ 'x'", "unknown(1)", "'a' &&", "nothing.x"])
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "github.ref ~ 'x'",
+        "unknown(1)",
+        "'a' &&",
+        "nothing.x",
+        "startsWith('a')",
+        "contains('a', 'a',)",
+    ],
+)
 def test_an_expression_it_does_not_know_is_refused(expression: str) -> None:
     with pytest.raises(ExpressionError):
         evaluate(expression, {"github": {}})

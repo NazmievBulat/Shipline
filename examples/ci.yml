@@ -7,9 +7,13 @@
 # main's runners on with the repository variable `CI_MAIN_RUNNER` set to `on`: then a push to
 # main, and the merge gate's dispatch on a scratch branch of its own, run on main's runners, so a
 # prefix of the merge line never waits behind pull requests' own CI. Each job names that choice:
-# `refs/heads/` and `merge.scratch_prefix`, and main's label, `<runner.prefix>-<main_machine>-main`
-# (here the defaults, with the runner prefix `example-app`). A pull request never gets them: only
-# a push to main or a dispatch, which needs write access, does.
+# `refs/heads/` and `merge.scratch_prefix`, and main's label,
+# `<runner.prefix>-<runner.main_machine>-main` (here the defaults, with the runner prefix
+# `example-app`). A pull request's own run never gets them; a scratch run does, and runs the
+# merge line's members, and the workflow as they changed it, on main's machine. Only a push or
+# a dispatch, both needing write access, starts one, and GitHub compares the branch's name
+# without its case: a branch ruleset that lets only the gate's identity create branches of the
+# prefix, in any case, keeps every other one off main's runners.
 name: CI
 
 on:

@@ -789,6 +789,7 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
             if job.get("conclusion") == "failure":
                 flaky[f"{run['name']}: {job['name']}"] += 1
     minutes = summarize(completed, iso(window.since), iso(window.until))
+    scratch = workflow_config.current().merge.scratch_prefix
     return {
         "workflows": workflows,
         "slowest_job": slowest,
@@ -805,7 +806,7 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
         "failed_scratch_runs": sum(
             1
             for run in completed
-            if (run.get("head_branch") or "").startswith(workflow_config.current().merge.scratch_prefix)
+            if (run.get("head_branch") or "").startswith(scratch)
             and run.get("conclusion") == "failure"
         ),
     }

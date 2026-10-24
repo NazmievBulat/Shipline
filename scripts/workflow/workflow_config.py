@@ -91,8 +91,8 @@ DEFAULTS: dict[str, Any] = {
     },
     "merge": {
         # The merge gate's own branches, each one prefix's test merge: this, then a random name.
-        # The gate deletes every branch that begins with it, and the example workflows run the
-        # gate's dispatches on them on main's runners (examples/ci.yml).
+        # The gate deletes the ones it named once no prefix needs them, and the example workflows
+        # run the gate's dispatches on them on main's runners (examples/ci.yml).
         "scratch_prefix": "workflow/merge-batch-",
     },
     "commands": {
@@ -107,7 +107,7 @@ DEFAULTS: dict[str, Any] = {
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
 # A machine's name, as a runner label holds it.
 _MACHINE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
-# A branch name's beginning, ended by `-` or `/` so it takes in only the gate's own branches:
+# A branch name's beginning, ended by `-` or `/` so the random name after it stands apart:
 # words of letters, digits, `_`, `.` and `-`, none beginning with `.` or `-` nor ending in
 # `.lock`, joined by single `/`; nothing `git ls-remote` reads as a pattern, and not a full ref.
 _WORD = r"(?!refs/)[A-Za-z0-9_][A-Za-z0-9_.-]*(?<!\.lock)(?<!\.)"

@@ -5,11 +5,16 @@ can read a value such as a job's `runs-on` and work out what GitHub would make o
 
 As GitHub does: `&&` and `||` give one of their operands, not a boolean; `false`, `0`, `''`
 and `null` are falsy; `==` and `!=` ignore the case of strings, and so do `startsWith`,
-`endsWith` and `contains`; a property that is not there is `null`. Anything else, an unknown
-function or a stray character, is refused rather than guessed.
+`endsWith` and `contains`; the names of contexts and properties are read without their case;
+a property that is not there is `null`; two kinds of value are compared as numbers, `null`
+as 0, a boolean as 0 or 1 and a string as the number it spells (0 when empty), else as no
+number, equal to nothing. Anything else is refused rather than guessed: an unknown function or
+a wrong number of arguments, a stray character. Both sides of `&&` and `||` are read, so a
+fault on the side GitHub skips is refused too.
 """
 
 import json
+import math
 import re
 from typing import Any
 
@@ -50,10 +55,54 @@ def _text(value: Any) -> str:
     return str(value)
 
 
+def _kind(value: Any) -> str:
+    if value is None or isinstance(value, bool):
+        return repr(value) if value is None else "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    return type(value).__name__
+
+
+def _number(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (bool, int, float)):
+        return float(value)
+    if isinstance(value, str):
+        if not value.strip():
+            return 0.0
+        try:
+            return float(json.loads(value.strip()))
+        except (ValueError, TypeError):
+            return math.nan
+    return math.nan
+
+
+def _compared(left: Any, right: Any) -> tuple[Any, Any]:
+    """The two sides as GitHub compares them: strings without their case, two kinds of value as
+    numbers."""
+    if _kind(left) != _kind(right):
+        return _number(left), _number(right)
+    if isinstance(left, str):
+        return left.casefold(), right.casefold()
+    return left, right
+
+
 def _equal(left: Any, right: Any) -> bool:
-    if isinstance(left, str) and isinstance(right, str):
-        return left.casefold() == right.casefold()
+    if isinstance(left, (dict, list)) and _kind(left) == _kind(right):
+        # An object or an array equals only itself.
+        return left is right
+    left, right = _compared(left, right)
     return left == right
+
+
+def _property(value: Any, name: Any) -> Any:
+    """A property by its name in any case; `null` when there is none."""
+    if not isinstance(value, dict):
+        return None
+    if not isinstance(name, str):
+        return value.get(name)
+    return next((inner for key, inner in value.items() if key.casefold() == name.casefold()), None)
 
 
 def _contains(container: Any, item: Any) -> bool:
@@ -124,8 +173,15 @@ class _Parser:
             elif operator == "!=":
                 value = not _equal(value, right)
             else:
-                value = {"<": value < right, ">": value > right, "<=": value <= right,
-                         ">=": value >= right}[operator]
+                value, right = _compared(value, right)
+                if isinstance(value, (dict, list, type(None))):
+                    raise ExpressionError(f"{operator} of {_kind(value)}")
+                value = {
+                    "<": value < right,
+                    ">": value > right,
+                    "<=": value <= right,
+                    ">=": value >= right,
+                }[operator]
         return value
 
     def unary(self) -> Any:
@@ -144,7 +200,7 @@ class _Parser:
             else:
                 key = self.either()
                 self.take("]")
-            value = value.get(key) if isinstance(value, dict) else None
+            value = _property(value, key)
         return value
 
     def primary(self) -> Any:
@@ -170,14 +226,21 @@ class _Parser:
                 arguments.append(self.either())
                 if self.peek() == ",":
                     self.take()
+                    if self.peek() == ")":
+                        raise ExpressionError(f"{token}: an argument expected after ','")
             self.take(")")
             function = _FUNCTIONS.get(token.lower())
             if function is None:
                 raise ExpressionError(f"unknown function {token}")
-            return function(*arguments)
-        if token not in self.context:
+            try:
+                return function(*arguments)
+            except TypeError as error:
+                raise ExpressionError(f"{token}: {error}") from None
+        if _property(self.context, token) is None and not any(
+            key.casefold() == token.casefold() for key in self.context
+        ):
             raise ExpressionError(f"unknown context {token}")
-        return self.context[token]
+        return _property(self.context, token)
 
 
 def evaluate(text: str, context: dict[str, Any]) -> Any:
