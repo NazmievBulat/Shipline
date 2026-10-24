@@ -1,3 +1,28 @@
+# Running Shipline
+
+Shipline runs from a checkout of its own, kept apart from the repository it works on, which
+holds none of its scripts. Clone it to `~/.local/share/shipline`, or elsewhere: a copy of
+`bin/shipline` kept outside any checkout runs the one `SHIPLINE_HOME` names. A repository
+calls it as `shipline <command>`: its rules, hooks and package scripts never name a path
+inside Shipline. The first time, the launcher is run by its path:
+
+```bash
+~/.local/share/shipline/bin/shipline --repo /path/to/example-app install-timer
+~/.local/share/shipline/bin/shipline --repo /path/to/example-app install-hooks
+```
+
+Each of the two writes the launcher of this checkout and the repository's main checkout, and
+points the link `~/.local/bin/shipline` at that launcher. The repository is the main checkout
+`--repo` names, else `SHIPLINE_REPO`, else the one the current folder is in; outside any
+repository, with none named, a command stops and says how to name one. A command started
+outside the repository runs in its main checkout. Every session gets `SHIPLINE_REPO` and the
+checkout's `bin` in its environment. The files a repository keeps for the gate and the panel
+(`pre-train-checks`, `advisory_service.py`, `pushing_checkout.py`, `run_proof.py`,
+`mechanical_conflicts.py`, `server_tests_for_changes.py`, `browser_tests_for_changes.py`) are
+read from its own `scripts/workflow`, and its E2E planner from `scripts/e2e-plan.py`; a
+missing one means none: no check, no helper, no selected test (the panel then notes that CI
+runs the whole suite).
+
 # Workflow workers
 
 The tick reads `WORKFLOW_WORKER_PROGRAM` from its environment first, then
@@ -76,8 +101,9 @@ How a script reads it:
   ```
 
   which sets `SHIPLINE_REPOSITORY`, `SHIPLINE_STATE_FOLDER`, `SHIPLINE_CI_RESULT`,
-  `SHIPLINE_LABEL_WORKFLOW`, `SHIPLINE_PRIORITY_HIGH` and the rest, and `SHIPLINE_CONFIG`, the
-  file itself.
+  `SHIPLINE_LABEL_WORKFLOW`, `SHIPLINE_PRIORITY_HIGH` and the rest, `SHIPLINE_CONFIG`, the
+  file itself, and exports `SHIPLINE_REPO`, the repository's main checkout, to every program
+  the script starts.
 - jq includes `priority.jq`, which reads the label names from `SHIPLINE_CONFIG` in the
   environment (export it first) with the same defaults.
 - Node (`codex-bridge.mjs`) reads the state folder from the file with the same default.

@@ -26,7 +26,6 @@ eval "$config"
 # Through `bash`, quiet and never failing: a session is not disturbed when the checkout no
 # longer has the launcher or the script.
 command="bash $(printf '%q' "$launcher") --repo $(printf '%q' "$SHIPLINE_REPO") notify 2>/dev/null || true"
-link_launcher
 
 before='{}'
 indent=2
@@ -42,6 +41,8 @@ if [[ -e $settings ]]; then
   indent=${#spaces}
   ((indent > 0)) || indent=2
 fi
+# Once the settings are known to be readable: a refusal above changes nothing.
+link_launcher
 
 # shellcheck disable=SC2016  # the dollars belong to jq
 after=$(jq --indent "$indent" --arg command "$command" '

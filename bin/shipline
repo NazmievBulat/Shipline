@@ -29,6 +29,7 @@ COMMANDS=(
   usage
   wake
   weaker-tests
+  workflow-metrics
 )
 
 usage() {
