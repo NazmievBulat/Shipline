@@ -130,7 +130,7 @@ tick_watched=""
 # 12: the self-update crashed itself, which this tick's end counts.
 if ((kept == 0 || kept == 10 || kept == 12)); then
   tick_watched=watched
-  exec 8>&2 2> >(python3 -B "$here/self_update.py" watch "$$" 2>&8 >&8 8>&-)
+  exec 7>&2 2> >(python3 -B "$here/self_update.py" watch "$$" 2>&7 >&7 7>&-)
 fi
 tick_ended() {
   if [[ -n $tick_watched ]]; then
@@ -138,7 +138,7 @@ tick_ended() {
     # that is gone must not end the tick before its end is counted.
     trap '' PIPE
     printf 'shipline-tick-ended %s\n' "$$" >&2
-    exec 2>&8 8>&-
+    exec 2>&7 7>&-
   fi
   python3 -B "$here/self_update.py" end "$$" "$1" $tick_skipped $tick_watched 9>&- || true
 }
@@ -190,7 +190,7 @@ trap 'tick_code=$?; rm -rf "$WORKFLOW_TRAIN_TICK"; tick_ended "$tick_code"' EXIT
 # The lock is closed for everything the tick calls: a `tmux` server started here lives on
 # after the tick, and would hold the lock for as long as its session runs.
 session() {
-  bash "$here/session" "$@" 9>&- 8>&-
+  bash "$here/session" "$@" 9>&- 8>&- 7>&-
 }
 
 # An audit ends with "audit finished", a worker with "worker finished", a hunt with "hunt
@@ -506,7 +506,7 @@ if [[ $METRICS_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] &&
   if mkdir -p "$HOME/.local/state/workflow"; then
     env -u WORKFLOW_TRAIN_TICK -u WORKFLOW_SESSION_SNAPSHOT -u WORKFLOW_DEFER_START \
       WORKFLOW_NOW="$NOW" setsid bash "$here/workflow-metrics" --daily </dev/null \
-      >>"$HOME/.local/state/workflow/metrics.log" 2>&1 8>&- 9>&- &
+      >>"$HOME/.local/state/workflow/metrics.log" 2>&1 7>&- 9>&- &
   else
     failed=1
   fi

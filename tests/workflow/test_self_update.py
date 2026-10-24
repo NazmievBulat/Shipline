@@ -593,6 +593,22 @@ def test_the_tick_moves_its_checkout_and_runs_the_new_version_at_once(workflow: 
     assert not any((home / ".local" / "shipline" / "runs").iterdir())
 
 
+def test_the_watched_tick_gets_its_standard_error_back_after_the_decide_lock(
+    workflow: Workflow,
+) -> None:
+    home, _ = _harness_shipline(workflow, "in_progress -")
+    env = {"SHIPLINE_REPO": str(workflow.repo)}
+
+    done = workflow.shipline("tick", env=env)
+
+    assert done.returncode == 0, done.stderr
+    # The decide lock's descriptor is opened and closed by the tick; the saved standard error
+    # is another, so the tick's end can still put it back.
+    assert "Bad file descriptor" not in done.stderr
+    trial = json.loads((home / ".local" / "shipline" / "trial.json").read_text())
+    assert trial["ticks"] == 1
+
+
 def test_a_handled_failure_of_the_tick_is_no_crash(workflow: Workflow) -> None:
     home, _ = _harness_shipline(workflow, "in_progress -")
     # GitHub cannot be reached: the tick says so and exits 1.
