@@ -410,6 +410,7 @@ def test_a_proof_that_does_not_match_the_squash_is_never_inherited(
         "running",
         "another workflow",
         "another merge tree",
+        "a merge without parents",
         "another run's merge",
         "a fork's run",
         "no planner",
@@ -429,6 +430,8 @@ def test_a_source_run_that_does_not_prove_the_tree_is_never_inherited(
         run["path"] = ".github/workflows/images.yml"
     elif change == "another merge tree":
         github[f"{_API}/git/commits/{_MERGE}"]["tree"]["sha"] = "f" * 40
+    elif change == "a merge without parents":
+        github[f"{_API}/git/commits/{_MERGE}"]["parents"] = []
     elif change == "another run's merge":
         # The run noted a merge of another head: its notes do not speak for what it ran.
         run["head_sha"] = "f" * 40
@@ -569,6 +572,19 @@ def test_main_s_planner_inherits_nothing_when_github_cannot_be_read(workflow: Wo
     assert done.stdout == ""
     assert "every job runs" in done.stderr
     assert output.read_text() == "inherited=[]\n"
+
+
+def test_main_s_planner_inherits_nothing_when_github_answers_too_deep_to_read(
+    workflow: Workflow,
+) -> None:
+    # Deeper than Python's JSON reader goes.
+    workflow.fake("gh", "#!/usr/bin/env python3\nprint('[' * 100_000)\n")
+
+    done = _proof(workflow, "inherited", "ci", env={"GITHUB_SHA": _SQUASH})
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.splitlines() == ["inherited=[]"]
+    assert "every job runs" in done.stderr
 
 
 @pytest.mark.parametrize("checkout", ["main", "worktree"])

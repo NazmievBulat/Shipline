@@ -166,7 +166,7 @@ def read(path: str, key: str | None = None) -> Any:
             page, end = decoder.raw_decode(raw)
             pages.append(page)
             raw = raw[end:].lstrip()
-    except ValueError as error:
+    except (ValueError, RecursionError) as error:
         raise Unreadable(f"gh api {path}: {error}") from error
     if key is not None:
         return [item for page in pages for item in page[key]]
@@ -240,7 +240,15 @@ def inherited(sha: str, workflow: str, api: Callable[..., Any] = read) -> dict[s
             if source["workflow"] == workflow:
                 found.update(_source_jobs(source, proof["tree"], api))
         return found
-    except (Unreadable, KeyError, TypeError, ValueError, AttributeError, StopIteration) as error:
+    except (
+        Unreadable,
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+        AttributeError,
+        StopIteration,
+    ) as error:
         print(f"nothing is inherited, every job runs: {error!r}", file=sys.stderr)
         return {}
 
