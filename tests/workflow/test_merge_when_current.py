@@ -4019,6 +4019,97 @@ def test_a_dropped_prefix_whose_runs_never_show_is_given_up_after_the_deadline(
     assert github.workflow.calls("gh run cancel") == []
 
 
+def test_past_the_deadline_the_gate_looks_once_more_before_it_gives_up(github: GitHub) -> None:
+    # The next sweep may come long after the drop: by then GitHub lists the late runs.
+    dropped = _dropped_nine(github)
+    branch = dropped["branch"]
+    assert _batch_call(github).returncode == 3
+    path = github.workflow.repo / ".local/workflow/merge-train.json"
+    train = _batch_state(github)
+    train["dropped"][0]["dropped"] -= 31 * 60
+    path.write_text(json.dumps(train))
+    runs = [
+        (900 + index, "completed" if index else "queued", branch, "workflow_dispatch", workflow)
+        for index, workflow in enumerate(dropped["requested"])
+    ]
+    _branch_runs(github, branch, *runs)
+
+    assert _batch_call(github).returncode == 3
+
+    assert list(_cancelled(github)) == ["900"]
+    assert _waiting_drops(github) == []
+    log = github.workflow.wake_log
+    assert not log.exists() or "gave up" not in log.read_text()
+
+
+def test_a_lasting_error_on_one_dropped_branch_does_not_hold_the_others(github: GitHub) -> None:
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    eight, nine = _scratch(github, "8"), _scratch(github, "9")
+    assert eight is not None and nine is not None
+    # 8 leaves the line: its prefix and 9's behind it are dropped.
+    github.pulls["8"]["state"] = "CLOSED"
+    unreadable = f"{_REPO}/actions/runs?branch={eight['branch']}&per_page=100"
+    github.api[unreadable] = "HTTP 404: Not Found"
+    _branch_runs(github, nine["branch"], (901, "queued"))
+
+    done = _batch_call(github)
+
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert list(_cancelled(github)) == ["901"]
+    assert nine["branch"] not in _scratch_branches(github)
+    assert eight["branch"] in _scratch_branches(github)
+
+
+def test_a_malformed_watch_list_never_changes_the_gates_result(github: GitHub) -> None:
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    path = github.workflow.repo / ".local/workflow/merge-train.json"
+    train = _batch_state(github)
+    train["dropped"] = [
+        None,
+        {"branch": 5},
+        {"branch": "workflow/merge-batch-x", "requested": None},
+    ]
+    path.write_text(json.dumps(train))
+
+    done = _batch_call(github)
+
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert _waiting_drops(github) == []
+
+
+def test_a_dispatch_whose_answer_was_lost_is_watched_too(github: GitHub) -> None:
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    during = json.loads((github.workflow.state / "batch-state-during-dispatch").read_text())
+    # Sent but not yet answered: it may have reached GitHub.
+    assert during["prefixes"]["members"][0]["scratch"]["dispatching"] == ["ci"]
+    assert _scratch(github, "7")["dispatching"] == []
+    # 9's dispatch was sent, but the gate stopped before GitHub answered.
+    path = github.workflow.repo / ".local/workflow/merge-train.json"
+    train = _batch_state(github)
+    nine = train["prefixes"]["members"][2]["scratch"]
+    nine.update(requested=[], dispatching=["ci"])
+    path.write_text(json.dumps(train))
+    github.pulls["9"]["state"] = "CLOSED"
+
+    assert _batch_call(github).returncode == 3
+
+    assert [(e["branch"], e["requested"]) for e in _waiting_drops(github)] == [
+        (nine["branch"], ["ci"])
+    ]
+
+
+def test_a_rejected_dispatch_is_not_watched(github: GitHub) -> None:
+    _batch_setup(github)
+    rejected = github.workflow.state / "reject-batch-dispatch"
+    rejected.touch()
+    assert _batch_call(github).returncode == 1
+    scratch = _scratch(github)
+    assert scratch is not None and scratch["requested"] == [] and scratch["dispatching"] == []
+
+
 def test_a_refused_cancel_is_logged_once_and_the_branch_still_goes(github: GitHub) -> None:
     _batch_setup(github)
     assert _batch_call(github).returncode == 3

@@ -1856,7 +1856,14 @@ class Train:
         self.retest: dict[str, str] | None = data.get("retest")
         # Scratch branches whose records left the line, with the workflows dispatched on them and
         # when: the sweep cancels their runs until it has seen one of each (_sweep_scratch).
-        self.dropped: list[dict[str, Any]] = data.get("dropped", [])
+        self.dropped: list[dict[str, Any]] = [
+            entry
+            for entry in data.get("dropped") or []
+            if isinstance(entry, dict)
+            and isinstance(entry.get("branch"), str)
+            and isinstance(entry.get("requested"), list)
+            and isinstance(entry.get("dropped"), (int, float))
+        ]
         self.scratch = self.scratch_records()
         self.first = self.front()
 
@@ -1872,7 +1879,11 @@ class Train:
             *self.proven.values(),
             *self.suites.values(),
         ]
-        return {record["branch"]: record for record in records}
+        return {
+            record["branch"]: record
+            for record in records
+            if isinstance(record, dict) and isinstance(record.get("branch"), str)
+        }
 
     def line(self) -> list[str]:
         """The waiting members in the order they are served: the fix of a red main first,
@@ -1908,11 +1919,13 @@ class Train:
         # A record that left the line may have runs GitHub does not list yet.
         current = self.scratch_records()
         watched = {entry["branch"] for entry in self.dropped}
-        self.dropped += [
-            {"branch": branch, "requested": record["requested"], "dropped": int(time.time())}
-            for branch, record in self.scratch.items()
-            if branch not in current and branch not in watched and record.get("requested")
-        ]
+        for branch, record in self.scratch.items():
+            # A dispatch sent but never answered may have reached GitHub too.
+            sent = sorted({*record.get("requested", []), *record.get("dispatching", [])})
+            if branch not in current and branch not in watched and sent:
+                self.dropped.append(
+                    {"branch": branch, "requested": sent, "dropped": int(time.time())}
+                )
         self.scratch = current
         with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False) as output:
             json.dump(
@@ -2751,20 +2764,27 @@ def _batch_report(train: Train, merged: list[str], acting: str, message: str) ->
 def _sweep_scratch(folder: Path) -> None:
     """Delete scratch branches that no saved batch, isolated failure awaiting a rerun or whole
     browser suite run names, each once its runs still queued or running are cancelled. A branch
-    whose runs cannot be read, or whose cancel is lost to an outage, is kept, with those after
-    it, for the next sweep.
+    whose runs cannot be read for now, or whose cancel is lost to an outage, stops the sweep and
+    is kept, with those after it, for the next; one that keeps failing is kept and passed over.
 
     GitHub lists a dispatched run only some time after it accepted the dispatch: the runs of a
     dropped branch are looked for, and cancelled, until one of each workflow dispatched on it
     has been seen, or DROPPED_RUNS_SECONDS after the drop, when the gate gives up and says so."""
     try:
         train = Train(folder)
+        before = json.dumps(train.dropped, sort_keys=True)
         kept = set(train.scratch_records())
         listed = git("ls-remote", "origin", f"refs/heads/{SCRATCH_PREFIX}*")
         branches = [line.split()[1].removeprefix("refs/heads/") for line in listed.splitlines()]
-        watched = {entry["branch"]: entry for entry in train.dropped}
+    except (Refused, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+        print(f"could not delete old batch branches: {error}", flush=True)
+        return
+    watched = {entry["branch"]: entry for entry in train.dropped}
+    try:
         for branch in branches:
-            if branch not in kept:
+            if branch in kept:
+                continue
+            try:
                 # A dropped prefix's runs would hold runners ahead of the live prefixes' runs.
                 found = _scratch_runs(branch)
                 _cancel(found, folder, f"scratch branch {branch}")
@@ -2773,29 +2793,43 @@ def _sweep_scratch(folder: Path) -> None:
                 deleted = push("origin", "--delete", f"refs/heads/{branch}")
                 if deleted.returncode:
                     raise Refused(deleted.refusal)
+            except Waiting:
+                raise
+            except Refused as error:
+                print(f"could not delete old batch branch {branch}: {error}", flush=True)
         for entry in list(train.dropped):
             branch = entry["branch"]
-            if branch in kept:
-                train.dropped.remove(entry)
-                continue
-            if time.time() - entry["dropped"] > DROPPED_RUNS_SECONDS:
-                missing = ", ".join(set(entry["requested"]) - set(entry.get("seen", [])))
-                wake_log(
-                    f"gave up looking for the {missing} run of dropped scratch branch {branch}: "
-                    f"GitHub listed none within {DROPPED_RUNS_SECONDS // 60} minutes"
-                )
-                train.dropped.remove(entry)
-                train.save()
-                continue
-            if branch not in branches:
-                found = _scratch_runs(branch)
-                _cancel(found, folder, f"scratch branch {branch}")
-                _seen(entry, found)
-            if set(entry["requested"]) <= set(entry.get("seen", [])):
-                train.dropped.remove(entry)
-            train.save()
-    except (Refused, OSError, KeyError, IndexError, ValueError) as error:
+            try:
+                if branch in kept:
+                    train.dropped.remove(entry)
+                    continue
+                if branch not in branches:
+                    # Past the deadline too: one last look before giving up.
+                    found = _scratch_runs(branch)
+                    _cancel(found, folder, f"scratch branch {branch}")
+                    _seen(entry, found)
+                missing = sorted(set(entry["requested"]) - set(entry.get("seen", [])))
+                if not missing:
+                    train.dropped.remove(entry)
+                elif time.time() - entry["dropped"] > DROPPED_RUNS_SECONDS:
+                    wake_log(
+                        f"gave up looking for the {', '.join(missing)} run of dropped scratch "
+                        f"branch {branch}: GitHub listed none within "
+                        f"{DROPPED_RUNS_SECONDS // 60} minutes"
+                    )
+                    train.dropped.remove(entry)
+            except Waiting:
+                raise
+            except Refused as error:
+                print(f"could not look for the runs of {branch}: {error}", flush=True)
+    except (Refused, OSError, KeyError, IndexError, TypeError, ValueError) as error:
         print(f"could not delete old batch branches: {error}", flush=True)
+    finally:
+        if json.dumps(train.dropped, sort_keys=True) != before:
+            try:
+                train.save()
+            except OSError as error:
+                print(f"could not save the dropped scratch branches: {error}", flush=True)
 
 
 def _seen(entry: dict[str, Any], found: list[dict[str, Any]]) -> None:
@@ -2881,6 +2915,10 @@ def _dispatch_scratch(train: Train, record: dict[str, Any], workflow: str) -> No
         return
     # Save only an accepted dispatch. If interrupted around the request, the
     # lookup above recovers an observable run; a never-sent request can retry.
+    # Until GitHub answers, the workflow is noted as being dispatched: dropped meanwhile, the
+    # record's branch is still watched for its run (_sweep_scratch).
+    record["dispatching"] = sorted({*record.get("dispatching", []), workflow})
+    train.save()
     dispatched = command(
         "gh",
         "workflow",
@@ -2892,7 +2930,9 @@ def _dispatch_scratch(train: Train, record: dict[str, Any], workflow: str) -> No
         record["branch"],
         check=False,
     )
+    record["dispatching"].remove(workflow)
     if dispatched.returncode:
+        train.save()
         raise Refused(f"batch {workflow} dispatch failed: {dispatched.stderr.strip()}")
     record["requested"].append(workflow)
     train.save()
