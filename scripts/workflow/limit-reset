@@ -66,7 +66,7 @@ usage_reset_for_clock() {
 remember_line_reset() {
   local prefix=$1 named=$2 text=$3 saved="" record
   # A late hook must not recreate a ticket directory after session cleanup removed it.
-  [[ -d ${prefix%/.local/workflow/*} ]] || return 1
+  [[ -d ${prefix%/"$SHIPLINE_STATE_FOLDER"/*} ]] || return 1
   if [[ -r $prefix.limit-line ]]; then
     read -r limit_at saved <"$prefix.limit-line" || return 1
     [[ $saved != "$named $text" || ! $limit_at =~ ^[0-9]+$ ]] || return 0

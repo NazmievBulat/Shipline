@@ -2,8 +2,13 @@
 # A guard against workflow mistakes, not a security boundary around the real gh binary.
 set -euo pipefail
 
-# Use the runner's repository setting so both follow a repository move together.
-source "$(dirname "${BASH_SOURCE[0]}")/../../../.github/runner/settings.sh"
+# The repository and the priority labels, as the tick reads them (`workflow_config.py`).
+# Without them, nothing names this worker's pull request or its labels, and its body update and
+# its pull requests are refused. The caller's own values never stand in for them.
+SHIPLINE_REPOSITORY="" SHIPLINE_PRIORITY_MEDIUM="" SHIPLINE_PRIORITY_HIGH=""
+if config=$(python3 "$(dirname "${BASH_SOURCE[0]}")/../workflow_config.py" shell); then
+  eval "$config"
+fi
 
 refuse() {
   echo "Codex worker: gh permits reads, its own ready/body update, and draft tickets labelled with only a medium or high priority; this command is refused." >&2
@@ -32,7 +37,9 @@ case ${1:-} in
             *) continue ;;
           esac
           # Only the priority a session gives a ticket it opens; `workflow` would start it.
-          [[ $label == "priority: medium" || $label == "priority: high" ]] || refuse
+          [[ -n ${SHIPLINE_PRIORITY_MEDIUM:-} &&
+             ( $label == "$SHIPLINE_PRIORITY_MEDIUM" || $label == "$SHIPLINE_PRIORITY_HIGH" ) ]] ||
+            refuse
         done
         [[ $draft == true ]] || refuse
         ;;
@@ -43,8 +50,8 @@ case ${1:-} in
   label) [[ ${2:-} == list ]] || refuse ;;
   api)
     # The one writable API shape: the body of this worker's own pull request.
-    if [[ $# -ge 6 && $2 == -X && $3 == PATCH &&
-          $4 == "repos/$repository/pulls/${WORKFLOW_SESSION#ticket-}" &&
+    if [[ -n $SHIPLINE_REPOSITORY && $# -ge 6 && $2 == -X && $3 == PATCH &&
+          $4 == "repos/$SHIPLINE_REPOSITORY/pulls/${WORKFLOW_SESSION#ticket-}" &&
           $5 == -F && $6 == body=@?* ]]; then
       output_args=("${@:7}")
       for ((i=0; i<${#output_args[@]}; i++)); do
