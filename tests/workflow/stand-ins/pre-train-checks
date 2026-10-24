@@ -1,4 +1,4 @@
 #!/bin/bash
-# A stand-in for the checks the merge gate runs before a pull request joins the train: the
-# tests read only that they pass.
+# A stand-in for the repository's `pre_train_checks` command, which the merge gate runs before a
+# pull request joins the train: the tests read only that they pass.
 exit 0
