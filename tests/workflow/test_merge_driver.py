@@ -2210,7 +2210,7 @@ def test_a_failing_test_goes_to_a_medium_worker_naming_the_run_and_keeps_the_lin
 
 
 @pytest.mark.parametrize("rerun", ["fails again", "passes"])
-@pytest.mark.parametrize("failure", ["runner shut down", "timed out"])
+@pytest.mark.parametrize("failure", ["runner shut down", "timed out", "layer download"])
 def test_a_runner_error_is_rerun_once_then_handed_back_to_a_reviewer(
     handed: GitHub, failure: str, rerun: str
 ) -> None:
@@ -2218,6 +2218,8 @@ def test_a_runner_error_is_rerun_once_then_handed_back_to_a_reviewer(
     _github_answers_repairs(workflow)
     if failure == "timed out":
         _fail(handed, conclusion="timed_out", log=None)
+    elif failure == "layer download":
+        _fail(handed, log="failed to solve: failed to compute cache key: short read: unexpected EOF\n")
     else:
         _fail(handed, log="##[error]The runner has received a shutdown signal.\n")
 
@@ -2250,7 +2252,7 @@ def test_a_runner_error_is_rerun_once_then_handed_back_to_a_reviewer(
     for job in jobs:
         job.update(status="completed", conclusion="success")
     if not passed:
-        jobs[-1]["conclusion"] = "failure" if failure == "runner shut down" else "timed_out"
+        jobs[-1]["conclusion"] = "timed_out" if failure == "timed out" else "failure"
         jobs[1]["conclusion"] = "failure"
     handed.pulls["7"]["statusCheckRollup"][0].update(
         status="COMPLETED", conclusion="SUCCESS" if passed else "FAILURE"
@@ -2466,3 +2468,54 @@ def test_a_failing_test_without_the_label_keeps_its_audit_path(handed: GitHub) -
     assert not (_folder(workflow) / "check-repair-7.json").exists()
     assert (_folder(workflow) / "merge-review-7").exists()
     assert _started(workflow) == []
+
+
+@pytest.mark.parametrize("workflow_name", ["ci", "images", "e2e"])
+def test_transport_retry_waits_for_the_entire_run_and_keeps_the_handoff(
+    handed: GitHub, workflow_name: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _behind(handed)
+    _fail(handed, log="#13 ERROR: failed to solve: unexpected EOF while pulling a layer\n")
+    path = _RUNS.format(head=handed.head)
+    run = handed.api[path]["workflow_runs"][0]
+    if workflow_name != "ci":
+        handed.api[path] = {"workflow_runs": []}
+        handed.api[path.replace("/ci.yml/", f"/{workflow_name}.yml/")] = {"workflow_runs": [run]}
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    jobs[-1]["name"] = "Docker images: image tests"
+    jobs[0].update(status="in_progress", conclusion=None)
+    run.update(status="in_progress", conclusion=None)
+    handed.save()
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh run rerun") == []
+    assert _note(workflow).exists()
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    jobs[0].update(status="completed", conclusion="success")
+    run.update(status="completed", conclusion="failure")
+    handed.save()
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh run rerun") == ["gh run rerun 20 -R example-org/example-app --failed"]
+    assert _note(workflow).exists()
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    assert _started(workflow) == []
+
+
+@pytest.mark.parametrize("log", [
+    "failed to solve: short read: unexpected EOF\n" + _FAILED_TEST,
+    "server under test: connection reset by peer\n",
+    "server under test: i/o timeout\n",
+    "server under test: unexpected EOF\n",
+])
+def test_transport_words_do_not_override_a_test_failure(handed: GitHub, log: str) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log=log)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh run rerun") == []
+    assert not _note(workflow).exists()
+    assert workflow.calls("gh pr ready") == ["gh pr ready 7 -R example-org/example-app --undo"]

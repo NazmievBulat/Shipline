@@ -213,6 +213,12 @@ def answer(args, cwd, env, out, err):
             (state / "batch-state-during-dispatch").write_text(train.read_text())
         if (state / "reject-batch-dispatch").exists():
             sys.exit("workflow dispatch rejected")
+    elif args[:2] == ["run", "view"] and "--log-failed" in args:
+        job = args[args.index("--job") + 1]
+        log = state / "job-logs" / job
+        if not log.exists():
+            sys.exit("failed to get run log: log not found")
+        print(log.read_text())
     elif args[:2] == ["run", "rerun"]:
         if (state / "fail-rerun").exists():
             sys.exit("rerun refused")
@@ -8364,3 +8370,53 @@ def test_a_read_made_old_by_a_long_wait_for_the_lock_is_made_again(
         assert (workflow.repo / ".local/workflow/merge-wanted-7").exists()
         assert _waiting(workflow) == ["7"]
     assert all(held < 5 for held in _held(workflow))
+
+
+@pytest.mark.parametrize("workflow_name", ["ci", "images", "e2e"])
+@pytest.mark.parametrize("second", ["passes", "fails again"])
+def test_prefix_transport_retry_keeps_the_prefix_until_the_second_result(
+    github: GitHub, workflow_name: str, second: str
+) -> None:
+    _batch_setup(github, images=True)
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+    scratch = _scratch(github)
+    path = (f"{_REPO}/actions/workflows/{workflow_name}.yml/runs?head_sha={scratch['head']}"
+            "&event=workflow_dispatch&per_page=100")
+    run = github.api[path]["workflow_runs"][0]
+    run.update(status="in_progress", conclusion=None, run_attempt=1)
+    jobs = github.api[f"{_REPO}/actions/runs/{run['id']}/jobs?per_page=100"]["jobs"]
+    job = next(j for j in jobs if j["name"] not in
+               ("CI: what to run", "CI result", "Docker images: what to run", "E2E: what to run"))
+    job.update(conclusion="failure", labels=["example-app-home-docker"])
+    logs = github.workflow.state / "job-logs"
+    logs.mkdir(exist_ok=True)
+    (logs / str(job["id"])).write_text(
+        "#13 [stage 1/2] FROM example-app:latest\n"
+        "#13 ERROR: short read: expected 28249323 bytes but got 0: unexpected EOF\n")
+    github.api[f"{_REPO}/check-runs/{job['id']}/annotations?per_page=100"] = []
+    for j in jobs:
+        j.setdefault("labels", ["example-app-home-docker"])
+    github.save()
+    done = _batch_call(github)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert rerun_calls(github.workflow) == []
+    assert _scratch(github)["branch"] == scratch["branch"]
+    run.update(status="completed", conclusion="failure")
+    github.save()
+    for _ in range(2):
+        done = _batch_call(github)
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert rerun_calls(github.workflow) == [
+            f"gh run rerun {run['id']} -R example-org/example-app --failed"]
+        assert _scratch(github)["branch"] == scratch["branch"]
+        assert _batch_state(github)["waiting"] == ["7", "8", "9"]
+        assert "7" not in _batch_state(github)["blocked"]
+    run.update(run_attempt=2, conclusion="success" if second == "passes" else "failure")
+    if second == "passes":
+        job["conclusion"] = "success"
+    github.save()
+    done = _batch_call(github)
+    assert done.returncode == (0 if second == "passes" else 1), done.stdout + done.stderr
+    assert len(rerun_calls(github.workflow)) == 1
+    assert ("7" in _batch_state(github)["blocked"]) == (second != "passes")
