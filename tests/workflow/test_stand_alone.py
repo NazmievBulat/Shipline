@@ -472,3 +472,30 @@ def test_a_repository_s_conflict_rules_are_used_when_it_holds_them(workflow: Wor
     done = _gate(workflow, 'print(g._taken_migrations("HEAD", "HEAD"))')
 
     assert done.stdout == "['migrations/0002_taken.py']\n", done.stderr
+
+
+def _an_app_change(workflow: Workflow) -> None:
+    (workflow.repo / "app.txt").write_text("changed\n")
+    workflow.git("add", "app.txt")
+    workflow.git("commit", "--quiet", "-m", "feat: an app change")
+
+
+def _browser_needed(workflow: Workflow) -> subprocess.CompletedProcess[str]:
+    return _gate(workflow, 'print("needed" if g.browser_needed("HEAD~1", "HEAD") else "none")')
+
+
+def test_without_an_e2e_planner_no_change_needs_browser_tests(workflow: Workflow) -> None:
+    (workflow.script.parents[1] / "e2e-plan.py").unlink()
+    _an_app_change(workflow)
+
+    done = _browser_needed(workflow)
+
+    assert done.stdout == "none\n", done.stderr
+
+
+def test_a_repository_s_e2e_planner_decides_when_it_holds_one(workflow: Workflow) -> None:
+    _an_app_change(workflow)
+
+    done = _browser_needed(workflow)
+
+    assert done.stdout == "needed\n", done.stderr
