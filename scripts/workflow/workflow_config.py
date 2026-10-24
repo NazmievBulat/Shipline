@@ -1,8 +1,9 @@
 """What differs between the repositories that use Shipline, read from one file.
 
 A repository keeps `shipline.json` at the root of its main checkout: the main checkout of the
-repository being worked on, found from the git common directory, so a worktree reads the same
-file as the main checkout. A key the file leaves out keeps its default, key by key; a key the
+repository being worked on (`SHIPLINE_REPO`, else the repository of the current directory; never
+found from where these scripts are), found from the git common directory, so a worktree reads the
+same file as the main checkout. A key the file leaves out keeps its default, key by key; a key the
 file names that Shipline does not know, or a value of the wrong kind, is refused, so a typing
 error never passes as a default.
 
@@ -11,10 +12,11 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix; no machines named, so `flow-page` samples only the machine it runs on; no hunt
-areas, so one hunt runs at a time, and no hunt plans file; no test command, which a repository
-names for its CI's test job (`ci_proof.py test`); a quiet cloud worker is woken after 30
-minutes.
+runner prefix; the workflow and runner tests `tools/parity` compares are in `tests/workflow` and
+`tests/runner`, and it knows of no differences; no machines named, so `flow-page` samples only
+the machine it runs on; no hunt areas, so one hunt runs at a time, and no hunt plans file; no
+test command, which a repository names for its CI's test job (`ci_proof.py test`); a quiet
+cloud worker is woken after 30 minutes.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -37,7 +39,6 @@ from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-HERE = Path(__file__).resolve().parent
 FILE = "shipline.json"
 # Where the runner pool names the repository its runners register with, and how long Bash may
 # take to read it.
@@ -49,6 +50,22 @@ DEFAULTS: dict[str, Any] = {
     "repository": None,
     "state_folder": ".local/workflow",
     "worktree_setup": "scripts/setup-worktree",
+    "commands": {
+        # The command line that runs the repository's tests, from the root of its checkout, by
+        # `bash -c` (`ci_proof.py test`).
+        "test": None,
+        # The repository's own commands Shipline calls, each split into words (`Config.command`).
+        "browser_tests_for_changes": None,
+        "server_tests_for_changes": None,
+        "pre_train_checks": None,
+        "mechanical_conflicts": None,
+        "browser_plan": None,
+        "hunt_app": None,
+        "hunt_browser": None,
+        "hunt_cursor": None,
+        "advisory_watch": None,
+        "push_checkout": None,
+    },
     "checks": {
         "ci_result": "CI result",
         "ci_plan": "CI: what to run",
@@ -83,6 +100,9 @@ DEFAULTS: dict[str, Any] = {
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
     },
+    # What `tools/parity` reads of a repository that keeps its own copy of the scripts: where its
+    # workflow and runner tests are, and the file that lists the differences it expects.
+    "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
     # The machines `flow-page` samples, each a name and, for another machine, the address `ssh`
     # reaches it at; one without an address is this machine. None named: only this machine.
     "machines": [],
@@ -92,10 +112,6 @@ DEFAULTS: dict[str, Any] = {
         "areas": {},
         # The repository's file of hunt plans, which a hunt with a plan is told of.
         "plans": None,
-    },
-    "commands": {
-        # The command line that runs the repository's tests, from the root of its checkout.
-        "test": None,
     },
     # Minutes without a push or a report after which the tick wakes a cloud worker; 0 never does.
     "cloud_wake_after_minutes": 30,
@@ -168,6 +184,13 @@ class Runner:
 
 
 @dataclass(frozen=True)
+class Parity:
+    workflow_tests: str
+    runner_tests: str
+    known: str | None = None
+
+
+@dataclass(frozen=True)
 class Machine:
     name: str
     # None for this machine.
@@ -183,8 +206,22 @@ class Hunts:
 
 @dataclass(frozen=True)
 class Commands:
-    # None when the file names none.
+    # Each None when the file names none.
     test: str | None
+    browser_tests_for_changes: str | None
+    server_tests_for_changes: str | None
+    pre_train_checks: str | None
+    mechanical_conflicts: str | None
+    browser_plan: str | None
+    hunt_app: str | None
+    hunt_browser: str | None
+    hunt_cursor: str | None
+    advisory_watch: str | None
+    push_checkout: str | None
+
+
+# The commands run as words, not by a shell: every one but `test`.
+RUN_AS_WORDS = tuple(name for name in DEFAULTS["commands"] if name != "test")
 
 
 @dataclass(frozen=True)
@@ -198,6 +235,7 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    parity: Parity
     machines: tuple[Machine, ...]
     hunts: Hunts
     commands: Commands
@@ -205,6 +243,20 @@ class Config:
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
+
+    def command(self, name: str) -> list[str] | None:
+        """The words a command is run with, or None when the repository has none. Its script is
+        the main checkout's (`_script`); the other words are passed as written."""
+        if name not in RUN_AS_WORDS:
+            raise KeyError(name)
+        line = getattr(self.commands, name)
+        if line is None:
+            return None
+        words = _words(line, name)
+        script = _script(words)
+        if script is not None:
+            words[script] = str(self.main / words[script])
+        return words
 
     @property
     def repository(self) -> str:
@@ -229,7 +281,7 @@ class Config:
         return state.parents[len(PurePosixPath(self.state_folder).parts) - 1]
 
 
-def main_checkout(start: Path = HERE) -> Path:
+def main_checkout(start: Path) -> Path:
     done = subprocess.run(
         ["git", "-C", str(start), "rev-parse", "--path-format=absolute", "--git-common-dir"],
         capture_output=True,
@@ -239,6 +291,28 @@ def main_checkout(start: Path = HERE) -> Path:
     if done.returncode:
         raise ConfigError(f"{start} is not in a git repository: {done.stderr.strip()}")
     return Path(done.stdout.strip()).parent
+
+
+def repository_checkout() -> Path:
+    """The main checkout of the repository Shipline works on: the one `SHIPLINE_REPO` names
+    (`shipline --repo` sets it), else the one the current directory is in. Never found from
+    where these scripts are: they are in Shipline's own checkout."""
+    named = os.environ.get("SHIPLINE_REPO")
+    if named:
+        try:
+            return main_checkout(Path(named))
+        except ConfigError:
+            raise ConfigError(
+                f"SHIPLINE_REPO names {named}, which is in no git repository"
+            ) from None
+    here = Path.cwd()
+    try:
+        return main_checkout(here)
+    except ConfigError:
+        raise ConfigError(
+            f"{here} is in no git repository: run Shipline inside the checkout of the repository "
+            "it works on, or name that checkout with SHIPLINE_REPO or `shipline --repo <path>`."
+        ) from None
 
 
 def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
@@ -335,6 +409,32 @@ def _relative(value: str, name: str) -> str:
     return value
 
 
+def _words(line: str, name: str) -> list[str]:
+    """A command line split into words as the shell splits them, with nothing expanded."""
+    where = f"commands.{name}"
+    try:
+        words = shlex.split(line)
+    except ValueError as error:
+        raise ConfigError(f"{FILE}: {where} cannot be split into words: {error}") from None
+    script = _script(words)
+    if script is not None:
+        _relative(words[script], where)
+    return words
+
+
+def _script(words: list[str]) -> int | None:
+    """Which word is the repository's own program, read from its main checkout wherever the
+    command runs, so a pull request's worktree never supplies it: a first word with a folder
+    in it, or, after a program found on the PATH (an interpreter), the first word with a folder
+    in it that is no option. None when every word is found elsewhere."""
+    if "/" in words[0]:
+        return 0
+    return next(
+        (index for index, word in enumerate(words) if "/" in word and not word.startswith("-")),
+        None,
+    )
+
+
 def _plans(value: str | None) -> str | None:
     if value is not None and not (
         _PLANS.fullmatch(value) and _relative(value, "hunts.plans") == value
@@ -397,8 +497,10 @@ def _from_origin(main: Path) -> str | None:
     return found[1] if done.returncode == 0 and found else None
 
 
-def load(start: Path = HERE) -> Config:
-    main = main_checkout(start)
+def load(start: Path | None = None) -> Config:
+    """The configuration of the repository `start` is in; without one, of the repository
+    Shipline works on (`repository_checkout`)."""
+    main = repository_checkout() if start is None else main_checkout(start)
     path = main / FILE
     try:
         text = path.read_text()
@@ -421,6 +523,9 @@ def load(start: Path = HERE) -> Config:
         raise ConfigError(f"{FILE}: labels.priority must name four different labels")
     if repository is not None and not _REPOSITORY.fullmatch(repository):
         raise ConfigError(f"{source}: repository must be owner/name, not {repository}")
+    for name in RUN_AS_WORDS:
+        if values["commands"][name] is not None:
+            _words(values["commands"][name], name)
     return Config(
         found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),
@@ -434,6 +539,7 @@ def load(start: Path = HERE) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
+        parity=parity_of(given),
         machines=tuple(Machine(**machine) for machine in values["machines"]),
         hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
         commands=Commands(**values["commands"]),
@@ -443,9 +549,24 @@ def load(start: Path = HERE) -> Config:
     )
 
 
+def parity_of(given: Any) -> Parity:
+    """The `parity` section of a file as read, checked as `load` checks it. `tools/parity` reads
+    only this of another repository's file, whose other keys its own scripts may read."""
+    if not isinstance(given, dict):
+        raise ConfigError(f"{FILE}: the file must be an object")
+    only = {"parity": given.get("parity", {})}
+    values = _merged({"parity": DEFAULTS["parity"]}, only, "")["parity"]
+    # As git names a path: `./tests//flow/` is `tests/flow`.
+    named = {
+        key: None if value is None else str(PurePosixPath(_relative(value, f"parity.{key}")))
+        for key, value in values.items()
+    }
+    return Parity(**named)
+
+
 @cache
 def current() -> Config:
-    """The configuration of the repository these scripts are in, read once a run."""
+    """The configuration of the repository Shipline works on, read once a run."""
     return load()
 
 
@@ -468,6 +589,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
         },
+        "parity": vars(config.parity).copy(),
         "machines": [
             {"name": machine.name, **({"address": machine.address} if machine.address else {})}
             for machine in config.machines
@@ -510,6 +632,13 @@ def shell(config: Config) -> str:
     lines.append(f"SHIPLINE_HUNT_AREAS=({' '.join(shlex.quote(area) for area in areas)})")
     screens = " ".join(shlex.quote(", ".join(paths)) for paths in areas.values())
     lines.append(f"SHIPLINE_HUNT_SCREENS=({screens})")
+    # Each command as an array of its words, empty when the repository has none.
+    for name in RUN_AS_WORDS:
+        words = " ".join(shlex.quote(word) for word in config.command(name) or [])
+        lines.append(f"SHIPLINE_COMMAND_{name.upper()}=({words})")
+    # The main checkout, exported: every program the script starts works on the same repository,
+    # whatever folder it starts in.
+    lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")
     return "\n".join(lines) + "\n"
 
 
@@ -518,7 +647,7 @@ def main() -> int:
         print("usage: workflow_config.py shell [folder]", file=sys.stderr)
         return 2
     try:
-        config = load(Path(sys.argv[2]) if len(sys.argv) == 3 else HERE)
+        config = load(Path(sys.argv[2]) if len(sys.argv) == 3 else None)
     except ConfigError as error:
         print(error, file=sys.stderr)
         return 1

@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""A stand-in for the repository's browser plan, its `browser_plan` command, which the merge
+gate asks whether a merge needs browser tests: the changed paths on standard input, each ended
+by a NUL; it prints `needed` or `none`.
+
+A change to the workflow, the tests, the docs or Markdown alone needs none; any other change
+does, and so does an empty one, which the planner cannot tell from a misread.
+"""
+
+import sys
+
+_NONE_NEEDED = (b"scripts/workflow/", b"tests/", b"docs/")
+
+changed = sys.stdin.buffer.read().split(b"\0")[:-1]
+needed = not changed or not all(
+    path.startswith(_NONE_NEEDED) or path.endswith(b".md") for path in changed
+)
+print("needed" if needed else "none")

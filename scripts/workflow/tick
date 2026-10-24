@@ -32,16 +32,21 @@
 #      A reviewer or audit whose pull request another member's gate call merged in a batch
 #      is told so once, to do its after-merge duties. One that waits for its checks before it
 #      joined the merge line is woken once per head for a check GitHub lost, as the gate defines
-#      it (`tick_lost_check.py`); an audit's pull request needs no label for that.
+#      it (`tick_lost_check.py`); an audit's pull request needs no label for that. A lost check
+#      beside a failure, before the line or in it, wakes as checks that finished.
 #   8. Waits that ended or stalled, for Claude workers and reviewers (never Codex bridges, hunts
 #      or audits): a session idle 50 minutes waiting for its own job or its turn in the train
 #      is asked once per idle stretch whether the wait is over; a worker idle 15 minutes on a
 #      ready pull request without "worker finished" is told once to finish; a busy session
-#      whose screen has not changed for 45 minutes, and a wait loop that finds its own shell,
-#      are named in the wake once. A running command is never interrupted. A cloud worker whose
-#      draft had no push and no report for `cloud_wake_after_minutes`, with no open question,
-#      is woken once through `claude --cloud` and named in the wake if still quiet that long
-#      after; one whose question was answered is woken at once (`cloud_workers.py wake`).
+#      whose screen has not changed for 45 minutes (once per stretch and head), and a busy
+#      wait loop that finds its own shell (once per loop), are interrupted with Escape, told
+#      why and named in the wake. Those two are the only running commands interrupted. An
+#      idle session that no rule covers for 50 minutes is named in the wake once per head,
+#      and typed nothing. When each screen last changed is noted for `session list`.
+#      A cloud worker whose draft had no push and no report for `cloud_wake_after_minutes`,
+#      with no open question, is woken once through `claude --cloud` and named in the wake if
+#      still quiet that long after; one whose question was answered is woken at once
+#      (`cloud_workers.py wake`).
 #   9. After the starts of step 6, the next draft without the label gets it when one may start
 #      (`ticket_starts.py`: by priority, then the older ticket, when its files overlap no running
 #      ticket's, nothing in `start-plan` holds it back, the machine has had room for 10
@@ -79,8 +84,16 @@ ANALYST_STOPPED_AFTER_MINUTES=40
 KEEP_ALIVE_AFTER_SECONDS=$((50 * 60))
 # A worker idle this long with its pull request ready, and no "worker finished", is told once.
 READY_UNFINISHED_SECONDS=$((15 * 60))
-# A busy session whose screen has not changed for this long is named in the wake, once.
+# A busy session whose screen has not changed for this long is nudged and named in the wake, once.
 STUCK_AFTER_SECONDS=$((45 * 60))
+# A busy session's wait loop that finds itself is nudged once its screen has stood still this long;
+# while the screen moves, it is named without a nudge after the second.
+LOOP_STILL_SECONDS=$((5 * 60))
+LOOP_NAMED_AFTER_SECONDS=$((15 * 60))
+# How many more times a nudge whose Enter was not taken is sent again.
+NUDGE_RETRIES=3
+# An idle session that no rule covers is named in the wake after this long, once per head.
+IDLE_NO_RULE_SECONDS=$((50 * 60))
 # The line a session ends with, WORDS standing for its words. `notify` reads it the same way.
 FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:]]*$'
 # The time of day, UTC, from which the daily metrics run starts; empty, it never does. A test
@@ -106,8 +119,12 @@ if [[ -z $SHIPLINE_REPOSITORY ]]; then
 fi
 # priority.jq reads the label names from it.
 export SHIPLINE_CONFIG
-common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir) || exit 1
-main=$(dirname "$common")
+# The repository's main checkout (`SHIPLINE_REPO`, else the one of the current folder), never
+# the checkout these scripts are in.
+main=$SHIPLINE_REPO
+common=$(git -C "$main" rev-parse --path-format=absolute --git-common-dir) || exit 1
+# What the tick and the gate ask git, they ask of the repository, whichever folder ran it.
+cd "$main" || exit 1
 
 # A second tick exits while the first still runs. The lock is in the git common directory, where
 # no change of shipline.json moves it: a tick that reads a new state folder still waits for one
@@ -624,12 +641,15 @@ while read -r name state _; do
     mark=$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-$turn-${health%% *}-$head
   fi
   # A check GitHub lost after its run finished never completes: the gate runs CI again for it.
-  # In the line, the wake still comes again for a new turn or state of main.
+  # In the line, the wake still comes again for a new turn or state of main. A failed member's
+  # lost check is not run again: it is woken once per head as if its checks had finished.
   lost=false
   if jq -e --arg number "$number" --arg head "$head" '.lost[$number].head == $head' \
     <<<"$train" >/dev/null; then
     lost=true
-    if [[ $mark == */$name.train-nudged-* ]]; then
+    if jq -e --arg number "$number" '.lost[$number].failed == true' <<<"$train" >/dev/null; then
+      lost=failed
+    elif [[ $mark == */$name.train-nudged-* ]]; then
       mark=$mark-lost
     else
       mark=$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head
@@ -648,16 +668,22 @@ while read -r name state _; do
     elif .__typename == "StatusContext" then (.state | IN("SUCCESS", "FAILURE", "ERROR"))
     else false end)' <<<"$pull" >/dev/null; }; then
     # Before the line, a lost check is seen by no gate: the tick looks for one itself, as the
-    # gate would, and tells the session once per head. Each run is read once in this tick.
+    # gate would, and tells the session once per head. Each run is read once in this tick. One
+    # lost beside a failure is woken, once per head, as if its checks had finished.
     [[ $in_line == false && -e $notes.checks-wait ]] || continue
-    mark=$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head
-    [[ ! -e $mark ]] || continue
+    [[ ! -e $main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head ]] || continue
     WORKFLOW_BACKGROUND_GITHUB=1 python3 -B "$here/tick_lost_check.py" \
       "$main/$SHIPLINE_STATE_FOLDER" "$number" <<<"$pull" 9>&-
     found=$?
     ((found != 3)) || continue
-    ((found == 0)) || { failed=1; continue; }
-    lost=true
+    if ((found == 4)); then
+      lost=failed
+      mark=$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-$head
+    else
+      ((found == 0)) || { failed=1; continue; }
+      lost=true
+      mark=$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head
+    fi
   fi
   if [[ ! -e $notes.checks-wait ]]; then
     started=$(stat -c %Y "$notes.started" 9>&-) || continue
@@ -685,7 +711,7 @@ while read -r name state _; do
     [[ $own == true ]] || continue
   fi
   wake=checks-finished
-  [[ $lost == false ]] || wake=lost-check
+  [[ $lost != true ]] || wake=lost-check
   if delivery=$(session "$wake" "$name" "$head" 2>&1); then
     nudged+="$name "
     echo "$head" >"$mark" || { failed=1; continue; }
@@ -756,7 +782,105 @@ asks_permission() {
   LC_ALL=C grep -qE '^[[:space:]│]*Do you want to [^?]*\?' <<<"$screen"
 }
 
+# The last line of words above the box, without the mark Claude draws before it. The lines
+# Claude draws itself, its spinner and the time a turn took ("✻ Worked for 3m 2s"), are not
+# words of the session.
+last_line() {
+  local screen top
+  screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 1
+  top=$(LC_ALL=C awk '/^─/ { above = last; last = NR }
+    END { print above ? above : (last ? last : NR + 1) }' <<<"$screen")
+  LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" |
+    { LC_ALL=C grep -vE '^[[:space:]]*((·|✢|✳|✶|✻|✽)[[:space:]]|\*[[:space:]]+[^[:space:]]+…)' || true; } |
+    LC_ALL=C sed -E 's/^[[:space:]]*((●|⎿)[[:space:]]*)*//; s/[[:space:]]+$//' |
+    LC_ALL=C awk 'NF { line = $0 } END { print line }'
+}
+
+# Interrupts a busy session that does not move and tells it why (`session nudge-busy`). Sets
+# outcome to what the wake line says of it: "; nudge sent", "; nudge failed", "; interrupted,
+# text left in its box" when Escape put a queued message back, or nothing when the session was
+# left alone. Escape is never pressed on a dialog, a question to the owner or text in the box.
+# A nudge that failed leaves a `.nudge-retry` note: when the box still holds its message (its
+# Enter was not taken after Escape), the next passes send it again (`retry_nudge`), never with
+# a second Escape.
+nudge_busy() {
+  local name=$1 kind=$2 delivery sent
+  outcome=""
+  asks_permission "$name" && return 0
+  quiet "$name" || return 0
+  delivery=$(session nudge-busy "$name" "$kind" 2>&1)
+  sent=$?
+  if ((sent == 0)); then
+    nudged+="$name "
+    outcome="; nudge sent"
+  elif ((sent == 4)); then
+    nudged+="$name "
+    outcome="; interrupted, text left in its box"
+  elif ((sent != 3)); then
+    nudged+="$name "
+    echo "$delivery" >&2
+    wake_log "$name $3 nudge failed: $delivery"
+    outcome="; nudge failed"
+    echo "$kind 0" >"$main/$SHIPLINE_STATE_FOLDER/$name.nudge-retry" || true
+    failed=1
+  fi
+}
+
+# Sends again a nudge whose Enter was not taken, while the box still holds exactly it, at most
+# NUDGE_RETRIES times; then the wake is told once that it stays in the box. Anything else in
+# the box, or a session that went on, ends the retry.
+retry_nudge() {
+  local name=$1 note=$main/$SHIPLINE_STATE_FOLDER/$1.nudge-retry kind tries delivery sent
+  { read -r kind tries <"$note"; } 2>/dev/null || return 0
+  if [[ ! $kind =~ ^(still|loop)$ || ! $tries =~ ^[0-9]+$ ]] || ! holds_own_nudge "$name"; then
+    rm -f "$note"
+    return 0
+  fi
+  if ((tries >= NUDGE_RETRIES)); then
+    if note_for_wake "$name-retry-$NOW" "stuck? $name (nudge not taken; its text stays in the box)"; then
+      rm -f "$note"
+      wake_log "$name $kind nudge not taken after $tries more tries" || failed=1
+    else
+      failed=1
+    fi
+    return 0
+  fi
+  delivery=$(session nudge-busy "$name" "$kind" again 2>&1)
+  sent=$?
+  if ((sent == 0)); then
+    nudged+="$name "
+    rm -f "$note"
+    wake_log "$name $kind nudge sent again after its Enter was not taken" || failed=1
+  elif ((sent == 3)); then
+    rm -f "$note"
+  else
+    nudged+="$name "
+    echo "$kind $((tries + 1))" >"$note" || failed=1
+    echo "$delivery" >&2
+    wake_log "$name $kind nudge failed again: $delivery"
+    failed=1
+  fi
+}
+
+# Whether the session's box holds a message of the tick's own (its `.typed` note).
+holds_own_nudge() {
+  [[ -e $main/.claude/worktrees/ticket-${1#*-}/$SHIPLINE_STATE_FOLDER/$1.typed ]] &&
+    ! bash "$here/bridge-empty" "$1" 9>&-
+}
+
 running=$(session list) || failed=1
+
+# When each screen last changed, or the session's state: the 45-minute rule below counts from
+# it, and `session list` shows it. A session's first look is a change.
+while read -r name state _; do
+  [[ $name =~ ^(ticket|review|audit)-[0-9]+$ || $name == hunt-* || $name == analyst-* ]] || continue
+  # The state goes with the sum: a session that turns busy starts its 45 minutes then.
+  sum=$(screen_sum "$name")/$state || continue
+  seen=$main/$SHIPLINE_STATE_FOLDER/$name.screen-seen
+  { read -r last_sum last_since <"$seen"; } 2>/dev/null || last_sum=""
+  [[ $last_sum == "$sum" && $last_since =~ ^[0-9]+$ ]] || echo "$sum $NOW" >"$seen" || failed=1
+done <<<"$running"
+
 while read -r name state _; do
   [[ $state != limit && $name =~ ^(ticket|review)-([0-9]+)$ ]] || continue
   number=${BASH_REMATCH[2]}
@@ -820,15 +944,51 @@ while read -r name state _; do
     rm -f "$ready"
   fi
 
+  # Busy, and not a session that ended its turn to wait for its own job.
+  busy=false
+  [[ $state != busy || -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]] ||
+    busy=true
+  # The commit the session's work stands on: a new one is news even on a screen that is still.
+  head=$(git -C "$main/.claude/worktrees/ticket-$number" rev-parse HEAD 2>/dev/null 9>&-) ||
+    head=""
+  # Since when its screen has not changed (the note the pass above keeps).
+  last_since=""
+  { read -r _ last_since <"$main/$SHIPLINE_STATE_FOLDER/$name.screen-seen"; } 2>/dev/null || true
+  [[ $last_since =~ ^[0-9]+$ ]] || last_since=$NOW
+  [[ ! -e $main/$SHIPLINE_STATE_FOLDER/$name.nudge-retry ]] || retry_nudge "$name"
+
   # What it runs: a wait loop that finds its own shell never ends, whatever its screen shows.
   if activity=$(session running "$name" 2>/dev/null); then
     loop=$(jq -r '.finds_itself // ""' <<<"$activity")
     if [[ -n $loop ]]; then
       mark=$main/$SHIPLINE_STATE_FOLDER/$name.loop-noted
       if [[ ! -r $mark || $(<"$mark") != "$loop" ]]; then
-        if note_for_wake "$name-loop-$NOW" "wait loop finds itself? $name (running: $loop)"; then
+        outcome=""
+        later=false
+        # Only when the loop is the command it started last and its screen stands still: Escape
+        # would stop other work, not a loop left in the background. While the screen moves, the
+        # loop is named when it stands still, the session ends its turn, or after 15 minutes. One
+        # the tick may not type into is named at once.
+        first=$main/$SHIPLINE_STATE_FOLDER/$name.loop-seen
+        { read -r first_at first_loop <"$first"; } 2>/dev/null || first_loop=""
+        if [[ $first_loop != "$loop" || ! $first_at =~ ^[0-9]+$ ]]; then
+          first_at=$NOW
+          printf '%s %s\n' "$NOW" "$loop" >"$first" || failed=1
+        fi
+        if [[ $busy == true && $(jq -r '.running // ""' <<<"$activity") == "$loop" &&
+              $nudged != *" $name "* ]] && ! asks_permission "$name" && quiet "$name"; then
+          if ((NOW - last_since >= LOOP_STILL_SECONDS)); then
+            nudge_busy "$name" loop loop
+          elif ((NOW - first_at < LOOP_NAMED_AFTER_SECONDS)); then
+            later=true
+          fi
+        fi
+        line="wait loop finds itself? $name (running: $loop)$outcome"
+        if [[ $later == true ]]; then
+          :
+        elif note_for_wake "$name-loop-$NOW" "$line"; then
           printf '%s\n' "$loop" >"$mark" || failed=1
-          wake_log "$name runs a wait loop that finds its own shell: $loop" || failed=1
+          wake_log "$line" || failed=1
         else
           failed=1
         fi
@@ -838,29 +998,36 @@ while read -r name state _; do
     activity='{"running": ""}'
   fi
 
-  # Busy, and not a session that ended its turn to wait for its own job.
-  seen=$main/$SHIPLINE_STATE_FOLDER/$name.screen-seen
-  if [[ $state != busy || -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]]; then
-    rm -f "$seen"
-    continue
+  # Idle, and no rule above covers it: not a wait for its own job or turn, not a worker on a
+  # ready pull request, not a question to the owner. Named once per head; nothing is typed.
+  idle_at=""
+  [[ ! -e $notes.idle ]] || idle_at=$(written_at "$notes.idle")
+  if [[ $state == idle && $idle_at =~ ^[0-9]+$ && -z $since && ! -e $notes.asking ]] &&
+      ((NOW - idle_at >= IDLE_NO_RULE_SECONDS)) &&
+      { [[ $name != ticket-* ]] || ! grep -qE "^$number false " <<<"$pulls"; }; then
+    mark=$main/$SHIPLINE_STATE_FOLDER/$name.idle-noted
+    if [[ ! -r $mark || $(<"$mark") != "$head" ]] && quiet "$name"; then
+      line="idle, no rule: $name ($(((NOW - idle_at) / 60)) min, last line: $(last_line "$name"))"
+      if note_for_wake "$name-idle-$NOW" "$line"; then
+        printf '%s\n' "$head" >"$mark" || failed=1
+        wake_log "$line" || failed=1
+      else
+        failed=1
+      fi
+    fi
   fi
-  if asks_permission "$name"; then
-    rm -f "$seen"
-    continue
-  fi
-  sum=$(screen_sum "$name") || continue
-  read -r last_sum last_since <"$seen" 2>/dev/null || last_sum=""
-  if [[ $last_sum != "$sum" || ! $last_since =~ ^[0-9]+$ ]]; then
-    echo "$sum $NOW" >"$seen" || failed=1
-    continue
-  fi
+
+  # A session given a message in this tick has a new screen at the next.
+  [[ $busy == true && $nudged != *" $name "* ]] || continue
   ((NOW - last_since >= STUCK_AFTER_SECONDS)) || continue
+  asks_permission "$name" && continue
   mark=$main/$SHIPLINE_STATE_FOLDER/$name.stuck-noted
-  [[ ! -r $mark || $(<"$mark") != "$last_since" ]] || continue
+  [[ ! -r $mark || $(<"$mark") != "$last_since $head" ]] || continue
   what=$(jq -r '.running // ""' <<<"$activity")
-  line="stuck? $name ($(((NOW - last_since) / 60)) min, running: ${what:-no command})"
-  if note_for_wake "$name-stuck-$last_since" "$line"; then
-    echo "$last_since" >"$mark" || failed=1
+  nudge_busy "$name" still stuck
+  line="stuck? $name ($(((NOW - last_since) / 60)) min, running: ${what:-no command})$outcome"
+  if note_for_wake "$name-stuck-$last_since-$NOW" "$line"; then
+    echo "$last_since $head" >"$mark" || failed=1
     wake_log "$line" || failed=1
   else
     failed=1

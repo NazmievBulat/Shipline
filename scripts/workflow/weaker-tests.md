@@ -3,9 +3,9 @@
 From the repository root:
 
 ```bash
-scripts/workflow/weaker-tests --base origin/main
-scripts/workflow/weaker-tests --base origin/main --working-tree
-scripts/workflow/weaker-tests 227
+shipline weaker-tests --base origin/main
+shipline weaker-tests --base origin/main --working-tree
+shipline weaker-tests 227
 ```
 
 The first command compares the merge base with HEAD. `--head <commit>` selects a published
