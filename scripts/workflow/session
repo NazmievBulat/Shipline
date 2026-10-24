@@ -529,7 +529,12 @@ wait_for_link() {
 # The sentence a worker or an audit is started with.
 sentence_of() {
   case $1 in
-    ticket-*) echo "Implement pull request ${1#ticket-} $RULES_ON_MAIN" ;;
+    ticket-*)
+      # A failing test of a handed-off pull request names its run (`check_repair.py`).
+      local worker_sentence
+      worker_sentence=$(python3 -B "$script_dir/check_repair.py" sentence "$main/$SHIPLINE_STATE_FOLDER" "${1#ticket-}")
+      echo "$worker_sentence $RULES_ON_MAIN"
+      ;;
     audit-*) echo "Audit pull request ${1#audit-} $RULES_ON_MAIN" ;;
     review-*)
       local review_sentence

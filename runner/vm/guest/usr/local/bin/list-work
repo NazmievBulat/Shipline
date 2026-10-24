@@ -1,0 +1,25 @@
+#!/bin/bash
+# Prints what one folder holds, one line for each thing in it at any depth, in a fixed order: its
+# kind and mode, its owner, what it holds (the SHA-256 of a file, where a link points), its path.
+# The image build lists the work folder with it (vm.Dockerfile), and check-isolation lists it again
+# before a job: the two must be equal, so nothing an earlier job left or changed there slips by.
+#
+#   list-work <folder>
+#
+# A path is printed quoted, a new line in a name included, so that no name prints like another
+# line. A folder that is not there holds nothing.
+set -euo pipefail
+[ -e "$1" ] || exit 0
+cd "$1"
+find . -mindepth 1 -print0 | LC_ALL=C sort -z | while IFS= read -r -d '' path; do
+  # The raw mode in hexadecimal holds the kind as well: file, folder, link, pipe, device.
+  read -r mode owner < <(stat --printf '%f %u:%g\n' -- "$path")
+  if [ -L "$path" ]; then
+    holds=$(printf '%q' "$(readlink -- "$path")")
+  elif [ -f "$path" ]; then
+    holds=$(sha256sum <"$path" | cut -d' ' -f1)
+  else
+    holds=-
+  fi
+  printf '%s %s %s %q\n' "$mode" "$owner" "$holds" "${path#./}"
+done

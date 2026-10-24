@@ -116,7 +116,7 @@ def _runner_token(program: str) -> str | None:
         if not marker.exists():
             print(
                 f"{program}: no GitHub identity of its own in {github_identity.folder()}; "
-                "using the gh login (.github/runner/README.md says how to give it one)",
+                "using the gh login (runner/README.md says how to give it one)",
                 file=sys.stderr,
                 flush=True,
             )

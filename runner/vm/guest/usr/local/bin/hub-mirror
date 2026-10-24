@@ -1,0 +1,18 @@
+#!/bin/sh
+# Runs as root inside the virtual machine before its Docker starts (hub-mirror.service). Docker
+# pulls Docker Hub images through the cache on the home machine (README.md, "Docker Hub cache")
+# only when the cache answers now. A mirror that does not answer costs Docker a wait for each
+# request before it goes to Docker Hub, and a firewall that drops the address makes that wait
+# long, so an unanswered question here leaves Docker on Docker Hub for the whole job.
+#
+# Keep the address in step with hub_cache_address and hub_cache_port in settings.sh.
+mirror=http://172.31.255.2:5000
+config=/etc/docker/daemon.json
+
+if curl --silent --fail --max-time 3 --output /dev/null "$mirror/v2/"; then
+  mkdir -p "$(dirname "$config")"
+  printf '{"registry-mirrors": ["%s"]}\n' "$mirror" >"$config"
+  echo "Docker pulls Docker Hub images through the cache at $mirror."
+else
+  echo "The Docker Hub cache at $mirror does not answer; Docker pulls from Docker Hub."
+fi
