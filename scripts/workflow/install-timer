@@ -12,7 +12,11 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-sh "$here/../../.github/runner/install-github-budget.sh"
+# The runner's installer of the shared GitHub budget's `gh`, where the repository holds one.
+budget_installer=$here/../../.github/runner/install-github-budget.sh
+if [[ -f $budget_installer ]]; then
+  sh "$budget_installer"
+fi
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
 units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 

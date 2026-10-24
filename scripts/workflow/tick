@@ -69,8 +69,20 @@ FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 gh() { python3 "$here/github_budget.py" call tick "$@"; }
 source "$here/bridge-failed"
-# Use the same repository as the runner registration and the worker gh shim.
-source "$here/../../.github/runner/settings.sh"
+# Use the same repository as the runner registration and the worker gh shim: the runner's
+# settings name it where the repository holds them, and otherwise the main checkout's `origin`.
+settings=$here/../../.github/runner/settings.sh
+if [[ -f $settings ]]; then
+  source "$settings"
+else
+  repository=$(git -C "$here" config --get remote.origin.url | sed -nE 's#/$##; s#\.git$##;
+    s#^(https://([^/@]+@)?|ssh://git@|git@)github\.com[:/]([^/]+/[^/]+)$#\3#p')
+fi
+if [[ -z ${repository:-} ]]; then
+  echo "cannot tell which repository the workflow works on: $settings is missing and" \
+    "origin names no GitHub repository" >&2
+  exit 1
+fi
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)") || exit 1
 
 # A second tick exits while the first still runs.

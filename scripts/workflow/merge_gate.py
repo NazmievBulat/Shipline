@@ -13,19 +13,16 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Generator, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any, NoReturn
 
-import advisory_service
 import priority
-import pushing_checkout
 import train_reads
 from merge_handoff import Handoff, authorized
-from run_proof import RECEIPT, passed_jobs
-from run_proof import WHOLE as WHOLE_REQUEST
 from workflow_commands import (
     COMMAND_TIMEOUT,
     GIT_READ_TIMEOUT,
@@ -40,6 +37,65 @@ from workflow_commands import (
 from workflow_commands import (
     run as run_command,
 )
+
+# A repository may hold three helpers beside these scripts, and the gate uses them when it does:
+# `advisory_service` tells a scan that could not reach a package advisory service, which is a
+# wait; `pushing_checkout` installs the pushing checkout's packages before its hook and words a
+# hook's refusal; `run_proof` reads and writes the `Workflow-Proof` line with which main skips a
+# job its squash proved. Without them a failed push is refused with its last lines, nothing is
+# installed first, and no proof is read or written, so main never skips a job: a job counts as
+# passed only where it passed itself. A helper that is there but cannot start stops the gate.
+try:
+    import advisory_service
+except ModuleNotFoundError as error:
+    if error.name != "advisory_service":
+        raise
+    advisory_service = None
+try:
+    import pushing_checkout
+except ModuleNotFoundError as error:
+    if error.name != "pushing_checkout":
+        raise
+    pushing_checkout = None
+try:
+    from run_proof import RECEIPT, passed_jobs
+    from run_proof import WHOLE as WHOLE_REQUEST
+except ModuleNotFoundError as error:
+    if error.name != "run_proof":
+        raise
+    RECEIPT = WHOLE_REQUEST = None
+
+    def passed_jobs(parts: list[dict[str, Any]]) -> set[str]:
+        """The jobs that passed in the run itself, a job run in parts once each of its parts
+        did; no proof line is read."""
+        grouped: dict[str, list[tuple[re.Match[str] | None, dict[str, Any]]]] = {}
+        for job in parts:
+            part = re.fullmatch(r"(.+) \((\d+) of (\d+)\)", job["name"])
+            grouped.setdefault(part[1] if part else job["name"], []).append((part, job))
+        return {
+            name
+            for name, group in grouped.items()
+            if all(job.get("conclusion") == "success" for _, job in group)
+            and sorted((int(part[2]), int(part[3])) for part, _ in group if part)
+            in ([], [(number, len(group)) for number in range(1, len(group) + 1)])
+        }
+
+
+def mechanical_conflicts() -> ModuleType | None:
+    """The repository's rules for the conflicts and migration numbers a refresh settles itself,
+    `mechanical_conflicts` beside the scripts, read only when a refresh needs them. Without
+    them no conflict is mechanical and there are no migrations to renumber."""
+    try:
+        import mechanical_conflicts as rules
+    except ModuleNotFoundError as error:
+        if error.name != "mechanical_conflicts":
+            raise
+        return None
+    return rules
+
+
+# How many of its last lines a failed push is refused with, when the repository words no refusal.
+REFUSAL_LINES = 10
 
 REPOSITORY = "NazmievBulat/Shipline"
 API = f"repos/{REPOSITORY}"
@@ -61,6 +117,29 @@ WINDOW_CEILING = 4
 # A check GitHub still lists as queued or running this long after its run completed was lost:
 # GitHub missed its end, and no wait brings it.
 LOST_AFTER_SECONDS = 10 * 60
+# How many times a handoff judges its own place again when the line changed it meanwhile.
+HANDOFF_ATTEMPTS = 3
+# How long a handoff's one check of its head, under the merge lock, may take.
+HEAD_CHECK_TIMEOUT = 10
+# A handoff's last read of its pull request still stands this long after it; a longer wait for
+# the merge lock reads it again, at most LOCK_WAITS times.
+FRESH_READ_SECONDS = 5
+LOCK_WAITS = 10
+# Each member's own entries in the saved line, by the Train attribute that holds them.
+MEMBER_ENTRIES = (
+    "blocked",
+    "suspended",
+    "conflicts",
+    "approved",
+    "proven",
+    "batch_failed",
+    "suites",
+    "proofs",
+    "priorities",
+    "reruns",
+    "lost",
+)
+MEMBER_MARKS = ("unavailable", "fixes", "refreshable")
 
 # Set only while computing train order, never while verifying a merge.
 _planning_reads: train_reads.Reads | None = None
@@ -171,8 +250,8 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     gate sets it for every push it makes. The hook runs with the pushing checkout's packages,
     installed first when its lockfiles changed since their last install. A failed install, or
     a scan that could not reach an advisory service after its own tries, is a wait."""
-    checkout = pushing_checkout.top(where)
-    failed = pushing_checkout.install_if_changed(checkout)
+    checkout = pushing_checkout.top(where) if pushing_checkout else where or Path.cwd()
+    failed = pushing_checkout.install_if_changed(checkout) if pushing_checkout else ""
     if failed:
         raise PackagesWaiting(failed)
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
@@ -187,6 +266,8 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         output,
         push_failure(output, checkout) if done.returncode else "",
     )
+    if advisory_service is None:
+        return pushed
     folder = main_checkout() / ".local" / "workflow"
     service = advisory_service.unreachable(output) if pushed.returncode else None
     if service:
@@ -206,7 +287,10 @@ def push_failure(output: str, checkout: Path) -> str:
 
     The first line is all the wake and a hand-back show, so a shortage is named there, before
     the hook's step that failed and its last lines."""
-    refusal = pushing_checkout.refusal(output, checkout)
+    if pushing_checkout:
+        refusal = pushing_checkout.refusal(output, checkout)
+    else:
+        refusal = "\n".join([line for line in output.splitlines() if line.strip()][-REFUSAL_LINES:])
     shortage = next(
         (line.strip() for line in output.splitlines() if short_of_memory(line)),
         None,
@@ -476,6 +560,8 @@ def _failed_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def unreached_service(parts: list[dict[str, Any]]) -> str | None:
     """The advisory service whose absence alone failed a CI run, from the audit's annotation:
     "CI: dependencies" is the only failed job besides "CI result", which follows it."""
+    if advisory_service is None:
+        return None
     failed = _failed_jobs(parts)
     if {job["name"] for job in failed} - {"CI result"} != {"CI: dependencies"}:
         return None
@@ -566,8 +652,13 @@ def _rerun(
             return f"automatic retry of {name} deferred: main moved"
     folder.mkdir(parents=True, exist_ok=True)
     note = f"automatic retry requested for failed jobs of {name} {when}"
-    # Claim before contacting GitHub: an interrupted or ambiguous request must not repeat.
-    marker.write_text(note + "\n")
+    # Claim before contacting GitHub: an interrupted or ambiguous request must not repeat. Of two
+    # calls at once (a handoff judges its own run outside the merge lock), only one sends it.
+    try:
+        with marker.open("x") as claim:
+            claim.write(note + "\n")
+    except FileExistsError:
+        return f"the re-run of {name} is requested; GitHub has not shown it yet"
     try:
         done = command(
             "gh", "run", "rerun", str(run["id"]), "-R", REPOSITORY, "--failed", check=False
@@ -582,11 +673,15 @@ def _rerun(
     else:
         note = f"automatically re-ran failed jobs of {name} {when}"
     marker.write_text(note + "\n")
+    wake_log(note)
+    return note
+
+
+def wake_log(line: str) -> None:
     log = Path.home() / ".local/state/workflow/wake.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a") as output:
-        output.write(f"{int(time.time())} {note}\n")
-    return note
+        output.write(f"{int(time.time())} {line}\n")
 
 
 def pull_service_wait(
@@ -982,6 +1077,7 @@ def _refresh_health(folder: Path, *, retry: bool = False) -> tuple[str, Health]:
     # The tick asks a service a push found unreachable, so that its next outage is told too.
     if (
         retry
+        and advisory_service
         and (note := advisory_service.down(folder))
         and advisory_service.answers(note["service"])
     ):
@@ -1047,13 +1143,17 @@ def browser_needed(base: str, merge: str) -> bool:
 
     The gate reads the exact difference from main, so a merge that changes nothing needs
     none; the planner runs on an empty diff only because it cannot tell one from a misread.
+    A repository that holds no planner has no browser suite, so no change needs one.
     """
+    planner = HERE.parent / "e2e-plan.py"
+    if not planner.exists():
+        return False
     changed = command(
         "git", "diff", "--no-renames", "--name-only", "-z", base, merge, errors="surrogateescape"
     ).stdout.split("\0")[:-1]
     if not changed:
         return False
-    found = importlib.util.spec_from_file_location("e2e_plan", HERE.parent / "e2e-plan.py")
+    found = importlib.util.spec_from_file_location("e2e_plan", planner)
     if found is None or found.loader is None:
         raise Refused("could not read the E2E planner")
     plan = importlib.util.module_from_spec(found)
@@ -1194,9 +1294,8 @@ def refresh_pull(
     train.refreshable.discard(number)
     merged = command("git", "merge", "--no-ff", "--no-commit", base, check=False)
     message = "chore: test against current main"
+    rules = mechanical_conflicts()
     if mechanical:
-        from mechanical_conflicts import MechanicalConflict, resolve
-
         conflicts = git("diff", "--name-only", "--diff-filter=U").splitlines()
         if conflicts:
             Path(git("rev-parse", "--git-path", "MERGE_MSG")).write_text(
@@ -1208,9 +1307,17 @@ def refresh_pull(
             and command("git", "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode
         ):
             raise Refused(merged.stderr.strip() or merged.stdout.strip())
+    if mechanical and rules is None and (conflicts or conflicting(pull)):
+        # Without the repository's rules no conflict is mechanical, whether git or only GitHub
+        # sees it: the reviewer resolves it.
+        where = f" in {', '.join(conflicts)}" if conflicts else ""
+        raise Refused(
+            f"non-mechanical conflict{where}: the repository resolves no conflict mechanically"
+        )
+    if mechanical and rules is not None:
         try:
-            resolved = resolve(head, base)
-        except MechanicalConflict as error:
+            resolved = rules.resolve(head, base)
+        except rules.MechanicalConflict as error:
             if conflicts:
                 raise Refused(f"non-mechanical conflict in {', '.join(conflicts)}: {error}") from error
             raise Refused(str(error)) from error
@@ -1230,20 +1337,15 @@ def refresh_pull(
         raise Refused(merged.stderr.strip() or merged.stdout.strip())
     if (
         not mechanical
+        and rules is not None
         and not command("git", "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode
     ):
         # Git merges two migrations numbered alike in different files cleanly; the migration
         # tool then has two heads. The branch's new ones move past main's last, or wait as a
         # conflict.
-        from mechanical_conflicts import (
-            MechanicalConflict,
-            MigrationCollision,
-            renumber_migrations,
-        )
-
         try:
-            moved = renumber_migrations(head, base)
-        except MigrationCollision as error:
+            moved = rules.renumber_migrations(head, base)
+        except rules.MigrationCollision as error:
             message = "merge main: conflict in " + ", ".join(error.paths)
             Path(git("rev-parse", "--git-path", "MERGE_MSG")).write_text(message + "\n")
             train.conflicts[number] = head
@@ -1253,7 +1355,7 @@ def refresh_pull(
                 f"mechanically ({error}); renumber the branch's migrations after main's last, "
                 f"commit with '{message}', push, then wait for CI"
             ) from error
-        except MechanicalConflict as error:
+        except rules.MechanicalConflict as error:
             raise Refused(str(error)) from error
         if moved:
             message = "merge main: renumber migration " + ", ".join(
@@ -1261,7 +1363,7 @@ def refresh_pull(
             )
     # An older run without provenance cannot prove freshness. If main is already contained,
     # an empty commit requests a new pull_request event rather than replaying the old event.
-    if Handoff.read(train.path.parent, number) is not None:
+    if WHOLE_REQUEST and Handoff.read(train.path.parent, number) is not None:
         message += "\n\n" + WHOLE_REQUEST
     _commit_and_push(pull, train, number, message, save=unblocked)
     print(
@@ -2111,6 +2213,76 @@ class Train:
         self.save()
         return self.first == number
 
+    def member(self, number: str) -> dict[str, Any]:
+        """What the line holds of one member alone."""
+        return {
+            "queued": number in self.queue,
+            **{name: getattr(self, name).get(number) for name in MEMBER_ENTRIES},
+            **{name: number in getattr(self, name) for name in MEMBER_MARKS},
+        }
+
+    def admit(self, view: "OwnView") -> None:
+        """Take a member's own part from its view, keeping every other member as saved."""
+        number = view.number
+        if view.left:
+            self.queue = [entry for entry in self.queue if entry != number]
+        if number in view.queue and number not in self.queue:
+            self.queue.append(number)
+            # Whether its checks still run is the tick's to read with the others': until then
+            # it does not take the turn from a member whose run is green.
+            if number not in self.pending:
+                self.pending.append(number)
+        for name in MEMBER_ENTRIES:
+            entries, judged = getattr(self, name), getattr(view, name)
+            entries.pop(number, None)
+            if number in judged:
+                entries[number] = judged[number]
+        self.unavailable = [entry for entry in self.unavailable if entry != number]
+        self.fixes = [entry for entry in self.fixes if entry != number]
+        self.refreshable.discard(number)
+        self.unavailable += [number] if number in view.unavailable else []
+        self.fixes += [number] if number in view.fixes else []
+        self.refreshable |= {number} & view.refreshable
+        self.save()
+
+
+class OwnView(Train):
+    """One member's part of the line, judged as `claim` judges it, apart from the other members.
+
+    A handoff judges its own pull request with it before it takes the merge lock: it reads the
+    saved line without the lock, reads GitHub only about this member and main, and saves
+    nothing. The line takes its result under the lock (Train.admit); the other members' order is
+    left to the turn of the line, whose merge driver reads them.
+    """
+
+    def __init__(self, folder: Path, number: str) -> None:
+        super().__init__(folder)
+        self.number = number
+        # Whether the member left the queue while judged: it joins again at the back.
+        self.left = False
+        # Whether the line's judgment of the member finished, so its result can be taken.
+        self.judged = False
+        self.queue = [entry for entry in self.queue if entry == number]
+        for name in MEMBER_ENTRIES:
+            entries = getattr(self, name)
+            setattr(self, name, {number: entries[number]} if number in entries else {})
+        self.unavailable = [entry for entry in self.unavailable if entry == number]
+        self.fixes = [entry for entry in self.fixes if entry == number]
+        self.refreshable &= {number}
+        self.pending = []
+        self.passing = []
+        self.first = self.front()
+
+    def reconcile(self, known: dict[str, Any] | None = None, acting: str | None = None) -> None:
+        self.judged = False
+        self._reconcile(known, acting)
+        if self.number not in self.queue:
+            self.left = True
+        self.judged = True
+
+    def save(self) -> None:
+        self.first = self.front()
+
 
 def _run_token(run: dict[str, Any]) -> str:
     return f"{run['id']}:{run.get('run_attempt', 1)}"
@@ -2188,11 +2360,12 @@ def _merge_tree(base: str, head: str) -> str | None:
 
 
 def _taken_migrations(head: str, base: str) -> list[str]:
-    from mechanical_conflicts import MechanicalConflict, taken_migrations
-
+    rules = mechanical_conflicts()
+    if rules is None:
+        return []
     try:
-        return taken_migrations(head, base)
-    except MechanicalConflict as error:
+        return rules.taken_migrations(head, base)
+    except rules.MechanicalConflict as error:
         raise Refused(f"could not compare migration numbers: {error}") from error
 
 
@@ -2328,6 +2501,9 @@ def squash_proof(
     tree: str,
     evidence: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]],
 ) -> str:
+    """The `Workflow-Proof` line of a squash, or none where the repository writes no proof."""
+    if RECEIPT is None:
+        return ""
     sources = []
     for key, (run, parts) in evidence.items():
         workflow = key.split("_", 1)[0]
@@ -2364,7 +2540,7 @@ def commit_list(number: str) -> str:
 def squash_body(number: str, proof: str) -> Iterator[str]:
     listed = commit_list(number)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt") as body:
-        body.write((listed + "\n\n" if listed else "") + proof + "\n")
+        body.write("\n\n".join(part for part in (listed, proof) if part) + "\n")
         body.flush()
         yield body.name
 
@@ -3253,95 +3429,189 @@ def train_status(folder: Path) -> int:
     return 0
 
 
-def pre_train_checks(number: str, folder: Path) -> None:
-    """A failed local inventory must neither join nor stay approved for a prefix."""
-    done = command("bash", str(HERE / "pre-train-checks"), check=False)
+def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> None:
+    """A failed local inventory must neither join nor stay approved for a prefix.
+
+    A repository that holds no `pre-train-checks` beside the gate has none to fail. A caller
+    that does not hold the merge lock (a handoff) takes it only to leave the line."""
+    checks = HERE / "pre-train-checks"
+    if not checks.exists():
+        return
+    done = command("bash", str(checks), check=False)
     print(done.stdout, end="", flush=True)
     print(done.stderr, end="", file=sys.stderr, flush=True)
     if done.returncode:
-        train = Train(folder)
-        members = train.prefixes["members"] if train.prefixes else []
-        for index, member in enumerate(members):
-            if member["number"] == number:
-                _drop_line(train, index)
-                break
-        train.remove(number)
-        Handoff.path(folder, number).unlink(missing_ok=True)
+        with nullcontext() if locked else handoff_lock(folder, number):
+            train = Train(folder)
+            members = train.prefixes["members"] if train.prefixes else []
+            for index, member in enumerate(members):
+                if member["number"] == number:
+                    _drop_line(train, index)
+                    break
+            train.remove(number)
+            Handoff.path(folder, number).unlink(missing_ok=True)
         raise Refused("pre-train checks failed; fix the inventory before joining the merge train")
 
 
-def handoff(number: str, folder: Path) -> int:
-    """A published passed round is required before the reviewer can leave."""
-    folder.mkdir(parents=True, exist_ok=True)
+@contextmanager
+def handoff_lock(folder: Path, number: str) -> Iterator[None]:
+    """The merge lock, held by a handoff: how long it held it goes to the wake log."""
     with (folder / "merge.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        pull = read_pull(number)
-        head = pull["headRefOid"]
-        # Checks failed only for an unreachable advisory service: the tick waits and re-runs.
-        if (
-            not ready(pull)
-            or conflicting(pull)
-            or (failed_checks(pull) and not pull_service_wait(pull, folder, number))
-        ):
-            raise Refused("only a ready, non-conflicting pull request can be handed off")
-        if git("rev-parse", "HEAD") != head or git("status", "--porcelain"):
-            raise Refused("handoff requires the clean published pull request worktree")
-        if git("branch", "--show-current") != pull["headRefName"]:
-            raise Refused("handoff requires the pull request branch")
-        reviews = api(f"{API}/pulls/{number}/reviews")
-        rounds = []
-        for review in reviews:
-            match = re.match(
-                r"^<!-- workflow-review round=([0-9]+)(?: result=(sent-back|passed))? -->",
-                review.get("body") or "",
-            )
-            if match:
-                rounds.append((int(match[1]), match[2], review.get("commit_id")))
-        latest = max(enumerate(rounds), key=lambda r: (r[1][0], r[0]))[1] if rounds else None
-        if latest is None or latest[1:] != ("passed", head):
-            raise Refused("the latest independent round must have passed on the current head")
-        from conflict_review import Scope, passed
-
-        current = next(
-            review
-            for review in reversed(reviews)
-            if review.get("commit_id") == head
-            and (review.get("body") or "").startswith(
-                f"<!-- workflow-review round={latest[0]} result=passed -->"
-            )
-        )
-        conflict = re.search(
-            r"^<!-- workflow-conflict extends=([0-9a-f]{40}) -->$",
-            current["body"],
-            re.MULTILINE,
-        )
-        if "<!-- workflow-conflict" in current["body"] and conflict is None:
-            raise Refused("conflict round needs full review: invalid conflict marker")
-        if conflict:
-            try:
-                scope = Scope.read(folder, number)
-                if (
-                    scope is None
-                    or scope.head != conflict[1]
-                    or passed(reviews, scope.head) is None
-                ):
-                    raise ValueError("conflict round lacks its scope or earlier passed round")
-                scope.validate(Path.cwd(), head)
-            except (ValueError, OSError, TypeError) as error:
-                raise Refused(f"conflict round needs full review: {error}") from error
-        pre_train_checks(number, folder)
-        note = Handoff(head, max(r[0] for r in rounds), pull["headRefName"])
-        train = Train(folder)
+        taken = time.monotonic()
         try:
-            train.claim(number, pull)
-        except Waiting:
+            yield
+        finally:
+            held = time.monotonic() - taken
+            try:
+                wake_log(f"handoff {number} held the merge lock for {held:.1f} s")
+            except OSError as error:
+                print(f"could not log the handoff's hold of the merge lock: {error}", flush=True)
+
+
+def _confirm_head(branch: str, head: str) -> None:
+    """Under the merge lock: the branch's head on GitHub is still `head`. One try of git, bounded
+    by HEAD_CHECK_TIMEOUT, with no gh call: it waits for neither GitHub's budget nor a call slot."""
+    ref = f"refs/heads/{branch}"
+    try:
+        done = run_command("git", "ls-remote", "--heads", "origin", ref, timeout=HEAD_CHECK_TIMEOUT)
+    except CommandTimeout:
+        raise Refused("could not confirm the head; try again") from None
+    if done.returncode:
+        raise Refused("could not confirm the head; try again")
+    # A pattern matches the end of a ref's name: only the branch's own line counts.
+    if [line.split() for line in done.stdout.splitlines() if line.endswith(f"\t{ref}")] != [
+        [head, ref]
+    ]:
+        raise Refused("the pull request head changed during the handoff; review it again")
+
+
+def _failing(pull: dict[str, Any]) -> set[str]:
+    return {check.get("name", check.get("context", "unknown")) for check in _failed_rollup(pull)}
+
+
+def handoff(number: str, folder: Path) -> int:
+    """A published passed round is required before the reviewer can leave.
+
+    Its own pull request is checked, and its place in the line judged, before the merge lock is
+    taken. Under the lock the handoff only confirms its head with git, joins the line and saves
+    its note: the other members' order is the tick's to read, at the turn of the line.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    pull = read_pull(number)
+    head = pull["headRefOid"]
+    # Checks failed only for an unreachable advisory service: the tick waits and re-runs.
+    if (
+        not ready(pull)
+        or conflicting(pull)
+        or (failed_checks(pull) and not pull_service_wait(pull, folder, number))
+    ):
+        raise Refused("only a ready, non-conflicting pull request can be handed off")
+    if git("rev-parse", "HEAD") != head or git("status", "--porcelain"):
+        raise Refused("handoff requires the clean published pull request worktree")
+    if git("branch", "--show-current") != pull["headRefName"]:
+        raise Refused("handoff requires the pull request branch")
+    reviews = api(f"{API}/pulls/{number}/reviews")
+    rounds = []
+    for review in reviews:
+        match = re.match(
+            r"^<!-- workflow-review round=([0-9]+)(?: result=(sent-back|passed))? -->",
+            review.get("body") or "",
+        )
+        if match:
+            rounds.append((int(match[1]), match[2], review.get("commit_id")))
+    latest = max(enumerate(rounds), key=lambda r: (r[1][0], r[0]))[1] if rounds else None
+    if latest is None or latest[1:] != ("passed", head):
+        raise Refused("the latest independent round must have passed on the current head")
+    from conflict_review import Scope, passed
+
+    current = next(
+        review
+        for review in reversed(reviews)
+        if review.get("commit_id") == head
+        and (review.get("body") or "").startswith(
+            f"<!-- workflow-review round={latest[0]} result=passed -->"
+        )
+    )
+    conflict = re.search(
+        r"^<!-- workflow-conflict extends=([0-9a-f]{40}) -->$",
+        current["body"],
+        re.MULTILINE,
+    )
+    if "<!-- workflow-conflict" in current["body"] and conflict is None:
+        raise Refused("conflict round needs full review: invalid conflict marker")
+    if conflict:
+        try:
+            scope = Scope.read(folder, number)
+            if (
+                scope is None
+                or scope.head != conflict[1]
+                or passed(reviews, scope.head) is None
+            ):
+                raise ValueError("conflict round lacks its scope or earlier passed round")
+            scope.validate(Path.cwd(), head)
+        except (ValueError, OSError, TypeError) as error:
+            raise Refused(f"conflict round needs full review: {error}") from error
+    pre_train_checks(number, folder, locked=False)
+    note = Handoff(head, max(r[0] for r in rounds), pull["headRefName"])
+    checked = pull
+    attempts = waits = 0
+    view: OwnView | None = None
+    while True:
+        if view is None:
+            if attempts == HANDOFF_ATTEMPTS:
+                raise Waiting(
+                    "the merge line kept changing this pull request's place; run the handoff again"
+                )
+            attempts += 1
+            if pull is not checked:
+                # A check failed since the first read: judged as the first read was.
+                if failed_checks(pull) and not pull_service_wait(pull, folder, number):
+                    raise Refused("only a ready, non-conflicting pull request can be handed off")
+                checked = pull
+            view = OwnView(folder, number)
+            before = view.member(number)
+            outcome: Refused | None = None
+            try:
+                view.claim(number, pull)
+            except Refused as error:
+                if not view.judged:
+                    raise
+                outcome = error
+        # Read again just before the lock: GitHub's budget, its call slots and its retries are
+        # waited for here, never while the lock is held.
+        fresh = read_pull(number)
+        if (fresh["headRefOid"], fresh["headRefName"]) != (head, pull["headRefName"]):
+            raise Refused("the pull request head changed during the handoff; review it again")
+        if not ready(fresh) or conflicting(fresh):
+            raise Refused("only a ready, non-conflicting pull request can be handed off")
+        if _failing(fresh) - _failing(pull):
+            # A check failed meanwhile: judged again, as the first read was.
+            pull, view = fresh, None
+            continue
+        read = time.monotonic()
+        with handoff_lock(folder, number):
+            if time.monotonic() - read > FRESH_READ_SECONDS:
+                # Another holder kept the lock long enough for that read to be old: let it go
+                # and read again.
+                waits += 1
+                if waits > LOCK_WAITS:
+                    raise Waiting("the merge lock stayed busy; run the handoff again")
+                continue
+            _confirm_head(pull["headRefName"], head)
+            train = Train(folder)
+            if train.member(number) != before:
+                # The tick or a gate changed its place meanwhile: judge it again.
+                pull, view = fresh, None
+                continue
+            train.admit(view)
             # Queued and passed over in its place until the tick's re-run is green; a wait
-            # before it was queued (an unreadable member) is no handoff.
-            if number not in Train(folder).queue:
-                raise
-        note.save(folder, number)
+            # before it was queued is no handoff.
+            if outcome is not None and not (isinstance(outcome, Waiting) and number in train.queue):
+                raise outcome
+            note.save(folder, number)
         print(f"pull request {number} handed to the tick after round {note.round}")
-    return 0
+        return 0
 
 
 def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
