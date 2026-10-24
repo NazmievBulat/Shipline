@@ -584,7 +584,9 @@ WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/main-status" --tick-main-status 9>&- ||
 budget_ready || paused
 
 # Passed reviews can leave a durable merge handoff instead of a model waiting in line.
-# The driver calls the same gate and returns every refusal needing judgment to review.
+# The driver calls the same gate and returns every refusal needing judgment to review. A failing
+# test of a handoff's own makes it a draft, which a worker below fixes in its line place; its
+# runners' failure is re-run once (`check_repair.py`).
 WORKFLOW_BACKGROUND_GITHUB=1 python3 -B "$here/merge_driver.py" 9>&- || failed=1
 budget_ready || paused
 running=$(session list) || failed=1
