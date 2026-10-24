@@ -17,10 +17,17 @@ from pathlib import Path
 
 RUNNER = Path(__file__).resolve().parents[2] / "runner"
 PREFIX = "example-app"
-REPOSITORY = "example-owner/example-app"
-# The label every ordinary pull request job asks for.
-ORDINARY = f"{PREFIX}-home"
+# This machine, and the other machine of the pool, which may take its pull request jobs.
+MACHINE = "machine-two"
+OTHER = "machine-one"
 SHARED_JOB_MEMORY = "8g"
+SPARE_UNIT = f"{PREFIX}-runner-spare.service"
+ORDINARY_UNIT = f"{PREFIX}-runner@"
+
+
+def ordinary_label(machine: str) -> str:
+    """The label of a machine's ordinary runners."""
+    return f"{PREFIX}-{machine}"
 
 
 def runner_name(machine: str, kind: str, number: int = 1) -> str:
@@ -48,7 +55,7 @@ exit 1
 @dataclass
 class Machine:
     root: Path
-    name: str = "machine-two"
+    name: str = MACHINE
     env: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -63,11 +70,15 @@ class Machine:
     def pool_settings(self) -> Path:
         return self.root / "home" / ".config" / PREFIX / "pool.sh"
 
-    def settle(self, **settings: str | int) -> None:
-        """Write the machine's local settings, one `key=value` line each."""
+    def settle(self, slots: int, jobs_on: str | None = None, job_memory: str | None = None) -> None:
+        """Write the machine's local settings: its ordinary pull request slots, the machine that
+        takes its pull request jobs, and the memory cap of one ordinary job."""
         self.local_settings.parent.mkdir(parents=True, exist_ok=True)
-        lines = [f"runner_prefix={PREFIX}", f"repository={REPOSITORY}", f"machine={self.name}"]
-        lines += [f"{key}={value}" for key, value in settings.items()]
+        lines = [f"machine={self.name}", f"other_machines=({OTHER})", f"runner_count={slots}"]
+        if jobs_on is not None:
+            lines.append(f"ordinary_jobs_on={jobs_on}")
+        if job_memory is not None:
+            lines.append(f"job_memory={job_memory}")
         self.local_settings.write_text("\n".join(lines) + "\n")
 
     def runners(self, *listed: tuple[str, str, list[str]]) -> None:
@@ -144,6 +155,7 @@ def make_machine(root: Path) -> Machine:
     machine.env = {
         "PATH": f"{stand_ins}:{os.path.dirname(shutil.which('bash') or '/bin/bash')}:/usr/bin:/bin",
         "HOME": str(home),
+        "RUNNER_PREFIX": PREFIX,
         "SHIPLINE_RUNNER_SETTINGS": str(machine.local_settings),
         "GH_TOKEN": "stand-in",
     }

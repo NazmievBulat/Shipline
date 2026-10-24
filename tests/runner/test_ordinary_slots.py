@@ -5,15 +5,16 @@ another machine's ordinary runner is online again."""
 from pathlib import Path
 
 import pytest
-from slot_stand_ins import ORDINARY, Machine, make_machine, runner_name
+from slot_stand_ins import OTHER, Machine, make_machine, ordinary_label, runner_name
 
-OTHER = "machine-one"
+# The label of the other machine's ordinary runners.
+ORDINARY = ordinary_label(OTHER)
 
 
 @pytest.fixture
 def machine(tmp_path: Path) -> Machine:
     machine = make_machine(tmp_path)
-    machine.settle(role="ordinary", ordinary_slots=0, ordinary_jobs_elsewhere="yes")
+    machine.settle(slots=0, jobs_on=OTHER)
     return machine
 
 
@@ -54,7 +55,7 @@ def test_the_spare_holding_the_slot_is_not_another_machines_runner(machine: Mach
     """Else the spare would see itself online, give the slot back, and take it again."""
     machine.runners(
         (runner_name(OTHER, "ordinary"), "offline", [ORDINARY]),
-        _spare(machine, ORDINARY),
+        _spare(machine, ordinary_label(machine.name)),
     )
 
     assert machine.ordinary_slots() == 1
@@ -63,7 +64,7 @@ def test_the_spare_holding_the_slot_is_not_another_machines_runner(machine: Mach
 def test_a_machine_with_slots_of_its_own_keeps_them_beside_another_machine(
     machine: Machine,
 ) -> None:
-    machine.settle(role="ordinary", ordinary_slots=3)
+    machine.settle(slots=3)
     machine.runners((runner_name(OTHER, "ordinary"), "online", [ORDINARY]), _spare(machine))
 
     assert machine.ordinary_slots() == 3
@@ -79,7 +80,7 @@ def test_the_spare_takes_the_slot_while_no_other_machine_has_an_online_ordinary_
     assert done.returncode == 0, done.stderr
     (added,) = _label_calls(machine)
     assert "POST" in added
-    assert ORDINARY in added
+    assert ordinary_label(machine.name) in added
 
 
 def test_the_spare_gives_the_slot_back_once_another_machines_ordinary_runner_is_online(
@@ -87,7 +88,7 @@ def test_the_spare_gives_the_slot_back_once_another_machines_ordinary_runner_is_
 ) -> None:
     machine.runners(
         (runner_name(OTHER, "ordinary"), "online", [ORDINARY]),
-        _spare(machine, ORDINARY),
+        _spare(machine, ordinary_label(machine.name)),
     )
 
     done = machine.keep_spare()
@@ -95,7 +96,7 @@ def test_the_spare_gives_the_slot_back_once_another_machines_ordinary_runner_is_
     assert done.returncode == 0, done.stderr
     (removed,) = _label_calls(machine)
     assert "DELETE" in removed
-    assert ORDINARY in removed
+    assert ordinary_label(machine.name) in removed
 
 
 def test_the_spare_keeps_what_it_holds_when_the_runner_list_cannot_be_read(

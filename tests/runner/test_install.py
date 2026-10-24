@@ -4,7 +4,14 @@ pull request jobs, and writes the machine's own memory cap of one ordinary job."
 from pathlib import Path
 
 import pytest
-from slot_stand_ins import SHARED_JOB_MEMORY, Machine, make_machine
+from slot_stand_ins import (
+    ORDINARY_UNIT,
+    OTHER,
+    SHARED_JOB_MEMORY,
+    SPARE_UNIT,
+    Machine,
+    make_machine,
+)
 
 
 @pytest.fixture
@@ -15,20 +22,20 @@ def machine(tmp_path: Path) -> Machine:
 def test_a_machine_whose_jobs_go_to_another_machine_installs_with_no_ordinary_slot(
     machine: Machine,
 ) -> None:
-    machine.settle(role="ordinary", ordinary_slots=0, ordinary_jobs_elsewhere="yes")
+    machine.settle(slots=0, jobs_on=OTHER)
 
     done = machine.install()
 
     assert done.returncode == 0, done.stderr
     enabled = " ".join(machine.calls("systemctl"))
-    assert "spare" in enabled
-    assert "ordinary@" not in enabled
+    assert SPARE_UNIT in enabled
+    assert ORDINARY_UNIT not in enabled
 
 
 def test_a_machine_with_no_ordinary_slot_and_no_other_machine_for_its_jobs_is_refused(
     machine: Machine,
 ) -> None:
-    machine.settle(role="ordinary", ordinary_slots=0)
+    machine.settle(slots=0)
 
     done = machine.install()
 
@@ -37,8 +44,20 @@ def test_a_machine_with_no_ordinary_slot_and_no_other_machine_for_its_jobs_is_re
     assert machine.calls("systemctl") == []
 
 
+def test_a_machine_whose_jobs_go_to_a_machine_outside_the_pool_is_refused(
+    machine: Machine,
+) -> None:
+    machine.settle(slots=0, jobs_on="machine-elsewhere")
+
+    done = machine.install()
+
+    assert done.returncode != 0
+    assert "machine-elsewhere" in done.stderr
+    assert machine.calls("systemctl") == []
+
+
 def test_the_machines_own_job_memory_is_written_into_its_pool_settings(machine: Machine) -> None:
-    machine.settle(role="ordinary", ordinary_slots=3, job_memory="5g")
+    machine.settle(slots=3, job_memory="5g")
 
     done = machine.install()
 
@@ -47,7 +66,7 @@ def test_the_machines_own_job_memory_is_written_into_its_pool_settings(machine: 
 
 
 def test_a_job_container_is_capped_at_the_machines_own_job_memory(machine: Machine) -> None:
-    machine.settle(role="ordinary", ordinary_slots=3, job_memory="5g")
+    machine.settle(slots=3, job_memory="5g")
     assert machine.install().returncode == 0
 
     done = machine.start_job_container()
@@ -60,7 +79,7 @@ def test_a_job_container_is_capped_at_the_machines_own_job_memory(machine: Machi
 def test_a_job_container_is_capped_at_the_shared_value_when_the_machine_names_none(
     machine: Machine,
 ) -> None:
-    machine.settle(role="ordinary", ordinary_slots=3)
+    machine.settle(slots=3)
     assert machine.install().returncode == 0
 
     done = machine.start_job_container()
