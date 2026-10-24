@@ -26,8 +26,8 @@ everything checks out; whatever cannot be read means every job runs.
 
     ci_proof.py test [ARGUMENT ...]
 
-runs the repository's own test command (`commands.test`) from the root of its checkout, with the
-job's arguments after it.
+runs the repository's own test command (`commands.test`) from the root of the checkout it is
+called in, with the job's arguments after it.
 """
 
 import argparse
@@ -118,7 +118,7 @@ def receipt(message: str) -> dict[str, Any] | None:
         return None
     try:
         proof = json.loads(lines[0].removeprefix(RECEIPT))
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
 
     def source(value: Any) -> bool:
@@ -178,7 +178,10 @@ def read(path: str, key: str | None = None) -> Any:
 
 
 def _source_jobs(source: dict[str, Any], tree: str, api: Callable[..., Any]) -> dict[str, int]:
-    """The jobs a run named by a proof passed on `tree`: none unless its notes prove that tree."""
+    """The jobs a run named by a proof passed on `tree`: none unless its notes prove that tree.
+
+    A run of a fork, whose workflow the fork may have changed, never counts, nor do CI notes of
+    a merge the run did not test: its own head, or GitHub's merge of its head into main."""
     config = workflow_config.current()
     titles, workflow = config.annotations, source["workflow"]
     run = api(f"{config.api}/actions/runs/{source['run']}")
@@ -186,6 +189,7 @@ def _source_jobs(source: dict[str, Any], tree: str, api: Callable[..., Any]) -> 
         run.get("status") != "completed"
         or run.get("conclusion") != "success"
         or run.get("path") != f".github/workflows/{getattr(config.workflows, workflow)}"
+        or run["head_repository"]["full_name"] != config.repository
     ):
         return {}
     parts = api(f"{config.api}/actions/runs/{source['run']}/jobs?per_page=100", "jobs")
@@ -199,7 +203,11 @@ def _source_jobs(source: dict[str, Any], tree: str, api: Callable[..., Any]) -> 
         merges = [message for title, message in noted if title == titles.merge_tested]
         if len(merges) != 1 or not _SHA.fullmatch(merges[0]):
             return {}
-        if api(f"{config.api}/git/commits/{merges[0]}")["tree"]["sha"] != tree:
+        merge = api(f"{config.api}/git/commits/{merges[0]}")
+        if merge["tree"]["sha"] != tree or run["head_sha"] not in (
+            merges[0],
+            merge["parents"][-1]["sha"],
+        ):
             return {}
     elif not {(titles.files_tested, tree), (titles.browser_suite, "whole")} <= noted:
         return {}
@@ -303,9 +311,11 @@ def _main_test(args: list[str]) -> int:
         )
         return 1
     # The command line is the repository's own, as its file names it; the job's arguments
-    # follow it as words of their own.
+    # follow it as words of their own, so it must end where arguments may follow.
     return subprocess.run(
-        ["bash", "-c", config.commands.test + ' "$@"', "test", *args], cwd=config.main, check=False
+        ["bash", "-c", config.commands.test + ' "$@"', "test", *args],
+        cwd=_git("rev-parse", "--show-toplevel"),
+        check=False,
     ).returncode
 
 

@@ -179,7 +179,8 @@ def test_the_gate_reads_the_notes_as_written(workflow: Workflow) -> None:
                       {"id": 3, "name": "CI: server tests", **done}]
                 e2e = [{"id": 4, "name": "E2E: what to run", **done},
                        {"id": 6, "name": "playwright", **done}]
-                print(json.dumps([g.tested_merge(ci, base, head), g.whole_server_tests(run, ci, merge),
+                print(json.dumps([g.tested_merge(ci, base, head),
+                                  g.whole_server_tests(run, ci, merge),
                                   g.whole_suite(run, e2e, tree), g.server_tests_selected(ci)]))
                 """
             ),
@@ -232,20 +233,22 @@ def test_a_job_in_parts_passed_once_every_part_passed(workflow: Workflow) -> Non
     assert done.stdout == "['CI result', 'CI: server tests']\n", done.stderr
 
 
-# What GitHub holds for a squash on main and the runs its proof names: CI run 20, whose planner
-# (job 21) noted the merge it tested, and E2E run 30, whose planner (job 31) noted its files.
-_BASE, _TREE, _SQUASH, _MERGE = "a" * 40, "c" * 40, "d" * 40, "e" * 40
+# What GitHub holds for a squash on main and the runs its proof names: the pull request's CI
+# run 20 on its head, whose planner (job 21) noted the merge it tested, and E2E run 30, whose
+# planner (job 31) noted its files.
+_BASE, _HEAD, _TREE, _SQUASH, _MERGE = "a" * 40, "b" * 40, "c" * 40, "d" * 40, "e" * 40
 
 
 def _github(proof: str) -> dict[str, Any]:
     done = {"status": "completed", "conclusion": "success"}
+    run = {"head_sha": _HEAD, "head_repository": {"full_name": "example-org/example-app"}, **done}
     return {
         f"{_API}/git/commits/{_SQUASH}": {
             "message": f"feat: seven (#7)\n\n* feat: seven\n\n{proof}\n",
             "tree": {"sha": _TREE},
             "parents": [{"sha": _BASE}],
         },
-        f"{_API}/actions/runs/20": {"id": 20, "path": ".github/workflows/ci.yml", **done},
+        f"{_API}/actions/runs/20": {"id": 20, "path": ".github/workflows/ci.yml", **run},
         f"{_API}/actions/runs/20/jobs?per_page=100": {
             "jobs": [
                 {"id": 21, "name": "CI: what to run", **done},
@@ -261,8 +264,11 @@ def _github(proof: str) -> dict[str, Any]:
             {"title": "Server tests", "message": "whole"},
             {"title": "Web suite", "message": "whole"},
         ],
-        f"{_API}/git/commits/{_MERGE}": {"tree": {"sha": _TREE}},
-        f"{_API}/actions/runs/30": {"id": 30, "path": ".github/workflows/e2e.yml", **done},
+        f"{_API}/git/commits/{_MERGE}": {
+            "tree": {"sha": _TREE},
+            "parents": [{"sha": "9" * 40}, {"sha": _HEAD}],
+        },
+        f"{_API}/actions/runs/30": {"id": 30, "path": ".github/workflows/e2e.yml", **run},
         f"{_API}/actions/runs/30/jobs?per_page=100": {
             "jobs": [
                 {"id": 31, "name": "E2E: what to run", **done},
@@ -332,7 +338,8 @@ def test_the_gate_s_own_proof_is_read_back(workflow: Workflow) -> None:
                 import merge_gate as g
                 g.api = lambda path, key=None, **given: [{"title": "Web suite", "message": "whole"}]
                 ok = {"status": "completed", "conclusion": "success"}
-                ci = [{"id": 21, "name": "CI: what to run", **ok}, {"id": 22, "name": "CI: web", **ok}]
+                ci = [{"id": 21, "name": "CI: what to run", **ok},
+                      {"id": 22, "name": "CI: web", **ok}]
                 print(g.squash_proof(sys.argv[2], sys.argv[3], {"ci": ({"id": 20}, ci)}))
                 """
             ),
@@ -365,6 +372,7 @@ def test_the_gate_s_own_proof_is_read_back(workflow: Workflow) -> None:
         "no proof",
         "not json",
         "a run by name",
+        "a nested proof",
     ],
 )
 def test_a_proof_that_does_not_match_the_squash_is_never_inherited(
@@ -380,19 +388,33 @@ def test_a_proof_that_does_not_match_the_squash_is_never_inherited(
         squash["parents"].append({"sha": "f" * 40})
     elif change == "two proofs":
         # A branch's commit carried a line of its own, which the squash lists before the gate's.
-        squash["message"] = squash["message"].replace("* feat: seven", "* feat: seven\n\n" + _receipt())
+        listed = "* feat: seven\n\n" + _receipt()
+        squash["message"] = squash["message"].replace("* feat: seven", listed)
     elif change == "no proof":
         squash["message"] = "feat: seven (#7)\n"
     elif change == "not json":
         squash["message"] = "feat: seven (#7)\n\nWorkflow-Proof: {\"base\":\n"
     elif change == "a run by name":
         squash["message"] = squash["message"].replace('"run":20', '"run":"20"')
+    elif change == "a nested proof":
+        # Deeper than Python's JSON reader goes.
+        squash["message"] = "feat: seven (#7)\n\nWorkflow-Proof: " + "[" * 100_000 + "\n"
 
     assert _inherited(workflow, github) == {}
 
 
 @pytest.mark.parametrize(
-    "change", ["failed", "running", "another workflow", "another merge tree", "unreadable"]
+    "change",
+    [
+        "failed",
+        "running",
+        "another workflow",
+        "another merge tree",
+        "another run's merge",
+        "a fork's run",
+        "no planner",
+        "unreadable",
+    ],
 )
 def test_a_source_run_that_does_not_prove_the_tree_is_never_inherited(
     workflow: Workflow, change: str
@@ -407,12 +429,35 @@ def test_a_source_run_that_does_not_prove_the_tree_is_never_inherited(
         run["path"] = ".github/workflows/images.yml"
     elif change == "another merge tree":
         github[f"{_API}/git/commits/{_MERGE}"]["tree"]["sha"] = "f" * 40
+    elif change == "another run's merge":
+        # The run noted a merge of another head: its notes do not speak for what it ran.
+        run["head_sha"] = "f" * 40
+    elif change == "a fork's run":
+        run["head_repository"] = {"full_name": "example-fork/example-app"}
+    elif change == "no planner":
+        github[f"{_API}/actions/runs/20/jobs?per_page=100"]["jobs"].pop(0)
     elif change == "unreadable":
         github[f"{_API}/check-runs/21/annotations?per_page=100"] = None
 
     assert _inherited(workflow, github) == {}
     # The other source still proves its own jobs.
     assert _inherited(workflow, github, "e2e") == {"E2E: what to run": 30, "playwright": 30}
+
+
+def test_a_dispatched_run_proves_the_commit_it_ran_on(workflow: Workflow) -> None:
+    """The gate's run of a scratch branch notes that branch's own head as the merge it tested."""
+    github = _github(_receipt())
+    github[f"{_API}/actions/runs/20"]["head_sha"] = _MERGE
+    github[f"{_API}/git/commits/{_MERGE}"]["parents"] = [{"sha": _BASE}]
+
+    assert _inherited(workflow, github) == {"CI result": 20, "CI: server tests": 20, "CI: web": 20}
+
+
+def test_a_browser_run_of_a_fork_is_never_inherited(workflow: Workflow) -> None:
+    github = _github(_receipt())
+    github[f"{_API}/actions/runs/30"]["head_repository"] = {"full_name": "example-fork/x"}
+
+    assert _inherited(workflow, github, "e2e") == {}
 
 
 def test_a_suite_job_is_inherited_only_when_its_suite_ran_whole(workflow: Workflow) -> None:
@@ -468,7 +513,10 @@ def _gh(workflow: Workflow, github: dict[str, Any]) -> None:
             github = json.load(open("@STATE@/github.json"))
             if sys.argv[1:3] != ["api", "--paginate"] or sys.argv[3] not in github:
                 sys.exit("HTTP 404: Not Found")
-            print(json.dumps(github[sys.argv[3]]))
+            reply = github[sys.argv[3]]
+            paged = isinstance(reply, dict) and "_pages" in reply
+            for page in reply["_pages"] if paged else [reply]:
+                print(json.dumps(page))
             """
         ),
     )
@@ -493,6 +541,22 @@ def test_main_s_planner_names_each_inherited_job_and_hands_them_on(workflow: Wor
     )
 
 
+def test_main_s_planner_reads_every_page_of_a_run_s_jobs(workflow: Workflow) -> None:
+    github = _github(_receipt())
+    jobs = github[f"{_API}/actions/runs/20/jobs?per_page=100"]["jobs"]
+    github[f"{_API}/actions/runs/20/jobs?per_page=100"] = {
+        "_pages": [{"jobs": jobs[:2]}, {"jobs": jobs[2:]}]
+    }
+    _gh(workflow, github)
+
+    done = _proof(workflow, "inherited", "ci", env={"GITHUB_SHA": _SQUASH})
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.splitlines()[-1] == (
+        'inherited=["CI result", "CI: server tests", "CI: web"]'
+    )
+
+
 def test_main_s_planner_inherits_nothing_when_github_cannot_be_read(workflow: Workflow) -> None:
     _gh(workflow, {})
     output = workflow.root / "github-output"
@@ -507,16 +571,29 @@ def test_main_s_planner_inherits_nothing_when_github_cannot_be_read(workflow: Wo
     assert output.read_text() == "inherited=[]\n"
 
 
-def test_the_test_command_is_the_one_the_config_names(workflow: Workflow) -> None:
+@pytest.mark.parametrize("checkout", ["main", "worktree"])
+def test_the_test_command_is_the_one_the_config_names(workflow: Workflow, checkout: str) -> None:
+    """It runs from the root of the checkout it is called in."""
     (workflow.repo / "shipline.json").write_text(
         json.dumps({"commands": {"test": "echo \"ran in $PWD\" > ran.txt; sh -c 'exit 3'"}})
     )
-    below = workflow.repo / "scripts"
+    root = workflow.repo
+    if checkout == "worktree":
+        root = workflow.root / "worktree"
+        workflow.git("worktree", "add", "--quiet", "--detach", str(root))
 
-    done = _proof(workflow, "test", "--fast", "tests/a test.py", cwd=below)
+    done = subprocess.run(
+        [sys.executable, "-B", str(root / "scripts/workflow/ci_proof.py"), "test"],
+        cwd=root / "scripts",
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
 
     assert done.returncode == 3, done.stderr
-    assert (workflow.repo / "ran.txt").read_text() == f"ran in {workflow.repo}\n"
+    assert (root / "ran.txt").read_text() == f"ran in {root}\n"
 
 
 def test_the_test_command_is_given_the_job_s_own_arguments(workflow: Workflow) -> None:
