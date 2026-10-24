@@ -1065,6 +1065,8 @@ def test_members_sharing_a_hot_path_are_served_back_to_back(github: GitHub, hot:
     # The order of joining is kept, so a member leaving the group restores it.
     saved = json.loads((github.workflow.repo / ".local/workflow/merge-train.json").read_text())
     assert saved["waiting"] == ["7", "8", "9", "10"]
+    # Without hot paths the line is saved as before.
+    assert ("hot_paths" in saved) == hot
 
 
 def test_a_hot_path_never_moves_a_member_across_priorities(github: GitHub) -> None:

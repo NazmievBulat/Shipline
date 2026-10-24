@@ -1963,6 +1963,8 @@ class Train:
         another, make one group; it is served where its earliest member joined."""
         served: dict[str, str | None] = {}
         joined = sorted(self.queue, key=self.rank)
+        if not CONFIG.hot_paths:
+            return dict.fromkeys(joined)
         for number in joined:
             if number in served:
                 continue
