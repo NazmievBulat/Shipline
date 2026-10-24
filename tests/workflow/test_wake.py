@@ -96,6 +96,28 @@ def test_an_unreachable_advisory_service_is_told_once_at_any_hour(night: Workflo
     assert len(night.sent()) == 2  # one failed attempt, then one delivered message
 
 
+def test_main_with_only_an_advisory_is_named_on_its_main_line_at_any_hour(
+    night: Workflow,
+) -> None:
+    """The gate publishes an advisory main as a state of its own, and notes the change."""
+    night.orchestrator("busy")
+    folder = night.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    line = (
+        "main: advisory since 2026-10-13T15:00:00Z, CI result, CI: audit (0123456789ab): "
+        "GHSA-1 in vite (path traversal); merging goes on, the update that fixes it goes first"
+    )
+    (folder / "main-status").write_text(line + "\n")
+    (folder / "main-status.pending").write_text(line + "\n")
+
+    done = _wake(night, at=_at(12, 0))
+
+    assert done.returncode == 0, done.stderr
+    [prompt] = night.sent()
+    assert f"; {line}. Log: ~/" in prompt
+    assert not (folder / "main-status.pending").exists()
+
+
 def test_a_lost_check_is_told_once_at_any_hour_on_a_line_of_its_own(night: Workflow) -> None:
     night.orchestrator("busy")
     pending = night.repo / ".local/workflow/lost-checks.pending"

@@ -85,6 +85,7 @@ jobs:
               tests/runner/test_programs.py
               tests/runner/test_rendering.py
               tests/tools/test_parity.py
+              tests/workflow/test_break_35.py
               tests/workflow/test_browser_test_slots.py
               tests/workflow/test_github_identity.py
               tests/workflow/test_install_hooks.py

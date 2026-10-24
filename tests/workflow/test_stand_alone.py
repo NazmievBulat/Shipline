@@ -201,6 +201,46 @@ def test_a_squash_carries_the_commits_then_the_proof(workflow: Workflow) -> None
     ), done.stderr
 
 
+@pytest.mark.parametrize("named", [True, False])
+def test_the_named_dependency_audit_is_the_job_read_for_an_advisory_service_and_main_s_advisory(
+    workflow: Workflow, named: bool
+) -> None:
+    # The repository's advisory watch names npm when the text says it could not be reached.
+    workflow.fake(
+        "example-advisory",
+        "#!/bin/bash\n"
+        f'[[ $1 == unreachable ]] && ! grep -q {json.dumps(_UNREACHED)} || echo npm\n',
+    )
+    config = json.loads((workflow.repo / "shipline.json").read_text())
+    config.setdefault("commands", {})["advisory_watch"] = "example-advisory"
+    if named:
+        config["checks"] = {
+            "dependency_audit": "CI: audit",
+            "advisory_annotation": "Dependency audit: advisories only",
+        }
+    (workflow.repo / "shipline.json").write_text(json.dumps(config))
+
+    done = _gate(
+        workflow,
+        f"""
+        g.api = lambda path, key=None, **given: (
+            [{{"title": "Advisory service unreachable", "message": {_UNREACHED!r}}}]
+            if "/12/" in path
+            else [{{"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}}]
+        )
+        failed = {{"status": "completed", "conclusion": "failure"}}
+        main = [{{"id": 11, "name": "CI result", **failed}}, {{"id": 12, "name": "CI: audit", **failed}}]
+        pull = [{{"id": 13, "name": "CI: audit", "status": "completed", "conclusion": "success"}}]
+        print(g.unreached_service(main), g.strict_jobs(pull)[0]["conclusion"])
+        """,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == (
+        "npm passed over an advisory on main\n" if named else "None success\n"
+    )
+
+
 def test_a_repository_s_proof_is_read_and_written_when_it_holds_it(workflow: Workflow) -> None:
     _helpers_beside_the_scripts(workflow)
 

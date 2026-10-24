@@ -80,6 +80,8 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `checks.ci_result` | the check that sums up CI | `CI result` |
 | `checks.ci_plan`, `checks.e2e_plan` | the planner checks of CI and of the browser suite | `CI: what to run`, `E2E: what to run` |
 | `checks.images` | the prefix of every image check; its planner is `<prefix>: what to run` | `Docker images` |
+| `checks.dependency_audit` | the job that audits the dependencies against published advisories | none: `CI: dependencies` |
+| `checks.advisory_annotation` | the title of the notice the audit writes on main when advisories alone failed it, a JSON list of `<advisory> in <package> (<summary>)`. With it, main failing only on such an advisory is `advisory`, not red, and the line keeps merging | none: an advisory makes main red |
 | `annotations.*` | the titles of the planners' annotations the merge gate reads: `merge_tested`, `files_tested`, `server_tests`, `web_suite`, `browser_suite` | `Merge tested`, `Files tested`, `Server tests`, `Web suite`, `Browser suite` |
 | `workflows.ci`, `workflows.e2e`, `workflows.images` | the workflow files under `.github/workflows/` | `ci.yml`, `e2e.yml`, `images.yml` |
 | `labels.workflow`, `labels.audited` | the label that starts a ticket, and an audit's | `workflow`, `audited` |
@@ -155,7 +157,7 @@ call. A session runs one as `shipline <command>`, the name with dashes
 | `hunt_app` | `session` when a hunt stops: `stop`, in the hunt's worktree; the hunter itself, by `shipline hunt-app` | | `session start hunt` refuses |
 | `hunt_browser` | the hunter, by `shipline hunt-browser`, which its sentence names | | the sentence names none |
 | `hunt_cursor` | `session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>` | what it prints is kept in the report folder's `cursor.log` | a Cursor hunt is refused |
-| `advisory_watch` | the merge gate: `unreachable` with a failed push's output, or a failed audit's annotations, on standard input; `answers <service>` | `unreachable` prints the advisory service the text says was unreachable, or nothing; `answers` exits 0 when the service answers again | no outage is read: a failed push is refused as it is |
+| `advisory_watch` | the merge gate: `unreachable` with a failed push's output, or a failed audit's annotations (without the advisories notice, `checks.advisory_annotation`), on standard input; `answers <service>` | `unreachable` prints the advisory service the text says was unreachable, or nothing; `answers` exits 0 when the service answers again. Beside the advisories notice, a service it names, or a failure of its own, keeps main red | no outage is read: a failed push is refused as it is, and main's advisories notice stands alone |
 | `push_checkout` | the merge gate, before each push and after one that failed: `install <checkout>`; `refusal <checkout>` with the push's whole output on standard input | `install` installs what changed since its last install and exits non-zero with the reason when it failed, which is a wait; `refusal` prints the hook's failed step with its last lines | nothing is installed, and a failed push is refused with its last 10 lines |
 
 The merge gate keeps the outage an advisory watch found in its state folder:
