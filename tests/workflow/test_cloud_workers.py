@@ -658,3 +658,238 @@ def test_existing_cloud_worker_keeps_provenance_for_its_fix_round(workflow: Work
     assert done.returncode == 0, done.stderr
     assert len(workflow.calls("tmux cloud-7 new-session")) == 1
     assert not workflow.is_running("ticket-7")
+
+
+_ORCHESTRATOR = "<!-- shipline-orchestrator -->"
+_QUESTION = (
+    "How should a failed upload be retried?\n\n"
+    "1. Retry once after a minute (recommended)\n"
+    "2. Retry three times\n"
+    "3. Never retry\n\n"
+    "Owner only: {owner}\n"
+    "Reply 1, 2 or 3."
+)
+
+
+def _question(identity: int = 4, owner: str = "no", text: str = _QUESTION) -> dict[str, object]:
+    comment = _comment(identity, text.format(owner=owner))
+    comment.update(user={"login": "example-owner", "type": "User"}, author_association="OWNER")
+    return comment
+
+
+def _answers(workflow: Workflow, number: int = 7) -> list[str]:
+    """The bodies of the comments the tick posted on the pull request."""
+    pages = json.loads((workflow.state / f"comments-{number}.json").read_text())
+    return [
+        comment["body"]
+        for page in pages
+        for comment in page
+        if comment["body"].startswith(f"{_ORCHESTRATOR} answered for the owner")
+    ]
+
+
+def _stand_in_wake(workflow: Workflow) -> Path:
+    """Waking a cloud worker comes from another change; until then a stand-in counts the wakes."""
+    module = workflow.script.with_name("cloud_workers.py")
+    text = module.read_text()
+    hook = "    return  # Waking a cloud worker after an answer is not built yet.\n"
+    assert text.count(hook) == 1
+    woken = workflow.state / "woken"
+    module.write_text(
+        text.replace(hook, f"    with open({str(woken)!r}, 'a') as f:\n        f.write(path.name + '\\n')\n")
+    )
+    return woken
+
+
+def _wake_log(workflow: Workflow) -> str:
+    log = workflow.wake_log
+    return log.read_text() if log.exists() else ""
+
+
+def _at(minutes: int) -> dict[str, str]:
+    return {**_ENV, "WORKFLOW_NOW": str(_NOW + minutes * 60)}
+
+
+def test_a_question_not_owner_only_is_answered_once_after_15_minutes(workflow: Workflow) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    woken = _stand_in_wake(workflow)
+    _comments(workflow, _question())
+
+    early = workflow.run_script("tick", env=_at(14))
+    assert early.returncode == 0, early.stderr
+    assert _answers(workflow) == []
+    assert not woken.exists()
+
+    due = workflow.run_script("tick", env=_at(15))
+    again = workflow.run_script("tick", env=_at(25))
+
+    assert due.returncode == again.returncode == 0, due.stderr + again.stderr
+    assert _answers(workflow) == [
+        f"{_ORCHESTRATOR} answered for the owner: 1\n\n"
+        "> 1. Retry once after a minute (recommended)"
+    ]
+    assert woken.read_text() == "cloud-7\n"
+    assert _wake_log(workflow).count('answered for the owner: cloud-7, "1"') == 1
+    # Answered, it no longer waits for the owner.
+    assert not (workflow.repo / ".local/workflow/cloud-7.asking").exists()
+
+
+@pytest.mark.parametrize(
+    ("text", "word", "line"),
+    [
+        (
+            "Rename the flag?\n\n"
+            '"keep it": keep the old name (recommended)\n"rename it": use the new name\n\n'
+            'Owner only: no\nReply "keep it" or "rename it".',
+            "keep it",
+            '"keep it": keep the old name (recommended)',
+        ),
+        (
+            "Which order?\n\n- **2** Newest first (recommended)\n- **1** Oldest first\n\n"
+            "**Owner only: no**\n1 or 2",
+            "2",
+            "- **2** Newest first (recommended)",
+        ),
+    ],
+    ids=["quoted words", "recommendation not numbered first"],
+)
+def test_the_answer_is_the_first_choice_listed(
+    workflow: Workflow, text: str, word: str, line: str
+) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    _stand_in_wake(workflow)
+    _comments(workflow, _question(text=text))
+
+    done = workflow.run_script("tick", env=_at(15))
+
+    assert done.returncode == 0, done.stderr
+    assert _answers(workflow) == [f"{_ORCHESTRATOR} answered for the owner: {word}\n\n> {line}"]
+    assert f'answered for the owner: cloud-7, "{word}"' in _wake_log(workflow)
+
+
+@pytest.mark.parametrize("owner", ["yes", "missing"])
+def test_an_owner_only_question_or_one_without_the_line_is_left(
+    workflow: Workflow, owner: str
+) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    woken = _stand_in_wake(workflow)
+    workflow.orchestrator("busy")
+    text = _QUESTION if owner == "yes" else _QUESTION.replace("Owner only: {owner}\n", "")
+    _comments(workflow, _question(owner=owner, text=text))
+
+    first = workflow.run_script("tick", env=_at(15))
+    second = workflow.run_script("tick", env=_at(60))
+
+    assert first.returncode == second.returncode == 0, first.stderr + second.stderr
+    assert _answers(workflow) == []
+    assert not woken.exists()
+    assert "answered for the owner" not in _wake_log(workflow)
+    named = [message for message in workflow.sent() if "Owner only" in message]
+    if owner == "yes":
+        assert named == []
+    else:
+        [message] = named
+        assert 'cloud-7: the question has no "Owner only" line; left for the owner' in message
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"body": "1", "user": {"login": "example-owner", "type": "User"}},
+        {"body": f"{_ORCHESTRATOR}\n2", "user": {"login": "example-owner", "type": "User"}},
+    ],
+    ids=["owner", "orchestrator"],
+)
+def test_an_earlier_answer_wins(workflow: Workflow, answer: dict[str, object]) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    woken = _stand_in_wake(workflow)
+    _comments(workflow, _question(), {"id": 5, "created_at": "2026-10-19T18:05:00Z", **answer})
+
+    done = workflow.run_script("tick", env=_at(15))
+
+    assert done.returncode == 0, done.stderr
+    assert _answers(workflow) == []
+    assert not woken.exists()
+
+
+def test_a_bots_comment_is_no_answer(workflow: Workflow) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    _stand_in_wake(workflow)
+    bot = {
+        "id": 5,
+        "body": "Codex Review: no major issues.",
+        "created_at": "2026-10-19T18:05:00Z",
+        "user": {"login": "example-review[bot]", "type": "Bot"},
+    }
+    _comments(workflow, _question(), bot)
+
+    done = workflow.run_script("tick", env=_at(15))
+
+    assert done.returncode == 0, done.stderr
+    assert len(_answers(workflow)) == 1
+
+
+def test_a_question_from_someone_without_write_access_is_never_answered(
+    workflow: Workflow,
+) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    woken = _stand_in_wake(workflow)
+    question = _question()
+    question.update(user={"login": "passer-by", "type": "User"}, author_association="NONE")
+    _comments(workflow, question)
+
+    done = workflow.run_script("tick", env=_at(60))
+
+    assert done.returncode == 0, done.stderr
+    assert _answers(workflow) == []
+    assert not woken.exists()
+
+
+def test_a_failed_answer_is_tried_again_and_posted_once(workflow: Workflow) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    woken = _stand_in_wake(workflow)
+    _comments(workflow, _question())
+    (workflow.state / "fail-gh-comment").touch()
+
+    failed = workflow.run_script("tick", env=_at(15))
+    assert _answers(workflow) == []
+    assert not woken.exists()
+    (workflow.state / "fail-gh-comment").unlink()
+    workflow.run_script("tick", env=_at(18))
+    workflow.run_script("tick", env=_at(21))
+
+    assert failed.returncode != 0
+    assert len(_answers(workflow)) == 1
+    assert woken.read_text() == "cloud-7\n"
+
+
+def test_zero_minutes_in_the_config_turns_answering_off(workflow: Workflow) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    woken = _stand_in_wake(workflow)
+    # The config key comes from another change; until then the stand-in is its default.
+    module = workflow.script.with_name("cloud_workers.py")
+    text = module.read_text()
+    assert text.count("ANSWER_AFTER_MINUTES = 15\n") == 1
+    module.write_text(text.replace("ANSWER_AFTER_MINUTES = 15\n", "ANSWER_AFTER_MINUTES = 0\n"))
+    _comments(workflow, _question())
+
+    done = workflow.run_script("tick", env=_at(600))
+
+    assert done.returncode == 0, done.stderr
+    assert _answers(workflow) == []
+    assert not woken.exists()
+
+
+def test_the_rules_give_a_cloud_workers_question_the_shape_the_tick_answers() -> None:
+    rules = (Path(__file__).resolve().parents[2] / "scripts/workflow/RULES.md").read_text()
+    cloud = " ".join(rules.split("### Cloud workers", 1)[1].split("\n## ", 1)[0].split())
+    assert "the line `Owner only: yes` or `Owner only: no`" in cloud
+    assert f"`{_ORCHESTRATOR} answered for the owner: <reply word>`" in cloud

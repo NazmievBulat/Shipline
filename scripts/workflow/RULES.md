@@ -283,8 +283,15 @@ subagent when
 `codex review` would run locally. It pushes only to its pull request's branch, never
 force-pushes and never skips or weakens the pre-push hook. It reports the start, first push,
 blockers with their exact errors, owner questions and ready by pull request comments beginning with
-`<!-- cloud-worker -->`. The tick relays them without a model: a final question rings the
-phone once through `notify` and appears in the wake as `asking the owner: cloud-N`; a
+`<!-- cloud-worker -->`. A question has the shape of "Asking the owner": the recommendation
+first, then the choices one line each, each beginning with its reply word, then the line
+`Owner only: yes` or `Owner only: no`, and the reply words on the last line. The tick relays
+them without a model: a final question rings the phone once through `notify` and appears in
+the wake as `asking the owner: cloud-N`. A question marked `Owner only: no` with no answer
+after 15 minutes (`answer_for_owner_after_minutes`) is answered once by the tick in a comment,
+`<!-- shipline-orchestrator --> answered for the owner: <reply word>`, quoting the recommended
+choice's line; an answer from the owner or the orchestrator that comes first wins. A question
+without the line is left for the owner, and the wake names it once. A
 `Blocked` report is told to the orchestrator once. A final `worker finished` removes the
 record only once the pull request is ready, letting the normal independent review start.
 Reports and failed deliveries are remembered locally. The workflow does not read cloud

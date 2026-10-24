@@ -252,6 +252,19 @@ if [[ "$1 $2 $3 $5" == "api -X POST -f" && $4 == repos/*/issues/*/labels ]]; the
   echo "$number" >> "@STATE@/labelled"
   exit 0
 fi
+# A comment posted on a pull request joins its comments, as GitHub lists them next, written by
+# the login `gh` uses.
+if [[ "$1 $2 $3 $5 $7" == "api -X POST -f --silent" && $4 == repos/*/issues/*/comments ]]; then
+  [ ! -e "@STATE@/fail-gh-comment" ] || exit 1
+  number=${4%/comments}
+  number=${number##*/}
+  comments="@STATE@/comments-$number.json"
+  [ -f "$comments" ] || echo '[[]]' > "$comments"
+  jq --arg body "${6#body=}" '.[-1] += [{id: (([.[][].id] | max // 0) + 1), body: $body,
+    created_at: "2026-10-19T18:00:00Z", user: {login: "example-owner", type: "User"},
+    author_association: "OWNER"}]' "$comments" > "$comments.new" && mv "$comments.new" "$comments"
+  exit 0
+fi
 asked="label list --limit 1000 --json name --jq ${8}"
 if [ "$*" = "$asked" ] && [ ! -e "@STATE@/fail-gh-labels" ]; then
   touch "@STATE@/labels"
