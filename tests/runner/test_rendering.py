@@ -103,16 +103,28 @@ def test_without_a_prefix_nothing_is_written(tmp_path: Path) -> None:
 
 
 def test_the_labels_are_the_ones_the_merge_gate_reads() -> None:
-    done = _run("--labels", "home", "office")
+    done = _run("--labels")
 
     assert done.returncode == 0, done.stderr
-    assert tuple(done.stdout.splitlines()) == workflow_config.runner_labels(
-        "example-app", ["home", "office"]
+    assert tuple(done.stdout.splitlines()) == workflow_config.runner_labels("example-app-home")
+
+
+def test_a_named_label_builds_the_labels() -> None:
+    env = {**_ENV, "RUNNER_PREFIX": "example-app", "RUNNER_LABEL": "example-pool"}
+    done = subprocess.run(
+        ["bash", str(_RENDER), "--labels"], env=env, capture_output=True, text=True, check=False
     )
 
+    assert tuple(done.stdout.splitlines()) == workflow_config.runner_labels("example-pool")
 
-def test_a_machine_name_that_cannot_name_a_label_is_refused() -> None:
-    done = _run("--labels", "home", "../office")
+
+@pytest.mark.parametrize("label", ["Example", "a b", "a/b", "-a"])
+def test_a_label_that_is_not_a_plain_name_is_refused(label: str) -> None:
+    env = {**_ENV, "RUNNER_PREFIX": "example-app", "RUNNER_LABEL": label}
+    done = subprocess.run(
+        ["bash", str(_RENDER), "--labels"], env=env, capture_output=True, text=True, check=False
+    )
 
     assert done.returncode != 0
+    assert "RUNNER_LABEL" in done.stderr
     assert done.stdout == ""

@@ -12,8 +12,8 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner prefix and no
-image build command, and runner labels built from the prefix and this machine's runner settings
-(`~/.config/shipline/runner.sh`), none without a prefix; no hunt areas, so one hunt runs at a
+image build command, and the runner label `<prefix>-home`, whose labels are the runner labels;
+none without a prefix; no hunt areas, so one hunt runs at a
 time, and no hunt plans file; no test command, which a repository names for its CI's test job
 (`ci_proof.py test`).
 
@@ -43,12 +43,9 @@ FILE = "shipline.json"
 # take to read it.
 RUNNER_SETTINGS = ".github/runner/settings.sh"
 RUNNER_SETTINGS_SECONDS = 5
-# What one machine of the runner pool holds, outside any repository: its own name and the other
-# machines' (`runner/README.md`). `SHIPLINE_RUNNER_SETTINGS` names another file.
-MACHINE_SETTINGS = "~/.config/shipline/runner.sh"
 # The prefix names a systemd unit and, as `<prefix>-runner`, a user of at most 32 characters.
 _PREFIX = re.compile(r"[a-z](?:[a-z0-9-]{0,23}[a-z0-9])?")
-_MACHINE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
+_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 
 # Every key the file may hold, with its default. The repository's default is found, not fixed.
 DEFAULTS: dict[str, Any] = {
@@ -83,13 +80,15 @@ DEFAULTS: dict[str, Any] = {
     },
     "runner": {
         # The runner labels of the machines the gate may re-run failed jobs on; when the file
-        # names none, they are built from the prefix and the machines (`runner_labels`).
+        # names none, they are built from the base label (`runner_labels`).
         "labels": [],
         "identity_folder": "~/.config/shipline-runner",
         # The prefix the runner pool names everything by: its images, network, services and
         # containers (`<prefix>-runner…`) and labels; without it, there are no runner figures
         # (`workflow_metrics.py`).
         "prefix": None,
+        # The base label every machine's runners carry; `<prefix>-home` by default.
+        "label": None,
         # The command line, run from the main checkout, that builds the runner images; without
         # it, the pool builds its own Dockerfile.
         "image_build": None,
@@ -162,6 +161,7 @@ class Runner:
     labels: tuple[str, ...]
     identity_folder: str
     prefix: str | None = None
+    label: str | None = None
     image_build: str | None = None
 
     @property
@@ -363,64 +363,11 @@ def _from_runner_settings(main: Path) -> str | None:
     return done.stdout
 
 
-def machine_settings() -> Path:
-    """The file of this machine's runner settings: `SHIPLINE_RUNNER_SETTINGS`, else
-    MACHINE_SETTINGS in the home folder."""
-    return Path(os.environ.get("SHIPLINE_RUNNER_SETTINGS") or MACHINE_SETTINGS).expanduser()
-
-
-def _machines() -> list[str]:
-    """This machine's name and the other machines', as Bash reads `machine` and
-    `other_machines` from the machine settings: in a `bash` of its own, with only PATH and HOME,
-    for at most RUNNER_SETTINGS_SECONDS. None named when the file is missing."""
-    path = machine_settings()
-    if not path.is_file():
-        return []
-    refused = f"{path} names no machines Bash can read from it"
-    try:
-        done = subprocess.run(
-            [
-                "bash",
-                "-c",
-                'source "$1" >/dev/null 2>&1 || exit 1; '
-                'printf "%s\\0" "${machine-}" "${other_machines[@]}"',
-                "settings",
-                str(path),
-            ],
-            env={key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ},
-            capture_output=True,
-            text=True,
-            timeout=RUNNER_SETTINGS_SECONDS,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        raise ConfigError(
-            f"{refused}: it ran for more than {RUNNER_SETTINGS_SECONDS} seconds"
-        ) from None
-    names = done.stdout.split("\0")[:-1]
-    if done.returncode or not names or not names[0]:
-        raise ConfigError(f"{refused}: it exited {done.returncode} and named no machine")
-    wrong = [name for name in names if not _MACHINE.fullmatch(name)]
-    if wrong:
-        raise ConfigError(f"{refused}: {wrong[0]!r} is not a machine name")
-    return names
-
-
-def runner_labels(prefix: str, machines: list[str]) -> tuple[str, ...]:
-    """The labels of the pool's runners: each machine's ordinary, main and Docker runners, and
-    the planner's (`runner/names.sh` names them the same way)."""
-    return (
-        *(
-            label
-            for machine in machines
-            for label in (
-                f"{prefix}-{machine}",
-                f"{prefix}-{machine}-main",
-                f"{prefix}-{machine}-docker",
-            )
-        ),
-        f"{prefix}-planner",
-    )
+def runner_labels(label: str) -> tuple[str, ...]:
+    """The labels every machine's runners carry, so GitHub gives a job to whichever machine has
+    one free: the base label, a spare's before it takes a slot, the merge train's first
+    member's, main's runners' and the Docker runners'."""
+    return (label, f"{label}-standby", f"{label}-first", f"{label}-main", f"{label}-docker")
 
 
 def _from_origin(main: Path) -> str | None:
@@ -470,9 +417,15 @@ def load(start: Path | None = None) -> Config:
             f"{FILE}: runner.prefix must be at most 25 lowercase letters, digits and hyphens, "
             f"starting with a letter and ending with a letter or digit, not {prefix}"
         )
+    label = values["runner"]["label"] or (prefix and f"{prefix}-home")
+    if label is not None and not _LABEL.fullmatch(label):
+        raise ConfigError(
+            f"{FILE}: runner.label must be lowercase letters, digits and hyphens, starting and "
+            f"ending with a letter or digit, not {label}"
+        )
     labels = tuple(values["runner"]["labels"])
-    if "labels" not in given.get("runner", {}) and prefix is not None:
-        labels = runner_labels(prefix, _machines())
+    if "labels" not in given.get("runner", {}) and label is not None:
+        labels = runner_labels(label)
     return Config(
         found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),
@@ -485,6 +438,7 @@ def load(start: Path | None = None) -> Config:
             labels=labels,
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
+            label=label,
             image_build=values["runner"]["image_build"],
         ),
         hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
@@ -518,6 +472,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "labels": list(config.runner.labels),
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
+            "label": config.runner.label,
             "image_build": config.runner.image_build,
         },
         "hunts": {
@@ -548,6 +503,7 @@ def shell(config: Config) -> str:
         "IDENTITY_FOLDER": config.runner.identity_folder,
         # Empty when the file names none.
         "RUNNER_PREFIX": config.runner.prefix or "",
+        "RUNNER_LABEL": config.runner.label or "",
         "RUNNER_IMAGE_BUILD": config.runner.image_build or "",
         "HUNT_PLANS": config.hunts.plans or "",
         "CONFIG": json.dumps(config.given, separators=(",", ":")),

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Every name of the runner pool comes from one prefix, RUNNER_PREFIX (`runner.prefix` of the
-# repository's shipline.json): its user, folders, images, network, units and labels.
+# repository's shipline.json): its user, folders, images, network and units, and the base label,
+# RUNNER_LABEL (`runner.label`), `<prefix>-home` when it names none.
 #
-#   RUNNER_PREFIX=example-app render-units.sh <folder>         the systemd units, into <folder>
-#   RUNNER_PREFIX=example-app render-units.sh --names          the names, as `name=value` lines
-#   RUNNER_PREFIX=example-app render-units.sh --labels <machine>...   the runners' labels
+#   RUNNER_PREFIX=example-app render-units.sh <folder>    the systemd units, into <folder>
+#   RUNNER_PREFIX=example-app render-units.sh --names     the names, as `name=value` lines
+#   RUNNER_PREFIX=example-app render-units.sh --labels    the labels every runner carries
 #
 # The units are the templates in `units/` beside this file, with `@PREFIX@` replaced by the
 # prefix in their names and their text; nothing else in them varies. Machine names and counts
@@ -14,7 +15,7 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 usage() {
-  echo "usage: RUNNER_PREFIX=<prefix> render-units.sh <folder> | --names | --labels <machine>..." >&2
+  echo "usage: RUNNER_PREFIX=<prefix> [RUNNER_LABEL=<label>] render-units.sh <folder> | --names | --labels" >&2
   exit 2
 }
 
@@ -23,6 +24,11 @@ usage() {
 prefix=${RUNNER_PREFIX:-}
 if [[ ! $prefix =~ ^[a-z]([a-z0-9-]{0,23}[a-z0-9])?$ ]]; then
   echo "RUNNER_PREFIX must be at most 25 lowercase letters, digits and hyphens, starting with a letter and ending with a letter or digit, not '$prefix'" >&2
+  exit 1
+fi
+label=${RUNNER_LABEL:-$prefix-home}
+if [[ ! $label =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+  echo "RUNNER_LABEL must be lowercase letters, digits and hyphens, starting and ending with a letter or digit, not '$label'" >&2
   exit 1
 fi
 
@@ -37,24 +43,19 @@ docker_image=$prefix-runner-docker
 network=$prefix-runner
 hub_cache=$prefix-runner-hub-cache
 units=$prefix-runner
-planner_label=$prefix-planner
+label=$label
+standby_label=$label-standby
+first_label=$label-first
+main_label=$label-main
+docker_label=$label-docker
 NAMES
 }
 
-# Each machine's ordinary, main and Docker labels, then the planner's: the labels the merge gate
-# reads (`runner_labels` of workflow_config.py).
+# Every machine's runners carry the same labels, so GitHub gives a job to whichever machine has
+# one free: the base label, a spare's before it takes a slot, the merge train's first member's,
+# main's runners' and the Docker runners' (`runner_labels` of workflow_config.py).
 labels() {
-  local machine
-  for machine in "$@"; do
-    [[ $machine =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || {
-      echo "'$machine' is not a machine name: lowercase letters, digits and hyphens" >&2
-      exit 1
-    }
-  done
-  for machine in "$@"; do
-    printf '%s\n' "$prefix-$machine" "$prefix-$machine-main" "$prefix-$machine-docker"
-  done
-  printf '%s\n' "$prefix-planner"
+  printf '%s\n' "$label" "$label-standby" "$label-first" "$label-main" "$label-docker"
 }
 
 render() {
@@ -69,7 +70,7 @@ render() {
 
 case ${1:-} in
   --names) [[ $# -eq 1 ]] || usage; names ;;
-  --labels) shift; labels "$@" ;;
+  --labels) [[ $# -eq 1 ]] || usage; labels ;;
   "" | -*) usage ;;
   *) [[ $# -eq 1 ]] || usage; render "$1" ;;
 esac
