@@ -20,14 +20,25 @@ reviewer nudged, a status check sent, a stuck session), the lines the session co
 each check-in of the wake (whom it told, or why it told nobody, and its lines of their own). A
 figure that moves between two ticks (minutes waited, megabytes held, a session's link) is left
 out. A decision of one side matches the same decision of the other within `--window` seconds
-(150 by default): the shadow tick runs just before the real one, and a start prints its line
-once its session is up.
+(150 by default): the shadow tick runs just before the real one, in the same start of its
+service. A line of the journal counts from the start of the service it was printed in, when
+the journal shows systemd starting it (a start prints its line once its session is up,
+minutes later); and a real decision is compared only when a shadow tick ran within the window
+of it, so a real tick whose shadow tick did not run adds no difference.
 
 What only one side logs is not compared: the real installation's merge gate and automatic
-ticket starts, which a shadow tick does not run, and its worktree cleanup; a reviewer's start,
-which the real tick prints no line for (`reviewer_start.py` keeps the session's words to
-itself); and the train status a shadow tick notes for explaining a difference. Without
-`--journal` the lines of the session commands are not compared either.
+ticket starts, which a shadow tick does not run, the nudge of a session whose pull request the
+merge driver merged in a batch, and its worktree cleanup; a reviewer's start, which the real
+tick prints no line for (`reviewer_start.py` keeps the session's words to itself); and the
+train status a shadow tick notes for explaining a difference. Without `--journal` the lines of
+the session commands are not compared either.
+
+Some differences follow from what a shadow tick does not run, and are explained by it: a nudge
+for a new turn of the merge line or a new state of main, which the real tick's own reconcile
+and report refresh make in the same tick (the shadow tick reads the line and the report as the
+tick before left them); and a check-in that tells the orchestrator of a hand-back or a cloud
+worker's report the real tick noted in the same tick. The wake log is the machine's, one for
+every repository on it: compare a run on a machine that works on one repository only.
 
 Each difference is printed with both versions, the decision of the same session or of the wake
 paired when both sides took one, `(nothing)` for the side that took none. The last line counts
@@ -52,7 +63,7 @@ _STAMPED = re.compile(r"^(\d+) (.+)$")
 # A check-in of the wake: its local time, why it looked, then its lines, indented.
 _CHECK_IN = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)  (.+)$")
 # `journalctl -o short-unix`: the moment, the host, the program and its process, the words.
-_JOURNAL = re.compile(r"^(\d+(?:\.\d+)?) \S+ [^\s:]+?(?:\[\d+\])?: (.*)$")
+_JOURNAL = re.compile(r"^(\d+(?:\.\d+)?) \S+ ([^\s:]+?)(?:\[\d+\])?: (.*)$")
 
 _NAME = r"(?:ticket|review|audit|cloud)-\d+|hunt-[a-z0-9][a-z0-9-]*"
 # The lines of the session commands and of the tick that a journal holds: the session they name,
@@ -69,7 +80,7 @@ _SESSION_LINES = [
 # The tick's own lines of the wake log.
 _TICK_LINES = [
     re.compile(
-        rf"^(?P<who>{_NAME}) (?:merged in a batch as \S+; session nudged|merge conflict on \S+; "
+        rf"^(?P<who>{_NAME}) (?:merge conflict on \S+; "
         r"reviewer nudged|checks finished on \S+; reviewer nudged|lost check on \S+; "
         r"reviewer nudged|wake failed: .*)$"
     ),
@@ -87,10 +98,10 @@ _TICK_LINES = [
 ]
 # What a check-in did: told the orchestrator, or why it told nobody.
 _OUTCOMES = [
-    (re.compile(r"^told (\S+): "), "told {0}"),
-    (re.compile(r"^\S+ is \S+; not told$"), None),
-    (re.compile(r"^nothing changed since the last check-in; \S+ not told$"), None),
-    (re.compile(r"^the check-in could not be sent to \S+$"), None),
+    (re.compile(r"^told (.+?): "), "told {0}"),
+    (re.compile(r"^.+ is \S+; not told$"), None),
+    (re.compile(r"^nothing changed since the last check-in; .+ not told$"), None),
+    (re.compile(r"^the check-in could not be sent to .+$"), None),
     (re.compile(r"^(?:named )?orchestrator .*nobody was told$"), None),
 ]
 # A check-in's lines of their own.
@@ -110,13 +121,18 @@ class Decision:
 def _figures_out(words: str) -> str:
     """The words without the figures that move between two ticks."""
     words = re.sub(r" idle \d+ min waiting", " idle N min waiting", words)
+    words = re.sub(
+        r"^the processors are overloaded: .*(; the next tick)",
+        r"the processors are overloaded\1",
+        words,
+    )
     return re.sub(r"\((\d+) min([,)])", r"(N min\2", words)
 
 
 def _session_line(words: str, at: float) -> Decision | None:
     for pattern, kept in _SESSION_LINES:
         if found := pattern.match(words):
-            text = kept.format(**found.groupdict()) if kept else words
+            text = kept.format(**found.groupdict()) if kept else _figures_out(words)
             return Decision(at, found["who"] or "start", text, session=True)
     return None
 
@@ -134,7 +150,9 @@ def _check_in_line(reason: str, words: str, at: float) -> Decision | None:
             text = kept.format(*found.groups()) if kept else words
             return Decision(at, "wake", f"wake ({reason}): {text}")
     if words.startswith(_OWN_LINES):
-        return Decision(at, "wake", f"wake: {_figures_out(words)}")
+        # Paired with the same kind of line of the other side, not with whom the wake told.
+        kind = next(line for line in _OWN_LINES if words.startswith(line))
+        return Decision(at, f"wake, {kind.rstrip(': ')}", f"wake: {_figures_out(words)}")
     return None
 
 
@@ -174,12 +192,20 @@ def read_log(path: Path) -> tuple[list[Decision], list[float]]:
 
 
 def read_journal(path: Path) -> list[Decision]:
-    """The lines of the session commands the real tick printed."""
+    """The lines of the session commands the real tick printed, each at the start of the
+    service it was printed in, when the journal shows it."""
     decisions = []
+    started: float | None = None
     for line in _lines(path):
-        if (found := _JOURNAL.match(line)) and (
-            decision := _session_line(found[2].strip(), float(found[1]))
-        ):
+        if not (found := _JOURNAL.match(line)):
+            continue
+        at, program, words = float(found[1]), found[2], found[3].strip()
+        if program == "systemd":
+            if words.startswith("Starting "):
+                started = at
+            elif words.startswith(("Finished ", "Failed ")) or words.endswith(" failed."):
+                started = None
+        elif decision := _session_line(words, at if started is None else started):
             decisions.append(decision)
     return decisions
 
@@ -283,9 +309,15 @@ def main() -> int:
         )
         shadow = [decision for decision in shadow if not decision.session]
         real = [decision for decision in real if not decision.session]
-    # The real tick that a shadow tick ran just before is the shadow's, until the window ends.
+    # The real tick that a shadow tick ran just before is the shadow's, until the window ends;
+    # one without a shadow tick beside it is no one's.
     shadow = [decision for decision in shadow if start <= decision.at <= end]
-    real = [decision for decision in real if start <= decision.at <= end + window]
+    real = [
+        decision
+        for decision in real
+        if start - window <= decision.at <= end + window
+        and (not runs or any(abs(decision.at - run) <= window for run in runs))
+    ]
     compared, differences = compare(shadow, real, window)
     for ours, theirs in differences:
         taken = [decision for decision in (ours, theirs) if decision]

@@ -58,10 +58,12 @@
 # and a start (without its link or figures), and the wake's check-in. It reads all the real tick
 # reads, the merge line as last saved (the gate's read path, without its lock), and notes the
 # train status whenever it changed. It does not run what only carries decisions out or keeps
-# records: the metrics, the cloud workers' poll, the worktree cleanup, main's report, the merge
-# driver and the automatic ticket start. A start is logged when `session start` would make it:
-# room for it, and for a reviewer the checks of `reviewer_start.py`. Its own lock keeps a second
-# shadow tick out, and never the real one.
+# records: the metrics, the cloud workers' poll, the worktree cleanup (it only drops from its
+# list the sessions cleanup stops, of a pull request closed without merging), main's report,
+# the merge driver and the automatic ticket start. A start is logged when `session start` would
+# make it: no session of its pull request running, room for it, and for a reviewer the checks
+# of `reviewer_start.py` (and of the merge driver, for a hand-back's). Its own lock keeps a
+# second shadow tick out, and never the real one.
 set -uo pipefail
 
 # A session that holds more than this while idle is squeezed.
@@ -130,9 +132,16 @@ if ((shadow)); then
     echo "the shadow tick before this one is still running"
     exit 0
   fi
-  # The log holds the names and the heads of the work: for its owner alone.
+  # The log holds the names and the heads of the work: for its owner alone, and never written
+  # through a link.
   export SHIPLINE_SHADOW=$main/.local/shipline/shadow.log
+  if [[ -L $SHIPLINE_SHADOW ]]; then
+    echo "$SHIPLINE_SHADOW is a link; a shadow tick writes no file through it" >&2
+    exit 1
+  fi
   (umask 077 && mkdir -p "${SHIPLINE_SHADOW%/*}" && : >>"$SHIPLINE_SHADOW") || exit 1
+  # Git takes no lock it can do without, such as the index's in a session's worktree.
+  export GIT_OPTIONAL_LOCKS=0
 else
   mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
   exec 9>"$common/shipline-tick.lock"
@@ -162,7 +171,7 @@ say() {
 # A note the tick reads again in a later tick. A shadow tick leaves the real tick's notes as
 # they are, and keeps none of its own.
 keep() {
-  ((shadow)) || echo "$2" >"$1"
+  ((shadow)) || printf '%s\n' "$2" >"$1"
 }
 # The tick's line of the wake log; a shadow tick's goes to its own log.
 wake_log() {
@@ -174,7 +183,7 @@ wake_log() {
   mkdir -p "${log%/*}" && printf '%s %s\n' "$NOW" "$*" >>"$log"
 }
 if ((shadow)); then
-  # The notes the shadow tick takes for its own wake (`wake`), which reads them beside the real ones.
+  # The notes the shadow tick takes for its own wake, which reads them beside the real ones.
   export SHIPLINE_SHADOW_NOTES=$WORKFLOW_TRAIN_TICK/shadow-notes
   shadow_note "shadow tick"
 fi
@@ -197,22 +206,80 @@ snapshot_busy() {
     mv "$WORKFLOW_SESSION_SNAPSHOT.pending" "$WORKFLOW_SESSION_SNAPSHOT"
 }
 
-# A start of a shadow tick, logged when `session start` would make it: with room for it, as
-# `session room` reads it, or 75 as when it waits. A cloud worker needs no room here.
+# Whether a session runs, as a shadow tick would have left it: what it stopped does not, what it
+# started does, and the others as `tmux` finds them.
+shadow_stopped=" "
+shadow_started=" "
+shadow_alive() {
+  [[ $shadow_stopped != *" $1 "* ]] || return 1
+  [[ $shadow_started != *" $1 "* ]] || return 0
+  tmux -L "$1" has-session -t "=$1" 2>/dev/null 9>&-
+}
+
+# A start of a shadow tick, logged when `session start` would make it: none while a session of
+# the pull request runs, which it refuses; with room for it, as `session room` reads it, or 75
+# as when it waits. A cloud worker needs no room here.
 shadow_start() {
-  local kind=$1 number=$2 program=${3:-} name room
+  local kind=$1 number=$2 program=${3:-} name room other
   case $kind in
     worker) name=ticket-$number ;;
     review) name=review-$number ;;
     *) name=$kind-$number ;;
   esac
   [[ $program != cloud ]] || name=cloud-$number
+  for other in ticket audit review codex cloud; do
+    ! shadow_alive "$other-$number" || return 1
+  done
   if [[ $program != cloud ]] && ! room=$(bash "$here/session" room 2>&1 9>&-); then
     shadow_note "$room; the next tick tries this start again"
     return 75
   fi
   shadow_note "$name started"
+  shadow_started+="$name "
   snapshot_busy "$name"
+}
+
+# A hand-back's reviewer in a shadow tick, started as the merge driver starts it
+# (`merge_driver.py --start-hand-back`), read only: none while a session of its pull request
+# runs, none unless the pull request is open, ready and labelled, and none that the checks of
+# `reviewer_start.py` hold back, as for a ready pull request below. Its rounds are read the same.
+shadow_hand_back() {
+  local number=$1 other pull reviews history round sent_back
+  for other in ticket audit review codex cloud; do
+    ! shadow_alive "$other-$number" || return 0
+  done
+  grep -qE "^$number false " <<<"$pulls" || return 0
+  pull=$(python3 "$here/tick_snapshot.py" view "$snapshot" "$number" 9>&-) || return 1
+  reviews=$(gh api --paginate "repos/$SHIPLINE_REPOSITORY/pulls/$number/reviews" 9>&-) || return 1
+  history=$(jq -scr '[.[][] | (.body // "") |
+    capture("^<!-- workflow-review round=(?<round>[0-9]+)( result=(?<result>sent-back|passed))? -->")? |
+    {round: (.round | tonumber), result: (.result // "sent-back")}] |
+    [(map(.round) | max // 0), (map(select(.result == "sent-back")) | length)] | @tsv' <<<"$reviews") ||
+    return 1
+  read -r round sent_back <<<"$history"
+  python3 -B "$here/reviewer_start.py" --shadow "$main/$SHIPLINE_STATE_FOLDER" "$number" \
+    "$(jq -r '.headRefOid' <<<"$pull")" "$((round + 1))" "$sent_back" \
+    "$(jq -r '.headRefName' <<<"$pull")" 9>&- || return 0
+  shadow_start review "$number"
+}
+
+# What `session cleanup` decides beside removing worktrees: it stops the sessions of a pull
+# request closed without merging. They leave the tick's list, as they do in the real tick.
+shadow_cleanup() {
+  local path number state session
+  [[ -n ${WORKFLOW_PR_SNAPSHOT:-} ]] || return 0
+  while IFS= read -r path; do
+    [[ ${path%/*} == "$main/.claude/worktrees" && ${path##*/} =~ ^ticket-([0-9]+)$ ]] || continue
+    number=${BASH_REMATCH[1]}
+    [[ ! -e $main/$SHIPLINE_STATE_FOLDER/merge-wanted-$number ]] || continue
+    state=$(python3 "$here/tick_snapshot.py" view "$WORKFLOW_PR_SNAPSHOT" "$number" 9>&- |
+      jq -r '.state') || continue
+    [[ $state != OPEN && $state != MERGED ]] || continue
+    for session in "ticket-$number" "audit-$number" "review-$number"; do
+      shadow_stopped+="$session "
+      snapshot_drop "$session" "codex-$number"
+    done
+  done < <(git -C "$main" worktree list --porcelain 9>&- | sed -n 's/^worktree //p')
 }
 
 # A shadow tick reads the sessions and logs what it would make of them, in the words the
@@ -221,7 +288,11 @@ shadow_session() {
   case $1 in
     list | running | load | room) bash "$here/session" "$@" 9>&- ;;
     stop)
+      # One that runs no more is left as it is: `session stop` says so, and stops nothing.
+      shadow_alive "$2" || { [[ $2 == ticket-* ]] && shadow_alive "codex-${2#ticket-}"; } ||
+        return 0
       shadow_note "$2 stopped"
+      shadow_stopped+="$2 codex-${2#ticket-} "
       snapshot_drop "$2" "codex-${2#ticket-}"
       ;;
     squeeze) shadow_note "$2 squeezed" ;;
@@ -230,12 +301,14 @@ shadow_session() {
       snapshot_busy "$2"
       ;;
     bridge)
+      # The new bridge prints its start, as any session does, before the bridge says so.
+      shadow_note "$2 started"
       shadow_note "$2: its bridge was started again"
       snapshot_busy "$2"
       ;;
     start) shadow_start "$2" "$3" "${5:-}" ;;
-    # The worktrees of finished work stay; their removal decides nothing the real tick logs.
-    cleanup) ;;
+    # The worktrees of finished work stay: removing them decides nothing the real tick logs.
+    cleanup) [[ ${2:-} == hunts ]] || shadow_cleanup ;;
     # The tick itself logs each message it would have typed, in the wake log's words.
     checks-finished | conflict-found | lost-check | batch-merged | status-check | finish-ready) ;;
     *) shadow_note "session $*" ;;
@@ -598,9 +671,9 @@ running=$(session list) || failed=1
 nudged=" "
 if train=$(WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/merge-when-current" --train-status 9>&-); then
 # A shadow tick notes the line it read whenever it changed: it explains a decision that differs.
-if ((shadow)) &&
-    [[ $(grep -E '^[0-9]+ train status: ' "$SHIPLINE_SHADOW" | tail -n 1 | cut -d ' ' -f 2-) != "train status: $train" ]]; then
-  shadow_note "train status: $train"
+if ((shadow)); then
+  last=$(tac "$SHIPLINE_SHADOW" | grep -m 1 -E '^[0-9]+ train status: ' | cut -d ' ' -f 2-)
+  [[ $last == "train status: $train" ]] || shadow_note "train status: $train"
 fi
 while read -r name state _; do
   [[ $state != limit && $name =~ ^(review|audit)-([0-9]+)$ ]] || continue
@@ -930,7 +1003,7 @@ while read -r number draft base; do
     ((local_starts_held == 0)) || continue
     # A hand-back's fresh reviewer, at its pull request's place in the order.
     if ((shadow)); then
-      shadow_start review "$number"
+      shadow_hand_back "$number"
     else
       python3 -B "$here/merge_driver.py" --start-hand-back "$number" 9>&-
     fi
@@ -998,7 +1071,8 @@ while read -r number draft base; do
     read -r round sent_back <<<"$history"
     branch=${head#* }
     if ((shadow)); then
-      python3 -B "$here/reviewer_start.py" --shadow "$main/$SHIPLINE_STATE_FOLDER" "$number" "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&- &&
+      python3 -B "$here/reviewer_start.py" --shadow "$main/$SHIPLINE_STATE_FOLDER" "$number" \
+        "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&- &&
         shadow_start review "$number"
     else
       python3 -B "$here/reviewer_start.py" "$main/$SHIPLINE_STATE_FOLDER" "$number" "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&-

@@ -90,7 +90,9 @@ Before a repository that runs the workflow from its own copy of the scripts move
 `shipline <command>`, Shipline is run beside it in shadow: `shipline --repo <checkout> tick
 --shadow` takes the decisions of a tick on that repository and carries out none (`tick` says
 what it reads and what it leaves). It writes them to `.local/shipline/shadow.log` of the
-checkout, readable by its owner alone, and leaves every note of the installation as it was.
+checkout, readable by its owner alone, and leaves every note of the installation as it was. Its
+reads of GitHub are real calls, counted in the machine's shared GitHub budget beside the
+tick's own, and a reviewer's head pushed from elsewhere is fetched as the real tick fetches it.
 
 Each shadow tick runs just before the installation's own tick, so both see the same state, for
 example as a step before the tick in its service, which the owner adds by a drop-in:

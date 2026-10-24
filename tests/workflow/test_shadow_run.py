@@ -295,6 +295,71 @@ def test_a_start_that_would_wait_for_memory_is_logged_and_holds_the_later_ones(
     assert not workflow.is_running("ticket-7") and not workflow.is_running("ticket-8")
 
 
+def _handed_back(workflow: Workflow, sent_back: int) -> None:
+    """Pull request 6, ready, whose merge the driver handed back to a fresh reviewer."""
+    workflow.add_pull_request(6, draft=False)
+    folder = workflow.repo / ".local" / "workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-review-6").write_text('{"reason": "conflicts with main"}\n')
+    rounds = [
+        {"body": f"<!-- workflow-review round={round} result=sent-back -->"}
+        for round in range(1, sent_back + 1)
+    ]
+    (workflow.state / "reviews-6.json").write_text(json.dumps(rounds))
+
+
+@pytest.mark.parametrize(
+    ("sent_back", "allowed", "started"),
+    [(1, False, True), (2, False, False), (2, True, True)],
+    ids=["second round", "third round unallowed", "third round allowed"],
+)
+def test_a_hand_back_s_reviewer_starts_as_the_merge_driver_would_start_it(
+    workflow: Workflow, sent_back: int, allowed: bool, started: bool
+) -> None:
+    _handed_back(workflow, sent_back)
+    if allowed:
+        (workflow.repo / ".local" / "workflow" / "review-6.allow-round").write_text("3\n")
+    workflow.add_pull_request(7)
+
+    done = workflow.run_script("tick", "--shadow", env=_CLOCK)
+
+    assert done.returncode == 0, done.stderr
+    assert _decisions(_shadow_log(workflow)) == [
+        *(["review-6 started"] if started else []),
+        "ticket-7 started",
+    ]
+
+
+def test_a_hand_back_whose_pull_request_has_a_session_gets_no_reviewer(
+    workflow: Workflow,
+) -> None:
+    _handed_back(workflow, 0)
+    workflow.running("ticket-6")
+
+    done = workflow.run_script("tick", "--shadow", env=_CLOCK)
+
+    assert done.returncode == 0, done.stderr
+    assert _decisions(_shadow_log(workflow)) == []
+
+
+def test_the_sessions_of_a_pull_request_closed_without_merging_are_gone_as_cleanup_leaves_them(
+    workflow: Workflow,
+) -> None:
+    workflow.add_worktree(9, state="CLOSED")
+    workflow.running("ticket-9")
+    workflow.screen("● Waiting for the full Python run in the background." + _BOX, "ticket-9")
+    _written(workflow.notes(9) / "ticket-9.job-wait", _NOW - 51 * 60)
+
+    shadow = workflow.run_script("tick", "--shadow", env=_CLOCK)
+    real = workflow.run_script("tick", env=_CLOCK)
+
+    assert shadow.returncode == 0, shadow.stderr
+    assert real.returncode == 0, real.stderr
+    assert not workflow.is_running("ticket-9")
+    assert _decisions(_shadow_log(workflow)) == []
+    assert not workflow.wake_log.exists() or "ticket-9" not in workflow.wake_log.read_text()
+
+
 def test_each_shadow_tick_marks_its_run_and_the_train_status_when_it_changes(
     workflow: Workflow,
 ) -> None:
@@ -696,7 +761,7 @@ def test_without_the_journal_the_session_commands_are_not_compared(tmp_path: Pat
 
 
 def test_only_the_hours_of_the_shadow_run_are_compared(tmp_path: Path) -> None:
-    shadow = f"{_NOW} shadow tick\n{_NOW + 3600} shadow tick\n"
+    shadow = f"{_NOW} shadow tick\n{_NOW + 1790} shadow tick\n{_NOW + 3600} shadow tick\n"
     wake = (
         f"{_NOW - 600} review-10 checks finished on {'a' * 40}; reviewer nudged\n"
         f"{_NOW + 1800} review-11 checks finished on {'a' * 40}; reviewer nudged\n"
@@ -712,6 +777,65 @@ def test_only_the_hours_of_the_shadow_run_are_compared(tmp_path: Path) -> None:
         "1 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 18:00:00: 1 differ",
     ]
     assert named.returncode == 0, named.stdout
+
+
+def test_a_journal_line_counts_from_the_start_of_its_service(tmp_path: Path) -> None:
+    """A start prints its line once its session is up, minutes into the tick."""
+    shadow = f"{_NOW} shadow tick\n{_NOW} ticket-7 started\n{_NOW + 890} shadow tick\n"
+    journal = (
+        f"{_NOW - 1}.0 example-host systemd[1]: Starting workflow-tick.service - Workflow tick...\n"
+        f"{_NOW + 400}.0 example-host bash[7]: ticket-7 started: https://example.com/s\n"
+        f"{_NOW + 410}.0 example-host systemd[1]: Finished workflow-tick.service - Workflow tick.\n"
+        f"{_NOW + 900}.0 example-host bash[8]: ticket-8 started: https://example.com/t\n"
+    )
+
+    done = _compare(*_logs(tmp_path, shadow, "", journal))
+
+    assert done.returncode == 1
+    assert [line for line in done.stdout.splitlines() if not line.startswith(" ")] == [
+        "2026-09-21 17:15:00 ticket-8",
+        "2 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 17:14:50: 1 differ",
+    ]
+
+
+def test_a_real_tick_without_a_shadow_tick_beside_it_is_not_compared(tmp_path: Path) -> None:
+    shadow = f"{_NOW} shadow tick\n{_NOW + 360} shadow tick\n"
+    wake = f"{_NOW + 180} review-10 checks finished on {'a' * 40}; reviewer nudged\n"
+
+    done = _compare(*_logs(tmp_path, shadow, wake, "\n"), "--window", "60")
+
+    assert done.returncode == 0, done.stdout
+    assert done.stdout.startswith("0 decisions compared")
+
+
+def test_the_load_of_a_held_start_and_an_orchestrator_s_spaced_name_compare(
+    tmp_path: Path,
+) -> None:
+    held = (
+        "the processors are overloaded: load {} over 5 minutes, ceiling 6 (1.5 times 4 processors)"
+    )
+    shadow = (
+        f"{_NOW} shadow tick\n{_NOW} "
+        + held.format("7.10")
+        + "; the next tick tries this start again\n"
+        "2026-09-21 17:00:00  after a reset\n  told Check in: Wake check-in, 17:00.\n"
+    )
+    wake = "2026-09-21 17:00:01  after a reset\n  Check in is busy; not told\n"
+    journal = (
+        f"{_NOW + 1}.0 example-host bash[7]: "
+        + held.format("7.25")
+        + "; the next tick tries this start again\n"
+    )
+
+    done = _compare(*_logs(tmp_path, shadow, wake, journal))
+
+    assert done.returncode == 1
+    assert done.stdout.splitlines()[:3] == [
+        "2026-09-21 17:00:00 wake",
+        "  shadow: wake (after a reset): told Check in",
+        "  real:   wake (after a reset): Check in is busy; not told",
+    ]
+    assert done.stdout.splitlines()[-1].endswith(": 1 differ")
 
 
 @pytest.mark.parametrize(
