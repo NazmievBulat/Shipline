@@ -21,12 +21,10 @@ it too. The repository is the main checkout
 `--repo` names, else `SHIPLINE_REPO`, else the one the current folder is in; outside any
 repository, with none named, a command stops and says how to name one. A command started
 outside the repository runs in its main checkout. Every session gets `SHIPLINE_REPO` and the
-checkout's `bin` in its environment. The files a repository keeps for the gate and the panel
-(`pre-train-checks`, `advisory_service.py`, `pushing_checkout.py`, `run_proof.py`,
-`mechanical_conflicts.py`, `server_tests_for_changes.py`, `browser_tests_for_changes.py`) are
-read from its own `scripts/workflow`, and its E2E planner from `scripts/e2e-plan.py`; a
-missing one means none: no check, no helper, no selected test (the panel then notes that CI
-runs the whole suite).
+checkout's `bin` in its environment. The gate reads a repository's `run_proof.py` from its own
+`scripts/workflow`; its other parts are the commands its `shipline.json` names (below,
+"The repository's commands"), read from its main checkout; a missing one means none: no
+check, no helper, no selected test (the panel then notes that CI runs the whole suite).
 
 # Workflow workers
 

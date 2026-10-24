@@ -18,6 +18,10 @@ from workflow_harness import SESSION_LINK, Workflow, instruction
 _WORKER = instruction("Implement pull request 7")
 
 _TMUX = shutil.which("tmux")
+# A tmux built with systemd support moves each new pane into a scope of its own. CI builds one
+# beside the tmux on the PATH and names it here.
+_TMUX_WITH_SYSTEMD = os.environ.get("WORKFLOW_TEST_TMUX_WITH_SYSTEMD")
+_MB = 1024 * 1024
 
 
 def _has_user_scopes() -> bool:
@@ -56,14 +60,43 @@ def real_tmux(workflow: Workflow) -> Iterator[Workflow]:
     try:
         yield workflow
     finally:
-        for name in ("ticket-7", "ticket-8", "audit-7", "review-7", "cloud-7"):
+        # The build the test chose, which may differ from the one on the PATH.
+        tmux = workflow.bin / "tmux" if (workflow.bin / "tmux").exists() else _TMUX
+        for socket in sockets.glob("tmux-*/*"):
             subprocess.run(
-                [str(_TMUX), "-L", name, "kill-server"],
+                [str(tmux), "-L", socket.name, "kill-server"],
                 env=workflow.env,
                 capture_output=True,
                 check=False,
             )
         shutil.rmtree(sockets, ignore_errors=True)
+
+
+@pytest.fixture(
+    params=[
+        pytest.param(_TMUX, id="tmux"),
+        pytest.param(
+            _TMUX_WITH_SYSTEMD,
+            id="tmux-with-systemd",
+            # Environment prerequisite: CI names the second build; elsewhere there may be none.
+            marks=pytest.mark.skipif(  # noqa: TID251
+                not _TMUX_WITH_SYSTEMD, reason="no tmux with systemd support is named"
+            ),
+        ),
+    ]
+)
+def each_tmux(real_tmux: Workflow, request: pytest.FixtureRequest) -> Workflow:
+    """The real `tmux` of one build: the one on the PATH, or the one with systemd support."""
+    (real_tmux.bin / "tmux").symlink_to(request.param)
+    return real_tmux
+
+
+def _real_scopes(workflow: Workflow) -> None:
+    """The real systemd makes each session's scope, and the real kernel holds its limits."""
+    (workflow.bin / "systemd-run").unlink()
+    workflow.env["XDG_RUNTIME_DIR"] = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    workflow.env["WORKFLOW_CGROUP_ROOT"] = "/sys/fs/cgroup"
+    workflow.env["WORKFLOW_PROC_ROOT"] = "/proc"
 
 
 def test_a_cloud_launch_has_a_terminal_and_survives_its_panes_immediate_exit(
@@ -286,16 +319,19 @@ def test_real_codex_and_bridge_are_started_and_stopped_together(real_tmux: Workf
         )
 
 
-# Environment prerequisite: a user's systemd that makes scopes; CI's runners have none.
-@pytest.mark.skipif(not _has_user_scopes(), reason="no user systemd to make scopes")  # noqa: TID251
+# Environment prerequisite: a user's systemd that makes scopes, as GitHub's runners have.
+_USER_SCOPES = pytest.mark.skipif(  # noqa: TID251
+    not _has_user_scopes(), reason="no user systemd to make scopes"
+)
+
+
+@_USER_SCOPES
 def test_a_runaway_test_run_is_stopped_at_its_session_limit_and_the_others_go_on(
-    real_tmux: Workflow,
+    each_tmux: Workflow,
 ) -> None:
     """The real kernel and systemd."""
-    (real_tmux.bin / "systemd-run").unlink()
-    real_tmux.env["XDG_RUNTIME_DIR"] = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    real_tmux.env["WORKFLOW_CGROUP_ROOT"] = "/sys/fs/cgroup"
-    real_tmux.env["WORKFLOW_PROC_ROOT"] = "/proc"
+    real_tmux = each_tmux
+    _real_scopes(real_tmux)
     log = real_tmux.state / "run-7.log"
     run = real_tmux.repo / "scripts" / "workflow" / "test-run"
     allocate = real_tmux.state / "allocate.py"
@@ -332,3 +368,66 @@ def test_a_runaway_test_run_is_stopped_at_its_session_limit_and_the_others_go_on
     listed = real_tmux.run("list").stdout.splitlines()
     assert [line.split("  ")[0] for line in listed] == ["ticket-7", "ticket-8"]
     assert all("(limit 96 MB)" in line for line in listed), listed
+
+
+def _claude_noting_its_group(workflow: Workflow) -> None:
+    """A `claude` that notes the control group it runs in, as the kernel says it."""
+    workflow.fake(
+        "claude",
+        "#!/bin/bash\n"
+        'if [ "$*" = "agents --json" ]; then echo "[]"; exit 0; fi\n'
+        'sed -n "s/^0:://p" /proc/self/cgroup > "@STATE@/group-$WORKFLOW_SESSION"\n'
+        f'echo "Remote Control: {SESSION_LINK}"\n'
+        "exec /bin/sleep 600\n",
+    )
+
+
+@_USER_SCOPES
+@pytest.mark.parametrize("count", [3, 10])
+def test_sessions_started_one_after_another_each_run_inside_their_limits(
+    each_tmux: Workflow, count: int
+) -> None:
+    """A tmux with systemd support moves each new pane into a scope of its own, and that move once
+    raced the session's own scope: the first of three sessions ran with no limit at all."""
+    _real_scopes(each_tmux)
+    _claude_noting_its_group(each_tmux)
+    limits = {"WORKFLOW_SESSION_MEMORY_MAX": "96M", "WORKFLOW_SESSION_SWAP_MAX": "16M"}
+    names = [f"ticket-{number}" for number in range(1, count + 1)]
+    for number in range(1, count + 1):
+        each_tmux.add_pull_request(number)
+        done = each_tmux.run("start", "worker", str(number), env=limits)
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.splitlines()[-1] == f"ticket-{number} started: {SESSION_LINK}"
+
+    held = {}
+    for name in names:
+        group = Path("/sys/fs/cgroup" + (each_tmux.state / f"group-{name}").read_text().strip())
+        held[name] = (
+            (group / "memory.max").read_text().strip(),
+            (group / "memory.swap.max").read_text().strip(),
+        )
+    listed = each_tmux.run("list").stdout.splitlines()
+
+    assert held == dict.fromkeys(names, (str(96 * _MB), str(16 * _MB)))
+    assert sorted(line.split("  ")[0] for line in listed) == sorted(names)
+    assert all("(limit 96 MB)" in line for line in listed), listed
+
+
+def test_a_session_whose_scope_does_not_hold_its_limits_is_refused(each_tmux: Workflow) -> None:
+    """As when the user's systemd makes the scope but has no memory controller to set it with."""
+    each_tmux.fake(
+        "systemd-run",
+        '#!/bin/bash\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n',
+    )
+    each_tmux.add_pull_request(7)
+
+    done = each_tmux.run("start", "worker", "7")
+
+    assert done.returncode != 0
+    assert done.stderr.splitlines()[-1] == (
+        "ticket-7 was not started: its scope does not hold its memory limits of 8 GB and 4 GB of "
+        "swap (memory.max missing, memory.swap.max missing)"
+    )
+    assert "started" not in done.stdout
+    assert not (each_tmux.state / "claude-ran").exists()
+    assert each_tmux.run("list").stdout == ""
