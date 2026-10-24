@@ -415,7 +415,7 @@ def test_tick_reads_reviews_from_the_organization(workflow: Workflow) -> None:
     assert done.returncode == 0, done.stderr
     # The tick also reads main's CI for the merge gate; only the reviews read is checked here.
     assert [call for call in workflow.calls("gh api --paginate") if "/pulls/" in call] == [
-        "gh api --paginate repos/NazmievBulat/Shipline/pulls/7/reviews"
+        "gh api --paginate repos/example-org/example-app/pulls/7/reviews"
     ]
 
 

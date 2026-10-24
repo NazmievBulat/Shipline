@@ -1,0 +1,54 @@
+2026-10-16 23:00:00  every 20 minutes
+  usage: 5-hour window 10% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
+  sessions: none; pull requests: drafts 22; ready medium 21 (checks passing); main: red since 2026-10-16T22:00:00Z, CI result (0123456789ab); starts: allowed; tmp pressure: false
+  told Check-in: Wake check-in, 23:00.
+2026-10-17 01:00:00  every 20 minutes
+  usage: 5-hour window 10% used, resets in 2h10m, weekly 30%
+  sessions: none; pull requests: none; main: green (0123456789ab); starts: allowed; tmp pressure: false
+  nothing changed since the last check-in; Check-in not told
+2026-10-23 01:00:00  every 20 minutes
+  usage: 5-hour window 40% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
+  sessions: ticket-22 busy, review-21 idle; pull requests: drafts 22; ready medium 21 (checks passing); main: green (0123456789ab); starts: allowed; tmp pressure: false
+  told Check-in: Wake check-in, 01:00. Usage: 40% used.
+2026-10-23 02:00:00  every 20 minutes
+  usage: 5-hour window 55% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
+  sessions: ticket-22 busy, review-21 idle; pull requests: drafts 22; ready medium 21 (checks passing); main: red since 2026-10-23T01:30:00Z, CI result (0123456789ab); commits since last green main 89abcdef0123: 0123456 fix: two; starts: allowed; tmp pressure: false
+  told Check-in: Wake check-in, 02:00. Usage: 55% used.
+1792720830 review-21 checks finished on aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reviewer nudged
+2026-10-23 03:00:00  every 20 minutes
+  usage: 5-hour window 60% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
+  sessions: ticket-22 busy; pull requests: drafts 22; ready medium 21 (checks passing); main: green (0123456789ab); starts: allowed; tmp pressure: false
+  nothing changed since the last check-in; Check-in not told
+1792724430 review-21 lost check on aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reviewer nudged
+2026-10-23 04:00:00  every 20 minutes
+  usage: 5-hour window 91% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
+  sessions: ticket-22 busy, review-21 idle, review-22 busy; pull requests: drafts 22; ready medium 21 (checks passing); main: red since 2026-10-23T03:30:00Z, CI result (0123456789ab); commits since last green main 89abcdef0123: 0123456 fix: two; starts: allowed; tmp pressure: false
+  told Check-in: Wake check-in, 04:00. Usage: 91% used.
+1792728030 review-22 merge conflict on bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; reviewer nudged
+2026-10-23 05:00:00  every 20 minutes
+  usage: 5-hour window 70% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
+  sessions: ticket-22 busy; pull requests: drafts 22; ready medium 21 (checks passing); main: green (0123456789ab); starts: allowed; tmp pressure: false
+  nothing changed since the last check-in; Check-in not told
+1792731630 ticket-22 idle 52 min waiting for its own job or turn; status check sent
+2026-10-23 06:00:00  every 20 minutes
+  usage: 5-hour window 72% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
+  sessions: ticket-22 busy; pull requests: drafts 22; ready medium 21 (checks passing); main: red since 2026-10-23T05:40:00Z, CI result (0123456789ab); commits since last green main 89abcdef0123: 0123456 fix: two; starts: allowed; tmp pressure: false
+  nothing changed since the last check-in; Check-in not told
+1792735230 ticket-22 idle on ready pull request 22 without worker finished; told to finish
+2026-10-23 07:00:00  every 20 minutes
+  usage: 5-hour window 74% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
+  sessions: ticket-22 busy; pull requests: drafts 22; ready medium 21 (checks passing); main: pending, CI result (0123456789ab); starts: allowed; tmp pressure: false
+  nothing changed since the last check-in; Check-in not told
+2026-10-23 09:00:00  every 20 minutes
+  usage: 5-hour window 30% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
+  sessions: ticket-23 busy; pull requests: drafts 22; ready medium 21 (checks passing); main: red since 2026-10-23T08:30:00Z, CI: dependencies (0123456789ab); CI: dependencies could not reach PyPI's advisory service, and nothing was found wrong with main; starts: allowed; tmp pressure: false
+  nothing changed since the last check-in; Check-in not told
+2026-10-23 10:00:00  every 20 minutes
+  usage: 5-hour window 20% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
+  sessions: ticket-23 busy; pull requests: drafts 22; ready medium 21 (checks passing); main: green (0123456789ab); starts: allowed; tmp pressure: false
+  told Check-in: Wake check-in, 10:00. Usage: 20% used.
+1792749630 review-23 checks finished on cccccccccccccccccccccccccccccccccccccccc; reviewer nudged
+2026-10-23 11:00:00  every 20 minutes
+  usage: 5-hour window 25% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
+  sessions: none; pull requests: drafts 22; ready medium 21 (checks passing); main: green (0123456789ab); starts: allowed; tmp pressure: false
+  nothing changed since the last check-in; Check-in not told
