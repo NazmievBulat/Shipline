@@ -3112,13 +3112,17 @@ def _ci_runs(head: str, *, pull: bool = True) -> str:
     return f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={head}{event}&per_page=100"
 
 
+def _check_runs_path(head: str) -> str:
+    return f"{_REPO}/commits/{head}/check-runs?per_page=100"
+
+
 # The runs of check suite 5000, which holds every check run `_check_runs` shows.
 _SUITE_RUNS = f"{_REPO}/actions/runs?check_suite_id=5000&per_page=100"
 
 
 def _check_runs(github: GitHub, head: str, *checks: tuple[str, str]) -> None:
     """The check runs GitHub shows on `head`, by name and status, all in check suite 5000."""
-    github.api[f"{_REPO}/commits/{head}/check-runs?per_page=100"] = {
+    github.api[_check_runs_path(head)] = {
         "total_count": len(checks),
         "check_runs": [
             {
@@ -3223,7 +3227,7 @@ def test_a_green_rerun_whose_check_runs_cannot_be_read_keeps_its_place(
     assert _train(github)["waiting"] == ["7", "8"]
     github.api[_ci_runs(github.head)] = {"workflow_runs": []}
     # GitHub fails the read of the head's check runs: unavailable, or with a server error.
-    github.api[f"{_REPO}/commits/{github.head}/check-runs?per_page=100"] = answer
+    github.api[_check_runs_path(github.head)] = answer
     github.save()
     for _ in range(2):
         train = _train(github)
@@ -3232,16 +3236,157 @@ def test_a_green_rerun_whose_check_runs_cannot_be_read_keeps_its_place(
         assert train["first"] == "7"
 
 
-def test_a_green_rerun_whose_ci_check_runs_are_gone_is_pending_again(github: GitHub) -> None:
+def test_a_moment_with_no_runs_and_no_check_runs_keeps_the_green_rerun_waiting(
+    github: GitHub,
+) -> None:
     _green_rerun_on_old_main(github)
+    _check_runs(github, github.head, ("CI: what to run", "completed"), ("CI result", "completed"))
+    github.save()
     assert _train(github)["waiting"] == ["7", "8"]
-    # Neither the run nor any CI check run is shown on the head any more.
+    listed = github.api[_ci_runs(github.head)]
+    checks = github.api[_check_runs_path(github.head)]
+    # Right after a re-run GitHub can lag on the head's check runs as on its runs: for a moment
+    # it lists neither.
     github.api[_ci_runs(github.head)] = {"workflow_runs": []}
+    github.api[_check_runs_path(github.head)] = {"total_count": 0, "check_runs": []}
+    github.save()
+    train = _train(github)
+    assert train["blocked"] == ["7"]
+    assert train["waiting"] == ["7", "8"]
+    assert train["first"] == "7"
+    waits = github.run()
+    assert waits.returncode == 1
+    assert "failed checks" not in waits.stderr
+    assert "has not started" in waits.stderr
+    # Then it lists both again, and the member refreshes.
+    github.api[_ci_runs(github.head)] = listed
+    github.api[_check_runs_path(github.head)] = checks
+    github.save()
+    assert _train(github)["waiting"] == ["7", "8"]
+    done = github.run()
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "failed checks" not in done.stderr
+
+
+def test_the_saved_line_after_an_empty_look_still_names_the_rerun_refreshable(
+    github: GitHub,
+) -> None:
+    _green_rerun_on_old_main(github)
+    _check_runs(github, github.head, ("CI: what to run", "completed"), ("CI result", "completed"))
+    github.save()
+    assert _train(github)["waiting"] == ["7", "8"]
+    listed = github.api[_ci_runs(github.head)]
+    github.api[_ci_runs(github.head)] = {"workflow_runs": []}
+    github.api[_SUITE_RUNS] = {"workflow_runs": []}
+    github.save()
+    assert _train(github)["waiting"] == ["7", "8"]
+    saved = json.loads((github.workflow.repo / ".local/workflow/merge-train.json").read_text())
+    assert saved["refreshable"] == ["7"]
+    github.api[_ci_runs(github.head)] = listed
+    github.save()
+    assert _train(github)["waiting"] == ["7", "8"]
+    done = github.run()
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "failed checks" not in done.stderr
+
+
+def test_a_partial_rerun_still_running_is_pending_and_keeps_no_stale_mark(
+    github: GitHub,
+) -> None:
+    # A failed job re-run in part: its new attempt runs while the other jobs are finished.
+    _green_rerun_on_old_main(github)
+    _check_runs(
+        github,
+        github.head,
+        ("CI: what to run", "completed"),
+        ("CI: server tests", "in_progress"),
+        ("CI result", "in_progress"),
+    )
+    [run] = github.api[_ci_runs(github.head)]["workflow_runs"]
+    github.api[_ci_runs(github.head)] = {"workflow_runs": []}
+    github.api[_SUITE_RUNS] = {
+        "workflow_runs": [
+            {**run, "status": "in_progress", "conclusion": None, "path": ".github/workflows/ci.yml"}
+        ]
+    }
     github.save()
     train = _train(github)
     assert train["blocked"] == ["7"]
     assert train["waiting"] == ["8"]
-    assert train["first"] == "8"
+    assert not github.workflow.calls("sleep 30")
+
+
+def _unlisted_line(github: GitHub, members: int) -> list[str]:
+    """A line of `members` pull requests whose CI jobs all finished, but whose CI runs GitHub
+    lists neither by head nor by check suite, as when a rate limit hits them all at once."""
+    numbers = [str(7 + index) for index in range(members)]
+    for index, number in enumerate(numbers):
+        if number not in github.pulls:
+            github.pulls[number] = {
+                **deepcopy(github.pulls["7"]),
+                "headRefOid": f"{index + 1:040x}",
+                "headRefName": f"ticket/member-{number}",
+            }
+            github.workflow.running(f"review-{number}")
+        head = github.pulls[number]["headRefOid"]
+        github.api[_ci_runs(head)] = {"workflow_runs": []}
+        _check_runs(github, head, ("CI: what to run", "completed"), ("CI result", "completed"))
+    github.api[_SUITE_RUNS] = {"workflow_runs": []}
+    github.save()
+    _line(github, numbers)
+    return numbers
+
+
+def test_one_read_of_a_line_github_lists_no_runs_for_pauses_once_not_per_member(
+    github: GitHub,
+) -> None:
+    # One reconciliation holds the merge lock: its pause does not grow with the line.
+    _unlisted_line(github, 6)
+    done = github.workflow.run_script("merge-when-current", "--train-status")
+    assert done.returncode == 0, done.stderr
+    assert github.workflow.calls("sleep 30") == ["sleep 30"]
+
+
+def test_a_gate_call_on_a_line_github_lists_no_runs_for_pauses_once(github: GitHub) -> None:
+    # The first member's gate call reconciles the whole line under the merge lock.
+    _unlisted_line(github, 4)
+    done = github.run()
+    assert done.returncode != 0
+    assert github.workflow.calls("sleep 30") == ["sleep 30"]
+
+
+def test_red_main_pauses_once_for_earlier_main_commits_github_lists_no_runs_for(
+    github: GitHub,
+) -> None:
+    workflow = github.workflow
+    workflow.git("checkout", "main")
+    earlier = []
+    for name in ("first", "second", "third"):
+        workflow.git("commit", "--allow-empty", "-m", f"fix: {name} change")
+        earlier.append(workflow.git("rev-parse", "HEAD"))
+    workflow.git("commit", "--allow-empty", "-m", "fix: the red change")
+    github.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    github.main("failure")
+    # Main's history names three earlier green pushes, whose runs GitHub now lists nowhere.
+    github.api[
+        f"{_REPO}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100"
+    ] = {
+        "workflow_runs": [
+            {"id": 5 + index, "head_sha": commit} for index, commit in enumerate(earlier)
+        ]
+    }
+    for commit in earlier:
+        github.api[_ci_runs(commit, pull=False)] = {"workflow_runs": []}
+        _check_runs(github, commit, ("CI result", "completed"))
+    github.api[_SUITE_RUNS] = {"workflow_runs": []}
+    github.save()
+
+    done = workflow.run_script("main-status")
+
+    assert done.returncode == 0, done.stderr
+    assert "main: red" in done.stdout
+    assert workflow.calls("sleep 30") == ["sleep 30"]
 
 
 @pytest.mark.parametrize(

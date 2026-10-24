@@ -170,10 +170,9 @@ MEMBER_MARKS = ("unavailable", "fixes", "refreshable")
 
 # Set only while computing train order, never while verifying a merge.
 _planning_reads: train_reads.Reads | None = None
-# The heads GitHub listed no CI run for although their CI jobs finished, in this process; and
-# those it was asked again for after the pause, which it is once.
-_unlisted: set[str] = set()
-_asked_again: set[str] = set()
+# Whether this process already paused for GitHub to list a CI run: it pauses once in all, so a
+# line whose runs GitHub lists for none of its members never holds the merge lock longer.
+_paused = False
 
 
 class Refused(Exception):
@@ -388,7 +387,6 @@ def runs(
         raise
     except Refused, KeyError, TypeError, ValueError:
         # Unread is not absent: the head has no CI result yet, and the line keeps its judgment.
-        _unlisted.add(head)
         return []
 
 
@@ -397,8 +395,9 @@ def _unlisted_runs(path: str, head: str, *, pull: bool, scheduled: bool) -> list
 
     GitHub sometimes lists no CI run for such a head and lists it when asked again a little
     later. The run is found by the check suite of its jobs; when that lists none either, GitHub
-    is asked again after a pause, once in a process. A run still not found is no CI result yet,
-    a wait: the line keeps what it judged of the head before (`_unlisted`)."""
+    is asked again, after a pause the first time in a process. A run still not found is no CI
+    result yet, a wait: the line keeps what it judged of the head before."""
+    global _paused
     suites = _ci_suites(head)
     if not suites:
         return []
@@ -418,13 +417,10 @@ def _unlisted_runs(path: str, head: str, *, pull: bool, scheduled: bool) -> list
     )
     if found:
         return found
-    if head not in _asked_again:
-        _asked_again.add(head)
+    if not _paused:
+        _paused = True
         command("sleep", str(UNLISTED_RETRY_SECONDS))
-    found = _own_runs(api(path, "workflow_runs", fresh=True), head, pull=pull, scheduled=scheduled)
-    if not found:
-        _unlisted.add(head)
-    return found
+    return _own_runs(api(path, "workflow_runs", fresh=True), head, pull=pull, scheduled=scheduled)
 
 
 def _ci_check(name: str) -> bool:
@@ -2127,8 +2123,8 @@ class Train:
         pulls: dict[str, Any] = {}
         suite_states: dict[str, str | None] = {}
         lost: dict[str, dict[str, Any]] = {}
-        # A blocked head's CI run that cannot be read, or that GitHub lists no more though its
-        # jobs finished, is no new evidence: its mark stays.
+        # A blocked head's CI run that cannot be read, or that GitHub lists no more, is no new
+        # evidence: GitHub can lag on its check runs too, so its mark stays.
         refreshable, self.refreshable = self.refreshable, set()
         # Use the same session state and owner-question notes as the tick. A background
         # job leaves its session running and must not lose its turn merely for waiting.
@@ -2215,12 +2211,7 @@ class Train:
                             note_lost(self.path.parent, number, pull["headRefOid"], found)
                     if state == "red":
                         self.blocked[number] = pull["headRefOid"]
-                    elif (
-                        not ci
-                        and pull["headRefOid"] in _unlisted
-                        and number in refreshable
-                        and number in self.blocked
-                    ):
+                    elif not ci and number in refreshable and number in self.blocked:
                         self.refreshable.add(number)
                     elif state == "green" and number in self.blocked:
                         # Its own green run cannot clear a failure its prefix run found. A
