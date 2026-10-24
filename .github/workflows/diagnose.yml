@@ -23,22 +23,20 @@ jobs:
           set +e
           mkdir -p "$RUNNER_TEMP/look"
           cat > "$RUNNER_TEMP/look/look.sh" <<'SH'
+          env | sort > "$1"
           bash -c ": a long command line that passes the eightieth column, then codex exec; sleep 5" &
           sleep 0.5
-          echo "widest: $(ps aux | awk '{ print length }' | sort -n | tail -1)"
-          echo "widest with -ww: $(ps auxww | awk '{ print length }' | sort -n | tail -1)"
-          echo "tty: $(tty 2>&1); /dev/tty: $( (stty size < /dev/tty) 2>&1)"
-          echo "fd0: $(readlink /proc/self/fd/0) fd1: $(readlink /proc/self/fd/1) fd2: $(readlink /proc/self/fd/2)"
-          echo "session leader: $(ps -o sid= -p $$) tty of me: $(ps -o tty= -p $$)"
+          echo "$1 widest: $(ps aux | awk '{ print length }' | sort -n | tail -1)"
+          echo "$1 widest in a bare environment: $(env -i PATH="$PATH" ps aux | awk '{ print length }' | sort -n | tail -1)"
           kill %1
           SH
           cat > "$RUNNER_TEMP/look/test_look.py" <<'PY'
           import os, subprocess, sys
           def test_look():
-              done = subprocess.run(["bash", os.environ["LOOK"]], capture_output=True, text=True)
-              print("inside", done.stdout, done.stderr, file=sys.__stderr__)
+              done = subprocess.run(["bash", os.environ["LOOK"], os.environ["RUNNER_TEMP"] + "/inside"], capture_output=True, text=True)
+              print(done.stdout, done.stderr, file=sys.__stderr__)
           PY
           export LOOK="$RUNNER_TEMP/look/look.sh"
           python -m pytest -p no:cacheprovider -p no:xdist -c /dev/null -q -s "$RUNNER_TEMP/look/test_look.py"
-          python3 -c 'import os, subprocess; done = subprocess.run(["bash", os.environ["LOOK"]], capture_output=True, text=True); print("outside", done.stdout, done.stderr)'
-          python -m pytest -p no:cacheprovider -p no:xdist -c /dev/null -q -s "$RUNNER_TEMP/look/test_look.py" < /dev/null
+          bash "$LOOK" "$RUNNER_TEMP/outside"
+          diff "$RUNNER_TEMP/outside" "$RUNNER_TEMP/inside" | sed -E 's/=(.{40}).*/=\1.../'
