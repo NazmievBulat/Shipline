@@ -222,7 +222,7 @@ def test_failed_savings_reads_back_off_and_keep_their_day_across_midnight(night:
     assert _wake(night, "ticket-7", at=_at(19, 53)).returncode == 0
     assert len(reads.read_text().splitlines()) == count
     fixture.write_text(complete)
-    assert _wake(night, at=_at(20, 11)).returncode == 0
+    assert _wake(night, at=_at(20, 14)).returncode == 0
     assert "saved (2026-10-12 UTC): images 24.00" in night.sent()[-1]
     assert not progress.exists()
     assert not progress.with_suffix(".progress.retry").exists()
