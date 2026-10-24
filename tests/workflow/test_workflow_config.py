@@ -61,6 +61,7 @@ _DEFAULTS = {
         },
     },
     "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
+    "hunts": {"areas": {}, "plans": None},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
     "commands": {
         name: None
@@ -163,13 +164,15 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     example = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
 
     def keys(value: Any, prefix: str = "") -> set[str]:
-        if not isinstance(value, dict):
+        # The hunt areas are named by the repository, not by Shipline.
+        if not isinstance(value, dict) or prefix == ".hunts.areas":
             return {prefix}
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 
     assert keys(example) == keys(_DEFAULTS)
     assert example["repository"].endswith("/example-app")
     assert example["runner"]["labels"]
+    assert example["hunts"]["areas"]
 
 
 def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
@@ -349,6 +352,20 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"state_folder": "../workflow"}', "state_folder"),
         ('{"repositry": "example-owner/example-app"}', "repositry"),
         ('{"checks": {"ci_results": "CI result"}}', "checks.ci_results"),
+        ('{"hunts": {"areas": [{"name": "phone"}]}}', "hunts.areas"),
+        ('{"hunts": {"areas": {"Phone": ["/calls"]}}}', "hunts.areas"),
+        ('{"hunts": {"areas": {"phone app": ["/calls"]}}}', "hunts.areas"),
+        ('{"hunts": {"areas": {"phone": []}}}', "hunts.areas.phone"),
+        ('{"hunts": {"areas": {"phone": "/calls"}}}', "hunts.areas.phone"),
+        ('{"hunts": {"areas": {"phone": ["calls"]}}}', "hunts.areas.phone"),
+        ('{"hunts": {"areas": {"phone": ["/calls, /contacts"]}}}', "hunts.areas.phone"),
+        ('{"hunts": {"areas": {"phone": ["/calls\\"$(touch nope)"]}}}', "hunts.areas.phone"),
+        ('{"hunts": {"areas": {"phone": ["/calls`id`"]}}}', "hunts.areas.phone"),
+        ('{"hunts": {"plans": "/docs/hunt-plans.md"}}', "hunts.plans"),
+        ('{"hunts": {"plans": "../hunt-plans.md"}}', "hunts.plans"),
+        ('{"hunts": {"plans": "docs/hunt plans.md"}}', "hunts.plans"),
+        ('{"hunts": {"plans": "docs/$HOME.md"}}', "hunts.plans"),
+        ('{"hunts": {"plan": "docs/hunt-plans.md"}}', "hunts.plan"),
     ],
 )
 def test_a_file_that_cannot_be_read_is_refused_by_name(
@@ -466,6 +483,38 @@ def test_bash_without_a_file_reads_the_defaults(tmp_path: Path) -> None:
         "0",
         "{}",
     ]
+
+
+def test_the_hunt_areas_and_plans_are_read_by_python_and_bash(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    areas = {"phone": ["/calls", "/contacts/[id]"], "billing": ["/invoices"]}
+    _write(repo, {"hunts": {"areas": areas, "plans": "docs/hunt-plans.md"}})
+
+    config = workflow_config.load(repo)
+    printed = _shell(
+        repo,
+        'printf "%s\\n" "${#SHIPLINE_HUNT_AREAS[@]}" "${SHIPLINE_HUNT_AREAS[@]}" '
+        '"${SHIPLINE_HUNT_SCREENS[@]}" "$SHIPLINE_HUNT_PLANS"',
+    )
+
+    assert config.hunts.areas == {"phone": ("/calls", "/contacts/[id]"), "billing": ("/invoices",)}
+    assert config.hunts.plans == "docs/hunt-plans.md"
+    assert printed.splitlines() == [
+        "2",
+        "phone",
+        "billing",
+        "/calls, /contacts/[id]",
+        "/invoices",
+        "docs/hunt-plans.md",
+    ]
+
+
+def test_bash_reads_no_hunt_areas_and_no_plans_by_default(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+
+    printed = _shell(repo, 'printf "%s|" "${#SHIPLINE_HUNT_AREAS[@]}" "$SHIPLINE_HUNT_PLANS"')
+
+    assert printed == "0||"
 
 
 def _jq(config: str | None, labels: list[str], program: str = "priority_name") -> str:
