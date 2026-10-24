@@ -216,6 +216,34 @@ def _run(
     return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
+def run_shown(*args: str, timeout: float | None, grace: float) -> int | None:
+    """Runs a command whose output is this one's, and returns its exit code; None when it ran
+    past `timeout`. It then gets a TERM, and `grace` seconds later a KILL, as does every process
+    it started. An interrupt kills them at once, and nothing it started outlives it."""
+    process: subprocess.Popen[str] | None = None
+    try:
+        with _defer_interrupts():
+            process = subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        assert process is not None
+        _stop(process, unwind=True, cleanup_timeout=grace)
+        return None
+    except BaseException:
+        if process is not None:
+            _stop(process)
+        raise
+    # A server it left in the background would hold its ports for the next run.
+    _kill_run(process.pid, set())
+    return code
+
+
 def run(
     *args: str,
     timeout: float | None = COMMAND_TIMEOUT,

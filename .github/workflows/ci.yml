@@ -109,6 +109,7 @@ jobs:
               tests/workflow/test_check_parts.py
               tests/workflow/test_ci.py
               tests/workflow/test_ci_demand.py
+              tests/workflow/test_ci_tests_for_changes.py
               tests/workflow/test_cloud_workers.py
               tests/workflow/test_codex_worker.py
               tests/workflow/test_conflict_review.py

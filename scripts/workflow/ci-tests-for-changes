@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# The tests CI will run for this change; with --run, a cloud worker's push runs them first
+# (`ci_tests_for_changes.py`).
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec python3 -B "$here/ci_tests_for_changes.py" "$@"
