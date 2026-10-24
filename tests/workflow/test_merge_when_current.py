@@ -1656,6 +1656,8 @@ def test_each_merge_on_an_advisory_main_wakes_nobody(github: GitHub) -> None:
         github.save()
         assert github.workflow.run_script("main-status").stdout.startswith(state)
         assert not (folder / "main-status.pending").exists()
+    # The pending line it published said that main stays advisory.
+    assert (folder / "main-status").read_text().startswith("main: advisory")
 
     # The update lands: main's run on it goes on for a while, then passes. Leaving the advisory
     # state is told once main is green.
@@ -1664,11 +1666,62 @@ def test_each_merge_on_an_advisory_main_wakes_nobody(github: GitHub) -> None:
     github.save()
     assert github.workflow.run_script("main-status").stdout.startswith("main: pending")
     assert not (folder / "main-status.pending").exists()
+    assert (folder / "main-status").read_text().endswith("; still advisory\n")
     github.main()
     github.save()
     assert github.workflow.run_script("main-status").stdout.startswith("main: green")
     assert (folder / "main-status.pending").read_text().startswith("main: green")
-    assert not (folder / "main-advisory").exists()
+
+
+def test_an_advisory_main_published_before_its_state_was_kept_wakes_nobody_at_a_merge(
+    github: GitHub,
+) -> None:
+    """A main already advisory, published by a gate that did not keep the state through pending:
+    its next merge is not told either."""
+    _advisory_config(github)
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "main-status").write_text(
+        "main: advisory since 2026-10-16T08:00:00Z, CI result, CI: audit (0123456789ab): "
+        "GHSA-1 in vite (path traversal); merging goes on, the update that fixes it goes first\n"
+    )
+    github.main()
+    run = github.api[f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.base}&per_page=100"]
+    run["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    for job in github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"]:
+        job.update(status="in_progress", conclusion=None)
+    github.save()
+
+    assert github.workflow.run_script("main-status").stdout.startswith("main: pending")
+    assert not (folder / "main-status.pending").exists()
+
+
+def test_an_outage_beside_mains_advisories_is_red_and_says_what_was_found(
+    github: GitHub,
+) -> None:
+    _advisory_config(github)
+    (github.workflow.script.parent / "advisory_service.py").write_text(
+        'ANNOTATION = "Advisory service unreachable"\n'
+        "def unreachable(output):\n"
+        '    return "PyPI" if "PyPI" in output else None\n'
+        "def answers(service):\n"
+        "    return False\n"
+    )
+    outage = {
+        "title": "Advisory service unreachable",
+        "annotation_level": "failure",
+        "message": "Refused because PyPI's advisory service could not be reached.",
+    }
+    _main_audit_failed(github, outage, _advisories_notice(_ADVISORY_LINES[:1]))
+
+    line = github.workflow.run_script("main-status").stdout
+
+    assert line.startswith("main: red"), line
+    assert (
+        f"; {_AUDIT} could not reach PyPI's advisory service, and found advisories: "
+        "GHSA-1 in vite (path traversal)"
+    ) in line
+    assert "nothing was found wrong" not in line
 
 
 @pytest.mark.parametrize("warned", [True, False])
@@ -1696,6 +1749,37 @@ def test_the_update_that_fixes_mains_advisory_is_a_blocker_and_goes_first(
 
     train = _train(github)
     # Only a clean audit is the update: a pass over main's own advisory is not.
+    assert train["first"] == ("7" if warned else "8")
+    assert (train["priorities"]["8"] == "blocker") is not warned
+
+
+@pytest.mark.parametrize("warned", [True, False])
+def test_the_update_tested_on_an_earlier_main_is_the_fix_only_with_a_clean_audit(
+    github: GitHub, warned: bool
+) -> None:
+    """Main moved under the update while the line kept merging: its latest green run with a
+    clean audit proves it, whatever main that run tested."""
+    _advisory_config(github)
+    earlier = github.base
+    _two_stale_pulls(github)
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(github.base, head, run_id=30, tested_base=earlier)
+    github.api[f"{_REPO}/actions/runs/30/jobs?per_page=100"]["jobs"].append(
+        {"id": 39, "name": _AUDIT, "status": "completed", "conclusion": "success"}
+    )
+    github.api[f"{_REPO}/check-runs/39/annotations?per_page=100"] = (
+        [{"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}]
+        if warned
+        else []
+    )
+    _main_audit_failed(github, _advisories_notice())
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+
+    assert github.workflow.run_script("main-status").returncode == 0
+
+    train = _train(github)
     assert train["first"] == ("7" if warned else "8")
     assert (train["priorities"]["8"] == "blocker") is not warned
 

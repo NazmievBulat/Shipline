@@ -612,23 +612,29 @@ PLAIN_LENGTH = 80
 ADVISORIES_NAMED = 5
 
 
-def advisories_only(parts: list[dict[str, Any]]) -> list[str]:
-    """The advisories that alone failed a run of main, from the audit's notice, or none.
+def audit_notice(parts: list[dict[str, Any]]) -> tuple[list[str], bool]:
+    """The advisories the audit's notice names on a failed run of main, or none, and whether an
+    advisory service that did not answer left a lock file unaudited beside them.
 
     The dependency audit is the only failed job besides "CI result", which follows it, and its
     notice lists the advisories: the audit writes it only when it audited everything, every tool
     answering, and found nothing wrong but advisories. Without the notice, a lock file it could
-    not audit or a tool that failed, the failure is main's as any other."""
+    not audit or a tool that failed, the failure is main's as any other; so it is with an
+    outage beside the notice, which is not advisories alone."""
     if ADVISORIES_ONLY is None:
-        return []
+        return [], False
     failed = _failed_jobs(parts)
     if {job["name"] for job in failed} - {CI_RESULT} != {DEPENDENCIES}:
-        return []
+        return [], False
     job = next(job for job in failed if job["name"] == DEPENDENCIES)
     notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
-    # An advisory service that did not answer left a lock file unaudited: not advisories alone.
-    if advisory_service and any(note.get("title") == advisory_service.ANNOTATION for note in notes):
-        return []
+    unaudited = bool(advisory_service) and any(
+        note.get("title") == advisory_service.ANNOTATION for note in notes
+    )
+    return _advisory_lines(notes), unaudited
+
+
+def _advisory_lines(notes: list[dict[str, Any]]) -> list[str]:
     for note in notes:
         if note.get("title") != ADVISORIES_ONLY:
             continue
@@ -649,6 +655,13 @@ def advisories_only(parts: list[dict[str, Any]]) -> list[str]:
             return []
         return []
     return []
+
+
+def _named(advisories: list[str]) -> str:
+    named = ", ".join(advisories[:ADVISORIES_NAMED])
+    if len(advisories) > ADVISORIES_NAMED:
+        named += f" and {len(advisories) - ADVISORIES_NAMED} more"
+    return named
 
 
 def _retry_failed_main(
@@ -896,23 +909,27 @@ def push_health(
         assessments.append((*verdict(ci[0], parts), ci[0]))
         if assessments[-1][0] == "red":
             try:
-                advisories = advisories_only(parts)
+                advisories, unaudited = audit_notice(parts)
             except Waiting:
                 # GitHub could not be read: main is unknown until it can be.
                 raise
             except Refused:
                 # An unread notice is no advisory: main stays red.
-                advisories = []
+                advisories, unaudited = [], False
             try:
-                service = None if advisories else unreached_service(parts)
+                service = None if advisories and not unaudited else unreached_service(parts)
             except Waiting:
                 # Diagnostic only: main stays red as it is, and is not re-run for the service.
                 service = None
             if service:
-                unreached = (
-                    f"; {DEPENDENCIES} could not reach {service}'s advisory service, "
-                    "and nothing was found wrong with main"
+                unreached = f"; {DEPENDENCIES} could not reach {service}'s advisory service, " + (
+                    f"and found advisories: {_named(advisories)}"
+                    if advisories
+                    else "and nothing was found wrong with main"
                 )
+            if unaudited:
+                # Red by the outage's own rule, and re-run as for it.
+                advisories = []
             # A re-run finds the same advisories again.
             if retry_folder is not None and not advisories:
                 retry_notes.append(
@@ -949,9 +966,7 @@ def push_health(
         since = min(run.get("updated_at", "unknown time") for _, run in failed)
         names = ", ".join(name for checks, _ in failed for name in checks)
         if advisories and len(failed) == 1:
-            named = ", ".join(advisories[:ADVISORIES_NAMED])
-            if len(advisories) > ADVISORIES_NAMED:
-                named += f" and {len(advisories) - ADVISORIES_NAMED} more"
+            named = _named(advisories)
             # Main's other checks must pass first: until they have, main is pending.
             running = [
                 *(job["name"] for job in ci_parts if job.get("status") != "completed"),
@@ -1232,28 +1247,31 @@ def record_green(
     )
 
 
+# How a pending main line says that main was advisory before it and stays so: each merge on an
+# advisory main passes through pending, and main is advisory until it is green, red or unknown.
+STILL_ADVISORY = "; still advisory"
+
+
 def publish(folder: Path, health: Health) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     target = folder / "main-status"
     old = target.read_text() if target.exists() else ""
-    line = health.line + "\n"
+    # Kept in the line itself, replaced whole, so two writers at once never leave it behind.
+    before = state_of(old)
+    if before == "pending" and old.rstrip("\n").endswith(STILL_ADVISORY):
+        before = "advisory"
+    after = health.state
+    line = health.line
+    if after == "pending" and before == "advisory":
+        after = "advisory"
+        line += STILL_ADVISORY
+    line += "\n"
     with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as output:
         output.write(line)
         temporary = output.name
     os.replace(temporary, target)
     # Every merge passes through pending to green; only a red, advisory or unreadable main, and
-    # the change out of it, is worth waking the orchestrator for. Each merge on an advisory main
-    # passes through pending too: main stays advisory, remembered, until it is green, red or
-    # unknown again.
-    remembered = folder / "main-advisory"
-    before, after = (
-        "advisory" if state == "pending" and remembered.exists() else state
-        for state in (state_of(old), state_of(line))
-    )
-    if health.state == "advisory":
-        remembered.touch()
-    elif health.state != "pending":
-        remembered.unlink(missing_ok=True)
+    # the change out of it, is worth waking the orchestrator for.
     if (
         (before != after and {"red", "advisory", "unknown"} & {before, after})
         or (health.scheduled and health.scheduled not in old)
