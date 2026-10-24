@@ -339,6 +339,7 @@ def _difference(
 
 def compare(shipline: Path, checkout: Path) -> tuple[list[Difference], list[Entry], str]:
     """What differs, file by file; the installation's known entries; and its known list's name."""
+    ours_all, theirs_all = tracked(shipline), tracked(checkout)
     parity, known_path = parity_of(checkout)
     known_name = str(known_path) if known_path else ""
     known = read_known(known_path, known_name) if known_path else []
@@ -355,7 +356,6 @@ def compare(shipline: Path, checkout: Path) -> tuple[list[Difference], list[Entr
     inverse: list[Rule] = [(theirs, ours, None) for ours, theirs in trees]
     inverse += [(e.checkout, e.shipline, e) for e in renames if e.checkout != "-"]
 
-    ours_all, theirs_all = tracked(shipline), tracked(checkout)
     ours = {name: there for name in ours_all if (there := _where(name, forward))}
     theirs = {name: there for name in theirs_all if (there := _where(name, inverse))}
     # A file pairs with its place on the other side when that place pairs back with it.

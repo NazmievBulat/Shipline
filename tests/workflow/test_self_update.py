@@ -1077,3 +1077,25 @@ def test_a_tick_whose_whole_group_is_stopped_counts_neither_way(
     trial = json.loads((home / ".local" / "shipline" / "trial.json").read_text())
     assert trial["tick_failures"] == trial["ticks"] == 0
     assert not (runs / str(tick.pid)).exists()
+
+
+def test_installation_state_folder_keeps_a_held_gate_lock_from_being_updated(
+    shipline: Shipline,
+) -> None:
+    import fcntl
+
+    config = shipline.root / "installation.json"
+    config.write_text('{"state_folder": ".installed/state"}')
+    shipline.env["SHIPLINE_CONFIG"] = str(config)
+    shipline.good()
+    landed = shipline.land()
+    shipline.later(10)
+    folder = shipline.repo / ".installed/state"
+    folder.mkdir(parents=True)
+    with (folder / "merge.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert shipline.tick() == 0
+        assert shipline.head == shipline.first
+    shipline.later(10)
+    assert shipline.tick() == _MOVED
+    assert shipline.head == landed

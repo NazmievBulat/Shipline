@@ -1813,9 +1813,15 @@ def test_installed_timers_and_hooks_keep_the_config_lookup(workflow: Workflow, s
     assert command.startswith(f"{key}={value} bash ")
     worktree = workflow.add_worktree(7)
     clean = {k: v for k, v in workflow.env.items() if k not in ("SHIPLINE_CONFIG", "XDG_CONFIG_HOME")}
+    # Observe the config reached by the hook, even though hooks suppress consumer errors.
+    (workflow.script.parent / "notify").write_text(
+        'config=$(python3 "$(dirname "$0")/workflow_config.py" shell) || exit 1; '
+        'eval "$config"; printf %s "$SHIPLINE_STATE_FOLDER"\n'
+    )
     done = subprocess.run(["bash", "-c", command], cwd=worktree, env=clean,
                           input="{}", capture_output=True, text=True, timeout=30)
     assert done.returncode == 0, done.stderr
+    assert done.stdout == ".installation/state"
     # Reinstalling updates the same hook, rather than adding a second one.
     assert workflow.shipline("install-hooks").returncode == 0
     again = json.loads((Path(workflow.env["HOME"]) / ".claude/settings.json").read_text())
