@@ -80,11 +80,14 @@ if [[ -z $SHIPLINE_REPOSITORY ]]; then
 fi
 # priority.jq reads the label names from it.
 export SHIPLINE_CONFIG
-main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)") || exit 1
+common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir) || exit 1
+main=$(dirname "$common")
 
-# A second tick exits while the first still runs.
+# A second tick exits while the first still runs. The lock is in the git common directory, where
+# no change of shipline.json moves it: a tick that reads a new state folder still waits for one
+# that read the old.
 mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
-exec 9>"$main/$SHIPLINE_STATE_FOLDER/tick.lock"
+exec 9>"$common/shipline-tick.lock"
 if ! flock --nonblock 9; then
   echo "the tick before this one is still running"
   exit 0

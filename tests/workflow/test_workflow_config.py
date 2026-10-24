@@ -3,6 +3,7 @@ repositories that use Shipline; `workflow_config.py` reads it, key by key over i
 
 import hashlib
 import importlib.util
+import fcntl
 import json
 import os
 import subprocess
@@ -166,6 +167,84 @@ def test_the_repository_named_in_the_file_wins_over_the_runner_settings_and_orig
 
     _write(repo, {"repository": "named-owner/named-app"})
     assert workflow_config.load(repo).repository == "named-owner/named-app"
+
+
+# What Bash reads from the runner settings: every form a script may use names it.
+_SETTINGS = {
+    "default with a variable": "repository=${SHIPLINE_REPOSITORY:-example-org/example-app}\n",
+    "readonly": "readonly repository=example-org/example-app\n",
+    "declare": "declare -r repository=example-org/example-app\n",
+    "set twice": "repository=example-org/old-app\nrepository=example-org/example-app\n",
+    "export": "export repository='example-org/example-app'  # the pool's\n",
+}
+
+
+def _settings(repo: Path, text: str) -> Path:
+    path = repo / ".github/runner/settings.sh"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+@pytest.mark.parametrize("settings", list(_SETTINGS), ids=list(_SETTINGS))
+def test_the_reader_names_the_repository_bash_reads_from_the_runner_settings(
+    tmp_path: Path, settings: str
+) -> None:
+    # A clone of a fork: origin is not the repository the runners work on.
+    repo = _repository(tmp_path, "https://github.com/example-fork/example-app.git")
+    path = _settings(repo, _SETTINGS[settings])
+    sourced = subprocess.run(
+        ["bash", "-c", 'source "$1"; printf %s "$repository"', "bash", str(path)],
+        env=_GIT_ENV,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert sourced == "example-org/example-app"
+
+    done = subprocess.run(
+        ["python3", str(_WORKFLOW / "workflow_config.py"), "shell", str(repo)],
+        env={**_GIT_ENV, "SHIPLINE_REPOSITORY": "example-org/from-the-caller"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert "SHIPLINE_REPOSITORY=example-org/example-app\n" in done.stdout
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Names it, but Bash reads nothing.
+        "repository=$(exit 3)\n",
+        "repository=\"$WORKFLOW_SECRET\"\n",
+        # Stops Bash before it reads one.
+        "exit 4\nrepository=example-org/example-app\n",
+        # Never ends.
+        "while :; do :; done\nrepository=example-org/example-app\n",
+    ],
+    ids=["empty", "from the caller", "fails", "never ends"],
+)
+def test_runner_settings_that_name_a_repository_bash_cannot_read_are_refused(
+    tmp_path: Path, text: str
+) -> None:
+    repo = _repository(tmp_path)
+    _settings(repo, text)
+    os.environ["WORKFLOW_SECRET"] = "example-org/from-the-caller"
+    try:
+        with pytest.raises(workflow_config.ConfigError, match=r"\.github/runner/settings\.sh"):
+            workflow_config.load(repo)
+    finally:
+        del os.environ["WORKFLOW_SECRET"]
+
+
+def test_runner_settings_that_name_no_repository_leave_it_to_origin(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _settings(repo, "# Only the pool's own settings.\nrunner_count=2\n")
+
+    assert workflow_config.load(repo).repository == "example-owner/example-app"
 
 
 @pytest.mark.parametrize("repository", ["example-owner/.github", "example-owner/example.app"])
@@ -520,7 +599,7 @@ def test_another_repository_state_folder_and_check_names_reach_the_gate_the_tick
         call.startswith("worktree-setup ") and call.endswith(str(workflow.worktree(8)))
         for call in workflow.calls()
     )
-    assert (workflow.repo / state / "tick.lock").exists()
+    assert (workflow.repo / ".git" / "shipline-tick.lock").exists()
     # Nothing of the defaults: no other repository asked, no default state folder made.
     assert not [call for call in workflow.calls("gh") if "example-org" in call]
     for checkout in (workflow.repo, workflow.worktree(7), workflow.worktree(8)):
@@ -958,3 +1037,22 @@ def test_the_codex_gh_takes_no_value_from_its_callers_environment(
         assert "this command is refused" in done.stderr, done.stderr
     assert not workflow.calls("gh pr create")
     assert not workflow.calls("gh api")
+
+
+@pytest.mark.parametrize("renamed", [False, True], ids=["same folder", "renamed folder"])
+def test_a_second_tick_waits_for_the_first_across_a_change_of_the_state_folder(
+    workflow: Workflow, renamed: bool
+) -> None:
+    # The lock is in the git common directory, which no configuration moves.
+    common = Path(workflow.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+    with (common / "shipline-tick.lock").open("w") as first_tick:
+        fcntl.flock(first_tick, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if renamed:
+            # The owner pulls a main that renames the state folder while the first tick runs.
+            _commit_on_main(workflow, {"shipline.json": json.dumps({"state_folder": ".shipline"})})
+
+        done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stderr
+    assert "the tick before this one is still running" in done.stdout, done.stdout + done.stderr
+    assert not workflow.calls("gh")

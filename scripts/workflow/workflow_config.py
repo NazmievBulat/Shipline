@@ -6,11 +6,11 @@ file as the main checkout. A key the file leaves out keeps its default, key by k
 file names that Shipline does not know, or a value of the wrong kind, is refused, so a typing
 error never passes as a default.
 
-The defaults are neutral. The repository is the `repository` of `.github/runner/settings.sh`
-when the runner pool names one, else the owner and name of the `origin` remote on GitHub; the
-check names, annotation titles, workflow files and labels are the ones Shipline's own CI and
-labels use; the state folder is `.local/workflow`; the worktree set-up command, run only when
-present, is `scripts/setup-worktree`; no runner labels.
+The defaults are neutral. The repository is the `repository` Bash reads from
+`.github/runner/settings.sh` when the runner pool names one, else the owner and name of the
+`origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
+ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
+set-up command, run only when present, is `scripts/setup-worktree`; no runner labels.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -23,6 +23,7 @@ the same defaults.
 """
 
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -34,8 +35,10 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 FILE = "shipline.json"
-# Where the runner pool names the repository its runners register with.
+# Where the runner pool names the repository its runners register with, and how long Bash may
+# take to read it.
 RUNNER_SETTINGS = ".github/runner/settings.sh"
+RUNNER_SETTINGS_SECONDS = 5
 
 # Every key the file may hold, with its default. The repository's default is found, not fixed.
 DEFAULTS: dict[str, Any] = {
@@ -215,16 +218,39 @@ def _relative(value: str, name: str) -> str:
 
 
 def _from_runner_settings(main: Path) -> str | None:
+    """The `repository` Bash reads from the runner settings, as `tick` and the Codex worker's
+    `gh` read it when they sourced the file: in a `bash` of its own, with only PATH and HOME,
+    for at most RUNNER_SETTINGS_SECONDS. None when the file names no `repository`."""
+    path = main / RUNNER_SETTINGS
     try:
-        text = (main / RUNNER_SETTINGS).read_text()
+        text = path.read_text()
     except OSError:
         return None
-    found = re.search(
-        r"""^[ \t]*(?:export[ \t]+)?repository=(["']?)([^"'\s]+)\1[ \t]*(?:#.*)?$""",
-        text,
-        re.MULTILINE,
-    )
-    return found[2] if found else None
+    if not re.search(r"\brepository=", text):
+        return None
+    refused = f"{RUNNER_SETTINGS} names a repository that Bash cannot read from it"
+    try:
+        done = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1" >/dev/null 2>&1; printf %s "${repository-}"',
+                "settings",
+                str(path),
+            ],
+            env={key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ},
+            capture_output=True,
+            text=True,
+            timeout=RUNNER_SETTINGS_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise ConfigError(
+            f"{refused}: it ran for more than {RUNNER_SETTINGS_SECONDS} seconds"
+        ) from None
+    if done.returncode or not done.stdout:
+        raise ConfigError(f"{refused}: it read {done.stdout!r} and exited {done.returncode}")
+    return done.stdout
 
 
 def _from_origin(main: Path) -> str | None:

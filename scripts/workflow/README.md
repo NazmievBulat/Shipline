@@ -41,7 +41,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 
 | Key | What it names | Default |
 | --- | --- | --- |
-| `repository` | `owner/name` on GitHub | `repository` of `.github/runner/settings.sh`, else the `origin` remote on GitHub; a script that needs it stops when neither names one |
+| `repository` | `owner/name` on GitHub | `repository` as Bash reads it from `.github/runner/settings.sh` (sourced in a `bash` of its own, with only `PATH` and `HOME`, for at most 5 seconds), else the `origin` remote on GitHub; a script that needs it stops when neither names one |
 | `state_folder` | the folder of the workflow's notes, in the main checkout and in each worktree | `.local/workflow` |
 | `worktree_setup` | the command that prepares a new worktree, run only when present | `scripts/setup-worktree` |
 | `checks.ci_result` | the check that sums up CI | `CI result` |
@@ -53,6 +53,11 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `labels.priority.blocker` … `.low` | the four priority labels | `priority: blocker` … `priority: low` |
 | `runner.labels` | the runner labels the merge gate may re-run failed jobs on | none: the gate re-runs nothing |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
+
+Change `state_folder` only with every session stopped: running sessions keep their notes and
+locks in the folder they started with, and the tick, the gate and `session` look for them in the
+new one. The tick's own lock, `shipline-tick.lock` in the git common directory, does not move
+with it, so two ticks never run at once across the change.
 
 A key the file leaves out keeps its default, one by one, also inside `checks`, `labels` and the
 others; without the file every value is its default. A key Shipline does not know, or a value
