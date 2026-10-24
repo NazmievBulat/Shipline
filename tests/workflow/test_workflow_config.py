@@ -64,7 +64,8 @@ _DEFAULTS = {
         "labels": [],
         "identity_folder": "~/.config/shipline-runner",
         "prefix": None,
-        "main_machine": "home",
+        # `<prefix>-home` once a prefix is named.
+        "label": None,
         "image_build": None,
     },
     # The branches the merge gate tests its prefixes on are named by this, then a random name.
@@ -180,24 +181,28 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
         workflow_config.load(repo)
 
 
-def test_main_s_runner_label_is_named_by_the_prefix_and_the_main_machine(tmp_path: Path) -> None:
+def test_the_runner_label_is_the_prefix_s_home_label_unless_named(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
 
+    assert workflow_config.load(repo).runner.label is None
     assert workflow_config.load(repo).runner.main_label is None
 
     _write(repo, {"runner": {"prefix": "example-app"}})
-    assert workflow_config.load(repo).runner.main_label == "example-app-home-main"
+    runner = workflow_config.load(repo).runner
+    assert (runner.label, runner.main_label) == ("example-app-home", "example-app-home-main")
 
-    _write(repo, {"runner": {"prefix": "example-app", "main_machine": "office"}})
-    assert workflow_config.load(repo).runner.main_label == "example-app-office-main"
+    _write(repo, {"runner": {"prefix": "example-app", "label": "example-app-office"}})
+    runner = workflow_config.load(repo).runner
+    assert (runner.label, runner.main_label) == ("example-app-office", "example-app-office-main")
+    assert _as_json(workflow_config.load(repo))["runner"]["label"] == "example-app-office"
 
 
-@pytest.mark.parametrize("machine", ["", "office main", "office/main", "-office", "office,x"])
-def test_a_main_machine_that_is_not_a_plain_name_is_refused(tmp_path: Path, machine: str) -> None:
+@pytest.mark.parametrize("label", ["", "home label", "home,x", "-home", "home/x", "self-hosted"])
+def test_a_runner_label_that_is_not_a_plain_label_is_refused(tmp_path: Path, label: str) -> None:
     repo = _repository(tmp_path)
-    _write(repo, {"runner": {"prefix": "example-app", "main_machine": machine}})
+    _write(repo, {"runner": {"prefix": "example-app", "label": label}})
 
-    with pytest.raises(workflow_config.ConfigError, match="runner.main_machine"):
+    with pytest.raises(workflow_config.ConfigError, match="runner.label"):
         workflow_config.load(repo)
 
 
@@ -205,7 +210,8 @@ def test_the_example_s_main_label_is_one_of_its_runner_labels() -> None:
     example = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
     runner = example["runner"]
 
-    assert f"{runner['prefix']}-{runner['main_machine']}-main" in runner["labels"]
+    assert runner["label"] == f"{runner['prefix']}-home"
+    assert f"{runner['label']}-main" in runner["labels"]
 
 
 def test_the_scratch_prefix_is_read_and_must_name_branches_of_the_gate_s_own(

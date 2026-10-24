@@ -34,7 +34,7 @@
     "labels": ["example-app-home", "example-app-home-main", "example-app-home-docker", "example-app-planner"],
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app",
-    "main_machine": "home",
+    "label": "example-app-home",
     "image_build": "tools/shipline/build-runner-images"
   },
   "merge": {

@@ -24,8 +24,8 @@ workflow_config = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(workflow_config)
 
 HOSTED = "ubuntu-latest"
-# The examples show the default scratch prefix and main machine, and the example config's
-# runner prefix, which has no default.
+# The examples show the default scratch prefix, and the default label of the example config's
+# runner prefix, which has no default itself.
 PREFIX = workflow_config.DEFAULTS["merge"]["scratch_prefix"]
 _EXAMPLE_RUNNER = json.loads((_ROOT / "examples/shipline.json").read_text())["runner"]
 MAIN = [
@@ -34,7 +34,7 @@ MAIN = [
         labels=(),
         identity_folder="",
         prefix=_EXAMPLE_RUNNER["prefix"],
-        main_machine=workflow_config.DEFAULTS["runner"]["main_machine"],
+        label=workflow_config.home_label(_EXAMPLE_RUNNER["prefix"]),
     ).main_label,
 ]
 
@@ -121,7 +121,7 @@ def test_github_reads_the_scratch_prefix_without_its_case(path: Path) -> None:
 def test_the_examples_name_the_config_s_default_prefix_and_label(path: Path) -> None:
     text = path.read_text()
 
-    assert _EXAMPLE_RUNNER["main_machine"] == workflow_config.DEFAULTS["runner"]["main_machine"]
+    assert _EXAMPLE_RUNNER["label"] == f"{_EXAMPLE_RUNNER['prefix']}-home"
 
     assert f"'refs/heads/{PREFIX}'" in text
     assert re.findall(r'"self-hosted", "([^"]+)"', text) == [MAIN[1]] * len(_runs_on(path))

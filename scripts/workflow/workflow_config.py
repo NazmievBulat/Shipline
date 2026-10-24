@@ -14,7 +14,7 @@ ones Shipline's own CI and labels use; the state folder is `.local/workflow`; th
 set-up command, run only when present, is `scripts/setup-worktree`; the merge gate's scratch
 branches begin `workflow/merge-batch-`; no runner prefix and no image build command, and runner
 labels built from the prefix and this machine's runner settings (`~/.config/shipline/runner.sh`),
-none without a prefix, with main's runners on the machine `home`; no test command, which a
+none without a prefix, and main's runners labelled `<prefix>-home-main`; no test command, which a
 repository names for its CI's test job (`ci_proof.py test`), and no browser command, which it
 names for its E2E's browser job (`ci_proof.py browser`).
 
@@ -50,6 +50,8 @@ MACHINE_SETTINGS = "~/.config/shipline/runner.sh"
 # The prefix names a systemd unit and, as `<prefix>-runner`, a user of at most 32 characters.
 _PREFIX = re.compile(r"[a-z](?:[a-z0-9-]{0,23}[a-z0-9])?")
 _MACHINE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
+# A runner label the file names: GitHub reads labels without their case.
+_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?")
 
 # Every key the file may hold, with its default. The repository's default is found, not fixed.
 DEFAULTS: dict[str, Any] = {
@@ -91,9 +93,10 @@ DEFAULTS: dict[str, Any] = {
         # containers (`<prefix>-runner…`) and labels; without it, there are no runner figures
         # (`workflow_metrics.py`).
         "prefix": None,
-        # The one machine of the pool whose runners take main's jobs: they carry the label
-        # `<prefix>-<main_machine>-main` (`Runner.main_label`), which no other machine has.
-        "main_machine": "home",
+        # The label every machine's runners share, `<prefix>-home` when the file names none
+        # (`home_label`): main's runners, on the one machine that has them, carry `<label>-main`
+        # (`Runner.main_label`), and the merge line's first member asks for `<label>-first`.
+        "label": None,
         # The command line, run from the main checkout, that builds the runner images; without
         # it, the pool builds its own Dockerfile.
         "image_build": None,
@@ -166,7 +169,8 @@ class Runner:
     labels: tuple[str, ...]
     identity_folder: str
     prefix: str | None = None
-    main_machine: str = "home"
+    # The label every machine's runners share; None without a prefix.
+    label: str | None = None
     image_build: str | None = None
 
     @property
@@ -176,9 +180,7 @@ class Runner:
     @property
     def main_label(self) -> str | None:
         """The label of main's runners; None without a runner pool."""
-        if self.prefix is None:
-            return None
-        return f"{self.prefix}-{self.main_machine}-main"
+        return None if self.label is None else f"{self.label}-main"
 
 
 @dataclass(frozen=True)
@@ -381,6 +383,11 @@ def _machines() -> list[str]:
     return names
 
 
+def home_label(prefix: str) -> str:
+    """The label the pool's runners share when the file names none."""
+    return f"{prefix}-home"
+
+
 def runner_labels(prefix: str, machines: list[str]) -> tuple[str, ...]:
     """The labels of the pool's runners: each machine's ordinary, main and Docker runners, and
     the planner's (`runner/names.sh` names them the same way)."""
@@ -448,11 +455,14 @@ def load(start: Path | None = None) -> Config:
     labels = tuple(values["runner"]["labels"])
     if "labels" not in given.get("runner", {}) and prefix is not None:
         labels = runner_labels(prefix, _machines())
-    if not _MACHINE.fullmatch(values["runner"]["main_machine"]):
+    label = values["runner"]["label"]
+    if label is not None and (label == "self-hosted" or not _LABEL.fullmatch(label)):
         raise ConfigError(
-            f"{FILE}: runner.main_machine must be a machine's name, "
-            f"not {values['runner']['main_machine']}"
+            f"{FILE}: runner.label must be a runner label of lowercase letters, digits, `.`, "
+            f"`_` and `-`, not {label}"
         )
+    if label is None and prefix is not None:
+        label = home_label(prefix)
     scratch_prefix = values["merge"]["scratch_prefix"]
     if not _SCRATCH_PREFIX.fullmatch(scratch_prefix):
         raise ConfigError(
@@ -471,7 +481,7 @@ def load(start: Path | None = None) -> Config:
             labels=labels,
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
-            main_machine=values["runner"]["main_machine"],
+            label=label,
             image_build=values["runner"]["image_build"],
         ),
         merge=Merge(scratch_prefix=scratch_prefix),
@@ -505,7 +515,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "labels": list(config.runner.labels),
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
-            "main_machine": config.runner.main_machine,
+            "label": config.runner.label,
             "image_build": config.runner.image_build,
         },
         "merge": vars(config.merge).copy(),
