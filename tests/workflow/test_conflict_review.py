@@ -105,7 +105,7 @@ def test_tick_starts_conflict_sentence_only_with_passed_handed_off_head(
         main if review == "wrong head" else head,
     )
     if review == "missing":
-        handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"] = []
+        handed.api["repos/example-org/example-app/pulls/7/reviews"] = []
         handed.save()
 
     done = workflow.run_script("tick")
@@ -297,7 +297,7 @@ def test_gate_handoff_checks_conflict_round_scope(handed: GitHub, extra: str) ->
         resolved = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
         workflow.git("push", "origin", "HEAD", cwd=workflow.worktree(7))
     handed.pulls["7"]["headRefOid"] = resolved
-    handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"] = [
+    handed.api["repos/example-org/example-app/pulls/7/reviews"] = [
         {"body": "<!-- workflow-review round=1 result=passed -->", "commit_id": head},
         {
             "body": (
@@ -308,18 +308,18 @@ def test_gate_handoff_checks_conflict_round_scope(handed: GitHub, extra: str) ->
         },
     ]
     if extra == "revoked":
-        handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"][0]["body"] = (
+        handed.api["repos/example-org/example-app/pulls/7/reviews"][0]["body"] = (
             "<!-- workflow-review round=1 result=sent-back -->"
         )
     elif extra == "scope":
         scope.unlink()
     elif extra == "extends":
-        handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"][1]["body"] = (
+        handed.api["repos/example-org/example-app/pulls/7/reviews"][1]["body"] = (
             "<!-- workflow-review round=2 result=passed -->\n"
             f"<!-- workflow-conflict extends={main} -->"
         )
     elif extra == "marker":
-        handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"][1]["body"] = (
+        handed.api["repos/example-org/example-app/pulls/7/reviews"][1]["body"] = (
             "<!-- workflow-review round=2 result=passed -->\n"
             "<!-- workflow-conflict extends=unreadable -->"
         )

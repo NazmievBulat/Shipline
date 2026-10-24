@@ -47,6 +47,7 @@ jobs:
               tests/workflow/test_train_reads.py
               tests/workflow/test_usage.py
               tests/workflow/test_weekly_limit.py
+              tests/workflow/test_workflow_config.py
           - shard: 3
             files: >-
               tests/workflow/test_check_parts.py

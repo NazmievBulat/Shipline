@@ -19,16 +19,23 @@ from workflow_harness import Workflow
 
 github = github_fixture
 handed = handed_fixture
-_API = "repos/NazmievBulat/Shipline"
+_API = "repos/example-org/example-app"
+
+
+def _load(name: str) -> ModuleType:
+    path = Path(__file__).resolve().parents[2] / f"scripts/workflow/{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture
 def reads_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    path = Path(__file__).resolve().parents[2] / "scripts/workflow/train_reads.py"
-    spec = importlib.util.spec_from_file_location("train_reads", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # What train_reads reads this checkout's repository and workflow files with.
+    monkeypatch.setitem(sys.modules, "workflow_config", _load("workflow_config"))
+    module = _load("train_reads")
     monkeypatch.setenv("WORKFLOW_TRAIN_TICK", str(tmp_path))
     (tmp_path / "context.json").write_text(json.dumps({"started": time.time()}))
     return module
@@ -210,10 +217,12 @@ def test_run_jobs_and_annotations_share_the_member_cache_across_ticks(
     tmp_path: Path,
 ) -> None:
     _snapshot(tmp_path)
+    # Loaded from this checkout, the cache knows its jobs by this checkout's repository.
+    api = reads_module.workflow_config.current().api
     paths = [
-        f"{_API}/actions/workflows/ci.yml/runs?head_sha=abc&event=pull_request&per_page=100",
-        f"{_API}/actions/runs/20/jobs?per_page=100",
-        f"{_API}/check-runs/21/annotations?per_page=100",
+        f"{api}/actions/workflows/ci.yml/runs?head_sha=abc&event=pull_request&per_page=100",
+        f"{api}/actions/runs/20/jobs?per_page=100",
+        f"{api}/check-runs/21/annotations?per_page=100",
     ]
     replies = [
         [{"id": 20, "status": "completed", "conclusion": "success"}],
