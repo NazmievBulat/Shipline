@@ -178,3 +178,56 @@ the scripts before these commands existed, `scripts/workflow/pre-train-checks`,
 longer read: each becomes a command named here, which answers in the form above. Its program now
 lives in the main checkout whichever worktree runs it, so one that reads the change finds the
 checkout from the folder it runs in (`git rev-parse --show-toplevel`), not from its own path.
+
+# A shadow run
+
+Before a repository that runs the workflow from its own copy of the scripts moves onto
+`shipline <command>`, Shipline is run beside it in shadow: `shipline --repo <checkout> tick
+--shadow` takes the decisions of a tick on that repository and carries out none (`tick` says
+what it reads and what it leaves). It writes them to `.local/shipline/shadow.log` of the
+checkout, readable by its owner alone, and leaves every note of the installation as it was. Its
+reads of GitHub are real calls, counted in the machine's shared GitHub budget beside the
+tick's own, and a reviewer's head pushed from elsewhere is fetched as the real tick fetches it.
+
+Each shadow tick runs on a timer of its own, 75 seconds before each of the installation's ticks
+(theirs runs every 3 minutes, up to 25 seconds late), and stops itself after 60 seconds, whatever
+it waits for, logging that it was cut short: so it reads the state the real tick will read, has
+ended before the real tick starts, and never holds it back. Its service's own timeouts are the
+last bound. A real tick still running from its last start when a shadow tick starts may be
+writing the marks the shadow reads: the shadow tick then takes nothing and logs that it was
+skipped (`SHIPLINE_SHADOW_BESIDE` names the real tick's service).
+
+The owner writes the two units, the service with every `Environment=` line of the
+installation's `workflow-tick.service` (its `PATH`, its `TMUX_TMPDIR`, its own `WORKFLOW_*`
+settings), so that the shadow tick finds the same sessions and settings:
+
+    # ~/.config/systemd/user/shipline-shadow.service
+    [Unit]
+    Description=Shipline in shadow beside the workflow tick: decides, carries out nothing
+
+    [Service]
+    Type=oneshot
+    WorkingDirectory=<checkout>
+    <every Environment= line of workflow-tick.service>
+    Environment=SHIPLINE_SHADOW_BESIDE=workflow-tick.service
+    ExecStart=<path of the Shipline checkout>/bin/shipline --repo <checkout> tick --shadow
+    TimeoutStartSec=66
+    TimeoutStopSec=2
+
+    # ~/.config/systemd/user/shipline-shadow.timer
+    [Timer]
+    OnCalendar=*:1/3:45
+    AccuracySec=1s
+
+    [Install]
+    WantedBy=timers.target
+
+and starts it with `systemctl --user enable --now shipline-shadow.timer`. After the run:
+
+    journalctl --user -u workflow-tick.service -o short-unix --since <start> >tick.journal
+    tools/compare-shadow --shadow <checkout>/.local/shipline/shadow.log \
+      --wake ~/.local/state/workflow/wake.log --journal tick.journal
+
+lists every decision the two took differently, with both versions, and exits 0 when none
+differs. A decision that came due in the seconds between the two ticks' clocks is a timing
+difference, counted on its last line and listed with `--timing`.

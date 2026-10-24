@@ -75,6 +75,10 @@
 # reached by a message, as one session reaches another, which only a session can send: a short
 # `claude -p` on Claude Haiku 5.5, with no settings and the one tool, sends it.
 #
+# A shadow run (`tick --shadow`) names its own log in SHIPLINE_SHADOW: the check-in goes there,
+# in the same words, and is not sent, and the wake writes no note of its own. It also reads the
+# notes the shadow tick took for it, which that tick keeps in SHIPLINE_SHADOW_NOTES.
+#
 # `gh`, `claude` and `date` are found on the PATH, so a test can replace them.
 set -uo pipefail
 
@@ -99,6 +103,10 @@ PENDING=$STATE/wake.pending
 RETRY_SECONDS=$((5 * 60))
 # The questions to the owner the orchestrator was told of, one "<session> <asked at>" a line.
 ASKED=$STATE/wake.asked
+shadow=${SHIPLINE_SHADOW:-}
+[[ -z $shadow ]] || LOG=$shadow
+# The shadow tick's own notes are read only in a shadow run.
+[[ -n $shadow ]] || unset SHIPLINE_SHADOW_NOTES
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 github_ready=1
@@ -111,7 +119,7 @@ export SHIPLINE_CONFIG
 # The repository's main checkout, never the checkout these scripts are in.
 main=$SHIPLINE_REPO
 resent=("$@")
-mkdir -p "$STATE"
+[[ -n $shadow ]] || mkdir -p "$STATE"
 # Main's line as the gate published it: green, pending, red, advisory (only advisories failed
 # its dependency audit, and merging goes on) or unknown. A change into or out of red, advisory or
 # unknown is noted in main-status.pending and told at any hour. Main stays advisory through the
@@ -177,14 +185,15 @@ fi
 balance=$main/$SHIPLINE_STATE_FOLDER/runner-balance.pending
 balance_files=()
 balance_lines=()
-if [[ -d $balance ]]; then
+for folder in "$balance" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/runner-balance.pending"}; do
+  [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"Runner balance, last change: \(.line | strings | select(length > 0))."' "$event"); then
       balance_files+=("$event")
       balance_lines+=("$line")
     fi
-  done < <(find "$balance" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
-fi
+  done < <(find "$folder" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+done
 analyses=$main/$SHIPLINE_STATE_FOLDER/analyses.pending
 analysis_files=()
 analysis_lines=()
@@ -209,15 +218,16 @@ hour=$(date -d "@$NOW" +%-H)
 answered=$main/$SHIPLINE_STATE_FOLDER/answered-for-owner.pending
 answer_files=()
 answer_lines=()
-if ((hour >= NIGHT_UNTIL_HOUR && hour < NIGHT_FROM_HOUR)) && [[ -d $answered ]]; then
+for folder in "$answered" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/answered-for-owner.pending"}; do
+  ((hour >= NIGHT_UNTIL_HOUR && hour < NIGHT_FROM_HOUR)) && [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"answered for the owner: \(.name | strings), \(.reply | strings | tojson)"' "$event") &&
         at=$(jq -er '.at | numbers | floor' "$event") && at=$(date -d "@$at" +%H:%M); then
       answer_files+=("$event")
       answer_lines+=("$line ($at)")
     fi
-  done < <(find "$answered" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
-fi
+  done < <(find "$folder" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+done
 if [[ -d $handbacks ]]; then
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"pull request \(.number): \(.reason)"' "$event"); then
@@ -227,32 +237,35 @@ if [[ -d $handbacks ]]; then
   done < <(find "$handbacks" -type f -print0 | sort -z)
 fi
 
-if [[ -d $lost ]]; then
+for folder in "$lost" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/lost-checks.pending"}; do
+  [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"lost check: \(.check) of run \(.run) on pull request \(.number)"' "$event"); then
       lost_files+=("$event")
       lost_lines+=("$line")
     fi
-  done < <(find "$lost" -type f -name '*.json' -print0 | sort -z)
-fi
+  done < <(find "$folder" -type f -name '*.json' -print0 | sort -z)
+done
 # Rule breaks travel with the lost checks: told at any hour, on a line of their own.
-if [[ -d $breaks ]]; then
+for folder in "$breaks" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/rule-breaks.pending"}; do
+  [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"rule break: \(.name) said review finished without a merge handoff"' "$event"); then
       lost_files+=("$event")
       lost_lines+=("$line")
     fi
-  done < <(find "$breaks" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
-fi
+  done < <(find "$folder" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+done
 
-if [[ -d $stuck ]]; then
+for folder in "$stuck" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/stuck.pending"}; do
+  [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '.line | strings' "$event"); then
       stuck_files+=("$event")
       stuck_lines+=("$line")
     fi
-  done < <(find "$stuck" -type f -name '*.json' -print0 | sort -z)
-fi
+  done < <(find "$folder" -type f -name '*.json' -print0 | sort -z)
+done
 # The self-update's notes are in the Shipline checkout these scripts are in, not the repository's.
 shipline=$(cd "$here/../.." && pwd)/.local/shipline/wake.pending
 if [[ -d $shipline ]]; then
@@ -343,22 +356,53 @@ if [[ -n $asking ]]; then
   untold=$(grep -vxF -f <(cat "$ASKED" 2>/dev/null; echo) <<<"$asking")
 fi
 
+# A shadow run also looks when the look comes due within SHIPLINE_SHADOW_AHEAD seconds, as far
+# as its tick looks ahead (the real tick reads its clock later), and the check-in's first line
+# says in how many: `compare-shadow` reads it as the reason only the real wake looked. A night
+# look whose night has ended by the earliest the real tick reads its clock
+# (SHIPLINE_SHADOW_REAL_FROM) says so too: only the shadow looked.
+ahead=0
+[[ -z $shadow ]] || ahead=${SHIPLINE_SHADOW_AHEAD:-0}
+real_from=${SHIPLINE_SHADOW_REAL_FROM:-$NOW}
+[[ $real_from =~ ^[0-9]+$ ]] || real_from=$NOW
+due=""
+# The seconds until it is night, 0 at night.
+night_in() {
+  local hour start
+  hour=$(date -d "@$1" +%-H)
+  ((hour >= NIGHT_FROM_HOUR || hour < NIGHT_UNTIL_HOUR)) && { echo 0; return; }
+  start=$(date -d "$(date -d "@$1" +%F) $NIGHT_FROM_HOUR:00" +%s)
+  echo $((start - $1))
+}
+# Whether this many seconds have passed since the last look, or will within `ahead`; and, when
+# the look comes due later, in how many seconds, at the soonest after `$2` (the night's start).
+looked_before() {
+  local wait=$(($1 - $(since_last_look) - 30)) after=${2:-0}
+  ((wait <= 0 && after == 0)) && return 0
+  ((wait > after)) || wait=$after
+  ((ahead && wait <= ahead)) || return 1
+  due="due within $wait s: "
+}
 if ((${#resent[@]} == 0)); then
   if [[ -s $PENDING || -s $main_pending || -n $service_line || ${#handback_files[@]} -gt 0 || ${#cloud_files[@]} -gt 0 || ${#analysis_files[@]} -gt 0 || ${#lost_files[@]} -gt 0 || ${#stuck_files[@]} -gt 0 || ${#answer_files[@]} -gt 0 || $tmp_alert == true || -n $untold ]]; then
-    (($(since_last_look) + 30 >= RETRY_SECONDS)) || exit 0
+    looked_before "$RETRY_SECONDS" || exit 0
   else
-    ((hour >= NIGHT_FROM_HOUR || hour < NIGHT_UNTIL_HOUR)) || exit 0
-    (($(since_last_look) + 30 >= LOOK_EVERY_SECONDS)) || exit 0
+    night=$(night_in "$NOW")
+    ((night == 0 || ahead)) || exit 0
+    looked_before "$LOOK_EVERY_SECONDS" "$night" || exit 0
+    if [[ -n $shadow && $night == 0 && $(night_in "$real_from") != 0 ]]; then
+      due="ends within $((real_from - NOW)) s: "
+    fi
   fi
 fi
-echo "$NOW" >"$LOOKED"
+[[ -n $shadow ]] || echo "$NOW" >"$LOOKED"
 # The names not yet told go first, without the ones woken again since.
 if [[ -s $PENDING ]]; then
   mapfile -t waiting < <(grep -vxF -f <(printf '%s\n' "${resent[@]}" "") "$PENDING")
   resent=("${waiting[@]}" "${resent[@]}")
 fi
 # Written down before anything can fail; removed once the orchestrator was told.
-((${#resent[@]} == 0)) || printf '%s\n' "${resent[@]}" >"$PENDING"
+[[ -n $shadow ]] || ((${#resent[@]} == 0)) || printf '%s\n' "${resent[@]}" >"$PENDING"
 
 log() {
   printf '%s\n' "$@" >>"$LOG"
@@ -451,6 +495,7 @@ find_orchestrator() {
 # waits 3 seconds for it and says so.
 send_to() {
   local to=$1 message=$2 answer
+  [[ -z $shadow ]] || return 0
   answer=$(cd "$STATE" && timeout "$SEND_SECONDS" claude -p --model "$CHAT_MODEL" --setting-sources "" \
     --tools SendMessage --output-format stream-json --verbose \
     --system-prompt "You deliver one message between Claude sessions. Call SendMessage exactly once, with the recipient and the text given, the text unchanged. Then answer with one word: sent." \
@@ -483,7 +528,7 @@ seen="sessions: $(sessions_line "$sessions"); pull requests: $pulls; starts: $ga
 
 reason="every 20 minutes"
 ((${#resent[@]} == 0)) || reason="after a reset"
-log "$(date -d "@$NOW" '+%Y-%m-%d %H:%M:%S')  $reason" \
+log "$(date -d "@$NOW" '+%Y-%m-%d %H:%M:%S')  $due$reason" \
   "  usage: $usage" "  $seen"
 ((${#resent[@]} == 0)) || log "  the tick sent its instruction again to: ${resent[*]}"
 [[ -z $asking_line ]] || log "  asking the owner: $asking_line"
@@ -543,6 +588,10 @@ if [[ -n $service_line ]]; then
 fi
 
 if send_to "$name" "$message"; then
+  if [[ -n $shadow ]]; then
+    log "  told $name: $message"
+    exit "$failed"
+  fi
   echo "$seen" >"$TOLD"
   # A question told before stays told while it is open, also while its session works again on
   # its own job and so is not in this check-in.
