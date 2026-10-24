@@ -5,7 +5,7 @@ import sys
 from datetime import datetime
 from urllib.parse import urlencode
 
-from merge_gate import API, REPOSITORY, Refused, api, command
+from merge_gate import API, REPOSITORY, WORKFLOW_FILES, Refused, api, command
 
 
 def instant(value: str) -> datetime:
@@ -21,7 +21,7 @@ def measure(since: str, until: str) -> dict[str, object]:
     if hours <= 0:
         raise ValueError("the end must be after the start")
     query = urlencode({"event": "pull_request", "created": f"{since}..{until}", "per_page": 100})
-    runs = api(f"{API}/actions/workflows/ci.yml/runs?{query}", "workflow_runs")
+    runs = api(f"{API}/actions/workflows/{WORKFLOW_FILES['ci']}/runs?{query}", "workflow_runs")
     pulls = json.loads(
         command(
             "gh",

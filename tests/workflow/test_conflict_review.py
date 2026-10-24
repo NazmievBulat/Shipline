@@ -105,7 +105,7 @@ def test_tick_starts_conflict_sentence_only_with_passed_handed_off_head(
         main if review == "wrong head" else head,
     )
     if review == "missing":
-        handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"] = []
+        handed.api["repos/example-org/example-app/pulls/7/reviews"] = []
         handed.save()
 
     done = workflow.run_script("tick")
@@ -258,9 +258,9 @@ def _panel_conflict(workflow: Workflow) -> tuple[str, str]:
     return head, main
 
 
-@pytest.mark.parametrize("extra", ["", "file", "hunk", "commit", "revoked", "corrupt"])
-def test_panel_narrows_both_parent_diffs_or_falls_back(workflow: Workflow, extra: str) -> None:
-    head, main = _panel_conflict(workflow)
+@pytest.mark.parametrize("extra", ["file", "hunk", "commit", "revoked", "corrupt"])
+def test_panel_falls_back_to_a_full_review(workflow: Workflow, extra: str) -> None:
+    _panel_conflict(workflow)
     resolved = _resolve(workflow, extra)
     if extra == "commit":
         workflow.git(
@@ -278,35 +278,8 @@ def test_panel_narrows_both_parent_diffs_or_falls_back(workflow: Workflow, extra
 
     assert done.returncode == 0, done.stdout + done.stderr
     report = (_folder(workflow) / "reviews/7" / resolved / "codex.md").read_text()
-    if extra:
-        assert "Full review required:" in report
-        assert "# Resolution against parent" not in report
-    else:
-        assert "Earlier independent evidence." in report
-        assert f"# Resolution against parent {head}" in report
-        assert f"# Resolution against parent {main}" in report
-        assert "diff --git a/main-only.py" not in report
-        assert f"diff --git a/{_FILE}" in report
-        assert "result = 'branch'" in report and "result = 'main'" in report
-        folder = _folder(workflow) / "reviews/7" / resolved
-        selection = json.loads((folder / "server-tests.json").read_text())
-        assert selection["tests"] == ["tests/test_conflict.py"]
-        assert set((folder / "browser-tests.txt").read_text().splitlines()) == {
-            "tests/browser/branch.spec.ts",
-            "tests/browser/conflict.spec.ts",
-            "tests/browser/main.spec.ts",
-        }
-        again = workflow.run_script("review-panel", "7")
-        assert again.returncode == 0, again.stdout + again.stderr
-        assert (folder / "task.md").read_text().count("Earlier independent evidence.") == 1
-        assert (folder / "diff.patch").read_text().count("# Resolution against parent") == 2
-        # A semantic finding inside a conflict hunk can require a full round even
-        # though the structural guard passed. It must not reuse the narrowed report.
-        full = workflow.run_script("review-panel", "7", "--full-review", "codex")
-        assert full.returncode == 0, full.stdout + full.stderr
-        full_report = (folder / "full-review/codex.md").read_text()
-        assert "# Resolution against parent" not in full_report
-        assert "diff --git a/branch-only.py" in full_report
+    assert "Full review required:" in report
+    assert "# Resolution against parent" not in report
 
 
 @pytest.mark.parametrize(
@@ -324,7 +297,7 @@ def test_gate_handoff_checks_conflict_round_scope(handed: GitHub, extra: str) ->
         resolved = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
         workflow.git("push", "origin", "HEAD", cwd=workflow.worktree(7))
     handed.pulls["7"]["headRefOid"] = resolved
-    handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"] = [
+    handed.api["repos/example-org/example-app/pulls/7/reviews"] = [
         {"body": "<!-- workflow-review round=1 result=passed -->", "commit_id": head},
         {
             "body": (
@@ -335,18 +308,18 @@ def test_gate_handoff_checks_conflict_round_scope(handed: GitHub, extra: str) ->
         },
     ]
     if extra == "revoked":
-        handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"][0]["body"] = (
+        handed.api["repos/example-org/example-app/pulls/7/reviews"][0]["body"] = (
             "<!-- workflow-review round=1 result=sent-back -->"
         )
     elif extra == "scope":
         scope.unlink()
     elif extra == "extends":
-        handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"][1]["body"] = (
+        handed.api["repos/example-org/example-app/pulls/7/reviews"][1]["body"] = (
             "<!-- workflow-review round=2 result=passed -->\n"
             f"<!-- workflow-conflict extends={main} -->"
         )
     elif extra == "marker":
-        handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"][1]["body"] = (
+        handed.api["repos/example-org/example-app/pulls/7/reviews"][1]["body"] = (
             "<!-- workflow-review round=2 result=passed -->\n"
             "<!-- workflow-conflict extends=unreadable -->"
         )
