@@ -1,3 +1,9 @@
-# The differences `tools/parity` expects between Shipline and an installation's own copy of the
-# scripts. Each entry is one line, below a line of its reason; `tools/parity` says how to write
-# a rename and a rewrite.
+# An example of an installation's known list. The real one lives in the installation, at the
+# path its shipline.json names as `parity.known`; `tools/parity` says how entries are written.
+
+# Shipline reads the repository from its config, where example-app's copy names it.
+rewrite scripts/workflow/tick |"$SHIPLINE_REPOSITORY"|"example-owner/example-app"|
+# example-app's copy keeps the older name of the merge helper.
+rename scripts/workflow/merge-when-current scripts/workflow/merge-when-green
+# example-app's own hunt stays in its repository.
+rename - scripts/workflow/hunt-app

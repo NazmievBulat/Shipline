@@ -1,7 +1,8 @@
 """`tools/parity` prints every difference between Shipline and an installation's own copy of the
-scripts, except those `tools/parity-known.txt` lists: a path rename or a text rewrite, each with
-its reason."""
+scripts, except those the installation's known list names: a path rename or a text rewrite, each
+with its reason."""
 
+import json
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,8 @@ _ROOT = Path(__file__).resolve().parents[2]
 _TOOL = _ROOT / "tools/parity"
 _KNOWN = _ROOT / "tools/parity-known.txt"
 _CONFIG = _ROOT / "scripts/workflow/workflow_config.py"
+# Where the installations of these tests keep their known list.
+_AT = "tools/shipline/parity-known.txt"
 
 _TICK = '#!/bin/bash\nset -euo pipefail\necho "tick for $SHIPLINE_REPOSITORY"\nexit 0\n'
 
@@ -30,21 +33,21 @@ def _checkout(folder: Path, files: dict[str, str]) -> Path:
     return folder
 
 
-def _shipline(tmp_path: Path, files: dict[str, str], known: str = "") -> Path:
-    """A Shipline checkout with the real tool, `files` and `known` as its known differences.
-    The config reader the tool imports is there untracked, so it is not compared."""
-    root = _checkout(tmp_path / "shipline", {**files, "tools/parity-known.txt": known})
+def _shipline(tmp_path: Path, files: dict[str, str]) -> Path:
+    """A Shipline checkout with the real tool and `files`. The config reader the tool imports is
+    there untracked, so it is not compared."""
+    root = _checkout(tmp_path / "shipline", files)
+    (root / "tools").mkdir(exist_ok=True)
     shutil.copy(_TOOL, root / "tools/parity")
-    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
     (root / "scripts/workflow").mkdir(parents=True, exist_ok=True)
     shutil.copy(_CONFIG, root / "scripts/workflow/workflow_config.py")
     return root
 
 
-def _parity(shipline: Path, checkout: Path) -> subprocess.CompletedProcess[str]:
+def _parity(shipline: Path, checkout: Path, *options: str) -> subprocess.CompletedProcess[str]:
     # Run by the interpreter: CI's temporary folders may not run programs.
     return subprocess.run(
-        [sys.executable, "-B", str(shipline / "tools/parity"), str(checkout)],
+        [sys.executable, "-B", str(shipline / "tools/parity"), *options, str(checkout)],
         capture_output=True,
         text=True,
         timeout=60,
@@ -53,9 +56,16 @@ def _parity(shipline: Path, checkout: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _both(
-    tmp_path: Path, ours: dict[str, str], theirs: dict[str, str], known: str = ""
+    tmp_path: Path,
+    ours: dict[str, str],
+    theirs: dict[str, str],
+    known: str | None = None,
+    *options: str,
 ) -> subprocess.CompletedProcess[str]:
-    return _parity(_shipline(tmp_path, ours, known), _checkout(tmp_path / "app", theirs))
+    """Compares `ours` with `theirs`, an installation that names `known` as its known list."""
+    if known is not None:
+        theirs = {**theirs, "shipline.json": json.dumps({"parity": {"known": _AT}}), _AT: known}
+    return _parity(_shipline(tmp_path, ours), _checkout(tmp_path / "app", theirs), *options)
 
 
 def test_the_same_files_print_nothing(tmp_path: Path) -> None:
@@ -128,7 +138,10 @@ def test_a_config_that_names_one_test_folder_keeps_the_other_s_default(tmp_path:
         ("{", "shipline.json is not JSON"),
         ('{"parity": []}', "shipline.json: parity"),
         ('{"parity": {"workflow_test": "x"}}', "shipline.json: unknown key parity.workflow_test"),
-        ('{"parity": {"workflow_tests": 3}}', "shipline.json: parity.workflow_tests must be a name"),
+        (
+            '{"parity": {"workflow_tests": 3}}',
+            "shipline.json: parity.workflow_tests must be a name",
+        ),
         (
             '{"parity": {"runner_tests": "../elsewhere"}}',
             "shipline.json: parity.runner_tests must be a path inside the checkout",
@@ -209,9 +222,71 @@ def test_a_file_that_lost_its_executable_bit_is_printed(tmp_path: Path) -> None:
 
     assert done.returncode == 1
     assert done.stdout == (
-        "mode: shipline/scripts/workflow/tick is executable, "
-        "checkout/scripts/workflow/tick is not executable\n"
+        "mode: shipline/scripts/workflow/tick is an executable file, "
+        "checkout/scripts/workflow/tick is a file\n"
     )
+
+
+def test_an_empty_file_on_one_side_only_is_printed(tmp_path: Path) -> None:
+    done = _both(
+        tmp_path,
+        {"tests/workflow/__init__.py": ""},
+        {"scripts/workflow/hook*": ""},
+        None,
+        "--summary",
+    )
+
+    assert done.returncode == 1
+    assert done.stdout == "0+ 0- - scripts/workflow/hook\n0+ 0- tests/workflow/__init__.py -\n"
+
+
+def test_a_binary_file_that_differs_is_printed(tmp_path: Path) -> None:
+    shipline = _shipline(tmp_path, {})
+    checkout = _checkout(tmp_path / "app", {})
+    for root, data in ((shipline, b"\xff\x00a"), (checkout, b"\xff\x00b")):
+        (root / "scripts/workflow").mkdir(parents=True, exist_ok=True)
+        (root / "scripts/workflow/icon.png").write_bytes(data)
+        subprocess.run(["git", "-C", str(root), "add", "scripts/workflow/icon.png"], check=True)
+
+    done = _parity(shipline, checkout)
+
+    assert (done.returncode, done.stderr) == (1, "")
+    assert done.stdout == (
+        "binary files differ: shipline/scripts/workflow/icon.png checkout/scripts/workflow/icon.png\n"
+    )
+
+
+def test_a_symlink_differs_from_a_file_holding_its_target(tmp_path: Path) -> None:
+    shipline = _shipline(tmp_path, {"scripts/workflow/gh": "../gh-bin/gh"})
+    checkout = _checkout(tmp_path / "app", {})
+    (checkout / "scripts/workflow").mkdir(parents=True)
+    (checkout / "scripts/workflow/gh").symlink_to("../gh-bin/gh")
+    subprocess.run(["git", "-C", str(checkout), "add", "-A"], check=True)
+
+    done = _parity(shipline, checkout)
+
+    assert done.returncode == 1
+    assert done.stdout.splitlines()[-1] == (
+        "mode: shipline/scripts/workflow/gh is a file, checkout/scripts/workflow/gh is a symlink"
+    )
+
+
+def test_a_missing_line_break_at_the_end_is_printed(tmp_path: Path) -> None:
+    done = _both(tmp_path, {"scripts/workflow/x": "a\n"}, {"scripts/workflow/x": "a"})
+
+    assert done.returncode == 1
+    assert done.stdout.splitlines()[-3:] == ["-a", "+a", "\\ No newline at end of file"]
+
+
+def test_the_index_is_compared_not_the_working_tree(tmp_path: Path) -> None:
+    shipline = _shipline(tmp_path, {"scripts/workflow/tick*": _TICK})
+    checkout = _checkout(tmp_path / "app", {"scripts/workflow/tick*": _TICK})
+    # A change not added yet is no change of the checkout.
+    (checkout / "scripts/workflow/tick").write_text("edited\n")
+
+    done = _parity(shipline, checkout)
+
+    assert (done.returncode, done.stdout) == (0, "")
 
 
 def test_an_untracked_file_is_not_compared(tmp_path: Path) -> None:
@@ -284,7 +359,10 @@ def test_a_file_renamed_away_leaves_its_old_name_on_the_other_side_unpaired(
     )
 
     assert done.returncode == 1
-    assert done.stdout.splitlines()[:2] == ["--- /dev/null", "+++ checkout/scripts/workflow/merge-line"]
+    assert done.stdout.splitlines()[:2] == [
+        "--- /dev/null",
+        "+++ checkout/scripts/workflow/merge-line",
+    ]
 
 
 def test_a_known_file_kept_on_one_side_only_is_not_printed(tmp_path: Path) -> None:
@@ -350,6 +428,60 @@ def test_a_rewrite_applies_only_to_the_files_it_names(tmp_path: Path) -> None:
     assert "tick" not in done.stdout
 
 
+def test_a_known_rewrite_beside_an_unknown_change_still_shows_the_change(tmp_path: Path) -> None:
+    known = "# The repository.\nrewrite scripts/workflow/tick |$SHIPLINE_REPOSITORY|example/app|\n"
+    theirs = _TICK.replace("$SHIPLINE_REPOSITORY", "example/app").replace("exit 0", "exit 5")
+
+    done = _both(
+        tmp_path, {"scripts/workflow/tick*": _TICK}, {"scripts/workflow/tick*": theirs}, known
+    )
+
+    assert done.returncode == 1
+    assert [line for line in done.stdout.splitlines()[2:] if line[:1] in "+-"] == [
+        "-exit 0",
+        "+exit 5",
+    ]
+
+
+def test_rewrites_do_not_apply_to_each_other_s_results(tmp_path: Path) -> None:
+    known = (
+        "# One name.\nrewrite scripts/workflow/x |alpha|beta|\n"
+        "# Another name.\nrewrite scripts/workflow/x |beta|gamma|\n"
+    )
+
+    done = _both(
+        tmp_path, {"scripts/workflow/x": "alpha\n"}, {"scripts/workflow/x": "gamma\n"}, known
+    )
+
+    assert done.returncode == 1
+    assert "-beta" in done.stdout.splitlines() and "+gamma" in done.stdout.splitlines()
+
+
+def test_only_a_star_is_a_wildcard_in_a_rewrite_s_path(tmp_path: Path) -> None:
+    known = "# The repository.\nrewrite scripts/workflow/[xy] |a|b|\n"
+
+    done = _both(tmp_path, {"scripts/workflow/x": "a\n"}, {"scripts/workflow/x": "b\n"}, known)
+
+    assert done.returncode == 1
+    assert "-a" in done.stdout.splitlines()
+    assert done.stdout.splitlines()[-1].startswith(f"unused: {_AT}:2: ")
+
+
+def test_a_rename_of_the_scripts_folder_leaves_the_rules_paired_with_agents_md(
+    tmp_path: Path,
+) -> None:
+    known = "# Its scripts live elsewhere.\nrename scripts/workflow/ lib/workflow/\n"
+
+    done = _both(
+        tmp_path,
+        {"scripts/workflow/tick*": _TICK, "scripts/workflow/RULES.md": "# Rules\n"},
+        {"lib/workflow/tick*": _TICK, "AGENTS.md": "# Rules\n"},
+        known,
+    )
+
+    assert (done.returncode, done.stdout, done.stderr) == (0, "", "")
+
+
 def test_a_known_difference_found_nowhere_is_printed(tmp_path: Path) -> None:
     known = (
         "# The repository.\n"
@@ -358,13 +490,14 @@ def test_a_known_difference_found_nowhere_is_printed(tmp_path: Path) -> None:
         "# An old name.\n"
         "rename scripts/workflow/old scripts/workflow/older\n"
     )
-    done = _both(tmp_path, {"scripts/workflow/tick*": _TICK}, {"scripts/workflow/tick*": _TICK}, known)
+    done = _both(
+        tmp_path, {"scripts/workflow/tick*": _TICK}, {"scripts/workflow/tick*": _TICK}, known
+    )
 
     assert done.returncode == 1
     assert done.stdout == (
-        "unused: tools/parity-known.txt:2: rewrite scripts/workflow/tick "
-        "|$SHIPLINE_NOWHERE|example/app|\n"
-        "unused: tools/parity-known.txt:5: rename scripts/workflow/old scripts/workflow/older\n"
+        f"unused: {_AT}:2: rewrite scripts/workflow/tick |$SHIPLINE_NOWHERE|example/app|\n"
+        f"unused: {_AT}:5: rename scripts/workflow/old scripts/workflow/older\n"
     )
 
 
@@ -372,7 +505,16 @@ def test_a_known_difference_found_nowhere_is_printed(tmp_path: Path) -> None:
     "known,refusal",
     [
         ("rename scripts/workflow/a scripts/workflow/b\n", "line 1: no reason above it"),
-        ("# Why.\nmove scripts/workflow/a scripts/workflow/b\n", "line 2: not a rename or a rewrite"),
+        ("#\nrename scripts/workflow/a scripts/workflow/b\n", "line 2: no reason above it"),
+        ("# Why.\n\nrename scripts/workflow/a scripts/workflow/b\n", "line 3: no reason above it"),
+        (
+            "# Why.\nrename scripts/workflow/a/ scripts/workflow/b\n",
+            "line 2: a folder is renamed to",
+        ),
+        (
+            "# Why.\nmove scripts/workflow/a scripts/workflow/b\n",
+            "line 2: not a rename or a rewrite",
+        ),
         ("# Why.\nrename scripts/workflow/a\n", "line 2: a rename names two paths"),
         ("# Why.\nrename - -\n", "line 2: a rename names two paths"),
         ("# Why.\nrewrite scripts/workflow/a |x|y\n", "line 2: a rewrite is PATH |FROM|TO|"),
@@ -387,7 +529,7 @@ def test_a_known_list_it_cannot_read_is_refused(tmp_path: Path, known: str, refu
 
     assert done.returncode == 2
     assert done.stdout == ""
-    assert done.stderr.startswith(f"tools/parity-known.txt: {refusal}")
+    assert done.stderr.startswith(f"{_AT}: {refusal}")
 
 
 def test_a_folder_that_is_no_checkout_is_refused(tmp_path: Path) -> None:
@@ -405,11 +547,78 @@ def test_it_is_run_with_one_checkout(tmp_path: Path) -> None:
         [sys.executable, "-B", str(_TOOL)], capture_output=True, text=True, timeout=60, check=False
     )
 
-    assert (done.returncode, done.stderr) == (2, "usage: tools/parity CHECKOUT\n")
+    assert (done.returncode, done.stderr) == (2, "usage: tools/parity [--summary] CHECKOUT\n")
 
 
-def test_shipline_s_own_known_list_is_read_and_its_tool_runs() -> None:
-    assert _KNOWN.is_file()
+def test_without_a_known_list_in_its_config_nothing_is_ignored(tmp_path: Path) -> None:
+    shipline = _shipline(tmp_path, {"scripts/workflow/merge-line*": _TICK})
+    # Shipline's own list does not speak for an installation.
+    (shipline / "tools/parity-known.txt").write_text(
+        "# The merge line.\nrename scripts/workflow/merge-line scripts/workflow/merge-train\n"
+    )
+    subprocess.run(["git", "-C", str(shipline), "add", "-A"], check=True)
+    checkout = _checkout(tmp_path / "app", {"scripts/workflow/merge-train*": _TICK})
+
+    done = _parity(shipline, checkout)
+
+    assert done.returncode == 1
+    assert (
+        "+++ /dev/null" in done.stdout
+        and "+++ checkout/scripts/workflow/merge-train" in done.stdout
+    )
+
+
+def test_a_known_list_the_config_names_but_that_is_not_there_is_refused(tmp_path: Path) -> None:
+    theirs = {"shipline.json": json.dumps({"parity": {"known": _AT}})}
+
+    done = _both(tmp_path, {}, theirs)
+
+    assert done.returncode == 2
+    assert done.stdout == ""
+    assert done.stderr.startswith(f"{_AT}: cannot be read")
+
+
+def test_the_summary_gives_one_line_per_file(tmp_path: Path) -> None:
+    ours = {"scripts/workflow/tick*": _TICK, "scripts/workflow/gone": "a\nb\n", "runner/x": "1\n"}
+    theirs = {
+        "scripts/workflow/tick*": _TICK.replace("exit 0", "echo done\nexit 3"),
+        "tests/workflow/test_new.py": "def test(): pass\n",
+        ".github/runner/x*": "1\n",
+    }
+    known = "# An old name.\nrename scripts/workflow/old scripts/workflow/older\n"
+
+    done = _both(tmp_path, ours, theirs, known, "--summary")
+
+    assert (done.returncode, done.stderr) == (1, "")
+    assert done.stdout == (
+        "0+ 0- runner/x .github/runner/x\n"
+        "0+ 2- scripts/workflow/gone -\n"
+        "2+ 1- scripts/workflow/tick scripts/workflow/tick\n"
+        "1+ 0- - tests/workflow/test_new.py\n"
+        f"unused: {_AT}:2: rename scripts/workflow/old scripts/workflow/older\n"
+    )
+
+
+def test_shipline_s_example_known_list_is_read(tmp_path: Path) -> None:
+    entries = [
+        line
+        for line in _KNOWN.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+    done = _both(tmp_path, {}, {}, _KNOWN.read_text())
+
+    # Nothing to match here, so every entry is printed as unused, and none is refused.
+    assert entries
+    assert (done.returncode, done.stderr) == (1, "")
+    assert done.stdout.splitlines() == [
+        f"unused: {_AT}:{number}: {line}"
+        for number, line in enumerate(_KNOWN.read_text().splitlines(), 1)
+        if line in entries
+    ]
+
+
+def test_shipline_s_tool_runs() -> None:
     assert _TOOL.stat().st_mode & 0o111
     done = subprocess.run(
         ["git", "-C", str(_ROOT), "ls-files", "-s", "tools/parity"],

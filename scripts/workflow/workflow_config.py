@@ -12,7 +12,7 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
 runner prefix; the workflow and runner tests `tools/parity` compares are in `tests/workflow` and
-`tests/runner`.
+`tests/runner`, and it knows of no differences.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -81,8 +81,9 @@ DEFAULTS: dict[str, Any] = {
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
     },
-    # Where the repository keeps its own copy's workflow and runner tests, for `tools/parity`.
-    "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner"},
+    # What `tools/parity` reads of a repository that keeps its own copy of the scripts: where its
+    # workflow and runner tests are, and the file that lists the differences it expects.
+    "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
 }
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
@@ -144,6 +145,7 @@ class Runner:
 class Parity:
     workflow_tests: str
     runner_tests: str
+    known: str | None = None
 
 
 @dataclass(frozen=True)
@@ -320,14 +322,24 @@ def load(start: Path = HERE) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
-        parity=Parity(
-            **{
-                key: _relative(value, f"parity.{key}")
-                for key, value in values["parity"].items()
-            }
-        ),
+        parity=parity_of(given),
         given=given,
         main=main,
+    )
+
+
+def parity_of(given: Any) -> Parity:
+    """The `parity` section of a file as read, checked as `load` checks it. `tools/parity` reads
+    only this of another repository's file, whose other keys its own scripts may read."""
+    if not isinstance(given, dict):
+        raise ConfigError(f"{FILE}: the file must be an object")
+    only = {"parity": given.get("parity", {})}
+    values = _merged({"parity": DEFAULTS["parity"]}, only, "")["parity"]
+    known = values["known"]
+    return Parity(
+        workflow_tests=_relative(values["workflow_tests"], "parity.workflow_tests"),
+        runner_tests=_relative(values["runner_tests"], "parity.runner_tests"),
+        known=None if known is None else _relative(known, "parity.known"),
     )
 
 

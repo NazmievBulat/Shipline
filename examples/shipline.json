@@ -37,6 +37,7 @@
   },
   "parity": {
     "workflow_tests": "tools/shipline/tests",
-    "runner_tests": "tools/runner/tests"
+    "runner_tests": "tools/runner/tests",
+    "known": "tools/shipline/parity-known.txt"
   }
 }
