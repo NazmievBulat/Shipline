@@ -44,6 +44,7 @@ _DEFAULTS = {
         "images": "Docker images",
         "dependency_audit": None,
         "advisory_annotation": None,
+        "prefix_only": [],
     },
     "annotations": {
         "merge_tested": "Merge tested",
@@ -90,11 +91,14 @@ _DEFAULTS = {
             "hunt_cursor",
             "advisory_watch",
             "push_checkout",
+            "push_checks",
         )
     },
     "review": {"high_effort_paths": []},
     "answer_for_owner_after_minutes": 15,
     "cloud_wake_after_minutes": 30,
+    "merge_train": {"queued_limit_minutes": 20},
+    "cloud_pre_push": {"suites": {}},
 }
 
 
@@ -130,6 +134,27 @@ def test_without_a_file_every_value_is_its_default(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
 
     assert _as_json(workflow_config.load(repo)) == _DEFAULTS
+
+
+@pytest.mark.parametrize("groups", [[], ["images"], ["browser_whole"], ["server_whole"],
+                                     ["images", "browser_whole", "server_whole"]])
+def test_prefix_only_groups_are_read(tmp_path: Path, groups: list[str]) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {"prefix_only": groups}})
+    config = workflow_config.load(repo)
+    assert _as_json(config)["checks"]["prefix_only"] == groups
+    mapped = config.checks.groups()
+    assert mapped["images"].workflow == "images"
+    assert mapped["browser_whole"].jobs == ("playwright",)
+    assert mapped["server_whole"].jobs == ("CI: server tests",)
+
+
+@pytest.mark.parametrize("groups", [["unknown"], ["images", "images"], "images", None, [3]])
+def test_invalid_prefix_only_groups_are_refused(tmp_path: Path, groups: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {"prefix_only": groups}})
+    with pytest.raises(workflow_config.ConfigError, match="checks.prefix_only"):
+        workflow_config.load(repo)
 
 
 def test_refresh_reads_ignored_paths_and_globs_even_before_output_exists(tmp_path: Path) -> None:
@@ -294,8 +319,8 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     example = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
 
     def keys(value: Any, prefix: str = "") -> set[str]:
-        # The hunt areas are named by the repository, not by Shipline.
-        if not isinstance(value, dict) or prefix == ".hunts.areas":
+        # The hunt areas and the suites are named by the repository, not by Shipline.
+        if not isinstance(value, dict) or prefix in (".hunts.areas", ".cloud_pre_push.suites"):
             return {prefix}
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 
@@ -1192,7 +1217,8 @@ def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> d
 # the cloud worker's since it is told never to end a turn to wait for an answer.
 _TEXTS_BEFORE = {
     "worker": "325cbf877af37ce9da33010ca5fadb43199e42a93e78235e72d234068a61438c",
-    "cloud": "a331c8a4ccec16eeaf7cf29fc4b5177e6ef0c6e9ef2efc0edb924ad8ce8f90a7",
+    # Since it tells a cloud worker to push as one, so its push runs CI's tests.
+    "cloud": "cd523614cb42d86a5f7b72324e18f0cd0aca26721968201015b5610c5db7252f",
     "review": "ea932fce613e8e9c075daa884a2adee29b64ee5610f1fcd922f27aa6cd39c49a",
     "wake": "af21558438c99d72e165c8fb8ab4febdd80204e43f532a399697b4131441d080",
 }
@@ -1464,6 +1490,7 @@ def test_the_gate_reads_the_named_checks_titles_workflow_files_and_runner_labels
         "ci_plan": "Build: what to run",
         "e2e_plan": "Browser: what to run",
         "images": "Images",
+        "prefix_only": [],
     }
     proven = {
         "every server test": True,
@@ -1598,3 +1625,18 @@ def test_a_second_tick_waits_for_the_first_across_a_change_of_the_state_folder(
     assert done.returncode == 0, done.stderr
     assert "the tick before this one is still running" in done.stdout, done.stdout + done.stderr
     assert not workflow.calls("gh")
+
+
+@pytest.mark.parametrize("minutes", [0, 5, 1440])
+def test_the_prefix_queue_limit_is_configurable(tmp_path: Path, minutes: int) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"merge_train": {"queued_limit_minutes": minutes}})
+    assert workflow_config.load(repo).merge_train.queued_limit_minutes == minutes
+
+
+@pytest.mark.parametrize("minutes", [-1, 1441, True, 1.5, "20"])
+def test_an_invalid_prefix_queue_limit_is_refused(tmp_path: Path, minutes: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"merge_train": {"queued_limit_minutes": minutes}})
+    with pytest.raises(workflow_config.ConfigError, match="merge_train.queued_limit_minutes"):
+        workflow_config.load(repo)

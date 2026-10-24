@@ -47,6 +47,7 @@ _COMMANDS = (
     "hunt_cursor",
     "advisory_watch",
     "push_checkout",
+    "push_checks",
 )
 
 

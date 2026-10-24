@@ -582,3 +582,15 @@ def test_a_requested_retry_polls_until_attempt_metadata_catches_up_then_reuses_r
     assert steady.api(path, fetch)[0]["run_attempt"] == 2
     assert steady.api(jobs_path, fetch_jobs)[0]["conclusion"] == "success"
     assert calls.count(path) == calls.count(jobs_path) == 3  # completed retry is steady again
+
+
+def test_a_queue_mutation_invalidates_the_ticks_cached_runs_and_jobs(
+    reads_module: ModuleType, tmp_path: Path,
+) -> None:
+    reads = reads_module.Reads(tmp_path, "base")
+    path = f"{_API}/actions/runs/100/jobs?per_page=100"
+    assert reads.api(path, lambda: ["queued"]) == ["queued"]
+    reads.invalidate()
+    assert reads.api(path, lambda: ["cancelled"]) == ["cancelled"]
+    reads.finish()
+    assert reads_module.Reads(tmp_path, "base").api(path, lambda: ["unexpected"]) == ["cancelled"]

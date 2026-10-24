@@ -73,6 +73,16 @@ job the pull request skipped, which main always runs, waits for main's own succe
 nothing merges meanwhile, so no later push cancels that run. The squash commit carries the
 gate's proof (a `Workflow-Proof` line): main's CI and E2E skip a job that line shows passed,
 whole, on the identical tree, and name the run they inherited.
+`checks.prefix_only` in `shipline.json` lists the groups `images` (the image workflow's jobs),
+`browser_whole` (E2E's `playwright` job) and `server_whole` (CI's `CI: server tests` job).
+For a listed group, a pull request's ready, push and refresh runs keep the fast checks and
+the tests selected by its change; the whole group runs only on its prefix or, for a first
+member merging alone, the gate's scratch branch. The gate waits for that scratch proof,
+records it in the squash and lets main inherit it on the identical tree, including image jobs.
+A group the path filters need none of runs nowhere; an absent or empty list keeps the usual
+checks. The wake reports the previous UTC day's runner minutes saved once a day: each
+merged pull request's proven scratch group job minutes times its own CI runs whose planner
+recorded that group as deferred, with reruns of the same run counted once.
 Main's other checks still run, and any failure makes main red as before. A push to main the
 gate did not make runs everything. A different tree waits for main's own checks, then the
 gate is called again; a stale pull request is refreshed meanwhile. The tick reports a red, advisory or unreadable main in the
@@ -91,12 +101,19 @@ medium, low), then in the order they joined within one priority. A pull request 
 label changes while it waits moves at the next turn. The gate tests the first members of
 the line at once, each as a prefix: main and every member ahead of it, merged with this one,
 on a scratch branch of its own, with its CI, the whole browser suite's E2E run and any
-required image checks. How many it tests, the window, starts at 4, grows by one after each
+required image checks. A scratch CI or E2E job asking for `<label>-main-batch` that queues
+longer than `merge_train.queued_limit_minutes` (default 20) has its first attempt cancelled
+and its whole run re-run once, so attempt 2 takes the ordinary runner choice; a job past the
+limit on a later attempt is reported once in the gate's output and wake, and keeps waiting.
+Image jobs and jobs outside that lane do not trigger this retry; the gate remembers the
+recovery across restarts, and `--train-status` shows it with the prefix.
+How many it tests, the window, starts at 4, grows by one after each
 merge and halves after a failed prefix, never below 1 and never above 4 (`WINDOW_CEILING` in
 `scripts/workflow/merge_gate.py`). A member merges as soon as its own prefix passed and every
 member ahead of it merged; its squash must match its prefix's tree, and main inherits that
 prefix's green result. A first member whose own CI tested its merge with the current main
-merges by its own checks and needs no prefix. Each member must still have a passed review
+merges by its own checks; any listed `checks.prefix_only` groups must first pass on its
+prefix or the gate's scratch run. Each member must still have a passed review
 and a gate call on its current head. A member whose prefix failed once every member ahead of
 it merged is blocked as a failed check, and its own gate call reports it; the prefixes behind
 it hold its change, so they are built again from the new front without it, and their failure
@@ -336,6 +353,31 @@ removes the record only once the pull request is ready, letting the normal indep
 start. Reports and failed deliveries are remembered locally. The workflow does not read cloud
 transcripts or stop cloud sessions; the owner answers in the cloud session or on the pull
 request.
+
+A cloud worker's push also runs the tests CI will run for its change: its machine is its own,
+so the slower suites cost no local machine anything. It exports `SHIPLINE_CLOUD_WORKER=1` in
+every shell before pushing, runs each push in the background and waits for it, and the
+repository's pre-push hook ends with
+`shipline ci-tests-for-changes --run --extra-only`, which runs nothing unless that is set. A
+local worker, a reviewer, the gate and the tick push as before, and nothing that runs today
+is skipped for anyone. The suites are the `cloud_pre_push.suites` of `shipline.json`, each
+chosen by its selection command as CI chooses it, against where the branch left main, with
+the working changes and without the local cap of three browser specs.
+`shipline ci-tests-for-changes` alone prints that choice and why, the same for anyone;
+`--run` runs the repository's push checks (`commands.push_checks`) first. The suites test
+what CI tests: when main has moved on since the branch left it, they run in a temporary
+worktree of the branch merged with the fetched main, set up by the repository's setup command
+and removed afterwards; a branch that conflicts with main is refused and told to merge it.
+When the worker runs as root, it exports `SHIPLINE_CLOUD_TEST_USER`, gives that unprivileged
+account the checkout (`chown -R`) and marks it safe for git (`safe.directory`), as root and as
+the account; every suite and browser probe runs as the account. As root without it, or with
+an account that cannot write the checkout or that git does not trust there, the push is
+refused before any test runs, naming the remedy. Each suite reports its time and has 25
+minutes; a failed or timed-out suite refuses the push. When no browser can start, the browser
+suite is left to CI with the probe's error. Only after the server suite timed out does the
+worker export `SHIPLINE_CLOUD_SERVER_PART="1 of 4"` (or another part), which runs that part
+of the selected server tests as CI parts it and leaves the rest to CI; a failing part still
+refuses. It unsets it once it is not needed.
 
 A cloud session that ends its turn stays stopped until something types into it. The tick keeps,
 in each record, when it first saw the draft's head and the time of the last report. A worker
