@@ -3,40 +3,21 @@
 // filesystem or arbitrary command tool is exposed to the bridge model.
 import { execFileSync } from "node:child_process"
 import { readFileSync, rmSync, writeFileSync } from "node:fs"
-import { dirname } from "node:path"
+import { fileURLToPath } from "node:url"
 import { createInterface } from "node:readline"
 import { setTimeout as delay } from "node:timers/promises"
 
 const [worktree, name] = process.argv.slice(2)
 if (!worktree || !/^ticket-[0-9]+$/.test(name ?? "")) process.exit(2)
 const socket = `codex-${name.slice(7)}`
-// The state folder named in shipline.json of the main checkout, `.local/workflow` when it names
-// none, as workflow_config.py reads it. A file that cannot be read stops the bridge.
+// Use the same file selection and validation as Bash and Python, including installations.
 function stateFolder() {
-  const common = execFileSync(
-    "git",
-    ["-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-    { encoding: "utf8", timeout: 5000 },
-  ).trim()
-  let config = {}
-  try {
-    config = JSON.parse(readFileSync(`${dirname(common)}/shipline.json`, "utf8"))
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error
-  }
-  if (config === null || typeof config !== "object" || Array.isArray(config)) {
-    throw new Error("shipline.json: the file must be an object")
-  }
-  const folder = "state_folder" in config ? config.state_folder : ".local/workflow"
-  if (
-    typeof folder !== "string" ||
-    !folder.trim() ||
-    folder.startsWith("/") ||
-    folder.split("/").includes("..")
-  ) {
-    throw new Error("shipline.json: state_folder must be a path inside the checkout")
-  }
-  return folder
+  const config = JSON.parse(execFileSync(
+    "python3",
+    [fileURLToPath(new URL("./workflow_config.py", import.meta.url)), "json", worktree],
+    { encoding: "utf8", timeout: 15000 },
+  ))
+  return config.state_folder ?? ".local/workflow"
 }
 const notes = `${worktree}/${stateFolder()}/${name}`
 function tmux(...args) {

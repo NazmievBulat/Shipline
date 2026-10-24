@@ -33,8 +33,9 @@
 #
 # What the tick's automatic ticket start did, and why the next ticket waits, rides with the
 # next check-in, a line each, once per change (`ticket_starts.py` notes them): `started 611
-# (priority high)`, `608 waits: shares scripts/workflow/merge_gate.py with 563`. Such a line
-# counts as a change for a check-in, and does not by itself make the wake look in the day.
+# (priority high)`, `608 waits: shares scripts/workflow/merge_gate.py with 563`, and, for a hot
+# path of shipline.json, `612 waits: hot path web/src/pages/** with 598`. Such a line counts as
+# a change for a check-in, and does not by itself make the wake look in the day.
 #
 # So do the orchestrator's decisions (`decide` records them): each ticket still held with its
 # reason and age, `38 held after 37: shares scripts/workflow/tick (2h10m)`, and the answers given
@@ -112,10 +113,10 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 github_ready=1
 python3 "$here/github_budget.py" ready wake || github_ready=0
 # The state folder and the labels (`workflow_config.py`), read once; priority.jq reads the
-# label names from SHIPLINE_CONFIG.
+# label names from SHIPLINE_CONFIG_JSON.
 config=$(python3 "$here/workflow_config.py" shell) || exit 1
 eval "$config"
-export SHIPLINE_CONFIG
+export SHIPLINE_CONFIG_JSON
 # The repository's main checkout, never the checkout these scripts are in.
 main=$SHIPLINE_REPO
 saved_line=""
@@ -125,7 +126,7 @@ saved_sent=$main/$SHIPLINE_STATE_FOLDER/prefix-savings.sent
 # with the other daily findings; unchanged check-ins must not send it twice.
 # A shadow run writes no note of its own, so it neither reads nor keeps a savings report.
 if [[ -z $shadow ]] && ((github_ready)) &&
-    jq -e '.checks.prefix_only // [] | length > 0' <<<"$SHIPLINE_CONFIG" >/dev/null &&
+    jq -e '.checks.prefix_only // [] | length > 0' <<<"$SHIPLINE_CONFIG_JSON" >/dev/null &&
     [[ ! -r $saved_sent || $(<"$saved_sent") != "$saved_day" ]]; then
   mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
   (umask 077; touch "$main/$SHIPLINE_STATE_FOLDER/prefix-savings.lock")

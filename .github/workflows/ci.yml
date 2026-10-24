@@ -88,11 +88,13 @@ jobs:
               tests/runner/test_rendering.py
               tests/tools/test_parity.py
               tests/workflow/test_break_35.py
+              tests/workflow/test_break_45.py
               tests/workflow/test_browser_test_slots.py
               tests/workflow/test_github_identity.py
               tests/workflow/test_install_hooks.py
               tests/workflow/test_limit_in_own_words.py
               tests/workflow/test_merge_driver.py
+              tests/workflow/test_break_55.py
               tests/workflow/test_notify.py
               tests/workflow/test_priority.py
               tests/workflow/test_review_effort.py

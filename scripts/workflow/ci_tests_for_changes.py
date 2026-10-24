@@ -410,7 +410,7 @@ def main(argv: list[str]) -> int:
         suites = config.cloud_pre_push.suites
         if part and not any(suite.name == SERVER and suite.part for suite in suites):
             raise Refused(
-                "a server part was named, but shipline.json names no "
+                f"a server part was named, but {config.path} names no "
                 f"cloud_pre_push.suites.{SERVER}.part"
             )
         account = _account(arguments.run)

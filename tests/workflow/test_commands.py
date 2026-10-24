@@ -1038,7 +1038,7 @@ def test_without_a_hunt_app_a_hunt_is_refused_in_a_sentence(workflow: Workflow) 
 
     assert done.returncode == 1
     assert done.stderr.strip() == (
-        "this repository names no hunt_app command in shipline.json, so a hunt has no app to use"
+        f"this repository names no hunt_app command in {workflow.repo / 'shipline.json'}, so a hunt has no app to use"
     )
     assert not workflow.hunt_worktree("phone-1").exists()
     assert not workflow.calls("tmux")
@@ -1054,7 +1054,7 @@ def test_without_a_cursor_hunter_a_cursor_hunt_is_refused_in_a_sentence(
 
     assert done.returncode == 1
     assert done.stderr.strip() == (
-        "this repository names no hunt_cursor command in shipline.json, so it has no Cursor hunter"
+        f"this repository names no hunt_cursor command in {workflow.repo / 'shipline.json'}, so it has no Cursor hunter"
     )
     assert not workflow.calls("tmux")
 
@@ -1171,7 +1171,7 @@ def test_without_a_selection_shipline_selects_nothing_and_says_the_whole_suite_r
     assert done.returncode == 0
     assert done.stdout == ""
     assert done.stderr == (
-        f"this repository names no {key} command in shipline.json: "
+        f"this repository names no {key} command in {workflow.repo / 'shipline.json'}: "
         "no test is selected, and CI runs the whole suite\n"
     )
 
@@ -1182,7 +1182,7 @@ def test_without_a_command_shipline_says_the_repository_has_none(workflow: Workf
     done = workflow.shipline("hunt-browser", "open", "/")
 
     assert done.returncode == 1
-    assert done.stderr == "this repository names no hunt_browser command in shipline.json\n"
+    assert done.stderr == f"this repository names no hunt_browser command in {workflow.repo / 'shipline.json'}\n"
 
 
 def test_shipline_knows_every_command_a_repository_may_name() -> None:
@@ -1200,6 +1200,6 @@ def test_without_pre_train_checks_shipline_has_none_to_fail(workflow: Workflow) 
 
     assert done.returncode == 0
     assert done.stderr == (
-        "this repository names no pre_train_checks command in shipline.json: "
+        f"this repository names no pre_train_checks command in {workflow.repo / 'shipline.json'}: "
         "there is no check to fail\n"
     )

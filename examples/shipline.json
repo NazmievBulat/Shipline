@@ -1,5 +1,6 @@
 {
   "repository": "example-owner/example-app",
+  "install_folder": ".",
   "state_folder": ".local/shipline",
   "worktree_setup": "tools/prepare-worktree",
   "refresh": {
@@ -100,6 +101,12 @@
     "queued_limit_minutes": 20
   },
   "answer_for_owner_after_minutes": 15,
+  "hot_paths": ["src/example_app/models.py", "web/src/pages/**"],
+  "conflict_review": {
+    "effort": "medium",
+    "model": "sonnet",
+    "max_changed_lines": 40
+  },
   "cloud_pre_push": {
     "suites": {
       "server": {

@@ -365,10 +365,11 @@ _TESTS = {"test": "tests", "browser": "browser tests"}
 
 
 def _run_command(name: str, args: list[str]) -> int:
-    line = getattr(workflow_config.current().commands, name)
+    config = workflow_config.current()
+    line = getattr(config.commands, name)
     if line is None:
         print(
-            f"{workflow_config.FILE} names no commands.{name}, "
+            f"{config.path} names no commands.{name}, "
             f"the command that runs this repository's {_TESTS[name]}",
             file=sys.stderr,
         )

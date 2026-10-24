@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NoReturn
+from urllib.parse import quote
 
 import check_repair
 import priority
@@ -145,7 +146,7 @@ MEMBER_ENTRIES = (
     "reruns",
     "lost",
 )
-MEMBER_MARKS = ("unavailable", "fixes", "refreshable")
+MEMBER_MARKS = ("unavailable", "fixes", "refreshable", "restored")
 
 # Set only while computing train order, never while verifying a merge.
 _planning_reads: train_reads.Reads | None = None
@@ -1027,7 +1028,7 @@ def wake_log(line: str) -> None:
         output.write(f"{int(time.time())} {line}\n")
 
 
-def _cancel(found: list[dict[str, Any]], folder: Path, whose: str) -> None:
+def _cancel(found: list[dict[str, Any]], folder: Path, whose: str, *, report: bool = False) -> None:
     """Cancel each run of `found` still queued or running, so that it holds no runner ahead of
     live work, each once. A cancel GitHub refuses (the run already finishing) goes to the wake
     log once and stops nothing. One held back by the shared budget, or lost to a GitHub outage
@@ -1062,6 +1063,10 @@ def _cancel(found: list[dict[str, Any]], folder: Path, whose: str) -> None:
             note = f"could not cancel run {run['id']} of {whose}: {error}"
             claim.write_text(note + "\n")
             wake_log(note)
+            if report:
+                print(note, flush=True)
+        elif report:
+            print(f"cancel requested for run {run['id']} of {whose}", flush=True)
 
 
 def pull_service_wait(
@@ -1659,7 +1664,7 @@ def path_filter(patterns: list[str]) -> Callable[[str], bool]:
     starting with `!` takes the file back, so negated patterns alone match nothing.
     """
     rules = [
-        (pattern.startswith("!"), _filter_pattern(pattern.removeprefix("!")))
+        (pattern.startswith("!"), workflow_config.path_pattern(pattern.removeprefix("!")))
         for pattern in patterns
     ]
 
@@ -1671,87 +1676,6 @@ def path_filter(patterns: list[str]) -> Callable[[str], bool]:
         return started
 
     return matches
-
-
-def _filter_pattern(pattern: str) -> re.Pattern[str]:
-    """One filter pattern as a regular expression. `*` is any characters but `/`, `**` is any
-    characters, and `**/` where a folder's name starts is zero or more folders (inside a name,
-    `**` is any characters and the `/` stays). `?` and `+` make what stands before them
-    zero or one, or one or more, of it. `[...]` is one character of its set, with `-` ranges.
-    A backslash makes the next character itself, and every other character is itself.
-
-    GitHub does not document a `?` or `+` with nothing before it, or a `[` that no `]` closes
-    (nor an empty `[]`): each of those is read as the character itself.
-    """
-    # Each part is what one piece of the pattern matches and how often it may stand: at least
-    # `fewest` (0 or 1) times, and at most once or, with `many`, any number of times. Repeating
-    # a part only changes those two, so no repetition ever nests inside another.
-    parts: list[tuple[str, int, bool]] = []
-    at = 0
-    while at < len(pattern):
-        char = pattern[at]
-        if pattern.startswith("**/", at) and pattern[at - 1 : at] in ("", "/"):
-            # Zero or more folders: repeating it, however, is still that.
-            parts.append(("(?:.*/)?", 1, False))
-            at += 3
-            continue
-        if pattern.startswith("**", at):
-            parts.append((".", 0, True))
-            at += 2
-            continue
-        at += 1
-        if char == "*":
-            parts.append(("[^/]", 0, True))
-        elif char in "?+" and parts:
-            expression, fewest, many = parts[-1]
-            if expression != "(?:.*/)?":
-                parts[-1] = (expression, 0, many) if char == "?" else (expression, fewest, True)
-        elif char == "\\" and at < len(pattern):
-            parts.append((re.escape(pattern[at]), 1, False))
-            at += 1
-        elif char == "[" and (found := _filter_set(pattern, at)):
-            expression, at = found
-            parts.append((expression, 1, False))
-        else:
-            parts.append((re.escape(char), 1, False))
-    times = {(1, False): "", (0, False): "?", (1, True): "+", (0, True): "*"}
-    return re.compile(
-        "".join(expression + times[fewest, many] for expression, fewest, many in parts),
-        flags=re.DOTALL,
-    )
-
-
-def _filter_set(pattern: str, at: int) -> tuple[str, int] | None:
-    """The set that starts at `at`, just after a `[`, as one character of a regular expression,
-    and where the pattern goes on after its `]`; None when no `]` closes a set of at least one
-    character. A backslash makes the next character itself. A `-` between two characters of
-    a-z, of A-Z or of 0-9 is the range from the first to the second, as GitHub allows ranges
-    only there; any other `-`, and a range that runs backwards, is the characters themselves.
-    """
-    chars: list[tuple[str, bool]] = []
-    while at < len(pattern) and (pattern[at] != "]" or not chars):
-        if pattern[at] == "]":
-            return None
-        escaped = pattern[at] == "\\" and at + 1 < len(pattern)
-        if escaped:
-            at += 1
-        chars.append((pattern[at], escaped))
-        at += 1
-    if at == len(pattern):
-        return None
-    members: list[str] = []
-    index = 0
-    while index < len(chars):
-        char = chars[index][0]
-        last = chars[index + 2][0] if index + 2 < len(chars) else ""
-        ranged = any(first <= char <= last <= final for first, final in ("az", "AZ", "09"))
-        if chars[index + 1 : index + 2] == [("-", False)] and ranged:
-            members.append(f"{re.escape(char)}-{re.escape(last)}")
-            index += 3
-        else:
-            members.append(re.escape(char))
-            index += 1
-    return f"[{''.join(members)}]", at + 1
 
 
 def browser_needed(base: str, merge: str) -> bool:
@@ -2427,6 +2351,15 @@ class Train:
         # scratch branch of its own (_run_line). A batch or probes saved before it are dropped,
         # and the sweep deletes their branch.
         self.prefixes: dict[str, Any] | None = data.get("prefixes")
+        # Older records are cumulative: each member contains every saved member before it.
+        # Explicit dependencies let a restored member run beside work already on this main.
+        ahead: list[str] = []
+        for member in self.prefixes["members"] if self.prefixes else []:
+            member.setdefault("ahead", list(ahead))
+            ahead.append(member["number"])
+        self.restored: list[str] = list(
+            dict.fromkeys([*data.get("restored", []), *data.get("proven", {})])
+        )
         # How many members are tested at once: one more after each merge, half after a failed
         # prefix, from 1 to WINDOW_CEILING.
         self.window: int = min(max(data.get("window", WINDOW_CEILING), 1), WINDOW_CEILING)
@@ -2444,6 +2377,9 @@ class Train:
         self.proofs: dict[str, list[Any]] = data.get("proofs", {})
         # Each member's priority as its labels said at the last reconcile.
         self.priorities: dict[str, str] = data.get("priorities", {})
+        # The hot paths of shipline.json each member's change touches, read on its head with
+        # those hot paths: `{"head": ..., "patterns": [...], "paths": [...]}`.
+        self.hot: dict[str, dict[str, Any]] = data.get("hot_paths", {})
         # The head each member's lost-check push made: a check lost on it is not pushed for again.
         self.reruns: dict[str, str] = data.get("reruns", {})
         # Each member's lost check at the last reconcile, with its head, for the tick's wake.
@@ -2482,18 +2418,49 @@ class Train:
             if isinstance(record, dict) and isinstance(record.get("branch"), str)
         }
 
+    def rank(self, number: str) -> tuple[int, int]:
+        # Proven fixes share the first place, keeping their order of joining.
+        return (
+            (0, 0)
+            if number in self.fixes
+            else (1, priority.rank(self.priorities.get(number, priority.UNLABELLED)))
+        )
+
     def line(self) -> list[str]:
         """The waiting members in the order they are served: the fix of a red main first,
-        then by priority, then by the order of joining within one priority."""
-        return sorted(
-            self.queue,
-            # Proven fixes share the first place, keeping their order of joining.
-            key=lambda number: (
-                (0, 0)
-                if number in self.fixes
-                else (1, priority.rank(self.priorities.get(number, priority.UNLABELLED)))
-            ),
-        )
+        then by priority, then by the order of joining within one priority, members that
+        share a hot path back to back at the place of the earliest of them."""
+        return list(self.hot_groups())
+
+    def hot_paths_of(self, number: str) -> set[str]:
+        record = self.hot.get(number)
+        if not record or record.get("patterns") != list(CONFIG.hot_paths):
+            return set()
+        return set(record.get("paths", []))
+
+    def hot_groups(self) -> dict[str, str | None]:
+        """Every member in the order served, with the hot path that put it beside a member of
+        its group, or None. Members of one priority that share a hot path, directly or through
+        another, make one group; it is served where its earliest member joined."""
+        served: dict[str, str | None] = {}
+        joined = sorted(self.queue, key=self.rank)
+        if not CONFIG.hot_paths:
+            return dict.fromkeys(joined)
+        for number in joined:
+            if number in served:
+                continue
+            group, why = [number], {number: None}
+            for current in group:
+                for other in joined:
+                    if other in why or other in served or self.rank(other) != self.rank(number):
+                        continue
+                    both = self.hot_paths_of(current) & self.hot_paths_of(other)
+                    if shared := [hot for hot in CONFIG.hot_paths if hot in both]:
+                        group.append(other)
+                        why[other] = shared[0]
+                        why[current] = why[current] or shared[0]
+            served.update((member, why[member]) for member in sorted(group, key=joined.index))
+        return served
 
     def front(self) -> str | None:
         eligible = [
@@ -2541,6 +2508,7 @@ class Train:
                     "turn": self.turn,
                     "approved": self.approved,
                     "prefixes": self.prefixes,
+                    "restored": self.restored,
                     "window": self.window,
                     "proven": self.proven,
                     "batch_failed": self.batch_failed,
@@ -2549,6 +2517,8 @@ class Train:
                     "lost": self.lost,
                     "retest": self.retest,
                     "dropped": self.dropped,
+                    # Only with hot paths named: without them the line is saved as before.
+                    **({"hot_paths": self.hot} if self.hot else {}),
                 },
                 output,
             )
@@ -2560,8 +2530,9 @@ class Train:
         """The scratch branch whose runs decide the first member's turn: its prefix, or the
         whole suite of its tested merge."""
         members = self.prefixes["members"] if self.prefixes else []
-        if members and members[0]["number"] == first and members[0]["scratch"]:
-            return members[0]["scratch"]
+        for member in members:
+            if member["number"] == first and member["scratch"]:
+                return member["scratch"]
         return self.suites.get(first or "")
 
     def merged_one(self) -> None:
@@ -2615,6 +2586,8 @@ class Train:
                 [self.path.read_text() if self.path.exists() else "", base, pulls,
                  CONFIG.checks.prefix_only]
                 + inputs(self.queue)
+                # Named hot paths change the order, though nothing on GitHub changed.
+                + ([list(CONFIG.hot_paths)] if CONFIG.hot_paths else [])
             )
 
         previous = train_reads.load(context / "reconciled.json")
@@ -2782,6 +2755,8 @@ class Train:
                                 # The rerun tested it on what main is now. It gets its earlier
                                 # slot back, and that run is its next prefix.
                                 self.blocked.pop(number)
+                                if number not in self.restored:
+                                    self.restored.append(number)
                                 if "under" in failure["batch"]:
                                     self.proven[number] = {
                                         **failure["batch"],
@@ -2808,6 +2783,7 @@ class Train:
         self.queue = remaining
         # A label changed while waiting moves its pull request at this turn.
         self.priorities = {number: priority.of(pulls[number].get("labels")) for number in remaining}
+        self.read_hot_paths(pulls)
         self.fixes = []
         proofs: dict[str, list[Any]] = {}
         # The update that fixes an advisory on main goes first too, so main turns green.
@@ -2877,6 +2853,7 @@ class Train:
             for number, scratch in self.proven.items()
             if number in remaining and pulls[number]["headRefOid"] == scratch["member"]
         }
+        self.restored = [number for number in self.restored if number in remaining]
         self._pending_turns(pulls, suite_states)
         self.save()
 
@@ -2940,6 +2917,19 @@ class Train:
                     continue
                 if state != "green":
                     continue
+                member = next((m for m in members if m["number"] == number), None)
+                if (
+                    member
+                    and member["scratch"]
+                    and (member.get("kept") or number in self.restored)
+                ):
+                    # A restored prefix's own PR checks stay green while its replacement runs.
+                    # A completed independent prefix takes a turn to prove its tree or have
+                    # its failure handled by the gate; planning never authorizes its merge.
+                    prefix = _suite_state(member["scratch"])
+                    if prefix in (None, "pending"):
+                        self.pending.append(number)
+                        continue
                 images = [] if "images" in CONFIG.checks.prefix_only else runs("images", head, pull=True)
                 if images:
                     state = verdict(images[0], jobs(images[0]), images=True)[0]
@@ -2960,13 +2950,14 @@ class Train:
             except Refused, KeyError, TypeError, ValueError, IndexError:
                 # Unreadable evidence never grants a later member a turn.
                 continue
-        # A prefix holds the members ahead of it: behind a pending one it cannot merge first.
-        ahead = []
-        for member in members:
-            if member["number"] in self.pending:
-                break
-            ahead.append(member["number"])
-        batched = set(ahead)
+        # A prefix cannot go past a pending member it contains. Independent kept work can.
+        kept = any(member.get("kept") for member in members)
+        batched = {
+            member["number"]
+            for member in members
+            if not member["ahead"]
+            or (not kept and not set(member["ahead"]) & set(self.pending))
+        }
         if self.pending:
             # Only a member behind a pending one takes its turn. A green member ahead of
             # every pending one is first anyway and keeps its single path.
@@ -2979,6 +2970,43 @@ class Train:
                         self.passing.append(number)
                 except Refused, KeyError, TypeError, ValueError, IndexError:
                     continue
+
+    def read_hot_paths(self, pulls: dict[str, Any]) -> None:
+        """Which hot paths each member's change touches, read again for a new head only."""
+        patterns = list(CONFIG.hot_paths)
+        kept = {
+            number: record
+            for number, record in self.hot.items()
+            if number in self.queue
+            and record.get("head") == pulls[number]["headRefOid"]
+            and record.get("patterns") == patterns
+        }
+        if patterns:
+            base = None
+            for number in self.queue:
+                if number in kept:
+                    continue
+                head = pulls[number]["headRefOid"]
+                try:
+                    base = base or git("ls-remote", "origin", "refs/heads/main").split()[0]
+                    paths = {
+                        hot for file in changed_files(base, head) for hot in CONFIG.hot_paths_of(file)
+                    }
+                except BudgetWaiting:
+                    raise
+                except Waiting:
+                    # GitHub stalls: the members not read yet are read at the next turn, not
+                    # each waited for under the merge lock.
+                    break
+                except Refused, IndexError:
+                    # Unread, it is served as without hot paths, and read again next time.
+                    continue
+                kept[number] = {
+                    "head": head,
+                    "patterns": patterns,
+                    "paths": [hot for hot in patterns if hot in paths],
+                }
+        self.hot = kept
 
     def suspend(self, number: str, head: str, health: str) -> None:
         self.suspended[number] = f"{head}:{health}"
@@ -3003,6 +3031,7 @@ class Train:
         self.reruns.pop(number, None)
         self.lost.pop(number, None)
         self.proven.pop(number, None)
+        self.restored = [entry for entry in self.restored if entry != number]
         self.save()
 
     def claim(self, number: str, pull: dict[str, Any]) -> bool:
@@ -3075,6 +3104,8 @@ class Train:
         self.refreshable.discard(number)
         self.unavailable += [number] if number in view.unavailable else []
         self.fixes += [number] if number in view.fixes else []
+        self.restored = [entry for entry in self.restored if entry != number]
+        self.restored += [number] if number in view.restored else []
         self.refreshable |= {number} & view.refreshable
         self.save()
 
@@ -3101,6 +3132,7 @@ class OwnView(Train):
             setattr(self, name, {number: entries[number]} if number in entries else {})
         self.unavailable = [entry for entry in self.unavailable if entry == number]
         self.fixes = [entry for entry in self.fixes if entry == number]
+        self.restored = [entry for entry in self.restored if entry == number]
         self.refreshable &= {number}
         self.pending = []
         self.passing = []
@@ -3198,6 +3230,16 @@ def _merge_tree(base: str, head: str) -> str | None:
     if not re.fullmatch(r"[0-9a-f]{40}", tree):
         raise Refused("git did not return a batch tree")
     return tree
+
+
+def changed_files(base: str, head: str) -> list[str]:
+    """The files a pull request's change touches: from where it left main to its head."""
+    for commit, ref in ((base, "refs/heads/main"), (head, head)):
+        if command("git", "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode:
+            git("fetch", "origin", ref)
+    fork = command("git", "merge-base", base, head).stdout.strip()
+    listed = command("git", "diff", "--name-only", "--no-renames", "-z", fork, head).stdout
+    return [path for path in listed.split("\0") if path]
 
 
 def _taken_migrations(head: str, base: str) -> list[str]:
@@ -3388,8 +3430,8 @@ def _batch_signal(train: Train) -> None:
     its turn, change the turn."""
     members = train.prefixes["members"] if train.prefixes else []
     scratch = [
-        (member["scratch"], index == 0)
-        for index, member in enumerate(members)
+        (member["scratch"], member["number"] == train.first)
+        for member in members
         if member["scratch"]
     ]
     if train.first in train.suites:
@@ -3600,11 +3642,11 @@ def _sweep_scratch(folder: Path) -> None:
         kept = set(train.scratch_records())
         listed = git("ls-remote", "origin", f"refs/heads/{SCRATCH_PREFIX}*")
         # `ls-remote` also lists a branch that only ends like one of the gate's: only a branch
-        # the gate named is ever deleted.
+        # of the gate's namespace is ever deleted.
         branches = [
             branch
             for line in listed.splitlines()
-            if _is_scratch(branch := line.split()[1].removeprefix("refs/heads/"))
+            if (branch := line.split()[1].removeprefix("refs/heads/")).startswith(SCRATCH_PREFIX)
         ]
     except (Refused, OSError, KeyError, IndexError, TypeError, ValueError) as error:
         print(f"could not delete old batch branches: {error}", flush=True)
@@ -3617,7 +3659,7 @@ def _sweep_scratch(folder: Path) -> None:
             try:
                 # A dropped prefix's runs would hold runners ahead of the live prefixes' runs.
                 found = _scratch_runs(branch)
-                _cancel(found, folder, f"scratch branch {branch}")
+                _cancel(found, folder, f"scratch branch {branch}", report=True)
                 if branch in watched:
                     _seen(watched[branch], found)
                 deleted = push("origin", "--delete", f"refs/heads/{branch}")
@@ -3636,7 +3678,7 @@ def _sweep_scratch(folder: Path) -> None:
                 if branch not in branches:
                     # Past the deadline too: one last look before giving up.
                     found = _scratch_runs(branch)
-                    _cancel(found, folder, f"scratch branch {branch}")
+                    _cancel(found, folder, f"scratch branch {branch}", report=True)
                     _seen(entry, found)
                 missing = sorted(set(entry["requested"]) - set(entry.get("seen", [])))
                 if not missing:
@@ -3680,21 +3722,18 @@ def _seen(entry: dict[str, Any], found: list[dict[str, Any]]) -> None:
     entry["seen"] = sorted(seen)
 
 
-def _is_scratch(branch: str) -> bool:
-    """Whether the gate named the branch: its scratch prefix, then a random name."""
-    return bool(re.fullmatch(rf"{re.escape(SCRATCH_PREFIX)}[0-9a-f]{{32}}", branch))
-
-
 def _scratch_runs(branch: str) -> list[dict[str, Any]]:
     """Every run of a scratch branch the gate made, across every workflow, read fresh from GitHub.
 
-    A branch of another name in the gate's namespace, and a pull request's own run, are never
-    the gate's to cancel."""
-    if not _is_scratch(branch):
+    The namespace includes branches from older saved state; branches outside it, and a pull
+    request's own run, are never the gate's to cancel."""
+    if not branch.startswith(SCRATCH_PREFIX):
         return []
     return [
         run
-        for run in _api(f"{API}/actions/runs?branch={branch}&per_page=100", "workflow_runs")
+        for run in _api(
+            f"{API}/actions/runs?branch={quote(branch, safe='/')}&per_page=100", "workflow_runs"
+        )
         if run.get("head_branch") == branch and run.get("event") != "pull_request"
     ]
 
@@ -3814,6 +3853,12 @@ def _extend_line(train: Train, base: str, fresh: bool) -> None:
     """
     record = train.prefixes or {"base": base, "merged": 0, "members": []}
     members = record["members"]
+    if members:
+        _restore_prefixes(train, record, base)
+        if train.restored and any(member.get("kept") for member in members):
+            # Only work saved at restoration may go first. New prefixes wait until it
+            # drains, then include the restored front in their dependencies.
+            return
     first = train.front()
     starting = not members
     if (
@@ -3830,6 +3875,8 @@ def _extend_line(train: Train, base: str, fresh: bool) -> None:
     for number in line[line.index(members[-1]["number"] if members else first) + bool(members) :]:
         if len(members) + len(added) >= train.window:
             break
+        if any(member["number"] == number for member in members):
+            continue
         if (
             number in train.blocked
             or number in train.suspended
@@ -3883,7 +3930,17 @@ def _extend_line(train: Train, base: str, fresh: bool) -> None:
             own = fresh and starting and not added and number == first
             scratch = None if own else _prefix_scratch(current, base, under)
         added.append(
-            {"number": number, "head": head, "tree": tree, "commit": current, "scratch": scratch}
+            {
+                "number": number,
+                "head": head,
+                "tree": tree,
+                "commit": current,
+                "scratch": scratch,
+                "ahead": [
+                    *(members[-1]["ahead"] + [members[-1]["number"]] if members else []),
+                    *(member["number"] for member in added),
+                ],
+            }
         )
     if starting and not (
         added
@@ -3903,22 +3960,106 @@ def _extend_line(train: Train, base: str, fresh: bool) -> None:
         train.save()
 
 
-def _drop_line(train: Train, keep: int = 0) -> None:
-    """Forget the prefixes from the `keep`th member on. Each holds every member ahead of it, so
-    those behind a dropped one go with it; the sweep deletes their branches."""
-    if train.prefixes is not None:
-        del train.prefixes["members"][keep:]
-        if not train.prefixes["members"]:
+def _restore_prefixes(train: Train, record: dict[str, Any], base: str) -> None:
+    """A restored member tests on main alone; prefixes already built there keep their work.
+
+    Retained work may already fill the window. It is never evicted to make room for the
+    restored member's own prefix; new branches start only when the window has room.
+    """
+    members = record["members"]
+    line = train.line()
+    for number in line:
+        if number not in train.restored or any(m["number"] == number for m in members):
+            continue
+        if not any(
+            line.index(number) < line.index(m["number"])
+            for m in members
+            if m["number"] not in train.restored
+        ):
+            continue
+        if (
+            number in train.blocked
+            or number in train.suspended
+            or number in train.conflicts
+            or number in train.unavailable
+            or number in train.pending
+        ):
+            continue
+        pull = read_pull(number)
+        head = pull["headRefOid"]
+        if train.approved.get(number) != head or not _batch_ready(pull, base):
+            continue
+        tree = _merge_tree(base, head)
+        if tree is None or _taken_migrations(head, base):
+            continue
+        under = git("rev-parse", f"{base}^{{tree}}")
+        proven = train.proven.get(number)
+        if (
+            proven
+            and proven["member"] == head
+            and proven["under"] == under
+            and git("rev-parse", f"{proven['head']}^{{tree}}") == tree
+        ):
+            scratch = {key: value for key, value in proven.items() if key != "member"}
+            commit = proven["head"]
+            train.proven.pop(number)
+        else:
+            commit = git(
+                "commit-tree", tree, "-p", base, "-p", head, "-m",
+                f"chore: test merge train pull request {number}",
+            )
+            scratch = _prefix_scratch(commit, base, under)
+        for member in members:
+            member["kept"] = True
+        members.append(
+            {"number": number, "head": head, "tree": tree, "commit": commit,
+             "scratch": scratch, "ahead": []}
+        )
+        members.sort(key=lambda member: line.index(member["number"]))
+        train.save()
+
+
+def _drop_prefix(train: Train, number: str) -> None:
+    """Forget this member and prefixes containing it, retaining independent work."""
+    if train.prefixes:
+        members = train.prefixes["members"]
+        members[:] = [m for m in members if m["number"] != number and number not in m["ahead"]]
+        if not members:
             train.prefixes = None
+    train.save()
+
+
+def _move_prefixes(train: Train, number: str, base: str) -> None:
+    """Keep only prefixes that contain the squash now on main, removing that dependency."""
+    assert train.prefixes is not None
+    record = train.prefixes
+    remaining = []
+    for member in record["members"]:
+        if number in member["ahead"]:
+            member["ahead"].remove(number)
+            remaining.append(member)
+    record["members"] = remaining
+    record["base"] = base
+    if not remaining:
+        train.prefixes = None
+
+
+def _drop_line(train: Train) -> None:
+    """Forget every prefix, for example when main changes; the sweep deletes their branches."""
+    train.prefixes = None
     train.save()
 
 
 def _first_invalid(train: Train, record: dict[str, Any]) -> int:
     """The index of the first member whose prefix no longer stands, or how many there are.
 
-    A prefix stands while its member waits in the line at its approved head, eligible, in the
-    order the line serves them; the first must be the front."""
+    A prefix stands while its member waits at its approved head, eligible, in the order the
+    line serves them. A restored front may have independent kept work beside it."""
     line = train.line()
+    front = train.front()
+    independent = any(
+        member["number"] == front and not member["ahead"] for member in record["members"]
+    )
     present = []
     for member in record["members"]:
         if member["number"] not in line:
@@ -3930,7 +4071,11 @@ def _first_invalid(train: Train, record: dict[str, Any]) -> int:
         if (
             index >= len(present)
             or served[index] != number
-            or (index == 0 and number != train.front())
+            or (
+                index == 0 and number != front
+                and front not in train.restored
+                and not independent
+            )
             or train.approved.get(number) != member["head"]
             or number in train.blocked
             or number in train.suspended
@@ -3950,21 +4095,26 @@ def _start_prefixes(train: Train) -> None:
     Only the first member's prefix decides this call: a later one that cannot start yet is
     tried again at the next call, and never keeps a member ahead of it from merging."""
     members = train.prefixes["members"] if train.prefixes else []
-    for index, member in enumerate(list(members)):
+    started = sum(m["scratch"] is None or m["scratch"]["pushed"] for m in members)
+    for member in list(members):
         scratch = member["scratch"]
         if scratch is None:
             continue
+        if not scratch["pushed"] and started >= train.window:
+            continue
         try:
+            was_pushed = scratch["pushed"]
             _push_scratch(
                 train,
                 scratch,
                 f"pull request {member['number']}'s prefix",
-                lambda index=index: _drop_line(train, index),
+                lambda number=member["number"]: _drop_prefix(train, number),
             )
+            started += not was_pushed
             for workflow in scratch["workflows"]:
                 _dispatch_scratch(train, scratch, workflow)
         except Refused as error:
-            if index == 0:
+            if member["number"] == train.front():
                 raise
             print(f"the prefix of pull request {member['number']} starts later: {error}", flush=True)
             return
@@ -4029,9 +4179,19 @@ def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
                 pending.append(waits)
                 continue
         if state == "red":
+            waits = check_repair.runner_wait(folder, found[0], parts)
+            if waits:
+                pending.append(waits)
+                continue
+        if state == "red":
+            failure = (
+                "failed again after its runner retry"
+                if check_repair.repeated(folder, found[0]["id"])
+                else "failed"
+            )
             return Prefix(
                 "red",
-                f"{workflow} run {found[0]['id']} of {whose} failed ({', '.join(failing)})",
+                f"{workflow} run {found[0]['id']} of {whose} {failure} ({', '.join(failing)})",
                 evidence,
                 workflow,
                 found[0],
@@ -4087,15 +4247,18 @@ def _run_line(
         if record is None:
             return None
         raise Waiting("merging stopped: " + health.line)
-    if record is not None:
+    while record is not None:
         valid = _first_invalid(train, record)
-        if valid < len(record["members"]):
-            print(
-                f"merge train: the prefix of pull request {record['members'][valid]['number']} "
-                "and those behind it are tested again",
-                flush=True,
-            )
-            _drop_line(train, valid)
+        if valid == len(record["members"]):
+            break
+        number = record["members"][valid]["number"]
+        print(
+            f"merge train: the prefix of pull request {number} "
+            "and those containing it are tested again",
+            flush=True,
+        )
+        _drop_prefix(train, number)
+        record = train.prefixes
     _extend_line(train, base, fresh)
     if train.prefixes is None:
         return None
@@ -4139,7 +4302,7 @@ def _prefix_failed(
         "workflow": found.workflow,
         "run": _run_token(found.run),
     }
-    _drop_line(train)
+    _drop_prefix(train, number)
     train.failed_prefix()
     train.fail(number, member["head"])
     # Its own checks stay green and unchanged, so no checks wake would come.
@@ -4168,7 +4331,11 @@ def _merge_prefixes(
 ) -> int | None:
     while train.prefixes is not None:
         record = train.prefixes
-        member = record["members"][0]
+        member = next((m for m in record["members"] if m["number"] == train.front()), None)
+        if member is None or member["ahead"]:
+            if merged:
+                _refill(train, record["base"])
+            return stop("merge train: waiting for the members ahead of the next prefix")
         number, head, tree = member["number"], member["head"], member["tree"]
         if member["scratch"] is None:
             # Its own CI tested its merge with this main: it merges by its own checks.
@@ -4227,7 +4394,7 @@ def _merge_prefixes(
             or pull["headRefOid"] != head
             or not _batch_ready(pull, current_base, settling=bool(record["merged"]))
         ):
-            _drop_line(train)
+            _drop_prefix(train, number)
             train.turn += 1
             train.save()
             return stop(f"merge train: prefix member {number} is no longer ready")
@@ -4276,11 +4443,10 @@ def _merge_prefixes(
                 "main did not match the prefix squash; waiting for main's own checks",
                 then="refuse",
             )
-        record["base"] = actual
         record["merged"] += 1
-        record["members"].pop(0)
-        if not record["members"]:
-            train.prefixes = None
+        # Only prefixes containing this squash still test the new main. Independent ones
+        # get a new prefix there; descendants of the kept member retain their runs.
+        _move_prefixes(train, number, actual)
         train.merged_one()
         train.remove(number)
         ci, parts = found.evidence["ci"]
@@ -4298,6 +4464,13 @@ def _merge_prefixes(
             )
         except (Refused, OSError) as error:
             print(f"could not record inherited prefix green: {error}", flush=True)
+        if train.restored or (
+            train.prefixes and any(m.get("kept") for m in train.prefixes["members"])
+        ):
+            # The squash dropped independent retests, even when the last kept prefix
+            # merged. Recompute pending state before filling slots on the new main.
+            train.reconcile(acting=acting)
+            _refill(train, actual)
     if acting not in merged:
         # Unreachable while the caller is the first member; never claim its merge.
         return _batch_wait("merge train: prefixes merged " + ", ".join(merged))
@@ -4319,18 +4492,16 @@ def _advance_line(train: Train, number: str, base: str) -> None:
     if context := train_reads.tick():
         train_reads.save(context / "main.json", {"head": actual})
     if record is not None:
+        member = next((m for m in record["members"] if m["number"] == number), None)
         if (
             record["base"] != base
-            or record["members"][0]["number"] != number
+            or member is None
             or git("show", "-s", "--format=%P", actual) != base
-            or git("rev-parse", f"{actual}^{{tree}}") != record["members"][0]["tree"]
+            or git("rev-parse", f"{actual}^{{tree}}") != member["tree"]
         ):
             _drop_line(train)
         else:
-            record["members"].pop(0)
-            record["base"] = actual
-            if not record["members"]:
-                train.prefixes = None
+            _move_prefixes(train, number, actual)
             train.save()
     _refill(train, actual)
 
@@ -4416,11 +4587,20 @@ def _whole_suite_run(
             if waits:
                 return _batch_wait(f"merge train: {waits}")
         if state == "red":
+            waits = check_repair.runner_wait(train.path.parent, found[0], parts)
+            if waits:
+                return _batch_wait(f"merge train: {waits}")
+        if state == "red":
             # Blocked like a failed check, and kept: a rerun of this same run, once green,
             # restores its place and lets the next call merge.
             train.fail(number, head)
+            failure = (
+                "failed again after its runner retry"
+                if check_repair.repeated(train.path.parent, found[0]["id"])
+                else "failed"
+            )
             raise Refused(
-                f"{WHOLE[workflow]}, run {found[0]['id']}, failed on this pull request's "
+                f"{WHOLE[workflow]}, run {found[0]['id']}, {failure} on this pull request's "
                 f"tested merge ({', '.join(failing)}); treat it as a failed check: fix and push, "
                 "or rerun that run and call this gate again"
             )
@@ -4515,6 +4695,18 @@ def train_status(folder: Path) -> int:
                         else train.priorities.get(number, priority.UNLABELLED)
                         for number in train.line()
                     },
+                    # The hot path that served each member beside one of its group.
+                    **(
+                        {
+                            "hot_paths": {
+                                number: hot
+                                for number, hot in train.hot_groups().items()
+                                if hot is not None
+                            }
+                        }
+                        if CONFIG.hot_paths
+                        else {}
+                    ),
                     "turn": train.turn,
                     # A check GitHub lost on a member's head: the tick wakes its reviewer.
                     "lost": train.lost,
@@ -4526,6 +4718,7 @@ def train_status(folder: Path) -> int:
                             "number": member["number"],
                             "branch": member["scratch"]["branch"] if member["scratch"] else None,
                             "state": _prefix_summary(member["scratch"]),
+                            "kept": bool(member.get("kept")),
                             "queued_retries": (member["scratch"] or {}).get("queued_retries", {}),
                             "runs": [
                                 {
@@ -4560,9 +4753,9 @@ def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> None:
         with nullcontext() if locked else handoff_lock(folder, number):
             train = Train(folder)
             members = train.prefixes["members"] if train.prefixes else []
-            for index, member in enumerate(members):
+            for member in members:
                 if member["number"] == number:
-                    _drop_line(train, index)
+                    _drop_prefix(train, number)
                     break
             train.remove(number)
             Handoff.path(folder, number).unlink(missing_ok=True)
@@ -4606,6 +4799,15 @@ def _failing(pull: dict[str, Any]) -> set[str]:
     return {check.get("name", check.get("context", "unknown")) for check in _failed_rollup(pull)}
 
 
+def _usual_reviewer(folder: Path, number: str, head: str, why: str) -> NoReturn:
+    """Leave the round to the usual reviewer: the tick stops this one and starts that one."""
+    (folder / f"review-{number}.usual-reviewer").write_text(head + "\n")
+    raise Refused(
+        f"this round needs the usual reviewer: {why}; end with review finished, and the tick "
+        "starts the usual reviewer"
+    )
+
+
 def handoff(number: str, folder: Path) -> int:
     """A published passed round is required before the reviewer can leave.
 
@@ -4639,7 +4841,7 @@ def handoff(number: str, folder: Path) -> int:
     latest = max(enumerate(rounds), key=lambda r: (r[1][0], r[0]))[1] if rounds else None
     if latest is None or latest[1:] != ("passed", head):
         raise Refused("the latest independent round must have passed on the current head")
-    from conflict_review import Scope, passed
+    from conflict_review import Scope, named_reviewer, passed
 
     current = next(
         review
@@ -4656,6 +4858,13 @@ def handoff(number: str, folder: Path) -> int:
     )
     if "<!-- workflow-conflict" in current["body"] and conflict is None:
         raise Refused("conflict round needs full review: invalid conflict marker")
+    # The cheaper reviewer `conflict_review` names was started for a small conflict: anything
+    # beyond resolving it within its lines is the usual reviewer's.
+    named = CONFIG.conflict_review if named_reviewer(folder, number) else None
+    if named is not None and conflict is None:
+        _usual_reviewer(
+            folder, number, head, "the reviewer of a small conflict passes no full review"
+        )
     if conflict:
         try:
             scope = Scope.read(folder, number)
@@ -4665,6 +4874,24 @@ def handoff(number: str, folder: Path) -> int:
                 or passed(reviews, scope.head) is None
             ):
                 raise ValueError("conflict round lacks its scope or earlier passed round")
+            if named is not None:
+                try:
+                    lines, outside = scope.size(Path.cwd(), head)
+                except (ValueError, subprocess.SubprocessError, CommandTimeout) as error:
+                    _usual_reviewer(folder, number, head, str(error))
+                if outside:
+                    _usual_reviewer(
+                        folder, number, head, f"the resolution changes {', '.join(outside)} too"
+                    )
+                if lines > named.max_changed_lines:
+                    _usual_reviewer(
+                        folder,
+                        number,
+                        head,
+                        f"the conflict and its resolution take {lines} lines in "
+                        f"{', '.join(scope.files)}, more than the {named.max_changed_lines} of "
+                        "conflict_review.max_changed_lines",
+                    )
             scope.validate(Path.cwd(), head)
         except (ValueError, OSError, TypeError) as error:
             raise Refused(f"conflict round needs full review: {error}") from error
@@ -5007,4 +5234,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Shared diagnosis imports this module. Keep the CLI's exception classes and cached
+    # reads: loading a second copy would turn an expected wait into an uncaught error.
+    sys.modules["merge_gate"] = sys.modules[__name__]
     sys.exit(main())
