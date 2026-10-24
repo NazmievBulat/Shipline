@@ -73,6 +73,10 @@ hub_cache_port=5000
 # through it, so above this the cache starts again empty (hub-cache.sh, looked at every 10 minutes).
 hub_cache_most_megabytes=20480
 
+# The runner balancer (balance_runners.py) reads its own lines of pool-settings.sh, among them
+# `balance off`, which stops it. Every other script reads that line as nothing.
+balance() { :; }
+
 # One planning slot, outside the ordinary/Docker queue; place 15 stays in the firewall range.
 planner_label=home-planner
 planner_place=15

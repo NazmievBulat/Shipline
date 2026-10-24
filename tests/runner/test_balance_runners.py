@@ -13,15 +13,24 @@ from typing import Any
 
 import pytest
 
-BALANCER = Path(__file__).resolve().parents[2] / "runner" / "balance_runners.py"
+_ROOT = Path(__file__).resolve().parents[2]
+# What install.sh copies beside the balancer: the pool's settings and the GitHub budget.
+_INSTALLED = [
+    _ROOT / "runner/balance_runners.py",
+    _ROOT / "runner/settings.sh",
+    _ROOT / "scripts/workflow/github_budget.py",
+    _ROOT / "scripts/workflow/github_identity.py",
+]
 NOW = 1792828200
 MINUTE = 60
-# The pool's labels, shared by every machine: `<prefix>-home` unless the settings name another.
+# The pool's labels (settings.sh), shared by every machine.
 ORDINARY = "example-app-home"
 DOCKER = "example-app-home-docker"
+STANDBY = "example-app-home-standby"
 
-# Answers the queued and running runs, each run's jobs and the runners from `github.json`, and
-# writes every call to the log.
+# Answers the queued and running runs, each run's jobs and the runners from `github.json`, deletes
+# a runner's registration unless it runs a job (or `busy-on-delete` names it, a job it took since
+# the listing), and writes every call to the log.
 _FAKE_GH = """#!/usr/bin/env python3
 import json
 import re
@@ -37,8 +46,17 @@ if (state / "fail-gh").exists():
     sys.exit(1)
 github = json.loads((state / "github.json").read_text())
 path = arguments[-1]
-api = "repos/example-org/example-app/actions"
-if found := re.fullmatch(api + r"/runs/(\\d+)/jobs\\?per_page=100", path):
+api = "repos/example-owner/example-app/actions"
+if arguments[:3] == ["api", "-X", "DELETE"]:
+    found = re.fullmatch(api + r"/runners/(\\d+)", path)
+    runner = next(runner for runner in github["runners"] if runner["id"] == int(found[1]))
+    busy = state / "busy-on-delete"
+    if runner["busy"] or (busy.exists() and busy.read_text().strip() == runner["name"]):
+        print("gh: Runner is currently running a job (HTTP 422)", file=sys.stderr)
+        sys.exit(1)
+    github["runners"].remove(runner)
+    (state / "github.json").write_text(json.dumps(github))
+elif found := re.fullmatch(api + r"/runs/(\\d+)/jobs\\?per_page=100", path):
     print(json.dumps({"jobs": github["jobs"].get(found[1], [])}))
 elif urlsplit(path).path == api + "/runs":
     status = parse_qs(urlsplit(path).query)["status"][0]
@@ -46,13 +64,6 @@ elif urlsplit(path).path == api + "/runs":
     print(json.dumps({"total_count": len(runs), "workflow_runs": runs}))
 elif path == api + "/runners?per_page=100":
     print(json.dumps({"total_count": len(github["runners"]), "runners": github["runners"]}))
-elif found := re.fullmatch(api + r"/runners/(\\d+)", path):
-    # Asked again just before a stop: `busy-on-recheck` names a runner that took a job since.
-    runner = next(runner for runner in github["runners"] if runner["id"] == int(found[1]))
-    recheck = state / "busy-on-recheck"
-    if recheck.exists() and recheck.read_text().strip() == runner["name"]:
-        runner = {**runner, "busy": True}
-    print(json.dumps(runner))
 else:
     print(f"gh: could not answer {arguments}", file=sys.stderr)
     sys.exit(1)
@@ -74,7 +85,8 @@ def _iso(moment: int) -> str:
 
 
 class Machine:
-    """One machine of the pool: its settings, readings, GitHub's answers and the balancer's runs."""
+    """One machine of the pool: the balancer installed as install.sh installs it, with its
+    pool-settings.sh, its readings, GitHub's answers and the balancer's runs."""
 
     def __init__(self, root: Path, programs: Path) -> None:
         self.root = root
@@ -83,9 +95,16 @@ class Machine:
         self.home = root / "home"
         self.home.mkdir()
         self.programs = programs
-        self.settings_file = root / "runner.sh"
+        self.installed = self.home / ".local/share/example-app-runner"
+        self.installed.mkdir(parents=True)
+        for source in _INSTALLED:
+            shutil.copy2(source, self.installed / source.name)
+        self.balancer = self.installed / "balance_runners.py"
+        self.settings_file = self.installed / "pool-settings.sh"
         self.proc = root / "proc"
         self.proc.mkdir()
+        self.kvm = root / "kvm"
+        self.kvm.touch()
         self.now = NOW
         self.runs: list[dict[str, Any]] = []
         self.jobs: dict[str, list[dict[str, Any]]] = {}
@@ -104,15 +123,19 @@ class Machine:
         path.write_text(text.replace("@STATE@", str(self.state)))
         path.chmod(0o755)
 
-    def settings(self, *, ordinary: int, docker: int, bounds: str = "", extra: str = "") -> None:
+    def settings(
+        self, *, ordinary: int, docker: int | None, bounds: str = "", extra: str = ""
+    ) -> None:
+        """pool-settings.sh as install.sh writes it, with the balancer's lines."""
         self.settings_file.write_text(
-            "# The settings of this machine.\n"
-            "repository=example-org/example-app\n"
-            "RUNNER_PREFIX=example-app\n"
             "machine=box\n"
-            'roles="ordinary docker"\n'
+            "roles='ordinary docker'\n"
+            "other_machines='other'\n"
             f"ordinary_jobs={ordinary}\n"
-            f"docker_runners={docker}\n" + bounds + extra
+            f"ordinary_blacksmith_jobs={ordinary}\n"
+            + ("" if docker is None else f"docker_runners={docker}\n")
+            + bounds
+            + extra
         )
         self.settings_file.chmod(0o640)
 
@@ -135,14 +158,14 @@ class Machine:
         )
 
     def registered(self, *, ordinary: int, docker: int, busy: tuple[str, ...] = ()) -> None:
-        """The runners GitHub lists: this machine's, its main runner and spare, the planner and
-        another machine's two ordinary slots."""
+        """The runners GitHub lists: this machine's slots and its spare, its Docker runners, its
+        main runner, the planner and another machine's two slots."""
         names = [(f"box-{k}", ORDINARY) for k in range(1, ordinary + 1)]
+        names += [(f"box-{ordinary + 1}", STANDBY)]
         names += [(f"box-docker-{k}", DOCKER) for k in range(1, docker + 1)]
         names += [
-            ("box-main-1", "example-app-home-main"),
-            ("box-spare", "example-app-home-standby"),
-            ("planner-1", "example-app-planner"),
+            ("box-main", "example-app-home-main"),
+            ("box-planner", "home-planner"),
             ("other-1", ORDINARY),
             ("other-2", ORDINARY),
         ]
@@ -201,10 +224,10 @@ class Machine:
             "PATH": f"{self.programs}:{os.environ['PATH']}",
             "HOME": str(self.home),
             "LANG": "C.UTF-8",
-            "SHIPLINE_RUNNER_SETTINGS": str(self.settings_file),
             "WORKFLOW_NOW": str(self.now),
             "WORKFLOW_LOADAVG_FILE": str(self.proc / "loadavg"),
             "WORKFLOW_PROC_ROOT": str(self.proc),
+            "RUNNER_KVM_DEVICE": str(self.kvm),
         }
 
     def run(
@@ -213,7 +236,7 @@ class Machine:
         self.now += after_minutes * MINUTE
         self._write_github()
         done = subprocess.run(
-            ["python3", "-B", str(BALANCER)],
+            ["python3", "-B", str(self.balancer)],
             env={**self._env(), **(env or {})},
             capture_output=True,
             text=True,
@@ -227,7 +250,7 @@ class Machine:
         """A run in the background, for two at once."""
         self._write_github()
         return subprocess.Popen(
-            ["python3", "-B", str(BALANCER)],
+            ["python3", "-B", str(self.balancer)],
             env=self._env(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -238,6 +261,15 @@ class Machine:
         log = self.state / "calls.log"
         lines = log.read_text().splitlines() if log.exists() else []
         return [line for line in lines if line.startswith(tool)]
+
+    def deleted(self) -> list[str]:
+        """The runners whose registrations were deleted, by name."""
+        listed = {str(runner["id"]): runner["name"] for runner in self.runners}
+        return [
+            listed[call.rsplit("/", 1)[1]]
+            for call in self.calls("gh api -X DELETE")
+            if call.rsplit("/", 1)[1] in listed
+        ]
 
     def changes(self) -> list[str]:
         """What changed, from the log: the words after the time, before the first `;`."""
@@ -270,7 +302,7 @@ def test_ordinary_jobs_queued_for_five_minutes_add_a_slot_when_there_is_room(
     machine.run()
 
     assert machine.calls("systemctl") == [
-        "systemctl --user enable --now example-app-runner@4.service"
+        "systemctl --user enable --now example-app-runner@5.service"
     ]
     assert machine.count("ordinary_jobs") == 4
     assert machine.count("docker_runners") == 1
@@ -388,12 +420,13 @@ def test_a_runner_github_does_not_list_is_not_stopped(machine: Machine) -> None:
 
 def test_a_runner_that_took_a_job_since_the_listing_is_not_stopped(machine: Machine) -> None:
     _held_by_load(machine)
-    (machine.state / "busy-on-recheck").write_text("box-docker-1\n")
+    (machine.state / "busy-on-delete").write_text("box-docker-1\n")
 
     machine.run()
 
     assert machine.calls("systemctl") == []
     assert machine.count("docker_runners") == 1
+    assert len(machine.calls("gh api -X DELETE")) == 1
 
 
 def test_an_offline_runner_is_not_stopped(machine: Machine) -> None:
@@ -420,7 +453,7 @@ def test_a_runner_that_does_not_stop_keeps_its_count(machine: Machine) -> None:
 def test_a_move_whose_new_runner_does_not_start_says_what_it_did(machine: Machine) -> None:
     machine.queue(ORDINARY, 8)
     machine.load(3.0)
-    (machine.state / "fail-systemctl-example-app-runner@4.service").touch()
+    (machine.state / "fail-systemctl-example-app-runner@5.service").touch()
 
     machine.run(code=1)
 
@@ -429,7 +462,7 @@ def test_a_move_whose_new_runner_does_not_start_says_what_it_did(machine: Machin
         "drained a Docker runner (1 to 0) to move it, and an ordinary slot did not start"
     ]
     # It was a change: the next one waits its 5 minutes.
-    (machine.state / "fail-systemctl-example-app-runner@4.service").unlink()
+    (machine.state / "fail-systemctl-example-app-runner@5.service").unlink()
     machine.forget_calls()
     machine.load(1.0)
     machine.run(after_minutes=1)
@@ -445,9 +478,12 @@ def test_the_highest_slot_goes_and_main_and_the_planner_are_never_touched(
 
     machine.run()
 
+    # The highest is the spare beyond the three slots: keep-spare.sh moves the label off a slot.
     assert machine.calls("systemctl") == [
-        "systemctl --user disable --now example-app-runner@3.service"
+        "systemctl --user disable --now example-app-runner@4.service"
     ]
+    assert machine.deleted() == ["box-4"]
+    assert machine.count("ordinary_jobs") == 2
     assert machine.changes() == ["removed an ordinary slot (3 to 2)"]
 
 
@@ -507,7 +543,7 @@ def test_moving_a_docker_runner_to_an_ordinary_slot_drains_it_first(machine: Mac
 
     assert machine.calls("systemctl") == [
         "systemctl --user disable --now example-app-runner-docker@1.service",
-        "systemctl --user enable --now example-app-runner@4.service",
+        "systemctl --user enable --now example-app-runner@5.service",
     ]
     assert (machine.count("docker_runners"), machine.count("ordinary_jobs")) == (0, 4)
     assert machine.changes() == [
@@ -619,7 +655,7 @@ def test_two_runs_at_once_change_once(machine: Machine) -> None:
 
     assert [first.wait(timeout=60), second.wait(timeout=60)] == [0, 0]
     assert machine.calls("systemctl") == [
-        "systemctl --user enable --now example-app-runner@4.service"
+        "systemctl --user enable --now example-app-runner@5.service"
     ]
     assert machine.count("ordinary_jobs") == 4
 
@@ -687,7 +723,7 @@ def test_settings_that_would_leave_their_names_change_nothing(machine: Machine, 
     done = machine.run(code=1)
 
     assert machine.calls("systemctl") == [] and machine.calls("gh") == []
-    assert "names no" in done.stderr
+    assert "name no" in done.stderr
 
 
 def test_a_state_file_that_is_not_the_balancers_is_started_over(machine: Machine) -> None:
@@ -701,14 +737,87 @@ def test_a_state_file_that_is_not_the_balancers_is_started_over(machine: Machine
     assert machine.changes() == ["added an ordinary slot (3 to 4)"]
 
 
-def test_the_prefix_may_come_from_the_environment(machine: Machine) -> None:
-    text = machine.settings_file.read_text().replace("RUNNER_PREFIX=example-app\n", "")
-    machine.settings_file.write_text(text)
+def test_the_units_are_named_by_the_folder_the_pool_is_installed_in_or_the_environment(
+    machine: Machine,
+) -> None:
     machine.queue(ORDINARY, 10)
 
-    machine.run(env={"RUNNER_PREFIX": "example-app"})
+    machine.run(env={"RUNNER_PREFIX": "other-app"})
 
-    assert machine.changes() == ["added an ordinary slot (3 to 4)"]
+    assert machine.calls("systemctl") == [
+        "systemctl --user enable --now other-app-runner@5.service"
+    ]
+
+
+def test_no_docker_runner_starts_without_kvm(machine: Machine) -> None:
+    machine.settings(ordinary=3, docker=1, bounds="balance_ordinary=3-5\nbalance_docker=0-2\n")
+    machine.queue(DOCKER, 10)
+    machine.kvm.unlink()
+
+    machine.run()
+
+    assert machine.calls("systemctl") == []
+
+
+def test_the_runners_never_take_more_places_than_the_firewalls_range(machine: Machine) -> None:
+    # Three slots, the spare and one Docker runner take five places: there are five.
+    machine.settings(
+        ordinary=3, docker=1, bounds="balance_ordinary=2-5\nbalance_docker=1-2\n", extra="most_runners=5\n"
+    )
+    machine.queue(ORDINARY, 10)
+
+    machine.run()
+
+    assert machine.calls("systemctl") == []
+
+
+def test_an_install_that_wrote_no_docker_count_keeps_its_docker_runners(machine: Machine) -> None:
+    machine.settings(ordinary=3, docker=None, bounds="balance_ordinary=3-5\nbalance_docker=0-3\n")
+    machine.queue(DOCKER, 10)
+    _held_by_load(machine)
+
+    machine.run()
+
+    assert machine.calls("systemctl") == []
+    assert "docker_runners" not in machine.settings_file.read_text()
+
+
+def test_a_runners_registration_goes_before_its_unit(machine: Machine) -> None:
+    _held_by_load(machine)
+
+    machine.run()
+
+    calls = [call for call in machine.calls("") if call.startswith(("gh api -X", "systemctl"))]
+    assert calls == [
+        f"gh api -X DELETE repos/example-owner/example-app/actions/runners/{_id(machine, 'box-docker-1')}",
+        "systemctl --user disable --now example-app-runner-docker@1.service",
+    ]
+
+
+def _id(machine: Machine, name: str) -> int:
+    return next(runner["id"] for runner in machine.runners if runner["name"] == name)
+
+
+def test_a_reinstall_keeps_the_balancers_own_lines(machine: Machine) -> None:
+    machine.settings(
+        ordinary=3,
+        docker=1,
+        bounds="balance_ordinary=2-5\nbalance_docker=0-2\n",
+        extra="balance_forecast=/srv/example/ci-demand.json\n  balance off\nbalancer=x\n",
+    )
+
+    done = subprocess.run(
+        ["python3", "-B", str(machine.balancer), "kept", str(machine.settings_file)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == (
+        "balance_ordinary=2-5\nbalance_docker=0-2\n"
+        "balance_forecast=/srv/example/ci-demand.json\nbalance off\n"
+    )
 
 
 def test_the_settings_may_name_the_pools_label(machine: Machine) -> None:
@@ -716,7 +825,7 @@ def test_the_settings_may_name_the_pools_label(machine: Machine) -> None:
         ordinary=3,
         docker=1,
         bounds="balance_ordinary=2-5\nbalance_docker=0-2\n",
-        extra="runner_label=example-app-lab\n",
+        extra="label=example-app-lab\ndocker_label=example-app-lab-docker\n",
     )
     machine.queue(ORDINARY, 10)
     machine.queue("example-app-lab-docker", 10)
@@ -726,3 +835,18 @@ def test_the_settings_may_name_the_pools_label(machine: Machine) -> None:
 
     # Only the lab's Docker jobs wait for this machine's pool.
     assert machine.changes() == ["started a Docker runner (1 to 2)"]
+
+
+def test_every_pool_script_reads_a_pool_settings_that_says_balance_off(machine: Machine) -> None:
+    machine.settings(ordinary=3, docker=1, extra="balance off\n")
+
+    # As keep-spare.sh and keep-runner.sh read them: in `sh`, stopping at any failed command.
+    done = subprocess.run(
+        ["sh", "-eu", "-c", '. "$1/settings.sh"; . "$1/pool-settings.sh"; echo "$ordinary_jobs"',
+         "sh", str(machine.installed)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert (done.returncode, done.stdout) == (0, "3\n"), done.stderr

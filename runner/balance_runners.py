@@ -1,10 +1,11 @@
 """Moves this machine's runners between CI and Docker, and adds or removes them, by the queues,
 its load and the demand on its way.
 
-A systemd user timer runs it every minute, beside the spare supervisor (`systemd/`). It changes
-only this machine's own ordinary slots (`<prefix>-runner@<k>.service`) and Docker runner VMs
-(`<prefix>-runner-docker@<k>.service`): never another machine's, never a main runner or the
-planner, and only within the bounds of the machine's local settings:
+A systemd user timer runs it every minute (`systemd/example-app-runner-balance.timer`), installed
+beside the spare supervisor (`keep-spare.sh`) and read like it: `settings.sh`, then the machine's
+own `pool-settings.sh` that `install.sh` writes beside it. It changes only this machine's own
+ordinary slots and Docker runners, never another machine's, never a main runner or the planner,
+and only within the bounds of `pool-settings.sh`:
 
     balance_ordinary=MIN-MAX
     balance_docker=MIN-MAX
@@ -13,9 +14,17 @@ A kind without bounds, or one the machine has no role for (`roles`), keeps its i
 (`ordinary_jobs`, `docker_runners`) as both bounds: nothing changes there until its owner widens
 them. A line `balance off` stops the balancer, and the counts stay as they are.
 
+An ordinary slot is one of the `ordinary_jobs` registrations that carry the pool's label
+(`keep-spare.sh` gives it to that many): adding one starts the next unit,
+`<prefix>-runner@<ordinary_jobs + ordinary_spares + 1>.service`, and writes the count one
+higher; removing one writes it one lower and stops the highest unit. A Docker runner is
+`<prefix>-runner-docker@<k>.service`, from 1 to `docker_runners`, only on a machine with
+/dev/kvm. Every runner takes a place of the firewall's range: never more than `most_runners`.
+
 Each minute it reads, from GitHub under the runners' own identity and within the shared budget
-(`github_budget.py`), the queued and running jobs for the pool's ordinary label and Docker label
-and the runners of the pool; and from the machine, its 5-minute load against the session start ceiling of
+(`github_budget.py`), the queued and running jobs for the pool's labels, which every machine's
+runners share (`label` and `docker_label` of `settings.sh`), and the runners of the pool; and
+from the machine, its 5-minute load against the session start ceiling of
 `scripts/workflow/session` (the processors times WORKFLOW_LOAD_PER_PROCESSOR, 1.5) and its
 available memory.
 
@@ -26,10 +35,12 @@ available memory.
   session starts (above the ceiling). It moves one to the other kind when the other kind has
   queued for 5 minutes, this kind has nothing queued and there is no room to add: it drains
   one, then adds one of the other in the same step, when the memory the drained one frees is
-  enough for the other. A runner goes only once GitHub lists it online and idle, asked once more
-  just before it is stopped, never mid-job; the highest numbered one goes, and the step waits
-  while it is busy. Its count is written down before it stops, and a new runner's after it
-  starts, each put back when the other half fails.
+  enough for the other.
+- A runner goes only once GitHub lists it online and idle, never mid-job: its registration is
+  deleted before its unit stops, which GitHub refuses while it runs a job. The highest numbered
+  one goes (`<machine>-<k>`, `<machine>-docker-<k>`, as `names.sh` names them), and the step
+  waits while it is busy. A count is written before a runner stops and after a new one starts,
+  each put back when the other half fails.
 - At most one change every 5 minutes.
 - The forecast the tick writes (`~/.local/state/workflow/ci-demand.json`, or the path of
   `balance_forecast`) says how many ordinary and Docker jobs come within 30 minutes. This
@@ -44,14 +55,9 @@ Every change is one line of `~/.local/state/workflow/runner-balance.log`: the ti
 changed, the queues, the forecast, the load and the memory. Its state (since when a kind's
 queue was empty, the last change) is in `runner-balance.json` beside it.
 
-The pool's labels are shared by every machine: ordinary jobs ask for its label (`runner_label`
-in the settings, `<prefix>-home` without one), Docker jobs for `<label>-docker`, and spares wait
-as `<label>-standby`. Machines differ only by their runners' names, `<machine>-<k>` and
-`<machine>-docker-<k>`.
-
-The settings are a Bash file, `~/.config/shipline/runner.sh` unless SHIPLINE_RUNNER_SETTINGS
-names another; a change of count is written back to its line there. The prefix is the
-environment's RUNNER_PREFIX when the settings name none.
+    balance_runners.py            balance, once
+    balance_runners.py kept FILE  the balancer's own lines of a pool-settings.sh, which a
+                                  reinstall keeps (`install.sh`)
 """
 
 from __future__ import annotations
@@ -76,7 +82,7 @@ if not (HERE / "github_budget.py").exists():
 from github_budget import RUNNER, Limited, call  # noqa: E402
 
 KINDS = ("docker", "ordinary")
-# What the settings call each kind's installed count, and the systemd unit of its k-th runner.
+# What the settings call each kind's installed count.
 COUNT_NAMES = {"ordinary": "ordinary_jobs", "docker": "docker_runners"}
 WORDS = {"ordinary": "an ordinary slot", "docker": "a Docker runner"}
 NAMES = {"ordinary": "ordinary", "docker": "Docker"}
@@ -87,8 +93,9 @@ FORECAST_FRESH_SECONDS = 10 * 60
 # Room to add: the load this far under the ceiling, and this much memory for the kind added.
 LOAD_MARGIN = 4
 MEMORY_GB = {"ordinary": 3, "docker": 8}
-# What a repository, the prefix and a machine's name may be, as `render-units.sh` takes them:
-# they go into GitHub's paths, the labels and the unit names. `.` and `..` are no owner or name.
+# What a repository, the prefix, a machine's name and a label may be: they go into GitHub's
+# paths, the unit names and the labels. `.` and `..` are no owner or name. The prefix and the
+# machine are as `render-units.sh` takes them.
 REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
 PREFIX = re.compile(r"[a-z]([a-z0-9-]{0,23}[a-z0-9])?")
 MACHINE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
@@ -98,20 +105,29 @@ SETTINGS_SECONDS = 5
 SYSTEMCTL_SECONDS = 180
 GITHUB_SECONDS = 30
 PER_PAGE = 100
+# What GitHub answers when a runner's registration is deleted while it runs a job.
+BUSY = re.compile(r"currently running a job|HTTP 422")
 
 STATE = Path.home() / ".local/state/workflow"
 LOG = STATE / "runner-balance.log"
 STATE_FILE = STATE / "runner-balance.json"
 LOCK = STATE / "runner-balance.lock"
 DEFAULT_FORECAST = STATE / "ci-demand.json"
+SETTINGS = HERE / "settings.sh"
+POOL_SETTINGS = HERE / "pool-settings.sh"
+# The balancer's own lines of pool-settings.sh: a reinstall keeps them.
+OWN_LINE = re.compile(r"[ \t]*(balance_(ordinary|docker|forecast)=.*|balance[ \t]+off)[ \t]*")
 SETTINGS_READ = (
     "repository",
     "RUNNER_PREFIX",
     "machine",
-    "runner_label",
+    "label",
+    "docker_label",
     "roles",
     "ordinary_jobs",
+    "ordinary_spares",
     "docker_runners",
+    "most_runners",
     "balance_ordinary",
     "balance_docker",
     "balance_forecast",
@@ -131,22 +147,21 @@ def now() -> int:
     return int(os.environ.get("WORKFLOW_NOW") or time.time())
 
 
-def settings_path() -> Path:
-    given = os.environ.get("SHIPLINE_RUNNER_SETTINGS")
-    return Path(given) if given else Path.home() / ".config/shipline/runner.sh"
-
-
-def read_settings(path: Path) -> dict[str, str]:
-    """The values the balancer reads, as Bash reads them from the file, `balance off` among
-    them, with only PATH and HOME, for at most SETTINGS_SECONDS."""
+def read_settings() -> dict[str, str]:
+    """The values the balancer reads, as the pool's scripts read them (settings.sh, then
+    pool-settings.sh), `balance off` among them, with only PATH and HOME, for at most
+    SETTINGS_SECONDS."""
     script = (
+        '. "$1" >/dev/null 2>&1 || exit 1; '
         'balance() { [[ ${1-} == off ]] && balance_off=1; return 0; }; '
-        'source "$1" >/dev/null 2>&1; shift; '
+        '. "$2" >/dev/null 2>&1; shift 2; '
         'for name in "$@"; do printf "%s=%s\\0" "$name" "${!name-}"; done'
     )
+    if not POOL_SETTINGS.is_file():
+        raise Refused(f"{POOL_SETTINGS} is missing: install.sh writes it")
     try:
         done = subprocess.run(
-            ["bash", "-c", script, "settings", str(path), *SETTINGS_READ],
+            ["bash", "-c", script, "settings", str(SETTINGS), str(POOL_SETTINGS), *SETTINGS_READ],
             env={key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ},
             capture_output=True,
             text=True,
@@ -154,16 +169,18 @@ def read_settings(path: Path) -> dict[str, str]:
             check=False,
         )
     except subprocess.TimeoutExpired:
-        raise Refused(f"{path} ran for more than {SETTINGS_SECONDS} seconds") from None
-    if done.returncode or not path.is_file():
-        raise Refused(f"{path} cannot be read")
+        raise Refused(f"the settings ran for more than {SETTINGS_SECONDS} seconds") from None
+    if done.returncode:
+        raise Refused(f"{SETTINGS} cannot be read")
     return dict(item.split("=", 1) for item in done.stdout.split("\0") if item)
 
 
-def _count(values: dict[str, str], kind: str) -> int:
-    text = values.get(COUNT_NAMES[kind], "") or "0"
+def _number(values: dict[str, str], name: str, default: int | None = None) -> int | None:
+    text = values.get(name, "")
+    if not text:
+        return default
     if not text.isdigit():
-        raise Refused(f"{COUNT_NAMES[kind]} is '{text}', not a count")
+        raise Refused(f"{name} is '{text}', not a count")
     return int(text)
 
 
@@ -180,14 +197,21 @@ class Machine:
     repository: str
     prefix: str
     name: str
-    pool_label: str
+    labels: dict[str, str]
     counts: dict[str, int]
     bounds: dict[str, tuple[int, int]]
+    # The registered ordinary runners beyond the slots, and the most runners of all kinds.
+    spares: int
+    most: int
     off: bool
     forecast_path: Path
 
     def label(self, kind: str) -> str:
-        return self.pool_label + "-docker" if kind == "docker" else self.pool_label
+        return self.labels[kind]
+
+    def highest(self, kind: str) -> int:
+        """The number of the kind's highest runner."""
+        return self.counts[kind] + (self.spares if kind == "ordinary" else 0)
 
     def unit(self, kind: str, k: int) -> str:
         return f"{self.prefix}-runner{'-docker' if kind == 'docker' else ''}@{k}.service"
@@ -195,33 +219,60 @@ class Machine:
     def runner_name(self, kind: str, k: int) -> str:
         return f"{self.name}{'-docker' if kind == 'docker' else ''}-{k}"
 
+    def places(self) -> int:
+        """The places of the firewall's range the runners take."""
+        return self.highest("ordinary") + self.counts["docker"]
 
-def machine(path: Path) -> Machine:
-    values = read_settings(path)
-    # The pool's units are given the prefix; a machine's settings may name it too.
-    values["RUNNER_PREFIX"] = values.get("RUNNER_PREFIX") or os.environ.get("RUNNER_PREFIX", "")
+
+def machine() -> Machine:
+    values = read_settings()
+    # The pool's units are named from its prefix: the environment's, the settings', or that of
+    # the folder the pool is installed in, `<prefix>-runner`.
+    values["RUNNER_PREFIX"] = (
+        os.environ.get("RUNNER_PREFIX")
+        or values.get("RUNNER_PREFIX")
+        or HERE.name.removesuffix("-runner")
+    )
     for needed, pattern in (
         ("repository", REPOSITORY),
         ("RUNNER_PREFIX", PREFIX),
         ("machine", MACHINE),
+        ("label", LABEL),
     ):
         if not pattern.fullmatch(values.get(needed, "")):
-            raise Refused(f"{path} names no {needed}")
-    pool_label = values.get("runner_label") or values["RUNNER_PREFIX"] + "-home"
-    if not LABEL.fullmatch(pool_label):
-        raise Refused(f"{path} names no runner_label GitHub takes: {pool_label}")
+            raise Refused(f"the settings name no {needed}")
+    labels = {
+        "ordinary": values["label"],
+        "docker": values.get("docker_label") or values["label"] + "-docker",
+    }
+    if not LABEL.fullmatch(labels["docker"]):
+        raise Refused("the settings name no docker_label")
     roles = set(values.get("roles", "").split())
-    counts = {kind: _count(values, kind) for kind in KINDS}
+    ordinary = _number(values, "ordinary_jobs")
+    if ordinary is None:
+        raise Refused("the settings name no ordinary_jobs")
+    # An install that wrote no Docker count leaves its Docker runners as they are.
+    docker = _number(values, "docker_runners")
+    counts = {"ordinary": ordinary, "docker": docker or 0}
+    bounds = {kind: _bounds(values, kind, counts[kind], roles) for kind in KINDS}
+    if docker is None:
+        bounds["docker"] = (0, 0)
     return Machine(
         repository=values["repository"],
         prefix=values["RUNNER_PREFIX"],
         name=values["machine"],
-        pool_label=pool_label,
+        labels=labels,
         counts=counts,
-        bounds={kind: _bounds(values, kind, counts[kind], roles) for kind in KINDS},
+        bounds=bounds,
+        spares=(_number(values, "ordinary_spares", 0) or 0) if "ordinary" in roles else 0,
+        most=_number(values, "most_runners", 0) or 0,
         off=values.get("balance_off") == "1",
         forecast_path=Path(values.get("balance_forecast") or DEFAULT_FORECAST).expanduser(),
     )
+
+
+def has_kvm() -> bool:
+    return Path(os.environ.get("RUNNER_KVM_DEVICE") or "/dev/kvm").exists()
 
 
 # What the machine reads.
@@ -339,18 +390,29 @@ def _label(label: Any) -> str:
     return str(label.get("name", "")) if isinstance(label, dict) else ""
 
 
-def idle(box: Machine, listed: list[dict[str, Any]], name: str) -> bool:
-    """GitHub lists the runner online and running no job, read twice: in the listing, and once
-    more just before it is stopped, so a job it took since the listing keeps it."""
+def idle(listed: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    """The runner, when GitHub lists it online and running no job."""
+    return next(
+        (
+            runner
+            for runner in listed
+            if runner.get("name") == name
+            and runner.get("status") == "online"
+            and runner.get("busy") is False
+        ),
+        None,
+    )
 
-    def free(runner: dict[str, Any]) -> bool:
-        return runner.get("status") == "online" and runner.get("busy") is False
 
-    found = next((runner for runner in listed if runner.get("name") == name), None)
-    if found is None or not free(found):
+def deregister(box: Machine, runner: dict[str, Any]) -> bool:
+    """Delete the runner's registration: False when GitHub refuses because it runs a job."""
+    path = f"repos/{box.repository}/actions/runners/{int(runner['id'])}"
+    done = call("balancer", "api", "-X", "DELETE", path, timeout=GITHUB_SECONDS, identity=RUNNER)
+    if done.returncode == 0:
+        return True
+    if BUSY.search(done.stderr + done.stdout):
         return False
-    again = _api(box.repository, f"actions/runners/{int(found['id'])}")
-    return again.get("name") == name and free(again)
+    raise Refused(f"GitHub did not delete {runner.get('name')}: {done.stderr.strip()}")
 
 
 # The decision.
@@ -369,6 +431,10 @@ class View:
     share: dict[str, float] | None
     empty_since: dict[str, int | None]
     last_change: int | None
+    # Whether one more of a kind fits the bounds, the places and the machine (/dev/kvm): as it is,
+    # and once one of the other kind is gone.
+    can_add: dict[str, bool]
+    can_move_into: dict[str, bool]
     forecast: dict[str, float] | None = None
     # The share a first slot of each kind would take, for a kind the machine has none of.
     first_share: dict[str, float] | None = None
@@ -410,8 +476,8 @@ def decide(view: View) -> tuple[str, ...] | None:
     """("add", kind), ("remove", kind), ("move", from, to) or None."""
     if view.last_change is not None and view.moment - view.last_change < CHANGE_EVERY_SECONDS:
         return None
-    below_max = [kind for kind in KINDS if view.counts[kind] < view.bounds[kind][1]]
-    for kind in sorted(below_max, key=view.waited, reverse=True):
+    addable = [kind for kind in KINDS if view.can_add[kind]]
+    for kind in sorted(addable, key=view.waited, reverse=True):
         if view.room(kind) and (view.waiting(kind) or view.wave(kind)):
             return ("add", kind)
     for kind in KINDS:
@@ -421,7 +487,7 @@ def decide(view: View) -> tuple[str, ...] | None:
         if (
             view.waiting(other)
             and not view.queues[kind].queued
-            and other in below_max
+            and view.can_move_into[other]
             and not view.room(other)
             and view.load is not None
             and view.ceiling is not None
@@ -438,8 +504,10 @@ def decide(view: View) -> tuple[str, ...] | None:
 # What it changes.
 
 
-def write_count(path: Path, kind: str, count: int) -> None:
-    """The new count on its own line of the settings, the rest of the file and its mode kept."""
+def write_count(kind: str, count: int) -> None:
+    """The new count on its own line of pool-settings.sh, the rest of the file and its mode
+    kept, replaced whole: a script that reads it meanwhile reads the old or the new."""
+    path = POOL_SETTINGS
     name = COUNT_NAMES[kind]
     text = path.read_text()
     line = f"{name}={count}"
@@ -469,7 +537,9 @@ def systemctl(*arguments: str) -> None:
             f"systemctl {' '.join(arguments)} ran for more than {SYSTEMCTL_SECONDS} seconds"
         ) from None
     if done.returncode:
-        raise Refused(f"systemctl {' '.join(arguments)}: {done.stderr.strip() or done.stdout.strip()}")
+        raise Refused(
+            f"systemctl {' '.join(arguments)}: {done.stderr.strip() or done.stdout.strip()}"
+        )
 
 
 def _save(path: Path, text: str) -> None:
@@ -482,7 +552,8 @@ def _save(path: Path, text: str) -> None:
 def _log(view: View, what: str) -> None:
     def queue(kind: str) -> str:
         queued = view.queues[kind].queued
-        return f"{kind} {queued}" + (f" (oldest {int(view.waited(kind) // 60)} min)" if queued else "")
+        oldest = f" (oldest {int(view.waited(kind) // 60)} min)" if queued else ""
+        return f"{kind} {queued}{oldest}"
 
     forecast = (
         "forecast none"
@@ -506,73 +577,87 @@ def _log(view: View, what: str) -> None:
     print(line)
 
 
-def _start(box: Machine, path: Path, kind: str, count: int) -> None:
+def _start(box: Machine, kind: str) -> None:
     """Start the next runner of the kind, then write its count; a count that cannot be written
     stops the runner again."""
-    unit = box.unit(kind, count + 1)
+    unit = box.unit(kind, box.highest(kind) + 1)
     systemctl("enable", "--now", unit)
     try:
-        write_count(path, kind, count + 1)
+        write_count(kind, box.counts[kind] + 1)
     except OSError:
         systemctl("disable", "--now", unit)
         raise
+    box.counts[kind] += 1
 
 
-def _stop(box: Machine, path: Path, kind: str, count: int) -> None:
-    """Write the count one lower, then stop the highest runner of the kind; a runner that does
-    not stop gets its count back."""
-    write_count(path, kind, count - 1)
+def _stop(box: Machine, kind: str, runner: dict[str, Any]) -> bool:
+    """Write the count one lower, delete the highest runner's registration and stop its unit;
+    False, with the count put back, when GitHub refuses because the runner took a job. A
+    runner that does not stop gets its count back too."""
+    count, unit = box.counts[kind], box.unit(kind, box.highest(kind))
+    write_count(kind, count - 1)
     try:
-        systemctl("disable", "--now", box.unit(kind, count))
+        if not deregister(box, runner):
+            write_count(kind, count)
+            return False
+        systemctl("disable", "--now", unit)
     except Refused:
-        write_count(path, kind, count)
+        write_count(kind, count)
         raise
+    box.counts[kind] -= 1
+    return True
 
 
-def apply(
-    change: tuple[str, ...], box: Machine, view: View, listed: list[dict[str, Any]], path: Path
-) -> bool:
+def apply(change: tuple[str, ...], box: Machine, view: View, listed: list[dict[str, Any]]) -> bool:
     """Make the change; False when it waits for a busy runner."""
-    counts = view.counts
+    before = dict(box.counts)
     kind = change[1]
     if change[0] == "add":
-        _start(box, path, kind, counts[kind])
+        _start(box, kind)
         verb = "added" if kind == "ordinary" else "started"
-        _log(view, f"{verb} {WORDS[kind]} ({counts[kind]} to {counts[kind] + 1})")
+        _log(view, f"{verb} {WORDS[kind]} ({before[kind]} to {box.counts[kind]})")
         return True
-    name = box.runner_name(kind, counts[kind])
-    if not idle(box, listed, name):
+    name = box.runner_name(kind, box.highest(kind))
+    runner = idle(listed, name)
+    if runner is None or not _stop(box, kind, runner):
         print(f"{name} is not idle on GitHub; it is stopped once it is")
         return False
-    _stop(box, path, kind, counts[kind])
     if change[0] == "remove":
         verb = "removed" if kind == "ordinary" else "stopped"
-        _log(view, f"{verb} {WORDS[kind]} ({counts[kind]} to {counts[kind] - 1})")
+        _log(view, f"{verb} {WORDS[kind]} ({before[kind]} to {box.counts[kind]})")
         return True
     other = change[2]
     try:
-        _start(box, path, other, counts[other])
+        _start(box, other)
     except (Refused, OSError) as error:
         _log(
             view,
-            f"drained {WORDS[kind]} ({counts[kind]} to {counts[kind] - 1}) to move it, and "
+            f"drained {WORDS[kind]} ({before[kind]} to {box.counts[kind]}) to move it, and "
             f"{WORDS[other]} did not start",
         )
         raise PartlyChanged(str(error)) from None
     _log(
         view,
-        f"moved {WORDS[kind]} to {WORDS[other]} ({NAMES[kind]} {counts[kind]} to "
-        f"{counts[kind] - 1}, {NAMES[other]} {counts[other]} to {counts[other] + 1})",
+        f"moved {WORDS[kind]} to {WORDS[other]} ({NAMES[kind]} {before[kind]} to "
+        f"{box.counts[kind]}, {NAMES[other]} {before[other]} to {box.counts[other]})",
     )
     return True
 
 
+def _fits(box: Machine, kind: str, *, freed: int = 0) -> bool:
+    """One more of the kind fits its bounds, the firewall's places and the machine."""
+    return (
+        box.counts[kind] < box.bounds[kind][1]
+        and box.places() - freed + 1 <= box.most
+        and (kind != "docker" or has_kvm())
+    )
+
+
 def balance() -> int:
     moment = now()
-    path = settings_path()
-    box = machine(path)
+    box = machine()
     if box.off:
-        print(f"balance off in {path}; the counts stay as they are")
+        print(f"balance off in {POOL_SETTINGS}; the counts stay as they are")
         return 0
     found = queues(box)
     # After the queues, which take a call per run: the listing a stop is decided on is fresh.
@@ -603,7 +688,7 @@ def balance() -> int:
         first_share = {kind: forecast[kind] / (slots[kind] + 1) for kind in KINDS}
     view = View(
         moment=moment,
-        counts=box.counts,
+        counts=dict(box.counts),
         bounds=box.bounds,
         queues=found,
         load=load,
@@ -612,13 +697,15 @@ def balance() -> int:
         share=share,
         empty_since=empty_since,
         last_change=state.get("last_change"),
+        can_add={kind: _fits(box, kind) for kind in KINDS},
+        can_move_into={kind: _fits(box, kind, freed=1) for kind in KINDS},
         forecast=forecast,
         first_share=first_share,
     )
     change = decide(view)
     changed = False
     try:
-        changed = change is not None and apply(change, box, view, listed, path)
+        changed = change is not None and apply(change, box, view, listed)
     except PartlyChanged:
         changed = True
         raise
@@ -633,7 +720,25 @@ def balance() -> int:
     return 0
 
 
+def kept(path: Path) -> int:
+    """Print the balancer's own lines of a pool-settings.sh: its bounds, its forecast path and
+    `balance off`."""
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return 0
+    for line in lines:
+        if OWN_LINE.fullmatch(line):
+            print(line.strip())
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["kept"] and len(sys.argv) == 3:
+        return kept(Path(sys.argv[2]))
+    if len(sys.argv) > 1:
+        print("usage: balance_runners.py [kept <pool-settings.sh>]", file=sys.stderr)
+        return 2
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     with LOCK.open("a") as lock:
         try:
