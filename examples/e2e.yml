@@ -116,9 +116,7 @@ jobs:
       # taken.
       - name: Whether the prefix takes main's lane
         id: lane
-        if: >-
-          vars.CI_MAIN_RUNNER == 'on' && github.event_name == 'workflow_dispatch'
-          && github.run_attempt == '1' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-')
+        if: github.event_name == 'workflow_dispatch' && vars.CI_MAIN_RUNNER == 'on' && github.run_attempt == '1' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-')
         run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" main-lane
       # A squash the gate made carries its proof: main skips the browser job when it passed,
       # whole, on the identical tree, and names the run it inherited. Any other push runs it.
