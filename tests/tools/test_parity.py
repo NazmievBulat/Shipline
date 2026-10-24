@@ -2,6 +2,8 @@
 scripts, except those the installation's known list names: a path rename or a text rewrite, each
 with its reason."""
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -605,6 +607,38 @@ def test_a_folder_that_is_no_checkout_is_refused(tmp_path: Path) -> None:
     assert done.returncode == 2
     assert done.stdout == ""
     assert "is not a git checkout" in done.stderr
+
+
+def test_a_git_that_hangs_is_named_as_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loader = importlib.machinery.SourceFileLoader("parity", str(_TOOL))
+    tool = importlib.util.module_from_spec(importlib.util.spec_from_loader("parity", loader))
+    loader.exec_module(tool)
+    monkeypatch.setattr(tool, "GIT_SECONDS", 1)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin/git").write_text("#!/bin/sh\nexec sleep 30\n")
+    (tmp_path / "bin/git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+
+    with pytest.raises(tool.Refused, match="git rev-parse took more than 1 seconds"):
+        tool.tracked(tmp_path)
+
+
+def test_a_command_the_checkout_s_git_config_names_is_not_run(tmp_path: Path) -> None:
+    checkout = _checkout(tmp_path / "app", {"scripts/workflow/tick*": _TICK})
+    ran = tmp_path / "ran"
+    (tmp_path / "monitor").write_text(f'#!/bin/sh\ntouch "{ran}"\necho\n')
+    (tmp_path / "monitor").chmod(0o755)
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "core.fsmonitor", str(tmp_path / "monitor")],
+        check=True,
+    )
+
+    done = _parity(_shipline(tmp_path, {"scripts/workflow/tick*": _TICK}), checkout)
+
+    assert (done.returncode, done.stdout, done.stderr) == (0, "", "")
+    assert not ran.exists()
 
 
 def test_it_is_run_with_one_checkout() -> None:

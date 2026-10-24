@@ -69,6 +69,10 @@ class Refused(Exception):
     """The comparison cannot be made; the message says why."""
 
 
+class TooLong(Refused):
+    """Git took more than GIT_SECONDS."""
+
+
 @dataclass
 class Entry:
     line: int
@@ -188,14 +192,15 @@ def parity_of(checkout: Path) -> workflow_config.Parity:
 def _git(checkout: Path, *arguments: str, given: bytes | None = None) -> bytes:
     try:
         done = subprocess.run(
-            ["git", "-C", str(checkout), *arguments],
+            # A file monitor the checkout's own git config names is not run.
+            ["git", "-c", "core.fsmonitor=false", "-C", str(checkout), *arguments],
             input=given,
             capture_output=True,
             timeout=GIT_SECONDS,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        raise Refused(
+        raise TooLong(
             f"git {arguments[0]} took more than {GIT_SECONDS} seconds in {checkout}"
         ) from None
     if done.returncode:
@@ -234,6 +239,8 @@ def tracked(checkout: Path) -> dict[str, File]:
     """Every file git's index holds in a checkout, by its path."""
     try:
         top = _git(checkout, "rev-parse", "--show-toplevel").decode().strip()
+    except TooLong:
+        raise
     except Refused:
         top = ""
     if not top or Path(top).resolve() != checkout.resolve():
