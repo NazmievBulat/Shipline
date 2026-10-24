@@ -8402,14 +8402,14 @@ def _queue_config(github: GitHub, limit: int | None = None) -> None:
     github.workflow.git("update-index", "--skip-worktree", "shipline.json")
 
 
-@pytest.mark.parametrize("workflow", ["ci", "e2e"])
+@pytest.mark.parametrize("suite", ["ci", "e2e"])
 def test_a_scratch_main_lane_job_past_the_default_limit_is_cancelled_then_rerun_once(
-    github: GitHub, workflow: str,
+    github: GitHub, suite: str,
 ) -> None:
     _queue_config(github)
     _batch_setup(github)
     assert _batch_call(github).returncode == 3
-    run = _queued_prefix_job(github, workflow=workflow)
+    run = _queued_prefix_job(github, workflow=suite)
     identity = run["id"]
     assert _batch_call(github).returncode == 3
     assert len(github.workflow.calls(f"gh run cancel {identity} ")) == 1
@@ -8419,7 +8419,7 @@ def test_a_scratch_main_lane_job_past_the_default_limit_is_cancelled_then_rerun_
     # Cancellation finishes on GitHub between gate calls; a new process resumes the retry.
     scratch = _scratch(github)
     run = github.api[
-        f"{_REPO}/actions/workflows/{workflow}.yml/runs?head_sha={scratch['head']}"
+        f"{_REPO}/actions/workflows/{suite}.yml/runs?head_sha={scratch['head']}"
         "&event=workflow_dispatch&per_page=100"
     ]["workflow_runs"][0]
     run.update(status="completed", conclusion="cancelled")
@@ -8433,6 +8433,15 @@ def test_a_scratch_main_lane_job_past_the_default_limit_is_cancelled_then_rerun_
     assert status.returncode == 0, status.stderr
     prefix = json.loads(status.stdout)["prefixes"][0]
     assert prefix["queued_retries"][str(identity)]["state"] == "rerun requested"
+    # A successful ordinary attempt still supplies the normal merge proof.
+    _finish_batch(github)
+    github.api[
+        f"{_REPO}/actions/workflows/{suite}.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0]["run_attempt"] = 2
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
 
 
 @pytest.mark.parametrize("minutes,limit", [(19, None), (21, 25)])
@@ -8448,17 +8457,17 @@ def test_a_scratch_job_under_the_queue_limit_is_left_alone(
     assert not github.workflow.calls("gh run rerun")
 
 
-@pytest.mark.parametrize("workflow,label", [
+@pytest.mark.parametrize("suite,label", [
     ("images", "example-app-home-docker"), ("ci", "example-app-home"),
     ("e2e", "home-planner"),
 ])
 def test_a_long_wait_outside_the_main_batch_lane_is_not_cancelled(
-    github: GitHub, workflow: str, label: str,
+    github: GitHub, suite: str, label: str,
 ) -> None:
     _queue_config(github)
-    _batch_setup(github, images=workflow == "images")
+    _batch_setup(github, images=suite == "images")
     assert _batch_call(github).returncode == 3
-    _queued_prefix_job(github, minutes=87, workflow=workflow, label=label)
+    _queued_prefix_job(github, minutes=87, workflow=suite, label=label)
     assert _batch_call(github).returncode == 3
     assert not github.workflow.calls("gh run cancel")
     assert not github.workflow.calls("gh run rerun")
@@ -8494,3 +8503,102 @@ def test_no_run_outside_the_scratch_prefix_is_cancelled_for_its_queue(
     assert _batch_call(github).returncode == 3
     assert not github.workflow.calls("gh run cancel")
     assert not github.workflow.calls("gh run rerun")
+
+
+
+def test_a_retry_queued_on_ordinary_runners_is_reported_without_another_retry(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, attempt=2, label="example-app-home")
+    first = _batch_call(github)
+    assert first.returncode == 3
+    assert "run 100 attempt 2" in first.stdout
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+    assert not github.workflow.calls("gh run rerun")
+
+
+def test_a_timestamp_missing_from_a_queued_job_starts_a_durable_observation(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    part = github.api[f"{_REPO}/actions/runs/100/jobs?per_page=100"]["jobs"][0]
+    part.pop("created_at")
+    assert _batch_call(github).returncode == 3
+    assert not github.workflow.calls("gh run cancel")
+    path = github.workflow.repo / ".local/workflow/merge-train.json"
+    state = json.loads(path.read_text())
+    observation = state["prefixes"]["members"][0]["scratch"]["queued_retries"]["100"]["jobs"]
+    observation["1:102"] -= 21 * 60
+    path.write_text(json.dumps(state))
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+
+
+def test_one_queued_matrix_part_past_the_limit_retries_the_run(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    parts = github.api[f"{_REPO}/actions/runs/100/jobs?per_page=100"]["jobs"]
+    parts.insert(0, {**parts[0], "id": 103, "name": "CI: server tests (1 of 3)",
+                     "created_at": datetime.now(UTC).isoformat()})
+    parts.append({**parts[0], "id": 104, "name": "CI: server tests (3 of 3)",
+                  "status": "completed", "conclusion": "success"})
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+
+
+def test_a_cancel_lost_to_an_outage_is_retried_after_a_gate_restart(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    github.cancel_unavailable = [100]
+    _batch_call(github)
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 2
+    assert not github.workflow.calls("gh run rerun")
+
+
+def test_train_status_recovers_a_later_prefix_without_polluting_its_json(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, number="8")
+    github.save()
+    done = github.workflow.run_script("merge-when-current", "--train-status")
+    assert done.returncode == 0, done.stderr
+    status = json.loads(done.stdout)
+    assert status["prefixes"][1]["queued_retries"]["100"]["state"] == "cancel requested"
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+
+
+
+def test_a_stale_job_from_the_previous_attempt_does_not_report_a_new_wait(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, attempt=2)
+    github.api[f"{_REPO}/actions/runs/100/jobs?per_page=100"]["jobs"][0]["run_attempt"] = 1
+    done = _batch_call(github)
+    assert done.returncode == 3
+    assert "queued past" not in done.stdout
+    assert not (github.workflow.repo / ".local/workflow/prefix-queues.pending").exists()
+    assert not github.workflow.calls("gh run cancel")
+
+
+def test_a_custom_pool_label_and_unrelated_planner_label_do_not_change_recovery(github: GitHub) -> None:
+    _queue_config(github)
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config["runner"].update(label="example-pool", planner_label="home-planner")
+    path.write_text(json.dumps(config))
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, label="example-pool-main-batch")
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1

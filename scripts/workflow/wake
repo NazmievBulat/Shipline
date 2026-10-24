@@ -231,6 +231,16 @@ if [[ -d $lost ]]; then
     fi
   done < <(find "$lost" -type f -name '*.json' -print0 | sort -z)
 fi
+# Scratch queue warnings use the same durable delivery and sent receipts as lost checks.
+queues=$main/$SHIPLINE_STATE_FOLDER/prefix-queues.pending
+if [[ -d $queues ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '.line | strings' "$event"); then
+      lost_files+=("$event")
+      lost_lines+=("$line")
+    fi
+  done < <(find "$queues" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+fi
 # Rule breaks travel with the lost checks: told at any hour, on a line of their own.
 if [[ -d $breaks ]]; then
   while IFS= read -r -d '' event; do

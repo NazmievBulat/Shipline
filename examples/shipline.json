@@ -86,5 +86,9 @@
       "^app/auth/", "^app/permissions/", "^config/secrets"
     ]
   },
-  "answer_for_owner_after_minutes": 15
+  "merge_train": {
+    "queued_limit_minutes": 20
+  },
+  "answer_for_owner_after_minutes": 15,
+  "cloud_wake_after_minutes": 30
 }
