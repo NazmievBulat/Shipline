@@ -1601,3 +1601,186 @@ def test_a_second_tick_waits_for_the_first_across_a_change_of_the_state_folder(
     assert done.returncode == 0, done.stderr
     assert "the tick before this one is still running" in done.stdout, done.stdout + done.stderr
     assert not workflow.calls("gh")
+
+
+def _installation(workflow: Workflow, source: str = "home") -> Path:
+    """A config outside the repository, found without adding any repository file."""
+    if source == "explicit":
+        path = workflow.root / "installation" / "settings.json"
+        workflow.env["SHIPLINE_CONFIG"] = str(path)
+    else:
+        base = Path(workflow.env["HOME"]) / ".config"
+        if source == "xdg":
+            base = workflow.root / "config"
+            workflow.env["XDG_CONFIG_HOME"] = str(base)
+        path = base / "shipline" / "example-org-example-app" / "shipline.json"
+    path.parent.mkdir(parents=True)
+    return path
+
+
+def _read_installation(workflow: Workflow, form: str = "shell", cwd: Path | None = None):
+    return subprocess.run(
+        ["python3", str(workflow.script.parent / "workflow_config.py"), form],
+        cwd=cwd or workflow.repo,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("source", ["home", "xdg", "explicit"])
+@pytest.mark.parametrize("checkout_config", [False, True])
+def test_installation_config_is_used_without_merging_the_checkout(
+    workflow: Workflow, source: str, checkout_config: bool
+) -> None:
+    install_shipline(workflow)
+    path = _installation(workflow, source)
+    path.write_text(json.dumps({"state_folder": ".installation/state"}))
+    checkout = workflow.repo / "shipline.json"
+    if checkout_config:
+        checkout.write_text(json.dumps({"labels": {"workflow": "checkout-only"}}))
+    else:
+        workflow.git("rm", "shipline.json")
+        workflow.git("commit", "-m", "chore: no checkout configuration")
+    worktree = workflow.add_worktree(7)
+    for cwd in (workflow.repo, worktree):
+        done = _read_installation(workflow, cwd=cwd)
+        assert done.returncode == 0, done.stderr
+        assert "SHIPLINE_STATE_FOLDER=.installation/state\n" in done.stdout
+        assert "SHIPLINE_LABEL_WORKFLOW=workflow\n" in done.stdout
+        assert f"SHIPLINE_CONFIG={path}\n" in done.stdout
+        assert f"SHIPLINE_INSTALL_FOLDER={path.parent}\n" in done.stdout
+
+
+@pytest.mark.parametrize("form", ["shell", "sh"])
+def test_explicit_config_wins_and_is_exported_as_an_absolute_path(
+    workflow: Workflow, form: str
+) -> None:
+    home = _installation(workflow)
+    home.write_text('{"state_folder": ".home"}')
+    explicit = workflow.root / "selected.json"
+    explicit.write_text('{"state_folder": ".selected"}')
+    workflow.env["SHIPLINE_CONFIG"] = "../selected.json"
+    done = subprocess.run(
+        ["bash" if form == "shell" else "sh", "-c",
+         'config=$(python3 "$1" "$2") || exit 1; eval "$config"; '
+         'python3 "$1" "$2"', "config",
+         str(workflow.script.parent / "workflow_config.py"), form],
+        cwd=workflow.repo, env=workflow.env, capture_output=True, text=True, timeout=30,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "SHIPLINE_STATE_FOLDER=.selected\n" in done.stdout
+    assert f"SHIPLINE_CONFIG={explicit}\n" in done.stdout
+
+
+@pytest.mark.parametrize("source", ["home", "explicit"])
+@pytest.mark.parametrize("kind", ["missing", "json", "encoding", "key", "directory", "link"])
+def test_bad_installation_files_are_refused_with_the_selected_path(
+    workflow: Workflow, source: str, kind: str
+) -> None:
+    path = _installation(workflow, source)
+    if kind == "missing" and source == "home":
+        # An absent optional installation falls through to the checkout.
+        assert _read_installation(workflow).returncode == 0
+        return
+    if kind == "json":
+        path.write_text("{")
+    elif kind == "encoding":
+        path.write_bytes(b"\xff")
+    elif kind == "key":
+        path.write_text('{"labels": {"unknown": "refuse"}}')
+    elif kind == "directory":
+        path.mkdir()
+    elif kind == "link":
+        path.symlink_to(path.parent / "absent.json")
+    done = _read_installation(workflow)
+    assert done.returncode == 1
+    assert done.stdout == ""
+    assert done.stderr.startswith(str(path)), done.stderr
+    assert "Traceback" not in done.stderr
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+@pytest.mark.parametrize("folder", [None, "programs", "absolute"])
+def test_installation_programs_run_from_every_worktree(
+    workflow: Workflow, qualified: bool, folder: str | None
+) -> None:
+    install_shipline(workflow)
+    path = _installation(workflow)
+    installed = path.parent if folder is None else path.parent / "programs"
+    installed.mkdir(exist_ok=True)
+    program = installed / "tools" / "check.py"
+    program.parent.mkdir()
+    program.write_text("import os, sys\nprint('installation', os.getcwd(), sys.argv[1:])\n")
+    config = {"commands": {"pre_train_checks":
+        "python3 " + ("@install/" if qualified else "") + "tools/check.py"}}
+    if folder is not None:
+        config["install_folder"] = str(installed) if folder == "absolute" else folder
+    path.write_text(json.dumps(config))
+    worktrees = [workflow.repo, workflow.add_worktree(7), workflow.add_worktree(8)]
+    # Neither a program nor a config supplied by a worktree may win.
+    for worktree in worktrees[1:]:
+        (worktree / "tools").mkdir(exist_ok=True)
+        (worktree / "tools/check.py").write_text("raise RuntimeError('worktree program')\n")
+        (worktree / "shipline.json").write_text("{")
+    for worktree in worktrees:
+        done = workflow.shipline("pre-train-checks", "argument with space", cwd=worktree)
+        assert done.returncode == 0, done.stderr
+        assert done.stdout == f"installation {worktree} ['argument with space']\n"
+    # The checkout wins an unqualified lookup; @install/ always keeps the installed program.
+    program = workflow.repo / "tools/check.py"
+    program.parent.mkdir(exist_ok=True)
+    program.write_text("print('checkout')\n")
+    done = workflow.shipline("pre-train-checks", cwd=worktrees[-1])
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == (f"installation {worktrees[-1]} []\n" if qualified else "checkout\n")
+    if qualified:
+        (installed / "tools/check.py").unlink()
+        done = workflow.shipline("pre-train-checks", cwd=worktrees[-1])
+        assert done.returncode != 0
+        assert done.stdout == ""
+
+
+def test_install_only_command_without_an_installation_folder_is_refused(workflow: Workflow) -> None:
+    (workflow.repo / "shipline.json").write_text(
+        '{"commands": {"pre_train_checks": "python3 @install/tools/check.py"}}'
+    )
+    done = _read_installation(workflow)
+    assert done.returncode == 1
+    assert "@install/" in done.stderr and "install_folder" in done.stderr
+
+
+@pytest.mark.parametrize("value", ["", 3, [], "   "])
+def test_invalid_installation_folder_is_refused(workflow: Workflow, value: Any) -> None:
+    path = _installation(workflow)
+    path.write_text(json.dumps({"install_folder": value}))
+    done = _read_installation(workflow)
+    assert done.returncode == 1
+    assert done.stderr.startswith(str(path)) and "install_folder" in done.stderr
+
+
+def test_installation_config_reaches_tick_wake_gate_and_install(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    path = _installation(workflow)
+    path.write_text(json.dumps({"state_folder": ".installation/state",
+                                "labels": {"workflow": "installed", "audited": "checked"}}))
+    workflow.add_pull_request(7, labels=("installed",))
+    done = workflow.shipline("tick")
+    assert done.returncode == 0, done.stderr
+    assert workflow.is_running("ticket-7")
+    assert (workflow.worktree(7) / ".installation/state/ticket-7.url").exists()
+    done = workflow.shipline("wake")
+    assert done.returncode == 0, done.stderr
+    gate = subprocess.run(
+        ["python3", "-c", "import merge_gate; print(merge_gate.CONFIG.state_folder)"],
+        cwd=workflow.script.parent,
+        env={**workflow.env, "SHIPLINE_REPO": str(workflow.repo)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert gate.returncode == 0, gate.stderr
+    assert gate.stdout == ".installation/state\n"
+    done = workflow.shipline("install-timer")
+    assert done.returncode == 0, done.stderr
+    assert (workflow.state / "labels").read_text().split() == ["installed", "checked"]
