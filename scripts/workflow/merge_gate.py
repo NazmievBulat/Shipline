@@ -449,40 +449,48 @@ def jobs(run: dict[str, Any]) -> list[dict[str, Any]]:
     return checks(api(f"{API}/actions/runs/{run['id']}/jobs?per_page=100", "jobs"))
 
 
-def job_notes(job: dict[str, Any], parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The notes of a job, from the attempt of its run where it ran; `parts` are the jobs
-    listed with it.
+def carried(job: dict[str, Any]) -> bool:
+    """Whether GitHub carried this job into its attempt from an earlier one, without running it.
 
-    A re-run of only the failed jobs carries a job that passed into the new attempt under
-    another ID and without its notes. GitHub lists each job with the attempt it ran in, so a
-    carried job is one whose attempt is older than the latest one any job listed with it ran
-    in (a re-run runs one job at least). Its notes are then those of the same job, passed and
-    on the same head, in that attempt. A job that ran in the latest attempt has only its own
-    notes, however few.
+    A re-run of only the failed jobs lists each job that passed before as a copy in the new
+    attempt: a new ID, the new attempt's `run_attempt`, no notes, and the `started_at` and
+    `completed_at` of the attempt it ran in, but the `created_at` of the re-run. A job that ran
+    in its attempt started after it was created.
+    """
+    started, created = _seconds(job.get("started_at")), _seconds(job.get("created_at"))
+    return started is not None and created is not None and started < created
+
+
+def job_notes(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """The notes of a job, from the attempt of its run where it ran.
+
+    A job carried into a re-run has no notes of its own. Its notes are those of the copy, in an
+    earlier attempt of the same run, with the same name, head and times, that passed and ran
+    there; a job carried by two re-runs has a carried copy in the attempt between. A job that
+    ran in its own attempt has only its own notes, however few.
     """
     notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
     attempt, run, head = job.get("run_attempt"), job.get("run_id"), job.get("head_sha")
-    latest = max(
-        (part["run_attempt"] for part in parts if isinstance(part.get("run_attempt"), int)),
-        default=None,
-    )
     if (
         notes
         or job.get("conclusion") != "success"
+        or not carried(job)
         or not isinstance(attempt, int)
-        or latest is None
-        or attempt >= latest
         or run is None
         or not head
     ):
         return notes
-    for ran in api(f"{API}/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100", "jobs"):
-        if (
-            ran.get("name") == job["name"]
-            and ran.get("head_sha") == head
-            and ran.get("conclusion") == "success"
-        ):
-            return api(f"{API}/check-runs/{ran['id']}/annotations?per_page=100")
+    for earlier in range(attempt - 1, 0, -1):
+        for copy in api(f"{API}/actions/runs/{run}/attempts/{earlier}/jobs?per_page=100", "jobs"):
+            if (
+                copy.get("name") == job["name"]
+                and copy.get("head_sha") == head
+                and copy.get("conclusion") == "success"
+                and copy.get("started_at") == job.get("started_at")
+                and copy.get("completed_at") == job.get("completed_at")
+                and not carried(copy)
+            ):
+                return api(f"{API}/check-runs/{copy['id']}/annotations?per_page=100")
     return []
 
 
@@ -1139,7 +1147,7 @@ def strict_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     strict: list[dict[str, Any]] = []
     for job in parts:
         if job["name"] == "CI: dependencies" and job.get("conclusion") == "success":
-            notes = job_notes(job, parts)
+            notes = job_notes(job)
             if any(note.get("title") == "Advisory on main" for note in notes):
                 job = {**job, "conclusion": "passed over an advisory on main"}
         strict.append(job)
@@ -1263,11 +1271,10 @@ def main_images_needed(head: str, ci: list[dict[str, Any]]) -> bool:
     push = next((run for run in ci if run["event"] == "push"), None)
     before = None
     if push:
-        push_jobs = jobs(push)
-        for job in push_jobs:
+        for job in jobs(push):
             if job["name"] != CI_PLAN:
                 continue
-            notes = job_notes(job, push_jobs)
+            notes = job_notes(job)
             before = next(
                 (note["message"].strip() for note in notes if note.get("title") == "Push base"),
                 None,
@@ -1381,7 +1388,7 @@ def inherited_image_jobs(
 
 def _planner_notes(parts: list[dict[str, Any]], plan: str) -> set[tuple[Any, str]]:
     planner = next(job for job in parts if job["name"] == plan)
-    return {(note.get("title"), note["message"].strip()) for note in job_notes(planner, parts)}
+    return {(note.get("title"), note["message"].strip()) for note in job_notes(planner)}
 
 
 def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
@@ -1419,7 +1426,7 @@ def tested_merge(parts: list[dict[str, Any]], base: str, head: str) -> str | Non
     for job in parts:
         if job["name"] != CI_PLAN:
             continue
-        for note in job_notes(job, parts):
+        for note in job_notes(job):
             if note.get("title") != NOTES.merge_tested:
                 continue
             merge = note["message"].strip()
@@ -1791,7 +1798,7 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
             return False
         tree = api(f"{API}/git/commits/{merge}")["tree"]["sha"]
         plan = next(job for job in image_jobs if job["name"] == IMAGES_PLAN)
-        notes = job_notes(plan, image_jobs)
+        notes = job_notes(plan)
         if not any(
             note.get("title") == NOTES.files_tested and note["message"].strip() == tree
             for note in notes
@@ -4016,7 +4023,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             image_plan = next(
                 job for job in image_jobs if job["name"] == IMAGES_PLAN
             )
-            image_notes = job_notes(image_plan, image_jobs)
+            image_notes = job_notes(image_plan)
             if not any(
                 note.get("title") == NOTES.files_tested and note["message"].strip() == tree
                 for note in image_notes

@@ -263,11 +263,31 @@ def test_an_earlier_attempts_jobs_and_notes_share_the_member_cache_across_ticks(
         f"{api}/actions/runs/20/attempts/1/jobs?per_page=100",
         f"{api}/check-runs/21/annotations?per_page=100",
     ]
+    # As GitHub lists them: the carried copy has attempt 2's number and creation, attempt 1's run.
+    ran = {"started_at": "2026-10-24T09:00:02Z", "completed_at": "2026-10-24T09:05:00Z"}
     replies = [
         [{"id": 20, "run_attempt": 2, "status": "completed", "conclusion": "success"}],
-        [{"id": 521, "status": "completed", "conclusion": "success"}],
+        [
+            {
+                "id": 521,
+                "run_attempt": 2,
+                "created_at": "2026-10-24T10:00:00Z",
+                **ran,
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ],
         [],
-        [{"id": 21, "status": "completed", "conclusion": "success"}],
+        [
+            {
+                "id": 21,
+                "run_attempt": 1,
+                "created_at": "2026-10-24T09:00:00Z",
+                **ran,
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ],
         [{"title": "Merge tested", "message": "merge"}],
     ]
     calls: list[str] = []

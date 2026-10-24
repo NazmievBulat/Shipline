@@ -1325,6 +1325,17 @@ def test_a_fix_that_passed_every_check_failing_on_red_main_merges(github: GitHub
     assert "passed every check failing on main: CI result, CI: web" in done.stdout
 
 
+def _attempt_times(attempt: int) -> dict[str, str]:
+    """When attempt `attempt` of a run was created, started and completed: each re-run an
+    hour after the one before."""
+    hour = 8 + attempt
+    return {
+        "created_at": f"2026-10-24T{hour:02}:00:00Z",
+        "started_at": f"2026-10-24T{hour:02}:00:02Z",
+        "completed_at": f"2026-10-24T{hour:02}:05:00Z",
+    }
+
+
 def _rerun_failed_jobs(
     github: GitHub,
     run_id: int,
@@ -1334,27 +1345,37 @@ def _rerun_failed_jobs(
     attempts: int = 2,
 ) -> None:
     """Run `run_id` failed a job and re-ran its failed jobs alone until its last attempt,
-    `attempts`, passed. Each re-run carried the `carried` jobs from the first attempt under a
-    new job ID, without notes, and with the attempt they ran in: GitHub lists each job with its
-    own `run_attempt`. The first attempt ran on `earlier_head`, the head of the run unless a
-    test says otherwise."""
+    `attempts`, passed. Each re-run carried the `carried` jobs from the first attempt as GitHub
+    does: in each later attempt a copy with a new job ID, that attempt's `run_attempt`, no
+    notes, the original `started_at` and `completed_at`, and the later `created_at` of the
+    re-run. The first attempt ran on `earlier_head`, the head of the run unless a test says
+    otherwise."""
     for reply in github.api.values():
         for run in reply.get("workflow_runs", []) if isinstance(reply, dict) else []:
             if run["id"] == run_id:
                 run["run_attempt"] = attempts
+                run["run_started_at"] = _attempt_times(attempts)["created_at"]
     latest = github.api[f"{_REPO}/actions/runs/{run_id}/jobs?per_page=100"]["jobs"]
     for attempt in range(1, attempts + 1):
         listed = deepcopy(latest) if attempt < attempts else latest
         for job in listed:
             job.update(
                 run_id=run_id,
-                run_attempt=1 if job["name"] in carried else attempt,
+                run_attempt=attempt,
                 head_sha=earlier_head or head if attempt == 1 else head,
+                **_attempt_times(attempt),
             )
             if job["name"] not in carried and attempt < attempts:
                 job["conclusion"] = "failure"
             if job["name"] in carried and attempt > 1:
-                job["id"] = run_id + 500 * (attempt - 1) + job["id"] % 100
+                job.update(
+                    {
+                        key: value
+                        for key, value in _attempt_times(1).items()
+                        if key != "created_at"
+                    },
+                    id=run_id + 500 * (attempt - 1) + job["id"] % 100,
+                )
                 github.api[f"{_REPO}/check-runs/{job['id']}/annotations?per_page=100"] = []
         if attempt < attempts:
             github.api[f"{_REPO}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100"] = {
@@ -1377,7 +1398,7 @@ def test_a_clean_audit_that_ran_in_a_full_rerun_is_not_read_as_its_older_advisor
 ) -> None:
     # A full re-run ran every job again: the audit's attempt is the run's latest, and a clean
     # audit writes no notes. Its pass over main's advisory in attempt 1 is older evidence.
-    first = {"id": 39, "name": _DEPENDENCIES, "run_id": 30, "run_attempt": 1}
+    first = {"id": 39, "name": _DEPENDENCIES, "run_id": 30, "run_attempt": 1, **_attempt_times(1)}
     replies = {
         f"{gate.API}/check-runs/539/annotations?per_page=100": [],
         f"{gate.API}/actions/runs/30/attempts/1/jobs?per_page=100": [
@@ -1390,6 +1411,7 @@ def test_a_clean_audit_that_ran_in_a_full_rerun_is_not_read_as_its_older_advisor
     monkeypatch.setattr(gate, "api", lambda path, key=None, *, paginate=True: replies[path])
     latest = {
         **first,
+        **_attempt_times(2),
         "id": 539,
         "run_attempt": 2,
         "head_sha": "a" * 40,
@@ -1399,7 +1421,11 @@ def test_a_clean_audit_that_ran_in_a_full_rerun_is_not_read_as_its_older_advisor
     assert gate.strict_jobs([latest])[0]["conclusion"] == "success"
 
 
-def _attempt_job(job_id: int, attempt: int, conclusion: str | None = "success") -> dict[str, Any]:
+def _attempt_job(
+    job_id: int, attempt: int, conclusion: str | None = "success", *, ran: int | None = None
+) -> dict[str, Any]:
+    """The planner of run 30 as attempt `attempt` lists it; `ran` is the attempt it ran in,
+    `attempt` unless GitHub carried it from an earlier one."""
     return {
         "id": job_id,
         "name": "CI: what to run",
@@ -1408,24 +1434,18 @@ def _attempt_job(job_id: int, attempt: int, conclusion: str | None = "success") 
         "head_sha": "a" * 40,
         "status": "completed" if conclusion else "in_progress",
         "conclusion": conclusion,
+        **{
+            key: value
+            for key, value in _attempt_times(ran or attempt).items()
+            if key != "created_at"
+        },
+        "created_at": _attempt_times(attempt)["created_at"],
     }
 
 
-@pytest.mark.parametrize("case", ["carried", "failed copy", "still running", "unreadable"])
-def test_a_carried_job_reads_the_notes_of_the_attempt_it_ran_in(
-    gate: Any, monkeypatch: pytest.MonkeyPatch, case: str
-) -> None:
-    # Attempt 3 re-ran the failed jobs; the planner it carried ran in attempt 2.
-    carried = {**_attempt_job(731, 2), "conclusion": None if case == "still running" else "success"}
-    replies: dict[str, Any] = {
-        f"{gate.API}/check-runs/731/annotations?per_page=100": [],
-        f"{gate.API}/actions/runs/30/attempts/2/jobs?per_page=100": gate.Waiting("HTTP 502")
-        if case == "unreadable"
-        else [_attempt_job(631, 2, "failure" if case == "failed copy" else "success")],
-        f"{gate.API}/check-runs/631/annotations?per_page=100": [
-            {"title": "Merge tested", "message": "second"}
-        ],
-    }
+def _notes_api(
+    gate: Any, monkeypatch: pytest.MonkeyPatch, replies: dict[str, Any]
+) -> list[str]:
     calls: list[str] = []
 
     def api(path: str, key: str | None = None, *, paginate: bool = True) -> Any:
@@ -1435,16 +1455,71 @@ def test_a_carried_job_reads_the_notes_of_the_attempt_it_ran_in(
         return replies[path]
 
     monkeypatch.setattr(gate, "api", api)
-    parts = [carried, {**_attempt_job(732, 3), "name": "CI: web"}]
+    return calls
+
+
+def _notes_path(gate: Any, job_id: int) -> str:
+    return f"{gate.API}/check-runs/{job_id}/annotations?per_page=100"
+
+
+def _attempt_path(gate: Any, attempt: int) -> str:
+    return f"{gate.API}/actions/runs/30/attempts/{attempt}/jobs?per_page=100"
+
+
+@pytest.mark.parametrize(
+    "case", ["carried", "failed copy", "still running", "unreadable", "ran again"]
+)
+def test_a_carried_job_reads_the_notes_of_the_attempt_it_ran_in(
+    gate: Any, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    # Attempt 2 re-ran the failed jobs and carried the planner, which ran in attempt 1.
+    if case == "ran again":
+        job = _attempt_job(531, 2)  # a full re-run ran it again: created before it started
+    else:
+        job = _attempt_job(531, 2, None if case == "still running" else "success", ran=1)
+    calls = _notes_api(
+        gate,
+        monkeypatch,
+        {
+            _notes_path(gate, 531): [],
+            _attempt_path(gate, 1): gate.Waiting("gh api failed: HTTP 502")
+            if case == "unreadable"
+            else [_attempt_job(31, 1, "failure" if case == "failed copy" else "success")],
+            _notes_path(gate, 31): [{"title": "Merge tested", "message": "first"}],
+        },
+    )
     if case == "unreadable":
         # Unread is not unannotated: the gate waits for GitHub instead of deciding.
         with pytest.raises(gate.Waiting):
-            gate.job_notes(carried, parts)
+            gate.job_notes(job)
         return
-    notes = gate.job_notes(carried, parts)
-    assert notes == ([{"title": "Merge tested", "message": "second"}] if case == "carried" else [])
-    if case == "still running":
-        assert calls == [f"{gate.API}/check-runs/731/annotations?per_page=100"]
+    notes = gate.job_notes(job)
+    assert notes == ([{"title": "Merge tested", "message": "first"}] if case == "carried" else [])
+    if case in ("still running", "ran again"):
+        assert calls == [_notes_path(gate, 531)]
+
+
+def test_a_job_carried_twice_reads_the_attempt_it_ran_in_not_an_older_copy(
+    gate: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # It ran in attempt 2, which wrote "second"; attempt 3 carried it, and attempt 4 again.
+    # Attempt 1's copy ran at other times, so its "first" is another run of the job.
+    _notes_api(
+        gate,
+        monkeypatch,
+        {
+            _notes_path(gate, 731): [],
+            _attempt_path(gate, 3): [_attempt_job(631, 3, ran=2)],
+            _notes_path(gate, 631): [],
+            _attempt_path(gate, 2): [_attempt_job(531, 2)],
+            _notes_path(gate, 531): [{"title": "Merge tested", "message": "second"}],
+            _attempt_path(gate, 1): [_attempt_job(31, 1)],
+            _notes_path(gate, 31): [{"title": "Merge tested", "message": "first"}],
+        },
+    )
+    assert gate.job_notes(_attempt_job(731, 4, ran=2)) == [
+        {"title": "Merge tested", "message": "second"}
+    ]
 
 
 def test_a_fix_whose_full_rerun_passed_its_audit_clean_takes_the_red_main_turn(
@@ -1460,7 +1535,7 @@ def test_a_fix_whose_full_rerun_passed_its_audit_clean_takes_the_red_main_turn(
     audit = {"id": 39, "name": _DEPENDENCIES, "status": "completed", "conclusion": "success"}
     first = [*deepcopy(github.api[jobs]["jobs"]), dict(audit)]
     for job in first:
-        job.update(run_id=30, run_attempt=1, head_sha=head)
+        job.update(run_id=30, run_attempt=1, head_sha=head, **_attempt_times(1))
     github.api[f"{_REPO}/actions/runs/30/attempts/1/jobs?per_page=100"] = {"jobs": first}
     github.api[f"{_REPO}/check-runs/39/annotations?per_page=100"] = [
         {"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}
@@ -1470,7 +1545,9 @@ def test_a_fix_whose_full_rerun_passed_its_audit_clean_takes_the_red_main_turn(
     latest.append(dict(audit))
     planner_notes = github.api[f"{_REPO}/check-runs/31/annotations?per_page=100"]
     for job in latest:
-        job.update(id=500 + job["id"], run_id=30, run_attempt=2, head_sha=head)
+        job.update(
+            id=500 + job["id"], run_id=30, run_attempt=2, head_sha=head, **_attempt_times(2)
+        )
     github.api[f"{_REPO}/check-runs/531/annotations?per_page=100"] = planner_notes
     github.api[f"{_REPO}/check-runs/532/annotations?per_page=100"] = []
     github.api[f"{_REPO}/check-runs/539/annotations?per_page=100"] = []
