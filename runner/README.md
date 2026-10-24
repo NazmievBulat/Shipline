@@ -112,7 +112,9 @@ ordinary_blacksmith_jobs=1
 ```
 
 How many runners a machine has is its own choice. Two machines must never have the same name:
-they would take each other's registrations.
+they would take each other's registrations. A machine runs one pool: the addresses of the
+runners' networks and of the cache (`settings.sh`), the runners' GitHub identity
+(`~/.config/shipline-runner`) and the planner's notes are the machine's, not a prefix's.
 
 ## Installing a machine
 
@@ -127,7 +129,9 @@ sudo sh ~/.local/share/<prefix>-runner/install-firewall.sh
 (`render-units.sh`), builds the images, and starts the runners as services of your user. It
 records the repository's names, its checkout and the machine's settings in `pool-settings.sh`
 beside the copy. The runners wait until `install-firewall.sh` has put the firewall in place. To
-take a newer version, run it again from main.
+take a newer version, run it again from main. To change the prefix, stop the pool's services and
+remove `~/.local/share/<prefix>-runner` first: an install under a new prefix does not find the
+old one.
 
 ## The units
 
