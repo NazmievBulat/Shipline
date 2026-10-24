@@ -30,6 +30,9 @@
 # (priority high)`, `608 waits: shares scripts/workflow/merge_gate.py with 563`. Such a line
 # counts as a change for a check-in, and does not by itself make the wake look in the day.
 #
+# So do the findings of the tick's daily metrics run (`workflow-metrics --daily` notes them), once
+# per day: `Workflow metrics findings (report .local/analyses/metrics-<date>.md): <line>; <line>.`
+#
 # A session that ended its turn with a question to the owner is named on a line of its own,
 # with how long it has waited: `asking the owner: review-156 (8 min)`. The stop hook (`notify`)
 # notes the question when the stop rings the phone, and drops it when he answers. A question
@@ -118,6 +121,18 @@ if [[ -d $starts ]]; then
       start_lines+=("$lines")
     fi
   done < <(find "$starts" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+fi
+metrics=$main/$SHIPLINE_STATE_FOLDER/metrics-findings.pending
+metrics_files=()
+metrics_lines=()
+if [[ -d $metrics ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '(.lines | map(strings) | select(length > 0) | join("; ")) as $lines |
+        "Workflow metrics findings (report \(.report | strings)): \($lines)."' "$event"); then
+      metrics_files+=("$event")
+      metrics_lines+=("$line")
+    fi
+  done < <(find "$metrics" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
 if [[ -d $handbacks ]]; then
   while IFS= read -r -d '' event; do
@@ -396,7 +411,8 @@ if ((${#resent[@]} == 0 && ${#handback_files[@]} == 0 && ${#cloud_files[@]} == 0
     log "  $name is $state; not told"
     exit "$failed"
   fi
-  if [[ -r $TOLD && $(<"$TOLD") == "$seen" ]] && ((${#start_files[@]} == 0)); then
+  if [[ -r $TOLD && $(<"$TOLD") == "$seen" ]] &&
+      ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0)); then
     log "  nothing changed since the last check-in; $name not told"
     exit "$failed"
   fi
@@ -420,6 +436,9 @@ if ((${#start_lines[@]})); then
   joined=$(printf '%s; ' "${start_lines[@]}")
   message+=" Ticket starts by the tick: ${joined%; }."
 fi
+for line in "${metrics_lines[@]}"; do
+  message+=" $line"
+done
 if [[ -n $service_line ]]; then
   message+=" Package audit: $service_line; pushes wait for it, nothing was found wrong."
 fi
@@ -432,7 +451,7 @@ if send_to "$name" "$message"; then
     grep -xF -f <(asking_notes all; echo) >"$ASKED.new"
   mv "$ASKED.new" "$ASKED"
   rm -f "$PENDING"
-  for event in "${cloud_files[@]}" "${start_files[@]}"; do
+  for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}"; do
     rm -f -- "$event"
   done
   # Do not acknowledge a newer outage noted while the message was being sent.
