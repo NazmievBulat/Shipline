@@ -8,7 +8,8 @@ The reviewer is the one `conflict_review` of `shipline.json` names while the kep
 the conflict's merge and it stays within `max_changed_lines`: both sides of every conflicting
 hunk before the merge is committed, the lines the resolution wrote there after, and no other
 file. The choice is noted in `review-N.conflict-reviewer`, so the gate can hand a resolution
-that grew past it to the usual reviewer (`review-N.usual-reviewer`).
+that grew past it to the usual reviewer (`review-N.usual-reviewer`, which keeps that head with
+the usual reviewer).
 """
 
 import json
@@ -21,7 +22,7 @@ from typing import Any
 
 import workflow_config
 from merge_handoff import write_json
-from workflow_commands import GIT_READ_TIMEOUT, run
+from workflow_commands import GIT_READ_TIMEOUT, CommandTimeout, run
 
 _ROUND = re.compile(r"^<!-- workflow-review round=([0-9]+) result=(sent-back|passed) -->")
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -127,19 +128,20 @@ class Scope:
             raise ValueError(f"{file}: resolution changes lines outside conflicting hunks")
         return list(found.groups())
 
-    def size(self, root: Path) -> tuple[int, list[str]]:
-        """The lines of the conflicting files the kept worktree's resolution writes, and the
-        other files it changes. Before the merge is committed, the lines of both sides of
-        every conflicting hunk: the resolution decides each of them."""
+    def size(self, root: Path, head: str) -> tuple[int, list[str]]:
+        """The lines of the conflicting files the resolution at `head` decides, and the other
+        files it changes. Both sides of every conflicting hunk count, and once the merge is
+        committed the lines it wrote in their place, when they are more: a large conflict
+        resolved in a few lines is still a large one."""
         tree = self.automatic(root)
-        head = _git(root, "rev-parse", "HEAD").strip()
+        sides = sum(
+            len(side.splitlines())
+            for file in self.files
+            for found in self.block(sides=True).finditer(_blob(root, tree, file))
+            for side in found.groups()
+        )
         if head == self.head:
-            return sum(
-                len(side.splitlines())
-                for file in self.files
-                for found in self.block(sides=True).finditer(_blob(root, tree, file))
-                for side in found.groups()
-            ), []
+            return sides, []
         if _git(root, "rev-list", "--parents", "-n", "1", head).split() != [
             head,
             self.head,
@@ -150,12 +152,12 @@ class Scope:
             )
         changed = _git(root, "diff", "--no-renames", "--name-only", "-z", tree, head).split("\0")
         outside = sorted(set(filter(None, changed)) - set(self.files))
-        lines = sum(
+        written = sum(
             len(part.splitlines())
             for file in self.files
             for part in self.written(root, head, file, tree)
         )
-        return lines, outside
+        return max(sides, written), outside
 
     def validate(self, root: Path, head: str) -> str:
         """Refuse extra commits, changed parents, and edits outside conflict blocks."""
@@ -241,17 +243,23 @@ def reviewer(folder: Path, number: str) -> tuple[str, str]:
     """The effort and model of the fresh reviewer of pull request N, noted for the gate."""
     named = workflow_config.current().conflict_review
     record = folder / f"review-{number}.conflict-reviewer"
+    usual = folder / f"review-{number}.usual-reviewer"
     chosen, scope = USUAL, None
-    if named is not None:
-        try:
+    try:
+        root = _worktree(folder, number)
+        head = _git(root, "rev-parse", "HEAD").strip()
+        # The gate sent this head to the usual reviewer: it stays there until the head moves.
+        if usual.exists() and usual.read_text().strip() != head:
+            usual.unlink()
+        if named is not None and not usual.exists():
             scope = Scope.read(folder, number)
             if scope and _holds(folder, number, scope):
-                lines, outside = scope.size(_worktree(folder, number))
+                lines, outside = scope.size(root, head)
                 if not outside and lines <= named.max_changed_lines:
                     chosen = (named.effort, named.model)
-        except ValueError, TypeError, OSError, subprocess.SubprocessError:
-            # A conflict that cannot be measured gets the usual reviewer.
-            chosen = USUAL
+    except ValueError, TypeError, OSError, subprocess.SubprocessError, CommandTimeout:
+        # A conflict that cannot be measured gets the usual reviewer.
+        chosen = USUAL
     if chosen == USUAL or scope is None:
         record.unlink(missing_ok=True)
     else:
@@ -259,8 +267,6 @@ def reviewer(folder: Path, number: str) -> tuple[str, str]:
             record,
             {"head": scope.head, "main": scope.main, "effort": chosen[0], "model": chosen[1]},
         )
-    # The usual reviewer the gate asked for is this one, or a later one.
-    (folder / f"review-{number}.usual-reviewer").unlink(missing_ok=True)
     return chosen
 
 

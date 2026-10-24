@@ -545,15 +545,6 @@ cmd_start() {
   fi
   # Audits and independent reviewers never run on a smaller model, whatever the owner's default becomes.
   [[ $kind == worker ]] || model=opus
-  if [[ $kind == review ]]; then
-    # High on Opus, unless shipline.json names the reviewer of a small conflict and this is one.
-    local choice
-    choice=$(python3 -B "$script_dir/conflict_review.py" reviewer \
-      "$main/$SHIPLINE_STATE_FOLDER" "$number") || choice="high opus"
-    read -r effort model <<<"$choice"
-    [[ $effort =~ ^(low|medium|high|xhigh|max)$ && $model =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
-      { effort=high; model=opus; }
-  fi
 
   cmd_cleanup
 
@@ -573,6 +564,16 @@ cmd_start() {
   for other in "ticket-$number" "audit-$number" "review-$number" "codex-$number" "cloud-$number"; do
     ! is_running "$other" || die "$other is already running"
   done
+  if [[ $kind == review ]]; then
+    # High on Opus, unless shipline.json names the reviewer of a small conflict and this is one.
+    # Chosen under the start lock, with no reviewer running: the choice is noted for the gate.
+    local choice
+    choice=$(python3 -B "$script_dir/conflict_review.py" reviewer \
+      "$main/$SHIPLINE_STATE_FOLDER" "$number") || choice="high opus"
+    read -r effort model <<<"$choice"
+    [[ $effort =~ ^(low|medium|high|xhigh|max)$ && $model =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ &&
+       $model != codex && $model != cloud ]] || { effort=high; model=opus; }
+  fi
 
   if [[ $model == cloud ]]; then
     start_cloud_worker "$number" "$effort"

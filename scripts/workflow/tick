@@ -213,7 +213,9 @@ list_pull_requests() {
 note_rule_break() {
   local number=$1 folder=$main/$SHIPLINE_STATE_FOLDER state head event
   [[ ! -e $folder/merge-wanted-$number && ! -e $folder/merge-review-$number &&
-     ! -e $folder/batch-merged-$number && ! -e $folder/review-$number.usual-reviewer ]] || return 0
+     ! -e $folder/batch-merged-$number ]] || return 0
+  [[ ! -e $folder/review-$number.usual-reviewer ||
+     ! -e $folder/review-$number.conflict-reviewer ]] || return 0
   read -r state _ head < <(gh pr view "$number" --json state,headRefName,headRefOid \
     --jq '"\(.state) \(.headRefName) \(.headRefOid)"' 9>&-) || return 1
   [[ $state == OPEN && $head =~ ^[0-9a-f]{40}$ ]] || return 0

@@ -3966,8 +3966,8 @@ def handoff(number: str, folder: Path) -> int:
                 raise ValueError("conflict round lacks its scope or earlier passed round")
             if named is not None:
                 try:
-                    lines, outside = scope.size(Path.cwd())
-                except (ValueError, subprocess.SubprocessError) as error:
+                    lines, outside = scope.size(Path.cwd(), head)
+                except (ValueError, subprocess.SubprocessError, CommandTimeout) as error:
                     _usual_reviewer(folder, number, head, str(error))
                 if outside:
                     _usual_reviewer(
@@ -3978,8 +3978,9 @@ def handoff(number: str, folder: Path) -> int:
                         folder,
                         number,
                         head,
-                        f"the resolution writes {lines} lines in {', '.join(scope.files)}, more "
-                        f"than the {named.max_changed_lines} of conflict_review.max_changed_lines",
+                        f"the conflict and its resolution take {lines} lines in "
+                        f"{', '.join(scope.files)}, more than the {named.max_changed_lines} of "
+                        "conflict_review.max_changed_lines",
                     )
             scope.validate(Path.cwd(), head)
         except (ValueError, OSError, TypeError) as error:

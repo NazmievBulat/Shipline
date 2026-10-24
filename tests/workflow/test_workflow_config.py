@@ -255,6 +255,14 @@ def test_the_conflict_reviewer_is_read_whole(tmp_path: Path) -> None:
             "conflict_review.model must be a model name",
         ),
         (
+            {"effort": "medium", "model": "codex", "max_changed_lines": 40},
+            "conflict_review.model must be a model name",
+        ),
+        (
+            {"effort": "medium", "model": "cloud", "max_changed_lines": 40},
+            "conflict_review.model must be a model name",
+        ),
+        (
             {"effort": "medium", "model": "sonnet", "max_changed_lines": 0},
             "conflict_review.max_changed_lines must be a whole number above 0",
         ),

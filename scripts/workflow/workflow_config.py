@@ -276,7 +276,12 @@ def _conflict_review(value: Any, name: str) -> dict[str, Any]:
         raise ConfigError(f"{FILE}: {name} must name {', '.join(missing)}")
     if value["effort"] not in EFFORTS:
         raise ConfigError(f"{FILE}: {name}.effort must be one of {', '.join(EFFORTS)}")
-    if not isinstance(value["model"], str) or not _MODEL.fullmatch(value["model"]):
+    # `codex` and `cloud` name kinds of worker for `session start`, not a model.
+    if (
+        not isinstance(value["model"], str)
+        or not _MODEL.fullmatch(value["model"])
+        or value["model"] in ("codex", "cloud")
+    ):
         raise ConfigError(
             f"{FILE}: {name}.model must be a model name, not {json.dumps(value['model'])}"
         )

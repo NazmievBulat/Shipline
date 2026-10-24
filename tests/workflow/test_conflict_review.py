@@ -472,7 +472,7 @@ def test_without_a_named_conflict_reviewer_every_conflict_gets_the_usual_one(
         (
             "long",
             True,
-            f"the resolution writes 7 lines in {_FILE}, more than the 6 of "
+            f"the conflict and its resolution take 7 lines in {_FILE}, more than the 6 of "
             "conflict_review.max_changed_lines",
         ),
         ("file", True, "the resolution changes unrelated.py too"),
@@ -519,15 +519,42 @@ def test_the_gate_hands_a_larger_resolution_to_the_usual_reviewer(
         ) in done.stdout + done.stderr
 
 
+def test_a_large_conflict_resolved_in_a_few_lines_is_still_the_usual_reviewer_s(
+    workflow: Workflow,
+) -> None:
+    """Six lines of sides, one written: a restart after the resolution measures six."""
+    workflow.add_worktree(7, draft=False)
+    head, main = _conflict(workflow)
+    _conflict_review(workflow, 5)
+    _begin_merge(workflow, main)
+    folder = _folder(workflow)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "review-7.conflict.json").write_text(
+        json.dumps({"head": head, "main": main, "files": [_FILE]})
+    )
+    _resolve(workflow)
+
+    assert _reviewer(workflow) == "high opus\n"
+
+
 def test_a_reviewer_the_gate_sent_to_the_usual_one_is_stopped_without_a_rule_break(
     workflow: Workflow,
 ) -> None:
+    """Its pushed resolution is small enough for it: the gate's word alone keeps it away."""
     workflow.add_worktree(7, draft=False)
-    head = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
+    head, main = _conflict(workflow)
+    _conflict_review(workflow, 6)
+    _begin_merge(workflow, main)
     folder = _folder(workflow)
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "review-7.usual-reviewer").write_text(head + "\n")
-    (folder / "review-7.conflict-reviewer").write_text("{}\n")
+    (folder / "review-7.conflict.json").write_text(
+        json.dumps({"head": head, "main": main, "files": [_FILE]})
+    )
+    assert _reviewer(workflow) == "medium sonnet\n"
+    resolved = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", resolved)
+    # The gate refused its full-review round on the resolved head.
+    (folder / "review-7.usual-reviewer").write_text(resolved + "\n")
     workflow.running("review-7")
     _idle(workflow, "review-7")
     workflow.screen(
@@ -541,8 +568,12 @@ def test_a_reviewer_the_gate_sent_to_the_usual_one_is_stopped_without_a_rule_bre
     (workflow.state / "screen" / "review-7").unlink()
     second = workflow.run_script("tick")
     assert second.returncode == 0, second.stdout + second.stderr
-    # The fresh reviewer is the usual one, and the notes of the cheaper one are gone.
+    # The fresh reviewer is the usual one, and stays so on this head.
     assert workflow.is_running("review-7")
     assert "--effort high --model opus" in " ".join(session_arguments(workflow.state, "review-7"))
-    assert not (folder / "review-7.usual-reviewer").exists()
     assert not (folder / "review-7.conflict-reviewer").exists()
+    assert _reviewer(workflow) == "high opus\n"
+    # A new head is measured again.
+    workflow.git("commit", "--allow-empty", "-m", "fix: send-back", cwd=workflow.worktree(7))
+    _reviewer(workflow)
+    assert not (folder / "review-7.usual-reviewer").exists()
