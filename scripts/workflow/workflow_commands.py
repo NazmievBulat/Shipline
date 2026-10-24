@@ -23,6 +23,11 @@ READ_RETRY_DELAYS = (1, 2, 4)
 class CommandTimeout(Exception):
     """The command and its process group have been stopped."""
 
+    def __init__(self, message: str, output: str = "") -> None:
+        super().__init__(message)
+        # What the command printed before it was stopped: standard output, then standard error.
+        self.output = output
+
 
 def _interrupted(signum: int, frame: FrameType | None) -> NoReturn:
     raise SystemExit(128 + signum)
@@ -131,7 +136,8 @@ def _stop(
     *,
     unwind: bool = False,
     cleanup_timeout: float | None = None,
-) -> None:
+) -> tuple[str, str]:
+    """Stops the command and its run; returns all it printed, standard output and error."""
     # Taken before any signal: a stopped parent leaves its children to init, out of its tree.
     run = _run_processes(process.pid, set())
     if unwind:
@@ -154,7 +160,8 @@ def _stop(
     # What is left of the run would hold the output pipes, and with them the caller's merge
     # lock and push slot.
     _kill_run(process.pid, run)
-    process.communicate()
+    # Popen keeps what an earlier `communicate` read, so this is the whole output.
+    return process.communicate()
 
 
 def _run(
@@ -192,8 +199,10 @@ def _run(
         # Kill the entire group even when the leader has already exited and only a
         # child holds the output pipe. SIGKILL also stops hooks that ignore SIGTERM.
         assert process is not None
-        _stop(process, unwind=True, cleanup_timeout=2)
-        raise CommandTimeout(f"{' '.join(args)} timed out after {timeout:g}s") from None
+        stdout, stderr = _stop(process, unwind=True, cleanup_timeout=2)
+        raise CommandTimeout(
+            f"{' '.join(args)} timed out after {timeout:g}s", (stdout or "") + (stderr or "")
+        ) from None
     except BaseException:
         if process is not None:
             _stop(process, unwind=unwind_on_interrupt)
