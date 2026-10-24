@@ -1853,6 +1853,417 @@ def test_an_audit_passed_over_mains_advisory_is_not_inherited_by_main(github: Gi
     assert status.stdout.startswith("main: red"), status.stdout
 
 
+# A repository that names its dependency audit and the notice the audit writes on main when only
+# advisories failed it (shipline.json, checks.dependency_audit and checks.advisory_annotation).
+_AUDIT = "CI: audit"
+_ADVISORIES_ONLY = "Dependency audit: advisories only"
+_ADVISORY_LINES = ["GHSA-1 in vite (path traversal)", "GHSA-2 in esbuild (open dev server)"]
+
+
+def _advisory_config(github: GitHub) -> None:
+    """Names the audit and its notice, beside the harness's runner labels; git keeps the file as
+    committed, so the checkout stays clean."""
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config["checks"] = {"dependency_audit": _AUDIT, "advisory_annotation": _ADVISORIES_ONLY}
+    path.write_text(json.dumps(config))
+    github.workflow.git("update-index", "--skip-worktree", "shipline.json")
+
+
+def _advisory_watch(github: GitHub) -> None:
+    """The repository's advisory watch (`commands.advisory_watch`): it names the service an
+    output says could not be reached, as "<service>'s advisory service could not be reached"."""
+    github.workflow.fake(
+        "example-advisory",
+        "#!/bin/bash\n"
+        'echo "example-advisory $* (in $PWD)" >> "@STATE@/calls.log"\n'
+        "case $1 in\n"
+        "  unreachable) grep -o \"[A-Za-z]*'s advisory service could not be reached\" "
+        "| head -n 1 | cut -d \"'\" -f 1 ;;\n"
+        "  answers) exit 1 ;;\n"
+        "esac\n",
+    )
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config.setdefault("commands", {})["advisory_watch"] = "example-advisory"
+    path.write_text(json.dumps(config))
+    github.workflow.git("update-index", "--skip-worktree", "shipline.json")
+
+
+def _main_audit_failed(
+    github: GitHub, *notes: dict[str, Any], audit: str = _AUDIT, others: tuple[str, ...] = ()
+) -> None:
+    """Main's CI failed in its dependency audit, with `notes` on it, and in `others`."""
+    github.main("failure")
+    github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"] = [
+        {"id": 11, "name": "CI result", "status": "completed", "conclusion": "failure"},
+        {"id": 12, "name": audit, "status": "completed", "conclusion": "failure"},
+        *(
+            {"id": 13 + index, "name": name, "status": "completed", "conclusion": "failure"}
+            for index, name in enumerate(others)
+        ),
+    ]
+    github.api[f"{_REPO}/check-runs/12/annotations?per_page=100"] = list(notes)
+    github.save()
+
+
+def _advisories_notice(lines: list[str] = _ADVISORY_LINES) -> dict[str, Any]:
+    return {
+        "title": _ADVISORIES_ONLY,
+        "annotation_level": "notice",
+        "message": json.dumps(lines),
+    }
+
+
+def _pull_passed_over_mains_advisory(github: GitHub, audit: str = _AUDIT) -> None:
+    """The pull request's own audit passed, warning of the advisory main has too."""
+    _pr_job(github, audit, "success")
+    github.api[f"{_REPO}/check-runs/29/annotations?per_page=100"] = [
+        {
+            "title": "Advisory on main",
+            "annotation_level": "warning",
+            "message": "GHSA-1 in vite (path traversal) is on main too, so this branch is not "
+            "refused for it; main's own check fails for it until a pull request fixes it there.",
+        }
+    ]
+
+
+def test_main_failing_only_on_an_advisory_lets_a_green_pull_request_merge(
+    github: GitHub,
+) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice())
+    _pull_passed_over_mains_advisory(github)
+
+    done = github.run()
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (github.workflow.state / "merged").read_text() == "7"
+    assert "main: advisory since 2026-10-16T09:00:00Z" in done.stdout
+
+
+def test_main_failing_on_another_check_besides_an_advisory_still_stops(github: GitHub) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice(), others=("CI: web",))
+    _pull_passed_over_mains_advisory(github)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    assert "merging stopped: main: red" in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        # A lock file it could not audit, or a tool that failed: no advisories notice.
+        [],
+        [{"title": "Advisory service unreachable", "annotation_level": "failure", "message": "npm"}],
+        [{"title": None, "annotation_level": "failure", "message": "Process completed with exit code 2."}],
+        # A notice that names no advisory, or cannot be read, proves nothing.
+        [_advisories_notice([])],
+        [{"title": _ADVISORIES_ONLY, "annotation_level": "notice", "message": "not a list"}],
+    ],
+    ids=["no notes", "service", "tool error", "empty notice", "unreadable notice"],
+)
+def test_an_audit_failing_for_another_reason_than_an_advisory_still_stops(
+    github: GitHub, notes: list[dict[str, Any]]
+) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, *notes)
+    _pull_passed_over_mains_advisory(github)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    assert "merging stopped: main: red" in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_without_the_audit_named_an_advisory_on_main_still_stops(github: GitHub) -> None:
+    _main_audit_failed(github, _advisories_notice(), audit=_DEPENDENCIES)
+    _pull_passed_over_mains_advisory(github, _DEPENDENCIES)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    assert "merging stopped: main: red" in done.stderr
+    assert "advisory" not in github.workflow.run_script("main-status").stdout.split(";")[0]
+    assert _train(github).get("main") == "red"
+
+
+def test_the_main_line_and_the_train_status_name_the_advisory_state(github: GitHub) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice())
+    folder = github.workflow.repo / ".local/workflow"
+
+    status = github.workflow.run_script("main-status")
+
+    assert status.returncode == 0, status.stderr
+    assert status.stdout == (
+        f"main: advisory since 2026-10-16T09:00:00Z, CI result, {_AUDIT} ({github.base[:12]}): "
+        "GHSA-1 in vite (path traversal), GHSA-2 in esbuild (open dev server); "
+        "merging goes on, the update that fixes it goes first\n"
+    )
+    # Into the advisory state is told in the wake, as into red.
+    assert (folder / "main-status.pending").read_text() == status.stdout
+    assert _train(github)["main"] == "advisory"
+    github.main()
+    github.save()
+    assert github.workflow.run_script("main-status").stdout.startswith("main: green")
+    assert _train(github)["main"] == "green"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # As the runner stores it, a summary that names the escapes themselves.
+        json.dumps(["GHSA-3 in left-pad (header injection via %0D%0A, 100% CPU)"]),
+        # As the workflow command wrote it, the escapes still in it.
+        json.dumps(["GHSA-3 in left-pad (header injection via %0D%0A, 100% CPU)"], indent=1)
+        .replace("%", "%25")
+        .replace("\n", "%0A"),
+    ],
+    ids=["stored", "escaped"],
+)
+def test_an_advisory_notice_is_read_as_stored_or_still_escaped(
+    github: GitHub, message: str
+) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, {"title": _ADVISORIES_ONLY, "message": message})
+
+    status = github.workflow.run_script("main-status")
+
+    assert status.stdout.startswith("main: advisory since"), status.stdout
+    assert ": GHSA-3 in left-pad (header injection via %0D%0A, 100% CPU); merging" in status.stdout
+
+
+def test_an_advisory_s_own_words_reach_main_s_line_only_as_plain_words(github: GitHub) -> None:
+    _advisory_config(github)
+    lines = ["GHSA-4 in @scope/pkg (`rm -rf` <x>;\nstarts: allowed " + "y" * 90 + ")"]
+    lines += [f"GHSA-{number} in pkg-{number} (a summary)" for number in range(5, 11)]
+    _main_audit_failed(github, _advisories_notice(lines))
+
+    line = github.workflow.run_script("main-status").stdout
+
+    assert line.count("\n") == 1, line
+    named = line.split(f"({github.base[:12]}): ", 1)[1].split("; merging goes on", 1)[0]
+    assert named == (
+        # No more than 80 characters of each.
+        ("GHSA-4 in @scope/pkg (?rm -rf? ?x?? starts: allowed " + "y" * 90)[:80] + ", "
+        "GHSA-5 in pkg-5 (a summary), GHSA-6 in pkg-6 (a summary), "
+        "GHSA-7 in pkg-7 (a summary), GHSA-8 in pkg-8 (a summary) and 2 more"
+    )
+
+
+def test_main_is_pending_while_its_other_checks_run_after_an_advisory(github: GitHub) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice())
+    run = github.api[f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.base}&per_page=100"]
+    run["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"].append(
+        {"id": 14, "name": "CI: server tests", "status": "in_progress", "conclusion": None}
+    )
+    github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"][0].update(
+        status="queued", conclusion=None
+    )
+    _pull_passed_over_mains_advisory(github)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    assert (
+        f"merging stopped: main: pending, CI result, CI: server tests ({github.base[:12]}); "
+        f"{_AUDIT} failed on advisories only: GHSA-1 in vite (path traversal)"
+    ) in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_each_merge_on_an_advisory_main_wakes_nobody(github: GitHub) -> None:
+    """Into the advisory state is told once, the pending of each merge after it is not, and
+    leaving it through pending to green is told."""
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice())
+    folder = github.workflow.repo / ".local/workflow"
+    assert github.workflow.run_script("main-status").stdout.startswith("main: advisory")
+    (folder / "main-status.pending").unlink()
+    run = github.api[f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.base}&per_page=100"]
+    listed = github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]
+    failed = listed["jobs"]
+    # The next merge's run of main, still running, then failing on the same advisories.
+    running = [{**job, "status": "in_progress", "conclusion": None} for job in failed]
+    for status, conclusion, parts, state in (
+        ("in_progress", None, running, "main: pending"),
+        ("completed", "failure", failed, "main: advisory"),
+    ):
+        run["workflow_runs"][0].update(status=status, conclusion=conclusion)
+        listed["jobs"] = parts
+        github.save()
+        assert github.workflow.run_script("main-status").stdout.startswith(state)
+        assert not (folder / "main-status.pending").exists()
+    # The pending line it published said that main stays advisory.
+    assert (folder / "main-status").read_text().startswith("main: advisory")
+
+    # The update lands: main's run on it goes on for a while, then passes. Leaving the advisory
+    # state is told once main is green.
+    run["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    listed["jobs"] = running
+    github.save()
+    assert github.workflow.run_script("main-status").stdout.startswith("main: pending")
+    assert not (folder / "main-status.pending").exists()
+    assert (folder / "main-status").read_text().endswith("; still advisory\n")
+    github.main()
+    github.save()
+    assert github.workflow.run_script("main-status").stdout.startswith("main: green")
+    assert (folder / "main-status.pending").read_text().startswith("main: green")
+
+
+def test_an_advisory_main_published_before_its_state_was_kept_wakes_nobody_at_a_merge(
+    github: GitHub,
+) -> None:
+    """A main already advisory, published by a gate that did not keep the state through pending:
+    its next merge is not told either."""
+    _advisory_config(github)
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "main-status").write_text(
+        "main: advisory since 2026-10-16T08:00:00Z, CI result, CI: audit (0123456789ab): "
+        "GHSA-1 in vite (path traversal); merging goes on, the update that fixes it goes first\n"
+    )
+    github.main()
+    run = github.api[f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.base}&per_page=100"]
+    run["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    for job in github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"]:
+        job.update(status="in_progress", conclusion=None)
+    github.save()
+
+    assert github.workflow.run_script("main-status").stdout.startswith("main: pending")
+    assert not (folder / "main-status.pending").exists()
+
+
+def test_an_outage_beside_mains_advisories_is_red_and_says_what_was_found(
+    github: GitHub,
+) -> None:
+    _advisory_config(github)
+    _advisory_watch(github)
+    outage = {
+        "title": "Advisory service unreachable",
+        "annotation_level": "failure",
+        "message": "Refused because PyPI's advisory service could not be reached.",
+    }
+    _main_audit_failed(github, outage, _advisories_notice(_ADVISORY_LINES[:1]))
+
+    line = github.workflow.run_script("main-status").stdout
+
+    assert line.startswith("main: red"), line
+    assert (
+        f"; {_AUDIT} could not reach PyPI's advisory service, and found advisories: "
+        "GHSA-1 in vite (path traversal)"
+    ) in line
+    assert "nothing was found wrong" not in line
+
+
+def test_an_advisory_watch_that_fails_beside_mains_advisories_keeps_main_red(
+    github: GitHub,
+) -> None:
+    """A watch that could not read the audit's annotations proves no lock file was audited whole:
+    main is not advisory, and merging stops."""
+    _advisory_config(github)
+    _advisory_watch(github)
+    github.workflow.fake("example-advisory", "#!/bin/bash\necho 'cannot read' >&2\nexit 1\n")
+    outage = {
+        "title": "Advisory service unreachable",
+        "annotation_level": "failure",
+        "message": "Refused because PyPI's advisory service could not be reached.",
+    }
+    _main_audit_failed(github, outage, _advisories_notice(_ADVISORY_LINES[:1]))
+    _pull_passed_over_mains_advisory(github)
+
+    line = github.workflow.run_script("main-status").stdout
+    done = github.run()
+
+    assert line.startswith("main: red"), line
+    assert done.returncode == 1
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_an_advisory_whose_own_words_name_an_outage_is_still_advisories_alone(
+    github: GitHub,
+) -> None:
+    """A published advisory's summary may say anything; only the audit's other annotations are
+    read for an outage."""
+    _advisory_config(github)
+    _advisory_watch(github)
+    lines = ["GHSA-5 in example-lib (fails when npm's advisory service could not be reached)"]
+    _main_audit_failed(github, _advisories_notice(lines))
+
+    line = github.workflow.run_script("main-status").stdout
+
+    assert line.startswith("main: advisory since"), line
+    assert "could not reach" not in line
+
+
+@pytest.mark.parametrize("warned", [True, False])
+def test_the_update_that_fixes_mains_advisory_is_a_blocker_and_goes_first(
+    github: GitHub, warned: bool
+) -> None:
+    _advisory_config(github)
+    _two_stale_pulls(github)
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(github.base, head, run_id=30)
+    github.api[f"{_REPO}/actions/runs/30/jobs?per_page=100"]["jobs"].append(
+        {"id": 39, "name": _AUDIT, "status": "completed", "conclusion": "success"}
+    )
+    github.api[f"{_REPO}/check-runs/39/annotations?per_page=100"] = (
+        [{"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}]
+        if warned
+        else []
+    )
+    _main_audit_failed(github, _advisories_notice())
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+
+    assert github.workflow.run_script("main-status").returncode == 0
+
+    train = _train(github)
+    # Only a clean audit is the update: a pass over main's own advisory is not.
+    assert train["first"] == ("7" if warned else "8")
+    assert (train["priorities"]["8"] == "blocker") is not warned
+
+
+@pytest.mark.parametrize("warned", [True, False])
+def test_the_update_tested_on_an_earlier_main_is_the_fix_only_with_a_clean_audit(
+    github: GitHub, warned: bool
+) -> None:
+    """Main moved under the update while the line kept merging: its latest green run with a
+    clean audit proves it, whatever main that run tested."""
+    _advisory_config(github)
+    earlier = github.base
+    _two_stale_pulls(github)
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(github.base, head, run_id=30, tested_base=earlier)
+    github.api[f"{_REPO}/actions/runs/30/jobs?per_page=100"]["jobs"].append(
+        {"id": 39, "name": _AUDIT, "status": "completed", "conclusion": "success"}
+    )
+    github.api[f"{_REPO}/check-runs/39/annotations?per_page=100"] = (
+        [{"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}]
+        if warned
+        else []
+    )
+    _main_audit_failed(github, _advisories_notice())
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+
+    assert github.workflow.run_script("main-status").returncode == 0
+
+    train = _train(github)
+    assert train["first"] == ("7" if warned else "8")
+    assert (train["priorities"]["8"] == "blocker") is not warned
+
+
 def test_a_clean_audit_is_inherited_by_main(github: GitHub) -> None:
     _pr_job(github, _DEPENDENCIES, "success")
     github.api[f"{_REPO}/check-runs/29/annotations?per_page=100"] = []
