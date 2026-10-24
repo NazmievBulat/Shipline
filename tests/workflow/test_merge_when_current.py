@@ -233,8 +233,17 @@ def answer(args, cwd, env, out, err):
             if "event=workflow_dispatch" in path or "/actions/runs?branch=" in path:
                 print('{"workflow_runs": []}')
                 sys.exit(0)
+            if "/check-runs?" in path:
+                print('{"total_count": 0, "check_runs": []}')
+                sys.exit(0)
             sys.exit("unexpected API request: " + path)
         reply = data["api"][path]
+        answers = reply.get("_alternate") if isinstance(reply, dict) else None
+        if answers is not None:
+            # GitHub answers the same query in turns: this one, then the next.
+            reply = answers[0]
+            answers.append(answers.pop(0))
+            (state / "github.json").write_text(json.dumps(data))
         if reply is None:
             sys.exit("GitHub unavailable")
         if isinstance(reply, str):
@@ -3082,7 +3091,8 @@ def test_a_green_rerun_recovers_the_blocked_heads_old_place(github: GitHub) -> N
     assert github.workflow.git("rev-parse", "HEAD") == before
 
 
-def test_a_green_rerun_on_old_main_stays_blocked_until_refreshed(github: GitHub) -> None:
+def _green_rerun_on_old_main(github: GitHub) -> None:
+    """The blocked first member's failed check, re-run green on main before main moved again."""
     _blocked_first(github)
     old = github.base
     workflow = github.workflow
@@ -3095,6 +3105,152 @@ def test_a_green_rerun_on_old_main_stays_blocked_until_refreshed(github: GitHub)
     github.ci(github.base, github.head, tested_base=old, run_id=50)
     github.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "SUCCESS"
     github.save()
+
+
+def _ci_runs(head: str, *, pull: bool = True) -> str:
+    event = "&event=pull_request" if pull else ""
+    return f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={head}{event}&per_page=100"
+
+
+def _check_runs(github: GitHub, head: str, *checks: tuple[str, str]) -> None:
+    """The check runs GitHub shows on `head`, by name and status, all in check suite 5000."""
+    github.api[f"{_REPO}/commits/{head}/check-runs?per_page=100"] = {
+        "total_count": len(checks),
+        "check_runs": [
+            {
+                "id": 5001 + index,
+                "name": name,
+                "status": status,
+                "conclusion": "success" if status == "completed" else None,
+                "check_suite": {"id": 5000},
+            }
+            for index, (name, status) in enumerate(checks)
+        ],
+    }
+
+
+def _tick_context(github: GitHub) -> dict[str, str]:
+    path = github.workflow.root / "tick-reads"
+    path.mkdir()
+    (path / "context.json").write_text(json.dumps({"started": time.time()}))
+    (path / "pulls.json").write_text(json.dumps(github.pulls))
+    env = {"WORKFLOW_TRAIN_TICK": str(path), "WORKFLOW_SESSION_SNAPSHOT": str(path / "sessions")}
+    # The tick's snapshot of the sessions, as its first listing takes it.
+    assert github.workflow.run("list", env=env).returncode == 0
+    return env
+
+
+@pytest.mark.parametrize("tick", [False, True])
+def test_an_empty_runs_answer_keeps_a_green_rerun_on_old_main_in_the_line(
+    github: GitHub, tick: bool
+) -> None:
+    _green_rerun_on_old_main(github)
+    listed = github.api[_ci_runs(github.head)]
+    # Asked for the runs of the head, GitHub answers none and then the run, in turns.
+    github.api[_ci_runs(github.head)] = {"_alternate": [{"workflow_runs": []}, listed]}
+    _check_runs(github, github.head, ("CI: what to run", "completed"), ("CI result", "completed"))
+    github.save()
+    env = _tick_context(github) if tick else None
+    for _ in range(3):
+        done = github.workflow.run_script("merge-when-current", "--train-status", env=env)
+        assert done.returncode == 0, done.stderr
+        train = json.loads(done.stdout)
+        assert train["blocked"] == ["7"]
+        assert train["waiting"] == ["7", "8"]
+        assert train["first"] == "7"
+    done = github.run()
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "failed checks" not in done.stderr
+    assert github.workflow.git("rev-parse", "HEAD^2") == github.base
+    # It asked again half a minute after the empty answer, and needed no check suite.
+    assert "sleep 30" in github.workflow.calls("sleep")
+    assert not github.workflow.calls("gh api repos/example-org/example-app/actions/runs?")
+
+
+def test_a_green_rerun_github_stops_listing_keeps_its_place(github: GitHub) -> None:
+    _green_rerun_on_old_main(github)
+    assert _train(github)["waiting"] == ["7", "8"]
+    # Then GitHub lists the run neither by its head nor by its check suite.
+    github.api[_ci_runs(github.head)] = {"workflow_runs": []}
+    _check_runs(github, github.head, ("CI: what to run", "completed"), ("CI result", "completed"))
+    github.api[f"{_REPO}/actions/runs?check_suite_id=5000&per_page=100"] = {"workflow_runs": []}
+    github.save()
+    for _ in range(2):
+        train = _train(github)
+        assert train["blocked"] == ["7"]
+        assert train["waiting"] == ["7", "8"]
+        assert train["first"] == "7"
+    refused = github.run()
+    assert refused.returncode == 1
+    assert "failed checks" not in refused.stderr
+    assert "has not started" in refused.stderr
+
+
+def test_a_run_github_does_not_list_is_found_through_its_check_suite(github: GitHub) -> None:
+    _green_rerun_on_old_main(github)
+    [run] = github.api[_ci_runs(github.head)]["workflow_runs"]
+    github.api[_ci_runs(github.head)] = {"workflow_runs": []}
+    _check_runs(github, github.head, ("CI: what to run", "completed"), ("CI result", "completed"))
+    github.api[f"{_REPO}/actions/runs?check_suite_id=5000&per_page=100"] = {
+        "workflow_runs": [{**run, "path": ".github/workflows/ci.yml"}]
+    }
+    github.save()
+    for _ in range(2):
+        train = _train(github)
+        assert train["blocked"] == ["7"]
+        assert train["waiting"] == ["7", "8"]
+    done = github.run()
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "failed checks" not in done.stderr
+
+
+@pytest.mark.parametrize("checks", ["none", "running", "other workflow"])
+def test_a_head_without_a_finished_ci_check_run_stays_pending(
+    github: GitHub, checks: str
+) -> None:
+    _green_rerun_on_old_main(github)
+    github.api[_ci_runs(github.head)] = {"workflow_runs": []}
+    if checks == "running":
+        _check_runs(github, github.head, ("CI: what to run", "in_progress"))
+    elif checks == "other workflow":
+        _check_runs(github, github.head, ("Docker images: what to run", "completed"))
+    github.save()
+    train = _train(github)
+    assert train["blocked"] == ["7"]
+    assert train["waiting"] == ["8"]
+    refused = github.run()
+    assert refused.returncode == 1
+    assert "once a re-run is green" in refused.stderr
+    assert not github.workflow.calls("gh api repos/example-org/example-app/actions/runs?")
+    assert not github.workflow.calls("sleep 30")
+
+
+@pytest.mark.parametrize("listed", ["again", "check suite"])
+def test_an_empty_runs_answer_for_main_is_not_read_as_ci_not_started(
+    github: GitHub, listed: str
+) -> None:
+    [run] = github.api[_ci_runs(github.base, pull=False)]["workflow_runs"]
+    if listed == "again":
+        github.api[_ci_runs(github.base, pull=False)] = {
+            "_alternate": [{"workflow_runs": []}, {"workflow_runs": [run]}]
+        }
+    else:
+        github.api[_ci_runs(github.base, pull=False)] = {"workflow_runs": []}
+        github.api[f"{_REPO}/actions/runs?check_suite_id=5000&per_page=100"] = {
+            "workflow_runs": [{**run, "path": ".github/workflows/ci.yml"}]
+        }
+    _check_runs(github, github.base, ("CI result", "completed"))
+    github.save()
+
+    done = github.workflow.run_script("main-status")
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.startswith("main: green"), done.stdout
+
+
+def test_a_green_rerun_on_old_main_stays_blocked_until_refreshed(github: GitHub) -> None:
+    _green_rerun_on_old_main(github)
+    workflow = github.workflow
     stale = _train(github)
     assert stale["blocked"] == ["7"]
     assert _train(github)["turn"] == stale["turn"]

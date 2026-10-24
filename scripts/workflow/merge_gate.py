@@ -107,6 +107,11 @@ SCRATCH_PREFIX = "workflow/merge-batch-"
 E2E_PLAN = CONFIG.checks.e2e_plan
 CI_PLAN = CONFIG.checks.ci_plan
 CI_RESULT = CONFIG.checks.ci_result
+# What the name of every check of the CI workflow begins with: the words its planner and its
+# result share, "CI" by default.
+CI_PREFIX = os.path.commonprefix([CI_PLAN, CI_RESULT]).rstrip(": ") or CI_RESULT
+# How long after GitHub listed no CI run for a head whose CI jobs finished it is asked again.
+UNLISTED_RETRY_SECONDS = 30
 # Every check of the image workflow begins with this; its planner is IMAGES_PLAN.
 IMAGES = CONFIG.checks.images
 IMAGES_PLAN = CONFIG.checks.images_plan
@@ -319,9 +324,10 @@ def push_failure(output: str, checkout: Path) -> str:
     return f"the security scan was short of locked memory twice, a minute apart: {shortage}\n{refusal}"
 
 
-def api(path: str, key: str | None = None, *, paginate: bool = True) -> Any:
+def api(path: str, key: str | None = None, *, paginate: bool = True, fresh: bool = False) -> Any:
+    """GitHub's answer for `path`; `fresh` asks again what a reconciliation already read."""
     if _planning_reads is not None:
-        return _planning_reads.api(path, lambda: _api(path, key, paginate=paginate))
+        return _planning_reads.api(path, lambda: _api(path, key, paginate=paginate), fresh=fresh)
     return _api(path, key, paginate=paginate)
 
 
@@ -361,11 +367,52 @@ def runs(
     # Main is judged by the runs of its pushes (and manual reruns). A scheduled run of an
     # unchanged head is kept apart: it may report a failure, never hold or close the gate.
     event = "&event=pull_request" if pull else ""
-    found = api(
+    path = (
         f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
-        f"?head_sha={head}{event}&per_page=100",
-        "workflow_runs",
+        f"?head_sha={head}{event}&per_page=100"
     )
+    found = _own_runs(api(path, "workflow_runs"), head, pull=pull, scheduled=scheduled)
+    if found or workflow != "ci" or not (suites := _ci_suites(head)):
+        return found
+    # GitHub sometimes lists no CI run for a head whose CI jobs finished, and lists it when
+    # asked again a little later; a run it still does not list is found by its check suite.
+    command("sleep", str(UNLISTED_RETRY_SECONDS))
+    found = _own_runs(api(path, "workflow_runs", fresh=True), head, pull=pull, scheduled=scheduled)
+    if found:
+        return found
+    ci_path = f".github/workflows/{WORKFLOW_FILES['ci']}"
+    return _own_runs(
+        [
+            run
+            for suite in suites
+            for run in api(
+                f"{API}/actions/runs?check_suite_id={suite}&per_page=100", "workflow_runs"
+            )
+            if run.get("path", "").split("@")[0] == ci_path
+        ],
+        head,
+        pull=pull,
+        scheduled=scheduled,
+    )
+
+
+def _ci_suites(head: str) -> list[int]:
+    """The check suites of the CI jobs that finished on `head`, as its check runs show them."""
+    return sorted(
+        {
+            check["check_suite"]["id"]
+            for check in api(f"{API}/commits/{head}/check-runs?per_page=100", "check_runs")
+            if check.get("name", "").startswith(CI_PREFIX)
+            and check.get("status") == "completed"
+            and check.get("check_suite")
+        }
+    )
+
+
+def _own_runs(
+    found: list[dict[str, Any]], head: str, *, pull: bool, scheduled: bool
+) -> list[dict[str, Any]]:
+    """The runs of `head` that judge it, newest first: its pull request's, or main's own."""
     return sorted(
         [
             run
@@ -2045,7 +2092,8 @@ class Train:
         pulls: dict[str, Any] = {}
         suite_states: dict[str, str | None] = {}
         lost: dict[str, dict[str, Any]] = {}
-        self.refreshable = set()
+        # A blocked head's CI run that GitHub lists no more is no new evidence: its mark stays.
+        refreshable, self.refreshable = self.refreshable, set()
         # Use the same session state and owner-question notes as the tick. A background
         # job leaves its session running and must not lose its turn merely for waiting.
         sessions = {
@@ -2131,6 +2179,8 @@ class Train:
                             note_lost(self.path.parent, number, pull["headRefOid"], found)
                     if state == "red":
                         self.blocked[number] = pull["headRefOid"]
+                    elif not ci and number in refreshable and number in self.blocked:
+                        self.refreshable.add(number)
                     elif state == "green" and number in self.blocked:
                         # Its own green run cannot clear a failure its prefix run found. A
                         # new run or attempt of that prefix, or a fix, is needed first.
