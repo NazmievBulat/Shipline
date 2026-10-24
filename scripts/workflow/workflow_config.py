@@ -302,6 +302,7 @@ def shell(config: Config) -> str:
         "CI_PLAN": config.checks.ci_plan,
         "E2E_PLAN": config.checks.e2e_plan,
         "IMAGES": config.checks.images,
+        "IMAGES_PLAN": config.checks.images_plan,
         **{f"ANNOTATION_{key.upper()}": value for key, value in vars(config.annotations).items()},
         **{f"WORKFLOW_{key.upper()}": value for key, value in vars(config.workflows).items()},
         "LABEL_WORKFLOW": config.labels.workflow,

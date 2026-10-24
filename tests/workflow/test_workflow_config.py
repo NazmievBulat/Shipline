@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from workflow_harness import Workflow
 
 _WORKFLOW = Path(__file__).resolve().parents[2] / "scripts/workflow"
 # Loaded from its file, so the scripts' folder is not put on the path of every other test.
@@ -334,3 +335,147 @@ def test_bash_and_jq_read_the_same_labels(tmp_path: Path) -> None:
     assert _jq(config, ["priority: blocker"]) == "medium"
     assert _jq(config, [], "workflow_label") == "shipline"
     assert _shell(repo, 'printf "%s" "$SHIPLINE_LABEL_WORKFLOW"') == "shipline"
+
+
+# Answers the merge gate's reads of the Actions API for one repository and its workflow files,
+# and leaves everything else to the harness's stand-in: a read of any other repository or file
+# finds no runs, and main's health is then unknown.
+_ACTIONS_GH = r"""#!/usr/bin/env python3
+import json, os, re, sys
+args = sys.argv[1:]
+api = "repos/@REPOSITORY@/actions/"
+path = next((arg for arg in args if arg.startswith("repos/")), "")
+if args[:1] == ["api"] and path.startswith(api):
+    with open("@STATE@/calls.log", "a") as log:
+        log.write("gh " + " ".join(args) + "\n")
+    head = open("@STATE@/main-head").read().strip()
+    found = re.match(r"actions/workflows/([^/]+)/runs[?](.*)", path[len("repos/@REPOSITORY@/"):])
+    if found and found[1] == "@CI@" and f"head_sha={head}" in found[2]:
+        print(json.dumps({"workflow_runs": [{
+            "id": 501, "head_sha": head, "head_branch": "main", "event": "push",
+            "status": "completed", "conclusion": "failure", "run_attempt": 1,
+            "updated_at": "2026-10-20T10:00:00Z", "path": ".github/workflows/@CI@"}]}))
+    elif found:
+        print(json.dumps({"workflow_runs": []}))
+    elif path.startswith(api + "runs/501/jobs"):
+        print(json.dumps({"jobs": [
+            {"id": 11, "name": "@CI_RESULT@", "status": "completed", "conclusion": "failure",
+             "labels": ["ubuntu-latest"]}]}))
+    else:
+        sys.exit(f"gh: could not answer {' '.join(args)}")
+    sys.exit(0)
+os.execv("@HARNESS_GH@", ["gh", *args])
+"""
+
+_OTHER = {
+    "repository": "example-owner/example-app",
+    "state_folder": ".shipline/state",
+    "worktree_setup": "tools/prepare-worktree",
+    "checks": {
+        "ci_result": "Build result",
+        "ci_plan": "Build: what to run",
+        "e2e_plan": "Browser: what to run",
+        "images": "Images",
+    },
+    "workflows": {"ci": "build.yml", "e2e": "browser.yml", "images": "container.yml"},
+}
+
+
+def _commit_on_main(workflow: Workflow, files: dict[str, str]) -> None:
+    for name, text in files.items():
+        path = workflow.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(0o755)
+    workflow.git("add", *files)
+    workflow.git("commit", "--quiet", "-m", "chore: use shipline.json")
+    workflow.git("push", "--quiet", "origin", "main")
+
+
+def test_another_repository_state_folder_and_check_names_reach_the_gate_the_tick_and_session(
+    workflow: Workflow,
+) -> None:
+    _commit_on_main(
+        workflow,
+        {
+            "shipline.json": json.dumps(_OTHER),
+            "tools/prepare-worktree": '#!/bin/bash\nexec worktree-setup "$@"\n',
+        },
+    )
+    (workflow.state / "main-head").write_text(workflow.git("rev-parse", "main"))
+    harness_gh = workflow.bin / "gh-harness"
+    (workflow.bin / "gh").rename(harness_gh)
+    replacements = {
+        "@REPOSITORY@": _OTHER["repository"],
+        "@CI@": "build.yml",
+        "@CI_RESULT@": "Build result",
+        "@HARNESS_GH@": str(harness_gh),
+    }
+    gh = _ACTIONS_GH
+    for placeholder, value in replacements.items():
+        gh = gh.replace(placeholder, value)
+    workflow.fake("gh", gh)
+    state = Path(_OTHER["state_folder"])
+
+    # A draft that gets its worker.
+    workflow.add_pull_request(8)
+    # A ready pull request whose reviewer waits, idle, for checks that have now finished.
+    workflow.add_worktree(7, draft=False)
+    workflow.running("review-7")
+    notes = workflow.worktree(7) / state
+    notes.mkdir(parents=True)
+    started = notes / "review-7.started"
+    started.touch()
+    os.utime(started, (1_790_000_000, 1_790_000_000))
+    (notes / "review-7.idle").touch()
+    head = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
+    box = "\n" + "─" * 40 + "\n> \n" + "─" * 40 + "\n"
+    workflow.screen("● The checks are still running; I am waiting for them.\n" + box, "review-7")
+    (workflow.state / "reviews-7.json").write_text(
+        json.dumps(
+            [
+                {
+                    "body": "<!-- workflow-review round=1 result=passed -->",
+                    "commit_id": head,
+                    "submitted_at": "2026-09-21T15:00:00Z",
+                }
+            ]
+        )
+    )
+    (workflow.state / "rollup-7.json").write_text(
+        json.dumps(
+            [
+                {"__typename": "CheckRun", "name": name, "status": "COMPLETED",
+                 "conclusion": "SUCCESS"}
+                for name in ("Build result", "Images: what to run", "E2E")
+            ]
+        )
+    )  # fmt: skip
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stderr
+    # The gate: main's health, from the named repository, workflow file and check.
+    status = (workflow.repo / state / "main-status").read_text()
+    assert status.startswith("main: red since 2026-10-20T10:00:00Z, Build result ("), status
+    assert any(
+        "repos/example-owner/example-app/actions/workflows/build.yml/runs?head_sha=" in call
+        for call in workflow.calls("gh api")
+    )
+    # The tick: the reviewer's round read from the named repository, and the finished checks
+    # by their names.
+    assert "gh api --paginate repos/example-owner/example-app/pulls/7/reviews" in workflow.calls()
+    assert len(workflow.calls("tmux review-7 send-keys -t =review-7: -l The checks on ")) == 1
+    assert (workflow.repo / state / f"review-7.checks-nudged-{head}").exists()
+    # `session`: the worker's worktree set up by the named command, its notes in the folder.
+    assert workflow.is_running("ticket-8")
+    assert (workflow.worktree(8) / state / "ticket-8.url").exists()
+    assert any(
+        call.startswith("worktree-setup ") and call.endswith(str(workflow.worktree(8)))
+        for call in workflow.calls()
+    )
+    assert (workflow.repo / state / "tick.lock").exists()
+    # Nothing of the defaults: no other repository asked, no default state folder made.
+    assert not [call for call in workflow.calls("gh") if "NazmievBulat" in call]
+    for checkout in (workflow.repo, workflow.worktree(7), workflow.worktree(8)):
+        assert not (checkout / ".local" / "workflow").exists(), checkout

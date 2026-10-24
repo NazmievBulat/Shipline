@@ -21,6 +21,10 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "workflow"
 SESSION_LINK = "https://claude.ai/code/session_01TestLinkForWorkflow"
+# What `origin` is called in each test's repository, as in a real checkout, so the scripts take
+# the repository's owner and name from it (workflow_config.py); git is sent to the test's own
+# origin in its place.
+ORIGIN_URL = "https://github.com/NazmievBulat/Shipline.git"
 
 # A fake outside call whose cancellation is observable independently of runner speed. Its trap
 # first ignores TERM: GNU timeout sends a second one to the process group, and bash would run
@@ -853,7 +857,8 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
     template = _template()
     shutil.copytree(template / "origin.git", origin, symlinks=True)
     shutil.copytree(template / "repo", made.repo, symlinks=True)
-    made.git("remote", "set-url", "origin", str(origin))
+    made.git("remote", "set-url", "origin", ORIGIN_URL)
+    made.git("config", f"url.{origin}.insteadOf", ORIGIN_URL)
     return made
 
 

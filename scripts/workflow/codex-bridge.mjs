@@ -3,13 +3,32 @@
 // filesystem or arbitrary command tool is exposed to the bridge model.
 import { execFileSync } from "node:child_process"
 import { readFileSync, rmSync, writeFileSync } from "node:fs"
+import { dirname } from "node:path"
 import { createInterface } from "node:readline"
 import { setTimeout as delay } from "node:timers/promises"
 
 const [worktree, name] = process.argv.slice(2)
 if (!worktree || !/^ticket-[0-9]+$/.test(name ?? "")) process.exit(2)
 const socket = `codex-${name.slice(7)}`
-const notes = `${worktree}/.local/workflow/${name}`
+// The state folder named in shipline.json of the main checkout, `.local/workflow` when it names
+// none, as workflow_config.py reads it. A file that cannot be read stops the bridge.
+function stateFolder() {
+  const common = execFileSync(
+    "git",
+    ["-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+    { encoding: "utf8", timeout: 5000 },
+  ).trim()
+  let config = {}
+  try {
+    config = JSON.parse(readFileSync(`${dirname(common)}/shipline.json`, "utf8"))
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error
+  }
+  const folder = config.state_folder ?? ".local/workflow"
+  if (typeof folder !== "string" || !folder.trim()) throw new Error("shipline.json: state_folder")
+  return folder
+}
+const notes = `${worktree}/${stateFolder()}/${name}`
 function tmux(...args) {
   return execFileSync("tmux", ["-L", socket, ...args], { encoding: "utf8", timeout: 5000 })
 }
