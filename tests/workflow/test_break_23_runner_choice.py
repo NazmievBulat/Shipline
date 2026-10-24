@@ -1,8 +1,6 @@
-"""Breaking tests for the merge line's runner choice (examples/ci.yml, examples/e2e.yml), as an
-installation with a runner pool uses it: its own workflows plan on a bare `home-planner` label,
-pick `<prefix>-home-main` for a push to main when `CI_MAIN_RUNNER` is `on`, else the planner's
-`large`/`small` output on a first attempt, else `<prefix>-home`, and copy the examples' choice
-in front of their own.
+"""Breaking tests for the merge line's runner choice (examples/ci.yml, examples/e2e.yml). A
+repository with a runner pool copies the examples' choice into its own workflows, putting its
+own choice (a planner label, and its pool's labels) where the examples say `ubuntu-latest`.
 
 Each job's `runs-on` is read from the example files and worked out with tests/github_expression.py.
 """
@@ -21,14 +19,14 @@ _EXAMPLES = [_ROOT / "examples/ci.yml", _ROOT / "examples/e2e.yml"]
 HOSTED = "ubuntu-latest"
 MAIN = ["self-hosted", "example-app-home-main"]
 BATCH = "refs/heads/workflow/merge-batch-0123456789abcdef0123456789abcdef"
-# An installation's own choice, as the planner and its first attempt give it; the example's
-# `ubuntu-latest` is what it puts its own choice in place of.
+# A repository's own choice, put where the examples say `ubuntu-latest`: main's label for a push
+# to main, else what its planner chose on a first attempt, else the pool's ordinary label.
 OWN = (
     "(vars.CI_MAIN_RUNNER == 'on' && github.event_name == 'push' && github.ref == 'refs/heads/main'"
     " && 'example-app-home-main' || github.run_attempt == 1 && needs.plan.outputs.runner"
     " || 'example-app-home')"
 )
-OWN_PLANNER = "'home-planner'"
+OWN_PLANNER = "'example-app-home-planner'"
 
 
 def _runs_on(path: Path) -> dict[str, str]:
@@ -45,7 +43,7 @@ def _runs_on(path: Path) -> dict[str, str]:
 
 
 def _context(
-    event: str, ref: str, switch: str | None, attempt: int = 1, planned: str = "example-app-large"
+    event: str, ref: str, switch: str | None, attempt: int = 1, planned: str = "example-app-home-planned"
 ) -> dict[str, Any]:
     return {
         "github": {"event_name": event, "ref": ref, "run_attempt": str(attempt)},
@@ -55,7 +53,7 @@ def _context(
 
 
 def _installed(expression: str, job: str) -> str:
-    """The example's choice copied into an installation's workflow: its own choice where the
+    """The example's choice copied into a repository's workflow: its own choice where the
     example falls back to GitHub's runners."""
     own = OWN_PLANNER if job == "plan" else OWN
     assert expression.count(f"'{HOSTED}'") == 1, expression
@@ -73,7 +71,7 @@ _IDS = [f"{name}:{job}" for name, job, _ in _jobs()]
 def test_with_the_switch_off_the_copied_choice_changes_nothing(
     name: str, job: str, text: str
 ) -> None:
-    """Survives: with `CI_MAIN_RUNNER` off or unset the copied choice is the installation's own."""
+    """Survives: with `CI_MAIN_RUNNER` off or unset the copied choice is the repository's own."""
     own = OWN_PLANNER if job == "plan" else OWN
     installed = _installed(text, job)
     for switch in (None, "off", ""):
@@ -96,11 +94,11 @@ def test_with_the_switch_on_the_copied_choice_sends_a_scratch_run_to_main(
     name: str, job: str, text: str
 ) -> None:
     """Survives: a first attempt of the gate's dispatch, and a push to main, go to main's runners
-    in the installation's copy too; a pull request keeps the planner's choice."""
+    in a repository's copy too; a pull request keeps the planner's choice."""
     installed = _installed(text, job)
     assert value(installed, _context("workflow_dispatch", BATCH, "on")) == MAIN
     assert value(installed, _context("push", "refs/heads/main", "on")) == MAIN
-    expected = "home-planner" if job == "plan" else "example-app-large"
+    expected = "example-app-home-planner" if job == "plan" else "example-app-home-planned"
     assert value(installed, _context("pull_request", "refs/pull/7/merge", "on")) == expected
 
 
@@ -109,9 +107,9 @@ def test_a_scratch_run_whose_main_runners_are_offline_can_still_finish(
     name: str, job: str, text: str
 ) -> None:
     """Main's runners are offline or busy: the gate's prefix run must not wait for them forever.
-    Its next attempt (a re-run of the run, or of its stuck jobs) must be able to take the
-    ordinary label, as every other re-run in the installation does. Every attempt here asks for
-    main's label again, so with main's runners offline no attempt ever starts."""
+    Its next attempt (a re-run of the run, or of its stuck jobs) must be able to take another
+    label. Every attempt here asks for main's label again, so with main's runners offline no
+    attempt ever starts."""
     labels = {
         attempt: value(text, _context("workflow_dispatch", BATCH, "on", attempt))
         for attempt in (1, 2, 3)
@@ -126,7 +124,7 @@ def test_a_scratch_run_whose_main_runners_are_offline_can_still_finish(
         f"{name}:{job} asks for main's runners on every attempt: {labels}"
     )
     assert any(label != MAIN for label in installed.values()), (
-        f"{name}:{job}, as an installation copies it, asks for main's runners on every attempt: "
+        f"{name}:{job}, as a repository copies it, asks for main's runners on every attempt: "
         f"{installed}"
     )
 

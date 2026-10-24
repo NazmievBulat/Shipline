@@ -1,7 +1,7 @@
-"""Breaking tests for the lender (runner/lend_runners.py) as an installation runs it daily: two of
-main's runners on one machine, one or two lent to pull request jobs while main has none queued,
-the merge train's first member preferred, and now the merge gate's prefix runs counted as main's
-own. Each round is run against a stand-in GitHub that answers from a table."""
+"""Breaking tests for the lender (runner/lend_runners.py): main's runners on one machine, lent to
+pull request jobs while main has none under way, the merge train's first member preferred, and
+now the merge gate's prefix runs counted as main's own. Each round is run against a stand-in
+GitHub that answers from a table."""
 
 import importlib.util
 import json
