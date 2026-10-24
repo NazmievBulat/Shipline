@@ -46,8 +46,10 @@ network=example-app-runner
 subnet=172.30.0.0/24
 # Places 13 and 14 belong to main; place 15 belongs to the planner.
 most_runners=12
-# The most memory one job may use.
+# The most memory one job may use. A machine may name its own for its ordinary jobs, `job_memory`
+# in machines/<name>.sh, which install.sh writes into pool-settings.sh; without it this one holds.
 memory=10g
+job_memory=
 # An address nobody owns (it is reserved for examples). The firewall answers it with "refused",
 # which is how keep-runner.sh can tell, without being root, that the firewall is in place.
 firewall_marker=192.0.2.1

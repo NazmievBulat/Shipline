@@ -24,7 +24,6 @@ trap 'exit 130' INT TERM
 
 while true; do
   python3 "$here/github_budget.py" wait --identity runner keep-spare
-  slots=$(python3 "$here/ordinary_slots.py" "$ordinary_jobs" "$ordinary_blacksmith_jobs" "$repository")
   # Count every registration with the workflow label, even one we did not create, but not those of
   # another machine (names.sh): each machine has slots of its own. Nor one of main's runners lent
   # to PR jobs (lend_runners.py): that is no PR slot. An offline runner may return; a busy runner
@@ -36,6 +35,10 @@ while true; do
     # (planner-state.py). Replaced whole, so it never reads half of one.
     { cp "$listing" "$here/runners.tsv.new" && mv "$here/runners.tsv.new" "$here/runners.tsv"; } ||
       true
+    # From this listing too: a machine with no PR slot of its own takes one while no other machine
+    # has an online ordinary runner (ordinary_slots.py).
+    slots=$(python3 "$here/ordinary_slots.py" "$ordinary_jobs" "$ordinary_blacksmith_jobs" \
+      "$repository" "$other_machines" "$label" "$listing")
     occupied=$(awk -F '\t' -v label="$label" -v main="$main_label" -v first="$first_label" \
       -v total="$((ordinary_jobs + ordinary_spares))" \
       -v own="$own_runner" -v at="$own_number_at" -v others="$others" '

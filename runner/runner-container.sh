@@ -73,6 +73,7 @@ start_container() {
       --volume "$HOME/.local/state/ci-overflow/ledger:/home/runner/.local/state/ci-overflow/ledger" \
       "$image"
   else
-    docker run "$@" --memory "$memory" --shm-size 4g "$image"
+    # This machine's own cap of an ordinary job when it names one (settings.sh).
+    docker run "$@" --memory "${job_memory:-$memory}" --shm-size 4g "$image"
   fi
 }

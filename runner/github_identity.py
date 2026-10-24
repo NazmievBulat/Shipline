@@ -1,1 +1,1 @@
-../../scripts/workflow/github_identity.py
+../scripts/workflow/github_identity.py

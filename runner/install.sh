@@ -87,7 +87,9 @@ if [ "$known_machine" = no ]; then
   exit 1
 fi
 other_machines=$(printf '%s\n' $known | grep -vx -- "$machine" | tr '\n' ' ' | sed 's/ $//')
-# The machine's own roles and counts, in place of the defaults of settings.sh.
+# The machine's own roles and counts, in place of the defaults of settings.sh, and the memory cap
+# of one of its ordinary jobs when it names one.
+job_memory=
 . "$here/machines/$machine.sh"
 has_role() {
   case " $roles " in
@@ -111,10 +113,24 @@ has_role docker || docker_runners=0
 spares=0
 ! has_role ordinary || spares=$ordinary_spares
 
+# A machine of a pool of several may give all its PR slots to the others (README.md, "Moving a
+# machine's PR slots"): its spare still takes one while no other machine has an online ordinary
+# runner (keep-spare.sh), so it needs the spare. The only machine of the pool keeps one slot.
 if ! [ "$runners" -ge 0 ] 2>/dev/null || ! [ "$docker_runners" -ge 0 ] 2>/dev/null ||
-  { has_role ordinary && [ "$runners" -lt 1 ]; } ||
+  { has_role ordinary && [ "$runners" -lt 1 ] &&
+    { [ -z "$other_machines" ] || [ "$spares" -lt 1 ]; }; } ||
   [ $((runners + spares + docker_runners)) -gt "$most_runners" ]; then
   echo "There must be at least 1 ordinary runner, and at most $most_runners runners of both kinds together (including the spare)." >&2
+  exit 1
+fi
+# Docker reads the cap as a whole number with its unit (runner-container.sh); pool-settings.sh is
+# read as shell, so nothing else is written into it.
+size=
+case "$job_memory" in
+  [1-9]*[kmg]) size=${job_memory%?} ;;
+esac
+if [ -n "$job_memory" ] && case "$size" in '' | *[!0-9]*) true ;; *) false ;; esac; then
+  echo "job_memory must be a size Docker reads, a whole number and k, m or g (6g), not '$job_memory'." >&2
   exit 1
 fi
 ordinary_total=$((runners + spares))
@@ -208,6 +224,7 @@ systemctl --user stop example-app-runner-main.service example-app-runner-main-2.
   printf "other_machines='%s'\n" "$other_machines"
   printf 'ordinary_jobs=%s\n' "$runners"
   printf 'ordinary_blacksmith_jobs=%s\n' "$ordinary_blacksmith_jobs"
+  [ -z "$job_memory" ] || printf 'job_memory=%s\n' "$job_memory"
 } >"$installed/pool-settings.sh"
 # The planner's network goes too: it starts again on one made from the current `subnet`.
 for old_network in $(docker network ls --quiet --filter "name=^$network"); do

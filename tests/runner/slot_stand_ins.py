@@ -1,9 +1,10 @@
-"""A machine of the runner pool, with stand-ins for what its scripts touch.
+"""A machine of the runner pool, installed by `runner/install.sh` from a copy of `runner/`, with
+stand-ins for what its scripts touch.
 
-`systemctl`, `docker` and `gh` are small scripts placed first on the `PATH`; they write what they
-were asked to a log. `gh` keeps GitHub's runner list in a file the test prepares, and applies to
-it the labels a script adds, sets or removes, so a test reads the labels a runner ends with. The
-machine's local settings and its pool settings are files in the test's own directory.
+`systemctl`, `docker`, `loginctl`, `sleep` and `gh` are small scripts placed first on the `PATH`;
+they write what they were asked to a log. `gh` keeps GitHub's runner list in a file the test
+prepares, and applies to it the labels a script adds or removes, so a test reads the labels a
+runner ends with. `sleep` ends a script at its first pause, so a supervisor runs one round.
 
 Every name the pool's scripts are known by (their settings, files and arguments) is in this file
 alone, so the tests read as what a machine does.
@@ -18,30 +19,48 @@ from pathlib import Path
 
 RUNNER = Path(__file__).resolve().parents[2] / "runner"
 PREFIX = "example-app"
-# Every machine's runners carry the same labels, built from one base label (`runner.label`):
-# ordinary pull request jobs ask for it, and a spare carries the standby one until it takes a
-# slot. Machines differ only by their runners' names.
+REPOSITORY = "example-owner/example-app"
+# Every machine's runners carry the same labels (settings.sh): ordinary pull request jobs ask for
+# the base label, the train's first member for the first label, and an ordinary runner carries
+# the standby label until the spare supervisor gives it a slot. Machines differ only by their
+# runners' names.
 LABEL = f"{PREFIX}-home"
 STANDBY = f"{LABEL}-standby"
+FIRST = f"{LABEL}-first"
 MAIN = f"{LABEL}-main"
 DOCKER = f"{LABEL}-docker"
-# This machine, and the other machine of the pool.
-MACHINE = "machine-two"
-OTHER = "machine-one"
-SHARED_JOB_MEMORY = "8g"
-SPARE_UNIT = f"{PREFIX}-runner-spare.service"
-ORDINARY_UNIT = f"{PREFIX}-runner@"
+# The machine that gives its pull request slots, and the other machine of the pool.
+MACHINE = "home"
+OTHER = "office"
+# The memory cap of one ordinary job that settings.sh gives every machine.
+SHARED_JOB_MEMORY = "10g"
+# How `sleep` ends a script: it ran one round, up to its first pause.
+ROUND = 75
 
 
 def runner_name(machine: str, kind: str = "", number: int = 1) -> str:
     """The name a machine's runner registers with GitHub by: `<machine>-1` for an ordinary one,
-    `<machine>-<kind>-1` for the others."""
+    `<machine>-main` and `<machine>-docker-1` for main's and Docker ones (names.sh)."""
+    if kind == "main":
+        return f"{machine}-main"
     return f"{machine}-{kind}-{number}" if kind else f"{machine}-{number}"
 
+
+def ordinary_unit(number: int) -> str:
+    return f"{PREFIX}-runner@{number}.service"
+
+
+SPARE_UNIT = f"{PREFIX}-runner-spare.service"
 
 _LOGGING = """#!/bin/bash
 printf '%s\\n' "${0##*/} $*" >> "@STATE@/calls.log"
 """
+_STAND_INS = {
+    "systemctl": _LOGGING,
+    "docker": _LOGGING,
+    "loginctl": _LOGGING + "echo yes\n",
+    "sleep": _LOGGING + f"exit {ROUND}\n",
+}
 # GitHub's runner list and runner labels, kept in runners.json: missing, GitHub cannot be read.
 _GH = """#!/usr/bin/env python3
 import json, re, subprocess, sys
@@ -61,14 +80,10 @@ while rest:
         key, _, value = rest.pop(0).partition("=")
         if key in ("labels[]", "labels"):
             labels.append(value)
-    elif word == "--input":
-        source = rest.pop(0)
-        given = json.load(sys.stdin if source == "-" else open(source))
-        labels += given.get("labels", [])
     elif word in ("-q", "--jq"):
         jq = rest.pop(0)
-    elif word == "--paginate":
-        pass
+    elif word in ("-H", "--header", "--hostname"):
+        rest.pop(0)
     elif not word.startswith("-"):
         path = word
 try:
@@ -89,10 +104,10 @@ else:
     names = [label["name"] for label in runner["labels"]]
     if method == "POST":
         names += [label for label in labels if label not in names]
-    elif method == "PUT":
-        names = ["self-hosted", *labels]
     elif method == "DELETE":
-        names = [name for name in names if found[2] is None or name != found[2]]
+        names = [name for name in names if name != found[2]]
+    else:
+        sys.exit(1)
     runner["labels"] = [{"name": name} for name in names]
     with open(f"{state}/runners.json", "w") as kept:
         json.dump(runners, kept)
@@ -115,22 +130,40 @@ class Machine:
         return self.root / "state"
 
     @property
-    def local_settings(self) -> Path:
-        return self.root / "home" / ".config" / "shipline" / "runner.sh"
+    def source(self) -> Path:
+        """The copy of `runner/` that is installed from."""
+        return self.root / "source"
+
+    @property
+    def installed(self) -> Path:
+        return self.root / "home" / ".local" / "share" / f"{PREFIX}-runner"
 
     @property
     def pool_settings(self) -> Path:
-        return self.root / "home" / ".config" / PREFIX / "pool.sh"
+        return self.installed / "pool-settings.sh"
 
-    def settle(self, slots: int, alone: bool = False, job_memory: str | None = None) -> None:
+    def settle(
+        self,
+        slots: int,
+        alone: bool = False,
+        job_memory: str | None = None,
+        spares: int | None = None,
+    ) -> None:
         """Write the machine's local settings: its ordinary pull request slots, whether it is
-        the only machine of the pool, and the memory cap of one ordinary job."""
-        self.local_settings.parent.mkdir(parents=True, exist_ok=True)
-        others = "" if alone else OTHER
-        lines = [f"machine={self.name}", f"other_machines=({others})", f"ordinary_jobs={slots}"]
+        the only machine of the pool, the memory cap of one ordinary job, and its spares."""
+        machines = self.source / "machines"
+        shutil.rmtree(machines, ignore_errors=True)
+        machines.mkdir()
+        if not alone:
+            (machines / f"{OTHER}.sh").write_text(
+                "roles='ordinary'\nordinary_jobs=2\ndocker_runners=0\n"
+            )
+        lines = ["roles='ordinary'", f"ordinary_jobs={slots}", "docker_runners=0"]
         if job_memory is not None:
             lines.append(f"job_memory={job_memory}")
-        self.local_settings.write_text("\n".join(lines) + "\n")
+        if spares is not None:
+            lines.append(f"ordinary_spares={spares}")
+        (machines / f"{self.name}.sh").write_text("\n".join(lines) + "\n")
 
     def runners(self, *listed: tuple[str, str, list[str]]) -> None:
         """What GitHub lists: (name, status, labels) of each runner."""
@@ -159,10 +192,11 @@ class Machine:
         """GitHub's runner list cannot be read."""
         (self.state / "runners.json").unlink()
 
-    def run(self, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    def _run(self, *command: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", str(RUNNER / script), *arguments],
+            command,
             env=self.env,
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=60,
@@ -170,26 +204,61 @@ class Machine:
         )
 
     def install(self) -> subprocess.CompletedProcess[str]:
-        return self.run("install.sh")
+        return self._run("sh", str(self.source / "install.sh"), "--machine", self.name)
 
-    def keep_spare(self) -> subprocess.CompletedProcess[str]:
-        """One round of the spare's supervisor."""
-        return self.run("keep-spare.sh", "--once")
+    def installed_as(self, slots: int, **settings: str | int) -> None:
+        """Install the machine with its settings, then forget what the install called."""
+        self.settle(slots, **settings)  # type: ignore[arg-type]
+        done = self.install()
+        assert done.returncode == 0, done.stderr
+        (self.state / "calls.log").unlink(missing_ok=True)
+
+    def spare_round(self) -> subprocess.CompletedProcess[str]:
+        """One round of the spare supervisor, up to its first pause (ROUND)."""
+        return self._run("sh", str(self.installed / "keep-spare.sh"))
 
     def ordinary_slots(self) -> int:
-        """The ordinary slots this machine may hold now, as `ordinary_slots.py` counts them."""
-        done = subprocess.run(
-            ["python3", str(RUNNER / "ordinary_slots.py")],
-            env=self.env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=True,
+        """The ordinary slots of this machine now, from the runner list the spare supervisor
+        read: called as keep-spare.sh calls it."""
+        listing = self.root / "listing.tsv"
+        runners = json.loads((self.state / "runners.json").read_text())["runners"]
+        listing.write_text(
+            "".join(
+                "\t".join(
+                    [
+                        str(runner["id"]),
+                        runner["name"],
+                        runner["status"],
+                        str(runner["busy"]).lower(),
+                        ",".join(label["name"] for label in runner["labels"]),
+                    ]
+                )
+                + "\n"
+                for runner in runners
+            )
         )
+        done = self._run(
+            "sh",
+            "-c",
+            ". ./settings.sh && . ./pool-settings.sh && python3 ./ordinary_slots.py "
+            '"$ordinary_jobs" "$ordinary_blacksmith_jobs" "$repository" '
+            '"$other_machines" "$label" "$1"',
+            "ordinary-slots",
+            str(listing),
+            cwd=self.installed,
+        )
+        assert done.returncode == 0, done.stderr
         return int(done.stdout.strip())
 
     def start_job_container(self) -> subprocess.CompletedProcess[str]:
-        return self.run("runner-container.sh", runner_name(self.name))
+        """Start an ordinary job's container as keep-runner.sh starts it."""
+        return self._run(
+            "sh",
+            "-c",
+            ". ./settings.sh && . ./pool-settings.sh && . ./runner-container.sh && "
+            f"start_container ordinary {PREFIX}-runner-1 {PREFIX}-runner-1 </dev/null",
+            cwd=self.installed,
+        )
 
     def calls(self, program: str) -> list[str]:
         log = self.state / "calls.log"
@@ -200,20 +269,25 @@ class Machine:
 def make_machine(root: Path) -> Machine:
     machine = Machine(root)
     machine.state.mkdir(parents=True)
+    shutil.copytree(RUNNER, machine.source)
+    # The images are built by a stand-in docker; install.sh copies their Dockerfiles.
+    (machine.source / "Dockerfile").touch()
+    (machine.source / "vm.Dockerfile").touch()
     stand_ins = root / "bin"
     stand_ins.mkdir()
-    for program, text in {"systemctl": _LOGGING, "docker": _LOGGING, "gh": _GH}.items():
+    for program, text in {**_STAND_INS, "gh": _GH}.items():
         path = stand_ins / program
         path.write_text(text.replace("@STATE@", str(machine.state)))
         path.chmod(0o755)
     machine.runners()
     home = root / "home"
     home.mkdir()
+    real = {os.path.dirname(shutil.which(tool) or "/usr/bin/x") for tool in ("python3", "jq")}
     machine.env = {
-        "PATH": f"{stand_ins}:{os.path.dirname(shutil.which('bash') or '/bin/bash')}:/usr/bin:/bin",
+        "PATH": ":".join([str(stand_ins), *sorted(real), "/usr/bin", "/bin"]),
         "HOME": str(home),
         "RUNNER_PREFIX": PREFIX,
-        "SHIPLINE_RUNNER_SETTINGS": str(machine.local_settings),
-        "GH_TOKEN": "stand-in",
+        "RUNNER_KVM_DEVICE": str(root / "no-kvm"),
+        "WORKFLOW_GITHUB_RAW_GH": str(stand_ins / "gh"),
     }
     return machine

@@ -91,3 +91,32 @@ the prefix `example-app` against `tests/runner/expected/`.
 The image build runs from `/var/lib/<prefix>-runner/checkout`, a link to the repository's main
 checkout, with the values of `images.env` beside it (`RUNNER_PREFIX`, and
 `SHIPLINE_RUNNER_IMAGE_BUILD` when the repository names one); the install writes both.
+
+## Moving a machine's PR slots
+
+A machine that also runs the sessions, the planner and main's runners can go over its limit while
+another machine has room. Its ordinary PR slots may then move to the machine with room, but only
+once measured use there shows that room on every day of a week. The machine table and its reasons
+are written from the measured reports, never from guesses.
+
+1. Both machines run this version for seven whole days; `<prefix>-runner-usage.timer` writes one
+   line a minute of what each has free.
+2. On the receiving machine, run `python3 usage.py report --days 7`. It prints each day's busiest
+   hour. Only when it ends with `Room every day: yes` (exit 0) do the slots move. When it says
+   there is no room, nothing moves, and the report goes to the owner.
+3. The move is a change of each machine's own settings and an install, by the machine's owner and
+   on the owner's word: `ordinary_jobs` lowered on the giving machine and raised by as many on the
+   receiving one, which may also name `job_memory`, its own cap of one ordinary job (`6g`; without
+   it, `memory` of `settings.sh` holds). Then `install.sh` on each. Nothing names where the jobs
+   go: every machine's runners carry the same labels, so GitHub gives a job to whichever runner is
+   free.
+4. A machine may keep no PR slot of its own (`ordinary_jobs=0`) while the pool has another
+   machine; the only machine of a pool keeps at least one. PR jobs still run when no other machine
+   has an online ordinary runner: the giving machine's spare then takes one slot, and gives it
+   back once another machine's ordinary runner is online again (`keep-spare.sh`,
+   `ordinary_slots.py`). Main's runner lent to PR jobs does not count, as it is busy exactly when
+   main has work.
+5. The pull request that records the move states, measured before and after it: the queue wait of
+   PR jobs (each job's `started_at` minus `created_at`: median, 90th percentile and longest), and
+   each machine's CPU pressure at its busiest hour.
+6. When timing-sensitive tests fail on the receiving machine while it is full, the slots go back.
