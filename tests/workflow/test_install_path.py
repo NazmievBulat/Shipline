@@ -289,6 +289,12 @@ def _launched_commands() -> list[str]:
     return listed.split()
 
 
+def _configured_commands() -> list[str]:
+    """The repository's own commands `shipline` runs by the names its `shipline.json` gives."""
+    text = (_SHIPLINE / "bin" / "shipline").read_text()
+    return text.split("CONFIGURED=(\n", 1)[1].split(")", 1)[0].split()
+
+
 def _launch(
     launcher: Path, *args: str, cwd: Path, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -515,13 +521,16 @@ def test_the_rules_name_each_command_as_shipline_command() -> None:
         ]
         assert by_path == [], document
         assert "git-common-dir" not in text, document
-        assert set(re.findall(r"shipline ([a-z-]+)", text)) <= set(commands), document
+        named = set(re.findall(r"shipline ([a-z-]+)", text))
+        assert named <= set(commands) | set(_configured_commands()), document
     rules = (_WORKFLOW / "RULES.md").read_text()
     assert set(re.findall(r"`shipline ([a-z-]+)", rules)) == {
+        "browser-tests-for-changes",
         "install-hooks",
         "install-timer",
         "merge-when-current",
         "notify",
+        "pre-train-checks",
         "review-panel",
         "session",
         "tick",

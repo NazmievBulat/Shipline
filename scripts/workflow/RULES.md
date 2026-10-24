@@ -507,7 +507,7 @@ The analyst is the session `analyst-<name>`. The tick starts one a day, from 08:
 day's metrics report is written, as `analyst-day-<date>` over the last day, and on Sunday as
 `analyst-week-<date>` over the last 7 days, when the 5-hour usage window allows a start (not
 above 85% unless it resets within the hour). By hand it is
-`scripts/workflow/session start analyst <name> [1-7]`, the number being the days it reads. Its
+`shipline session start analyst <name> [1-7]`, the number being the days it reads. Its
 sentence is "Analyse the workflow over the last day (or the last N days), as analyst-<name>, by
 the section Analyse the workflow of AGENTS.md in this worktree". It runs Claude Opus at medium
 effort in a copy of `main` on no branch, and has 40 minutes: the tick stops it then, whatever
