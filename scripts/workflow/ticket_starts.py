@@ -68,6 +68,10 @@ MODEL_CALLS_PER_PICK = 3
 ASK_AGAIN_SECONDS = 30 * 60
 MODEL = "claude-haiku-5-5"
 MODEL_SECONDS = 90
+# A fetch of the tickets' heads, and any other git call; `decide` makes them under its lock,
+# which the tick's starts wait for. One fetch that stalls ends the fetches of that pick or call.
+FETCH_SECONDS = 15
+GIT_SECONDS = 60
 # The usage rule the orchestrator kept for its starts (AGENTS.md, the wake's check-in).
 USAGE_CEILING = 85
 USAGE_RESET_SECONDS = 3600
@@ -196,13 +200,24 @@ def model_files(body: str, main: Path) -> list[str] | None:
     return list(dict.fromkeys(paths)) or None
 
 
-def git(main: Path, *arguments: str) -> str:
-    done = subprocess.run(
-        ["git", "-C", str(main), *arguments], capture_output=True, text=True, check=False
-    )
+def git(main: Path, *arguments: str, timeout: float = GIT_SECONDS) -> str:
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(main), *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise Stalled(f"git {arguments[0]} gave no answer in {timeout:.0f} s") from None
     if done.returncode != 0:
         raise OSError(f"git {arguments[0]} failed: {done.stderr.strip()}")
     return done.stdout.strip()
+
+
+class Stalled(OSError):
+    """A git call ran out of its time: the network, most likely, gave no answer."""
 
 
 @dataclass
@@ -213,6 +228,8 @@ class Files:
     model_calls: int = MODEL_CALLS_PER_PICK
     # The tickets the model was asked about in this pick, answered or not.
     asked: set[str] = field(default_factory=set)
+    # A fetch ran out of its time: no other is tried, and the heads not fetched stay unknown.
+    stalled: bool = False
 
     @property
     def notes(self) -> Path:
@@ -244,7 +261,7 @@ class Files:
             kept = self.kept(str(pull["number"]))
             if kept is None or kept[1][-1] != pull["headRefOid"]:
                 wanted.append(pull)
-        if not wanted:
+        if not wanted or self.stalled:
             return set()
         main = "+refs/heads/main:refs/workflow/files/main"
         specs = {
@@ -262,16 +279,34 @@ class Files:
                 "origin",
                 main,
                 *specs.values(),
+                timeout=FETCH_SECONDS,
             )
             return set(specs)
+        except Stalled as error:
+            self.stalled = True
+            print(f"cannot fetch the heads of tickets: {error}", file=sys.stderr)
+            return set()
         except OSError as error:
             print(f"cannot fetch the heads of tickets together: {error}", file=sys.stderr)
         # One branch gone, as after a rename, fails the whole fetch: the others are fetched alone.
         fetched = set()
         for number, spec in specs.items():
             try:
-                git(self.main, "fetch", "--quiet", "--no-write-fetch-head", "origin", main, spec)
+                git(
+                    self.main,
+                    "fetch",
+                    "--quiet",
+                    "--no-write-fetch-head",
+                    "origin",
+                    main,
+                    spec,
+                    timeout=FETCH_SECONDS,
+                )
                 fetched.add(number)
+            except Stalled as error:
+                self.stalled = True
+                print(f"cannot fetch the head of {number}: {error}", file=sys.stderr)
+                break
             except OSError as error:
                 print(f"cannot fetch the head of {number}: {error}", file=sys.stderr)
         return fetched
@@ -361,7 +396,11 @@ def labels_of(pull: dict[str, Any]) -> set[str]:
 
 def running_numbers() -> set[str]:
     done = subprocess.run(
-        ["bash", str(here / "session"), "list"], capture_output=True, text=True, check=False
+        ["bash", str(here / "session"), "list"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=GIT_SECONDS,
     )
     return set(re.findall(r"^(?:ticket|audit|review|codex)-([0-9]+)\s", done.stdout, re.M))
 
@@ -406,7 +445,11 @@ def machine_wait(notes: Path, moment: int) -> str | None:
 def usage_wait(moment: int) -> str | None:
     """Why the 5-hour usage window holds a start now, or None. `decide` asks it too."""
     usage = subprocess.run(
-        ["bash", str(here / "usage")], capture_output=True, text=True, check=False
+        ["bash", str(here / "usage")],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=GIT_SECONDS,
     )
     for line in usage.stdout.splitlines():
         words = line.split()
@@ -541,7 +584,12 @@ class Queue:
         shared = []
         for other, theirs in self.busy_files.items():
             both = next(
-                (both for mine in found for their in theirs or [] if (both := overlap(mine, their))),
+                (
+                    both
+                    for mine in found
+                    for their in theirs or []
+                    if (both := overlap(mine, their))
+                ),
                 None,
             )
             if both:

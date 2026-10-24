@@ -2,6 +2,7 @@
 
 import json
 import re
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -816,3 +817,84 @@ def test_the_metrics_read_iso_times(team: Workflow) -> None:
     assert inside.returncode == before.returncode == 0, inside.stderr
     assert json.loads(inside.stdout)["kinds"]["restart"] == {"done": 1, "refused": 0}
     assert json.loads(before.stdout)["kinds"]["restart"] == {"done": 0, "refused": 0}
+
+
+def test_a_recorded_codex_choice_on_a_cloud_built_ticket_starts_codex(team: Workflow) -> None:
+    team.add_pull_request(7, labels=("workflow", "priority:+medium"))
+    (team.repo / ".local/workflow").mkdir(parents=True, exist_ok=True)
+    (team.repo / ".local/workflow/cloud-built-7").touch()
+
+    assert _decide(team, "program", "7", "codex").returncode == 0
+    ticked = team.run_script("tick", env={"WORKFLOW_WORKER_PROGRAM": "claude"})
+
+    assert ticked.returncode == 0, ticked.stderr
+    assert team.is_running("codex-7")
+    assert not (team.repo / ".local/workflow/cloud-7").exists()
+
+
+def test_an_allowance_needs_two_rounds_sent_back(team: Workflow) -> None:
+    _ticket(team, 8, "docs/two", draft=False, labels=("workflow", "priority:+medium"))
+    (team.state / "reviews-8.json").write_text(
+        json.dumps(
+            [
+                {"body": "<!-- workflow-review round=1 result=sent-back --> one"},
+                {"body": "<!-- workflow-review round=2 result=passed --> two"},
+            ]
+        )
+    )
+
+    done = _decide(team, "allowance", "8", "--round", "3", "--owner", "one more round")
+
+    assert done.returncode == 1
+    assert "1 round sent back: an allowance is needed only after two" in done.stderr
+    assert not (team.repo / ".local/workflow/review-8.allow-round").exists()
+
+
+def test_a_start_again_of_a_started_ticket_is_told_as_already_started(team: Workflow) -> None:
+    _ticket(team, 8, "docs/two")
+    assert _decide(team, "start", "8", at=_EVENING).returncode == 0
+
+    again = _decide(team, "start", "8", at=_EVENING + 60)
+
+    assert again.returncode == 1
+    assert "already started: 8 has the label workflow" in again.stderr
+    assert "refused" not in again.stderr
+    later = {"WORKFLOW_NOW": str(_EVENING + 1300), "TZ": "America/New_York"}
+    assert team.run_script("wake", env=later).returncode == 0
+    [prompt] = team.sent()
+    assert "8 already started" in prompt
+    assert "start of 8 refused" not in prompt
+
+
+def test_a_stalled_fetch_ends_the_decision_as_files_not_known(team: Workflow) -> None:
+    _ticket(team, 8, "docs/two")
+    real = subprocess.run(
+        ["bash", "-c", "command -v git"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    team.fake(
+        "git",
+        "#!/bin/bash\n"
+        'for word in "$@"; do [ "$word" = fetch ] && { echo x >> "@STATE@/fetches"; '
+        "/usr/bin/sleep 300; }; done\n"
+        f'exec {real} "$@"\n',
+    )
+    started = time.monotonic()
+
+    done = _decide(team, "start", "8", at=_EVENING)
+
+    assert time.monotonic() - started < 25
+    assert done.returncode == 1
+    assert "its files are not known yet" in done.stderr
+    # One fetch timed out: the call tried no other.
+    assert (team.state / "fetches").read_text().count("x") == 1
+
+
+def test_owner_words_left_blank_are_no_word_of_his(team: Workflow) -> None:
+    _ticket(team, 8, "docs/two")
+
+    done = _decide(
+        team, "answer", "8", "--area", "money", "--question", "q", "--meaning", "m", "--owner", " "
+    )
+
+    assert done.returncode == 1
+    assert "only the owner answers" in done.stderr

@@ -124,6 +124,10 @@ class Refused(Exception):
     """A check failed: the decision is recorded as refused, with this reason."""
 
 
+class AlreadyStarted(Refused):
+    """A start of a ticket that has the label: recorded with this reason, told as started."""
+
+
 class Failed(Exception):
     """GitHub or a file could not be read or written: nothing new is decided."""
 
@@ -352,17 +356,22 @@ def labels_of(pull: dict[str, Any]) -> set[str]:
 
 def sessions() -> set[str]:
     done = subprocess.run(
-        ["bash", str(here / "session"), "list"], capture_output=True, text=True, check=False
+        ["bash", str(here / "session"), "list"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
     )
     if done.returncode != 0:
         raise Failed(f"session list failed: {done.stderr.strip()}")
     return {line.split()[0] for line in done.stdout.splitlines() if line.split()}
 
 
-def next_round(number: int) -> int:
-    """One above the highest independent round published, from every page of the reviews."""
+def rounds(number: int) -> tuple[int, int]:
+    """The next independent round, one above the highest published, and how many rounds were
+    sent back, from every page of the reviews, as the tick counts them for its reviewer starts."""
     text = gh("api", "--paginate", f"{CONFIG.api}/pulls/{number}/reviews").stdout
-    decoder, position, rounds = json.JSONDecoder(), 0, [0]
+    decoder, position, published, sent_back = json.JSONDecoder(), 0, [0], 0
     while position < len(text):
         if text[position].isspace():
             position += 1
@@ -370,9 +379,12 @@ def next_round(number: int) -> int:
         page, position = decoder.raw_decode(text, position)
         for review in page if isinstance(page, list) else []:
             body = review.get("body") or "" if isinstance(review, dict) else ""
-            if found := re.match(r"<!-- workflow-review round=([0-9]+)", body):
-                rounds.append(int(found[1]))
-    return max(rounds) + 1
+            marker = r"<!-- workflow-review round=([0-9]+)( result=(sent-back|passed))? -->"
+            if found := re.match(marker, body):
+                published.append(int(found[1]))
+                # A marker from before outcomes were recorded counts as sent back.
+                sent_back += found[3] != "passed"
+    return max(published) + 1, sent_back
 
 
 # The checks: each returns the kind, the choice, its details and its evidence, or refuses.
@@ -393,7 +405,7 @@ def check_start(context: Context, number: int, after: int | None, owner: str | N
     if not pull.get("isDraft"):
         raise Refused(f"{number} is not a draft")
     if LABEL in labels_of(pull):
-        raise Refused(f"{number} already has the label {LABEL}")
+        raise AlreadyStarted(f"already started: {number} has the label {LABEL}")
     names = CONFIG.labels.priority
     if not any(names[name] in labels_of(pull) for name in priority.PRIORITIES):
         raise Refused(f"{number} has no priority label")
@@ -541,7 +553,12 @@ def check_allowance(context: Context, number: int, round: int, owner: str | None
     if owner is None:
         raise Refused("an allowance needs the owner's words (--owner)")
     context.pull(number)
-    wanted = next_round(number)
+    wanted, sent_back = rounds(number)
+    if sent_back < 2:
+        times = "round" if sent_back == 1 else "rounds"
+        raise Refused(
+            f"{number} has {sent_back} {times} sent back: an allowance is needed only after two"
+        )
     if round != wanted:
         raise Refused(f"the next independent round is {wanted}, not {round}")
     return Plan(
@@ -717,7 +734,8 @@ def decide(kind: str, number: int, options: argparse.Namespace) -> int:
     if not session:
         print("the orchestrator is not registered in .local/workflow/orchestrator", file=sys.stderr)
         return 3
-    owner = options.owner
+    # Blank words are no word of the owner's.
+    owner = options.owner if options.owner and options.owner.strip() else None
     with locked():
         context = Context(notes, now(), session)
         repair(notes)
@@ -754,7 +772,8 @@ def decide(kind: str, number: int, options: argparse.Namespace) -> int:
             refusal = None
         except Refused as refused:
             refusal = str(refused)
-            plan = Plan(kind, f"{kind} {number}", {}, [])
+            started = isinstance(refused, AlreadyStarted)
+            plan = Plan(kind, f"{kind} {number}", {"already_started": True} if started else {}, [])
         stamp = datetime.fromtimestamp(context.moment, UTC).strftime("%Y%m%dT%H%M%SZ")
         rule = PROGRAM_RULES.get(plan.details.get("program", ""), "") or RULES[plan.kind]
         record = {
@@ -775,7 +794,10 @@ def decide(kind: str, number: int, options: argparse.Namespace) -> int:
             record["reason"] = refusal
             append(notes, record)
             print(json.dumps(record))
-            print(f"refused: {refusal}", file=sys.stderr)
+            print(
+                refusal if plan.details.get("already_started") else f"refused: {refusal}",
+                file=sys.stderr,
+            )
             return 1
         append(notes, record)
         act(context, record)
@@ -808,7 +830,10 @@ def wake(notes: Path, moment: int) -> dict[str, Any]:
                 f'answered {line["number"]} ({details["area"]}): {details["question"]}: "{details["reply"]}"'
             )
         elif line.get("kind") == "start" and line.get("status") == "refused":
-            events.append(f"start of {line['number']} refused: {line.get('reason')}")
+            if (line.get("details") or {}).get("already_started"):
+                events.append(f"{line['number']} already started")
+            else:
+                events.append(f"start of {line['number']} refused: {line.get('reason')}")
     if len(events) > TOLD_EVENTS:
         events = [*events[:TOLD_EVENTS], f"and {len(events) - TOLD_EVENTS} more in {RECORDS}"]
     return {"held": held, "events": events, "cursor": len(lines)}
