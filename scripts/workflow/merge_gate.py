@@ -495,8 +495,13 @@ def verdict(
     if (
         run.get("conclusion") == "cancelled"
         and all(job.get("conclusion") in (None, "success", "skipped", "cancelled") for job in parts)
-        and lender_replanning(
-            str(run["id"]), head=run.get("head_sha"), attempt=run.get("run_attempt", 1)
+        and (
+            lender_replanning(
+                str(run["id"]), head=run.get("head_sha"), attempt=run.get("run_attempt", 1)
+            )
+            # The gate cancelled it, still running, once main inherited its result: that
+            # result stands for it.
+            or cancelled_inherited(run)
         )
     ):
         return "pending", [plan]
@@ -682,6 +687,28 @@ def wake_log(line: str) -> None:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a") as output:
         output.write(f"{int(time.time())} {line}\n")
+
+
+def _cancel(found: list[dict[str, Any]], folder: Path, whose: str) -> None:
+    """Cancel each run of `found` still queued or running, so that it holds no runner ahead of
+    live work. A cancel GitHub refuses (the run already finishing) goes to the wake log once and
+    stops nothing; a cancel the shared budget held back was never sent and is tried next call."""
+    for run in found:
+        refused = folder / f"cancel-refused-{run['id']}"
+        if run.get("status") == "completed" or refused.exists():
+            continue
+        try:
+            done = command("gh", "run", "cancel", str(run["id"]), "-R", REPOSITORY, check=False)
+            error = (done.stderr.strip() or done.stdout.strip()) if done.returncode else ""
+        except BudgetWaiting:
+            raise
+        except Refused as failure:
+            # A cancel that outlasted its deadline failed like any other.
+            error = str(failure)
+        if error:
+            note = f"could not cancel run {run['id']} of {whose}: {error}"
+            refused.write_text(note + "\n")
+            wake_log(note)
 
 
 def pull_service_wait(
@@ -896,6 +923,8 @@ def push_health(
     # Only pending checks may borrow a result. Main's own failures above always win.
     inherited = inherited_green(head)
     sources: list[str] = []
+    # Main's own runs whose result it inherited: under the lock they are cancelled, below.
+    redundant: list[dict[str, Any]] = []
     if inherited:
         ci_inherited = False
         unproven = inherited.get("ci_unproven")
@@ -919,6 +948,7 @@ def push_health(
                 assessments[0] = ("green", [], assessments[0][2])
                 sources.append(f"CI run {inherited['ci_run']}")
                 ci_inherited = True
+                redundant += ci
         own_images = any(run["head_sha"] == head for run in images)
         if inherited.get("images_run") and inherited.get("images_complete") is True:
             # Every image job passed on this very tree, which holds every earlier push of main
@@ -932,10 +962,19 @@ def push_health(
                     ),
                 ]
                 sources.append(f"Docker images run {inherited['images_run']}")
+                redundant += images
         elif ci_inherited and not own_images and main_images_needed(head, ci):
             # Main asks this after its own green CI above; an inherited CI asks it here. An
             # earlier push's image run in the list does not stand in for the head's own.
             assessments.append(("pending", ["Docker images have not started"], {}))
+        if retry and retry_folder is not None and redundant:
+            try:
+                cancel_inherited(head, inherited, redundant, retry_folder)
+            except BudgetWaiting:
+                # Never sent: the next tick under the lock cancels them.
+                pass
+            except (Refused, OSError) as error:
+                wake_log(f"could not cancel main's inherited runs of {head[:12]}: {error}")
     pending = [name for state, names, _ in assessments if state != "green" for name in names]
     if pending:
         return Health("pending", f"main: pending, {', '.join(pending)} ({head[:12]})")
@@ -968,6 +1007,44 @@ def inherited_green(head: str) -> dict[str, Any] | None:
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return None
+
+
+def cancelled_inherited(run: dict[str, Any]) -> bool:
+    """Whether the gate cancelled this run of main because main inherited its result on this
+    very tree. Any other cancelled run of main is red."""
+    if run.get("head_branch") != "main" or not run.get("head_sha"):
+        return False
+    receipt = inherited_green(run["head_sha"])
+    listed = receipt.get("cancelled_inherited") if receipt else None
+    return isinstance(listed, list) and {"run": run["id"], "tree": receipt["tree"]} in listed
+
+
+def cancel_inherited(
+    head: str, receipt: dict[str, Any], found: list[dict[str, Any]], folder: Path
+) -> None:
+    """Cancel main's runs of `head` still queued or running whose result main inherited. Each
+    is listed in the receipt first, with the tree it belongs to, so its cancellation never
+    turns main red; the runs of another tree leave the list."""
+    found = [run for run in found if run["head_sha"] == head and run.get("status") != "completed"]
+    if not found:
+        return
+    tree = receipt["tree"]
+    listed = [
+        entry
+        for entry in receipt.get("cancelled_inherited") or []
+        if isinstance(entry, dict) and entry.get("tree") == tree
+    ]
+    listed += [
+        {"run": run["id"], "tree": tree}
+        for run in found
+        if {"run": run["id"], "tree": tree} not in listed
+    ]
+    if listed != receipt.get("cancelled_inherited"):
+        with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as output:
+            json.dump({**receipt, "cancelled_inherited": listed}, output)
+            temporary = output.name
+        os.replace(temporary, folder / "main-tree-green.json")
+    _cancel(found, folder, f"main {head[:12]}, inherited on identical tree {tree}")
 
 
 def strict_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2602,7 +2679,8 @@ def _batch_report(train: Train, merged: list[str], acting: str, message: str) ->
 
 def _sweep_scratch(folder: Path) -> None:
     """Delete scratch branches that no saved batch, isolated failure awaiting a rerun or whole
-    browser suite run names."""
+    browser suite run names, each once its runs still queued or running are cancelled. A branch
+    whose runs cannot be read is kept, with those after it, for the next sweep."""
     try:
         train = Train(folder)
         kept = {
@@ -2616,12 +2694,29 @@ def _sweep_scratch(folder: Path) -> None:
         listed = git("ls-remote", "origin", f"refs/heads/{SCRATCH_PREFIX}*")
         for line in listed.splitlines():
             ref = line.split()[1]
-            if ref.removeprefix("refs/heads/") not in kept:
+            branch = ref.removeprefix("refs/heads/")
+            if branch not in kept:
+                # A dropped prefix's runs would hold runners ahead of the live prefixes' runs.
+                _cancel(_scratch_runs(branch), folder, f"scratch branch {branch}")
                 deleted = push("origin", "--delete", ref)
                 if deleted.returncode:
                     raise Refused(deleted.refusal)
     except (Refused, OSError, KeyError, IndexError, ValueError) as error:
         print(f"could not delete old batch branches: {error}", flush=True)
+
+
+def _scratch_runs(branch: str) -> list[dict[str, Any]]:
+    """Every run of a scratch branch the gate made, across every workflow, read fresh from GitHub.
+
+    A branch of another name in the gate's namespace, and a pull request's own run, are never
+    the gate's to cancel."""
+    if not re.fullmatch(rf"{re.escape(SCRATCH_PREFIX)}[0-9a-f]{{32}}", branch):
+        return []
+    return [
+        run
+        for run in _api(f"{API}/actions/runs?branch={branch}&per_page=100", "workflow_runs")
+        if run.get("head_branch") == branch and run.get("event") != "pull_request"
+    ]
 
 
 @contextmanager

@@ -213,10 +213,18 @@ def answer(args, cwd, env, out, err):
     elif args[:2] == ["run", "rerun"]:
         if (state / "fail-rerun").exists():
             sys.exit("rerun refused")
+    elif args[:2] == ["run", "cancel"]:
+        # Each cancel is written down with the scratch branches GitHub still has at that moment.
+        listed = check_output(["git", "--git-dir", data["origin"], "for-each-ref",
+            "--format=%(refname:short)", "refs/heads/workflow/merge-batch-*"], text=True).split()
+        with (state / "cancelled.log").open("a") as log:
+            log.write(" ".join([args[2], *listed]) + "\n")
+        if int(args[2]) in data.get("refuse_cancel", []):
+            sys.exit("Cannot cancel a workflow run that is completed.")
     elif args[0] == "api":
         path = args[-1]
         if path not in data["api"]:
-            if "event=workflow_dispatch" in path:
+            if "event=workflow_dispatch" in path or "/actions/runs?branch=" in path:
                 print('{"workflow_runs": []}')
                 sys.exit(0)
             sys.exit("unexpected API request: " + path)
@@ -269,6 +277,8 @@ class GitHub:
     )
     # Whether another push lands on a pull request's branch after each of the gate's reads of it.
     push_after_view: dict[str, list[bool]] = field(default_factory=dict[str, list[bool]])
+    # The runs whose cancel GitHub refuses.
+    refuse_cancel: list[int] = field(default_factory=list[int])
 
     def save(self) -> None:
         (self.workflow.state / "github.json").write_text(
@@ -288,6 +298,7 @@ class GitHub:
                     "lock_probe": self.lock_probe,
                     "line_after_view": self.line_after_view,
                     "push_after_view": self.push_after_view,
+                    "refuse_cancel": self.refuse_cancel,
                 }
             )
         )
@@ -2798,6 +2809,137 @@ def test_main_inherits_a_check_whose_every_part_passed(github: GitHub) -> None:
     assert receipt["ci_unproven"] == []
 
 
+def _main_ci_run(github: GitHub) -> dict[str, Any]:
+    return github.api[f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.base}&per_page=100"][
+        "workflow_runs"
+    ][0]
+
+
+def _cancelled_by_github(github: GitHub) -> None:
+    """GitHub shows main's CI run 10 cancelled, every job with it."""
+    _main_ci_run(github).update(status="completed", conclusion="cancelled")
+    _main_jobs(
+        github, ("CI result", "completed", "cancelled"), ("CI: web", "completed", "cancelled")
+    )
+
+
+def test_an_inherited_main_run_still_running_is_cancelled_and_main_stays_green(
+    github: GitHub,
+) -> None:
+    workflow = github.workflow
+    _squash_with_pending_main(github)
+
+    done = workflow.run_script("main-status", "--tick-main-status")
+
+    assert done.stdout.startswith("main: green"), done.stdout + done.stderr
+    assert workflow.calls("gh run cancel") == ["gh run cancel 10 -R NazmievBulat/Shipline"]
+    receipt = _receipt(github)
+    assert receipt["cancelled_inherited"] == [{"run": 10, "tree": receipt["tree"]}]
+    _cancelled_by_github(github)
+    status = workflow.run_script("main-status")
+    assert status.stdout.startswith("main: green"), status.stdout + status.stderr
+    assert "inherited from CI run 20" in status.stdout
+    assert workflow.run_script("main-status", "--tick-main-status").stdout.startswith("main: green")
+    assert len(workflow.calls("gh run cancel")) == 1
+
+
+def test_a_main_run_cancelled_otherwise_is_still_red(github: GitHub) -> None:
+    _squash_with_pending_main(github)
+    _cancelled_by_github(github)
+    status = github.workflow.run_script("main-status")
+    assert status.stdout.startswith("main: red"), status.stdout + status.stderr
+    # Listed for another tree, it is not this main's.
+    path = github.workflow.repo / ".local/workflow/main-tree-green.json"
+    elsewhere = [{"run": 10, "tree": "0" * 40}]
+    path.write_text(json.dumps({**_receipt(github), "cancelled_inherited": elsewhere}))
+    status = github.workflow.run_script("main-status")
+    assert status.stdout.startswith("main: red"), status.stdout + status.stderr
+
+
+def test_a_listed_run_that_failed_before_its_cancel_is_still_red(github: GitHub) -> None:
+    workflow = github.workflow
+    _squash_with_pending_main(github)
+    assert workflow.run_script("main-status", "--tick-main-status").stdout.startswith("main: green")
+    _main_ci_run(github).update(status="completed", conclusion="cancelled")
+    _main_jobs(github, ("CI result", "completed", "cancelled"), ("CI: web", "completed", "failure"))
+    status = workflow.run_script("main-status")
+    assert status.stdout.startswith("main: red"), status.stdout + status.stderr
+    assert "CI: web" in status.stdout
+
+
+def test_a_main_run_not_yet_inherited_is_never_cancelled(github: GitHub) -> None:
+    workflow = github.workflow
+    _pull_skipped_older(github)
+    _squash_with_pending_main(github)
+    _main_jobs(github, ("CI: server tests", "in_progress", None), (_OLDER, "in_progress", None))
+
+    done = workflow.run_script("main-status", "--tick-main-status")
+
+    assert done.stdout.startswith(f"main: pending, {_OLDER}"), done.stdout + done.stderr
+    assert workflow.calls("gh run cancel") == []
+    assert "cancelled_inherited" not in _receipt(github)
+    # The plain status, which holds no lock, cancels nothing either.
+    _main_jobs(github, ("CI: server tests", "in_progress", None), (_OLDER, "completed", "success"))
+    assert workflow.run_script("main-status").stdout.startswith("main: green")
+    assert workflow.calls("gh run cancel") == []
+
+
+def test_the_cancelled_runs_of_another_tree_are_pruned(github: GitHub) -> None:
+    _squash_with_pending_main(github)
+    path = github.workflow.repo / ".local/workflow/main-tree-green.json"
+    older = {"run": 5, "tree": "0" * 40}
+    path.write_text(json.dumps({**_receipt(github), "cancelled_inherited": [older]}))
+
+    done = github.workflow.run_script("main-status", "--tick-main-status")
+
+    assert done.stdout.startswith("main: green"), done.stdout + done.stderr
+    receipt = _receipt(github)
+    assert receipt["cancelled_inherited"] == [{"run": 10, "tree": receipt["tree"]}]
+
+
+def test_a_refused_cancel_of_main_is_logged_once(github: GitHub) -> None:
+    workflow = github.workflow
+    _squash_with_pending_main(github)
+    github.refuse_cancel = [10]
+    github.save()
+
+    for _ in range(2):
+        done = workflow.run_script("main-status", "--tick-main-status")
+        assert done.stdout.startswith("main: green"), done.stdout + done.stderr
+
+    assert len(workflow.calls("gh run cancel")) == 1
+    notes = [line for line in workflow.wake_log.read_text().splitlines() if "run 10" in line]
+    assert len(notes) == 1 and "Cannot cancel a workflow run that is completed." in notes[0]
+
+
+def test_an_inherited_image_run_of_main_is_cancelled_too(github: GitHub) -> None:
+    workflow = github.workflow
+    _images(github, release_conclusion="success")
+    _squash_with_pending_main(github)
+    _main_image_run(github, 60, github.base, status="in_progress", conclusion=None)
+    github.api[f"{_REPO}/actions/workflows/images.yml/runs?head_sha={github.base}&per_page=100"] = {
+        "workflow_runs": [github.api[_MAIN_IMAGES]["workflow_runs"][0]]
+    }
+    github.save()
+
+    done = workflow.run_script("main-status", "--tick-main-status")
+
+    assert done.stdout.startswith("main: green"), done.stdout + done.stderr
+    assert sorted(workflow.calls("gh run cancel")) == [
+        "gh run cancel 10 -R NazmievBulat/Shipline",
+        "gh run cancel 60 -R NazmievBulat/Shipline",
+    ]
+    image = github.api[_MAIN_IMAGES]["workflow_runs"][0]
+    image.update(status="completed", conclusion="cancelled")
+    github.api[f"{_REPO}/actions/runs/60/jobs?per_page=100"]["jobs"][1].update(
+        status="completed", conclusion="cancelled"
+    )
+    github.save()
+    status = workflow.run_script("main-status")
+    assert status.stdout.startswith("main: green"), status.stdout + status.stderr
+    assert "Docker images run 40" in status.stdout
+
+
 def _main_red_in_one_part(github: GitHub) -> None:
     github.main("failure")
     _main_jobs(
@@ -3641,6 +3783,120 @@ def test_a_member_leaving_the_line_keeps_the_prefixes_ahead_of_it(github: GitHub
     assert done.returncode == 0, done.stdout + done.stderr
     assert _merges(github) == ["7", "8"]
     assert len(github.workflow.calls("gh workflow run ci.yml")) == 3
+
+
+def _branch_runs(github: GitHub, branch: str, *runs: tuple[Any, ...]) -> None:
+    """The runs GitHub lists for `branch`, each `(id, status)` dispatched on it, or
+    `(id, status, its branch, its event)`; a completed one passed."""
+    github.api[f"{_REPO}/actions/runs?branch={branch}&per_page=100"] = {
+        "workflow_runs": [
+            {
+                "id": run[0],
+                "head_sha": "0" * 40,
+                "head_branch": run[2] if len(run) > 2 else branch,
+                "event": run[3] if len(run) > 2 else "workflow_dispatch",
+                "status": run[1],
+                "conclusion": "success" if run[1] == "completed" else None,
+            }
+            for run in runs
+        ]
+    }
+
+
+def _cancelled(github: GitHub) -> dict[str, list[str]]:
+    """Each run the gate asked GitHub to cancel, with the scratch branches there at that time."""
+    log = github.workflow.state / "cancelled.log"
+    lines = log.read_text().splitlines() if log.exists() else []
+    return {line.split()[0]: line.split()[1:] for line in lines}
+
+
+def test_a_dropped_prefix_has_its_unfinished_runs_cancelled_before_its_branch_goes(
+    github: GitHub,
+) -> None:
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    dropped, kept = _scratch(github, "9"), _scratch(github, "7")
+    assert dropped is not None and kept is not None
+    _branch_runs(
+        github,
+        dropped["branch"],
+        (901, "queued"),
+        (902, "in_progress"),
+        (903, "completed"),
+        # Listed for its branch by mistake, these are never the gate's to cancel.
+        (904, "in_progress", "ticket/9", "pull_request"),
+        (905, "in_progress", "main", "push"),
+    )
+    _branch_runs(github, kept["branch"], (701, "in_progress"))
+    github.pulls["9"]["state"] = "CLOSED"
+
+    done = _batch_call(github)
+
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert _numbers(github) == ["7", "8"]
+    cancelled = _cancelled(github)
+    assert list(cancelled) == ["901", "902"]
+    assert all(dropped["branch"] in branches for branches in cancelled.values())
+    assert github.workflow.calls("gh run cancel")[0] == "gh run cancel 901 -R NazmievBulat/Shipline"
+    assert dropped["branch"] not in _scratch_branches(github)
+    assert kept["branch"] in _scratch_branches(github)
+
+
+def test_every_prefix_dropped_at_once_has_its_runs_cancelled(github: GitHub) -> None:
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    old: dict[str, str] = {}
+    for index, member in enumerate(_prefixes(github)):
+        first = 800 + index * 10
+        _branch_runs(
+            github,
+            member["scratch"]["branch"],
+            (first, "queued"),
+            (first + 1, "in_progress"),
+            (first + 2, "waiting"),
+            (first + 3, "completed"),
+        )
+        old |= {str(first + offset): member["scratch"]["branch"] for offset in range(3)}
+    workflow = github.workflow
+    workflow.git("checkout", "main")
+    workflow.git("commit", "--allow-empty", "-m", "chore: move main again")
+    github.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    workflow.git("checkout", "ticket/seven")
+    github.main()
+
+    done = _batch_call(github)
+
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "main moved outside the merge train" in done.stdout
+    cancelled = _cancelled(github)
+    assert sorted(cancelled) == sorted(old)
+    assert all(old[run] in branches for run, branches in cancelled.items())
+    remaining = _scratch_branches(github)
+    assert not set(old.values()) & set(remaining)
+    assert sorted(remaining) == sorted(m["scratch"]["branch"] for m in _prefixes(github))
+
+
+def test_a_refused_cancel_is_logged_once_and_the_branch_still_goes(github: GitHub) -> None:
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    dropped = _scratch(github, "9")
+    assert dropped is not None
+    _branch_runs(github, dropped["branch"], (901, "in_progress"), (902, "in_progress"))
+    github.refuse_cancel = [901]
+    github.pulls["9"]["state"] = "CLOSED"
+
+    done = _batch_call(github)
+
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert list(_cancelled(github)) == ["901", "902"]
+    assert dropped["branch"] not in _scratch_branches(github)
+    log = github.workflow.wake_log.read_text()
+    notes = [line for line in log.splitlines() if "run 901" in line]
+    assert len(notes) == 1 and "Cannot cancel a workflow run that is completed." in notes[0]
+    assert "run 902" not in log
+    assert _batch_call(github).returncode == 3
+    assert github.workflow.wake_log.read_text().count("run 901") == 1
 
 
 def test_a_later_prefix_that_cannot_start_never_holds_a_ready_front(github: GitHub) -> None:
