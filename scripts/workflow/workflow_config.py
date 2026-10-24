@@ -11,7 +11,9 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `.github/runner/settings.sh` when the runner pool names one, else the owner and name of the
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
-set-up command, run only when present, is `scripts/setup-worktree`; no runner labels.
+set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
+runner prefix; no test command, which a repository names for its CI's test job
+(`ci_proof.py test`).
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -75,6 +77,13 @@ DEFAULTS: dict[str, Any] = {
         # The runner labels of the machines the gate may re-run failed jobs on.
         "labels": [],
         "identity_folder": "~/.config/shipline-runner",
+        # The prefix the runner pool names its services and containers by; without it, there are
+        # no runner figures (`workflow_metrics.py`).
+        "prefix": None,
+    },
+    "commands": {
+        # The command line that runs the repository's tests, from the root of its checkout.
+        "test": None,
     },
 }
 
@@ -126,10 +135,17 @@ class Labels:
 class Runner:
     labels: tuple[str, ...]
     identity_folder: str
+    prefix: str | None = None
 
     @property
     def identity_path(self) -> Path:
         return Path(self.identity_folder).expanduser()
+
+
+@dataclass(frozen=True)
+class Commands:
+    # None when the file names none.
+    test: str | None
 
 
 @dataclass(frozen=True)
@@ -143,6 +159,7 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    commands: Commands
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -327,7 +344,9 @@ def load(start: Path | None = None) -> Config:
         runner=Runner(
             labels=tuple(values["runner"]["labels"]),
             identity_folder=values["runner"]["identity_folder"],
+            prefix=values["runner"]["prefix"],
         ),
+        commands=Commands(**values["commands"]),
         given=given,
         main=main,
     )
@@ -356,7 +375,9 @@ def as_dict(config: Config) -> dict[str, Any]:
         "runner": {
             "labels": list(config.runner.labels),
             "identity_folder": config.runner.identity_folder,
+            "prefix": config.runner.prefix,
         },
+        "commands": vars(config.commands).copy(),
     }
 
 
