@@ -12,6 +12,15 @@ A third kind of session has no pull request: a hunt, which uses the running appl
 browser and reports the bugs it finds. It is started by hand with a sentence of its own, and
 the repository's hunt rules are its whole instruction.
 
+Two hunts may run at once, each in its own area of the application, never three. A repository
+names its areas in `shipline.json`, under `hunts.areas`: each a short name and the screens
+(paths) it covers. A hunt started with an area is told its area and its screens in its
+sentence; it stays off the other areas' screens except to pass through them. A hunt without
+an area hunts every screen and runs alone. With no areas configured, one hunt runs at a time.
+In the hunt plans file (`hunts.plans`, which the sentence of a hunt with a plan names), each
+task starts with its area or "Every screen."; a hunt with an area takes only the tasks of its
+area.
+
 A fourth kind has no pull request either: the analyst, a read-only session the tick starts once
 a day, which reads the workflow's own logs and proposes at most three changes to it (see
 "Analyse the workflow").
@@ -116,8 +125,9 @@ one waiting for the owner. So a pull request waiting for the owner does not hold
 failed checks joins at the back when the gate is called again; a green CI re-run on the same
 head and current main lifts a failed-check block and restores the pull request's earlier
 queue position, and a green re-run on an older main is refreshed in that place when its turn
-comes. A pull request that merged, closed, became a draft or left `main` as its base leaves
-the line. When the gate says the pull request waits behind another (or for main to change),
+comes. A re-run of only the failed jobs keeps the run's proof of the merge it tested, as a
+full re-run does. A pull request that merged, closed, became a draft or left `main` as its
+base leaves the line. When the gate says the pull request waits behind another (or for main to change),
 it has already run `scripts/workflow/notify waiting` itself: end the turn. The tick wakes
 that reviewer or audit when its pull request is first and all checks on its head have
 finished, once for each turn of the line, state of main and head. One whose checks failed
@@ -187,6 +197,8 @@ worker, reviewer and audit alike:
 - Run the repository's fast pre-train checks from the pull request's worktree before marking
   ready. They also run before a handoff or gate call admits it to the merge train; a failure
   refuses admission. They supplement CI, which still runs its normal checks.
+- A draft pull request runs no CI: its run starts when it is marked ready, on the head it then
+  has, and each later push runs again. So run the tests in the session before marking ready.
 - Run `scripts/workflow/weaker-tests --base <base> --working-tree` before marking ready.
   Explain each item in the description: why the change is correct and how the test still
   catches its original bug, ideally with a failing run on a deliberately broken version.
@@ -586,7 +598,8 @@ has the line "hunt finished" and any hunt that still runs 65 minutes after its s
 analyst (see "Analyse the workflow"), stops it on the line "analysis finished", idle or not,
 or 40 minutes after its start. `session cleanup` notes its report for the wake, however the
 analyst ended, and removes its worktree; the wake tells the orchestrator once, at any hour and
-busy or not. A daily start that failed is not tried again that day.
+busy or not. A daily start that failed is not tried again that day. Each hunt is stopped and
+removed on its own: ending one never touches another's worktree, notes or report.
 
 Every reviewer hands its passed review to the tick with `merge-when-current --handoff N`,
 then ends with `review finished` and is stopped as usual. When the tick stops a reviewer
@@ -720,10 +733,14 @@ The orchestrator session does what needs judgment:
   ready and stays idle without saying "worker finished". The orchestrator tells such a session
   (`SendMessage`) to read `git show origin/main:AGENTS.md` after a fetch and finish by it.
 - It starts a hunt when the owner asks for one:
-  `scripts/workflow/session start hunt <name> [plan|explore] [claude|codex|cursor]`, the name saying
-  what the hunt is (`plan-phone-2`). One hunt runs at a time, and the script refuses a second:
-  each runs a browser and a copy of the application. To compare hunter programs it runs the
-  same kind of hunt once with each, one after the other.
+  `scripts/workflow/session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>]`,
+  the name saying what the hunt is (`plan-phone-2`). The area, one of `hunts.areas`, is the
+  last word, after the kind and the program. A hunt without an area hunts every screen and
+  runs alone. A second hunt starts only beside a running hunt that has an area, and must name
+  a different area; a third is refused, and with no areas configured one hunt runs at a time.
+  Each runs a browser and a copy of the application, and two hunts over the same screens would
+  report the same bugs twice. To compare hunter programs it runs the same kind of hunt once
+  with each, one after the other.
 - When a check-in carries an analysis (`Workflow analysis day-<date> (report <link>): 1. ...`),
   it opens a draft ticket for each proposal it judges worth it, as in step 5 of the audit
   rules, naming the report, and gives the owner the link and the tickets it opened. The owner
