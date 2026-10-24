@@ -137,7 +137,14 @@ def _checks_failed(folder: Path, number: str, pull: dict[str, Any]) -> None:
         else:
             _hand_back(folder, number, f"pull request checks failed: {diagnosis.reason}")
         return
-    if diagnosis.kind != "own" or diagnosis.repair is None:
+    labelled = gate.CONFIG.labels.workflow
+    labels = train_reads.pull(number, gate.read_pull).get("labels", [])
+    if (
+        diagnosis.kind != "own"
+        or diagnosis.repair is None
+        # Only a labelled draft gets a worker; one without the label keeps its audit path.
+        or not any(label.get("name") == labelled for label in labels)
+    ):
         _hand_back(folder, number, f"pull request checks failed: {diagnosis.reason}")
         return
     earlier = check_repair.Repair.read(folder, number)

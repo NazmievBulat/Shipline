@@ -22,8 +22,9 @@ _SHA = re.compile(r"[0-9a-f]{40}")
 _COLOUR = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # The first failing test, by the first of these that matches anywhere in the diagnostics.
 _TESTS = (
-    # pytest: "FAILED tests/test_dates.py::test_leap_day - AssertionError"
-    re.compile(r"\b(?:FAILED|ERROR) (\S+\.py::\S+)"),
+    # pytest: "FAILED tests/test_dates.py::test_leap_day - AssertionError", its parameters whole
+    # even with a space ("test_totals[two items]")
+    re.compile(r"\b(?:FAILED|ERROR) (\S+\.py::(?:\[[^\]\n]*\]|\S)+)"),
     # Vitest: "FAIL src/dates.test.ts > parses a leap day"
     re.compile(r"\bFAIL\s+(\S+\.(?:test|spec)\.[A-Za-z]+(?: > [^\n]+)?)"),
     # Playwright: "1) [chromium] › e2e/plan.spec.ts:12:5 › opens the plan"
@@ -35,7 +36,8 @@ _INFRASTRUCTURE = re.compile(
     r"|\b(?:lost|unable to contact)\b[^\n]*\brunner"
     r"|\bjob\b[^\n]*\bexceeded\b[^\n]*\b(?:time|maximum execution)"
     r"|Failed to download action"
-    r"|Internal server error",
+    # GitHub's, not an HTTP status a server under test answered ("500 Internal Server Error")
+    r"|(?<![0-9] )(?<![0-9] \()Internal server error",
     re.IGNORECASE,
 )
 NOT_REPORTED = "not reported"
@@ -161,6 +163,8 @@ def diagnose(pull: dict[str, Any]) -> Diagnosis:
             and not job.get("name", "").endswith("result")
         ]
         runners_only = bool(failed)
+        runners = False
+        cancelled: list[str] = []
         for job in failed:
             notes = gate.api(f"{gate.API}/check-runs/{job['id']}/annotations?per_page=100")
             diagnostics = "\n".join(
@@ -173,13 +177,15 @@ def diagnose(pull: dict[str, Any]) -> Diagnosis:
             if job["conclusion"] == "timed_out" or (
                 test is None and _INFRASTRUCTURE.search(diagnostics)
             ):
+                runners = True
                 continue
-            runners_only = False
             name = safe(job.get("name", "")) or f"job {job['id']}"
             if job["conclusion"] != "failure":
                 # A job cancelled beside a failing one (fail-fast) says nothing of its own.
-                judgments.append(f"{name} of run {found['id']} was cancelled")
-            elif not diagnostics.strip():
+                cancelled.append(f"{name} of run {found['id']} was cancelled")
+                continue
+            runners_only = False
+            if not diagnostics.strip():
                 # Nothing to read is no repair to guess.
                 return Diagnosis(
                     "judgment", f"{name} of run {found['id']} failed without a log or annotation"
@@ -187,6 +193,10 @@ def diagnose(pull: dict[str, Any]) -> Diagnosis:
             else:
                 repair = Repair(head, found["id"], name, safe(test or "") or NOT_REPORTED)
                 own.append((repair.test, repair))
+        if cancelled and not runners:
+            # Cancelled with no job its runners failed beside it: a reviewer judges it.
+            runners_only = False
+            judgments.extend(cancelled)
         if runners_only:
             infrastructure.append((found, parts))
     if own:

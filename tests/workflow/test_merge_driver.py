@@ -2223,6 +2223,15 @@ def test_a_failed_job_with_nothing_to_read_goes_to_a_reviewer(handed: GitHub) ->
             "tests/test_quote.py::test_reads[ (id) id ]",
         ),
         ("Error: Process completed with exit code 1.\n", "not reported"),
+        (
+            "FAILED tests/test_dates.py::test_totals[two items] - assert 3 == 4\n",
+            "tests/test_dates.py::test_totals[two items]",
+        ),
+        (
+            # The server under test answered 500: no runner of GitHub's failed it.
+            '"GET /health HTTP/1.1" 500 Internal Server Error\n',
+            "not reported",
+        ),
     ],
 )
 def test_the_worker_sentence_names_the_first_failing_test_in_safe_words(
@@ -2239,3 +2248,55 @@ def test_the_worker_sentence_names_the_first_failing_test_in_safe_words(
     assert session_arguments(workflow.state, "ticket-7")[-1] == (
         f'claude --effort medium --remote-control ticket-7 "{_repair_sentence(test=test)}"'
     )
+
+
+@pytest.mark.parametrize("failure", ["runner lost", "timed out"])
+def test_a_runner_error_beside_a_part_fail_fast_cancelled_is_rerun_once(
+    handed: GitHub, failure: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    if failure == "timed out":
+        _fail(handed, conclusion="timed_out", log=None)
+    else:
+        _fail(handed, log="The self-hosted runner: home-1 lost communication with the server.\n")
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    # Fail-fast cancelled the other part of the matrix when the runner failed.
+    jobs.insert(
+        0,
+        {
+            "id": 19,
+            "name": "CI: server tests (2 of 2)",
+            "status": "completed",
+            "conclusion": "cancelled",
+            "labels": ["example-app-home"],
+        },
+    )
+    handed.api["repos/example-org/example-app/check-runs/19/annotations?per_page=100"] = []
+    (workflow.state / "job-logs/19").write_text("##[error]The operation was canceled.\n")
+    handed.save()
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh run rerun") == ["gh run rerun 20 -R example-org/example-app --failed"]
+    assert workflow.calls("gh pr ready") == []
+    assert _started(workflow) == []
+    assert _note(workflow).exists()
+
+
+def test_a_failing_test_without_the_label_keeps_its_audit_path(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    workflow.list_pull_request(7, draft=False, labels=())
+    handed.pulls["7"]["labels"] = []
+    _fail(handed)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh pr ready") == []
+    assert not _note(workflow).exists()
+    assert not (_folder(workflow) / "check-repair-7.json").exists()
+    assert (_folder(workflow) / "merge-review-7").exists()
+    assert _started(workflow) == []
