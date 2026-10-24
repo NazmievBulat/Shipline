@@ -880,8 +880,9 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
     made.fake("claude", _FAKE_CLAUDE)
     made.fake("codex", _FAKE_INSTALLER)
     # The repository's commands the stand-in `shipline.json` names: the checks the merge gate
-    # runs before a pull request joins the train, and its browser plan.
-    for command in ("pre-train-checks", "browser-plan"):
+    # runs before a pull request joins the train, its browser plan, a hunt's application and its
+    # Cursor hunter.
+    for command in ("pre-train-checks", "browser-plan", "hunt-app", "hunt-cursor"):
         made.fake(command, (STAND_INS / command).read_text())
     made.fake(
         "df",
@@ -999,9 +1000,8 @@ def _template() -> Path:
     runner_settings = repo / ".github" / "runner" / "settings.sh"
     runner_settings.parent.mkdir(parents=True)
     shutil.copy2(STAND_INS / "settings.sh", runner_settings)
-    # The runners the merge gate may re-run failed jobs on, and the repository's own commands it
-    # calls (`pre_train_checks`, `browser_plan`, stand-ins on the `PATH`): every other value is
-    # its default.
+    # The runners the merge gate may re-run failed jobs on, and the repository's own commands
+    # Shipline calls (stand-ins on the `PATH`): every other value is its default.
     shutil.copy2(STAND_INS / "shipline.json", repo / "shipline.json")
     (repo / ".gitignore").write_text(".local/\n.claude/\n")
     git("add", "-A")
