@@ -34,5 +34,12 @@
     "labels": ["example-app-home", "example-app-home-main", "example-app-home-docker", "example-app-planner"],
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app-runner"
+  },
+  "hunts": {
+    "areas": {
+      "phone": ["/calls", "/contacts"],
+      "billing": ["/invoices", "/settings/billing"]
+    },
+    "plans": "docs/hunt-plans.md"
   }
 }

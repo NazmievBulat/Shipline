@@ -12,6 +12,15 @@ A third kind of session has no pull request: a hunt, which uses the running appl
 browser and reports the bugs it finds. It is started by hand with a sentence of its own, and
 the repository's hunt rules are its whole instruction.
 
+Two hunts may run at once, each in its own area of the application, never three. A repository
+names its areas in `shipline.json`, under `hunts.areas`: each a short name and the screens
+(paths) it covers. A hunt started with an area is told its area and its screens in its
+sentence; it stays off the other areas' screens except to pass through them. A hunt without
+an area hunts every screen and runs alone. With no areas configured, one hunt runs at a time.
+In the hunt plans file (`hunts.plans`, which the sentence of a hunt with a plan names), each
+task starts with its area or "Every screen."; a hunt with an area takes only the tasks of its
+area.
+
 The rules of a session are this file as it is on `main`, not the copy in its worktree: the
 worktree holds the branch of the pull request, and a branch made before a rule changed has the
 old rule, or none. The sentence a session is started with says so and names the commands:
@@ -529,7 +538,8 @@ Codex responses reach the owner through their Haiku bridges; the tick reads comp
 from the bridge and stops it together with Codex. It never starts an audit,
 and nothing waits for one. It never starts a hunt either. It stops an idle hunt whose screen
 has the line "hunt finished" and any hunt that still runs 65 minutes after its start, and
-`session cleanup` then removes the hunt's worktree; the report stays.
+`session cleanup` then removes the hunt's worktree; the report stays. Each hunt is stopped
+and removed on its own: ending one never touches another's worktree, notes or report.
 
 Every reviewer hands its passed review to the tick with `merge-when-current --handoff N`,
 then ends with `review finished` and is stopped as usual. When the tick stops a reviewer
@@ -645,10 +655,14 @@ The orchestrator session does what needs judgment:
   ready and stays idle without saying "worker finished". The orchestrator tells such a session
   (`SendMessage`) to read `git show origin/main:AGENTS.md` after a fetch and finish by it.
 - It starts a hunt when the owner asks for one:
-  `scripts/workflow/session start hunt <name> [plan|explore] [claude|codex|cursor]`, the name saying
-  what the hunt is (`plan-phone-2`). One hunt runs at a time, and the script refuses a second:
-  each runs a browser and a copy of the application. To compare hunter programs it runs the
-  same kind of hunt once with each, one after the other.
+  `scripts/workflow/session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>]`,
+  the name saying what the hunt is (`plan-phone-2`). The area, one of `hunts.areas`, is the
+  last word, after the kind and the program. A hunt without an area hunts every screen and
+  runs alone. A second hunt starts only beside a running hunt that has an area, and must name
+  a different area; a third is refused, and with no areas configured one hunt runs at a time.
+  Each runs a browser and a copy of the application, and two hunts over the same screens would
+  report the same bugs twice. To compare hunter programs it runs the same kind of hunt once
+  with each, one after the other.
 - When a hunt has ended, it reads the report in `.local/hunts/<name>` of the main checkout.
   A Codex or Cursor hunter's report it publishes as a document with the pictures; a Claude Code hunter
   published its own (`report.url`). It gives the owner the link and the count of findings.
