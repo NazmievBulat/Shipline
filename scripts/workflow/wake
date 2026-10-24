@@ -47,6 +47,13 @@
 # sent: `Workflow analysis day-<date> (report <link>): 1. <proposal>; 2. <proposal>.`, or that it
 # ended without publishing its report.
 #
+# A question the tick answered on the owner's behalf (`Owner only: no`, see `tick`) is named on a
+# line of its own with the reply it typed and when, `answered for the owner: ticket-426, "1"
+# (03:12)`, so that he can overrule it. One given at night waits for the morning check-in, the
+# first look from 8:00, which lists every answer since 20:00; one given in the day is told at the
+# next look. Either is told once, busy or not, tried again every 5 minutes until it is sent; one
+# still not sent at 20:00 waits for the morning.
+#
 # A session that ended its turn with a question to the owner is named on a line of its own,
 # with how long it has waited: `asking the owner: review-156 (8 min)`. The stop hook (`notify`)
 # notes the question when the stop rings the phone, and drops it when he answers. A question
@@ -174,6 +181,21 @@ if [[ -d $analyses ]]; then
     fi
   done < <(find "$analyses" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
+# The answers the tick gave for the owner, read only in the day: those of the night wait for the
+# morning check-in. In the order they were given: the files are named by the time.
+hour=$(date -d "@$NOW" +%-H)
+answered=$main/$SHIPLINE_STATE_FOLDER/answered-for-owner.pending
+answer_files=()
+answer_lines=()
+if ((hour >= NIGHT_UNTIL_HOUR && hour < NIGHT_FROM_HOUR)) && [[ -d $answered ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '"answered for the owner: \(.name | strings), \(.reply | strings | tojson)"' "$event") &&
+        at=$(jq -er '.at | numbers | floor' "$event") && at=$(date -d "@$at" +%H:%M); then
+      answer_files+=("$event")
+      answer_lines+=("$line ($at)")
+    fi
+  done < <(find "$answered" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+fi
 if [[ -d $handbacks ]]; then
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"pull request \(.number): \(.reason)"' "$event"); then
@@ -290,10 +312,9 @@ if [[ -n $asking ]]; then
 fi
 
 if ((${#resent[@]} == 0)); then
-  if [[ -s $PENDING || -s $main_pending || -n $service_line || ${#handback_files[@]} -gt 0 || ${#cloud_files[@]} -gt 0 || ${#analysis_files[@]} -gt 0 || ${#lost_files[@]} -gt 0 || ${#stuck_files[@]} -gt 0 || $tmp_alert == true || -n $untold ]]; then
+  if [[ -s $PENDING || -s $main_pending || -n $service_line || ${#handback_files[@]} -gt 0 || ${#cloud_files[@]} -gt 0 || ${#analysis_files[@]} -gt 0 || ${#lost_files[@]} -gt 0 || ${#stuck_files[@]} -gt 0 || ${#answer_files[@]} -gt 0 || $tmp_alert == true || -n $untold ]]; then
     (($(since_last_look) + 30 >= RETRY_SECONDS)) || exit 0
   else
-    hour=$(date -d "@$NOW" +%-H)
     ((hour >= NIGHT_FROM_HOUR || hour < NIGHT_UNTIL_HOUR)) || exit 0
     (($(since_last_look) + 30 >= LOOK_EVERY_SECONDS)) || exit 0
   fi
@@ -434,7 +455,7 @@ log "$(date -d "@$NOW" '+%Y-%m-%d %H:%M:%S')  $reason" \
   "  usage: $usage" "  $seen"
 ((${#resent[@]} == 0)) || log "  the tick sent its instruction again to: ${resent[*]}"
 [[ -z $asking_line ]] || log "  asking the owner: $asking_line"
-for line in "${lost_lines[@]}" "${stuck_lines[@]}"; do
+for line in "${lost_lines[@]}" "${stuck_lines[@]}" "${answer_lines[@]}"; do
   log "  $line"
 done
 
@@ -445,7 +466,8 @@ state=${orchestrator%%$'\t'*}
 name=${orchestrator#*$'\t'}
 
 if ((${#resent[@]} == 0 && ${#handback_files[@]} == 0 && ${#cloud_files[@]} == 0 && ${#lost_files[@]} == 0 &&
-  ${#stuck_files[@]} == 0 && ${#analysis_files[@]} == 0)) &&
+  ${#stuck_files[@]} == 0 && ${#analysis_files[@]} == 0 &&
+  ${#answer_files[@]} == 0)) &&
   [[ ! -s $main_pending && -z $service_line && -z $untold ]]; then
   if [[ $state != idle && $tmp_alert != true ]]; then
     log "  $name is $state; not told"
@@ -461,7 +483,7 @@ fi
 # The sessions asking the owner stand on a line of their own, so the orchestrator sees them.
 between_lines=" "
 [[ -z $asking_line ]] || between_lines=$'\n'"asking the owner: $asking_line"$'\n'
-for line in "${lost_lines[@]}" "${stuck_lines[@]}"; do
+for line in "${lost_lines[@]}" "${stuck_lines[@]}" "${answer_lines[@]}"; do
   [[ $between_lines == *$'\n' ]] || between_lines=$'\n'
   between_lines+="$line"$'\n'
 done
@@ -518,6 +540,12 @@ if send_to "$name" "$message"; then
     mkdir -p "$main/$SHIPLINE_STATE_FOLDER/stuck.sent"
     for event in "${stuck_files[@]}"; do
       mv -- "$event" "$main/$SHIPLINE_STATE_FOLDER/stuck.sent/${event##*/}"
+    done
+  fi
+  if ((${#answer_files[@]})); then
+    mkdir -p "$main/$SHIPLINE_STATE_FOLDER/answered-for-owner.sent"
+    for event in "${answer_files[@]}"; do
+      mv -- "$event" "$main/$SHIPLINE_STATE_FOLDER/answered-for-owner.sent/${event##*/}"
     done
   fi
   if ((${#handback_files[@]})); then

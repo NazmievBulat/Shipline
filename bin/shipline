@@ -15,6 +15,8 @@ set -euo pipefail
 # scripts' own parts.
 COMMANDS=(
   decide
+  flow-page
+  install-flow-page-timer
   install-hooks
   install-timer
   main-status
