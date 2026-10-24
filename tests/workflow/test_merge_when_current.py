@@ -5947,6 +5947,26 @@ def test_an_image_rerun_can_restore_an_isolated_batch_failure_to_its_place(githu
     assert _batch_call(github).returncode == 2  # Refresh its stale green CI in its saved place.
 
 
+def test_the_sweep_never_deletes_a_branch_that_only_ends_like_the_gate_s(github: GitHub) -> None:
+    """`git ls-remote` lists a branch whose name only ends like the gate's pattern too: it is
+    someone else's."""
+    _batch_setup(github)
+    others = ["ticket/x/refs/heads/workflow/merge-batch-" + "0" * 32]
+    for branch in others:
+        github.workflow.git("push", "--quiet", "origin", f"{github.base}:refs/heads/{branch}")
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+
+    done = _batch_call(github)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
+    listed = github.workflow.git("ls-remote", "origin").split()
+    assert [branch for branch in others if f"refs/heads/{branch}" in listed] == others
+    # The gate's own scratch branches are gone.
+    assert sorted(_scratch_branches(github)) == sorted(others)
+
+
 def test_a_batch_saved_before_prefixes_is_dropped(github: GitHub) -> None:
     _batch_setup(github, count=4)
     path = github.workflow.repo / ".local/workflow/merge-train.json"

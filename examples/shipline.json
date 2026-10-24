@@ -8,6 +8,7 @@
   },
   "commands": {
     "test": "tools/run-tests",
+    "browser": "tools/run-browser-tests",
     "browser_tests_for_changes": {
       "run": "tools/shipline/browser-tests-for-changes",
       "form": "json",
@@ -62,6 +63,7 @@
       "example-app-home-standby",
       "example-app-home-first",
       "example-app-home-main",
+      "example-app-home-main-batch",
       "example-app-home-docker",
       "example-app-home-planner"
     ],
@@ -71,6 +73,9 @@
     "planner_label": "example-app-home-planner",
     "image_build": "tools/shipline/build-runner-images",
     "hub_cache": "tools/shipline/hub-cache"
+  },
+  "merge": {
+    "scratch_prefix": "workflow/merge-batch-"
   },
   "cloud_wake_after_minutes": 45,
   "parity": {

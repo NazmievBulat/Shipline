@@ -38,15 +38,16 @@ source "$here/names.sh"
 names() {
   local name
   for name in prefix image docker_image network container hub_cache_network \
-    hub_cache_container label standby_label first_label main_label docker_label planner_label; do
+    hub_cache_container label standby_label first_label main_label main_batch_label docker_label \
+    planner_label; do
     printf '%s=%s\n' "$name" "${!name}"
   done
 }
 
 # The labels the merge gate reads (`runner_labels` of workflow_config.py).
 labels() {
-  printf '%s\n' "$label" "$standby_label" "$first_label" "$main_label" "$docker_label" \
-    "$planner_label"
+  printf '%s\n' "$label" "$standby_label" "$first_label" "$main_label" "$main_batch_label" \
+    "$docker_label" "$planner_label"
 }
 
 render() {

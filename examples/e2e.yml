@@ -1,22 +1,71 @@
-# Install as workflows.e2e. tools/ci-plan also returns browser_files and browser_total;
-# it keeps the repository's existing browser selector and path filters in every event mode.
+# The browser tests of a repository that uses Shipline, as `.github/workflows/e2e.yml`
+# (`workflows.e2e` in shipline.json): a planner that writes the notes the merge gate reads, and
+# one job, `playwright` (job `browser`), that runs the repository's own browser command (`commands.browser`).
+# The gate judges a run by its planner (`checks.e2e_plan`, here its default) and by every job
+# that ran; a repository that names another planner names its job so.
+#
+# Every job runs on GitHub's own runners, the ordinary choice, except when the repository has a
+# runner pool and turns main's runners on with the repository variable `CI_MAIN_RUNNER` set to
+# `on`. Then a push to main runs on main's runners, `<runner.label>-main`. The merge gate's first
+# run of a prefix, its dispatch on a scratch branch of its own (`merge.scratch_prefix`), runs in
+# the merge line's lane on them, `<runner.label>-main-batch`, when its planner claims one of them
+# free there, so a prefix need not wait behind pull requests' own runs; else, and on any
+# re-run, it takes the ordinary choice, so it never waits on main's runners for one to free. The
+# lender keeps one of main's runners off the lane and takes the lane off the others while a push
+# to main waits (runner/lend_runners.py), so main keeps its place. The labels here are the
+# defaults, `<runner.prefix>-home` with the runner prefix `example-app`. A repository with a pool
+# puts its own choice where this says `ubuntu-latest`, and the planner's own on the planner,
+# `runner.planner_label`: only the pool's planner runner reads the lender's note, so a planner on
+# GitHub's runners never takes the lane.
+#
+# The choice keeps every other run of this workflow, a pull request's among them, off main's
+# runners, but not a branch's own copy of the workflow: a scratch run runs the merge line's
+# members, and the workflow as they changed it, on main's machine, and any pushed branch may name
+# main's label itself. GitHub reads the prefix without its case. Keep main's runners to the
+# workflows and branches meant for them with a runner group, have outside contributors' runs
+# approved before they start, and let only the gate's identity create branches of the prefix,
+# in any case.
+#
+# tools/ci-plan, the repository's own selector, also returns browser_files and browser_total; it
+# keeps the repository's existing browser selector and path filters in every event mode.
 name: E2E
+
 on:
+  # A draft runs no browser tests: marking it ready starts its run on the current head.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+  # The merge gate runs the whole browser suite on a scratch branch of its own with
+  # `gh workflow run`.
   workflow_dispatch:
+
+# Read-only for every run; a pull request from a fork gets no secrets either, as GitHub gives
+# `pull_request` runs of forks none.
 permissions:
   contents: read
+
+# A pull request's newer push cancels its older run. Every commit of main and every scratch run
+# keeps its own: the merge gate reads each of them. A draft's runs have a group of their own, so
+# the run of a last push to a draft never cancels the run of its marking ready.
+concurrency:
+  group: e2e-${{ github.event_name }}-${{ github.event_name == 'pull_request' && format('{0}-draft-{1}', github.ref, github.event.pull_request.draft) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   plan:
+    # The gate reads its notes from this job alone (`checks.e2e_plan`).
     name: "E2E: what to run"
+    # Skipped while the pull request is a draft; the browser job is skipped by its own check.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    # A push to main on main's runners; the planner of every other run on the ordinary choice.
+    runs-on: >-
+      ${{ vars.CI_MAIN_RUNNER == 'on' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && fromJSON('["self-hosted", "example-app-home-main"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read
+      # On main, reading the runs a squash's proof names, with their jobs and notes.
       actions: read
       checks: read
     outputs:
@@ -24,7 +73,9 @@ jobs:
       files: ${{ steps.selection.outputs.files }}
       prefix_only: ${{ steps.deferred.outputs.prefix_only || '[]' }}
       inherited: ${{ steps.inherited.outputs.inherited || '[]' }}
+      main_lane: ${{ steps.lane.outputs.main_lane || 'false' }}
     steps:
+      # On a pull request this is GitHub's merge of it into main: the tree the gate checks.
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
@@ -44,6 +95,7 @@ jobs:
         id: deferred
         if: steps.selection.outputs.needed == 'true'
         run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" prefix-only --needed browser_whole
+      # The gate takes a prefix's browser run only when it was whole.
       - name: The notes the gate reads
         env:
           DEFERRED: ${{ steps.deferred.outputs.prefix_only || '[]' }}
@@ -58,19 +110,40 @@ jobs:
           else
             python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes --whole browser_suite
           fi
+      # The merge gate's first run of a prefix takes the merge line's lane on main's runners only
+      # when the pool's lender notes one of them online and idle with it (`ci_proof.py
+      # main-lane`). Only the pool's planner runner sees that note: elsewhere the lane is never
+      # taken.
+      - name: Whether the prefix takes main's lane
+        id: lane
+        if: github.event_name == 'workflow_dispatch' && vars.CI_MAIN_RUNNER == 'on' && github.run_attempt == '1' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-')
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" main-lane
+      # A squash the gate made carries its proof: main skips the browser job when it passed,
+      # whole, on the identical tree, and names the run it inherited. Any other push runs it.
       - name: Browser tests main inherits on the identical tree
         id: inherited
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" inherited e2e
+
   browser:
+    # The gate's name for the job that runs the browser suite.
     name: playwright
     needs: plan
+    # Skipped while the pull request is a draft, when the change needs no browser test, and on
+    # main when main inherited it.
     if: >-
-      ${{ needs.plan.outputs.needed == 'true'
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+      && needs.plan.outputs.needed == 'true'
       && !contains(fromJSON(needs.plan.outputs.inherited), 'playwright') }}
-    runs-on: ubuntu-latest
+    # A push to main on main's runners; the gate's first run of a prefix in the merge line's lane
+    # when its planner found it free; every other run on the ordinary choice.
+    runs-on: >-
+      ${{ vars.CI_MAIN_RUNNER == 'on' && (github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && fromJSON('["self-hosted", "example-app-home-main"]') || github.run_attempt == '1'
+      && needs.plan.outputs.main_lane == 'true' && fromJSON('["self-hosted", "example-app-home-main-batch"]'))
+      || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
@@ -79,7 +152,13 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
-      - name: Whole on scratch and main, selected on a deferred PR
+      # Shipline's own scripts, which the repository does not hold: its main as it is now.
+      - name: Shipline
+        run: git clone --quiet --depth 1 https://github.com/NazmievBulat/Shipline.git "$RUNNER_TEMP/shipline"
+      # Whatever the browser tests need installed, the browsers among them, comes before this.
+      # The repository's browser command (`commands.browser`), whole on scratch and main, and
+      # on the selected files on a deferred pull request.
+      - name: Browser tests
         env:
           DEFERRED: ${{ needs.plan.outputs.prefix_only }}
           FILES: ${{ needs.plan.outputs.files }}
@@ -88,6 +167,7 @@ jobs:
           import json, os, subprocess
           selected = 'browser_whole' in json.loads(os.environ['DEFERRED'])
           files = json.loads(os.environ['FILES'])
+          command = ['python3', os.environ['RUNNER_TEMP'] + '/shipline/scripts/workflow/ci_proof.py', 'browser']
           if not selected or files:
-              subprocess.run(['tools/browser-tests', *files] if selected else ['tools/browser-tests'], check=True)
+              subprocess.run([*command, *files] if selected else command, check=True)
           PY

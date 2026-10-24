@@ -76,12 +76,15 @@ _DEFAULTS = {
     },
     "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
     "machines": [],
+    # The branches the merge gate tests its prefixes on are named by this, then a random name.
+    "merge": {"scratch_prefix": "workflow/merge-batch-"},
     "hunts": {"areas": {}, "plans": None},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
     "commands": {
         name: None
         for name in (
             "test",
+            "browser",
             "browser_tests_for_changes",
             "server_tests_for_changes",
             "pre_train_checks",
@@ -373,6 +376,72 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
         workflow_config.load(repo)
 
 
+@pytest.mark.parametrize(
+    "runner,main",
+    [
+        ({}, None),
+        ({"prefix": "example-app"}, "example-app-home-main"),
+        ({"prefix": "example-app", "label": "example-app-office"}, "example-app-office-main"),
+    ],
+)
+def test_main_s_runners_carry_the_runner_label_and_main(
+    tmp_path: Path, runner: dict[str, str], main: str | None
+) -> None:
+    """The labels the example workflows name for main's jobs and for the merge line's lane on
+    main's runners, both of which the gate may re-run."""
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": runner})
+    loaded = workflow_config.load(repo).runner
+
+    assert loaded.main_label == main
+    assert loaded.main_batch_label == (main and f"{main}-batch")
+    assert main is None or {main, f"{main}-batch"} <= set(loaded.labels)
+
+
+def test_the_example_s_main_label_is_one_of_its_runner_labels() -> None:
+    example = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
+    runner = example["runner"]
+
+    assert runner["label"] == f"{runner['prefix']}-home"
+    assert f"{runner['label']}-main" in runner["labels"]
+    assert f"{runner['label']}-main-batch" in runner["labels"]
+
+
+def test_the_scratch_prefix_is_read_and_must_name_branches_of_the_gate_s_own(
+    tmp_path: Path,
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"merge": {"scratch_prefix": "shipline/prefix-"}})
+
+    assert workflow_config.load(repo).merge.scratch_prefix == "shipline/prefix-"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        # Not ended by a separator, it would take in branches that only begin like it.
+        "workflow/merge-batch",
+        # Read as a pattern by `git ls-remote`, or not a branch name at all.
+        "workflow/*-",
+        "workflow/[a]-",
+        "workflow/merge batch-",
+        "workflow/../batch-",
+        "/workflow-",
+        "-workflow-",
+        "workflow//batch-",
+        "workflow/.batch-",
+        "workflow.lock/batch-",
+        "refs/heads/batch-",
+    ],
+)
+def test_a_scratch_prefix_that_is_not_a_plain_branch_prefix_is_refused(
+    tmp_path: Path, prefix: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"merge": {"scratch_prefix": prefix}})
+
+    with pytest.raises(workflow_config.ConfigError, match="merge.scratch_prefix"):
+        workflow_config.load(repo)
 def test_hot_paths_match_by_github_s_rules(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
     _write(repo, {"hot_paths": ["src/example_app/*.py", "web/src/pages/**", "docs/**/list.md"]})
@@ -538,6 +607,7 @@ _LABELS = (
     "example-app-home-standby",
     "example-app-home-first",
     "example-app-home-main",
+    "example-app-home-main-batch",
     "example-app-home-docker",
     "example-app-home-planner",
 )
@@ -563,6 +633,7 @@ def test_a_named_runner_label_builds_the_labels(tmp_path: Path) -> None:
         "example-pool-standby",
         "example-pool-first",
         "example-pool-main",
+        "example-pool-main-batch",
         "example-pool-docker",
         "example-pool-planner",
     )
@@ -634,8 +705,6 @@ def test_bash_reads_the_runner_label_and_the_built_labels(tmp_path: Path) -> Non
         "tools/hub 'cache'",
         *_LABELS,
     ]
-
-
 def test_the_test_folders_tools_parity_compares_are_read(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
     _write(repo, {"parity": {"workflow_tests": "app/tests/flow"}})
@@ -854,6 +923,8 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"checks": "CI result"}', "checks"),
         ('{"commands": {"test": ""}}', "commands.test"),
         ('{"commands": {"test": ["pytest"]}}', "commands.test"),
+        ('{"commands": {"browser": ""}}', "commands.browser"),
+        ('{"merge": {"scratch_prefix": ""}}', "merge.scratch_prefix"),
         ('{"runner": {"labels": "home"}}', "runner.labels"),
         ('{"state_folder": "/var/workflow"}', "state_folder"),
         ('{"state_folder": "../workflow"}', "state_folder"),
@@ -1666,6 +1737,34 @@ def test_the_gate_reads_the_named_checks_titles_workflow_files_and_runner_labels
     # The default titles, on checks of the named names: nothing is proven by them.
     checks = {key: named[key] for key in ("ci_plan", "e2e_plan", "ci_result")}
     assert _gate_reads(workflow, {**default, **checks}) == unproven
+
+
+def test_the_scratch_prefix_reaches_the_gate_and_the_figures_of_its_runs(
+    workflow: Workflow,
+) -> None:
+    _commit_on_main(
+        workflow, {"shipline.json": json.dumps({"merge": {"scratch_prefix": "shipline/prefix-"}})}
+    )
+    done = subprocess.run(
+        [
+            "python3",
+            "-B",
+            "-c",
+            'import sys; sys.path.insert(0, "scripts/workflow"); import merge_gate as g; '
+            "print(g.SCRATCH_PREFIX)",
+        ],
+        cwd=workflow.repo,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.stdout == "shipline/prefix-\n", done.stderr
+    # Every other script that tells the gate's runs apart reads it from the file, not as text.
+    for path in sorted(_WORKFLOW.iterdir()):
+        if path.is_file() and path.suffix != ".md" and path.name != "workflow_config.py":
+            assert "merge-batch" not in path.read_text(errors="replace"), path.name
 
 
 def test_without_a_repository_only_what_needs_one_stops(workflow: Workflow) -> None:

@@ -79,7 +79,7 @@ NOTIFY_WAITING = (
     else "scripts/workflow/notify waiting"
 )
 # The gate owns these branches: each holds one batch's test merge, never a pull request.
-SCRATCH_PREFIX = "workflow/merge-batch-"
+SCRATCH_PREFIX = CONFIG.merge.scratch_prefix
 E2E_PLAN = CONFIG.checks.e2e_plan
 CI_PLAN = CONFIG.checks.ci_plan
 CI_RESULT = CONFIG.checks.ci_result
@@ -3658,7 +3658,13 @@ def _sweep_scratch(folder: Path) -> None:
         before = json.dumps(train.dropped, sort_keys=True)
         kept = set(train.scratch_records())
         listed = git("ls-remote", "origin", f"refs/heads/{SCRATCH_PREFIX}*")
-        branches = [line.split()[1].removeprefix("refs/heads/") for line in listed.splitlines()]
+        # `ls-remote` also lists a branch that only ends like one of the gate's: only a branch
+        # of the gate's namespace is ever deleted.
+        branches = [
+            branch
+            for line in listed.splitlines()
+            if (branch := line.split()[1].removeprefix("refs/heads/")).startswith(SCRATCH_PREFIX)
+        ]
     except (Refused, OSError, KeyError, IndexError, TypeError, ValueError) as error:
         print(f"could not delete old batch branches: {error}", flush=True)
         return

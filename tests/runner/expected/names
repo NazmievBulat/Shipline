@@ -9,5 +9,6 @@ label=example-app-home
 standby_label=example-app-home-standby
 first_label=example-app-home-first
 main_label=example-app-home-main
+main_batch_label=example-app-home-main-batch
 docker_label=example-app-home-docker
 planner_label=example-app-home-planner

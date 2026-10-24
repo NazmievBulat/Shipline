@@ -15,15 +15,17 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `.github/runner/settings.sh` when the runner pool names one, else the owner and name of the
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
-set-up command, run only when present, is `scripts/setup-worktree`; no runner prefix and no
-image build or hub cache command, and the runner label `<prefix>-home` and planner label
-`<label>-planner`, whose labels are the runner labels, none without a prefix; the workflow and
-runner tests `tools/parity` compares are in `tests/workflow` and `tests/runner`, and it knows of
-no differences; no machines named, so `flow-page` samples only the machine it runs on; no hunt
-areas, so one hunt runs at a time, and no hunt plans file; no test command, which a repository
-names for its CI's test job (`ci_proof.py test`); a question to the owner marked `Owner only: no`
-gets its recommended reply after 15 minutes; a quiet cloud worker is woken after 30 minutes; no
-paths that call for a closer review.
+set-up command, run only when present, is `scripts/setup-worktree`; the merge gate's scratch
+branches begin `workflow/merge-batch-`; no runner prefix and no image build or hub cache
+command, and the runner label `<prefix>-home` and planner label `<label>-planner`, whose labels
+are the runner labels, main's runners' `<label>-main` among them; none without a prefix; the
+workflow and runner tests `tools/parity` compares are in `tests/workflow` and `tests/runner`,
+and it knows of no differences; no machines named, so `flow-page` samples only the machine it
+runs on; no hunt areas, so one hunt runs at a time, and no hunt plans file; no test command,
+which a repository names for its CI's test job (`ci_proof.py test`), and no browser command,
+which it names for its E2E's browser job (`ci_proof.py browser`); a question to the owner marked
+`Owner only: no` gets its recommended reply after 15 minutes; a quiet cloud worker is woken
+after 30 minutes; no paths that call for a closer review.
 
 `review.high_effort_paths` are regular expressions, each searched for in every path a pull
 request changes: a match runs its independent reviewer at high effort, not medium
@@ -78,8 +80,10 @@ DEFAULTS: dict[str, Any] = {
     "refresh": {"clear_generated": []},
     "commands": {
         # The command line that runs the repository's tests, from the root of its checkout, by
-        # `bash -c` (`ci_proof.py test`).
+        # `bash -c` (`ci_proof.py test`); and the one that runs its browser tests, the same way
+        # (`ci_proof.py browser`).
         "test": None,
+        "browser": None,
         # The repository's own commands Shipline calls, each split into words (`Config.command`).
         "browser_tests_for_changes": None,
         "server_tests_for_changes": None,
@@ -148,6 +152,12 @@ DEFAULTS: dict[str, Any] = {
         # Docker Hub directly.
         "hub_cache": None,
     },
+    "merge": {
+        # The merge gate's own branches, each one prefix's test merge: this, then a random name.
+        # The gate deletes them once no prefix needs them, and the example workflows run its
+        # first run of a prefix there in the merge line's lane on main's runners (examples/ci.yml).
+        "scratch_prefix": "workflow/merge-batch-",
+    },
     # What `tools/parity` reads of a repository that keeps its own copy of the scripts: where its
     # workflow and runner tests are, and the file that lists the differences it expects.
     "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
@@ -194,6 +204,11 @@ _SUITE_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
+# A branch name's beginning, ended by `-` or `/` so the random name after it stands apart:
+# words of letters, digits, `_`, `.` and `-`, none beginning with `.` or `-` nor ending in
+# `.lock`, joined by single `/`; nothing `git ls-remote` reads as a pattern, and not a full ref.
+_WORD = r"(?!refs/)[A-Za-z0-9_][A-Za-z0-9_.-]*(?<!\.lock)(?<!\.)"
+_SCRATCH_PREFIX = re.compile(rf"(?!.*\.\.){_WORD}(?:/{_WORD})*[-/]")
 # What `ssh` reads as a destination and nothing else: `user@host`, a name or an address, never a
 # word that starts with a dash, which it would read as one of its own options.
 _ADDRESS = re.compile(r"(?!-)[A-Za-z0-9_.@:\[\]-]+")
@@ -292,6 +307,22 @@ class Runner:
     @property
     def identity_path(self) -> Path:
         return Path(self.identity_folder).expanduser()
+
+    @property
+    def main_label(self) -> str | None:
+        """The label of main's runners; None without a runner pool."""
+        return None if self.label is None else f"{self.label}-main"
+
+    @property
+    def main_batch_label(self) -> str | None:
+        """The merge line's lane on main's runners, which they carry while no push to main
+        waits (runner/lend_runners.py); None without a runner pool."""
+        return None if self.label is None else f"{self.label}-main-batch"
+
+
+@dataclass(frozen=True)
+class Merge:
+    scratch_prefix: str
 
 
 @dataclass(frozen=True)
@@ -506,6 +537,7 @@ def _generated_no_links(root: Path, path: Path) -> None:
 class Commands:
     # Each None when the file names none.
     test: str | dict[str, Any] | None
+    browser: str | dict[str, Any] | None
     browser_tests_for_changes: str | dict[str, Any] | None
     server_tests_for_changes: str | dict[str, Any] | None
     pre_train_checks: str | dict[str, Any] | None
@@ -539,8 +571,9 @@ class CloudPrePush:
     suites: tuple[Suite, ...] = ()
 
 
-# The commands run as words, not by a shell: every one but `test`.
-RUN_AS_WORDS = tuple(name for name in DEFAULTS["commands"] if name != "test")
+# The commands run as words, not by a shell: every one but `test` and `browser`, the command
+# lines CI's jobs run by `bash -c` (`ci_proof.py`).
+RUN_AS_WORDS = tuple(name for name in DEFAULTS["commands"] if name not in ("test", "browser"))
 
 
 @dataclass(frozen=True)
@@ -573,6 +606,7 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    merge: Merge
     parity: Parity
     machines: tuple[Machine, ...]
     hunts: Hunts
@@ -983,7 +1017,7 @@ _FUNCTIONS = {
     "browser_plan": {"browser_plan"},
 }
 _EXIT_COMMANDS = {
-    "test", "pre_train_checks", "hunt_app", "hunt_browser", "hunt_cursor", "push_checks",
+    "test", "browser", "pre_train_checks", "hunt_app", "hunt_browser", "hunt_cursor", "push_checks",
 }
 _SERVER_FIELDS = {"whole", "tests", "total", "reasons"}
 
@@ -1047,7 +1081,7 @@ def _command_entry(entry: dict[str, Any], name: str) -> dict[str, Any]:
                 raise ConfigError(
                     f"{FILE}: {where}.fields must map whole, tests, total, reasons to field names"
                 )
-    if form != "functions" and name != "test":
+    if form != "functions" and name not in ("test", "browser"):
         _words(line, name)
     return entry.copy()
 
@@ -1169,13 +1203,14 @@ def _from_runner_settings(main: Path) -> str | None:
 def runner_labels(label: str, planner_label: str | None = None) -> tuple[str, ...]:
     """The labels every machine's runners carry, so GitHub gives a job to whichever machine has
     one free: the base label, a spare's before it takes a slot, the merge train's first
-    member's, main's runners', the Docker runners' and the planner's, `<label>-planner` unless
-    the file names another."""
+    member's, main's runners', the merge line's lane on them, the Docker runners' and the
+    planner's, `<label>-planner` unless the file names another."""
     return (
         label,
         f"{label}-standby",
         f"{label}-first",
         f"{label}-main",
+        f"{label}-main-batch",
         f"{label}-docker",
         planner_label or f"{label}-planner",
     )
@@ -1304,6 +1339,12 @@ def _load(main: Path, start: Path | None, document: ConfigFile) -> Config:
     labels = tuple(values["runner"]["labels"])
     if "labels" not in given.get("runner", {}) and label is not None:
         labels = runner_labels(label, planner_label)
+    scratch_prefix = values["merge"]["scratch_prefix"]
+    if not _SCRATCH_PREFIX.fullmatch(scratch_prefix):
+        raise ConfigError(
+            f"{FILE}: merge.scratch_prefix must be the beginning of a branch name, ended by "
+            f"- or /, not {scratch_prefix}"
+        )
     for name in RUN_AS_WORDS:
         entry = values["commands"][name]
         if isinstance(entry, dict):
@@ -1344,6 +1385,7 @@ def _load(main: Path, start: Path | None, document: ConfigFile) -> Config:
             image_build=values["runner"]["image_build"],
             hub_cache=values["runner"]["hub_cache"],
         ),
+        merge=Merge(scratch_prefix=scratch_prefix),
         parity=parity_of(given),
         machines=tuple(Machine(**machine) for machine in values["machines"]),
         hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
@@ -1426,6 +1468,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "image_build": config.runner.image_build,
             "hub_cache": config.runner.hub_cache,
         },
+        "merge": vars(config.merge).copy(),
         "parity": vars(config.parity).copy(),
         "machines": [
             {"name": machine.name, **({"address": machine.address} if machine.address else {})}

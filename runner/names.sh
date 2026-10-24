@@ -17,10 +17,13 @@ hub_cache_container=$prefix-hub-cache
 # The name the workflows ask for in `runs-on`. Every machine's runners carry the same labels, so
 # GitHub gives a job to whichever machine has a runner free: every ordinary container registers
 # with the standby label until it takes a slot, the merge train's first member's jobs ask for the
-# first label, main's for the main label, Docker's and the planner's for their own.
+# first label, main's for the main label, the merge gate's first run of a prefix for main's batch
+# label (which the lender gives main's runners while no push to main waits), Docker's and the
+# planner's for their own.
 standby_label=$label-standby
 first_label=$label-first
 main_label=$label-main
+main_batch_label=$label-main-batch
 docker_label=$label-docker
 planner_label=${planner_label:-$label-planner}
 

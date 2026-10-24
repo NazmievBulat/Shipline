@@ -82,6 +82,7 @@ jobs:
               tests/runner/test_build_images.py
               tests/runner/test_install.py
               tests/runner/test_layout.py
+              tests/runner/test_lend_runners.py
               tests/runner/test_ordinary_slots.py
               tests/runner/test_programs.py
               tests/runner/test_rendering.py
@@ -137,6 +138,7 @@ jobs:
               tests/workflow/test_flow_page.py
               tests/workflow/test_ci_minutes.py
               tests/workflow/test_ci_proof.py
+              tests/workflow/test_ci_runner_choice.py
               tests/workflow/test_getting_started.py
               tests/workflow/test_independent_review.py
               tests/workflow/test_lost_check.py

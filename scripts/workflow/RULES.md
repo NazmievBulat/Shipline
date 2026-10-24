@@ -104,7 +104,10 @@ one's squash; a hot path never moves a member past another priority. A pull requ
 label changes while it waits moves at the next turn. The gate tests the first members of
 the line at once, each as a prefix: main and every member ahead of it, merged with this one,
 on a scratch branch of its own, with its CI, the whole browser suite's E2E run and any
-required image checks. A scratch CI or E2E job asking for `<label>-main-batch` that queues
+required image checks. The gate's first run of a prefix takes main's runners when the
+repository has them and one is free, in a lane of its own that a push to main goes ahead of, so
+a prefix never waits behind pull requests' own CI.
+A scratch CI or E2E job asking for `<label>-main-batch` that queues
 longer than `merge_train.queued_limit_minutes` (default 20) has its first attempt cancelled
 and its whole run re-run once, so attempt 2 takes the ordinary runner choice; a job past the
 limit on a later attempt is reported once in the gate's output and wake, and keeps waiting.
