@@ -13,7 +13,15 @@ from typing import Any
 
 import pytest
 from workflow.test_merge_driver import handed as handed_fixture
-from workflow.test_merge_when_current import GitHub, _hand_off, _handing_off, _waiting
+from workflow.test_merge_when_current import (
+    GitHub,
+    _hand_off,
+    _handing_off,
+    _refreshed_first,
+    _two_stale_pulls,
+    _waiting,
+    _waiting_reviewers,
+)
 from workflow.test_merge_when_current import github as github_fixture
 from workflow_harness import Workflow
 
@@ -423,3 +431,48 @@ def test_the_tick_reads_the_members_a_handoff_left_unread(github: GitHub) -> Non
     assert done.returncode == 0, done.stdout + done.stderr
     assert (workflow.state / "merged").read_text() == "7"
     assert _waiting(workflow) == []
+
+
+@pytest.mark.parametrize("change", ["created", "cleared"])
+def test_an_owner_question_noted_during_the_scan_is_not_hidden_by_the_reconcile_cache(
+    github: GitHub,
+    change: str,
+) -> None:
+    second = _two_stale_pulls(github)
+    workflow = github.workflow
+    _waiting_reviewers(github)
+    assert github.run().returncode == 2
+    assert workflow.run_script("merge-when-current", "8", cwd=second).returncode == 3
+    _refreshed_first(github)
+    note = workflow.notes(7) / "review-7.owner-blocked"
+    if change == "cleared":
+        note.touch()
+    env = _context(github)
+    Path(env["WORKFLOW_SESSION_SNAPSHOT"]).write_text(workflow.run("list").stdout)
+    # The note changes after the scan read 7's availability, while it polls runs.
+    armed = workflow.state / "change-note"
+    armed.touch()
+    workflow.fake("gh-real", (workflow.bin / "gh").read_text())
+    action = f'rm -f "{note}"' if change == "cleared" else f'touch "{note}"'
+    workflow.fake(
+        "gh",
+        f'#!/bin/bash\nif [[ "$*" == *actions/runs* && -e "{armed}" ]]; then\n'
+        f'  rm "{armed}"; {action}\nfi\nexec "{workflow.bin / "gh-real"}" "$@"\n',
+    )
+
+    scanned = workflow.run_script("merge-when-current", "--train-status", env=env)
+    assert scanned.returncode == 0, scanned.stderr
+    assert not armed.exists()
+    again = workflow.run_script("merge-when-current", "--train-status", env=env)
+    assert again.returncode == 0, again.stderr
+    (Path(env["WORKFLOW_TRAIN_TICK"]) / "reconciled.json").unlink()
+    uncached = workflow.run_script("merge-when-current", "--train-status", env=env)
+    assert uncached.returncode == 0, uncached.stderr
+
+    assert json.loads(uncached.stdout)["first"] == ("8" if change == "created" else "7")
+    assert again.stdout == uncached.stdout
+    # Unchanged inputs still reuse the reconcile within the tick.
+    before = workflow.calls("gh")
+    reused = workflow.run_script("merge-when-current", "--train-status", env=env)
+    assert reused.stdout == uncached.stdout
+    assert workflow.calls("gh") == before
