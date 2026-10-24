@@ -1,0 +1,4 @@
+#!/bin/bash
+# A stand-in for the repository's `hunt_cursor` command, the Cursor hunter a hunt runs: the tests
+# read only how it was started.
+exit 0

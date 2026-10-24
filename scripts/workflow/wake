@@ -94,7 +94,7 @@ mkdir -p "$STATE"
 main_report=$main/$SHIPLINE_STATE_FOLDER/main-status
 main_pending=$main/$SHIPLINE_STATE_FOLDER/main-status.pending
 # The first push the package audit refused because an advisory service could not be reached
-# (scripts/workflow/advisory_service.py), told once.
+# (the repository's advisory_watch command, `shipline.json`), told once.
 service_pending=$main/$SHIPLINE_STATE_FOLDER/advisory-service.pending
 service_line=""
 [[ ! -s $service_pending ]] || service_line=$(<"$service_pending")

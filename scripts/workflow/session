@@ -117,6 +117,8 @@ RULES_ON_MAIN="by the rules of AGENTS.md as it is on main, not the copy in this 
 # screens) is checked by `workflow_config.py`. No double quotation mark, dollar, backtick or
 # backslash.
 HUNT_RULES="by the section Hunt for bugs of AGENTS.md in this worktree"
+# What the sentence adds when the repository names a command that drives the browser.
+HUNT_BROWSER="drive the browser with shipline hunt-browser"
 # What a hunt is a copy of. Another commit can be named to try a hunt before the scripts it
 # needs are on `main`.
 HUNT_REF=${WORKFLOW_HUNT_REF:-origin/main}
@@ -275,12 +277,12 @@ forget_notes() {
   fi
 }
 
-# The copy of the application a hunt started lives outside `tmux`, so it is stopped by name.
+# The copy of the application a hunt started lives outside `tmux`, so it is stopped by name, by
+# the repository's `hunt_app` command (`shipline.json`), in the hunt's worktree, where the hunter
+# started it.
 stop_hunted_application() {
-  local worktree
-  worktree=$(worktree_of "$1")
-  [[ ! -f $worktree/scripts/workflow/hunt-app ]] ||
-    bash "$worktree/scripts/workflow/hunt-app" stop >/dev/null 2>&1 || true
+  ((${#SHIPLINE_COMMAND_HUNT_APP[@]} > 0)) || return 0
+  (cd "$(worktree_of "$1")" && "${SHIPLINE_COMMAND_HUNT_APP[@]}" stop) >/dev/null 2>&1 || true
 }
 
 # Ends a `tmux` server and waits a moment for it to go. A server that had already ended counts
@@ -903,10 +905,17 @@ check_room_for_hunt() {
 cmd_start_hunt() {
   local hunt=$1 kind=$2 program=$3 area=$4 name="hunt-$1" prompt worktree report command label
   local screens
+  # A hunt uses a copy of the application, which the repository's own command runs.
+  ((${#SHIPLINE_COMMAND_HUNT_APP[@]} > 0)) ||
+    die "this repository names no hunt_app command in shipline.json, so a hunt has no app to use"
+  [[ $program != cursor || ${#SHIPLINE_COMMAND_HUNT_CURSOR[@]} -gt 0 ]] ||
+    die "this repository names no hunt_cursor command in shipline.json, so it has no Cursor hunter"
   case $kind in
     plan) prompt="Hunt for bugs with a plan, as $name, $HUNT_RULES" ;;
     explore) prompt="Hunt for bugs exploring, as $name, $HUNT_RULES" ;;
   esac
+  # The repository's command that drives the browser, when it names one.
+  ((${#SHIPLINE_COMMAND_HUNT_BROWSER[@]} == 0)) || prompt+="; $HUNT_BROWSER"
   [[ $kind != plan || -z $SHIPLINE_HUNT_PLANS ]] ||
     prompt+=". The plans are in $SHIPLINE_HUNT_PLANS."
   if [[ -n $area ]]; then
@@ -948,8 +957,8 @@ cmd_start_hunt() {
     # is kept beside the report. It may reach the application on this machine and write the
     # report, and nothing else outside its worktree.
     if [[ $program == cursor ]]; then
-      printf -v command 'bash %q %q %q %q 2>&1 | tee %q' \
-        "$script_dir/cursor-hunt" "$worktree" "$report" "$prompt" "$report/cursor.log"
+      printf -v command '%q ' "${SHIPLINE_COMMAND_HUNT_CURSOR[@]}" "$worktree" "$report" "$prompt"
+      printf -v command '%s2>&1 | tee %q' "$command" "$report/cursor.log"
       label=Cursor
     else
       command="codex exec --sandbox workspace-write -c sandbox_workspace_write.network_access=true --add-dir $report \"$prompt\" 2>&1 | tee $report/codex.log"
