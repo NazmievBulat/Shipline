@@ -9,6 +9,9 @@
 # serve it is the machine owner's choice, never the repository's. Without them nothing is served,
 # and a server installed before is stopped and removed.
 #
+# Another machine named in `shipline.json` is sampled with `ssh -o BatchMode=yes`: its key must
+# work without a password or an agent, as the service has neither.
+#
 #   systemctl --user list-timers flow-page.timer     when it runs next
 #   journalctl --user -u flow-page.service           what each pass did
 #   systemctl --user disable --now flow-page.timer   switch it off

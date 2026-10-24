@@ -46,6 +46,9 @@ if arguments[:2] == ["api", "graphql"]:
         assert fields["q"].startswith(words), fields
         print(json.dumps(json.loads((fixtures / "merged-search.json").read_text())[0]))
     else:
+        if (fixtures / "fail-timelines").exists():
+            print("HTTP 502: Bad Gateway", file=sys.stderr)
+            sys.exit(1)
         merged = json.loads((fixtures / "merged.json").read_text())
         asked = re.findall(r"p(\\d+): pullRequest\\(number: (\\d+)\\)", query)
         print(json.dumps({"data": {"repository": {
@@ -125,6 +128,11 @@ def _state(workflow: Workflow) -> Path:
     return workflow.root / "home" / ".local" / "state" / "workflow" / "flow-page"
 
 
+def _cache(workflow: Workflow, kind: str, repository: str = "example-org/example-app") -> Path:
+    """What the page keeps of one repository: each repository on the machine has its own."""
+    return _state(workflow) / "cache" / repository / kind
+
+
 def _site(workflow: Workflow) -> Path:
     return _state(workflow) / "site" / "index.html"
 
@@ -193,12 +201,13 @@ def test_each_stage_holds_its_pull_requests_with_their_ages_and_priorities(
     # Ready and labelled: in review from its last ready. A ready one without the label is not
     # the workflow's.
     assert items("in review") == [(43, 1, "medium", None)]
-    # The merge line in the gate's own order, each from its last passed review, blocked as the
-    # gate reads the line's front.
+    # The merge line in the gate's own order, each from its passed review as the daily numbers
+    # take it (the first pass after the last send-back: a round passed again while it waits is
+    # the line's time), blocked as the gate reads the line's front.
     assert items("merge line") == [
         (44, 3, "high", None),
         (46, 30, "medium", "failed checks"),
-        (45, 12, "medium", "conflicting"),
+        (45, 18, "medium", "conflicting"),
         (48, 1, "medium", "no reviewer that can act"),
         (51, 0.5, "medium", "suspended"),
     ]
@@ -258,35 +267,60 @@ def test_the_merged_pull_requests_give_each_stage_s_median_and_90th_percentile(
     merged = _pass(workflow)["merged"]
 
     assert merged["numbers"] == [30, 31, 32, 33]
-    # Nearest rank. 33 was never labelled; 32 was ready before its label, so it has no build
-    # and no review time; 31's review lasts to its last passed round.
+    # The stages of the daily numbers (`workflow_metrics._stages`), and before them the wait
+    # from opening to the first label; nearest rank. 33 was never labelled, so it has none; 32
+    # was ready before its label, so its build ends at the label; 31's review ends at the first
+    # pass after its send-back, and its round passed again counts to the merge line.
     assert merged["stages"] == {
         "waiting for a start": {"count": 3, "median": 1, "p90": 2},
-        "being built": {"count": 2, "median": 2, "p90": 4},
-        "in review": {"count": 2, "median": 2, "p90": 5},
-        "merge line": {"count": 3, "median": 2, "p90": 4},
+        "being built": {"count": 3, "median": 2, "p90": 4},
+        "in review": {"count": 3, "median": 3, "p90": 4},
+        "merge line": {"count": 3, "median": 4, "p90": 4},
     }
     assert merged["sent_back_share"] == 0.25
 
 
 def test_the_merged_timelines_are_read_once_and_pruned_to_the_window(workflow: Workflow) -> None:
     _sources(workflow)
-    cache = _state(workflow) / "merged"
+    cache = _cache(workflow, "merged")
     cache.mkdir(parents=True)
     # Merged before the window: no longer in the search.
     (cache / "29.json").write_text(json.dumps({"number": 29}))
+    # Another repository's, kept by its own pass.
+    other = _cache(workflow, "merged", "example-org/other-app")
+    other.mkdir(parents=True)
+    (other / "12.json").write_text(json.dumps({"number": 12}))
 
     first = _pass(workflow)
     asked = [call for call in workflow.calls("gh api graphql") if "pullRequest(number:" in call]
     assert len(asked) == 1
     assert all(f"pullRequest(number: {number})" in asked[0] for number in (30, 31, 32, 33))
     assert sorted(path.name for path in cache.iterdir()) == [f"{n}.json" for n in (30, 31, 32, 33)]
+    assert (other / "12.json").exists()
 
     second = _pass(workflow)
 
     asked = [call for call in workflow.calls("gh api graphql") if "pullRequest(number:" in call]
     assert len(asked) == 1
     assert second["merged"] == first["merged"]
+
+
+def test_timelines_that_cannot_be_read_leave_the_rest_of_the_merged_ones_on_the_page(
+    workflow: Workflow,
+) -> None:
+    folder = _sources(workflow)
+    cache = _cache(workflow, "merged")
+    cache.mkdir(parents=True)
+    kept = json.loads((folder / "merged.json").read_text())["30"]
+    (cache / "30.json").write_text(json.dumps(kept))
+    (folder / "fail-timelines").touch()
+
+    numbers = _pass(workflow)
+
+    assert numbers["merged"]["numbers"] == [30]
+    error = numbers["sources"]["merged pull requests"]["error"]
+    assert error.startswith("3 timelines not read: GitHub: HTTP 502"), error
+    assert (cache / "30.json").exists()
 
 
 def test_github_is_read_once_for_the_open_ones_once_for_the_merged_and_the_runs_in_pages(
@@ -376,6 +410,8 @@ def test_ci_per_workflow_and_per_job_slowest_first(workflow: Workflow) -> None:
         for w in ci["workflows"]
     ] == [("E2E", 1, 0, 30, 0, 0), ("CI", 3, 1, 12, 1, 1)]
     e2e, ci_workflow = ci["workflows"]
+    # A skipped job takes no time and waits for no runner.
+    assert [job["name"] for job in e2e["jobs"]] == ["browser"]
     assert (e2e["wait_median"], e2e["wait_p90"]) == (10, 10)
     assert (ci_workflow["wait_median"], ci_workflow["wait_p90"]) == (2, 5)
     assert [
@@ -404,7 +440,7 @@ def test_at_most_40_job_reads_a_pass_and_a_finished_attempt_s_jobs_are_read_once
     runs = json.loads((folder / "runs.json").read_text())
     many = [{**runs[0], "id": 400 + number} for number in range(45)]
     (folder / "runs.json").write_text(json.dumps(many))
-    cache = _state(workflow) / "jobs"
+    cache = _cache(workflow, "jobs")
     cache.mkdir(parents=True)
     # An attempt of a run no longer in the window.
     (cache / "99-1.json").write_text("[]")
@@ -504,7 +540,7 @@ def test_each_machine_is_sampled_and_one_that_misses_a_read_keeps_its_last_numbe
         ("this machine", "2026-10-24T07:50:00Z"),
     ]
     assert oct(kept.stat().st_mode & 0o777) == "0o600"
-    assert "last answer 05:00 UTC" in _site(workflow).read_text()
+    assert "last answer 10-24 05:00 UTC" in _site(workflow).read_text()
     command = "cat /proc/loadavg; nproc; grep -E '^Mem(Total|Available):' /proc/meminfo"
     assert workflow.calls("ssh") == [
         f"ssh -o BatchMode=yes -o ConnectTimeout=5 -- runner-1.example {command}",
@@ -548,6 +584,8 @@ def test_the_page_is_static_reloads_every_5_minutes_and_names_each_source_and_it
         "machines.json",
     ):
         assert f"{source}, read 07:50 UTC" in page, source
+    # The line's count with how many are blocked there.
+    assert ">merge line: 5, 4 blocked</h3>" in page
     for heading in ("Work now", "Merged in 24 hours", "Merge line", "CI", "Machines"):
         assert f">{heading}</h2>" in page
     assert oct(_site(workflow).stat().st_mode & 0o777) == "0o644"
@@ -582,6 +620,10 @@ def test_below_the_reserve_github_is_not_read_and_the_rest_of_the_page_is(
     numbers = _pass(workflow)
 
     assert workflow.calls("gh") == []
+    # Without the open pull requests no stage can be judged the bottleneck.
+    assert numbers["bottleneck"] == (
+        "bottleneck unknown: the open pull requests were not read (GitHub budget low: paused)"
+    )
     assert numbers["sources"]["open pull requests"]["error"] == "GitHub budget low: paused"
     assert numbers["sources"]["runs"]["error"] == "GitHub budget low: paused"
     page = _site(workflow).read_text()
@@ -597,6 +639,18 @@ def test_below_the_reserve_github_is_not_read_and_the_rest_of_the_page_is(
     ]
     assert numbers["machines"][0]["fresh"]
     assert workflow.calls("journalctl")
+
+
+def test_a_train_file_that_cannot_be_read_is_named_without_its_path(workflow: Workflow) -> None:
+    _sources(workflow)
+    train = workflow.repo / ".local" / "workflow" / "merge-train.json"
+    train.unlink()
+    train.mkdir()
+
+    numbers = _pass(workflow)
+
+    assert numbers["sources"]["merge train"]["error"] == "cannot be read: Is a directory"
+    assert str(workflow.root) not in _site(workflow).read_text()
 
 
 def test_a_pass_leaves_while_another_one_runs(workflow: Workflow) -> None:
@@ -668,6 +722,13 @@ def test_the_server_binds_only_to_the_configured_address(workflow: Workflow) -> 
     finally:
         server.terminate()
         server.communicate(timeout=10)
+
+
+def test_without_settings_nothing_is_served(workflow: Workflow) -> None:
+    done = workflow.run_script("flow-page", "--serve", str(_free_port("127.0.0.1")))
+
+    assert done.returncode == 1
+    assert "nothing is served" in done.stderr
 
 
 @pytest.mark.parametrize(
@@ -781,8 +842,8 @@ def test_the_page_s_state_is_kept_from_other_users(workflow: Workflow) -> None:
 
     _pass(workflow)
 
-    for path in (_state(workflow), _state(workflow) / "merged", _state(workflow) / "jobs"):
+    for path in (_state(workflow), _cache(workflow, "merged"), _cache(workflow, "jobs")):
         assert oct(path.stat().st_mode & 0o777) == "0o700", path
-    for path in (*(_state(workflow) / "merged").iterdir(), *(_state(workflow) / "jobs").iterdir()):
+    for path in (*_cache(workflow, "merged").iterdir(), *_cache(workflow, "jobs").iterdir()):
         assert oct(path.stat().st_mode & 0o777) == "0o600", path
     assert os.access(_site(workflow), os.R_OK)

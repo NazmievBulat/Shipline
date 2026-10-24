@@ -53,6 +53,7 @@ from workflow_metrics import (
     STATE,
     CheckIn,
     _minutes,
+    _stages,
     _summary,
     instant,
     iso,
@@ -63,9 +64,9 @@ from workflow_metrics import (
 
 FOLDER = STATE / "flow-page"
 SITE = FOLDER / "site"
-# Merged pull requests' timelines and finished run attempts' jobs, each read once.
-MERGED = FOLDER / "merged"
-JOBS = FOLDER / "jobs"
+# Merged pull requests' timelines and finished run attempts' jobs, each read once, in
+# `cache/<owner>/<name>/`: every repository on the machine shares the state folder.
+CACHE = FOLDER / "cache"
 MACHINES = FOLDER / "machines.json"
 LOCK = FOLDER / "lock"
 HOUR = 3600
@@ -187,6 +188,8 @@ def _github(*arguments: str) -> str:
         raise Unread("GitHub budget low: paused") from None
     except subprocess.TimeoutExpired:
         raise Unread(f"GitHub did not answer in {GITHUB_SECONDS} s") from None
+    except OSError as error:
+        raise Unread(f"gh cannot be run: {error.strerror}") from None
     if done.returncode:
         raise Unread("GitHub: " + plain(done.stderr.strip() or done.stdout.strip()))
     return done.stdout
@@ -217,10 +220,20 @@ def open_pulls(repository: str) -> list[dict[str, Any]]:
         after = {"after": page["pageInfo"]["endCursor"]}
 
 
-def merged_pulls(repository: str, since: float, until: float) -> list[dict[str, Any]]:
+def _cache(repository: str, kind: str) -> Path:
+    for folder in (FOLDER, CACHE, CACHE / repository.split("/")[0]):
+        _private(folder)
+    return _private(CACHE / repository / kind)
+
+
+def merged_pulls(
+    repository: str, since: float, until: float
+) -> tuple[list[dict[str, Any]], str | None]:
     """The pull requests merged in the window, with their timelines: those not read before are
-    read, and those no longer in the window are dropped."""
+    read, and those no longer in the window are dropped. Returns why some timelines were not
+    read, when they were not: the others are counted all the same."""
     words = f"repo:{repository} is:pr is:merged base:main merged:{iso(since)}..{iso(until)}"
+    merged = _cache(repository, "merged")
     numbers: list[int] = []
     after: dict[str, str] = {}
     while True:
@@ -229,15 +242,15 @@ def merged_pulls(repository: str, since: float, until: float) -> list[dict[str, 
         if not page["pageInfo"]["hasNextPage"]:
             break
         after = {"after": page["pageInfo"]["endCursor"]}
-    _private(MERGED)
     found: dict[int, dict[str, Any]] = {}
     for number in numbers:
         try:
-            found[number] = json.loads((MERGED / f"{number}.json").read_text())
+            found[number] = json.loads((merged / f"{number}.json").read_text())
         except OSError, ValueError:
             pass
     missing = [number for number in numbers if number not in found]
     owner, name = repository.split("/")
+    error = None
     for start in range(0, len(missing), TIMELINES_A_READ):
         asked = missing[start : start + TIMELINES_A_READ]
         query = (
@@ -246,17 +259,24 @@ def merged_pulls(repository: str, since: float, until: float) -> list[dict[str, 
             + "  }\n}\n"
             + MERGED_FIELDS
         )
-        nodes = _graphql(query, owner=owner, name=name)["repository"]
+        try:
+            nodes = _graphql(query, owner=owner, name=name)["repository"]
+        except Unread as refused:
+            error = str(refused)
+            continue
         for number in asked:
             node = nodes.get(f"p{number}")
             if node and node.get("mergedAt"):
                 found[number] = node
-                _save(MERGED / f"{number}.json", node)
-    kept = {f"{number}.json" for number in found}
-    for path in MERGED.iterdir():
+                _save(merged / f"{number}.json", node)
+    kept = {f"{number}.json" for number in numbers}
+    for path in merged.iterdir():
         if path.name not in kept:
             path.unlink(missing_ok=True)
-    return sorted(found.values(), key=lambda pull: instant(pull["mergedAt"]))
+    pulls = sorted(found.values(), key=lambda pull: instant(pull["mergedAt"]))
+    if error:
+        error = f"{len(numbers) - len(found)} timelines not read: {error}"
+    return pulls, error
 
 
 def workflow_runs(repository: str, since: float, until: float) -> tuple[list[dict[str, Any]], bool]:
@@ -318,14 +338,14 @@ def read_jobs(repository: str, runs: list[dict[str, Any]]) -> tuple[int, str | N
     """The jobs of each finished run attempt, from what was read before or from GitHub, at most
     JOB_READS reads a pass, the newest first. Returns how many runs' jobs are not read yet, and
     why reading stopped when GitHub refused."""
-    _private(JOBS)
+    folder = _cache(repository, "jobs")
     finished = [run for run in runs if run.get("status") == "completed"]
     keys = {run["id"]: f"{run['id']}-{run.get('run_attempt') or 1}.json" for run in finished}
     reads = 0
     unread = 0
     error = None
     for run in sorted(finished, key=lambda run: run["created_at"], reverse=True):
-        cached = JOBS / keys[run["id"]]
+        cached = folder / keys[run["id"]]
         try:
             run["jobs"] = json.loads(cached.read_text())
             continue
@@ -344,7 +364,7 @@ def read_jobs(repository: str, runs: list[dict[str, Any]]) -> tuple[int, str | N
         run["jobs"] = jobs
         _save(cached, jobs)
     kept = set(keys.values())
-    for path in JOBS.iterdir():
+    for path in folder.iterdir():
         if path.name not in kept:
             path.unlink(missing_ok=True)
     return unread, error
@@ -474,7 +494,6 @@ def sample_machine(machine: workflow_config.Machine) -> dict[str, Any] | None:
 def read_machines(config: workflow_config.Config, moment: int) -> list[dict[str, Any]]:
     """One sample of each machine added to those of the window, which are kept."""
     machines = config.machines or (THIS_MACHINE,)
-    names = {machine.name for machine in machines}
     try:
         samples = json.loads(MACHINES.read_text())["samples"]
     except OSError, ValueError, KeyError, TypeError:
@@ -483,7 +502,7 @@ def read_machines(config: workflow_config.Config, moment: int) -> list[dict[str,
         sample
         for sample in samples
         if isinstance(sample, dict)
-        and sample.get("machine") in names
+        and isinstance(sample.get("machine"), str)
         and isinstance(sample.get("at"), str)
         and _moment(sample["at"]) is not None
         and _moment(sample["at"]) >= moment - WINDOW
@@ -492,6 +511,7 @@ def read_machines(config: workflow_config.Config, moment: int) -> list[dict[str,
         found = sample_machine(machine)
         if found:
             kept.append({"at": iso(moment), "machine": machine.name, **found})
+    _private(FOLDER)
     _save(MACHINES, {"samples": kept})
     return kept
 
@@ -557,7 +577,7 @@ def stage_of(pull: dict[str, Any], label: str, line: set[str]) -> tuple[str, flo
     created = instant(pull["createdAt"])
     ready = _events(pull, "ReadyForReviewEvent")
     if str(pull["number"]) in line:
-        return "merge line", max(_rounds(pull, "passed") or ready or [created])
+        return "merge line", _line_entered(pull) or max(ready or [created])
     labelled = label in {node.get("name") for node in (pull.get("labels") or {}).get("nodes") or []}
     if not labelled:
         return ("waiting for a start", created) if pull.get("isDraft") else None
@@ -565,6 +585,16 @@ def stage_of(pull: dict[str, Any], label: str, line: set[str]) -> tuple[str, flo
         entered = _events(pull, "LabeledEvent", label) + _events(pull, "ConvertToDraftEvent")
         return "being built", max(entered or [created])
     return "in review", max(ready or [created])
+
+
+def _line_entered(pull: dict[str, Any]) -> float | None:
+    """When a pull request joined the merge line, as the daily numbers take it
+    (`workflow_metrics._stages`): its first passed round after the last send-back."""
+    sent_back = _rounds(pull, "sent-back")
+    return min(
+        (moment for moment in _rounds(pull, "passed") if moment > max(sent_back, default=0)),
+        default=None,
+    )
 
 
 def _age(hours: float | None) -> str:
@@ -613,9 +643,12 @@ def work_now(
     return stages
 
 
-def bottleneck(stages: dict[str, list[dict[str, Any]]]) -> str:
+def bottleneck(stages: dict[str, list[dict[str, Any]]], unread: str | None = None) -> str:
     """The stage, among being built, in review and the merge line, that holds the most pull
-    requests, the one with the older oldest on a tie."""
+    requests, the one with the older oldest on a tie. Without the open pull requests no stage
+    can be judged: `unread` says why they were not read."""
+    if unread is not None:
+        return f"bottleneck unknown: the open pull requests were not read ({unread})"
     candidates = [
         (len(items), max((item["hours"] or 0) for item in items), stage)
         for stage, items in stages.items()
@@ -636,26 +669,20 @@ def bottleneck(stages: dict[str, list[dict[str, Any]]]) -> str:
 
 
 def merged_numbers(pulls: list[dict[str, Any]], label: str) -> dict[str, Any]:
-    """Each stage's hours, opened to the first label, to the first ready after it, to the last
-    passed review, to merged; a pull request that skipped a stage is not counted for it."""
+    """Each stage's hours: opened to the first label, then the daily numbers' own stages
+    (`workflow_metrics._stages`: build, review, merge line), which count only a pull request
+    that was labelled and passed its review; and the share sent back at least once."""
     hours: dict[str, list[float]] = {stage: [] for stage in STAGES}
     sent_back = 0
     for pull in pulls:
-        opened, merged = instant(pull["createdAt"]), instant(pull["mergedAt"])
-        labelled = min(_events(pull, "LabeledEvent", label), default=None)
-        ready = min(
-            (
-                moment
-                for moment in _events(pull, "ReadyForReviewEvent")
-                if labelled is not None and moment >= labelled
-            ),
-            default=None,
-        )
-        passed = max(_rounds(pull, "passed"), default=None)
-        moments = (opened, labelled, ready, passed, merged)
-        for stage, start, end in zip(STAGES, moments, moments[1:], strict=False):
-            if start is not None and end is not None and end >= start:
-                hours[stage].append((end - start) / HOUR)
+        labelled = _events(pull, "LabeledEvent", label)
+        if labelled:
+            hours["waiting for a start"].append(
+                max(0.0, min(labelled) - instant(pull["createdAt"])) / HOUR
+            )
+        if stages := _stages(pull, label):
+            for stage, key in zip(STAGES[1:], ("build", "review", "merge_line"), strict=True):
+                hours[stage].append(stages[key])
         sent_back += bool(_rounds(pull, "sent-back"))
     return {
         "numbers": [pull["number"] for pull in pulls],
@@ -750,6 +777,9 @@ def ci_numbers(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         jobs: dict[str, dict[str, list[Any]]] = {}
         for run in finished:
             for job in run.get("jobs") or []:
+                # A skipped job takes no time and waits for no runner.
+                if job.get("conclusion") == "skipped":
+                    continue
                 into = jobs.setdefault(
                     words(job.get("name") or "?"),
                     {"durations": [], "waits": [], "conclusions": []},
@@ -838,8 +868,16 @@ def _gb(kb: float | None) -> float | None:
 # The pass.
 
 
-def _source(read: dict[str, Any], name: str, moment: int, error: str | None = None) -> None:
-    read[name] = {"source": SOURCES[name], "read_at": iso(moment), "error": error}
+def _source(read: dict[str, Any], name: str, error: str | None = None) -> None:
+    """A source as read now: the time it was read, and why it was not, when it was not."""
+    read[name] = {"source": SOURCES[name], "read_at": iso(now()), "error": error}
+
+
+def _cannot(error: Exception) -> str:
+    """Why a file cannot be read, without its path: the page is served."""
+    if isinstance(error, OSError) and error.strerror:
+        return f"cannot be read: {error.strerror}"
+    return f"cannot be read ({type(error).__name__})"
 
 
 def measure(config: workflow_config.Config, moment: int) -> dict[str, Any]:
@@ -852,37 +890,43 @@ def measure(config: workflow_config.Config, moment: int) -> dict[str, Any]:
         try:
             found = reader(*args)
         except Unread as error:
-            _source(read, name, moment, str(error))
+            _source(read, name, str(error))
             return None
-        _source(read, name, moment)
+        _source(read, name)
         return found
 
     pulls = attempt("open pull requests", open_pulls, repository)
     try:
         train = read_train(config)
-        _source(read, "merge train", moment)
-    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        _source(read, "merge train")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, ImportError) as error:
         train = None
-        _source(read, "merge train", moment, plain(f"cannot be read: {error}"))
+        _source(read, "merge train", _cannot(error))
     merged = attempt("merged pull requests", merged_pulls, repository, since, until)
+    if merged:
+        merged, partly = merged
+        if partly:
+            _source(read, "merged pull requests", partly)
     journal = attempt("journal", read_journal, since, until)
     check_ins, ticks, found = read_wake_log()
-    _source(read, "wake log", moment, None if found else "not found")
+    _source(read, "wake log", None if found else "not found")
     listed = attempt("runs", workflow_runs, repository, since, until)
     runs, capped = listed if listed else ([], False)
     unread = 0
     if listed:
         unread, error = read_jobs(repository, runs)
         if error:
-            _source(read, "runs", moment, f"jobs: {error}")
+            _source(read, "runs", f"jobs: {error}")
     samples = read_machines(config, moment)
-    _source(read, "machines", moment)
+    _source(read, "machines")
     stages = work_now(pulls, train, label, moment)
     return {
         "now": iso(moment),
-        "bottleneck": bottleneck(stages),
+        "bottleneck": bottleneck(
+            stages, None if pulls is not None else read["open pull requests"]["error"]
+        ),
         "stages": {stage: {"items": items} for stage, items in stages.items()},
-        "merged": merged_numbers(merged or [], label) if merged is not None else None,
+        "merged": merged_numbers(merged, label) if merged is not None else None,
         "line": line_numbers(
             merged,
             journal,
@@ -992,7 +1036,12 @@ class _Server(http.server.ThreadingHTTPServer):
 
 def serve(port: int, folder: Path) -> int:
     where = served()
-    address = where[0] if where else DEFAULT_ADDRESS
+    if where is None:
+        raise SettingsError(
+            f"{workflow_config.RUNNER_SETTINGS} names no flow_page_address or flow_page_port:"
+            " nothing is served"
+        )
+    address = where[0]
     folder.mkdir(parents=True, exist_ok=True)
     _Server.address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
     with _Server((address, port), partial(_Folder, directory=str(folder))) as server:

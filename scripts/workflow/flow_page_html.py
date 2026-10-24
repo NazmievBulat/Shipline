@@ -94,7 +94,9 @@ def _work(numbers: dict[str, Any]) -> str:
     parts = ["<h2>Work now</h2>", _source(numbers, "open pull requests", "merge train")]
     for stage, found in numbers["stages"].items():
         items = found["items"]
-        parts.append(f"<h3>{_text(stage)}: {len(items)}</h3>")
+        blocked = sum(1 for item in items if item["blocked"])
+        count = f"{len(items)}, {blocked} blocked" if blocked else str(len(items))
+        parts.append(f"<h3>{_text(stage)}: {count}</h3>")
         if not items:
             continue
         rows = [
@@ -214,7 +216,7 @@ def _machines(numbers: dict[str, Any]) -> str:
         if machine["at"] is None:
             parts.append(f'<h3>{_text(machine["name"])}</h3><p class="muted">No answer yet.</p>')
             continue
-        when = "" if machine["fresh"] else f", last answer {_clock(machine['at'])}"
+        when = "" if machine["fresh"] else f", last answer {_when(machine['at'])} UTC"
         share = machine["load"] / machine["processors"] if machine["processors"] else None
         parts.append(
             f"<h3>{_text(machine['name'])}{_text(when)}</h3>"
