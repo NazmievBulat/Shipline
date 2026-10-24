@@ -17,15 +17,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any, NoReturn
 
-import advisory_service
 import priority
-import pushing_checkout
 import train_reads
 from merge_handoff import Handoff, authorized
-from run_proof import RECEIPT, passed_jobs
-from run_proof import WHOLE as WHOLE_REQUEST
 from workflow_commands import (
     COMMAND_TIMEOUT,
     GIT_READ_TIMEOUT,
@@ -40,6 +37,44 @@ from workflow_commands import (
 from workflow_commands import (
     run as run_command,
 )
+
+# A repository may hold three helpers beside these scripts, and the gate uses them when it does:
+# `advisory_service` tells a scan that could not reach a package advisory service, which is a
+# wait; `pushing_checkout` installs the pushing checkout's packages before its hook and words a
+# hook's refusal; `run_proof` reads and writes the `Workflow-Proof` line with which main skips a
+# job its squash proved. Without them a failed push is refused with its last lines, nothing is
+# installed first, and no proof is read or written, so main never skips a job.
+try:
+    import advisory_service
+except ModuleNotFoundError:
+    advisory_service = None
+try:
+    import pushing_checkout
+except ModuleNotFoundError:
+    pushing_checkout = None
+try:
+    from run_proof import RECEIPT, passed_jobs
+    from run_proof import WHOLE as WHOLE_REQUEST
+except ModuleNotFoundError:
+    RECEIPT = WHOLE_REQUEST = None
+
+    def passed_jobs(parts: list[dict[str, Any]]) -> set[str]:
+        return set()
+
+
+def mechanical_conflicts() -> ModuleType | None:
+    """The repository's rules for the conflicts and migration numbers a refresh settles itself,
+    `mechanical_conflicts` beside the scripts, read only when a refresh needs them. Without
+    them no conflict is mechanical and there are no migrations to renumber."""
+    try:
+        import mechanical_conflicts as rules
+    except ModuleNotFoundError:
+        return None
+    return rules
+
+
+# How many of its last lines a failed push is refused with, when the repository words no refusal.
+REFUSAL_LINES = 10
 
 REPOSITORY = "NazmievBulat/Shipline"
 API = f"repos/{REPOSITORY}"
@@ -171,8 +206,8 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     gate sets it for every push it makes. The hook runs with the pushing checkout's packages,
     installed first when its lockfiles changed since their last install. A failed install, or
     a scan that could not reach an advisory service after its own tries, is a wait."""
-    checkout = pushing_checkout.top(where)
-    failed = pushing_checkout.install_if_changed(checkout)
+    checkout = pushing_checkout.top(where) if pushing_checkout else where or Path.cwd()
+    failed = pushing_checkout.install_if_changed(checkout) if pushing_checkout else ""
     if failed:
         raise PackagesWaiting(failed)
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
@@ -187,6 +222,8 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         output,
         push_failure(output, checkout) if done.returncode else "",
     )
+    if advisory_service is None:
+        return pushed
     folder = main_checkout() / ".local" / "workflow"
     service = advisory_service.unreachable(output) if pushed.returncode else None
     if service:
@@ -206,7 +243,10 @@ def push_failure(output: str, checkout: Path) -> str:
 
     The first line is all the wake and a hand-back show, so a shortage is named there, before
     the hook's step that failed and its last lines."""
-    refusal = pushing_checkout.refusal(output, checkout)
+    if pushing_checkout:
+        refusal = pushing_checkout.refusal(output, checkout)
+    else:
+        refusal = "\n".join([line for line in output.splitlines() if line.strip()][-REFUSAL_LINES:])
     shortage = next(
         (line.strip() for line in output.splitlines() if short_of_memory(line)),
         None,
@@ -476,6 +516,8 @@ def _failed_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def unreached_service(parts: list[dict[str, Any]]) -> str | None:
     """The advisory service whose absence alone failed a CI run, from the audit's annotation:
     "CI: dependencies" is the only failed job besides "CI result", which follows it."""
+    if advisory_service is None:
+        return None
     failed = _failed_jobs(parts)
     if {job["name"] for job in failed} - {"CI result"} != {"CI: dependencies"}:
         return None
@@ -982,6 +1024,7 @@ def _refresh_health(folder: Path, *, retry: bool = False) -> tuple[str, Health]:
     # The tick asks a service a push found unreachable, so that its next outage is told too.
     if (
         retry
+        and advisory_service
         and (note := advisory_service.down(folder))
         and advisory_service.answers(note["service"])
     ):
@@ -1194,9 +1237,8 @@ def refresh_pull(
     train.refreshable.discard(number)
     merged = command("git", "merge", "--no-ff", "--no-commit", base, check=False)
     message = "chore: test against current main"
+    rules = mechanical_conflicts()
     if mechanical:
-        from mechanical_conflicts import MechanicalConflict, resolve
-
         conflicts = git("diff", "--name-only", "--diff-filter=U").splitlines()
         if conflicts:
             Path(git("rev-parse", "--git-path", "MERGE_MSG")).write_text(
@@ -1208,9 +1250,17 @@ def refresh_pull(
             and command("git", "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode
         ):
             raise Refused(merged.stderr.strip() or merged.stdout.strip())
+    if mechanical and rules is None and (conflicts or conflicting(pull)):
+        # Without the repository's rules no conflict is mechanical, whether git or only GitHub
+        # sees it: the reviewer resolves it.
+        where = f" in {', '.join(conflicts)}" if conflicts else ""
+        raise Refused(
+            f"non-mechanical conflict{where}: the repository resolves no conflict mechanically"
+        )
+    if mechanical and rules is not None:
         try:
-            resolved = resolve(head, base)
-        except MechanicalConflict as error:
+            resolved = rules.resolve(head, base)
+        except rules.MechanicalConflict as error:
             if conflicts:
                 raise Refused(f"non-mechanical conflict in {', '.join(conflicts)}: {error}") from error
             raise Refused(str(error)) from error
@@ -1230,20 +1280,15 @@ def refresh_pull(
         raise Refused(merged.stderr.strip() or merged.stdout.strip())
     if (
         not mechanical
+        and rules is not None
         and not command("git", "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode
     ):
         # Git merges two migrations numbered alike in different files cleanly; the migration
         # tool then has two heads. The branch's new ones move past main's last, or wait as a
         # conflict.
-        from mechanical_conflicts import (
-            MechanicalConflict,
-            MigrationCollision,
-            renumber_migrations,
-        )
-
         try:
-            moved = renumber_migrations(head, base)
-        except MigrationCollision as error:
+            moved = rules.renumber_migrations(head, base)
+        except rules.MigrationCollision as error:
             message = "merge main: conflict in " + ", ".join(error.paths)
             Path(git("rev-parse", "--git-path", "MERGE_MSG")).write_text(message + "\n")
             train.conflicts[number] = head
@@ -1253,7 +1298,7 @@ def refresh_pull(
                 f"mechanically ({error}); renumber the branch's migrations after main's last, "
                 f"commit with '{message}', push, then wait for CI"
             ) from error
-        except MechanicalConflict as error:
+        except rules.MechanicalConflict as error:
             raise Refused(str(error)) from error
         if moved:
             message = "merge main: renumber migration " + ", ".join(
@@ -1261,7 +1306,7 @@ def refresh_pull(
             )
     # An older run without provenance cannot prove freshness. If main is already contained,
     # an empty commit requests a new pull_request event rather than replaying the old event.
-    if Handoff.read(train.path.parent, number) is not None:
+    if WHOLE_REQUEST and Handoff.read(train.path.parent, number) is not None:
         message += "\n\n" + WHOLE_REQUEST
     _commit_and_push(pull, train, number, message, save=unblocked)
     print(
@@ -2188,11 +2233,12 @@ def _merge_tree(base: str, head: str) -> str | None:
 
 
 def _taken_migrations(head: str, base: str) -> list[str]:
-    from mechanical_conflicts import MechanicalConflict, taken_migrations
-
+    rules = mechanical_conflicts()
+    if rules is None:
+        return []
     try:
-        return taken_migrations(head, base)
-    except MechanicalConflict as error:
+        return rules.taken_migrations(head, base)
+    except rules.MechanicalConflict as error:
         raise Refused(f"could not compare migration numbers: {error}") from error
 
 
@@ -2328,6 +2374,9 @@ def squash_proof(
     tree: str,
     evidence: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]],
 ) -> str:
+    """The `Workflow-Proof` line of a squash, or none where the repository writes no proof."""
+    if RECEIPT is None:
+        return ""
     sources = []
     for key, (run, parts) in evidence.items():
         workflow = key.split("_", 1)[0]
@@ -2364,7 +2413,7 @@ def commit_list(number: str) -> str:
 def squash_body(number: str, proof: str) -> Iterator[str]:
     listed = commit_list(number)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt") as body:
-        body.write((listed + "\n\n" if listed else "") + proof + "\n")
+        body.write("\n\n".join(part for part in (listed, proof) if part) + "\n")
         body.flush()
         yield body.name
 
@@ -3254,8 +3303,13 @@ def train_status(folder: Path) -> int:
 
 
 def pre_train_checks(number: str, folder: Path) -> None:
-    """A failed local inventory must neither join nor stay approved for a prefix."""
-    done = command("bash", str(HERE / "pre-train-checks"), check=False)
+    """A failed local inventory must neither join nor stay approved for a prefix.
+
+    A repository that holds no `pre-train-checks` beside the gate has none to fail."""
+    checks = HERE / "pre-train-checks"
+    if not checks.exists():
+        return
+    done = command("bash", str(checks), check=False)
     print(done.stdout, end="", flush=True)
     print(done.stderr, end="", file=sys.stderr, flush=True)
     if done.returncode:
