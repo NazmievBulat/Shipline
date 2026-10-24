@@ -1053,7 +1053,12 @@ while read -r name state _; do
   # Only skipped image planners means the draft run; ready must get its new run first.
   # GitHub keeps skipped draft checks beside the ready run on the same head.
   if [[ $lost == false ]] && { [[ $only_lost == true ]] || ! jq -e --arg result "$SHIPLINE_CI_RESULT" \
-    --arg images "$SHIPLINE_IMAGES_PLAN" '.statusCheckRollup | type == "array" and
+    --arg images "$SHIPLINE_IMAGES_PLAN" --arg images_prefix "$SHIPLINE_IMAGES" \
+    --argjson prefix_only "$(jq -c '.checks.prefix_only // []' <<<"$SHIPLINE_CONFIG")" '
+    .statusCheckRollup | if type == "array" then
+      map(select(((($prefix_only | index("images")) != null) and
+        ((.name // "") == $images_prefix or ((.name // "") | startswith($images_prefix + ":")))) | not))
+    else . end | type == "array" and
     any(.[]; .name == $result) and
     (all(.[]; .name != $images) or
       any(.[]; .name == $images and .conclusion != "SKIPPED")) and all(.[];

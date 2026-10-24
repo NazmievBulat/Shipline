@@ -25,7 +25,8 @@
     "e2e_plan": "Browser: what to run",
     "images": "Images",
     "dependency_audit": "Build: dependencies",
-    "advisory_annotation": "Advisory"
+    "advisory_annotation": "Advisory",
+    "prefix_only": ["images", "browser_whole", "server_whole"]
   },
   "annotations": {
     "merge_tested": "Merge built",
