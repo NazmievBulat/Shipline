@@ -57,7 +57,16 @@ passed; while they run, later pull requests may go first as while checks run, an
 is a failed check until a rerun of it passes. A change that needs no browser test, or no
 server test job, needs no run of that suite. A red, pending or unreadable main stops merging, with one exception: on a red main, a
 pull request whose fresh CI on that same main ran and passed every check failing on main merges, because it
-is the fix (a skipped check does not count). After a squash, main inherits the green result
+is the fix (a skipped check does not count). An advisory on main is not a red main: when main's
+dependency audit (`checks.dependency_audit` in `shipline.json`) is its only failed check, its
+other checks passed, and the audit's notice (`checks.advisory_annotation`) names advisories
+alone, main is `advisory`, merging goes on, and the update that fixes the advisory counts as the
+fix of a red main once its latest CI passed with its own audit clean, whatever main that CI
+tested; its merge is verified as any other's. The pending of each merge on an advisory main does
+not end that state. A failure of the audit for any other reason, a lock file it cannot audit, a
+tool error or an advisory service that did not answer, leaves main red. A pull request's own
+audit still refuses an advisory main does not have, and passes over one main has, with a
+warning. After a squash, main inherits the green result
 of the identical tree tested by the pull request CI for each CI job that run passed, and
 images when every image job passed on that same tree; the gate records the source runs. A CI
 job the pull request skipped, which main always runs, waits for main's own success, and
@@ -66,7 +75,7 @@ gate's proof (a `Workflow-Proof` line): main's CI and E2E skip a job that line s
 whole, on the identical tree, and name the run they inherited.
 Main's other checks still run, and any failure makes main red as before. A push to main the
 gate did not make runs everything. A different tree waits for main's own checks, then the
-gate is called again; a stale pull request is refreshed meanwhile. The tick reports a red or unreadable main in the
+gate is called again; a stale pull request is refreshed meanwhile. The tick reports a red, advisory or unreadable main in the
 wake, including the failing checks and commits since the last green main, and again when it
 leaves that state; green again lets merging go on.
 
@@ -74,8 +83,8 @@ Every ticket has a priority, one of four labels: `priority: blocker` stops every
 now (a red main, a push refused for everyone, a deadlocked train); `priority: high` removes a
 bottleneck (CI capacity, a flaky test, a stalled or slow workflow); `priority: medium` is
 anything else; `priority: low` only when the owner says so. A pull request without one counts
-as medium, and one with several as the most urgent of them. The fix of a red main counts as a
-blocker whatever its label, and goes before every other blocker.
+as medium, and one with several as the most urgent of them. The fix of a red main, an advisory's
+update included, counts as a blocker whatever its label, and goes before every other blocker.
 
 Ready pull requests merge in queue order, in a merge train: by priority first (blocker, high,
 medium, low), then in the order they joined within one priority. A pull request whose priority
@@ -318,10 +327,14 @@ subagent when
 `codex review` would run locally. It pushes only to its pull request's branch, never
 force-pushes and never skips or weakens the pre-push hook. It reports the start, first push,
 blockers with their exact errors, owner questions and ready by pull request comments beginning with
-`<!-- cloud-worker -->`. The tick relays them without a model: a final question rings the
-phone once through `notify` and appears in the wake as `asking the owner: cloud-N`; a
-`Blocked` report is told to the orchestrator once. A final `worker finished` removes the
-record only once the pull request is ready, letting the normal independent review start.
+`<!-- cloud-worker -->`. It never ends its turn to wait for an answer; it polls the pull
+request's comments every three minutes instead. The tick relays the reports without a model:
+a final question rings the phone once through `notify` and appears in the wake as `asking the
+owner: cloud-N`; a `Blocked` report is told to the orchestrator once. A final `worker finished`
+removes the record only once the pull request is ready, letting the normal independent review
+start. Reports and failed deliveries are remembered locally. The workflow does not read cloud
+transcripts or stop cloud sessions; the owner answers in the cloud session or on the pull
+request.
 
 A cloud worker's push also runs the tests CI will run for its change: its machine is its own,
 so the slower suites cost no local machine anything. It exports `SHIPLINE_CLOUD_WORKER=1` in
@@ -347,8 +360,23 @@ suite is left to CI with the probe's error. Only after the server suite timed ou
 worker export `SHIPLINE_CLOUD_SERVER_PART="1 of 4"` (or another part), which runs that part
 of the selected server tests as CI parts it and leaves the rest to CI; a failing part still
 refuses. It unsets it once it is not needed.
-Reports and failed deliveries are remembered locally. The workflow does not read cloud
-transcripts or stop cloud sessions; the owner answers in the cloud session.
+
+A cloud session that ends its turn stays stopped until something types into it. The tick keeps,
+in each record, when it first saw the draft's head and the time of the last report. A worker
+whose draft has had no push and no report for `cloud_wake_after_minutes` of `shipline.json`
+(30 by default; 0 turns waking off), and no open question (a question report with no later
+answer), is woken once per quiet stretch: the tick attaches to its session in a short-lived
+tmux pane (`claude --cloud <address>`), waits up to 60 seconds for the input box, checks that it
+is empty, types a status check, sends it a second later and ends the pane, which ends only the
+local client. The wake log says `woke cloud-N (30 min quiet)`. Only comments from an account
+that may write to the repository count, as reports and as answers: anyone may comment on a
+public pull request. An answer to its question, a comment starting
+`<!-- shipline-orchestrator -->` or an unmarked one (a reply quoting the question counts; a
+command to a bot such as `@codex review`, or any comment starting with `@`, does not), wakes it
+at once the same way. A worker still quiet that long
+after its wake is named in the wake once, `stuck? cloud-N (60 min, woken once)`, and is not
+woken again in that stretch. An attach that fails (no box, an ended or expired session, a usage
+limit shown, text already in the box) is logged once and never tried again in that stretch.
 
 ## "Fix the failed check of pull request N: job J of run R, first failing test T"
 

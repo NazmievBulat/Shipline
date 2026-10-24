@@ -41,6 +41,8 @@ _DEFAULTS = {
         "ci_plan": "CI: what to run",
         "e2e_plan": "E2E: what to run",
         "images": "Docker images",
+        "dependency_audit": None,
+        "advisory_annotation": None,
     },
     "annotations": {
         "merge_tested": "Merge tested",
@@ -92,6 +94,7 @@ _DEFAULTS = {
     },
     "review": {"high_effort_paths": []},
     "answer_for_owner_after_minutes": 15,
+    "cloud_wake_after_minutes": 30,
     "cloud_pre_push": {"suites": {}},
 }
 
@@ -193,6 +196,14 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     assert example["hunts"]["areas"]
 
 
+@pytest.mark.parametrize("minutes", [0, 45])
+def test_the_cloud_wake_wait_is_a_whole_number_of_minutes(tmp_path: Path, minutes: int) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"cloud_wake_after_minutes": minutes})
+
+    assert workflow_config.load(repo).cloud_wake_after_minutes == minutes
+
+
 @pytest.mark.parametrize("paths", [["("], "^db/", [""], [3]])
 def test_review_paths_must_be_a_list_of_regular_expressions(tmp_path: Path, paths: Any) -> None:
     repo = _repository(tmp_path)
@@ -210,6 +221,22 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
 
     _write(repo, {"runner": {"prefix": ""}})
     with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be a name"):
+        workflow_config.load(repo)
+
+
+def test_the_dependency_audit_and_its_advisory_annotation_are_read(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {"dependency_audit": "Audit", "advisory_annotation": "Advisory"}})
+
+    checks = workflow_config.load(repo).checks
+    assert (checks.dependency_audit, checks.advisory_annotation) == ("Audit", "Advisory")
+
+    _write(repo, {"checks": {"dependency_audit": "Audit"}})
+    checks = workflow_config.load(repo).checks
+    assert (checks.dependency_audit, checks.advisory_annotation) == ("Audit", None)
+
+    _write(repo, {"checks": {"advisory_annotation": ""}})
+    with pytest.raises(workflow_config.ConfigError, match="checks.advisory_annotation must be"):
         workflow_config.load(repo)
 
 
@@ -595,6 +622,10 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         # Bash would wrap a number this large.
         ('{"answer_for_owner_after_minutes": 2000000000000000000}', "answer_for_owner_after_minutes"),
         ('{"answer_for_owner_after_minutes": 1441}', "answer_for_owner_after_minutes"),
+        ('{"cloud_wake_after_minutes": "30"}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": -1}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": 1.5}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": true}', "cloud_wake_after_minutes"),
     ],
 )
 def test_a_file_that_cannot_be_read_is_refused_by_name(
@@ -1044,11 +1075,12 @@ def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> d
 
 
 # The SHA-256 of each text as the scripts wrote it before they read `shipline.json`; the worker's
-# and the cloud worker's since they ask for the `Owner only:` line of a question to the owner.
+# and the cloud worker's since they ask for the `Owner only:` line of a question to the owner, and
+# the cloud worker's since it is told never to end a turn to wait for an answer.
 _TEXTS_BEFORE = {
     "worker": "325cbf877af37ce9da33010ca5fadb43199e42a93e78235e72d234068a61438c",
     # Since it tells a cloud worker to push as one, so its push runs CI's tests.
-    "cloud": "54c30fad964fd29a54e74b2fd68d353903dd769cd14410b998cfd7f26fa0c5a3",
+    "cloud": "cd523614cb42d86a5f7b72324e18f0cd0aca26721968201015b5610c5db7252f",
     "review": "ea932fce613e8e9c075daa884a2adee29b64ee5610f1fcd922f27aa6cd39c49a",
     "wake": "af21558438c99d72e165c8fb8ab4febdd80204e43f532a399697b4131441d080",
 }
@@ -1347,7 +1379,7 @@ def test_the_gate_reads_the_named_checks_titles_workflow_files_and_runner_labels
             "shipline.json": json.dumps(
                 {
                     "annotations": {key: named[key] for key in _DEFAULTS["annotations"]},
-                    "checks": {key: named[key] for key in _DEFAULTS["checks"]},
+                    "checks": {key: named[key] for key in _DEFAULTS["checks"] if key in named},
                     "workflows": {"images": "container.yml"},
                     "runner": {"labels": ["example-app-elsewhere"]},
                 }
