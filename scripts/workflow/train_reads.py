@@ -13,6 +13,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import workflow_config
+
 
 def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
@@ -111,8 +113,10 @@ class Reads:
             self.steady.discard(head)
 
     def api(self, path: str, read: Callable[[], Any]) -> Any:
+        config = workflow_config.current()
+        files = "|".join(re.escape(name) for name in (config.workflows.ci, config.workflows.images))
         head_match = re.search(
-            r"/workflows/(?:ci|images)\.yml/runs\?head_sha=([^&]+)&event=pull_request",
+            rf"/workflows/(?:{files})/runs\?head_sha=([^&]+)&event=pull_request",
             path,
         )
         owner = head_match[1] if head_match else self.owners.get(path)
@@ -129,19 +133,17 @@ class Reads:
         if owner and token:
             if head_match:
                 for run in value:
-                    self.owners[
-                        f"repos/NazmievBulat/Shipline/actions/runs/{run['id']}/jobs?per_page=100"
-                    ] = owner
+                    self.owners[f"{config.api}/actions/runs/{run['id']}/jobs?per_page=100"] = owner
             elif "/jobs?" in path:
                 for job in value:
                     self.owners[
-                        f"repos/NazmievBulat/Shipline/check-runs/{job['id']}/annotations?per_page=100"
+                        f"{config.api}/check-runs/{job['id']}/annotations?per_page=100"
                     ] = owner
             # Pending members are always polled once per tick. A lost check must age
             # into recognition, and a scratch rerun must never use the member's cache.
             if (
                 owner in self.steady
-                and (value or "/images.yml/runs?" in path)
+                and (value or f"/{config.workflows.images}/runs?" in path)
                 and (
                     not isinstance(value, list)
                     or all(item.get("status", "completed") == "completed" for item in value)

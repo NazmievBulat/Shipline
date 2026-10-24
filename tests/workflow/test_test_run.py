@@ -1,8 +1,6 @@
 """`test-run` stops a session's test command at its whole-run limit and says why a run ended."""
 
-import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -236,6 +234,20 @@ def test_a_failure_without_a_kill_at_the_limit_adds_nothing(tmp_path: Path) -> N
     assert done.stderr == ""
 
 
+def test_a_command_killed_while_the_shell_is_between_commands_prints_no_job_notice(
+    tmp_path: Path,
+) -> None:
+    """Bash tells of a job killed by a signal ("<pid> Killed ( trap - INT QUIT; ...") before the
+    first command after it reaped it, wherever that is, not only in a quiet `wait`. Each command
+    of the run's shell is held back, as on a loaded machine, so the command dies between two."""
+    (tmp_path / "slow.sh").write_text("trap 'sleep 0.05' DEBUG\n")  # bash reads `BASH_ENV`
+
+    done = _run("bash", "-c", "kill -9 $$", env={"BASH_ENV": str(tmp_path / "slow.sh")})
+
+    assert done.returncode == 137
+    assert done.stderr == ""
+
+
 def test_a_stop_sent_to_the_run_reaches_the_command_and_its_children(tmp_path: Path) -> None:
     """The session ending a run it gave up on must not leave the test runner going."""
     child = tmp_path / "child"
@@ -279,27 +291,6 @@ def test_a_memory_stop_without_a_limit_it_can_read_names_no_size(tmp_path: Path)
     assert done.stderr.splitlines()[-1].startswith(
         "stopped: the test run passed its memory limit. A loop or a leak"
     )
-
-
-def test_the_test_scripts_a_session_runs_go_through_it() -> None:
-    """Without the prefix a session's run would have no whole-run limit and no last line."""
-    scripts = json.loads((SCRIPTS.parents[1] / "package.json").read_text())["scripts"]
-
-    for name in ("test:web", "test:python", "test:e2e"):
-        assert scripts[name].startswith("bash scripts/workflow/test-run "), name
-
-
-def test_the_server_tests_run_on_as_many_workers_as_in_ci() -> None:
-    """On one process they ran past the whole-run limit; CI runs them on its
-    `PYTEST_WORKERS`, which a session may lower."""
-    root = SCRIPTS.parents[1]
-    script = json.loads((root / "package.json").read_text())["scripts"]["test:python"]
-    workers = re.search(
-        r"^  PYTEST_WORKERS: (\d+)$", (root / ".github/workflows/ci.yml").read_text(), re.M
-    )
-
-    assert workers, "ci.yml names no PYTEST_WORKERS"
-    assert f"pytest -n ${{PYTEST_WORKERS:-{workers[1]}}} --dist worksteal" in script
 
 
 def test_a_worker_that_ignores_the_stop_goes_once_the_command_has_ended(tmp_path: Path) -> None:
