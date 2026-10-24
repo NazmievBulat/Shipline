@@ -44,8 +44,8 @@ from workflow_commands import (
 # wait; `pushing_checkout` installs the pushing checkout's packages before its hook and words a
 # hook's refusal; `run_proof` reads and writes the `Workflow-Proof` line with which main skips a
 # job its squash proved. Without them a failed push is refused with its last lines, nothing is
-# installed first, and no proof is read or written, so main never skips a job: a job counts as
-# passed only where it passed itself. A helper that is there but cannot start stops the gate.
+# installed first, and the proof is Shipline's own (`ci_proof`), the one its example CI reads. A
+# helper that is there but cannot start stops the gate.
 try:
     import advisory_service
 except ModuleNotFoundError as error:
@@ -64,22 +64,8 @@ try:
 except ModuleNotFoundError as error:
     if error.name != "run_proof":
         raise
-    RECEIPT = WHOLE_REQUEST = None
-
-    def passed_jobs(parts: list[dict[str, Any]]) -> set[str]:
-        """The jobs that passed in the run itself, a job run in parts once each of its parts
-        did; no proof line is read."""
-        grouped: dict[str, list[tuple[re.Match[str] | None, dict[str, Any]]]] = {}
-        for job in parts:
-            part = re.fullmatch(r"(.+) \((\d+) of (\d+)\)", job["name"])
-            grouped.setdefault(part[1] if part else job["name"], []).append((part, job))
-        return {
-            name
-            for name, group in grouped.items()
-            if all(job.get("conclusion") == "success" for _, job in group)
-            and sorted((int(part[2]), int(part[3])) for part, _ in group if part)
-            in ([], [(number, len(group)) for number in range(1, len(group) + 1)])
-        }
+    from ci_proof import RECEIPT, passed_jobs
+    from ci_proof import WHOLE as WHOLE_REQUEST
 
 
 def mechanical_conflicts() -> ModuleType | None:
