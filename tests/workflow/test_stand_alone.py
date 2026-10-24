@@ -1,6 +1,6 @@
 """The scripts run in a repository that holds only them, and use what a repository adds beside
-them: the gate's advisory-service, pushing-checkout and run-proof helpers, and the runner's
-settings and `gh` installer."""
+them: the gate's run-proof helper, and the runner's settings and `gh` installer. The commands a
+repository names in `shipline.json` are tried in `test_commands.py`."""
 
 import json
 import subprocess
@@ -9,9 +9,9 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from workflow_harness import Workflow
+from workflow_harness import Workflow, install_shipline
 
-_HELPERS = ("advisory_service", "pushing_checkout", "run_proof")
+_HELPERS = ("run_proof",)
 # What a scan that could not reach an advisory service says, as an outage would read it.
 _UNREACHED = "npm's advisory service could not be reached"
 
@@ -36,24 +36,29 @@ def _gate(workflow: Workflow, code: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _failing_hook(workflow: Workflow, lines: list[str]) -> None:
-    """A pre-push hook that prints `lines` and refuses. It lives in `workflow.bin`: CI runs
-    pytest in /dev/shm, where git finds a hook it cannot run and skips it."""
+def _failing_hook(workflow: Workflow, lines: list[str], *, stall: bool = False) -> None:
+    """A pre-push hook that prints `lines` and refuses, or with `stall` sleeps past any deadline.
+    It lives in `workflow.bin`: CI runs pytest in /dev/shm, where git finds a hook it cannot run
+    and skips it."""
     hooks = workflow.bin / "hooks"
     hooks.mkdir(exist_ok=True)
     hook = hooks / "pre-push"
     printed = "".join(f"echo {json.dumps(line)}\n" for line in lines)
-    hook.write_text(f'#!/bin/bash\necho pre-push >> "{workflow.state}/calls.log"\n{printed}exit 1\n')
+    end = "exec /bin/sleep 30" if stall else "exit 1"
+    hook.write_text(f'#!/bin/bash\necho pre-push >> "{workflow.state}/calls.log"\n{printed}{end}\n')
     hook.chmod(0o755)
     workflow.git("config", "core.hooksPath", str(hooks))
 
 
-def _push(workflow: Workflow) -> subprocess.CompletedProcess[str]:
-    """The gate pushes a new branch; it prints what came back, or the wait it raised."""
+def _push(workflow: Workflow, deadline: int | None = None) -> subprocess.CompletedProcess[str]:
+    """The gate pushes a new branch; it prints what came back, or the wait it raised. A
+    `deadline` is the gate's own for this test, shorter than its commands'."""
     workflow.git("commit", "--quiet", "--allow-empty", "-m", "feat: pushed by the gate")
     return _gate(
         workflow,
-        """
+        (f"g.COMMAND_TIMEOUT = {deadline}\n" if deadline else "")
+        + textwrap.dedent(
+            """
         import json
         try:
             pushed = g.push("origin", "HEAD:refs/heads/ticket/pushed")
@@ -61,46 +66,14 @@ def _push(workflow: Workflow) -> subprocess.CompletedProcess[str]:
             print(json.dumps({"waiting": type(error).__name__, "reason": str(error)}))
         else:
             print(json.dumps({"returncode": pushed.returncode, "refusal": pushed.refusal}))
-        """,
+        """
+        ),
     )
 
 
 def _helpers_beside_the_scripts(workflow: Workflow) -> None:
-    """Small helpers of a repository that holds them; each writes down that it was asked."""
+    """The small helper of a repository that holds it."""
     scripts = workflow.script.parent
-    calls = workflow.state / "calls.log"
-    (scripts / "advisory_service.py").write_text(
-        textwrap.dedent(
-            f"""\
-            ANNOTATION = "Advisory service unreachable"
-            def unreachable(output):
-                return "npm" if {_UNREACHED!r} in output else None
-            def note_down(folder, service):
-                (folder / "advisory-service-down").write_text(service)
-            def note_up(folder):
-                (folder / "advisory-service-down").unlink(missing_ok=True)
-            def down(folder):
-                return None
-            def answers(service):
-                return False
-            """
-        )
-    )
-    (scripts / "pushing_checkout.py").write_text(
-        textwrap.dedent(
-            f"""\
-            from pathlib import Path
-            def top(where):
-                return where or Path.cwd()
-            def install_if_changed(checkout):
-                with open({str(calls)!r}, "a") as log:
-                    log.write("install " + str(checkout) + "\\n")
-                return ""
-            def refusal(output, checkout):
-                return "the hook's step failed"
-            """
-        )
-    )
     (scripts / "run_proof.py").write_text(
         textwrap.dedent(
             """\
@@ -139,6 +112,22 @@ def test_a_failed_push_is_refused_with_its_last_lines(workflow: Workflow) -> Non
     assert len(refused) == 10, refused
     assert _UNREACHED in refused and "step 1" not in refused
     assert "failed to push" in refused[-1]
+
+
+def test_a_push_that_times_out_is_refused_with_its_last_twenty_lines(workflow: Workflow) -> None:
+    lines = [f"step {number}" for number in range(1, 26)] + [_UNREACHED]
+    _failing_hook(workflow, lines, stall=True)
+
+    done = _push(workflow, deadline=5)
+
+    assert done.returncode == 0, done.stderr
+    pushed = json.loads(done.stdout)
+    assert pushed["returncode"] != 0
+    # The deadline on the first line, then the hook's last twenty, which git never followed.
+    assert pushed["refusal"].splitlines() == [
+        "git push timed out after 5s",
+        *lines[-20:],
+    ], pushed["refusal"]
 
 
 def test_a_failed_push_is_never_read_as_an_outage_of_an_advisory_service(
@@ -186,12 +175,12 @@ def test_without_a_proof_helper_the_proof_is_shipline_s_own(workflow: Workflow) 
     ], done.stderr
 
 
-@pytest.mark.parametrize("helper", [*_HELPERS, "mechanical_conflicts"])
+@pytest.mark.parametrize("helper", _HELPERS)
 def test_a_helper_that_cannot_start_stops_the_gate(workflow: Workflow, helper: str) -> None:
     """Only a helper the repository does not hold is left out; a broken one is never so."""
     (workflow.script.parent / f"{helper}.py").write_text("import example_app_missing_package\n")
 
-    done = _gate(workflow, "g.mechanical_conflicts()")
+    done = _gate(workflow, 'print("started")')
 
     assert done.returncode == 1
     assert "No module named 'example_app_missing_package'" in done.stderr
@@ -212,26 +201,44 @@ def test_a_squash_carries_the_commits_then_the_proof(workflow: Workflow) -> None
     ), done.stderr
 
 
-def test_a_repository_s_helpers_are_used_when_it_holds_them(workflow: Workflow) -> None:
-    _helpers_beside_the_scripts(workflow)
-    _failing_hook(workflow, [_UNREACHED])
-
-    done = _push(workflow)
-
-    assert json.loads(done.stdout)["waiting"] == "ServiceWaiting", done.stdout + done.stderr
-    assert (workflow.repo / ".local/workflow/advisory-service-down").read_text() == "npm"
-    assert workflow.calls("install ") == [f"install {workflow.repo}"]
-
-
-def test_a_repository_s_refusal_of_a_failed_push_is_used_when_it_holds_it(
-    workflow: Workflow,
+@pytest.mark.parametrize("named", [True, False])
+def test_the_named_dependency_audit_is_the_job_read_for_an_advisory_service_and_main_s_advisory(
+    workflow: Workflow, named: bool
 ) -> None:
-    _helpers_beside_the_scripts(workflow)
-    _failing_hook(workflow, ["secret found in config.py"])
+    # The repository's advisory watch names npm when the text says it could not be reached.
+    workflow.fake(
+        "example-advisory",
+        "#!/bin/bash\n"
+        f'[[ $1 == unreachable ]] && ! grep -q {json.dumps(_UNREACHED)} || echo npm\n',
+    )
+    config = json.loads((workflow.repo / "shipline.json").read_text())
+    config.setdefault("commands", {})["advisory_watch"] = "example-advisory"
+    if named:
+        config["checks"] = {
+            "dependency_audit": "CI: audit",
+            "advisory_annotation": "Dependency audit: advisories only",
+        }
+    (workflow.repo / "shipline.json").write_text(json.dumps(config))
 
-    done = _push(workflow)
+    done = _gate(
+        workflow,
+        f"""
+        g.api = lambda path, key=None, **given: (
+            [{{"title": "Advisory service unreachable", "message": {_UNREACHED!r}}}]
+            if "/12/" in path
+            else [{{"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}}]
+        )
+        failed = {{"status": "completed", "conclusion": "failure"}}
+        main = [{{"id": 11, "name": "CI result", **failed}}, {{"id": 12, "name": "CI: audit", **failed}}]
+        pull = [{{"id": 13, "name": "CI: audit", "status": "completed", "conclusion": "success"}}]
+        print(g.unreached_service(main), g.strict_jobs(pull)[0]["conclusion"])
+        """,
+    )
 
-    assert json.loads(done.stdout)["refusal"] == "the hook's step failed", done.stderr
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == (
+        "npm passed over an advisory on main\n" if named else "None success\n"
+    )
 
 
 def test_a_repository_s_proof_is_read_and_written_when_it_holds_it(workflow: Workflow) -> None:
@@ -391,6 +398,8 @@ def _installer(workflow: Workflow) -> Path:
 
 
 def test_install_timer_runs_without_the_gh_installer(workflow: Workflow) -> None:
+    # `install-timer` runs from a Shipline checkout of its own.
+    install_shipline(workflow)
     assert not _installer(workflow).exists()
 
     done = workflow.run_script("install-timer")
@@ -403,6 +412,8 @@ def test_install_timer_runs_without_the_gh_installer(workflow: Workflow) -> None
 
 
 def test_install_timer_runs_the_gh_installer_first_when_it_is_there(workflow: Workflow) -> None:
+    # `install-timer` runs from a Shipline checkout of its own.
+    install_shipline(workflow)
     _installer(workflow).write_text(f'echo "install-github-budget $*" >> "{workflow.state}/calls.log"\n')
 
     done = workflow.run_script("install-timer")
@@ -412,98 +423,11 @@ def test_install_timer_runs_the_gh_installer_first_when_it_is_there(workflow: Wo
 
 
 def test_install_timer_stops_when_the_gh_installer_fails(workflow: Workflow) -> None:
+    # `install-timer` runs from a Shipline checkout of its own.
+    install_shipline(workflow)
     _installer(workflow).write_text("exit 3\n")
 
     done = workflow.run_script("install-timer")
 
     assert done.returncode == 3
     assert workflow.calls("systemctl") == []
-
-
-def _pre_train_checks(workflow: Workflow) -> subprocess.CompletedProcess[str]:
-    """The gate's checks before pull request 7 joins the train; it prints how they ended."""
-    return _gate(
-        workflow,
-        """
-        from pathlib import Path
-        folder = Path(".local/workflow")
-        folder.mkdir(parents=True, exist_ok=True)
-        try:
-            g.pre_train_checks("7", folder)
-        except g.Refused as error:
-            print("refused:", error)
-        else:
-            print("passed")
-        """,
-    )
-
-
-def test_a_repository_without_pre_train_checks_has_them_passed(workflow: Workflow) -> None:
-    (workflow.script.parent / "pre-train-checks").unlink()
-
-    done = _pre_train_checks(workflow)
-
-    assert done.stdout == "passed\n", done.stderr
-    assert done.stderr == ""
-
-
-def test_a_repository_s_pre_train_checks_are_run_when_it_holds_them(workflow: Workflow) -> None:
-    (workflow.script.parent / "pre-train-checks").write_text(
-        f'echo "pre-train-checks" >> "{workflow.state}/calls.log"\necho "a check failed"\nexit 1\n'
-    )
-
-    done = _pre_train_checks(workflow)
-
-    assert workflow.calls() == ["pre-train-checks"]
-    assert done.stdout == "a check failed\nrefused: pre-train checks failed; " \
-        "fix the inventory before joining the merge train\n", done.stderr
-
-
-def test_without_conflict_rules_no_migration_is_taken(workflow: Workflow) -> None:
-    done = _gate(workflow, 'print(g.mechanical_conflicts(), g._taken_migrations("HEAD", "HEAD"))')
-
-    assert done.stdout == "None []\n", done.stderr
-
-
-def test_a_repository_s_conflict_rules_are_used_when_it_holds_them(workflow: Workflow) -> None:
-    (workflow.script.parent / "mechanical_conflicts.py").write_text(
-        textwrap.dedent(
-            """\
-            class MechanicalConflict(Exception):
-                pass
-            def taken_migrations(head, base):
-                return ["migrations/0002_taken.py"]
-            """
-        )
-    )
-
-    done = _gate(workflow, 'print(g._taken_migrations("HEAD", "HEAD"))')
-
-    assert done.stdout == "['migrations/0002_taken.py']\n", done.stderr
-
-
-def _an_app_change(workflow: Workflow) -> None:
-    (workflow.repo / "app.txt").write_text("changed\n")
-    workflow.git("add", "app.txt")
-    workflow.git("commit", "--quiet", "-m", "feat: an app change")
-
-
-def _browser_needed(workflow: Workflow) -> subprocess.CompletedProcess[str]:
-    return _gate(workflow, 'print("needed" if g.browser_needed("HEAD~1", "HEAD") else "none")')
-
-
-def test_without_an_e2e_planner_no_change_needs_browser_tests(workflow: Workflow) -> None:
-    (workflow.script.parents[1] / "e2e-plan.py").unlink()
-    _an_app_change(workflow)
-
-    done = _browser_needed(workflow)
-
-    assert done.stdout == "none\n", done.stderr
-
-
-def test_a_repository_s_e2e_planner_decides_when_it_holds_one(workflow: Workflow) -> None:
-    _an_app_change(workflow)
-
-    done = _browser_needed(workflow)
-
-    assert done.stdout == "needed\n", done.stderr

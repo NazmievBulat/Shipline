@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # A draft runs no CI: its builder runs the tests in its own session. Marking it ready starts
+  # its run on the current head.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   merge_group:
@@ -12,9 +15,10 @@ permissions:
   contents: read
 
 # A pull request's newer push cancels its older run. Every commit of main and of the merge queue
-# keeps its own run: the merge gate reads each of them.
+# keeps its own run: the merge gate reads each of them. A draft's runs, which run nothing, have a
+# group of their own, so one queued after the ready run never cancels it.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && format('{0}-draft-{1}', github.ref, github.event.pull_request.draft) || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -22,6 +26,8 @@ jobs:
   # (examples/ci.yml), so Shipline proves its pieces on itself.
   plan:
     name: "CI: what to run"
+    # Skipped while the pull request is a draft; the jobs after it are skipped by their own check.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -51,9 +57,11 @@ jobs:
   tests:
     name: "CI: server tests (${{ matrix.shard }} of 4)"
     needs: plan
+    # Skipped while the pull request is a draft; no other run is filtered by that check.
     # Folded: the job's name holds a colon, which a plain YAML value may not.
     if: >-
-      ${{ !contains(fromJSON(needs.plan.outputs.inherited), 'CI: server tests') }}
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+      && !contains(fromJSON(needs.plan.outputs.inherited), 'CI: server tests') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -65,9 +73,18 @@ jobs:
         include:
           - shard: 1
             files: >-
+              tests/workflow/test_commands.py
+              tests/workflow/test_decisions.py
               tests/workflow/test_merge_when_current.py
           - shard: 2
             files: >-
+              tests/runner/test_build_images.py
+              tests/runner/test_install.py
+              tests/runner/test_layout.py
+              tests/runner/test_programs.py
+              tests/runner/test_rendering.py
+              tests/tools/test_parity.py
+              tests/workflow/test_break_35.py
               tests/workflow/test_browser_test_slots.py
               tests/workflow/test_github_identity.py
               tests/workflow/test_install_hooks.py
@@ -75,6 +92,7 @@ jobs:
               tests/workflow/test_merge_driver.py
               tests/workflow/test_notify.py
               tests/workflow/test_priority.py
+              tests/workflow/test_review_effort.py
               tests/workflow/test_session_memory.py
               tests/workflow/test_session_stop_and_cleanup.py
               tests/workflow/test_ticket_starts.py
@@ -85,6 +103,7 @@ jobs:
               tests/workflow/test_workflow_metrics.py
           - shard: 3
             files: >-
+              tests/workflow/test_break_4_switch.py
               tests/workflow/test_check_parts.py
               tests/workflow/test_ci.py
               tests/workflow/test_cloud_workers.py
@@ -92,6 +111,7 @@ jobs:
               tests/workflow/test_conflict_review.py
               tests/workflow/test_github_budget.py
               tests/workflow/test_input_box.py
+              tests/workflow/test_install_path.py
               tests/workflow/test_install_timer.py
               tests/workflow/test_path_filter.py
               tests/workflow/test_push_slots.py
@@ -105,12 +125,14 @@ jobs:
           - shard: 4
             files: >-
               tests/workflow/test_checks_finished.py
+              tests/workflow/test_flow_page.py
               tests/workflow/test_ci_minutes.py
               tests/workflow/test_ci_proof.py
               tests/workflow/test_independent_review.py
               tests/workflow/test_lost_check.py
               tests/workflow/test_merge_train_metrics.py
               tests/workflow/test_running_command.py
+              tests/workflow/test_session_hunt.py
               tests/workflow/test_session_limit.py
               tests/workflow/test_session_with_real_tmux.py
               tests/workflow/test_stand_alone.py
@@ -138,8 +160,8 @@ jobs:
             command -v "$tool" >/dev/null || { echo "missing: $tool"; exit 1; }
           done
       # Ubuntu's tmux is built with systemd support: it moves each new pane into a scope of its
-      # own, racing the memory-limited scope a session starts its command in, and the first
-      # session can lose its limit (#41). The tests run the scripts with a tmux built without it.
+      # own. The tests run the scripts with a tmux built without it, on the PATH, and the tests of
+      # the sessions' memory limits with both builds (the one with systemd is built below).
       - name: Cache tmux without systemd
         id: tmux
         uses: actions/cache@v4
@@ -165,6 +187,32 @@ jobs:
           export PATH="$HOME/.local/tmux/bin:$PATH"
           tmux -V
           if ldd "$(command -v tmux)" | grep -q libsystemd; then echo "tmux uses systemd"; exit 1; fi
+      - name: Cache tmux with systemd
+        id: tmux-systemd
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/tmux-systemd
+          key: tmux-3.4-systemd-${{ env.ImageOS }}-${{ runner.arch }}
+      - name: Build tmux with systemd
+        if: steps.tmux-systemd.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq libevent-dev libncurses-dev libsystemd-dev pkg-config
+          curl -fsSL --connect-timeout 20 --max-time 300 -o "$RUNNER_TEMP/tmux-systemd.tar.gz" \
+            https://github.com/tmux/tmux/releases/download/3.4/tmux-3.4.tar.gz
+          echo "551ab8dea0bf505c0ad6b7bb35ef567cdde0ccb84357df142c254f35a23e19aa  $RUNNER_TEMP/tmux-systemd.tar.gz" |
+            sha256sum -c -
+          mkdir "$RUNNER_TEMP/tmux-systemd"
+          tar -xzf "$RUNNER_TEMP/tmux-systemd.tar.gz" -C "$RUNNER_TEMP/tmux-systemd"
+          cd "$RUNNER_TEMP/tmux-systemd/tmux-3.4"
+          ./configure --prefix="$HOME/.local/tmux-systemd" --enable-systemd
+          make -j4 && make install
+      # Not on the PATH: named to the tests that start sessions with it.
+      - name: Name tmux with systemd to the tests
+        run: |
+          tmux_with_systemd="$HOME/.local/tmux-systemd/bin/tmux"
+          "$tmux_with_systemd" -V
+          ldd "$tmux_with_systemd" | grep -q libsystemd || { echo "tmux does not use systemd"; exit 1; }
+          echo "WORKFLOW_TEST_TMUX_WITH_SYSTEMD=$tmux_with_systemd" >> "$GITHUB_ENV"
       - name: The test tools
         run: python -m pip install --require-hashes -r requirements-test.txt
       # The test command shipline.json names (commands.test), with this shard's own words.
@@ -182,7 +230,8 @@ jobs:
     # The check the merge queue requires, by this name: it passes only when every job that ran
     # passed, the planner among them. Main skips the shards only when its proof shows they passed.
     name: CI
-    if: always()
+    # Skipped with the shards on a draft: a skipped result is no pass to the merge gate.
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     needs: [plan, tests]
     runs-on: ubuntu-latest
     timeout-minutes: 5

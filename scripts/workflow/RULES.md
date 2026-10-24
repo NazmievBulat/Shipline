@@ -5,12 +5,21 @@ This file holds the rules for repositories that use Shipline; Shipline's own dev
 A draft pull request labelled `workflow` gets a worker session, which builds it and marks it
 ready. The tick then starts a fresh Claude reviewer, which reviews it and merges it. An audit session is not a stage every pull request passes: it is only for a pull
 request the orchestrator names, one that was built before the workflow existed. A session is
-started by `scripts/workflow/session` with one sentence as its whole instruction. This file
+started by `shipline session` with one sentence as its whole instruction. This file
 says what each sentence means, and what the orchestrator session does.
 
 A third kind of session has no pull request: a hunt, which uses the running application in a
 browser and reports the bugs it finds. It is started by hand with a sentence of its own, and
 the repository's hunt rules are its whole instruction.
+
+Two hunts may run at once, each in its own area of the application, never three. A repository
+names its areas in `shipline.json`, under `hunts.areas`: each a short name and the screens
+(paths) it covers. A hunt started with an area is told its area and its screens in its
+sentence; it stays off the other areas' screens except to pass through them. A hunt without
+an area hunts every screen and runs alone. With no areas configured, one hunt runs at a time.
+In the hunt plans file (`hunts.plans`, which the sentence of a hunt with a plan names), each
+task starts with its area or "Every screen."; a hunt with an area takes only the tasks of its
+area.
 
 A fourth kind has no pull request either: the analyst, a read-only session the tick starts once
 a day, which reads the workflow's own logs and proposes at most three changes to it (see
@@ -34,7 +43,7 @@ commits, code and these rules, never the builder's transcript, logs, reasoning o
 An audit remains only for a pull request built before this workflow, named by the orchestrator.
 
 Every session that merges uses the merge gate, from its pull request's worktree:
-`bash "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/scripts/workflow/merge-when-current" N`.
+`shipline merge-when-current N`.
 Never call `gh pr merge` directly. The gate holds one machine-wide lock through the freshness
 check and squash merge, checks main's latest CI result and image checks of its pushes (a
 scheduled image run is only reported in the wake when it fails), and verifies that
@@ -48,7 +57,16 @@ passed; while they run, later pull requests may go first as while checks run, an
 is a failed check until a rerun of it passes. A change that needs no browser test, or no
 server test job, needs no run of that suite. A red, pending or unreadable main stops merging, with one exception: on a red main, a
 pull request whose fresh CI on that same main ran and passed every check failing on main merges, because it
-is the fix (a skipped check does not count). After a squash, main inherits the green result
+is the fix (a skipped check does not count). An advisory on main is not a red main: when main's
+dependency audit (`checks.dependency_audit` in `shipline.json`) is its only failed check, its
+other checks passed, and the audit's notice (`checks.advisory_annotation`) names advisories
+alone, main is `advisory`, merging goes on, and the update that fixes the advisory counts as the
+fix of a red main once its latest CI passed with its own audit clean, whatever main that CI
+tested; its merge is verified as any other's. The pending of each merge on an advisory main does
+not end that state. A failure of the audit for any other reason, a lock file it cannot audit, a
+tool error or an advisory service that did not answer, leaves main red. A pull request's own
+audit still refuses an advisory main does not have, and passes over one main has, with a
+warning. After a squash, main inherits the green result
 of the identical tree tested by the pull request CI for each CI job that run passed, and
 images when every image job passed on that same tree; the gate records the source runs. A CI
 job the pull request skipped, which main always runs, waits for main's own success, and
@@ -57,7 +75,7 @@ gate's proof (a `Workflow-Proof` line): main's CI and E2E skip a job that line s
 whole, on the identical tree, and name the run they inherited.
 Main's other checks still run, and any failure makes main red as before. A push to main the
 gate did not make runs everything. A different tree waits for main's own checks, then the
-gate is called again; a stale pull request is refreshed meanwhile. The tick reports a red or unreadable main in the
+gate is called again; a stale pull request is refreshed meanwhile. The tick reports a red, advisory or unreadable main in the
 wake, including the failing checks and commits since the last green main, and again when it
 leaves that state; green again lets merging go on.
 
@@ -65,8 +83,8 @@ Every ticket has a priority, one of four labels: `priority: blocker` stops every
 now (a red main, a push refused for everyone, a deadlocked train); `priority: high` removes a
 bottleneck (CI capacity, a flaky test, a stalled or slow workflow); `priority: medium` is
 anything else; `priority: low` only when the owner says so. A pull request without one counts
-as medium, and one with several as the most urgent of them. The fix of a red main counts as a
-blocker whatever its label, and goes before every other blocker.
+as medium, and one with several as the most urgent of them. The fix of a red main, an advisory's
+update included, counts as a blocker whatever its label, and goes before every other blocker.
 
 Ready pull requests merge in queue order, in a merge train: by priority first (blocker, high,
 medium, low), then in the order they joined within one priority. Members of one priority whose
@@ -119,9 +137,13 @@ one waiting for the owner. So a pull request waiting for the owner does not hold
 failed checks joins at the back when the gate is called again; a green CI re-run on the same
 head and current main lifts a failed-check block and restores the pull request's earlier
 queue position, and a green re-run on an older main is refreshed in that place when its turn
-comes. A pull request that merged, closed, became a draft or left `main` as its base leaves
-the line. When the gate says the pull request waits behind another (or for main to change),
-it has already run `scripts/workflow/notify waiting` itself: end the turn. The tick wakes
+comes. A re-run of only the failed jobs keeps the run's proof of the merge it tested, as a
+full re-run does. A pull request that merged, closed, became a draft or left `main` as its
+base leaves the line. One exception: a pull request whose failing test the tick gave to a
+worker (see "Fix the failed check of pull request N") keeps its place as a blocked member, as
+a draft and on its fix, until its fresh reviewer calls the gate; then it regains that place,
+and is served there once its fix's CI is green. When the gate says the pull request waits behind another (or for main to change),
+it has already run `shipline notify waiting` itself: end the turn. The tick wakes
 that reviewer or audit when its pull request is first and all checks on its head have
 finished, once for each turn of the line, state of main and head. One whose checks failed
 is woken as any waiting reviewer is, when its checks finish. A reviewer hands its merge to
@@ -155,6 +177,19 @@ worker, reviewer and audit alike:
 
 - A question to the owner is plain text at the end of a turn: the recommendation first, then
   the other choices, ending with the short words he can type back ("1", "merge it").
+- Just before those words the question carries one line of its own: `Owner only: yes` or
+  `Owner only: no`. `Owner only: yes` is required for money, privacy, legal text, text sent to
+  a model, and any product decision these rules keep for the owner; anything else is
+  `Owner only: no`. A question without the line counts as `Owner only: yes`, waits for him and
+  is named to the orchestrator once.
+- A question marked `Owner only: no` that has waited `answer_for_owner_after_minutes` in
+  `shipline.json` (15 by default; 0 turns it off) gets its recommended reply from the tick:
+  the first reply word after the line (so the recommended one comes first, a number or words
+  in quotes, never a command such as `/clear`), typed into the session once, as if he had
+  typed it.
+  His own reply, if it comes first, wins; so does text he has not sent yet. The wake's morning
+  check-in lists the questions answered for him overnight, with the reply given, so he can
+  overrule them. A Codex bridge relays and is never answered for him.
 - The question tool is not used.
 - The owner is never handed a shell command to run. What has to be run, the session runs.
 - A change to a screen still publishes the artifact with the options and gives the link; the
@@ -185,19 +220,24 @@ worker, reviewer and audit alike:
 - Start with brainstorming. A change to a screen publishes an options page (as in "Asking the
   owner") and ends the turn with the card's title, choices, reply words and link in text;
   nothing is built until the owner answers. A backend choice that is a product decision is
-  asked in text, recommendation first.
+  asked in text, recommendation first, with the `Owner only:` line of "Asking the owner".
   Any other choice is made and written into the pull request description.
-- Run the repository's fast pre-train checks from the pull request's worktree before marking
-  ready. They also run before a handoff or gate call admits it to the merge train; a failure
-  refuses admission. They supplement CI, which still runs its normal checks.
-- Run `scripts/workflow/weaker-tests --base <base> --working-tree` before marking ready.
+- Run the repository's fast pre-train checks, `shipline pre-train-checks`, from the pull
+  request's worktree before marking ready. They also run before a handoff or gate call
+  admits it to the merge train; a failure refuses admission. They supplement CI, which still
+  runs its normal checks.
+- A draft pull request runs no CI: its run starts when it is marked ready, on the head it then
+  has, and each later push runs again. So run the tests in the session before marking ready.
+- Run `shipline weaker-tests --base <base> --working-tree` before marking ready.
   Explain each item in the description: why the change is correct and how the test still
   catches its original bug, ideally with a failing run on a deliberately broken version.
 - Commit with conventional commits and push the branch. Never force-push.
-- Before a browser test run, `scripts/workflow/session protect ticket-N`; after it,
-  `scripts/workflow/session unprotect ticket-N`.
+- Before a browser test run, `shipline session protect ticket-N`; after it,
+  `shipline session unprotect ticket-N`.
 - To finish, run one round each of the test coverage reviewer and `codex review --base <base>`,
-  and test what was built, using the repository's local browser test selection. Fix the
+  and test what was built, using the repository's local browser test selection,
+  `shipline browser-tests-for-changes <base>`; when the repository configures none, it says
+  so, nothing is selected and CI runs the whole suite. Fix the
   findings and run
   one round on those fixes. Then mark ready and stop; the independent reviewer does the deep
   check. A job longer than this pull request
@@ -250,7 +290,7 @@ route list. With an empty diff it judges the description conservatively; an uncl
 stays with Claude. A sent-back ticket with a `codex-built-N` marker gets Codex for its fix round regardless of the default program, using the same screen exclusions above, which still get Claude.
 A ticket whose description has the line `Worker: Codex (a bug fix with no new UI)` on its own
 is eligible for Codex whatever its diff or its words, its fix rounds included. Only the
-orchestrator writes that line.
+orchestrator writes that line, with `shipline decide program N codex`.
 
 Read the task, including any `Answers given for the owner`. Put unanswered product decisions
 under `Questions for the owner` in the description, recommendation first, and ask in the bridge
@@ -297,9 +337,31 @@ record only once the pull request is ready, letting the normal independent revie
 Reports and failed deliveries are remembered locally. The workflow does not read cloud
 transcripts or stop cloud sessions; the owner answers in the cloud session.
 
+## "Fix the failed check of pull request N: job J of run R, first failing test T"
+
+A worker the tick starts at medium effort when a test of the pull request's own failed on its
+handed-off head, usually after main was merged in. It is the worker of "Implement pull request
+N" with these differences:
+
+- The task is the failed check. Read the description, then the failed log of run R with
+  `gh run view R --log-failed`. T is "not reported" when no test line could be read.
+- Find why the test fails on this head and fix it within the task of the pull request: the
+  code, or a test whose expectation main's change made wrong. Never weaken or skip a test to
+  make it pass. Run that test and the repository's fast pre-train checks.
+- There is no review to fix and no brainstorming; a fix that needs a product decision, or more
+  than a fix, is asked as any worker asks.
+- Commit, push without force, mark ready and say "worker finished". The pull request kept its
+  place in the merge train; a fresh reviewer reviews the fix as a normal round and hands it
+  off, and it is served in that place once its CI is green.
+
 ## "Review pull request N"
 
-A fresh context, always Claude Opus at high effort, started by `session start review N`.
+A fresh context, always Claude Opus, started by `session start review N`. It runs at medium
+effort, and at high when the change touches a path `review.high_effort_paths` of
+`shipline.json` names (stored data, text sent to a model, background work, locks and queues,
+account boundaries and security) or one of Shipline's own concurrent scripts, or when the
+description has the line `Review: high` on its own; `review-effort N` says which and why, and
+says high whenever it cannot tell.
 It knows only the description (the task), diff against the base, commits, code and rules
 from main. Do not read worker logs, transcripts, own reviews or ask the worker for a handover.
 Local `.local/workflow` session files are control notes, not review evidence. Panel reports
@@ -307,7 +369,7 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
 
 1. Read the description and whole diff. Run the panel of the main checkout, which a branch
    made before it existed does not have:
-   `bash "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/scripts/workflow/review-panel" N`.
+   `shipline review-panel N`.
    The independent reviewers are Cursor and Codex for a pull request Claude built, and
    Claude and Cursor for a pull request Codex built. Claude is the reviewing session;
    the panel runs Cursor and, when eligible, Codex in separate detached worktrees at the
@@ -334,7 +396,8 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
    test. A gap in a task requirement or bug fix counts toward sending back; optional extra
    coverage does not. Judge coverage yourself too; run `codex review --base <base>` only
    when Codex did not build this pull request.
-   Test what was built with the repository's local browser test selection; use the browser
+   Test what was built with the repository's local browser test selection
+   (`shipline browser-tests-for-changes <base>`); use the browser
    by hand for
    screens, protecting `review-N` before and unprotecting it after the run.
 2. Read only earlier independent reviews for this pull request from
@@ -362,12 +425,14 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
    If that round still finds problems, stop and ask the owner in text instead of continuing
    to fix or send back silently. Keep the session open without either completion line.
    A restart does not reset the count: read the published reviews. After the owner authorizes another round, the
-   orchestrator writes its number to `.local/workflow/review-N.allow-round` in the main
-   checkout. This permits that exact round only. Record the authorization with its review.
-5. Ask product decisions in text, recommendation first. A job longer than this pull request
+   orchestrator records it with `shipline decide allowance N --round R --owner "<his words>"`, which
+   writes its number to `.local/workflow/review-N.allow-round` in the main checkout. This
+   permits that exact round only. Record the authorization with its review.
+5. Ask product decisions in text, recommendation first, with the `Owner only:` line of
+   "Asking the owner". A job longer than this pull request
    becomes a draft ticket as in audit step 5, without the label `workflow`. No question or
    unaddressed finding may remain before merging.
-   When a watch for GitHub checks was stopped, run `scripts/workflow/notify waiting` before
+   When a watch for GitHub checks was stopped, run `shipline notify waiting` before
    ending the turn to wait for checks, instead of asking the owner for "go on". The tick
    wakes that reviewer once per head when all checks on the head have finished, including
    failed checks, even if the reviewer has not published its round yet. A reviewer does not
@@ -385,10 +450,8 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
   which passes only when
   each of them that ran passed. One listed as skipped while "CI: what to run" passed was not
   needed. The image check is every check whose name begins with "Docker images": "what to
-  run", the parts of the browser tests ("browser tests (1 of 3)" and on), the image tests
-  and the parts of the release tests. Each of them that ran must pass. One listed as
-  skipped while "Docker images: what to run" passed was not needed (the release tests of a
-  pull request that does not change the release setup), and is not waited for. The image
+  run" and the jobs it starts. Each of them that ran must pass. One listed as skipped while
+  "Docker images: what to run" passed was not needed, and is not waited for. The image
   check does not run for a draft: a pull request that changes what goes into the images lists
   all of them as skipped until it is marked ready, and then a new run starts. Those skipped
   checks are not a pass; the run that started after the pull request was marked ready is
@@ -396,7 +459,7 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
   When they hold, the reviewer publishes a passed independent round on the current head and,
   with no question or finding left, always hands the merge to the tick; it does not call the
   gate to merge and does not wait in the merge train:
-  `bash "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/scripts/workflow/merge-when-current" --handoff N`.
+  `shipline merge-when-current --handoff N`.
   Run it from the clean pull request worktree, based on `main`. It verifies the published
   round, records `.local/workflow/merge-wanted-N` in the main checkout with its head and
   round, and joins the same merge train. Only after that succeeds, end with `review finished`.
@@ -405,7 +468,8 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
   The tick keeps the worktree, retries expected waits, refreshes through the gate and merges
   through the gate, including batches. A gate refresh advances the note to its own pushed
   head; any other head change, a failed check, a conflict or another refusal revokes the
-  handoff and starts a fresh reviewer. Main being red or pending still follows the gate's
+  handoff and starts a fresh reviewer. A failed check that is the pull request's own failing
+  test goes to a worker instead (see "For the orchestrator session"). Main being red or pending still follows the gate's
   existing stop and fix rules. Stacked pull requests are moved mechanically as below;
   anything requiring judgment is returned to their own session or a fresh reviewer.
 - A branch merges `main` in only when it needs to, not because `main` moved: when GitHub
@@ -413,8 +477,8 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
   `DIRTY`), when the pull request below it merged (the next point), or when `main` changed a
   file the branch changes or depends on, or the merge gate requires fresh CI on current main.
   Each such merge is a push, and on a pull request that
-  changes the images each push sends the image check to the back of the Docker runners'
-  queue. A ready pull request that merges `main` in because of a conflict says so in the
+  changes the images each push sends the image check to the back of its runners' queue. A
+  ready pull request that merges `main` in because of a conflict says so in the
   commit message (`merge main: conflict in <files>`).
 - After the merge, for each pull request built on this one: set its base to `main` and merge
   `main` into its branch. Ask about a conflict that is not mechanical. A ready one labelled
@@ -449,7 +513,9 @@ Commit as `merge main: conflict in <files>` and push without force. Run the main
 `review-panel N`: it verifies that this is one merge of H and the recorded main, and gives
 the panel the diffs against both parents for F, with the task and earlier passed round.
 Read its completed reports, narrowed weaker-tests report and reached test selections. Run
-every selected server test and the local browser test selection, protecting `review-N`
+every selected server test (`server-tests.json`) and the local browser test selection
+(`browser-tests.txt`, empty when the repository configures none, and CI then runs the whole
+browser suite), protecting `review-N`
 before and unprotecting it after browser runs. The usual cap of three local browser test
 files and two workers still applies; CI runs the rest. For a changed screen, use the
 browser by hand too. The panel's local browser selection is limited to the files listed in
@@ -512,7 +578,7 @@ The analyst is the session `analyst-<name>`. The tick starts one a day, from 08:
 day's metrics report is written, as `analyst-day-<date>` over the last day, and on Sunday as
 `analyst-week-<date>` over the last 7 days, when the 5-hour usage window allows a start (not
 above 85% unless it resets within the hour). By hand it is
-`scripts/workflow/session start analyst <name> [1-7]`, the number being the days it reads. Its
+`shipline session start analyst <name> [1-7]`, the number being the days it reads. Its
 sentence is "Analyse the workflow over the last day (or the last N days), as analyst-<name>, by
 the section Analyse the workflow of AGENTS.md in this worktree". It runs Claude Opus at medium
 effort in a copy of `main` on no branch, and has 40 minutes: the tick stops it then, whatever
@@ -561,9 +627,9 @@ When it starts, and again after a restart, the orchestrator writes its session n
 Workers are started by a script, build and mark ready. Fresh reviewers review and merge. Audits are started by the
 orchestrator, by hand, and only for the pull requests built before the workflow existed.
 
-`scripts/workflow/tick` has no model in it (beyond the one that carries the wake's message, below)
+`shipline tick` has no model in it (beyond the one that carries the wake's message, below)
 and is run every 3 minutes by a systemd user timer
-(`scripts/workflow/install-timer` switches it on). It does only what has one right answer: it
+(`shipline install-timer` switches it on). It does only what has one right answer: it
 stops an idle audit whose screen has the line "audit finished", a reviewer with
 "review finished" (or "review sent back" once its pull request is draft), and an idle worker
 with "worker finished" (unless its pull request is still a draft), runs
@@ -594,7 +660,8 @@ has the line "hunt finished" and any hunt that still runs 65 minutes after its s
 analyst (see "Analyse the workflow"), stops it on the line "analysis finished", idle or not,
 or 40 minutes after its start. `session cleanup` notes its report for the wake, however the
 analyst ended, and removes its worktree; the wake tells the orchestrator once, at any hour and
-busy or not. A daily start that failed is not tried again that day.
+busy or not. A daily start that failed is not tried again that day. Each hunt is stopped and
+removed on its own: ending one never touches another's worktree, notes or report.
 
 Every reviewer hands its passed review to the tick with `merge-when-current --handoff N`,
 then ends with `review finished` and is stopped as usual. When the tick stops a reviewer
@@ -608,13 +675,34 @@ only at the front of the train. Expected waits keep the note; a gate refresh rec
 own pushed head. After a merge the tick records the stacked children, changes their bases
 to `main` and merges `main` into each clean branch worktree and pushes. It keeps the parent
 note until that work finishes, so a restart can continue after a base was changed.
-A conflict first gets a mechanical refresh in the kept worktree for recognized migration-chain
-or decision-record renumbering and separate additions to a Markdown list, with the relevant
-migration and decision-list checks before committing and pushing; success advances the note
-and keeps its train place.
+A conflict first gets a mechanical refresh in the kept worktree by the repository's configured
+conflict command, which resolves only the conflicts it recognizes and checks its own result
+before the gate commits and pushes; success advances the note and keeps its train place. A
+repository that configures none has no recognized conflict.
 A failed check, unrecognized conflict, unrelated head change or gate refusal needing judgment drops the
 note, revokes batch approval and requests one fresh reviewer. A child with its own session
 is left to that session; an unlabelled child keeps its orchestrator-managed audit path.
+A handed-off pull request whose checks failed is first read: the latest CI, image and E2E runs
+of its head (it waits while one still runs), and for each failed, timed-out or cancelled job
+(not the jobs whose name ends in "result") its failed log and its annotations. The first
+failing test is the first pytest line `FAILED <file>.py::<test>` (or `ERROR`), else the first
+Vitest `FAIL <file>.test.<ext> > <name>`, else the first Playwright
+`1) [project] › <file>.spec.ts:L:C › <name>`; with none, it is "not reported". A job failed
+for its runners when it timed out, or when it names no test and its log or annotations say
+that the runner was lost, disconnected or shut down, lost communication or could not be
+contacted, that the job exceeded its time, or "Failed to download action" or "Internal server
+error".
+- A job that failed on a test of its own: the tick makes the pull request a draft, revokes its
+  handoff, keeps its place in the line as a blocked member, and starts a worker at medium
+  effort whose sentence names the job, its run and the first failing test (below). The wake
+  names it once as a hand-back. Its fix gets a fresh reviewer as any ready pull request does.
+- Only the runners failed it: each failed run is re-run once, its failed jobs only, under the
+  rules of main's retry (the run completed at its first attempt, every job completed, its
+  failed jobs ran on the repository's own runners, no planner failed). The handoff waits for
+  the re-run. A run that may not be re-run, or fails again, goes to one fresh reviewer.
+- Anything else goes to one fresh reviewer, as before: a cancelled job, a failed job with no
+  log or annotation to read, a failure no run of the head shows, and a second failing test in
+  a row, one on the head the worker's fix made before a handed-off head of it passed.
 A recorded hand-back preserves local work at its recorded head, unresolved merge conflicts
 and local refresh commits after a failed push for its reviewer to inspect and finish
 pushing and checking. It does not
@@ -622,7 +710,7 @@ discard local work or authorize a merge. The wake names each hand-back once, ret
 until delivery.
 Ready pull requests with a merge note do not get another reviewer just for waiting in line.
 
-A reviewer still waiting for checks runs `scripts/workflow/notify waiting` and ends its turn,
+A reviewer still waiting for checks runs `shipline notify waiting` and ends its turn,
 without asking the owner for "go on". Its check-wait note makes it eligible for one nudge
 when all checks on the current head have finished, even before it publishes a round. A
 reviewer or audit waiting in the merge train is nudged only when its pull request is first
@@ -634,12 +722,14 @@ and logs each nudge in `~/.local/state/workflow/wake.log`. It leaves owner-block
 and unsent input alone; the reviewer reads the results and follows the merge gate rules.
 
 The tick also keeps waits moving, for Claude workers and reviewers only (never Codex bridges,
-hunts or audits), and never interrupts a running command or answers a question:
+hunts or audits), and never answers a question. It never interrupts a running command but in
+two cases, a still screen and a wait loop that finds itself (below); the full table is in
+`docs/nudge-rules.md`:
 
 - A session idle 50 minutes or more that waits for its own checks or job (its `notify waiting`
   stop) or, as a reviewer, for its turn in the merge train gets one status message, once per
   idle stretch: "Status check: if what you were waiting for is done, carry on; if not, run
-  `scripts/workflow/notify waiting` and end your turn." Its cached context lasts an hour after
+  `shipline notify waiting` and end your turn." Its cached context lasts an hour after
   its last turn, so the answer is cheap. Never one waiting for the owner, a finished one, one
   stopped on the usage limit, or one with unsent text in its box.
 - A worker idle 15 minutes on a pull request that has been ready as long, without
@@ -647,14 +737,53 @@ hunts or audits), and never interrupts a running command or answers a question:
   rings the phone either way, so only the words of its last reply tell a question apart: a
   reply that asks the owner is left alone.
 - A busy session whose screen (without the input box, the status line, the spinner and its
-  clock) has not changed for 45 minutes is named in the wake once, as `stuck? ticket-N (45 min,
-  running: <first line of the running command>)`, for the orchestrator to judge.
-- A running wait loop whose `pgrep -f` or `ps | grep` pattern matches its own shell never
-  ends; it is named in the wake once, as `wait loop finds itself? ticket-N (running: ...)`.
+  clock) has not changed for 45 minutes is nudged once per stretch and head: the tick presses
+  Escape, checks that the box is empty, and types "The command has produced nothing for 45
+  minutes. Check whether it is still running and go on." It is named in the wake as
+  `stuck? ticket-N (45 min, running: <first line of the running command>); nudge sent`.
+  `session list` shows when each screen last changed.
+- A busy session whose running wait loop has a `pgrep -f` or `ps | grep` pattern that matches
+  its own shell, which never ends, is nudged once per loop the same way, with "That loop finds
+  its own command line and never ends. Check the process by its number." It is named as
+  `wait loop finds itself? ticket-N (running: ...); nudge sent`.
+- Neither nudge goes to a session with text in its box, a message queued under its spinner
+  (a `❯ ` line between the spinner and the box) or a question to the owner on its screen: it
+  is named without `; nudge sent`. A permission prompt waits for the owner and is not called
+  stuck. Should Escape still put a message back into the box, nothing is typed after it, and
+  the line ends `; interrupted, text left in its box`. A wait loop is nudged only when it is
+  the command started last and the screen has stood still for 5 minutes; while the screen
+  moves, it is named when it stands still, the turn ends or 15 minutes have passed. A session
+  stopped on the usage limit, a hunt, an audit, an analyst and a Codex bridge are left alone.
+  A nudge whose Enter was not taken ends its line with `; nudge failed`, and is sent again at
+  the next passes, without another Escape, while the box holds exactly it, three times at
+  most; then the wake is told `stuck? ticket-N (nudge not taken; its text stays in the box)`.
+- An idle session that none of these rules covers for 50 minutes is named in the wake once per
+  head, as `idle, no rule: ticket-N (<min> min, last line: <line>)`. The tick types nothing it
+  has no rule for; the orchestrator decides.
 
 Each message and line is logged in `~/.local/state/workflow/wake.log`.
 
 The orchestrator session does what needs judgment:
+
+- Every decision of these kinds goes through `shipline decide`, never as chat alone: a start
+  (`shipline decide start N`), a hold of a ticket that shares files with a running one
+  (`shipline decide hold N --after M`, or `shipline decide start N --after M`), an answer to a
+  worker under the owner's standing delegation (`shipline decide answer N --area <area>
+  --question ... --reply ... --meaning ...`), the allowance of another review round after two
+  sent back (`shipline decide allowance N --round R`), a hand-back for judgment and a restart
+  of a session (`shipline decide hand-back N` or `shipline decide restart N`, with `--session`,
+  `--judgment` and `--message`), and the program of a ticket's next worker
+  (`shipline decide program N claude|codex|cloud`). The script checks each against these
+  rules, records it in `.local/workflow/decisions.jsonl` of the main checkout, a refusal too,
+  and does the act itself: the label, the `start-plan` line, the entry under `Answers given
+  for the owner`, `review-N.allow-round`, the `Worker:` line and `worker-program-N`. When the
+  decision is the owner's own word, it carries his exact words (`--owner "<his words>"`): an
+  answer in money, privacy, legal text or text sent to a model, an allowance, and a start of a
+  ticket marked `Start: owner only` need them. His word on a start also lifts the order and
+  overlap checks, never the 5-hour window. A message to a session that carries a decision
+  quotes the record's line that `shipline decide` printed. An interrupted decision is finished
+  by the next call of `shipline decide`; the tick starts nothing for a ticket whose decision is
+  unfinished.
 
 - Every ticket it opens gets a priority label (see the merge gate): `priority: blocker` for
   what stops every merge or push now, `priority: high` for a bottleneck, otherwise
@@ -665,15 +794,20 @@ The orchestrator session does what needs judgment:
   ready pull requests grouped by priority.
 - It starts no audit for a pull request labelled `workflow`. Of the pull requests built before
   the workflow existed (those without the label), it reads which are ready and not `audited`,
-  groups them into stacks by their bases, and starts `scripts/workflow/session start audit N`
+  groups them into stacks by their bases, and starts `shipline session start audit N`
   for the lowest one not yet audited of each stack. How many run at once is its decision, made
   from `session list` and the memory figures.
 - It chooses the effort level when it starts a session by hand, as the third word after the
   number: `session start <worker|audit|review> N <level>`. `low` for a mechanical change (a rename, a
   one-line fix); `medium` for work whose description is complete and testable; `high` for work
   that touches stored data, text sent to a model, concurrency, or a design the description
-  leaves open. Audits and independent reviewers run at `high`. Without a level a worker gets `medium` and an audit
-  `high`; the tick starts workers with no level.
+  leaves open. Audits run at `high`. Without a level a worker gets `medium`, an audit `high`
+  and an independent reviewer `medium`, or `high` for the paths `review.high_effort_paths`
+  names, for Shipline's own concurrent scripts and for a description with the line
+  `Review: high` (`review-effort N`); a level given by hand wins, and a conflict resolution's
+  reviewer runs at `high`. The tick starts workers and reviewers with no level. When it opens a
+  ticket whose review needs `high` that no path shows (text sent to a model, say), it writes
+  `Review: high` on a line of its own in the description.
 - It may choose the model as the word after the level: `opus` or `sonnet`. The default model is
   Opus. `sonnet` is used only when all of these hold: the change is mechanical; the description
   names exactly what changes; existing tests would catch a mistake; it does not touch stored
@@ -685,8 +819,8 @@ The orchestrator session does what needs judgment:
   independent reviewers always use Claude Opus.
 - A bug fix, screens included, may go to Codex. When the orchestrator opens or starts a ticket
   whose task fixes a bug and invents no new UI (no new control, layout or wording to choose),
-  it writes `Worker: Codex (a bug fix with no new UI)` on a line of its own in the
-  description. A ticket whose task needs clickable options never gets that line and goes to
+  it records `shipline decide program N codex`, which writes `Worker: Codex (a bug fix with no new UI)`
+  on a line of its own in the description. A ticket whose task needs clickable options never gets that line and goes to
   Claude. Without the line the tick routes as before.
 - It asks each audit session to tell it when it goes idle (`SendMessage` with
   `notify_when_idle`), so it reacts to a finished audit without polling.
@@ -710,10 +844,16 @@ The orchestrator session does what needs judgment:
   ready and stays idle without saying "worker finished". The orchestrator tells such a session
   (`SendMessage`) to read `git show origin/main:AGENTS.md` after a fetch and finish by it.
 - It starts a hunt when the owner asks for one:
-  `scripts/workflow/session start hunt <name> [plan|explore] [claude|codex|cursor]`, the name saying
-  what the hunt is (`plan-phone-2`). One hunt runs at a time, and the script refuses a second:
-  each runs a browser and a copy of the application. To compare hunter programs it runs the
-  same kind of hunt once with each, one after the other.
+  `shipline session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>]`,
+  the name saying what the hunt is (`plan-phone-2`). The area, one of `hunts.areas`, is the
+  last word, after the kind and the program. A hunt without an area hunts every screen and
+  runs alone. A second hunt starts only beside a running hunt that has an area, and must name
+  a different area; a third is refused, and with no areas configured one hunt runs at a time.
+  Each runs a browser and a copy of the application, and two hunts over the same screens would
+  report the same bugs twice. The copy is run by the repository's configured hunt command,
+  and a Cursor hunter is its configured one too; without them the script refuses the hunt in a
+  sentence. To compare hunter programs it runs the same kind of hunt once
+  with each, one after the other.
 - When a check-in carries an analysis (`Workflow analysis day-<date> (report <link>): 1. ...`),
   it opens a draft ticket for each proposal it judges worth it, as in step 5 of the audit
   rules, naming the report, and gives the owner the link and the tickets it opened. The owner
@@ -743,19 +883,21 @@ The orchestrator session does what needs judgment:
   and the load have been under the ceilings of `session start` for 10 minutes, nothing started
   in the last 5, and the 5-hour usage window allows starts (as in the check-in rule below).
 - The files of a ticket are in `.local/workflow/files-N` of the main checkout, one path a
-  line; `scripts/workflow/ticket-files N` prints them. They are the diff's when the ticket
+  line; `shipline ticket-files N` prints them. They are the diff's when the ticket
   has a real diff, the list under a `Files` heading of its description when it has one, and
   otherwise the answer of one short `claude -p` on Claude Haiku 5.5 that read the description,
   asked once per ticket and again only when the description changes.
 - `start-plan` holds what the files do not show, one rule a line: `609 after 605` (609 waits
   while 605 is open), `hold 590` (590 does not start), `hold all` (nothing starts by itself).
   The orchestrator writes those lines when the owner gives it a rule, and nothing else per
-  ticket. The orchestrator still names the waiting tickets to the owner when asked, from
-  `gh pr list --draft --json number,title,labels`, and still adds the label by hand when he
-  says to start one at once
-  (`gh api -X POST repos/NazmievBulat/Shipline/issues/<n>/labels -f "labels[]=workflow"`).
+  ticket; a hold of one ticket after another is `shipline decide hold`, which writes its own
+  line and removes it when the hold ends. The orchestrator still names the waiting tickets to the owner
+  when asked, from `gh pr list --draft --json number,title,labels`, and starts one at once
+  when he says so, with `shipline decide start N --owner "<his words>"`.
   The wake's check-in tells it what started and why the next one waits
-  (`608 waits: shares scripts/workflow/merge_gate.py with 563`), a line each, once per change.
+  (`608 waits: shares scripts/workflow/merge_gate.py with 563`), a line each, once per change,
+  and from the decision records each held ticket with its reason and age, and the answers
+  given and starts refused since the last check-in.
 - A session listed as `limit` is stopped on the usage limit. It is reported as that, never as
   working. The tick sends it its instruction again after the session or weekly reset, and
   the wake tells the orchestrator which sessions were resent. Four stay as they are
@@ -764,7 +906,7 @@ The orchestrator session does what needs judgment:
   be read or disagree with that hour, one with a text in its box
   that was not sent, and a hunt (`session resend <name>` types the instruction again,
   `session stop <name>` ends it).
-- It is woken from outside its own session by `scripts/workflow/wake`, which the tick runs: a
+- It is woken from outside its own session by `shipline wake`, which the tick runs: a
   schedule kept inside the orchestrator stops with it on the usage limit. Right after the tick
   sent sessions their instruction again after a reset, the wake tells the orchestrator which,
   at any hour; a message that could not be sent is tried again every 5 minutes until it is. Every 20 minutes from 20:00 to 8:00 it looks again and gives the orchestrator a
@@ -773,8 +915,13 @@ The orchestrator session does what needs judgment:
   slots, it tells the orchestrator once, at any hour and busy or not. A session whose
   stop rang the phone (see "Phone pushes") is named on a line of its own with how long it has
   waited, `asking the owner: review-156 (8 min)`, until he answers; a new question reaches the
-  orchestrator once, at any hour and busy or not. A `stuck?` or `wait loop finds itself?` line
-  of the tick reaches it the same way, once. The
+  orchestrator once, at any hour and busy or not. A `stuck?`, `wait loop finds itself?` or
+  `idle, no rule:` line of the tick reaches it the same way, once, and so does `owner question
+  without the Owner only line: ticket-426` (or `without a reply word`). A question the tick
+  answered for the owner (see "Asking the owner") is named `answered for the owner: ticket-426,
+  "1" (03:12)`: one answered at night in the first check-in from 8:00, which lists every answer
+  since 20:00, one answered in the day at the next look. The orchestrator passes them on to the
+  owner, who may overrule them. The
   check-in names the usage, the `/tmp` file slots, the sessions and the open pull requests; it is delivered as a
   message from a short `claude -p` on Claude Haiku 5.5. The wake itself starts,
   merges and pushes nothing. What it saw and did is in `~/.local/state/workflow/wake.log`. A
@@ -794,7 +941,7 @@ audit until it is opened again.
 ## Phone pushes
 
 The owner's phone rings when a worker, reviewer or audit is blocked on him, and only then.
-`scripts/workflow/notify` decides, called by four hooks that `scripts/workflow/install-hooks`
+`shipline notify` decides, called by four hooks that `shipline install-hooks`
 adds to `~/.claude/settings.json` (the owner runs it once).
 
 - A worker that ends its turn rings the phone unless the last line of its last message is
@@ -825,7 +972,7 @@ adds to `~/.claude/settings.json` (the owner runs it once).
   rings as that stop does. The question tool is not used; its hook stays, so that a session
   which used it anyway still rings.
 - Before ending a turn only to wait for your own background job (a Codex run, a test run), run
-  `scripts/workflow/notify waiting`. That one stop then neither rings nor marks the session
+  `shipline notify waiting`. That one stop then neither rings nor marks the session
   idle. Do not run it when the turn also asks the owner something.
   A reviewer is then marked as waiting for checks, so the tick can wake it when they
   finish; it is not idle, so its running job is not squeezed. It does not ring the phone.

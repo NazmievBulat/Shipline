@@ -23,6 +23,11 @@ READ_RETRY_DELAYS = (1, 2, 4)
 class CommandTimeout(Exception):
     """The command and its process group have been stopped."""
 
+    def __init__(self, message: str, output: str = "") -> None:
+        super().__init__(message)
+        # What the command printed before it was stopped: standard output, then standard error.
+        self.output = output
+
 
 def _interrupted(signum: int, frame: FrameType | None) -> NoReturn:
     raise SystemExit(128 + signum)
@@ -131,7 +136,8 @@ def _stop(
     *,
     unwind: bool = False,
     cleanup_timeout: float | None = None,
-) -> None:
+) -> tuple[str, str]:
+    """Stops the command and its run; returns all it printed, standard output and error."""
     # Taken before any signal: a stopped parent leaves its children to init, out of its tree.
     run = _run_processes(process.pid, set())
     if unwind:
@@ -154,7 +160,8 @@ def _stop(
     # What is left of the run would hold the output pipes, and with them the caller's merge
     # lock and push slot.
     _kill_run(process.pid, run)
-    process.communicate()
+    # Popen keeps what an earlier `communicate` read, so this is the whole output.
+    return process.communicate()
 
 
 def _run(
@@ -165,6 +172,7 @@ def _run(
     slot_fd: int | None = None,
     environment: dict[str, str] | None = None,
     github_slot_fd: int | None = None,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     # Hooks inherit the new group. Killing just git/gh leaves them able to mutate the
     # repository after the caller releases its merge lock. Never inherit that lock fd.
@@ -173,6 +181,8 @@ def _run(
         with _defer_interrupts():
             process = subprocess.Popen(
                 args,
+                # Without input the command reads what the caller's standard input holds.
+                stdin=None if input is None else subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -184,13 +194,15 @@ def _run(
                 if slot_fd is None
                 else {**(environment or os.environ), SLOT_FD_ENV: str(slot_fd)},
             )
-        stdout, stderr = process.communicate(timeout=timeout)
+        stdout, stderr = process.communicate(input, timeout=timeout)
     except subprocess.TimeoutExpired:
         # Kill the entire group even when the leader has already exited and only a
         # child holds the output pipe. SIGKILL also stops hooks that ignore SIGTERM.
         assert process is not None
-        _stop(process, unwind=True, cleanup_timeout=2)
-        raise CommandTimeout(f"{' '.join(args)} timed out after {timeout:g}s") from None
+        stdout, stderr = _stop(process, unwind=True, cleanup_timeout=2)
+        raise CommandTimeout(
+            f"{' '.join(args)} timed out after {timeout:g}s", (stdout or "") + (stderr or "")
+        ) from None
     except BaseException:
         if process is not None:
             _stop(process, unwind=unwind_on_interrupt)
@@ -209,6 +221,7 @@ def run(
     timeout: float | None = COMMAND_TIMEOUT,
     unwind_on_interrupt: bool = False,
     errors: str = "strict",
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if args and args[0] == "gh":
         from github_budget import Limited, call, wait
@@ -228,6 +241,7 @@ def run(
                         errors=errors,
                         environment=environment,
                         github_slot_fd=fd,
+                        input=input,
                     ),
                 )
             except Limited:
@@ -247,8 +261,15 @@ def run(
                 unwind_on_interrupt=unwind_on_interrupt,
                 errors=errors,
                 slot_fd=fd,
+                input=input,
             )
-    return _run(*args, timeout=timeout, unwind_on_interrupt=unwind_on_interrupt, errors=errors)
+    return _run(
+        *args,
+        timeout=timeout,
+        unwind_on_interrupt=unwind_on_interrupt,
+        errors=errors,
+        input=input,
+    )
 
 
 def transient(error: str) -> bool:

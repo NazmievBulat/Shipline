@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# The one command a repository calls Shipline by. Its rules, hooks and package scripts name
+# `shipline <command>`, never a path inside Shipline's checkout:
+#
+#   shipline [--repo <path>] <command> [arguments]
+#
+# The repository is the one whose checkout `--repo` names, else `SHIPLINE_REPO`, else the one
+# the current directory is in (`workflow_config.py`); it is passed on as `SHIPLINE_REPO`.
+# The scripts are those of the Shipline checkout this file is in, links followed, so a link
+# `~/.local/bin/shipline` runs the checkout it points into. A copy kept outside any checkout runs
+# the one `SHIPLINE_HOME` names, `~/.local/share/shipline` when it names none.
+set -euo pipefail
+
+# Every command a rule, a hook or the timer names. The others in `scripts/workflow` are the
+# scripts' own parts.
+COMMANDS=(
+  decide
+  flow-page
+  install-flow-page-timer
+  install-hooks
+  install-timer
+  main-status
+  merge-train-metrics
+  merge-when-current
+  notify
+  review-effort
+  review-panel
+  session
+  test-run
+  tick
+  ticket-files
+  uninstall
+  usage
+  wake
+  weaker-tests
+  workflow-metrics
+)
+
+# The repository's own commands its `shipline.json` names under `commands` (`hunt-app` for
+# `hunt_app`), run with the arguments given in the current folder.
+CONFIGURED=(
+  browser-tests-for-changes
+  server-tests-for-changes
+  pre-train-checks
+  mechanical-conflicts
+  browser-plan
+  hunt-app
+  hunt-browser
+  hunt-cursor
+  advisory-watch
+  push-checkout
+)
+
+usage() {
+  echo "usage: shipline [--repo <path>] <command> [arguments]" >&2
+  echo "commands: ${COMMANDS[*]} ${CONFIGURED[*]}" >&2
+  exit 2
+}
+
+self=$(readlink -f -- "${BASH_SOURCE[0]}")
+home=$(cd "$(dirname "$self")/.." && pwd)
+[[ -f $home/scripts/workflow/session ]] || home=${SHIPLINE_HOME:-$HOME/.local/share/shipline}
+if [[ ! -f $home/scripts/workflow/session ]]; then
+  echo "no Shipline checkout at $home: clone Shipline there, or name its checkout with SHIPLINE_HOME" >&2
+  exit 1
+fi
+
+case ${1:-} in
+  --repo)
+    [[ $# -ge 2 && -n $2 ]] || usage
+    SHIPLINE_REPO=$2
+    shift 2
+    ;;
+  --repo=?*)
+    SHIPLINE_REPO=${1#--repo=}
+    shift
+    ;;
+esac
+if [[ -n ${SHIPLINE_REPO:-} ]]; then
+  # Absolute, so a script that changes its folder still names the same repository.
+  [[ $SHIPLINE_REPO == /* ]] || SHIPLINE_REPO=$PWD/$SHIPLINE_REPO
+  export SHIPLINE_REPO
+  # The command runs in the repository: in the current folder when it is one of the
+  # repository's checkouts, else in its main checkout. A name that is no repository is left to
+  # the scripts, which say so.
+  named=$(git -C "$SHIPLINE_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || named=""
+  current=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || current=""
+  if [[ -n $named && $named != "$current" ]]; then
+    cd "$(dirname "$named")"
+  fi
+fi
+
+[[ $# -ge 1 ]] || usage
+command=$1
+shift
+for known in "${COMMANDS[@]}"; do
+  [[ $command != "$known" ]] || exec bash "$home/scripts/workflow/$command" "$@"
+done
+for known in "${CONFIGURED[@]}"; do
+  [[ $command == "$known" ]] || continue
+  config=$(python3 "$home/scripts/workflow/workflow_config.py" shell) || exit 1
+  eval "$config"
+  key=${command//-/_}
+  declare -n words="SHIPLINE_COMMAND_${key^^}"
+  if ((${#words[@]} > 0)); then
+    exec "${words[@]}" "$@"
+  fi
+  # Without a selection nothing is selected, and without checks none fails: neither is a
+  # failure. CI runs the whole suite.
+  case $command in
+    *-tests-for-changes)
+      echo "this repository names no $key command in shipline.json: no test is selected, and CI runs the whole suite" >&2
+      exit 0
+      ;;
+    pre-train-checks)
+      echo "this repository names no $key command in shipline.json: there is no check to fail" >&2
+      exit 0
+      ;;
+  esac
+  echo "this repository names no $key command in shipline.json" >&2
+  exit 1
+done
+echo "shipline: unknown command $command" >&2
+usage

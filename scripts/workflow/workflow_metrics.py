@@ -13,8 +13,9 @@
 
 What it reads: the merged pull requests (GraphQL, in pages of 100), the repository's workflow
 runs and their jobs (REST, through the shared GitHub budget, which revalidates what it read
-before), the wake log, the notes the gate and the tick leave in the state folder, the hunts'
-reports, and the machine's samples. It changes nothing on GitHub and nothing in the repository.
+before), the wake log, the notes the gate and the tick leave in the state folder, the
+orchestrator's decision records (`decide --metrics`), the hunts' reports, and the machine's
+samples. It changes nothing on GitHub and nothing in the repository.
 
 A gap has a fixed shape: a count over a threshold, a duration over a limit, a reason that repeats.
 Each detector below is one such rule, its threshold in THRESHOLDS; each one that fires prints one
@@ -38,6 +39,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import decisions
 import workflow_config
 
 # What counts as a gap. Each threshold changes only by a pull request of its own: this table is
@@ -240,9 +242,13 @@ def _processors() -> int | None:
 
 def _groups(prefix: str | None) -> dict[str, int]:
     """The CPU time, in microseconds, of each session's scope, of the tick's service and, when
-    the runner pool names its prefix, of each of its services and containers. A group's time
-    holds its children's: nothing below a matched group is read again."""
+    the runner pool names its prefix, of each of its services and containers, all named
+    `<prefix>-runner…`. A group's time holds its children's: nothing below a matched group is
+    read again."""
     found: dict[str, int] = {}
+    # `<prefix>-runner@1.service` is an ordinary runner, `<prefix>-runner-lend.service` another
+    # of the pool's units.
+    pool = prefix and re.compile(rf"{re.escape(prefix)}-runner(?:[-@].+)?\.(?:service|scope)")
     for folder, children, _files in os.walk(CGROUP_ROOT):
         name = os.path.basename(folder)
         key = None
@@ -250,7 +256,7 @@ def _groups(prefix: str | None) -> dict[str, int]:
             key = session["name"]
         elif name == TICK_SERVICE:
             key = name.removesuffix(".service")
-        elif prefix and name.startswith(prefix) and name.endswith((".service", ".scope")):
+        elif pool and pool.fullmatch(name):
             key = name.rsplit(".", 1)[0]
         if key is None:
             continue
@@ -1149,6 +1155,9 @@ def window_numbers(window: Window, sources: Sources) -> dict[str, Any]:
         "sessions": session_numbers(samples),
         "machine": machine_numbers(samples),
         "quality": quality,
+        "decisions": decisions.metrics(
+            workflow_config.current().state(), window.since, window.until, now()
+        ),
         "not_found": not_found,
     }
 
@@ -1583,6 +1592,40 @@ def markdown(measured: dict[str, Any]) -> str:
             ("weaker-tests items", lambda w: str(w["quality"]["weaker_tests_items"])),
             ("hunt findings", lambda w: str(w["quality"]["hunt_findings"])),
             ("reverts", lambda w: ", ".join(str(n) for n in w["quality"]["reverts"]) or "none"),
+        ],
+        windows,
+        days,
+    )
+    lines += _table(
+        "Decisions",
+        [
+            *(
+                (
+                    kind,
+                    lambda w, kind=kind: f"{w['decisions']['kinds'][kind]['done']} done,"
+                    f" {w['decisions']['kinds'][kind]['refused']} refused",
+                )
+                for kind in decisions.KINDS
+            ),
+            (
+                "hold episodes",
+                lambda w: "; ".join(
+                    f"{hold['number']} after {hold['after']}, {hold['hours']:.1f} h"
+                    + (" and on" if hold["open"] else "")
+                    for hold in w["decisions"]["holds"]
+                )
+                or "none",
+            ),
+            (
+                "answers per ticket",
+                lambda w: "; ".join(
+                    f"{number}: {count}"
+                    for number, count in sorted(
+                        w["decisions"]["answers"].items(), key=lambda item: int(item[0])
+                    )
+                )
+                or "none",
+            ),
         ],
         windows,
         days,

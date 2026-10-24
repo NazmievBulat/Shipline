@@ -2,10 +2,10 @@
 
 import fcntl
 import hashlib
-import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -16,9 +16,9 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from types import ModuleType
 from typing import Any, NoReturn
 
+import check_repair
 import priority
 import train_reads
 import workflow_config
@@ -38,25 +38,17 @@ from workflow_commands import (
     run as run_command,
 )
 
-# A repository may hold three helpers beside these scripts, and the gate uses them when it does:
-# `advisory_service` tells a scan that could not reach a package advisory service, which is a
-# wait; `pushing_checkout` installs the pushing checkout's packages before its hook and words a
-# hook's refusal; `run_proof` reads and writes the `Workflow-Proof` line with which main skips a
-# job its squash proved. Without them a failed push is refused with its last lines, nothing is
-# installed first, and the proof is Shipline's own (`ci_proof`), the one its example CI reads. A
-# helper that is there but cannot start stops the gate.
-try:
-    import advisory_service
-except ModuleNotFoundError as error:
-    if error.name != "advisory_service":
-        raise
-    advisory_service = None
-try:
-    import pushing_checkout
-except ModuleNotFoundError as error:
-    if error.name != "pushing_checkout":
-        raise
-    pushing_checkout = None
+# The files a repository keeps for the gate are in its own `scripts/workflow`, in its main
+# checkout: the repository Shipline works on, not the checkout these scripts are in. Searched last,
+# so none of them stands in for one of the scripts or for a module of Python's own.
+REPOSITORY_FILES = workflow_config.current().main / "scripts" / "workflow"
+sys.path.append(str(REPOSITORY_FILES))
+
+# A repository may hold one helper there, and the gate uses it when it does: `run_proof` reads
+# and writes the `Workflow-Proof` line with which main skips a job its squash proved. Without it
+# the proof is Shipline's own (`ci_proof`), the one its example CI reads. A helper that is there
+# but cannot start stops the gate. The repository's other parts are commands its `shipline.json`
+# names (`repository_command`).
 try:
     from run_proof import RECEIPT, passed_jobs
     from run_proof import WHOLE as WHOLE_REQUEST
@@ -67,36 +59,46 @@ except ModuleNotFoundError as error:
     from ci_proof import WHOLE as WHOLE_REQUEST
 
 
-def mechanical_conflicts() -> ModuleType | None:
-    """The repository's rules for the conflicts and migration numbers a refresh settles itself,
-    `mechanical_conflicts` beside the scripts, read only when a refresh needs them. Without
-    them no conflict is mechanical and there are no migrations to renumber."""
-    try:
-        import mechanical_conflicts as rules
-    except ModuleNotFoundError as error:
-        if error.name != "mechanical_conflicts":
-            raise
-        return None
-    return rules
-
-
-# How many of its last lines a failed push is refused with, when the repository words no refusal.
+# How many of its last lines a failed push is refused with when the repository words no refusal;
+# a push that outlasted its deadline keeps twice as many.
 REFUSAL_LINES = 10
+TIMEOUT_REFUSAL_LINES = 20
 
 CONFIG = workflow_config.current()
 REPOSITORY = CONFIG.repository
 API = CONFIG.api
 HERE = Path(__file__).resolve().parent
+# How a line names `notify waiting`: by the launcher's absolute path, which a session started
+# before the switch, with neither on its PATH, runs as well; a copy of the scripts in a
+# repository's tree, which has no launcher, by its path there.
+LAUNCHER = HERE.parents[1] / "bin" / "shipline"
+NOTIFY_WAITING = (
+    f"{shlex.quote(str(LAUNCHER))} notify waiting"
+    if LAUNCHER.is_file()
+    else "scripts/workflow/notify waiting"
+)
 # The gate owns these branches: each holds one batch's test merge, never a pull request.
 SCRATCH_PREFIX = "workflow/merge-batch-"
 E2E_PLAN = CONFIG.checks.e2e_plan
 CI_PLAN = CONFIG.checks.ci_plan
 CI_RESULT = CONFIG.checks.ci_result
+# The word or words the name of every check of the CI workflow begins with: those its planner
+# and its result begin with both, "CI" by default.
+CI_PREFIX = (
+    " ".join(os.path.commonprefix([CI_PLAN.replace(":", " ").split(), CI_RESULT.split()]))
+    or CI_RESULT
+)
+# How long after GitHub listed no CI run for a head whose CI jobs finished it is asked again.
+UNLISTED_RETRY_SECONDS = 30
 # Every check of the image workflow begins with this; its planner is IMAGES_PLAN.
 IMAGES = CONFIG.checks.images
 IMAGES_PLAN = CONFIG.checks.images_plan
 # The titles of the planners' annotations.
 NOTES = CONFIG.annotations
+# The job that audits the dependencies, and the title of the notice it writes on main when only
+# advisories failed it. With no notice named, an advisory on main makes main red as before.
+DEPENDENCIES = CONFIG.checks.dependency_audit or "CI: dependencies"
+ADVISORIES_ONLY = CONFIG.checks.advisory_annotation
 # The workflow files, by the gate's own names for them.
 WORKFLOW_FILES = {
     "ci": CONFIG.workflows.ci,
@@ -147,10 +149,23 @@ MEMBER_MARKS = ("unavailable", "fixes", "refreshable")
 
 # Set only while computing train order, never while verifying a merge.
 _planning_reads: train_reads.Reads | None = None
+# Whether this process already paused for GitHub to list a CI run: it pauses once in all, so a
+# line whose runs GitHub lists for none of its members never holds the merge lock longer.
+_paused = False
 
 
 class Refused(Exception):
     """Missing evidence is a refusal, never permission to merge."""
+
+
+class TimedOut(Refused):
+    """A command outlasted its deadline and was stopped."""
+
+    def __init__(self, message: str, output: str, timeout: float) -> None:
+        super().__init__(message)
+        # What it printed before it was stopped, and the deadline it outlasted.
+        self.output = output
+        self.timeout = timeout
 
 
 class Waiting(Refused):
@@ -175,7 +190,7 @@ class PackagesWaiting(PushWaiting):
 
 
 def command(
-    *args: str, check: bool = True, errors: str = "strict"
+    *args: str, check: bool = True, errors: str = "strict", input: str | None = None
 ) -> subprocess.CompletedProcess[str]:
     # A nested gate waits for the merge lock, then runs its own bounded commands, so its
     # whole run has no deadline of its own: one would kill a healthy push behind the lock.
@@ -186,14 +201,104 @@ def command(
             timeout=None if nested else COMMAND_TIMEOUT,
             unwind_on_interrupt=nested,
             errors=errors,
+            input=input,
         )
     except CommandTimeout as error:
-        raise Refused(str(error)) from error
+        raise TimedOut(str(error), error.output, COMMAND_TIMEOUT) from error
     if done.returncode == 75 and os.environ.get("WORKFLOW_BACKGROUND_GITHUB") == "1":
         raise BudgetWaiting(done.stderr.strip())
     if check and done.returncode:
         raise Refused(f"{' '.join(args)} failed: {done.stderr.strip() or done.stdout.strip()}")
     return done
+
+
+def repository_command(
+    name: str, *args: str, input: str | None = None, errors: str = "strict"
+) -> subprocess.CompletedProcess[str] | None:
+    """The repository's own command `name` (`shipline.json`), run with `args` in the current
+    folder and bounded like every command; None when the repository names none. It reads
+    `input`, and never the gate's own standard input. A command that is named but cannot start
+    stops the gate's call."""
+    words = CONFIG.command(name)
+    if words is None:
+        return None
+    try:
+        return command(*words, *args, check=False, input=input or "", errors=errors)
+    except OSError as error:
+        raise Refused(
+            f"cannot run the repository's {name} command, {shlex.join(words)}: {error}"
+        ) from error
+
+
+def said(done: subprocess.CompletedProcess[str]) -> str:
+    """Why a repository's command failed, in its own words."""
+    return done.stderr.strip() or done.stdout.strip() or f"it exited {done.returncode}"
+
+
+def nonblank_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.strip()]
+
+
+# The gate's note of a package advisory service a push found unreachable, kept until a push
+# succeeds or the service answers again, and the line the wake tells once an outage.
+SERVICE_DOWN = "advisory-service-down"
+SERVICE_PENDING = "advisory-service.pending"
+
+
+def unreachable_service(text: str) -> str | None:
+    """The advisory service the repository's `advisory_watch` reads in `text` as unreachable;
+    None when it names none, or when the repository has no advisory watch."""
+    done = repository_command("advisory_watch", "unreachable", input=text)
+    if done is None:
+        return None
+    if done.returncode:
+        # Unread is no outage: the failure is told, and the push is refused as it is.
+        print(
+            f"the repository's advisory_watch could not read an output: {said(done)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    return next(iter(nonblank_lines(done.stdout)), "").strip() or None
+
+
+def service_answers(service: str) -> bool:
+    """Whether an advisory service answers again, by the repository's `advisory_watch`."""
+    done = repository_command("advisory_watch", "answers", service)
+    return done is not None and not done.returncode
+
+
+def service_down(folder: Path) -> dict[str, str] | None:
+    """The outage noted in `folder`; a note that cannot be read counts as none."""
+    try:
+        note = json.loads((folder / SERVICE_DOWN).read_text())
+    except (OSError, ValueError):
+        return None
+    if isinstance(note, dict) and isinstance(note.get("service"), str) and note["service"]:
+        return note
+    return None
+
+
+def note_service_down(folder: Path, service: str) -> None:
+    """Notes the first push of an outage, and the line that tells it once; a later push of the
+    same outage keeps the first note."""
+    if service_down(folder) is not None:
+        return
+    folder.mkdir(parents=True, exist_ok=True)
+    since = time.strftime(
+        "%Y-%m-%d %H:%M UTC", time.gmtime(float(os.environ.get("WORKFLOW_NOW") or time.time()))
+    )
+    for name, text in (
+        (SERVICE_DOWN, json.dumps({"service": service, "since": since}) + "\n"),
+        (SERVICE_PENDING, f"{service}'s advisory service unreachable since {since}\n"),
+    ):
+        with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as output:
+            output.write(text)
+        os.replace(output.name, folder / name)
+
+
+def note_service_up(folder: Path) -> None:
+    (folder / SERVICE_DOWN).unlink(missing_ok=True)
 
 
 def read_github(*args: str) -> subprocess.CompletedProcess[str]:
@@ -245,6 +350,8 @@ class Pushed:
     output: str
     # The hook's step that failed and its last lines, when the push failed.
     refusal: str
+    # Whether the push outlasted its deadline; `output` is what it printed before it was stopped.
+    timed_out: bool = False
 
 
 def push(*args: str, where: Path | None = None) -> Pushed:
@@ -254,47 +361,66 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     gate sets it for every push it makes. The hook runs with the pushing checkout's packages,
     installed first when its lockfiles changed since their last install. A failed install, or
     a scan that could not reach an advisory service after its own tries, is a wait."""
-    checkout = pushing_checkout.top(where) if pushing_checkout else where or Path.cwd()
-    failed = pushing_checkout.install_if_changed(checkout) if pushing_checkout else ""
-    if failed:
-        raise PackagesWaiting(failed)
+    checkout = where or Path.cwd()
+    if CONFIG.command("push_checkout") is not None:
+        checkout = Path(git("-C", str(checkout), "rev-parse", "--show-toplevel"))
+        installed = repository_command("push_checkout", "install", str(checkout))
+        if installed and installed.returncode:
+            raise PackagesWaiting(said(installed))
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
     merged = ("env", "EIO_BACKEND=posix", "sh", "-c", 'exec "$@" 2>&1', "push", *git_args)
-    done = command(*merged, check=False)
-    if done.returncode and short_of_memory(done.stdout):
+    done, timeout = _push_once(merged)
+    if done.returncode and timeout is None and short_of_memory(done.stdout):
         command("sleep", str(PUSH_RETRY_SECONDS))
-        done = command(*merged, check=False)
+        done, timeout = _push_once(merged)
     output = done.stdout
     pushed = Pushed(
         done.returncode,
         output,
-        push_failure(output, checkout) if done.returncode else "",
+        push_failure(output, checkout, timeout) if done.returncode else "",
+        timeout is not None,
     )
-    if advisory_service is None:
+    if CONFIG.command("advisory_watch") is None:
         return pushed
     folder = main_checkout() / CONFIG.state_folder
-    service = advisory_service.unreachable(output) if pushed.returncode else None
+    # A scan stopped at the deadline never concluded that a service was out.
+    service = (
+        unreachable_service(output) if pushed.returncode and not pushed.timed_out else None
+    )
     if service:
-        folder.mkdir(parents=True, exist_ok=True)
-        advisory_service.note_down(folder, service)
+        note_service_down(folder, service)
         raise ServiceWaiting(
             f"the pre-push scan could not reach {service}'s advisory service; "
             "nothing was found wrong with the branch"
         )
     if not pushed.returncode:
-        advisory_service.note_up(folder)
+        note_service_up(folder)
     return pushed
 
 
-def push_failure(output: str, checkout: Path) -> str:
-    """What a failed push says, led by the scan's memory error when it ran short.
+def _push_once(merged: tuple[str, ...]) -> tuple[subprocess.CompletedProcess[str], float | None]:
+    """The push, and the deadline it outlasted, if it did: then it failed with what it printed."""
+    try:
+        return command(*merged, check=False), None
+    except TimedOut as error:
+        # 124, as `timeout` reports a command it stopped.
+        return subprocess.CompletedProcess(merged, 124, error.output, ""), error.timeout
 
-    The first line is all the wake and a hand-back show, so a shortage is named there, before
-    the hook's step that failed and its last lines."""
-    if pushing_checkout:
-        refusal = pushing_checkout.refusal(output, checkout)
+
+def push_failure(output: str, checkout: Path, timeout: float | None = None) -> str:
+    """What a failed push says, led by the deadline it outlasted, or by the scan's memory error
+    when it ran short.
+
+    The first line is all the wake and a hand-back show, so a timeout or a shortage is named
+    there, before the hook's step that failed, or was running, and its last lines."""
+    worded = repository_command("push_checkout", "refusal", str(checkout), input=output)
+    if worded and not worded.returncode and worded.stdout.strip():
+        refusal = worded.stdout.strip()
     else:
-        refusal = "\n".join([line for line in output.splitlines() if line.strip()][-REFUSAL_LINES:])
+        lines = REFUSAL_LINES if timeout is None else TIMEOUT_REFUSAL_LINES
+        refusal = "\n".join(nonblank_lines(output)[-lines:])
+    if timeout is not None:
+        return "\n".join(filter(None, [f"git push timed out after {timeout:g}s", refusal]))
     shortage = next(
         (line.strip() for line in output.splitlines() if short_of_memory(line)),
         None,
@@ -304,9 +430,10 @@ def push_failure(output: str, checkout: Path) -> str:
     return f"the security scan was short of locked memory twice, a minute apart: {shortage}\n{refusal}"
 
 
-def api(path: str, key: str | None = None, *, paginate: bool = True) -> Any:
+def api(path: str, key: str | None = None, *, paginate: bool = True, fresh: bool = False) -> Any:
+    """GitHub's answer for `path`; `fresh` asks again what a reconciliation already read."""
     if _planning_reads is not None:
-        return _planning_reads.api(path, lambda: _api(path, key, paginate=paginate))
+        return _planning_reads.api(path, lambda: _api(path, key, paginate=paginate), fresh=fresh)
     return _api(path, key, paginate=paginate)
 
 
@@ -346,11 +473,77 @@ def runs(
     # Main is judged by the runs of its pushes (and manual reruns). A scheduled run of an
     # unchanged head is kept apart: it may report a failure, never hold or close the gate.
     event = "&event=pull_request" if pull else ""
-    found = api(
+    path = (
         f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
-        f"?head_sha={head}{event}&per_page=100",
-        "workflow_runs",
+        f"?head_sha={head}{event}&per_page=100"
     )
+    listed = api(path, "workflow_runs")
+    found = _own_runs(listed, head, pull=pull, scheduled=scheduled)
+    if listed or workflow != "ci":
+        return found
+    try:
+        return _unlisted_runs(path, head, pull=pull, scheduled=scheduled)
+    except Waiting:
+        raise
+    except Refused, KeyError, TypeError, ValueError:
+        # Unread is not absent: the head has no CI result yet, and the line keeps its judgment.
+        return []
+
+
+def _unlisted_runs(path: str, head: str, *, pull: bool, scheduled: bool) -> list[dict[str, Any]]:
+    """The CI runs of `head` that GitHub did not list, when its check runs show CI jobs finished.
+
+    GitHub sometimes lists no CI run for such a head and lists it when asked again a little
+    later. The run is found by the check suite of its jobs; when that lists none either, GitHub
+    is asked again, after a pause the first time in a process. A run still not found is no CI
+    result yet, a wait: the line keeps what it judged of the head before."""
+    global _paused
+    suites = _ci_suites(head)
+    if not suites:
+        return []
+    ci_path = f".github/workflows/{WORKFLOW_FILES['ci']}"
+    found = _own_runs(
+        [
+            run
+            for suite in suites
+            for run in api(
+                f"{API}/actions/runs?check_suite_id={suite}&per_page=100", "workflow_runs"
+            )
+            if run.get("path", "").split("@")[0] == ci_path
+        ],
+        head,
+        pull=pull,
+        scheduled=scheduled,
+    )
+    if found:
+        return found
+    if not _paused:
+        _paused = True
+        command("sleep", str(UNLISTED_RETRY_SECONDS))
+    return _own_runs(api(path, "workflow_runs", fresh=True), head, pull=pull, scheduled=scheduled)
+
+
+def _ci_check(name: str) -> bool:
+    return re.match(rf"{re.escape(CI_PREFIX)}(?:$|[\s:(])", name) is not None
+
+
+def _ci_suites(head: str) -> list[int]:
+    """The check suites of the CI jobs that finished on `head`, as its check runs show them."""
+    return sorted(
+        {
+            check["check_suite"]["id"]
+            for check in api(f"{API}/commits/{head}/check-runs?per_page=100", "check_runs")
+            if _ci_check(check.get("name", ""))
+            and check.get("status") == "completed"
+            and check.get("check_suite")
+        }
+    )
+
+
+def _own_runs(
+    found: list[dict[str, Any]], head: str, *, pull: bool, scheduled: bool
+) -> list[dict[str, Any]]:
+    """The runs of `head` that judge it, newest first: its pull request's, or main's own."""
     return sorted(
         [
             run
@@ -432,6 +625,51 @@ def main_image_runs(head: str, recent: MainImages) -> list[dict[str, Any]]:
 
 def jobs(run: dict[str, Any]) -> list[dict[str, Any]]:
     return checks(api(f"{API}/actions/runs/{run['id']}/jobs?per_page=100", "jobs"))
+
+
+def carried(job: dict[str, Any]) -> bool:
+    """Whether GitHub carried this job into its attempt from an earlier one, without running it.
+
+    A re-run of only the failed jobs lists each job that passed before as a copy in the new
+    attempt: a new ID, the new attempt's `run_attempt`, no notes, and the `started_at` and
+    `completed_at` of the attempt it ran in, but the `created_at` of the re-run. A job that ran
+    in its attempt started after it was created.
+    """
+    started, created = _seconds(job.get("started_at")), _seconds(job.get("created_at"))
+    return started is not None and created is not None and started < created
+
+
+def job_notes(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """The notes of a job, from the attempt of its run where it ran.
+
+    A job carried into a re-run has no notes of its own. Its notes are those of the copy, in an
+    earlier attempt of the same run, with the same name, head and times, that passed and ran
+    there; a job carried by two re-runs has a carried copy in the attempt between. A job that
+    ran in its own attempt has only its own notes, however few.
+    """
+    notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+    attempt, run, head = job.get("run_attempt"), job.get("run_id"), job.get("head_sha")
+    if (
+        notes
+        or job.get("conclusion") != "success"
+        or not carried(job)
+        or not isinstance(attempt, int)
+        or run is None
+        or not head
+    ):
+        return notes
+    for earlier in range(attempt - 1, 0, -1):
+        for copy in api(f"{API}/actions/runs/{run}/attempts/{earlier}/jobs?per_page=100", "jobs"):
+            if (
+                copy.get("name") == job["name"]
+                and copy.get("head_sha") == head
+                and copy.get("conclusion") == "success"
+                and copy.get("started_at") == job.get("started_at")
+                and copy.get("completed_at") == job.get("completed_at")
+                and not carried(copy)
+            ):
+                return api(f"{API}/check-runs/{copy['id']}/annotations?per_page=100")
+    return []
 
 
 # A CI job that runs in parts is named with its part by GitHub, "CI: server tests (1 of 2)", and with
@@ -538,6 +776,11 @@ def workflow_verdict(
     )
 
 
+# The states of main in which the line merges: on an advisory main the audit alone failed, for
+# advisories only, and the update that fixes them is a pull request like any other.
+MERGING = ("green", "advisory")
+
+
 @dataclass
 class Health:
     state: str
@@ -575,13 +818,13 @@ def _failed_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def unreached_service(parts: list[dict[str, Any]]) -> str | None:
     """The advisory service whose absence alone failed a CI run, from the audit's annotation:
-    "CI: dependencies" is the only failed job besides "CI result", which follows it."""
-    if advisory_service is None:
+    the dependency audit is the only failed job besides "CI result", which follows it."""
+    if CONFIG.command("advisory_watch") is None:
         return None
     failed = _failed_jobs(parts)
-    if {job["name"] for job in failed} - {CI_RESULT} != {"CI: dependencies"}:
+    if {job["name"] for job in failed} - {CI_RESULT} != {DEPENDENCIES}:
         return None
-    job = next(job for job in failed if job["name"] == "CI: dependencies")
+    job = next(job for job in failed if job["name"] == DEPENDENCIES)
     try:
         notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
     except Waiting:
@@ -589,10 +832,99 @@ def unreached_service(parts: list[dict[str, Any]]) -> str | None:
         raise
     except Refused:
         return None
+    return _outage_in(notes)
+
+
+def _outage_in(notes: list[dict[str, Any]]) -> str | None:
+    """The advisory service the audit's annotations name as unreachable, by the repository's
+    `advisory_watch`."""
+    text = _outage_text(notes)
+    return unreachable_service(text) if text.strip() else None
+
+
+def _outage_text(notes: list[dict[str, Any]]) -> str:
+    """What the repository's `advisory_watch` reads of the audit's annotations. The advisories
+    notice is left out: published advisories' own words neither fake an outage nor hide one."""
+    return "".join(
+        f"{note.get('message') or ''}\n"
+        for note in notes
+        if ADVISORIES_ONLY is None or note.get("title") != ADVISORIES_ONLY
+    )
+
+
+# What of an advisory's line may reach main's line, and so the orchestrator's message: words and
+# plain marks, no quotes, backticks, angle brackets, semicolons or new lines, at most this long;
+# and at most this many advisories, the rest counted.
+_NOT_PLAIN = re.compile(r"[^\w .,:()\[\]/+!#&=%@-]")
+PLAIN_LENGTH = 80
+ADVISORIES_NAMED = 5
+
+
+def audit_notice(parts: list[dict[str, Any]]) -> tuple[list[str], bool, str | None]:
+    """The advisories the audit's notice names on a failed run of main, or none; whether a lock
+    file was left unaudited beside them; and the advisory service that did not answer, when the
+    repository's `advisory_watch` names one.
+
+    The dependency audit is the only failed job besides "CI result", which follows it, and its
+    notice lists the advisories: the audit writes it only when it audited everything, every tool
+    answering, and found nothing wrong but advisories. Without the notice, a lock file it could
+    not audit or a tool that failed, the failure is main's as any other; so it is with an
+    outage beside the notice, which is not advisories alone."""
+    if ADVISORIES_ONLY is None:
+        return [], False, None
+    failed = _failed_jobs(parts)
+    if {job["name"] for job in failed} - {CI_RESULT} != {DEPENDENCIES}:
+        return [], False, None
+    job = next(job for job in failed if job["name"] == DEPENDENCIES)
+    notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+    advisories = _advisory_lines(notes)
+    # Asked only beside a notice: a run without one is red whatever else it says.
+    text = _outage_text(notes)
+    if not advisories or not text.strip():
+        return advisories, False, None
+    done = repository_command("advisory_watch", "unreachable", input=text)
+    if done is None:
+        return advisories, False, None
+    if done.returncode:
+        # A watch that could not read the annotations proves no lock file was audited whole.
+        print(
+            f"the repository's advisory_watch could not read main's audit: {said(done)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return advisories, True, None
+    service = next(iter(nonblank_lines(done.stdout)), "").strip() or None
+    return advisories, service is not None, service
+
+
+def _advisory_lines(notes: list[dict[str, Any]]) -> list[str]:
     for note in notes:
-        if note.get("title") == advisory_service.ANNOTATION:
-            return advisory_service.unreachable(note.get("message") or "")
-    return None
+        if note.get("title") != ADVISORIES_ONLY:
+            continue
+        # A JSON list of "<advisory> in <package> (<summary>)". The runner undoes the escapes of
+        # the workflow command that wrote it; a message that still holds them is read undone.
+        message = note.get("message") or ""
+        for text in (
+            message,
+            message.replace("%0D", "\r").replace("%0A", "\n").replace("%25", "%"),
+        ):
+            try:
+                lines = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(lines, list) and all(isinstance(line, str) and line for line in lines):
+                # Published advisories' own words reach the orchestrator only as plain words.
+                return [_NOT_PLAIN.sub("?", " ".join(line.split()))[:PLAIN_LENGTH] for line in lines]
+            return []
+        return []
+    return []
+
+
+def _named(advisories: list[str]) -> str:
+    named = ", ".join(advisories[:ADVISORIES_NAMED])
+    if len(advisories) > ADVISORIES_NAMED:
+        named += f" and {len(advisories) - ADVISORIES_NAMED} more"
+    return named
 
 
 def _retry_failed_main(
@@ -622,7 +954,7 @@ def _retry_failed_main(
             isinstance(attempt, int) and attempt >= 2
         ):
             return earlier
-        if not advisory_service.answers(service):
+        if not service_answers(service):
             return (
                 f"{earlier}; main run {run['id']} is re-run once {service}'s advisory "
                 "service answers"
@@ -737,17 +1069,14 @@ def pull_service_wait(
 ) -> str | None:
     """Why a pull request whose checks failed only waits, or None when they failed for it.
 
-    Its latest CI run failed only in "CI: dependencies" (and "CI result", which follows it),
+    Its latest CI run failed only in the dependency audit (and "CI result", which follows it),
     because the package audit could not reach an advisory service: nothing was found wrong.
     With `retry` (the tick, or the gate under its lock), its failed jobs are re-run once that
     service answers again, under
     main's home-runner rules, once for each failed attempt. When the re-run shows a failure
     again, or nothing can re-run it, the failure is the pull request's, as any other.
     """
-    if {check.get("name") for check in _failed_rollup(pull)} - {
-        "CI: dependencies",
-        CI_RESULT,
-    }:
+    if {check.get("name") for check in _failed_rollup(pull)} - {DEPENDENCIES, CI_RESULT}:
         return None
     ci = runs("ci", pull["headRefOid"], pull=True)
     if not ci:
@@ -820,7 +1149,7 @@ def _service_wait(
         return None
     waits = f"{name} could not reach {service}'s advisory service, and nothing was found wrong"
     later = f"it is re-run once the service answers, {who}"
-    if not retry or not advisory_service.answers(service):
+    if not retry or not service_answers(service):
         return f"{waits}; {later}"
     return _rerun(
         run, folder, marker, f"after {service}'s advisory service answered again", name=name
@@ -836,21 +1165,36 @@ def push_health(
     assessments: list[tuple[str, list[str], dict[str, Any]]] = []
     retry_notes: list[str] = []
     unreached = ""
+    advisories: list[str] = []
+    ci_parts: list[dict[str, Any]] = []
     if ci:
-        parts = jobs(ci[0])
+        parts = ci_parts = jobs(ci[0])
         assessments.append((*verdict(ci[0], parts), ci[0]))
         if assessments[-1][0] == "red":
             try:
-                service = unreached_service(parts)
+                advisories, unaudited, service = audit_notice(parts)
+            except Waiting:
+                # GitHub could not be read: main is unknown until it can be.
+                raise
+            except Refused:
+                # An unread notice is no advisory: main stays red.
+                advisories, unaudited, service = [], False, None
+            try:
+                service = service if advisories else unreached_service(parts)
             except Waiting:
                 # Diagnostic only: main stays red as it is, and is not re-run for the service.
                 service = None
             if service:
-                unreached = (
-                    f"; CI: dependencies could not reach {service}'s advisory service, "
-                    "and nothing was found wrong with main"
+                unreached = f"; {DEPENDENCIES} could not reach {service}'s advisory service, " + (
+                    f"and found advisories: {_named(advisories)}"
+                    if advisories
+                    else "and nothing was found wrong with main"
                 )
-            if retry_folder is not None:
+            if unaudited:
+                # Red by the outage's own rule, and re-run as for it.
+                advisories = []
+            # A re-run finds the same advisories again.
+            if retry_folder is not None and not advisories:
                 retry_notes.append(
                     _retry_failed_main(ci[0], parts, retry_folder, retry=retry, service=service)
                 )
@@ -884,6 +1228,25 @@ def push_health(
     if failed:
         since = min(run.get("updated_at", "unknown time") for _, run in failed)
         names = ", ".join(name for checks, _ in failed for name in checks)
+        if advisories and len(failed) == 1:
+            named = _named(advisories)
+            # Main's other checks must pass first: until they have, main is pending.
+            running = [
+                *(job["name"] for job in ci_parts if job.get("status") != "completed"),
+                *(name for state, checks, _ in assessments if state == "pending" for name in checks),
+            ]
+            if running or ci[0].get("status") != "completed":
+                return Health(
+                    "pending",
+                    f"main: pending, {', '.join(running or [CI_RESULT])} ({head[:12]}); "
+                    f"{DEPENDENCIES} failed on advisories only: {named}",
+                )
+            return Health(
+                "advisory",
+                f"main: advisory since {since}, {names} ({head[:12]}): {named}; "
+                "merging goes on, the update that fixes it goes first",
+                tuple(failed[0][0]),
+            )
         # Main is named as faultless only when CI's dependencies job was all that failed.
         line = f"main: red since {since}, {names} ({head[:12]})"
         line += unreached if len(failed) == 1 else ""
@@ -1008,9 +1371,8 @@ def push_health(
 
 
 def main_checkout() -> Path:
-    return Path(
-        git("-C", str(HERE), "rev-parse", "--path-format=absolute", "--git-common-dir")
-    ).parent
+    """The main checkout of the repository the gate works on."""
+    return CONFIG.main
 
 
 def inherited_green(head: str) -> dict[str, Any] | None:
@@ -1081,13 +1443,13 @@ def cancel_inherited(
 
 
 def strict_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """A pull request's "CI: dependencies" passes over an advisory that main has too, with an
+    """A pull request's dependency audit passes over an advisory that main has too, with an
     "Advisory on main" warning (scripts/audit-against-base.py). That pass is not main's check:
     it neither makes the pull request the fix of a red main nor stands in for main's own run."""
     strict: list[dict[str, Any]] = []
     for job in parts:
-        if job["name"] == "CI: dependencies" and job.get("conclusion") == "success":
-            notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+        if job["name"] == DEPENDENCIES and job.get("conclusion") == "success":
+            notes = job_notes(job)
             if any(note.get("title") == "Advisory on main" for note in notes):
                 job = {**job, "conclusion": "passed over an advisory on main"}
         strict.append(job)
@@ -1147,26 +1509,42 @@ def record_green(
     )
 
 
+# How a pending main line says that main was advisory before it and stays so: each merge on an
+# advisory main passes through pending, and main is advisory until it is green, red or unknown.
+STILL_ADVISORY = "; still advisory"
+
+
 def publish(folder: Path, health: Health) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     target = folder / "main-status"
     old = target.read_text() if target.exists() else ""
-    line = health.line + "\n"
+    # Kept in the line itself, replaced whole, so two writers at once never leave it behind.
+    before = state_of(old)
+    if before == "pending" and old.rstrip("\n").endswith(STILL_ADVISORY):
+        before = "advisory"
+    after = health.state
+    line = health.line
+    if after == "pending" and before == "advisory":
+        after = "advisory"
+        line += STILL_ADVISORY
+    line += "\n"
     with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as output:
         output.write(line)
         temporary = output.name
     os.replace(temporary, target)
-    # Every merge passes through pending to green; only a red or unreadable main, and the
-    # change out of it, is worth waking the orchestrator for.
-    before, after = (
-        re.split(r"[ ,]", text.removeprefix("main: "), maxsplit=1)[0] for text in (old, line)
-    )
+    # Every merge passes through pending to green; only a red, advisory or unreadable main, and
+    # the change out of it, is worth waking the orchestrator for.
     if (
-        (before != after and {"red", "unknown"} & {before, after})
+        (before != after and {"red", "advisory", "unknown"} & {before, after})
         or (health.scheduled and health.scheduled not in old)
         or (health.retry and line != old)
     ):
         (folder / "main-status.pending").write_text(line)
+
+
+def state_of(line: str) -> str:
+    """The state a published main line names: green, pending, red, advisory or unknown."""
+    return re.split(r"[ ,:]", line.removeprefix("main: "), maxsplit=1)[0]
 
 
 def refresh_health(folder: Path, *, retry: bool = False) -> tuple[str, Health]:
@@ -1185,13 +1563,8 @@ def refresh_health(folder: Path, *, retry: bool = False) -> tuple[str, Health]:
 
 def _refresh_health(folder: Path, *, retry: bool = False) -> tuple[str, Health]:
     # The tick asks a service a push found unreachable, so that its next outage is told too.
-    if (
-        retry
-        and advisory_service
-        and (note := advisory_service.down(folder))
-        and advisory_service.answers(note["service"])
-    ):
-        advisory_service.note_up(folder)
+    if retry and (note := service_down(folder)) and service_answers(note["service"]):
+        note_service_up(folder)
     try:
         git("fetch", "origin", "main")
         head = git("rev-parse", "origin/main")
@@ -1214,7 +1587,7 @@ def main_images_needed(head: str, ci: list[dict[str, Any]]) -> bool:
         for job in jobs(push):
             if job["name"] != CI_PLAN:
                 continue
-            notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+            notes = job_notes(job)
             before = next(
                 (note["message"].strip() for note in notes if note.get("title") == "Push base"),
                 None,
@@ -1301,26 +1674,37 @@ def path_filter(patterns: list[str]) -> Callable[[str], bool]:
 
 
 def browser_needed(base: str, merge: str) -> bool:
-    """Whether a merge needs browser tests at all, by E2E's own rule (scripts/e2e-plan.py).
+    """Whether a merge needs browser tests at all, by the repository's `browser_plan`.
 
     The gate reads the exact difference from main, so a merge that changes nothing needs
     none; the planner runs on an empty diff only because it cannot tell one from a misread.
-    A repository that holds no planner has no browser suite, so no change needs one.
+    The plan reads the changed paths, each ended by a NUL, exits 0 and prints `needed` or
+    `none`. Only `none` with exit 0 means none: a plan that crashes, as a Python one does with
+    exit 1, never skips the browser tests. Without a plan every merge needs them while the
+    merged tree holds the E2E workflow, and none does without that file.
     """
-    planner = HERE.parent / "e2e-plan.py"
-    if not planner.exists():
-        return False
     changed = command(
         "git", "diff", "--no-renames", "--name-only", "-z", base, merge, errors="surrogateescape"
     ).stdout.split("\0")[:-1]
     if not changed:
         return False
-    found = importlib.util.spec_from_file_location("e2e_plan", planner)
-    if found is None or found.loader is None:
-        raise Refused("could not read the E2E planner")
-    plan = importlib.util.module_from_spec(found)
-    found.loader.exec_module(plan)
-    return plan.browser_needed([path.encode(errors="surrogateescape") for path in changed])
+    if CONFIG.command("browser_plan") is None:
+        suite = f"{merge}:.github/workflows/{WORKFLOW_FILES['e2e']}"
+        return not command("git", "cat-file", "-e", suite, check=False).returncode
+    done = repository_command(
+        "browser_plan", input="".join(f"{path}\0" for path in changed), errors="surrogateescape"
+    )
+    assert done is not None
+    answer = "" if done.returncode else done.stdout.strip()
+    if answer == "none":
+        return False
+    if answer != "needed":
+        print(
+            f"the browser plan could not answer, so browser tests run: {said(done)}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return True
 
 
 def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> bool:
@@ -1334,12 +1718,9 @@ def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> 
         job["name"] == "playwright" and job.get("conclusion") == "success" for job in parts
     ):
         return False
-    planner = next(job for job in parts if job["name"] == E2E_PLAN)
-    notes = {
-        (note.get("title"), note["message"].strip())
-        for note in api(f"{API}/check-runs/{planner['id']}/annotations?per_page=100")
-    }
-    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= notes
+    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= _planner_notes(
+        parts, E2E_PLAN
+    )
 
 
 def inherited_image_jobs(
@@ -1383,10 +1764,7 @@ def inherited_image_jobs(
 
 def _planner_notes(parts: list[dict[str, Any]], plan: str) -> set[tuple[Any, str]]:
     planner = next(job for job in parts if job["name"] == plan)
-    return {
-        (note.get("title"), note["message"].strip())
-        for note in api(f"{API}/check-runs/{planner['id']}/annotations?per_page=100")
-    }
+    return {(note.get("title"), note["message"].strip()) for note in job_notes(planner)}
 
 
 def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
@@ -1425,8 +1803,7 @@ def tested_merge(parts: list[dict[str, Any]], base: str, head: str) -> str | Non
     for job in parts:
         if job["name"] != CI_PLAN:
             continue
-        notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
-        for note in notes:
+        for note in job_notes(job):
             if note.get("title") != NOTES.merge_tested:
                 continue
             merge = note["message"].strip()
@@ -1459,7 +1836,9 @@ def refresh_pull(
     train.refreshable.discard(number)
     merged = command("git", "merge", "--no-ff", "--no-commit", base, check=False)
     message = "chore: test against current main"
-    rules = mechanical_conflicts()
+    # The repository's command that resolves the conflicts and moves the numbered files a
+    # refresh settles itself; without one no conflict is mechanical and nothing is renumbered.
+    rules = CONFIG.command("mechanical_conflicts") is not None
     if mechanical:
         conflicts = git("diff", "--name-only", "--diff-filter=U").splitlines()
         if conflicts:
@@ -1472,21 +1851,22 @@ def refresh_pull(
             and command("git", "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode
         ):
             raise Refused(merged.stderr.strip() or merged.stdout.strip())
-    if mechanical and rules is None and (conflicts or conflicting(pull)):
+    if mechanical and not rules and (conflicts or conflicting(pull)):
         # Without the repository's rules no conflict is mechanical, whether git or only GitHub
         # sees it: the reviewer resolves it.
         where = f" in {', '.join(conflicts)}" if conflicts else ""
         raise Refused(
             f"non-mechanical conflict{where}: the repository resolves no conflict mechanically"
         )
-    if mechanical and rules is not None:
-        try:
-            resolved = rules.resolve(head, base)
-        except rules.MechanicalConflict as error:
+    if mechanical and rules:
+        # It resolves the merge in the worktree, stages it and names each file it resolved.
+        done = repository_command("mechanical_conflicts", "resolve", head, base)
+        assert done is not None
+        if done.returncode:
             if conflicts:
-                raise Refused(f"non-mechanical conflict in {', '.join(conflicts)}: {error}") from error
-            raise Refused(str(error)) from error
-        message = "merge main: mechanical conflict in " + ", ".join(resolved)
+                raise Refused(f"non-mechanical conflict in {', '.join(conflicts)}: {said(done)}")
+            raise Refused(said(done))
+        message = "merge main: mechanical conflict in " + ", ".join(nonblank_lines(done.stdout))
         merged.returncode = 0
     if merged.returncode:
         conflicts = git("diff", "--name-only", "--diff-filter=U").splitlines()
@@ -1502,29 +1882,32 @@ def refresh_pull(
         raise Refused(merged.stderr.strip() or merged.stdout.strip())
     if (
         not mechanical
-        and rules is not None
+        and rules
         and not command("git", "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode
     ):
-        # Git merges two migrations numbered alike in different files cleanly; the migration
-        # tool then has two heads. The branch's new ones move past main's last, or wait as a
-        # conflict.
-        try:
-            moved = rules.renumber_migrations(head, base)
-        except rules.MigrationCollision as error:
-            message = "merge main: conflict in " + ", ".join(error.paths)
+        # Git merges two files numbered alike under different names cleanly; the tool that
+        # reads them in order then has two heads. The branch's new ones move past main's last,
+        # staged, or wait as a conflict: the command then names the files it could not move.
+        done = repository_command("mechanical_conflicts", "renumber", head, base)
+        assert done is not None
+        if done.returncode and (paths := nonblank_lines(done.stdout)):
+            message = "merge main: conflict in " + ", ".join(paths)
             Path(git("rev-parse", "--git-path", "MERGE_MSG")).write_text(message + "\n")
             train.conflicts[number] = head
             train.save()
             raise Refused(
-                f"main took the number of {', '.join(error.paths)} and it cannot be renumbered "
-                f"mechanically ({error}); renumber the branch's migrations after main's last, "
-                f"commit with '{message}', push, then wait for CI"
-            ) from error
-        except rules.MechanicalConflict as error:
-            raise Refused(str(error)) from error
+                f"main took the number of {', '.join(paths)} and it cannot be renumbered "
+                f"mechanically ({done.stderr.strip()}); renumber the branch's numbered files "
+                f"after main's last, commit with '{message}', push, then wait for CI"
+            )
+        if done.returncode:
+            raise Refused(said(done))
+        moved = [line.split() for line in nonblank_lines(done.stdout)]
+        if any(len(pair) != 2 for pair in moved):
+            raise Refused(f"could not read the files the repository renumbered: {done.stdout}")
         if moved:
             message = "merge main: renumber migration " + ", ".join(
-                f"{Path(old).name} to {Path(new).name}" for old, new in moved.items()
+                f"{Path(old).name} to {Path(new).name}" for old, new in moved
             )
     # An older run without provenance cannot prove freshness. If main is already contained,
     # an empty commit requests a new pull_request event rather than replaying the old event.
@@ -1579,20 +1962,23 @@ def lost_check(
     pull: dict[str, Any],
     known: list[dict[str, Any]] | None = None,
     read: Callable[[str], dict[str, Any]] | None = None,
+    *,
+    failed: bool = False,
 ) -> dict[str, Any] | None:
     """A check the rollup lists as queued or running whose workflow run completed at least
     LOST_AFTER_SECONDS ago, when every check not passing is lost so: a check still running for
     real may yet fail, and is waited for first. Each read run costs a request from the shared
     budget, so a check that started less than that ago ends the search: its run cannot have
     completed so long ago. `read` reads a run by its id; the tick passes one that keeps each
-    answer for the rest of the tick.
+    answer for the rest of the tick. A failed pull request's completed checks have had their
+    say: then only the checks not completed must each be lost.
     """
     now = float(os.environ.get("WORKFLOW_NOW") or time.time())
     seen = {str(run["id"]): run for run in known or []}
     # Every check that cannot be lost is ruled out before any run is read.
     waiting = []
     for check in pull["statusCheckRollup"]:
-        if _passing_check(check):
+        if _passing_check(check) or (failed and _completed_check(check)):
             continue
         if check.get("__typename") == "StatusContext" or check.get("status") == "COMPLETED":
             return None
@@ -1809,7 +2195,7 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
             return False
         tree = api(f"{API}/git/commits/{merge}")["tree"]["sha"]
         plan = next(job for job in image_jobs if job["name"] == IMAGES_PLAN)
-        notes = api(f"{API}/check-runs/{plan['id']}/annotations?per_page=100")
+        notes = job_notes(plan)
         if not any(
             note.get("title") == NOTES.files_tested and note["message"].strip() == tree
             for note in notes
@@ -1823,10 +2209,34 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
         return False
 
 
+def proves_advisory_fix(pull: dict[str, Any]) -> bool:
+    """Whether a pull request is the update that fixes an advisory on main: its latest CI run is
+    green and its own audit passed clean, without the "Advisory on main" warning, whatever main
+    that run tested. Only its place in the line rests on this; the gate verifies its merge as
+    any other's."""
+    try:
+        if failed_checks(pull):
+            return False
+        ci = runs("ci", pull["headRefOid"], pull=True)
+        if not ci:
+            return False
+        parts = jobs(ci[0])
+        if verdict(ci[0], parts)[0] != "green":
+            return False
+        return any(
+            job["name"] == DEPENDENCIES and job.get("conclusion") == "success"
+            for job in strict_jobs(parts)
+        )
+    except Waiting:
+        raise
+    except Refused, KeyError, TypeError, ValueError, IndexError:
+        return False
+
+
 def publish_first(number: str | None, batch: dict[str, Any] | None) -> None:
     """Tell the runners' lender which pull request is first, and the branch its batch is tested
     on: their CI and browser jobs get a runner before other pull requests' jobs
-    (.github/runner/lend_runners.py). The train is never held up for this note."""
+    (runner/lend_runners.py). The train is never held up for this note."""
     path = Path.home() / ".local/state/workflow/train-first.json"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2142,7 +2552,9 @@ class Train:
         pulls: dict[str, Any] = {}
         suite_states: dict[str, str | None] = {}
         lost: dict[str, dict[str, Any]] = {}
-        self.refreshable = set()
+        # A blocked head's CI run that cannot be read, or that GitHub lists no more, is no new
+        # evidence: GitHub can lag on its check runs too, so its mark stays.
+        marked, self.refreshable = self.refreshable, set()
         # Use the same session state and owner-question notes as the tick. A background
         # job leaves its session running and must not lose its turn merely for waiting.
         sessions = {
@@ -2157,12 +2569,32 @@ class Train:
         for number in dict.fromkeys([*self.queue, *self.blocked]):
             pull = known[number] if known and number in known else read_pull(number)
             pulls[number] = pull
+            try:
+                repair = check_repair.Repair.read(self.path.parent, number)
+            except ValueError:
+                repair = None
+            if (
+                repair is not None
+                and pull["state"] == "OPEN"
+                and pull["baseRefName"] == "main"
+                and (
+                    pull["isDraft"] or self.blocked.get(number) not in (None, pull["headRefOid"])
+                )
+            ):
+                # A failing test of its own went to a worker: as a draft, then on the fix's new
+                # head until its reviewer calls the gate, it keeps its place, passed over.
+                self.blocked.setdefault(number, repair.head)
+                self.unavailable.append(number)
+                remaining.append(number)
+                continue
             if not ready(pull):
                 self.blocked.pop(number, None)
                 continue
             if number in self.blocked and self.blocked[number] != pull["headRefOid"]:
                 # A fix on a new head joins at the back when its reviewer calls the gate.
-                # Keep its audit eligible for a checks-finished wake until that claim.
+                # Keep its audit eligible for a checks-finished wake until that claim; a check
+                # GitHub lost beside its failure still ends that wait.
+                self._failed_lost(number, pull, None, lost, failed=failed_checks(pull))
                 continue
             if self.conflicts.get(number) != pull["headRefOid"]:
                 self.conflicts.pop(number, None)
@@ -2208,6 +2640,7 @@ class Train:
                 suite_states[number] = None
             if failed_checks(pull):
                 self.blocked[number] = pull["headRefOid"]
+                self._failed_lost(number, pull, None, lost)
             elif suite_states[number] == "red" and self.blocked.get(number) == pull["headRefOid"]:
                 # The gate blocked it when it told its session that a whole suite failed
                 # (_whole_suite_run). Until then it keeps its turn, so the finished run
@@ -2228,6 +2661,13 @@ class Train:
                             note_lost(self.path.parent, number, pull["headRefOid"], found)
                     if state == "red":
                         self.blocked[number] = pull["headRefOid"]
+                        self._failed_lost(number, pull, ci[:1], lost)
+                    elif (
+                        not ci
+                        and number in marked
+                        and self.blocked.get(number) == pull["headRefOid"]
+                    ):
+                        self.refreshable.add(number)
                     elif state == "green" and number in self.blocked:
                         # Its own green run cannot clear a failure its prefix run found. A
                         # new run or attempt of that prefix, or a fix, is needed first.
@@ -2259,7 +2699,10 @@ class Train:
                             # Still blocked, but its turn may refresh the stale green run.
                             self.refreshable.add(number)
                 except Refused, KeyError, TypeError, ValueError, IndexError:
-                    pass
+                    # An unread run changes nothing: a green re-run on this same head keeps
+                    # its mark, so its turn still refreshes it.
+                    if number in marked and self.blocked.get(number) == pull["headRefOid"]:
+                        self.refreshable.add(number)
             remaining.append(number)
         self.queue = remaining
         # A label changed while waiting moves its pull request at this turn.
@@ -2267,15 +2710,19 @@ class Train:
         self.read_hot_paths(pulls)
         self.fixes = []
         proofs: dict[str, list[Any]] = {}
-        if health.startswith("main: red"):
+        # The update that fixes an advisory on main goes first too, so main turns green.
+        if state_of(health) in ("red", "advisory"):
             try:
                 base = git("ls-remote", "origin", "refs/heads/main").split()[0]
                 current = main_health(base, self.path.parent)
-                if current.state == "red":
+                if current.state in ("red", "advisory"):
                     for number in remaining:
                         if number in self.unavailable or number in self.conflicts:
                             continue
-                        evidence = fix_evidence(pulls[number], base, current)
+                        # An advisory's fix is proven whatever main it was tested on: main
+                        # moves under it while the line keeps merging.
+                        advisory = current.state == "advisory"
+                        evidence = fix_evidence(pulls[number], "" if advisory else base, current)
                         if evidence is None:
                             continue
                         judged = self.proofs.get(number)
@@ -2283,7 +2730,11 @@ class Train:
                             proven = judged[1]
                         else:
                             try:
-                                proven = proves_main_fix(pulls[number], base, current)
+                                proven = (
+                                    proves_advisory_fix(pulls[number])
+                                    if advisory
+                                    else proves_main_fix(pulls[number], base, current)
+                                )
                             except Waiting:
                                 # An unreadable GitHub proves nothing; judge it again next time.
                                 continue
@@ -2314,7 +2765,7 @@ class Train:
         self.lost = {
             number: found
             for number, found in {**self.lost, **lost}.items()
-            if number in remaining
+            if (number in remaining or number in self.blocked)
             and found["head"] == pulls[number]["headRefOid"]
             and (number in lost or number == acting)
         }
@@ -2326,6 +2777,27 @@ class Train:
         }
         self._pending_turns(pulls, suite_states)
         self.save()
+
+    def _failed_lost(
+        self,
+        number: str,
+        pull: dict[str, Any],
+        known: list[dict[str, Any]] | None,
+        lost: dict[str, dict[str, Any]],
+        *,
+        failed: bool = True,
+    ) -> None:
+        """A failed member's check GitHub lost never completes, so its reviewer's checks-finished
+        wake would never come: the tick gives it that wake, and the orchestrator is told. One
+        not known to have failed failed only when a lost check's run did not pass."""
+        try:
+            found = lost_check(pull, known, failed=True)
+        except Refused, KeyError, TypeError, ValueError, IndexError:
+            # Unreadable runs prove nothing lost; the next reconcile looks again.
+            return
+        if found and (failed or found["conclusion"] != "success"):
+            lost[number] = {"head": pull["headRefOid"], **found, "failed": True}
+            note_lost(self.path.parent, number, pull["headRefOid"], found)
 
     def _pending_turns(self, pulls: dict[str, Any], suite_states: dict[str, str | None]) -> None:
         # Pending entries keep their FIFO slots. Only a green run tested on current main
@@ -2598,6 +3070,12 @@ def _passing_check(check: dict[str, Any]) -> bool:
     )
 
 
+def _completed_check(check: dict[str, Any]) -> bool:
+    if check.get("__typename") == "StatusContext":
+        return check.get("state") in ("SUCCESS", "FAILURE", "ERROR")
+    return check.get("status") == "COMPLETED"
+
+
 def _passing_rollup(pull: dict[str, Any]) -> bool:
     return all(_passing_check(check) for check in pull["statusCheckRollup"])
 
@@ -2662,13 +3140,13 @@ def changed_files(base: str, head: str) -> list[str]:
 
 
 def _taken_migrations(head: str, base: str) -> list[str]:
-    rules = mechanical_conflicts()
-    if rules is None:
+    """The branch's numbered files whose number main took, by the repository's command."""
+    done = repository_command("mechanical_conflicts", "taken", head, base)
+    if done is None:
         return []
-    try:
-        return rules.taken_migrations(head, base)
-    except rules.MechanicalConflict as error:
-        raise Refused(f"could not compare migration numbers: {error}") from error
+    if done.returncode:
+        raise Refused(f"could not compare numbered files: {said(done)}")
+    return nonblank_lines(done.stdout)
 
 
 def _batch_runs(batch: dict[str, Any], workflow: str) -> list[dict[str, Any]]:
@@ -2761,7 +3239,7 @@ def _batch_service_answered(batch: dict[str, Any], folder: Path) -> bool:
         except Refused:
             # Unread now is read on a later tick; the gate call decides the wait itself.
             return False
-        return service is not None and advisory_service.answers(service)
+        return service is not None and service_answers(service)
     return False
 
 
@@ -3025,11 +3503,11 @@ def _push_scratch(
         pushed = push("origin", f"{record['head']}:refs/heads/{record['branch']}")
         if pushed.returncode:
             failure = pushed.refusal
-            output = pushed.output
+            # A push that keeps stalling ends the batch, whatever its scan printed first.
+            output = "" if pushed.timed_out else pushed.output
     except Waiting:
         raise
     except Refused as error:
-        # A push that outlasted its deadline failed like any other.
         failure = str(error)
     if failure is not None:
         reason = f"could not push {whose} scratch branch: " + failure
@@ -3285,7 +3763,7 @@ def _refill(train: Train, base: str) -> None:
             _drop_line(train)
         if train.prefixes is None:
             current, health = refresh_health(train.path.parent)
-            if current != base or health.state != "green":
+            if current != base or health.state not in MERGING:
                 return
         _extend_line(train, base, False)
         _start_prefixes(train)
@@ -3380,7 +3858,9 @@ def _run_line(
             _drop_line(train)
         return None
     record = train.prefixes
-    if health.state != "green" and not (record and record["merged"] and health.state == "pending"):
+    if health.state not in MERGING and not (
+        record and record["merged"] and health.state == "pending"
+    ):
         if record is None:
             return None
         raise Waiting("merging stopped: " + health.line)
@@ -3506,7 +3986,7 @@ def _merge_prefixes(
                 "main moved during the merge train; the prefixes are tested again",
                 then="refuse",
             )
-        if current_health.state != "green" and (
+        if current_health.state not in MERGING and (
             not record["merged"] or current_health.state != "pending"
         ):
             if current_health.state == "red":
@@ -3767,9 +4247,14 @@ def train_status(folder: Path) -> int:
             train.reconcile()
             if train_reads.tick() is None:
                 _batch_signal(train)
+        published = folder / "main-status"
         print(
             json.dumps(
                 {
+                    # Main's state as last published: green, pending, red, advisory or unknown.
+                    "main": (state_of(published.read_text()) or None)
+                    if published.exists()
+                    else None,
                     "first": train.first,
                     # Keep failed entries' slots internally, but let the tick deliver their
                     # ordinary checks-finished wake instead of waiting for a train turn.
@@ -3831,12 +4316,11 @@ def train_status(folder: Path) -> int:
 def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> None:
     """A failed local inventory must neither join nor stay approved for a prefix.
 
-    A repository that holds no `pre-train-checks` beside the gate has none to fail. A caller
-    that does not hold the merge lock (a handoff) takes it only to leave the line."""
-    checks = HERE / "pre-train-checks"
-    if not checks.exists():
+    A repository that names no `pre_train_checks` command has none to fail. A caller that does
+    not hold the merge lock (a handoff) takes it only to leave the line."""
+    done = repository_command("pre_train_checks")
+    if done is None:
         return
-    done = command("bash", str(checks), check=False)
     print(done.stdout, end="", flush=True)
     print(done.stderr, end="", file=sys.stderr, flush=True)
     if done.returncode:
@@ -4090,14 +4574,14 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             reason = f"behind {train.first}" if train.first else "for main to change"
             print(
                 f"merge train: pull request {number} waits {reason}; "
-                "run scripts/workflow/notify waiting and end the turn; the tick wakes you",
+                f"run {NOTIFY_WAITING} and end the turn; the tick wakes you",
                 flush=True,
             )
             command("bash", str(HERE / "notify"), "waiting")
             return 3
         # A pending or red main still lets a stale pull request refresh, so its CI runs on the
         # current main; the merge itself waits for green, or for proof of a fix, below.
-        if health.state not in ("green", "pending", "red"):
+        if health.state not in (*MERGING, "pending", "red"):
             # An unreadable main stops merging until it can be read; it needs no judgment.
             raise Waiting("merging stopped: " + health.line)
         head = pull["headRefOid"]
@@ -4172,7 +4656,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             image_plan = next(
                 job for job in image_jobs if job["name"] == IMAGES_PLAN
             )
-            image_notes = api(f"{API}/check-runs/{image_plan['id']}/annotations?per_page=100")
+            image_notes = job_notes(image_plan)
             if not any(
                 note.get("title") == NOTES.files_tested and note["message"].strip() == tree
                 for note in image_notes
@@ -4201,7 +4685,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
         # A red main merges only the fix: this pull request's CI on that same main ran and
         # passed every check failing there. A skipped check proves nothing.
         fixes = current_health.state == "red" and set(current_health.failing) <= passed_checks
-        if current_health.state != "green" and not fixes:
+        if current_health.state not in MERGING and not fixes:
             if current_health.state == "red":
                 # Sleep until main or this head changes; a later arrival may be the fix.
                 train.suspend(number, head, current_health.line)

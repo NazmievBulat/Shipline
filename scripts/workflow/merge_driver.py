@@ -5,10 +5,12 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
+import check_repair
 import merge_gate as gate
 import train_reads
 from conflict_review import prepare as prepare_conflict_review
@@ -75,6 +77,90 @@ def _queue_notice(folder: Path, number: str, request: Path) -> None:
         )
 
 
+def _hand_to_worker(
+    folder: Path, number: str, pull: dict[str, Any], repair: check_repair.Repair
+) -> None:
+    """A failing test of its own goes to a worker: the pull request becomes a draft, its
+    handoff is revoked, and it keeps its place in the line as a blocked member.
+
+    The note is written first, so an interruption at any step finishes on the next tick."""
+    if not repair.event:
+        repair.event = uuid.uuid4().hex
+    repair.save(folder, number)
+    if not pull["isDraft"]:
+        try:
+            gate.command("gh", "pr", "ready", number, "-R", gate.REPOSITORY, "--undo")
+        except gate.Waiting:
+            raise
+        except gate.Refused:
+            # Still ready: it goes to a reviewer, as before, and no worker repairs it.
+            check_repair.clear(folder, number)
+            raise
+    reason = (
+        f"pull request checks failed on its own test: a worker fixes job {repair.job} of run "
+        f"{repair.run}, first failing test {repair.test}"
+    )
+    with (folder / "merge.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not (folder / "merge-handbacks.sent" / repair.event).exists():
+            write_json(
+                folder / "merge-handbacks.pending" / repair.event,
+                {"number": number, "reason": reason},
+            )
+        Handoff.path(folder, number).unlink(missing_ok=True)
+        (folder / f"review-{number}.head").unlink(missing_ok=True)
+        train = gate.Train(folder)
+        train.approved.pop(number, None)
+        train.blocked[number] = repair.head
+        if number not in train.queue:
+            train.queue.append(number)
+        train.save()
+    print(f"merge handoff {number}: {reason}", flush=True)
+
+
+def _checks_failed(folder: Path, number: str, pull: dict[str, Any]) -> None:
+    """A handoff whose checks failed for the pull request: a worker for a failing test of its
+    own, one re-run for its runners, a reviewer for anything else."""
+    if not gate.failed_checks(pull):
+        waits = check_repair.rerun_running(folder, pull)
+        if waits:
+            print(f"merge handoff {number} waits: {waits}", flush=True)
+        else:
+            # Its line's run failed, not its own checks: a reviewer judges it, as before.
+            _hand_back(folder, number, "pull request checks failed")
+        return
+    diagnosis = check_repair.diagnose(pull)
+    if diagnosis.kind == "infrastructure":
+        waits = check_repair.rerun(folder, diagnosis)
+        if waits:
+            print(f"merge handoff {number} waits: {waits}", flush=True)
+        else:
+            _hand_back(folder, number, f"pull request checks failed: {diagnosis.reason}")
+        return
+    labelled = gate.CONFIG.labels.workflow
+    labels = train_reads.pull(number, gate.read_pull).get("labels", [])
+    if (
+        diagnosis.kind != "own"
+        or diagnosis.repair is None
+        # Only a labelled draft gets a worker; one without the label keeps its audit path.
+        or not any(label.get("name") == labelled for label in labels)
+    ):
+        _hand_back(folder, number, f"pull request checks failed: {diagnosis.reason}")
+        return
+    earlier = check_repair.Repair.read(folder, number)
+    if earlier is not None and earlier.head != pull["headRefOid"]:
+        # The worker's fix failed on a test too: no second worker, a reviewer judges it.
+        check_repair.clear(folder, number)
+        _hand_back(
+            folder,
+            number,
+            f"pull request checks failed again after a worker's fix: job {diagnosis.repair.job}"
+            f" of run {diagnosis.repair.run}, first failing test {diagnosis.repair.test}",
+        )
+        return
+    _hand_to_worker(folder, number, pull, earlier or diagnosis.repair)
+
+
 def _hand_back_pull(folder: Path, path: Path, running: set[str]) -> dict[str, Any] | None:
     """The pull request whose hand-back still wants a fresh reviewer, or None."""
     number = path.name.removeprefix("merge-review-")
@@ -107,6 +193,15 @@ def _tidy_hand_backs(folder: Path) -> None:
     for path in sorted(folder.glob("merge-review-*")):
         if path.name.removeprefix("merge-review-").isdigit():
             _hand_back_pull(folder, path, running)
+    for path in sorted(folder.glob("check-repair-*.json")):
+        number = path.name.removeprefix("check-repair-").removesuffix(".json")
+        # A pull request that merged or closed needs no repair, and its next failure none.
+        if number.isdigit() and train_reads.pull(number, gate.read_pull)["state"] != "OPEN":
+            path.unlink()
+    for path in folder.glob("check-rerun-*.json"):
+        # Its run has long finished its one re-run by then.
+        if time.time() - path.stat().st_mtime > check_repair.RERUN_KEPT_SECONDS:
+            path.unlink(missing_ok=True)
 
 
 def _start_hand_back(folder: Path, number: str) -> int:
@@ -310,6 +405,14 @@ def drive(folder: Path) -> None:
                 # A gate refresh or a re-run can follow the bulk snapshot. Each of these
                 # revokes the passed review, so it rests on a fresh read.
                 pull = train_reads.refresh_pull(number, gate.read_pull)
+            if (
+                pull["state"] == "OPEN"
+                and pull["headRefOid"] == note.head
+                and any(check.get("name") == gate.CI_RESULT for check in pull["statusCheckRollup"])
+                and gate._passing_rollup(pull)
+            ):
+                # Its handed-off head passed: a later failing test is a first one again.
+                check_repair.clear(folder, number)
             if pull["state"] == "MERGED":
                 # Keep the parent note through temporary API/IO failures: deleting it
                 # would lose the children already moved to main before a restart.
@@ -318,12 +421,22 @@ def drive(folder: Path) -> None:
                 except (gate.Refused, OSError, TypeError, ValueError, KeyError) as error:
                     print(f"stack follow-up {number} waits: {error}", flush=True)
             elif not gate.ready(pull):
-                _hand_back(folder, number, "pull request is no longer ready on main")
+                repair = check_repair.Repair.read(folder, number)
+                if pull["isDraft"] and repair is not None and repair.head == note.head:
+                    # Interrupted after it became a draft for its worker.
+                    _hand_to_worker(folder, number, pull, repair)
+                else:
+                    _hand_back(folder, number, "pull request is no longer ready on main")
             elif note.children is not None:
                 _hand_back(folder, number, "unfinished stack follow-up on an open pull request")
             elif pull["headRefOid"] != note.head or pull["headRefName"] != note.branch:
                 _hand_back(folder, number, "head changed since the passed review handoff")
-            elif gate.failed_checks(pull) or number in gate.Train(folder).blocked:
+            elif gate.failed_checks(pull) or (
+                # A green re-run on an older main stays blocked but keeps its place: its turn
+                # refreshes it, as for any stale green run.
+                number in (train := gate.Train(folder)).blocked
+                and number not in train.refreshable
+            ):
                 # An advisory service the audit could not reach found nothing wrong: the
                 # handoff waits, and its CI is re-run once the service answers. Under the
                 # lock a gate call re-runs under, so only one of them asks GitHub.
@@ -331,7 +444,7 @@ def drive(folder: Path) -> None:
                     fcntl.flock(lock, fcntl.LOCK_EX)
                     waits = gate.pull_service_wait(pull, folder, number, retry=True)
                 if not waits:
-                    _hand_back(folder, number, "pull request checks failed")
+                    _checks_failed(folder, number, pull)
                 elif waits.startswith("automatic"):
                     print(f"merge handoff {number}: {waits}", flush=True)
                 else:

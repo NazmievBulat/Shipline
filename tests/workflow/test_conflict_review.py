@@ -127,7 +127,9 @@ def test_tick_starts_conflict_sentence_only_with_passed_handed_off_head(
         else "Review pull request 7"
     )
     assert instruction(sentence) in args
-    assert "--effort high --model opus" in args
+    # A conflict resolution's reviewer stays high; this change names no path that needs it.
+    effort = "high" if review == "passed" else "medium"
+    assert f"--effort {effort} --model opus" in args
     assert workflow.git("rev-parse", "MERGE_HEAD", cwd=workflow.worktree(7)) == main
     scope = _folder(workflow) / "review-7.conflict.json"
     assert scope.exists() == (review == "passed")
@@ -408,6 +410,8 @@ def _reviewer(workflow: Workflow) -> str:
             str(_folder(workflow)),
             "7",
         ],
+        # `session` runs it from the repository's checkout, whose shipline.json it reads.
+        cwd=workflow.repo,
         env=workflow.env,
         capture_output=True,
         text=True,
