@@ -14,9 +14,8 @@ A kind without bounds, or one the machine has no role for (`roles`), keeps its i
 them. A line `balance off` stops the balancer, and the counts stay as they are.
 
 Each minute it reads, from GitHub under the runners' own identity and within the shared budget
-(`github_budget.py`), the queued and running jobs for this machine's ordinary label
-(`<prefix>-<machine>`) and Docker label (`<prefix>-<machine>-docker`) and the runners of the
-pool; and from the machine, its 5-minute load against the session start ceiling of
+(`github_budget.py`), the queued and running jobs for the pool's ordinary label and Docker label
+and the runners of the pool; and from the machine, its 5-minute load against the session start ceiling of
 `scripts/workflow/session` (the processors times WORKFLOW_LOAD_PER_PROCESSOR, 1.5) and its
 available memory.
 
@@ -44,6 +43,11 @@ available memory.
 Every change is one line of `~/.local/state/workflow/runner-balance.log`: the time, what
 changed, the queues, the forecast, the load and the memory. Its state (since when a kind's
 queue was empty, the last change) is in `runner-balance.json` beside it.
+
+The pool's labels are shared by every machine: ordinary jobs ask for its label (`runner_label`
+in the settings, `<prefix>-home` without one), Docker jobs for `<label>-docker`, and spares wait
+as `<label>-standby`. Machines differ only by their runners' names, `<machine>-<k>` and
+`<machine>-docker-<k>`.
 
 The settings are a Bash file, `~/.config/shipline/runner.sh` unless SHIPLINE_RUNNER_SETTINGS
 names another; a change of count is written back to its line there. The prefix is the
@@ -88,6 +92,7 @@ MEMORY_GB = {"ordinary": 3, "docker": 8}
 REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
 PREFIX = re.compile(r"[a-z]([a-z0-9-]{0,23}[a-z0-9])?")
 MACHINE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
+LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 SETTINGS_SECONDS = 5
 # A Docker runner's VM may take a while to start; one that takes longer is not waited for.
 SYSTEMCTL_SECONDS = 180
@@ -103,6 +108,7 @@ SETTINGS_READ = (
     "repository",
     "RUNNER_PREFIX",
     "machine",
+    "runner_label",
     "roles",
     "ordinary_jobs",
     "docker_runners",
@@ -174,20 +180,20 @@ class Machine:
     repository: str
     prefix: str
     name: str
+    pool_label: str
     counts: dict[str, int]
     bounds: dict[str, tuple[int, int]]
     off: bool
     forecast_path: Path
 
     def label(self, kind: str) -> str:
-        base = f"{self.prefix}-{self.name}"
-        return base + "-docker" if kind == "docker" else base
+        return self.pool_label + "-docker" if kind == "docker" else self.pool_label
 
     def unit(self, kind: str, k: int) -> str:
         return f"{self.prefix}-runner{'-docker' if kind == 'docker' else ''}@{k}.service"
 
     def runner_name(self, kind: str, k: int) -> str:
-        return f"{self.label(kind)}-{k}"
+        return f"{self.name}{'-docker' if kind == 'docker' else ''}-{k}"
 
 
 def machine(path: Path) -> Machine:
@@ -201,12 +207,16 @@ def machine(path: Path) -> Machine:
     ):
         if not pattern.fullmatch(values.get(needed, "")):
             raise Refused(f"{path} names no {needed}")
+    pool_label = values.get("runner_label") or values["RUNNER_PREFIX"] + "-home"
+    if not LABEL.fullmatch(pool_label):
+        raise Refused(f"{path} names no runner_label GitHub takes: {pool_label}")
     roles = set(values.get("roles", "").split())
     counts = {kind: _count(values, kind) for kind in KINDS}
     return Machine(
         repository=values["repository"],
         prefix=values["RUNNER_PREFIX"],
         name=values["machine"],
+        pool_label=pool_label,
         counts=counts,
         bounds={kind: _bounds(values, kind, counts[kind], roles) for kind in KINDS},
         off=values.get("balance_off") == "1",
@@ -286,7 +296,7 @@ class Queue:
 
 
 def queues(box: Machine) -> dict[str, Queue]:
-    """The queued and running jobs of this machine's two labels."""
+    """The queued and running jobs of the pool's two labels, every machine's."""
     found = {kind: Queue() for kind in KINDS}
     labels = {box.label(kind): kind for kind in KINDS}
     for status in ("queued", "in_progress"):
@@ -313,18 +323,15 @@ def runners(box: Machine) -> list[dict[str, Any]]:
 
 
 def pool_slots(box: Machine, listed: list[dict[str, Any]]) -> dict[str, int]:
-    """The pool's online runners of each kind, by their labels: `<prefix>-<machine>-docker` a
-    Docker runner, `<prefix>-<machine>` an ordinary slot, a main runner and the planner
-    neither."""
+    """The pool's online runners of each kind, every machine's: those with the pool's ordinary
+    label and those with its Docker label. A main runner, a spare and the planner are neither."""
     found = dict.fromkeys(KINDS, 0)
     for runner in listed:
         if runner.get("status") != "online":
             continue
-        for label in (_label(label) for label in runner.get("labels") or []):
-            if not label.startswith(box.prefix + "-") or label.endswith(("-main", "-planner")):
-                continue
-            found["docker" if label.endswith("-docker") else "ordinary"] += 1
-            break
+        labels = {_label(label) for label in runner.get("labels") or []}
+        for kind in KINDS:
+            found[kind] += box.label(kind) in labels
     return found
 
 

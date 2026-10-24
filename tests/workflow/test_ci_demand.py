@@ -420,3 +420,16 @@ def test_the_wake_names_the_last_balance_change_once_as_a_change(workflow: Workf
     assert len(workflow.sent()) == 2
     assert f"Runner balance, last change: {BALANCED}." in workflow.sent()[-1]
     assert not list(pending.iterdir())
+
+
+def test_a_spare_or_main_runners_job_is_no_slots(demand: Demand) -> None:
+    labels = [ORDINARY, DOCKER, "example-app-home-main", "example-app-home-standby", "x-planner"]
+    (demand.workflow.repo / "shipline.json").write_text(json.dumps({"runner": {"labels": labels}}))
+    demand.cloud(7, "working")
+    jobs = [_job(label) for label in labels]
+    demand.pull(7, runs=[(_run(71, "ci.yml"), jobs)])
+
+    forecast = demand.write()
+
+    assert forecast is not None
+    assert (forecast["ordinary"], forecast["docker"]) == (1, 1)

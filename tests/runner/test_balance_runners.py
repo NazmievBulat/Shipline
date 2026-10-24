@@ -16,8 +16,9 @@ import pytest
 BALANCER = Path(__file__).resolve().parents[2] / "runner" / "balance_runners.py"
 NOW = 1792828200
 MINUTE = 60
-ORDINARY = "example-app-box"
-DOCKER = "example-app-box-docker"
+# The pool's labels, shared by every machine: `<prefix>-home` unless the settings name another.
+ORDINARY = "example-app-home"
+DOCKER = "example-app-home-docker"
 
 # Answers the queued and running runs, each run's jobs and the runners from `github.json`, and
 # writes every call to the log.
@@ -134,15 +135,16 @@ class Machine:
         )
 
     def registered(self, *, ordinary: int, docker: int, busy: tuple[str, ...] = ()) -> None:
-        """The runners GitHub lists: this machine's, its main runner, the planner and another
-        machine's two ordinary slots."""
-        names = [(f"example-app-box-{k}", ORDINARY) for k in range(1, ordinary + 1)]
-        names += [(f"example-app-box-docker-{k}", DOCKER) for k in range(1, docker + 1)]
+        """The runners GitHub lists: this machine's, its main runner and spare, the planner and
+        another machine's two ordinary slots."""
+        names = [(f"box-{k}", ORDINARY) for k in range(1, ordinary + 1)]
+        names += [(f"box-docker-{k}", DOCKER) for k in range(1, docker + 1)]
         names += [
-            ("example-app-box-main-1", "example-app-box-main"),
-            ("example-app-planner-1", "example-app-planner"),
-            ("example-app-other-1", "example-app-other"),
-            ("example-app-other-2", "example-app-other"),
+            ("box-main-1", "example-app-home-main"),
+            ("box-spare", "example-app-home-standby"),
+            ("planner-1", "example-app-planner"),
+            ("other-1", ORDINARY),
+            ("other-2", ORDINARY),
         ]
         self.runners = [
             {
@@ -360,7 +362,7 @@ def test_nothing_queued_for_less_than_fifteen_minutes_keeps_the_runner(machine: 
 
 def test_a_busy_runner_is_never_stopped(machine: Machine) -> None:
     _held_by_load(machine)
-    machine.registered(ordinary=3, docker=1, busy=("example-app-box-docker-1",))
+    machine.registered(ordinary=3, docker=1, busy=("box-docker-1",))
 
     machine.run()
 
@@ -386,7 +388,7 @@ def test_a_runner_github_does_not_list_is_not_stopped(machine: Machine) -> None:
 
 def test_a_runner_that_took_a_job_since_the_listing_is_not_stopped(machine: Machine) -> None:
     _held_by_load(machine)
-    (machine.state / "busy-on-recheck").write_text("example-app-box-docker-1\n")
+    (machine.state / "busy-on-recheck").write_text("box-docker-1\n")
 
     machine.run()
 
@@ -397,7 +399,7 @@ def test_a_runner_that_took_a_job_since_the_listing_is_not_stopped(machine: Mach
 def test_an_offline_runner_is_not_stopped(machine: Machine) -> None:
     _held_by_load(machine)
     for runner in machine.runners:
-        if runner["name"] == "example-app-box-docker-1":
+        if runner["name"] == "box-docker-1":
             runner["status"] = "offline"
 
     machine.run()
@@ -495,7 +497,7 @@ def test_moving_a_docker_runner_to_an_ordinary_slot_drains_it_first(machine: Mac
     # Ordinary jobs wait, Docker has none, and the load leaves no room to add.
     machine.queue(ORDINARY, 8)
     machine.load(3.0)
-    machine.registered(ordinary=3, docker=1, busy=("example-app-box-docker-1",))
+    machine.registered(ordinary=3, docker=1, busy=("box-docker-1",))
 
     machine.run()
 
@@ -707,3 +709,20 @@ def test_the_prefix_may_come_from_the_environment(machine: Machine) -> None:
     machine.run(env={"RUNNER_PREFIX": "example-app"})
 
     assert machine.changes() == ["added an ordinary slot (3 to 4)"]
+
+
+def test_the_settings_may_name_the_pools_label(machine: Machine) -> None:
+    machine.settings(
+        ordinary=3,
+        docker=1,
+        bounds="balance_ordinary=2-5\nbalance_docker=0-2\n",
+        extra="runner_label=example-app-lab\n",
+    )
+    machine.queue(ORDINARY, 10)
+    machine.queue("example-app-lab-docker", 10)
+    machine.memory(9)
+
+    machine.run()
+
+    # Only the lab's Docker jobs wait for this machine's pool.
+    assert machine.changes() == ["started a Docker runner (1 to 2)"]

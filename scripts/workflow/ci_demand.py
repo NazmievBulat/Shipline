@@ -17,7 +17,7 @@ jobs its pull request's last runs started: for each of the CI, E2E and image wor
 newest run of its branch that ran a job, the jobs of its first attempt (the one a push starts)
 counted by the runner label they asked for
 (the labels of `runner.labels` in `shipline.json`: one ending `-docker` is a Docker runner's,
-one ending `-main` or `-planner` is neither, any other an ordinary slot's). A skipped job
+one ending `-main`, `-planner` or `-standby` is neither, any other an ordinary slot's). A skipped job
 counts for nothing, so Docker jobs count only when the pull request changes the images. A pull
 request with no such run counts as the others do on average, rounded up.
 
@@ -72,7 +72,7 @@ def now() -> int:
 
 def kind(label: str) -> str | None:
     """The kind of runner a pool label asks for: "ordinary", "docker" or None."""
-    if label not in CONFIG.runner.labels or label.endswith(("-main", "-planner")):
+    if label not in CONFIG.runner.labels or label.endswith(("-main", "-planner", "-standby")):
         return None
     return "docker" if label.endswith("-docker") else "ordinary"
 
