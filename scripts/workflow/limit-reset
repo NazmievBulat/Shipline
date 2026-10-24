@@ -72,6 +72,8 @@ remember_line_reset() {
     [[ $saved != "$named $text" || ! $limit_at =~ ^[0-9]+$ ]] || return 0
   fi
   usage_reset_for_clock "$named" "$text" || return 1
+  # A shadow run (`tick --shadow`) reads the reset as the real tick would, and keeps no note.
+  [[ -z ${SHIPLINE_SHADOW:-} ]] || return 0
   mkdir -p "${prefix%/*}" || return 1
   record=$(mktemp "$prefix.limit-line.XXXXXX") || return 1
   printf '%s %s %s\n' "$limit_at" "$named" "$text" >"$record" &&

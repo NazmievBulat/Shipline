@@ -62,10 +62,16 @@
 #                               changed for 45 minutes, or whose wait loop finds itself, and
 #                               tell it so (the tick does this, once); with `again`, only send
 #                               that message once more when its Enter was not taken
+#   session would-nudge <ticket-N|review-N> <still|loop> [again]
+#                               nudge-busy's checks alone, pressing nothing: exit 0 when it
+#                               would press, 3 when it would not (a shadow tick asks)
 #   session answer-for-owner <ticket-N|review-N|audit-N> <asked>
 #                               type the recommended reply of a question to the owner its
 #                               session marked `Owner only: no`, the one noted as asked at
 #                               <asked> (the tick does this, after a wait)
+#   session would-answer <ticket-N|review-N|audit-N> <asked>
+#                               answer-for-owner's checks alone, typing nothing: exit 0 when it
+#                               would type, 3 when it would not (a shadow tick asks)
 #   session running <name>      what the session's Bash tool runs, as JSON, and whether it is
 #                               a wait loop that finds itself (`running_command.py`)
 #   session bridge <ticket-N>   start the bridge of a Codex worker again when it ended while
@@ -173,7 +179,9 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session status-check <ticket-N|review-N>
        session finish-ready <ticket-N>
        session nudge-busy <ticket-N|review-N> <still|loop> [again]
+       session would-nudge <ticket-N|review-N> <still|loop> [again]
        session answer-for-owner <ticket-N|review-N|audit-N> <asked>
+       session would-answer <ticket-N|review-N|audit-N> <asked>
        session running <ticket-N|audit-N|review-N|hunt-name|analyst-name>
        session bridge <ticket-N>
        session cleanup [hunts]
@@ -545,7 +553,7 @@ cloud_sentence_of() {
   sentence_of "ticket-$1"
   # Unquoted for the set-up command alone: the text has no other dollar, backtick or backslash.
   cat <<EOF
-Cloud differences: work in your own cloud checkout and use the pull request's branch, not a local workflow worktree. Push only to the pull request's branch, never force-push, and never skip or weaken the pre-push hook. Run the repository's setup command, $SHIPLINE_WORKTREE_SETUP, when it has one, before testing and pushing. A database server cannot run as root: run it as a separate unprivileged user when this container runs as root. Run long suites in the background and wait for their results. Use a reviewer subagent in place of codex review, including verdicts for unit, API and browser coverage. Use only the selected local browser tests and at most two workers. Local session protect/unprotect commands and the phone bridge are unavailable here. Every report is a comment on this pull request starting with <!-- cloud-worker -->: report the start, first push, any blocker with the exact error, any question for the owner, and ready. A question for the owner ends on its last line with the question or the short words to type back, with the line Owner only: yes or Owner only: no just before those words. A blocker has a line starting with Blocked and includes the exact error. Never end your turn to wait for an answer: poll the pull request's comments every three minutes instead. Mark ready only after completing the worker's required work, then report with worker finished on the last line. Never merge. If a task explicitly asks for a comment-only smoke test, follow that task and stop after its requested comment.
+Cloud differences: work in your own cloud checkout and use the pull request's branch, not a local workflow worktree. Push only to the pull request's branch, never force-push, and never skip or weaken the pre-push hook. Export SHIPLINE_CLOUD_WORKER=1 in every shell before pushing: the pre-push hook then also runs the tests CI will run for this change, as shipline ci-tests-for-changes shows them; run each push in the background and wait for it, since each suite may take up to 25 minutes. When this container runs as root, also export SHIPLINE_CLOUD_TEST_USER naming the unprivileged user the tests run as, give that user the checkout with chown -R, and mark the checkout safe for git with git config --global --add safe.directory, as root and as that user. Only after the server suite timed out in a push, export SHIPLINE_CLOUD_SERVER_PART="1 of 4" (or another part) to run that part as CI parts it, and unset it once it is not needed. Run the repository's setup command, $SHIPLINE_WORKTREE_SETUP, when it has one, before testing and pushing. A database server cannot run as root: run it as a separate unprivileged user when this container runs as root. Run long suites in the background and wait for their results. Use a reviewer subagent in place of codex review, including verdicts for unit, API and browser coverage. Use only the selected local browser tests and at most two workers. Local session protect/unprotect commands and the phone bridge are unavailable here. Every report is a comment on this pull request starting with <!-- cloud-worker -->: report the start, first push, any blocker with the exact error, any question for the owner, and ready. A question for the owner ends on its last line with the question or the short words to type back, with the line Owner only: yes or Owner only: no just before those words. A blocker has a line starting with Blocked and includes the exact error. Never end your turn to wait for an answer: poll the pull request's comments every three minutes instead. Mark ready only after completing the worker's required work, then report with worker finished on the last line. Never merge. If a task explicitly asks for a comment-only smoke test, follow that task and stop after its requested comment.
 EOF
 }
 
@@ -1495,8 +1503,11 @@ shows_queued_message() {
 #
 # With `again`, the call only sends this message once more, typed by an earlier call whose
 # Enter was not taken: it exits 3 unless the box holds exactly that, and never presses Escape.
-cmd_nudge_busy() {
-  local name=$1 kind=$2 again=${3:-} notes typed poll screen message
+# What `nudge-busy` checks before it presses anything: it exits 3 when it would press nothing,
+# and dies when it cannot. `would-nudge` runs these alone, for a shadow tick, which presses
+# nothing. Sets message, notes, typed and screen for the caller.
+nudge_checks() {
+  local name=$1 kind=$2 again=$3
   message="That loop finds its own command line and never ends. Check the process by its number."
   [[ $kind != still ]] ||
     message="The command has produced nothing for 45 minutes. Check whether it is still running and go on."
@@ -1521,8 +1532,7 @@ cmd_nudge_busy() {
   if [[ $again == again ]]; then
     if [[ -n $typed && -r $notes.typed && $(cat "$notes.typed") == "$message" ]] &&
         holds_own_text "$name"; then
-      send_prompt "$name" "$message"
-      return
+      return 0
     fi
     echo "$name does not hold the message in its box; nothing was pressed" >&2
     exit 3
@@ -1534,6 +1544,20 @@ cmd_nudge_busy() {
   if shows_queued_message "$screen"; then
     echo "$name has a message queued; nothing was pressed" >&2
     exit 3
+  fi
+}
+
+cmd_would_nudge() {
+  local name=$1 kind=$2 again=${3:-} notes typed screen message
+  nudge_checks "$name" "$kind" "$again"
+}
+
+cmd_nudge_busy() {
+  local name=$1 kind=$2 again=${3:-} notes typed poll screen message
+  nudge_checks "$name" "$kind" "$again"
+  if [[ $again == again ]]; then
+    send_prompt "$name" "$message"
+    return
   fi
   tmux -L "$name" send-keys -t "=$name:" Escape 2>/dev/null || die "Escape could not be sent to $name"
   # Claude draws the interrupt, and puts back into the box what was queued while it worked.
@@ -1554,8 +1578,11 @@ cmd_nudge_busy() {
 # prompt for the owner or stopped on the usage limit. A question answered meanwhile, or any text
 # in the box but this reply, exits 3, so that the tick passes over the session quietly. The reply counts as the owner's: the
 # session's prompt hook drops the question.
-cmd_answer_for_owner() {
-  local name=$1 asked=$2 notes typed reply
+# What `answer-for-owner` checks before it types: it exits 3 when it would type nothing, and
+# dies when it cannot. `would-answer` runs these alone, for a shadow tick. Sets reply, notes and
+# typed for the caller.
+answer_checks() {
+  local name=$1 asked=$2
   notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
   require_running "$name"
   [[ ! -e $notes.codex ]] || die "$name is a Codex worker; its bridge relays"
@@ -1575,6 +1602,16 @@ cmd_answer_for_owner() {
     echo "$name has text in its box that was not sent; nothing was typed into it" >&2
     exit 3
   fi
+}
+
+cmd_would_answer() {
+  local name=$1 asked=$2 notes typed reply
+  answer_checks "$name" "$asked"
+}
+
+cmd_answer_for_owner() {
+  local name=$1 asked=$2 notes typed reply
+  answer_checks "$name" "$asked"
   send_prompt "$name" "$reply"
 }
 
@@ -1865,6 +1902,12 @@ codex_limit() {
   resets="$(LC_ALL=C TZ=UTC date -d "@$at" '+%b %-d, %Y, %-I:%M%P') (UTC)"
 }
 
+# A shadow run (`tick --shadow`) reads the sessions and changes none, whoever calls this.
+if [[ -n ${SHIPLINE_SHADOW:-} && ! ${1:-} =~ ^(list|running|load|room|would-nudge|would-answer)$ ]]; then
+  echo "a shadow run does not run session ${1:-}" >&2
+  exit 1
+fi
+
 case ${1:-} in
   start)
     check_load_per_processor
@@ -1948,16 +1991,24 @@ case ${1:-} in
     find_main_checkout
     cmd_nudge_idle "$2" finish
     ;;
-  nudge-busy)
+  nudge-busy | would-nudge)
     [[ ($# -eq 3 || ($# -eq 4 && $4 == again)) && $2 =~ ^(ticket|review)-[0-9]+$ &&
        $3 =~ ^(still|loop)$ ]] || usage
     find_main_checkout
-    cmd_nudge_busy "$2" "$3" "${4:-}"
+    if [[ $1 == would-nudge ]]; then
+      cmd_would_nudge "$2" "$3" "${4:-}"
+    else
+      cmd_nudge_busy "$2" "$3" "${4:-}"
+    fi
     ;;
-  answer-for-owner)
+  answer-for-owner | would-answer)
     [[ $# -eq 3 && $2 =~ ^(ticket|review|audit)-[0-9]+$ && $3 =~ ^[0-9]+\ [0-9]+$ ]] || usage
     find_main_checkout
-    cmd_answer_for_owner "$2" "$3"
+    if [[ $1 == would-answer ]]; then
+      cmd_would_answer "$2" "$3"
+    else
+      cmd_answer_for_owner "$2" "$3"
+    fi
     ;;
   running)
     [[ $# -eq 2 ]] && is_session_name "$2" || usage
