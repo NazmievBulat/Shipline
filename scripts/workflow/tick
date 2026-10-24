@@ -80,11 +80,13 @@ FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:
 METRICS_DAILY_AT=${WORKFLOW_METRICS_DAILY_AT-07:50}
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# A self-update that cannot be done leaves the tick to go on as it is. One move a tick.
-python3 -B "$here/self_update.py" start "$$"
-if (($? == 10)) && [[ -z ${SHIPLINE_TICK_MOVED:-} ]]; then
-  export SHIPLINE_TICK_MOVED=1
-  exec bash "$here/tick" "$@"
+# A self-update that cannot be done leaves the tick to go on as it is. One move a tick: the
+# tick that runs again after it moves nothing.
+moved=${SHIPLINE_TICK_MOVED:-}
+unset SHIPLINE_TICK_MOVED
+python3 -B "$here/self_update.py" start "$$" ${moved:+moved}
+if (($? == 10)) && [[ -z $moved ]]; then
+  SHIPLINE_TICK_MOVED=1 exec bash "$here/tick" "$@"
 fi
 # Set when this tick only found the one before it still running: it counts neither way.
 tick_skipped=""
@@ -92,6 +94,10 @@ tick_ended() {
   python3 -B "$here/self_update.py" end "$$" "$1" $tick_skipped 9>&- || true
 }
 trap 'tick_ended $?' EXIT
+# A tick that is stopped exits as stopped, not with the status of its last command.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 gh() { python3 "$here/github_budget.py" call tick "$@"; }
 source "$here/bridge-failed"
 # The repository, its check names, labels and state folder (`workflow_config.py`), read once.

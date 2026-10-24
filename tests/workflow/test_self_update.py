@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -257,7 +258,7 @@ def test_a_checkout_with_local_changes_is_left_alone_and_named_once(shipline: Sh
     assert shipline.head == shipline.first
     assert (shipline.home / "VERSION").read_text() == "mine\n"
     assert shipline.notices() == [
-        f"shipline not updated: its checkout {shipline.home} has local changes"
+        "shipline not updated: its checkout has local changes"
     ]
 
 
@@ -272,7 +273,7 @@ def test_a_checkout_with_commits_of_its_own_is_left_alone(shipline: Shipline) ->
 
     assert shipline.head == own
     assert shipline.notices() == [
-        f"shipline not updated: its checkout {shipline.home} has local changes"
+        "shipline not updated: its checkout has local changes"
     ]
 
 
@@ -385,6 +386,11 @@ def test_three_crashed_merge_gate_runs_in_a_row_roll_back(shipline: Shipline) ->
     _gate(shipline, 2, "")
     _gate(shipline, 1, "merge refused: git push origin timed out after 600s\n")
     _gate(shipline, 0, "")
+    _gate(shipline, 1, _TRACEBACK)
+    _gate(shipline, 1, "merge refused: gh pr merge 7 timed out after 600s\n")
+    # What the pull request's own checks printed rides on a refusal: still a refusal.
+    _gate(shipline, 1, "merge refused: pre-train checks failed:\n" + _TRACEBACK)
+    _gate(shipline, 1, "merge refused: pre-train checks failed:\ntest timed out after 30s\n")
     _gate(shipline, 1, _TRACEBACK)
     _gate(shipline, 1, "merge refused: gh pr merge 7 timed out after 600s\n")
     assert shipline.tick() == 0
@@ -641,3 +647,164 @@ def test_the_merge_driver_counts_a_crash_of_the_gate_it_ran(workflow: Workflow) 
     trial = json.loads((home / ".local" / "shipline" / "trial.json").read_text())
     assert trial["gate_failures"] == 1
     assert trial["last_gate"] == "KeyError: 'head'"
+
+
+def test_the_reason_of_a_roll_back_is_one_short_line(shipline: Shipline) -> None:
+    shipline.good()
+    shipline.land()
+    shipline.later(10)
+    shipline.tick()
+    for _ in range(3):
+        _gate(shipline, 1, "Traceback (most recent call last):\nValueError: " + "x\x1b" * 400)
+
+    assert shipline.tick() == _MOVED
+
+    [line] = shipline.notices()
+    assert line.endswith("(last: ValueError: " + "x" * 185 + "...)")
+    assert "\x1b" not in line
+
+
+def test_a_tick_that_already_moved_does_not_move_again(shipline: Shipline) -> None:
+    shipline.good()
+    bad = shipline.land()
+    shipline.later(10)
+    for _ in range(3):
+        shipline.tick(code=1)
+    pid = str(os.getpid())
+    assert shipline.run("start", pid).returncode == _MOVED
+    shipline.land()
+    shipline.later(10)
+
+    # The tick runs again as the version it moved to, which moves nothing in this tick.
+    again = shipline.run("start", pid, "moved")
+
+    assert again.returncode == 0, again.stderr
+    assert shipline.head == shipline.first != bad
+    assert (shipline.notes / "runs" / pid).read_text().split()[0] == shipline.first
+
+
+def test_nothing_moves_while_another_tick_runs_from_the_checkout(shipline: Shipline) -> None:
+    shipline.good()
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        assert shipline.run("start", str(other.pid)).returncode == 0
+        landed = shipline.land()
+        shipline.later(10)
+        assert shipline.tick() == 0
+        assert shipline.head == shipline.first
+    finally:
+        other.kill()
+        other.wait()
+    assert shipline.run("end", str(other.pid), "0").returncode == 0
+    shipline.later(10)
+
+    assert shipline.tick() == _MOVED
+    assert shipline.head == landed
+
+
+def test_a_run_whose_pid_was_taken_by_another_process_counts_as_failed(
+    shipline: Shipline,
+) -> None:
+    shipline.good()
+    bad = shipline.land()
+    shipline.later(10)
+    shipline.tick()
+    # A tick ended without its end, and its pid now belongs to a process that is no tick.
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        (shipline.notes / "runs" / str(other.pid)).write_text(f"{bad} 1\n")
+
+        shipline.tick()
+
+        # Its failure set the count back: only this tick's pass is counted since.
+        trial = json.loads((shipline.notes / "trial.json").read_text())
+        assert trial["ticks"] == 1
+        assert trial["last_tick"] == "it ended without its end"
+        assert not (shipline.notes / "runs" / str(other.pid)).exists()
+    finally:
+        other.kill()
+        other.wait()
+
+
+def test_an_update_before_any_version_is_good_goes_back_to_the_commit_it_came_from(
+    shipline: Shipline,
+) -> None:
+    shipline.tick()
+    bad = shipline.land()
+    shipline.later(10)
+    for _ in range(3):
+        shipline.tick(code=1)
+
+    assert shipline.tick() == _MOVED
+
+    assert shipline.head == shipline.first
+    assert shipline.notices()[0].startswith(f"shipline rolled back: {bad} -> {shipline.first}, ")
+
+
+def test_a_checkout_inside_another_repository_is_left_alone(shipline: Shipline) -> None:
+    # A Shipline copy that is no checkout of its own, in a repository that tracks a folder above.
+    outer = shipline.root / "outer"
+    outer.mkdir()
+    _git(outer, shipline.env, "init", "--quiet", "--initial-branch=main")
+    _git(outer, shipline.env, "remote", "add", "origin", _URL)
+    copy = outer / "shipline"
+    shutil.copytree(shipline.home, copy, ignore=shutil.ignore_patterns(".git"))
+    _git(outer, shipline.env, "add", "-A")
+    _git(outer, shipline.env, "commit", "--quiet", "-m", "chore: copy")
+
+    done = subprocess.run(
+        ["python3", "-B", str(copy / "scripts" / "workflow" / "self_update.py"), "start", "1"],
+        cwd=shipline.repo,
+        env=shipline.env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert not (copy / ".local").exists()
+
+
+def test_git_variables_of_the_caller_do_not_turn_it_on_another_repository(
+    shipline: Shipline,
+) -> None:
+    shipline.good()
+    landed = shipline.land()
+    shipline.later(10)
+    elsewhere = {"GIT_DIR": str(shipline.repo / ".git"), "GIT_WORK_TREE": str(shipline.repo)}
+
+    assert shipline.tick(env=elsewhere) == _MOVED
+
+    assert shipline.head == landed
+    assert _git(shipline.repo, shipline.env, "log", "--oneline", "--all") == ""
+
+
+def test_a_tick_stopped_by_a_signal_counts_as_failed(workflow: Workflow) -> None:
+    home, _ = _harness_shipline(workflow, "in_progress -")
+    # The tick is stopped while it waits for the sessions to be listed.
+    workflow.fake("tmux", "#!/bin/bash\n/bin/sleep 30\n")
+    env = {**workflow.env, "SHIPLINE_REPO": str(workflow.repo)}
+    runs = home / ".local" / "shipline" / "runs"
+    tick = subprocess.Popen(
+        ["bash", str(home / "bin" / "shipline"), "tick"],
+        cwd=workflow.repo,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not (runs / str(tick.pid)).exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        time.sleep(0.5)
+        tick.terminate()
+        assert tick.wait(timeout=60) == 143
+    finally:
+        tick.kill()
+        subprocess.run(["pkill", "-f", "/bin/sleep 30"], check=False)
+
+    trial = json.loads((home / ".local" / "shipline" / "trial.json").read_text())
+    assert trial["tick_failures"] == 1
+    assert trial["last_tick"] == "exit 143"
