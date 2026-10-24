@@ -31,21 +31,41 @@ if [[ -e $settings ]]; then
   ((indent > 0)) || indent=2
   # shellcheck disable=SC2016  # the dollars belong to jq
   after=$(jq --indent "$indent" --argjson replaced "$replaced" '
+    def command: if type == "object" and (.command | type) == "string" then .command else "" end;
     # A hook of exactly the shape `install-hooks` writes, whatever checkouts it names.
     def is_shipline:
-      (.command // "") | test("^bash ([^;&|\\\\ ]|\\\\.)+/bin/shipline --repo ([^;&|\\\\ ]|\\\\.)+ notify 2>/dev/null \\|\\| true$");
+      command | test("^bash ([^;&|\\\\ ]|\\\\.)+/bin/shipline --repo ([^;&|\\\\ ]|\\\\.)+ notify 2>/dev/null \\|\\| true$");
+    # A hook of the shape written when the scripts were in the repository.
+    def held:
+      command | test("^bash ([^;&|\\\\]|\\\\.)*/scripts/workflow/notify 2>/dev/null \\|\\| true$");
+    def hooks_of: if type == "object" and (.hooks | type) == "array" then .hooks else [] end;
+    def has_shipline: any(hooks_of[]; is_shipline);
+    # The groups of one event, the hooks of Shipline out. The hook they replaced goes back in place of
+    # the first, under the same matcher, unless the event already runs one of that shape: one
+    # notify hook an event. A group left empty by this goes; the others stay as they are.
+    def restore($kept):
+      reduce .[] as $group ({groups: [], done: ($kept == null or any(.[]; any(hooks_of[]; held)))};
+        if ($group | has_shipline) then
+          (reduce $group.hooks[] as $hook ({hooks: [], done: .done};
+            if ($hook | is_shipline) then
+              if (.done | not) and $kept.matcher == ($group.matcher // "") then
+                {hooks: (.hooks + [$kept.hook]), done: true}
+              else . end
+            else .hooks += [$hook] end)) as $out
+          | .done = $out.done
+          | if ($out.hooks | length) > 0 then .groups += [$group | .hooks = $out.hooks] else . end
+        else .groups += [$group] end)
+      | .groups;
     if (.hooks | type) != "object" then . else
-      .hooks |= with_entries(
-        .key as $event
-        | .value |= (
-            map((.matcher // "") as $matcher
-              | .hooks |= map(
-                  if is_shipline then
-                    ($replaced[$event] | select(. != null and .matcher == $matcher) | .hook) // empty
-                  else . end))
-            | map(select((.hooks | length) > 0))))
-      | .hooks |= with_entries(select(.value | length > 0))
-      | if .hooks == {} then del(.hooks) else . end
+      (.hooks | length) as $had
+      | .hooks |= (to_entries
+          | map(.key as $event
+              | if (.value | type) == "array" and any(.value[]; has_shipline) then
+                  (.value | restore($replaced[$event])) as $groups
+                  | if $groups == [] then empty else .value = $groups end
+                else . end)
+          | from_entries)
+      | if $had > 0 and .hooks == {} then del(.hooks) else . end
     end' <<<"$before")
   if [[ $(jq -S . <<<"$after") != "$(jq -S . <<<"$before")" ]]; then
     # Written through the file's own name, so a settings file that is a link stays one.
