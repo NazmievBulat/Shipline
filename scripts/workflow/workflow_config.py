@@ -732,7 +732,7 @@ def shell(config: Config, *, posix: bool = False) -> str:
     areas = config.hunts.areas
     lines.append(listed("SHIPLINE_HUNT_AREAS", areas))
     lines.append(listed("SHIPLINE_HUNT_SCREENS", (", ".join(paths) for paths in areas.values())))
-    # Each command as an array of its words, empty when the repository has none.
+    # Each command as its words, empty when the repository has none.
     for name in RUN_AS_WORDS:
         lines.append(listed(f"SHIPLINE_COMMAND_{name.upper()}", config.command(name) or []))
     # The main checkout, exported: every program the script starts works on the same repository,

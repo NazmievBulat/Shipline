@@ -137,4 +137,10 @@ def slots(
 
 
 if __name__ == "__main__":
-    print(slots(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]))
+    if len(sys.argv) < 5:
+        # A supervisor of an earlier install, still running while install.sh builds the images,
+        # names no label: without it no run can be counted, so every slot is kept.
+        print("Home slot budget unavailable: no pool label given", file=sys.stderr)
+        print(int(sys.argv[1]))
+    else:
+        print(slots(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]))
