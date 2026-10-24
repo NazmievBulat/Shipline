@@ -1,7 +1,7 @@
 """CI runs every test file in exactly one of its shards, on GitHub's own runners, and its last job,
 `CI`, passes only when every job that ran passed. It writes the merge gate's notes with
 `ci_proof.py`, as the example CI of a repository using Shipline does (examples/ci.yml). A draft
-pull request runs none of its own jobs."""
+pull request runs none of the jobs of either."""
 
 import importlib
 import json
@@ -98,21 +98,14 @@ _EVERY_JOB_PASSED = """\
 
 
 @pytest.mark.parametrize(
-    "path,job,name,condition",
-    [
-        (_CI, "ci", "CI", f"always() && ({_NOT_A_DRAFT})"),
-        (_EXAMPLE, "result", "CI result", "always()"),
-    ],
-    ids=["own", "example"],
+    "path,job,name", [(_CI, "ci", "CI"), (_EXAMPLE, "result", "CI result")], ids=["own", "example"]
 )
-def test_the_summing_up_check_needs_every_job(
-    path: Path, job: str, name: str, condition: str
-) -> None:
+def test_the_summing_up_check_needs_every_job(path: Path, job: str, name: str) -> None:
     text = _job(path, job)
 
     assert re.search(rf"^    name: {name}$", text, re.M)
     assert re.search(r"^    needs: \[plan, tests\]$", text, re.M)
-    assert _condition(text) == condition
+    assert _condition(text) == f"always() && ({_NOT_A_DRAFT})"
     assert _EVERY_JOB_PASSED in text
 
 
@@ -147,22 +140,13 @@ def test_the_planner_writes_the_gate_s_notes_and_main_s_inheritance(path: Path) 
 _NOT_INHERITED = "!contains(fromJSON(needs.plan.outputs.inherited), 'CI: server tests')"
 
 
-@pytest.mark.parametrize(
-    "path,condition",
-    [
-        (_CI, f"${{{{ ({_NOT_A_DRAFT}) && {_NOT_INHERITED} }}}}"),
-        (_EXAMPLE, f"${{{{ {_NOT_INHERITED} }}}}"),
-    ],
-    ids=["own", "example"],
-)
-def test_the_test_job_runs_the_config_s_command_unless_main_inherited_it(
-    path: Path, condition: str
-) -> None:
+@pytest.mark.parametrize("path", [_CI, _EXAMPLE], ids=["own", "example"])
+def test_the_test_job_runs_the_config_s_command_unless_main_inherited_it(path: Path) -> None:
     tests = _job(path, "tests")
 
     assert re.search(r'^    name: "CI: server tests[" (]', tests, re.M)
     assert re.search(r"^    needs: plan$", tests, re.M)
-    assert _condition(tests) == condition
+    assert _condition(tests) == f"${{{{ ({_NOT_A_DRAFT}) && {_NOT_INHERITED} }}}}"
     assert "python3 scripts/workflow/ci_proof.py test" in tests
 
 
@@ -177,7 +161,12 @@ def test_the_example_s_jobs_carry_the_config_s_default_names() -> None:
     names = re.findall(r"^    name: (.+)$", text, re.M)
 
     assert names == ['"CI: what to run"', '"CI: server tests"', "CI result"]
-    assert re.search(r"^  pull_request:\n  push:\n    branches: \[main\]\n", text, re.M)
+    assert re.search(
+        r"^  pull_request:\n    types: \[opened, synchronize, reopened, ready_for_review\]\n"
+        r"  push:\n    branches: \[main\]\n",
+        text,
+        re.M,
+    )
     assert re.search(r"^  workflow_dispatch:$", text, re.M)
     assert "pull_request_target" not in text
     assert re.search(r"^permissions:\n  contents: read$", text, re.M)
@@ -218,12 +207,15 @@ def test_a_folded_condition_is_read_on_one_line() -> None:
     assert _condition("  ci:\n    steps:\n      - if: never\n") is None
 
 
-def test_every_job_is_skipped_while_the_pull_request_is_a_draft() -> None:
+@pytest.mark.parametrize(
+    "path,result", [(_CI, "ci"), (_EXAMPLE, "result")], ids=["own", "example"]
+)
+def test_every_job_is_skipped_while_the_pull_request_is_a_draft(path: Path, result: str) -> None:
     """A draft's run ends at once and takes no runner for the tests; marking the pull request
     ready (`ready_for_review`) starts its run on the current head."""
-    jobs = {job: _condition(_job(_CI, job)) for job in _jobs(_CI)}
+    jobs = {job: _condition(_job(path, job)) for job in _jobs(path)}
 
-    assert sorted(jobs) == ["ci", "plan", "tests"]
+    assert sorted(jobs) == sorted(["plan", "tests", result])
     assert jobs["plan"] == _NOT_A_DRAFT
     assert all(condition and f"({_NOT_A_DRAFT})" in condition for job, condition in jobs.items()
                if job != "plan")
@@ -237,11 +229,12 @@ def test_main_s_push_and_the_merge_queue_are_not_filtered() -> None:
     assert re.search(r"^  push:\n    branches: \[main\]\n  merge_group:\n\n", triggers, re.M)
 
 
-def test_a_draft_s_run_never_cancels_a_ready_run() -> None:
+@pytest.mark.parametrize("path", [_CI, _EXAMPLE], ids=["own", "example"])
+def test_a_draft_s_run_never_cancels_a_ready_run(path: Path) -> None:
     """A last push to a draft and its marking ready come moments apart: were the draft's run
     queued second in the same group, it would cancel the ready run and leave the head with no CI.
     A draft's runs have a group of their own; a newer push still cancels an older run."""
-    text = _CI.read_text()
+    text = path.read_text()
     group = re.search(r"^concurrency:\n  group: (.+)\n  cancel-in-progress: (.+)$", text, re.M)
 
     assert group
