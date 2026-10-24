@@ -1,0 +1,4 @@
+{
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "<task-notification>\n<task-id>await-turn</task-id>\n<status>completed</status>\n<summary>The await_turn call completed</summary>\n</task-notification>"
+}
