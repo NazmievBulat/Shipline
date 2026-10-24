@@ -80,8 +80,10 @@ def mechanical_conflicts() -> ModuleType | None:
     return rules
 
 
-# How many of its last lines a failed push is refused with, when the repository words no refusal.
+# How many of its last lines a failed push is refused with when the repository words no refusal;
+# a push that outlasted its deadline keeps twice as many.
 REFUSAL_LINES = 10
+TIMEOUT_REFUSAL_LINES = 20
 
 CONFIG = workflow_config.current()
 REPOSITORY = CONFIG.repository
@@ -153,6 +155,16 @@ class Refused(Exception):
     """Missing evidence is a refusal, never permission to merge."""
 
 
+class TimedOut(Refused):
+    """A command outlasted its deadline and was stopped."""
+
+    def __init__(self, message: str, output: str, timeout: float) -> None:
+        super().__init__(message)
+        # What it printed before it was stopped, and the deadline it outlasted.
+        self.output = output
+        self.timeout = timeout
+
+
 class Waiting(Refused):
     """An expected wait which the tick may retry without a reviewer."""
 
@@ -188,7 +200,7 @@ def command(
             errors=errors,
         )
     except CommandTimeout as error:
-        raise Refused(str(error)) from error
+        raise TimedOut(str(error), error.output, COMMAND_TIMEOUT) from error
     if done.returncode == 75 and os.environ.get("WORKFLOW_BACKGROUND_GITHUB") == "1":
         raise BudgetWaiting(done.stderr.strip())
     if check and done.returncode:
@@ -245,6 +257,8 @@ class Pushed:
     output: str
     # The hook's step that failed and its last lines, when the push failed.
     refusal: str
+    # Whether the push outlasted its deadline; `output` is what it printed before it was stopped.
+    timed_out: bool = False
 
 
 def push(*args: str, where: Path | None = None) -> Pushed:
@@ -260,20 +274,26 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         raise PackagesWaiting(failed)
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
     merged = ("env", "EIO_BACKEND=posix", "sh", "-c", 'exec "$@" 2>&1', "push", *git_args)
-    done = command(*merged, check=False)
-    if done.returncode and short_of_memory(done.stdout):
+    done, timeout = _push_once(merged)
+    if done.returncode and timeout is None and short_of_memory(done.stdout):
         command("sleep", str(PUSH_RETRY_SECONDS))
-        done = command(*merged, check=False)
+        done, timeout = _push_once(merged)
     output = done.stdout
     pushed = Pushed(
         done.returncode,
         output,
-        push_failure(output, checkout) if done.returncode else "",
+        push_failure(output, checkout, timeout) if done.returncode else "",
+        timeout is not None,
     )
     if advisory_service is None:
         return pushed
     folder = main_checkout() / CONFIG.state_folder
-    service = advisory_service.unreachable(output) if pushed.returncode else None
+    # A scan stopped at the deadline never concluded that a service was out.
+    service = (
+        advisory_service.unreachable(output)
+        if pushed.returncode and not pushed.timed_out
+        else None
+    )
     if service:
         folder.mkdir(parents=True, exist_ok=True)
         advisory_service.note_down(folder, service)
@@ -286,15 +306,28 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     return pushed
 
 
-def push_failure(output: str, checkout: Path) -> str:
-    """What a failed push says, led by the scan's memory error when it ran short.
+def _push_once(merged: tuple[str, ...]) -> tuple[subprocess.CompletedProcess[str], float | None]:
+    """The push, and the deadline it outlasted, if it did: then it failed with what it printed."""
+    try:
+        return command(*merged, check=False), None
+    except TimedOut as error:
+        # 124, as `timeout` reports a command it stopped.
+        return subprocess.CompletedProcess(merged, 124, error.output, ""), error.timeout
 
-    The first line is all the wake and a hand-back show, so a shortage is named there, before
-    the hook's step that failed and its last lines."""
+
+def push_failure(output: str, checkout: Path, timeout: float | None = None) -> str:
+    """What a failed push says, led by the deadline it outlasted, or by the scan's memory error
+    when it ran short.
+
+    The first line is all the wake and a hand-back show, so a timeout or a shortage is named
+    there, before the hook's step that failed, or was running, and its last lines."""
     if pushing_checkout:
         refusal = pushing_checkout.refusal(output, checkout)
     else:
-        refusal = "\n".join([line for line in output.splitlines() if line.strip()][-REFUSAL_LINES:])
+        lines = REFUSAL_LINES if timeout is None else TIMEOUT_REFUSAL_LINES
+        refusal = "\n".join([line for line in output.splitlines() if line.strip()][-lines:])
+    if timeout is not None:
+        return "\n".join(filter(None, [f"git push timed out after {timeout:g}s", refusal]))
     shortage = next(
         (line.strip() for line in output.splitlines() if short_of_memory(line)),
         None,
@@ -432,6 +465,51 @@ def main_image_runs(head: str, recent: MainImages) -> list[dict[str, Any]]:
 
 def jobs(run: dict[str, Any]) -> list[dict[str, Any]]:
     return checks(api(f"{API}/actions/runs/{run['id']}/jobs?per_page=100", "jobs"))
+
+
+def carried(job: dict[str, Any]) -> bool:
+    """Whether GitHub carried this job into its attempt from an earlier one, without running it.
+
+    A re-run of only the failed jobs lists each job that passed before as a copy in the new
+    attempt: a new ID, the new attempt's `run_attempt`, no notes, and the `started_at` and
+    `completed_at` of the attempt it ran in, but the `created_at` of the re-run. A job that ran
+    in its attempt started after it was created.
+    """
+    started, created = _seconds(job.get("started_at")), _seconds(job.get("created_at"))
+    return started is not None and created is not None and started < created
+
+
+def job_notes(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """The notes of a job, from the attempt of its run where it ran.
+
+    A job carried into a re-run has no notes of its own. Its notes are those of the copy, in an
+    earlier attempt of the same run, with the same name, head and times, that passed and ran
+    there; a job carried by two re-runs has a carried copy in the attempt between. A job that
+    ran in its own attempt has only its own notes, however few.
+    """
+    notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+    attempt, run, head = job.get("run_attempt"), job.get("run_id"), job.get("head_sha")
+    if (
+        notes
+        or job.get("conclusion") != "success"
+        or not carried(job)
+        or not isinstance(attempt, int)
+        or run is None
+        or not head
+    ):
+        return notes
+    for earlier in range(attempt - 1, 0, -1):
+        for copy in api(f"{API}/actions/runs/{run}/attempts/{earlier}/jobs?per_page=100", "jobs"):
+            if (
+                copy.get("name") == job["name"]
+                and copy.get("head_sha") == head
+                and copy.get("conclusion") == "success"
+                and copy.get("started_at") == job.get("started_at")
+                and copy.get("completed_at") == job.get("completed_at")
+                and not carried(copy)
+            ):
+                return api(f"{API}/check-runs/{copy['id']}/annotations?per_page=100")
+    return []
 
 
 # A CI job that runs in parts is named with its part by GitHub, "CI: server tests (1 of 2)", and with
@@ -1087,7 +1165,7 @@ def strict_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     strict: list[dict[str, Any]] = []
     for job in parts:
         if job["name"] == "CI: dependencies" and job.get("conclusion") == "success":
-            notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+            notes = job_notes(job)
             if any(note.get("title") == "Advisory on main" for note in notes):
                 job = {**job, "conclusion": "passed over an advisory on main"}
         strict.append(job)
@@ -1214,7 +1292,7 @@ def main_images_needed(head: str, ci: list[dict[str, Any]]) -> bool:
         for job in jobs(push):
             if job["name"] != CI_PLAN:
                 continue
-            notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+            notes = job_notes(job)
             before = next(
                 (note["message"].strip() for note in notes if note.get("title") == "Push base"),
                 None,
@@ -1415,12 +1493,9 @@ def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> 
         job["name"] == "playwright" and job.get("conclusion") == "success" for job in parts
     ):
         return False
-    planner = next(job for job in parts if job["name"] == E2E_PLAN)
-    notes = {
-        (note.get("title"), note["message"].strip())
-        for note in api(f"{API}/check-runs/{planner['id']}/annotations?per_page=100")
-    }
-    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= notes
+    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= _planner_notes(
+        parts, E2E_PLAN
+    )
 
 
 def inherited_image_jobs(
@@ -1464,10 +1539,7 @@ def inherited_image_jobs(
 
 def _planner_notes(parts: list[dict[str, Any]], plan: str) -> set[tuple[Any, str]]:
     planner = next(job for job in parts if job["name"] == plan)
-    return {
-        (note.get("title"), note["message"].strip())
-        for note in api(f"{API}/check-runs/{planner['id']}/annotations?per_page=100")
-    }
+    return {(note.get("title"), note["message"].strip()) for note in job_notes(planner)}
 
 
 def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
@@ -1506,8 +1578,7 @@ def tested_merge(parts: list[dict[str, Any]], base: str, head: str) -> str | Non
     for job in parts:
         if job["name"] != CI_PLAN:
             continue
-        notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
-        for note in notes:
+        for note in job_notes(job):
             if note.get("title") != NOTES.merge_tested:
                 continue
             merge = note["message"].strip()
@@ -1657,17 +1728,21 @@ def _seconds(stamp: Any) -> float | None:
 
 
 def lost_check(
-    pull: dict[str, Any], known: list[dict[str, Any]] | None = None
+    pull: dict[str, Any],
+    known: list[dict[str, Any]] | None = None,
+    read: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """A check the rollup lists as queued or running whose workflow run completed at least
     LOST_AFTER_SECONDS ago, when every check not passing is lost so: a check still running for
     real may yet fail, and is waited for first. Each read run costs a request from the shared
     budget, so a check that started less than that ago ends the search: its run cannot have
-    completed so long ago.
+    completed so long ago. `read` reads a run by its id; the tick passes one that keeps each
+    answer for the rest of the tick.
     """
     now = float(os.environ.get("WORKFLOW_NOW") or time.time())
     seen = {str(run["id"]): run for run in known or []}
-    found = []
+    # Every check that cannot be lost is ruled out before any run is read.
+    waiting = []
     for check in pull["statusCheckRollup"]:
         if _passing_check(check):
             continue
@@ -1677,9 +1752,12 @@ def lost_check(
         started = _seconds(check.get("startedAt"))
         if not match or (started is not None and now - started < LOST_AFTER_SECONDS):
             return None
-        if match[1] not in seen:
-            seen[match[1]] = api(f"{API}/actions/runs/{match[1]}", paginate=False)
-        run = seen[match[1]]
+        waiting.append((check, match[1]))
+    found = []
+    for check, run_id in waiting:
+        if run_id not in seen:
+            seen[run_id] = (read or read_run)(run_id)
+        run = seen[run_id]
         finished = _seconds(run.get("updated_at"))
         if (
             run.get("status") != "completed"
@@ -1690,12 +1768,16 @@ def lost_check(
         found.append(
             {
                 "check": check.get("name", "unknown"),
-                "run": int(match[1]),
+                "run": int(run_id),
                 "conclusion": run.get("conclusion"),
             }
         )
     # A failed run's check is named first: it is a failure, never pushed for.
     return min(found, key=lambda lost: lost["conclusion"] == "success", default=None)
+
+
+def read_run(run: str) -> dict[str, Any]:
+    return api(f"{API}/actions/runs/{run}", paginate=False)
 
 
 def note_lost(folder: Path, number: str, head: str, lost: dict[str, Any]) -> None:
@@ -1879,7 +1961,7 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
             return False
         tree = api(f"{API}/git/commits/{merge}")["tree"]["sha"]
         plan = next(job for job in image_jobs if job["name"] == IMAGES_PLAN)
-        notes = api(f"{API}/check-runs/{plan['id']}/annotations?per_page=100")
+        notes = job_notes(plan)
         if not any(
             note.get("title") == NOTES.files_tested and note["message"].strip() == tree
             for note in notes
@@ -2109,10 +2191,10 @@ class Train:
             base = git("ls-remote", "origin", "refs/heads/main").split()[0]
             train_reads.save(context / "main.json", {"head": base})
 
-        def signature() -> str:
+        def inputs(queue: list[str]) -> list[Any]:
             # Local authorizations and owner questions can change while the tick runs.
             notes = []
-            for number in self.queue:
+            for number in queue:
                 root = CONFIG.state(
                     CONFIG.checkout_of(self.path.parent) / ".claude/worktrees" / f"ticket-{number}"
                 )
@@ -2126,15 +2208,16 @@ class Train:
                     self.path.parent / f"merge-review-{number}",
                 ]
                 notes += [(str(path), path.stat().st_mtime_ns) for path in paths if path.exists()]
+            return [
+                health.read_text() if health.exists() else "",
+                sorted(notes),
+                (context / "sessions").read_text(),
+            ]
+
+        def signature() -> str:
             return train_reads.digest(
-                [
-                    self.path.read_text() if self.path.exists() else "",
-                    base,
-                    health.read_text() if health.exists() else "",
-                    pulls,
-                    sorted(notes),
-                    (context / "sessions").read_text(),
-                ]
+                [self.path.read_text() if self.path.exists() else "", base, pulls]
+                + inputs(self.queue)
             )
 
         previous = train_reads.load(context / "reconciled.json")
@@ -2142,6 +2225,9 @@ class Train:
         if delegated and previous.get("signature") == signature():
             self.suite_states = previous["suite_states"]
             return
+        # The members the scan reads, blocked ones included.
+        queue = list(dict.fromkeys([*self.queue, *self.blocked]))
+        seen = inputs(queue)
         reads = train_reads.Reads(self.path.parent, base)
         _planning_reads = reads
         try:
@@ -2150,10 +2236,16 @@ class Train:
             reads.finish()
         finally:
             _planning_reads = None
+        # A note created or cleared while the scan ran may not be what it read: keep the
+        # result only for the inputs it saw, so the next reconcile computes it again. The key
+        # is taken first: a note changed after it leaves the key on the old note, a miss.
+        key = signature()
+        if inputs(queue) != seen:
+            return
         train_reads.save(
             context / "reconciled.json",
             {
-                "signature": signature(),
+                "signature": key,
                 "at": time.time(),
                 "suite_states": self.suite_states,
             },
@@ -3003,11 +3095,11 @@ def _push_scratch(
         pushed = push("origin", f"{record['head']}:refs/heads/{record['branch']}")
         if pushed.returncode:
             failure = pushed.refusal
-            output = pushed.output
+            # A push that keeps stalling ends the batch, whatever its scan printed first.
+            output = "" if pushed.timed_out else pushed.output
     except Waiting:
         raise
     except Refused as error:
-        # A push that outlasted its deadline failed like any other.
         failure = str(error)
     if failure is not None:
         reason = f"could not push {whose} scratch branch: " + failure
@@ -4104,7 +4196,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             image_plan = next(
                 job for job in image_jobs if job["name"] == IMAGES_PLAN
             )
-            image_notes = api(f"{API}/check-runs/{image_plan['id']}/annotations?per_page=100")
+            image_notes = job_notes(image_plan)
             if not any(
                 note.get("title") == NOTES.files_tested and note["message"].strip() == tree
                 for note in image_notes

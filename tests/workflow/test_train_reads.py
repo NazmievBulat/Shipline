@@ -13,7 +13,15 @@ from typing import Any
 
 import pytest
 from workflow.test_merge_driver import handed as handed_fixture
-from workflow.test_merge_when_current import GitHub, _hand_off, _handing_off, _waiting
+from workflow.test_merge_when_current import (
+    GitHub,
+    _hand_off,
+    _handing_off,
+    _refreshed_first,
+    _two_stale_pulls,
+    _waiting,
+    _waiting_reviewers,
+)
 from workflow.test_merge_when_current import github as github_fixture
 from workflow_harness import Workflow
 
@@ -248,6 +256,64 @@ def test_run_jobs_and_annotations_share_the_member_cache_across_ticks(
     assert calls == paths * 2
 
 
+def test_an_earlier_attempts_jobs_and_notes_share_the_member_cache_across_ticks(
+    reads_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    _snapshot(tmp_path)
+    api = reads_module.workflow_config.current().api
+    # A re-run of the failed jobs alone carried "CI: what to run" into attempt 2 without notes.
+    carried = f"{api}/check-runs/521/annotations?per_page=100"
+    paths = [
+        f"{api}/actions/workflows/ci.yml/runs?head_sha=abc&event=pull_request&per_page=100",
+        f"{api}/actions/runs/20/jobs?per_page=100",
+        carried,
+        f"{api}/actions/runs/20/attempts/1/jobs?per_page=100",
+        f"{api}/check-runs/21/annotations?per_page=100",
+    ]
+    # As GitHub lists them: the carried copy has attempt 2's number and creation, attempt 1's run.
+    ran = {"started_at": "2026-10-24T09:00:02Z", "completed_at": "2026-10-24T09:05:00Z"}
+    replies = [
+        [{"id": 20, "run_attempt": 2, "status": "completed", "conclusion": "success"}],
+        [
+            {
+                "id": 521,
+                "run_attempt": 2,
+                "created_at": "2026-10-24T10:00:00Z",
+                **ran,
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ],
+        [],
+        [
+            {
+                "id": 21,
+                "run_attempt": 1,
+                "created_at": "2026-10-24T09:00:00Z",
+                **ran,
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ],
+        [{"title": "Merge tested", "message": "merge"}],
+    ]
+    calls: list[str] = []
+
+    def read(path: str, reply: Any) -> Any:
+        calls.append(path)
+        return reply
+
+    for _ in range(2):
+        cache = reads_module.Reads(tmp_path, "main")
+        for path, reply in zip(paths, replies, strict=True):
+            assert cache.api(path, partial(read, path, reply)) == reply
+        cache.finish()
+        (tmp_path / "api.json").unlink()
+    # Only the carried job's empty notes are read again: they might not have been written yet.
+    assert calls == [*paths, carried]
+
+
 def test_a_gate_refresh_after_the_snapshot_keeps_its_advanced_handoff(handed: GitHub) -> None:
     workflow = handed.workflow
     env = _context(handed)
@@ -409,3 +475,48 @@ def test_the_tick_reads_the_members_a_handoff_left_unread(github: GitHub) -> Non
     assert done.returncode == 0, done.stdout + done.stderr
     assert (workflow.state / "merged").read_text() == "7"
     assert _waiting(workflow) == []
+
+
+@pytest.mark.parametrize("change", ["created", "cleared"])
+def test_an_owner_question_noted_during_the_scan_is_not_hidden_by_the_reconcile_cache(
+    github: GitHub,
+    change: str,
+) -> None:
+    second = _two_stale_pulls(github)
+    workflow = github.workflow
+    _waiting_reviewers(github)
+    assert github.run().returncode == 2
+    assert workflow.run_script("merge-when-current", "8", cwd=second).returncode == 3
+    _refreshed_first(github)
+    note = workflow.notes(7) / "review-7.owner-blocked"
+    if change == "cleared":
+        note.touch()
+    env = _context(github)
+    Path(env["WORKFLOW_SESSION_SNAPSHOT"]).write_text(workflow.run("list").stdout)
+    # The note changes after the scan read 7's availability, while it polls runs.
+    armed = workflow.state / "change-note"
+    armed.touch()
+    workflow.fake("gh-real", (workflow.bin / "gh").read_text())
+    action = f'rm -f "{note}"' if change == "cleared" else f'touch "{note}"'
+    workflow.fake(
+        "gh",
+        f'#!/bin/bash\nif [[ "$*" == *actions/runs* && -e "{armed}" ]]; then\n'
+        f'  rm "{armed}"; {action}\nfi\nexec "{workflow.bin / "gh-real"}" "$@"\n',
+    )
+
+    scanned = workflow.run_script("merge-when-current", "--train-status", env=env)
+    assert scanned.returncode == 0, scanned.stderr
+    assert not armed.exists()
+    again = workflow.run_script("merge-when-current", "--train-status", env=env)
+    assert again.returncode == 0, again.stderr
+    (Path(env["WORKFLOW_TRAIN_TICK"]) / "reconciled.json").unlink()
+    uncached = workflow.run_script("merge-when-current", "--train-status", env=env)
+    assert uncached.returncode == 0, uncached.stderr
+
+    assert json.loads(uncached.stdout)["first"] == ("8" if change == "created" else "7")
+    assert again.stdout == uncached.stdout
+    # Unchanged inputs still reuse the reconcile within the tick.
+    before = workflow.calls("gh")
+    reused = workflow.run_script("merge-when-current", "--train-status", env=env)
+    assert reused.stdout == uncached.stdout
+    assert workflow.calls("gh") == before
