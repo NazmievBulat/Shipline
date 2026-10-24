@@ -587,7 +587,8 @@ cmd_start() {
     if [[ $kind =~ ^(review|audit)$ ]]; then
       touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
       rm -f "$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-"* \
-        "$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-"* "$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-"*
+        "$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-"* "$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-"* \
+        "$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-"*
     fi
     save_link "$name" "$worktree"
     if [[ $kind == review ]]; then
