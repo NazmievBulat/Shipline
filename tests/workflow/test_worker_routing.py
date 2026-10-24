@@ -1,6 +1,9 @@
 """Codex provenance and the default program still route interface work to Claude."""
 
+import json
 import shlex
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from workflow_harness import Workflow
@@ -341,3 +344,140 @@ def test_the_line_does_not_override_the_claude_default(workflow: Workflow) -> No
     assert done.returncode == 0, done.stderr
     assert workflow.is_running("ticket-7")
     assert not workflow.is_running("codex-7")
+
+
+_NOW = 1792432800
+_BACKEND = "diff --git a/backend/tool.py b/backend/tool.py\n@@ -1 +1 @@\n-old\n+new\n"
+
+
+def _tick(workflow: Workflow, default: str):
+    """A tick under `default`, with room in the cloud's usage window."""
+    workflow.usage(20, datetime.fromtimestamp(_NOW + 7200, UTC).isoformat())
+    env = {"WORKFLOW_NOW": str(_NOW), "TZ": "UTC", "WORKFLOW_WORKER_PROGRAM": default}
+    return workflow.run_script("tick", env=env)
+
+
+def _record(workflow: Workflow, text: str, *markers: str) -> Path:
+    notes = workflow.repo / ".local/workflow"
+    notes.mkdir(parents=True, exist_ok=True)
+    for marker in markers:
+        (notes / f"{marker}-7").touch()
+    record = notes / "worker-program-7"
+    record.write_text(text)
+    return record
+
+
+def _started(workflow: Workflow) -> str:
+    if workflow.calls("tmux cloud-7 new-session"):
+        assert not workflow.is_running("ticket-7")
+        return "cloud"
+    assert workflow.is_running("ticket-7")
+    return "codex" if workflow.is_running("codex-7") else "claude"
+
+
+@pytest.mark.parametrize("default", ["claude", "codex", "cloud"])
+@pytest.mark.parametrize("recorded", ["cloud", "claude", "codex"])
+def test_a_ticket_s_recorded_program_overrides_the_default(
+    workflow: Workflow, default: str, recorded: str
+) -> None:
+    workflow.add_pull_request(7)
+    (workflow.state / "diff-7").write_text(_BACKEND)
+    _record(workflow, f"{recorded}\n")
+
+    done = _tick(workflow, default)
+
+    assert done.returncode == 0, done.stderr
+    assert _started(workflow) == recorded
+
+
+@pytest.mark.parametrize(
+    ("recorded", "markers"),
+    [
+        ("claude", ("codex-built",)),
+        ("claude", ("cloud-built",)),
+        ("codex", ("cloud-built",)),
+        ("cloud", ("codex-built",)),
+    ],
+)
+def test_a_recorded_program_overrides_a_fix_round_marker(
+    workflow: Workflow, recorded: str, markers: tuple[str, ...]
+) -> None:
+    workflow.add_pull_request(7)
+    (workflow.state / "diff-7").write_text(_BACKEND)
+    (workflow.state / "reviews-7.json").write_text(
+        '[{"body":"<!-- workflow-review round=1 result=sent-back --> Fix the backend"}]'
+    )
+    _record(workflow, recorded, *markers)
+
+    done = _tick(workflow, "claude")
+
+    assert done.returncode == 0, done.stderr
+    assert _started(workflow) == recorded
+
+
+@pytest.mark.parametrize("default", ["claude", "codex", "cloud"])
+@pytest.mark.parametrize("recorded", ["cloud", "codex"])
+def test_a_recorded_program_keeps_the_screen_exclusions(
+    workflow: Workflow, recorded: str, default: str
+) -> None:
+    workflow.add_pull_request(7)
+    (workflow.state / "diff-7").write_text(
+        "diff --git a/web/src/screen.tsx b/web/src/screen.tsx\n"
+        "--- a/screen.tsx\n+++ b/screen.tsx\n@@ -1 +1 @@\n"
+        "-<button>Old</button>\n+<button>New</button>\n"
+    )
+    _record(workflow, recorded)
+
+    done = _tick(workflow, default)
+
+    assert done.returncode == 0, done.stderr
+    assert _started(workflow) == "claude"
+
+
+_NO_PROGRAM = "worker-program-7 names no worker program (cloud, claude or codex); read as no record"
+
+
+def _named(workflow: Workflow) -> list[str]:
+    """The lines kept for the wake, with how often the wake log names the record."""
+    folder = workflow.repo / ".local/workflow"
+    lines = [
+        json.loads(note.read_text())["line"]
+        for note in sorted(folder.glob("stuck.*/worker-program-7-*.json"))
+    ]
+    log = workflow.wake_log.read_text() if workflow.wake_log.exists() else ""
+    # The tick's own entries; the wake's entries quote what it could not deliver.
+    assert log.splitlines().count(f"{_NOW} {_NO_PROGRAM}") == len(lines)
+    return lines
+
+
+@pytest.mark.parametrize("text", ["", "\n", "local\n", "cloud codex\n", "cloud\nclaude\n"])
+@pytest.mark.parametrize("default", ["claude", "codex", "cloud"])
+def test_a_record_naming_no_program_is_read_as_no_record(
+    workflow: Workflow, text: str, default: str
+) -> None:
+    workflow.add_pull_request(7)
+    (workflow.state / "diff-7").write_text(_BACKEND)
+    _record(workflow, text)
+
+    done = _tick(workflow, default)
+
+    assert done.returncode == 0, done.stderr
+    assert _started(workflow) == default
+    assert _named(workflow) == [_NO_PROGRAM]
+
+
+def test_a_record_naming_no_program_is_named_once_for_what_it_holds(workflow: Workflow) -> None:
+    """A start held for memory reads the record of the ticket behind it on every tick."""
+    workflow.add_pull_request(6)
+    workflow.add_pull_request(7)
+    record = _record(workflow, "local\n")
+    workflow.pressure_file.write_text("some avg10=99.00 avg60=99.00 avg300=99.00 total=0\n")
+
+    for _ in range(2):
+        _tick(workflow, "claude")
+    assert _named(workflow) == [_NO_PROGRAM]
+    record.write_text("remote\n")
+    _tick(workflow, "claude")
+
+    assert _named(workflow) == [_NO_PROGRAM] * 2
+    assert not workflow.is_running("ticket-7")

@@ -35,9 +35,16 @@
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app-runner"
   },
-  "cloud_wake_after_minutes": 45,
-  "answer_for_owner_after_minutes": 15,
+  "hunts": {
+    "areas": {
+      "phone": ["/calls", "/contacts"],
+      "billing": ["/invoices", "/settings/billing"]
+    },
+    "plans": "docs/hunt-plans.md"
+  },
   "commands": {
     "test": "tools/run-tests"
-  }
+  },
+  "cloud_wake_after_minutes": 45,
+  "answer_for_owner_after_minutes": 15
 }
