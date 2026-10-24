@@ -96,6 +96,13 @@ anything else; `priority: low` only when the owner says so. A pull request witho
 as medium, and one with several as the most urgent of them. The fix of a red main, an advisory's
 update included, counts as a blocker whatever its label, and goes before every other blocker.
 
+The gate's entry point is `scripts/workflow/merge_gate.py`, which re-exports its names.
+Its parts live beside it: `merge_github.py` handles commands and GitHub reads;
+`merge_checks.py` judges CI evidence; `merge_health.py` judges main and advisory outages;
+`merge_images.py` reads image runs and path filters; `merge_squash.py` prepares squashes;
+`merge_scratch.py` manages scratch runs and prefixes; `merge_train.py` owns the saved line
+and its order and status.
+
 Ready pull requests merge in queue order, in a merge train: by priority first (blocker, high,
 medium, low), then in the order they joined within one priority. Members of one priority whose
 changes touch the same hot path that `shipline.json` names (`hot_paths`) are served back to
