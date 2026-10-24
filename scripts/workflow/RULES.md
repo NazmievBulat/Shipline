@@ -51,10 +51,13 @@ pull request whose fresh CI on that same main ran and passed every check failing
 is the fix (a skipped check does not count). An advisory on main is not a red main: when main's
 dependency audit (`checks.dependency_audit` in `shipline.json`) is its only failed check, its
 other checks passed, and the audit's notice (`checks.advisory_annotation`) names advisories
-alone, main is `advisory`, merging goes on, and the update that fixes the advisory counts as the fix of a red main. A failure of
-the audit for any other reason, a lock file it cannot audit or a tool error, leaves main red. A
-pull request's own audit still refuses an advisory main does not have, and passes over one main
-has, with a warning. After a squash, main inherits the green result
+alone, main is `advisory`, merging goes on, and the update that fixes the advisory counts as the
+fix of a red main once its latest CI passed with its own audit clean, whatever main that CI
+tested; its merge is verified as any other's. The pending of each merge on an advisory main does
+not end that state. A failure of the audit for any other reason, a lock file it cannot audit, a
+tool error or an advisory service that did not answer, leaves main red. A pull request's own
+audit still refuses an advisory main does not have, and passes over one main has, with a
+warning. After a squash, main inherits the green result
 of the identical tree tested by the pull request CI for each CI job that run passed, and
 images when every image job passed on that same tree; the gate records the source runs. A CI
 job the pull request skipped, which main always runs, waits for main's own success, and

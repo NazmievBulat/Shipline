@@ -625,7 +625,11 @@ def advisories_only(parts: list[dict[str, Any]]) -> list[str]:
     if {job["name"] for job in failed} - {CI_RESULT} != {DEPENDENCIES}:
         return []
     job = next(job for job in failed if job["name"] == DEPENDENCIES)
-    for note in api(f"{API}/check-runs/{job['id']}/annotations?per_page=100"):
+    notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+    # An advisory service that did not answer left a lock file unaudited: not advisories alone.
+    if advisory_service and any(note.get("title") == advisory_service.ANNOTATION for note in notes):
+        return []
+    for note in notes:
         if note.get("title") != ADVISORIES_ONLY:
             continue
         # A JSON list of "<advisory> in <package> (<summary>)". The runner undoes the escapes of
@@ -1238,15 +1242,20 @@ def publish(folder: Path, health: Health) -> None:
         temporary = output.name
     os.replace(temporary, target)
     # Every merge passes through pending to green; only a red, advisory or unreadable main, and
-    # the change out of it, is worth waking the orchestrator for.
-    before, after = (state_of(text) for text in (old, line))
+    # the change out of it, is worth waking the orchestrator for. Each merge on an advisory main
+    # passes through pending too: main stays advisory, remembered, until it is green, red or
+    # unknown again.
+    remembered = folder / "main-advisory"
+    before, after = (
+        "advisory" if state == "pending" and remembered.exists() else state
+        for state in (state_of(old), state_of(line))
+    )
+    if health.state == "advisory":
+        remembered.touch()
+    elif health.state != "pending":
+        remembered.unlink(missing_ok=True)
     if (
-        (
-            before != after
-            and {"red", "advisory", "unknown"} & {before, after}
-            # Each merge on an advisory main passes through pending back to advisory.
-            and {before, after} != {"advisory", "pending"}
-        )
+        (before != after and {"red", "advisory", "unknown"} & {before, after})
         or (health.scheduled and health.scheduled not in old)
         or (health.retry and line != old)
     ):
@@ -1993,6 +2002,30 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
         return False
 
 
+def proves_advisory_fix(pull: dict[str, Any]) -> bool:
+    """Whether a pull request is the update that fixes an advisory on main: its latest CI run is
+    green and its own audit passed clean, without the "Advisory on main" warning, whatever main
+    that run tested. Only its place in the line rests on this; the gate verifies its merge as
+    any other's."""
+    try:
+        if failed_checks(pull):
+            return False
+        ci = runs("ci", pull["headRefOid"], pull=True)
+        if not ci:
+            return False
+        parts = jobs(ci[0])
+        if verdict(ci[0], parts)[0] != "green":
+            return False
+        return any(
+            job["name"] == DEPENDENCIES and job.get("conclusion") == "success"
+            for job in strict_jobs(parts)
+        )
+    except Waiting:
+        raise
+    except Refused, KeyError, TypeError, ValueError, IndexError:
+        return False
+
+
 def publish_first(number: str | None, batch: dict[str, Any] | None) -> None:
     """Tell the runners' lender which pull request is first, and the branch its batch is tested
     on: their CI and browser jobs get a runner before other pull requests' jobs
@@ -2397,7 +2430,10 @@ class Train:
                     for number in remaining:
                         if number in self.unavailable or number in self.conflicts:
                             continue
-                        evidence = fix_evidence(pulls[number], base, current)
+                        # An advisory's fix is proven whatever main it was tested on: main
+                        # moves under it while the line keeps merging.
+                        advisory = current.state == "advisory"
+                        evidence = fix_evidence(pulls[number], "" if advisory else base, current)
                         if evidence is None:
                             continue
                         judged = self.proofs.get(number)
@@ -2405,7 +2441,11 @@ class Train:
                             proven = judged[1]
                         else:
                             try:
-                                proven = proves_main_fix(pulls[number], base, current)
+                                proven = (
+                                    proves_advisory_fix(pulls[number])
+                                    if advisory
+                                    else proves_main_fix(pulls[number], base, current)
+                                )
                             except Waiting:
                                 # An unreadable GitHub proves nothing; judge it again next time.
                                 continue
@@ -3853,7 +3893,9 @@ def train_status(folder: Path) -> int:
             json.dumps(
                 {
                     # Main's state as last published: green, pending, red, advisory or unknown.
-                    "main": state_of(published.read_text()) if published.exists() else None,
+                    "main": (state_of(published.read_text()) or None)
+                    if published.exists()
+                    else None,
                     "first": train.first,
                     # Keep failed entries' slots internally, but let the tick deliver their
                     # ordinary checks-finished wake instead of waiting for a train turn.

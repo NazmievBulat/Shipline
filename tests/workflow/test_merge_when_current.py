@@ -1635,7 +1635,8 @@ def test_main_is_pending_while_its_other_checks_run_after_an_advisory(github: Gi
 
 
 def test_each_merge_on_an_advisory_main_wakes_nobody(github: GitHub) -> None:
-    """Into the advisory state is told once; the pending of each merge after it is not."""
+    """Into the advisory state is told once, the pending of each merge after it is not, and
+    leaving it through pending to green is told."""
     _advisory_config(github)
     _main_audit_failed(github, _advisories_notice())
     folder = github.workflow.repo / ".local/workflow"
@@ -1656,10 +1657,18 @@ def test_each_merge_on_an_advisory_main_wakes_nobody(github: GitHub) -> None:
         assert github.workflow.run_script("main-status").stdout.startswith(state)
         assert not (folder / "main-status.pending").exists()
 
+    # The update lands: main's run on it goes on for a while, then passes. Leaving the advisory
+    # state is told once main is green.
+    run["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    listed["jobs"] = running
+    github.save()
+    assert github.workflow.run_script("main-status").stdout.startswith("main: pending")
+    assert not (folder / "main-status.pending").exists()
     github.main()
     github.save()
     assert github.workflow.run_script("main-status").stdout.startswith("main: green")
     assert (folder / "main-status.pending").read_text().startswith("main: green")
+    assert not (folder / "main-advisory").exists()
 
 
 @pytest.mark.parametrize("warned", [True, False])
