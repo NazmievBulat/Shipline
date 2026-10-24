@@ -38,7 +38,9 @@ def _shards() -> dict[int, list[str]]:
         if found := re.fullmatch(r"\s+- shard: (\d+)", line):
             shard = int(found[1])
             shards[shard] = []
-        elif shard is not None and (found := re.fullmatch(r"\s+(tests/workflow/\S+\.py)", line)):
+        elif shard is not None and (
+            found := re.fullmatch(r"\s+(tests/(?:workflow|tools)/\S+\.py)", line)
+        ):
             shards[shard].append(found[1])
     return shards
 
@@ -49,10 +51,11 @@ def test_ci_runs_four_shards() -> None:
 
 
 def _test_files(root: Path) -> list[str]:
-    """The files pytest collects tests from under `tests/workflow`: its default `python_files`,
-    in every folder below it too."""
-    folder = root / "tests/workflow"
-    found = {*folder.rglob("test_*.py"), *folder.rglob("*_test.py")}
+    """The files pytest collects tests from under `tests/workflow` and `tests/tools`: its default
+    `python_files`, in every folder below them too."""
+    found = set()
+    for folder in (root / "tests/workflow", root / "tests/tools"):
+        found |= {*folder.rglob("test_*.py"), *folder.rglob("*_test.py")}
     return sorted(str(path.relative_to(root)) for path in found)
 
 
@@ -306,13 +309,23 @@ def test_a_draft_s_skipped_run_is_never_a_pass_to_the_merge_gate(gate: Any, run:
 
 
 def test_the_tests_use_a_tmux_that_leaves_each_pane_where_it_was_started() -> None:
-    """A tmux built with systemd support moves each new pane into a scope of its own, racing the
-    scope a session starts its command in; the session's memory limit is then lost."""
+    """A tmux built with systemd support moves each new pane into a scope of its own; the tests
+    run the scripts with one that leaves each pane where it was started."""
     text = _CI.read_text()
 
     assert "./configure --prefix=\"$HOME/.local/tmux\" --disable-systemd" in text
     assert 'echo "$HOME/.local/tmux/bin" >> "$GITHUB_PATH"' in text
     assert 'if ldd "$(command -v tmux)" | grep -q libsystemd; then' in text
+
+
+def test_the_tests_of_the_memory_limits_also_get_a_tmux_with_systemd_support() -> None:
+    """Sessions keep their limits whichever tmux starts them (#41): CI builds the second one and
+    names it to the tests, which would otherwise leave it out."""
+    text = _CI.read_text()
+
+    assert './configure --prefix="$HOME/.local/tmux-systemd" --enable-systemd' in text
+    assert 'ldd "$tmux_with_systemd" | grep -q libsystemd ||' in text
+    assert 'echo "WORKFLOW_TEST_TMUX_WITH_SYSTEMD=$tmux_with_systemd" >> "$GITHUB_ENV"' in text
 
 
 def test_the_rules_tell_a_worker_that_a_draft_runs_no_ci() -> None:

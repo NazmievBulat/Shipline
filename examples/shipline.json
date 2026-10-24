@@ -35,6 +35,15 @@
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app-runner"
   },
+  "parity": {
+    "workflow_tests": "tools/shipline/tests",
+    "runner_tests": "tools/runner/tests",
+    "known": "tools/shipline/parity-known.txt"
+  },
+  "machines": [
+    {"name": "this machine"},
+    {"name": "runner-1", "address": "runner@runner-1.example"}
+  ],
   "hunts": {
     "areas": {
       "phone": ["/calls", "/contacts"],

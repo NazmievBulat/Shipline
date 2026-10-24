@@ -330,7 +330,12 @@ def drive(folder: Path) -> None:
                 _hand_back(folder, number, "unfinished stack follow-up on an open pull request")
             elif pull["headRefOid"] != note.head or pull["headRefName"] != note.branch:
                 _hand_back(folder, number, "head changed since the passed review handoff")
-            elif gate.failed_checks(pull) or number in gate.Train(folder).blocked:
+            elif gate.failed_checks(pull) or (
+                # A green re-run on an older main stays blocked but keeps its place: its turn
+                # refreshes it, as for any stale green run.
+                number in (train := gate.Train(folder)).blocked
+                and number not in train.refreshable
+            ):
                 # An advisory service the audit could not reach found nothing wrong: the
                 # handoff waits, and its CI is re-run once the service answers. Under the
                 # lock a gate call re-runs under, so only one of them asks GitHub.
