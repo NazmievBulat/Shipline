@@ -72,37 +72,43 @@ ASKED=$STATE/wake.asked
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 github_ready=1
 python3 "$here/github_budget.py" ready wake || github_ready=0
-main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)") || exit 1
+# The state folder and the labels (`workflow_config.py`), read once; priority.jq reads the
+# label names from SHIPLINE_CONFIG.
+config=$(python3 "$here/workflow_config.py" shell) || exit 1
+eval "$config"
+export SHIPLINE_CONFIG
+# The repository's main checkout, never the checkout these scripts are in.
+main=$SHIPLINE_REPO
 resent=("$@")
 mkdir -p "$STATE"
-main_report=$main/.local/workflow/main-status
-main_pending=$main/.local/workflow/main-status.pending
+main_report=$main/$SHIPLINE_STATE_FOLDER/main-status
+main_pending=$main/$SHIPLINE_STATE_FOLDER/main-status.pending
 # The first push the package audit refused because an advisory service could not be reached
 # (scripts/workflow/advisory_service.py), told once.
-service_pending=$main/.local/workflow/advisory-service.pending
+service_pending=$main/$SHIPLINE_STATE_FOLDER/advisory-service.pending
 service_line=""
 [[ ! -s $service_pending ]] || service_line=$(<"$service_pending")
-handbacks=$main/.local/workflow/merge-handbacks.pending
+handbacks=$main/$SHIPLINE_STATE_FOLDER/merge-handbacks.pending
 handback_files=()
 handback_lines=()
-lost=$main/.local/workflow/lost-checks.pending
+lost=$main/$SHIPLINE_STATE_FOLDER/lost-checks.pending
 lost_files=()
 lost_lines=()
-breaks=$main/.local/workflow/rule-breaks.pending
-stuck=$main/.local/workflow/stuck.pending
+breaks=$main/$SHIPLINE_STATE_FOLDER/rule-breaks.pending
+stuck=$main/$SHIPLINE_STATE_FOLDER/stuck.pending
 stuck_files=()
 stuck_lines=()
 cloud_files=()
 cloud_lines=()
-if [[ -d $main/.local/workflow/cloud-events.pending ]]; then
+if [[ -d $main/$SHIPLINE_STATE_FOLDER/cloud-events.pending ]]; then
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"\(.name): \(.message) (\(.url))"' "$event"); then
       cloud_files+=("$event")
       cloud_lines+=("$line")
     fi
-  done < <(find "$main/.local/workflow/cloud-events.pending" -type f -print0 | sort -z)
+  done < <(find "$main/$SHIPLINE_STATE_FOLDER/cloud-events.pending" -type f -print0 | sort -z)
 fi
-starts=$main/.local/workflow/ticket-starts.pending
+starts=$main/$SHIPLINE_STATE_FOLDER/ticket-starts.pending
 start_files=()
 start_lines=()
 if [[ -d $starts ]]; then
@@ -189,7 +195,7 @@ asking_notes() {
   local note name asked identity
   shopt -s nullglob
   {
-    for note in "$main"/.claude/worktrees/*/.local/workflow/*.asking; do
+    for note in "$main"/.claude/worktrees/*/"$SHIPLINE_STATE_FOLDER"/*.asking; do
       name=${note##*/}
       name=${name%.asking}
       [[ ${1:-} == all || -e ${note%.asking}.idle ]] || continue
@@ -197,10 +203,10 @@ asking_notes() {
       read -r asked _ <"$note" 2>/dev/null || true
       [[ $asked =~ ^[0-9]+$ ]] && printf '%s %s\n' "$name" "$asked"
     done
-    for note in "$main"/.local/workflow/cloud-*.asking; do
+    for note in "$main/$SHIPLINE_STATE_FOLDER"/cloud-*.asking; do
       name=${note##*/}
       name=${name%.asking}
-      [[ -f $main/.local/workflow/$name ]] || continue
+      [[ -f $main/$SHIPLINE_STATE_FOLDER/$name ]] || continue
       read -r asked identity <"$note" 2>/dev/null || continue
       # Include the comment id in the identity: two questions in the same second are distinct.
       [[ $asked =~ ^[0-9]+$ && $identity =~ ^[0-9]+$ ]] &&
@@ -285,7 +291,7 @@ pull_requests_line() {
   ((github_ready)) || return 75
   WORKFLOW_BACKGROUND_GITHUB=1 python3 "$here/workflow_commands.py" pr list --state open --limit 200 --json number,isDraft,labels,statusCheckRollup --jq "$(<"$here/priority.jq")"'
     def numbers: sort_by(.number) | map(.number | tostring) | join(", ");
-    def labelled: .labels | map(.name) | index("workflow") != null;
+    def labelled: .labels | map(.name) | index(workflow_label) != null;
     def checks: [.statusCheckRollup[]? | (.conclusion // .state // "") | ascii_upcase]
       | if any(IN("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED")) then "failing"
         elif any(IN("", "PENDING", "EXPECTED", "IN_PROGRESS", "QUEUED")) then "pending"
@@ -308,7 +314,7 @@ sessions_line() {
 
 # The registered orchestrator: its name and whether it is idle. Never pick another session.
 find_orchestrator() {
-  local registration=$main/.local/workflow/orchestrator name="" found
+  local registration=$main/$SHIPLINE_STATE_FOLDER/orchestrator name="" found
   if [[ ! -r $registration ]]; then
     log "  orchestrator registration could not be read: $registration; nobody was told"
     return 1
@@ -443,15 +449,15 @@ if send_to "$name" "$message"; then
     done
   fi
   if ((${#stuck_files[@]})); then
-    mkdir -p "$main/.local/workflow/stuck.sent"
+    mkdir -p "$main/$SHIPLINE_STATE_FOLDER/stuck.sent"
     for event in "${stuck_files[@]}"; do
-      mv -- "$event" "$main/.local/workflow/stuck.sent/${event##*/}"
+      mv -- "$event" "$main/$SHIPLINE_STATE_FOLDER/stuck.sent/${event##*/}"
     done
   fi
   if ((${#handback_files[@]})); then
-    mkdir -p "$main/.local/workflow/merge-handbacks.sent"
+    mkdir -p "$main/$SHIPLINE_STATE_FOLDER/merge-handbacks.sent"
     for event in "${handback_files[@]}"; do
-      mv -- "$event" "$main/.local/workflow/merge-handbacks.sent/${event##*/}"
+      mv -- "$event" "$main/$SHIPLINE_STATE_FOLDER/merge-handbacks.sent/${event##*/}"
     done
   fi
   # Do not acknowledge a newer report published while the message was being sent.

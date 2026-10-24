@@ -156,12 +156,22 @@ is_session_name() {
   [[ $1 =~ ^(ticket|audit|review)-[0-9]+$ ]] || { [[ $1 == hunt-* ]] && is_hunt_name "${1#hunt-}"; }
 }
 
-# The main checkout, whichever worktree this script was called from.
+# The repository's main checkout, whichever of its worktrees this script was called from
+# (`SHIPLINE_REPO`, else the one of the current folder), and Shipline's own checkout, which this
+# script is in.
 find_main_checkout() {
   local here
   here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   script_dir=$here
-  main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+  # Its `bin`, for `shipline` in what a session runs, when this checkout has the launcher.
+  shipline_bin=$(cd "$here/../.." && pwd)/bin
+  [[ -f $shipline_bin/shipline ]] && shipline_bin+=: || shipline_bin=""
+  # The repository, its state folder and set-up command (`workflow_config.py`), read once a
+  # call: one Python start, which `list` below otherwise avoids.
+  local config
+  config=$(python3 "$here/workflow_config.py" shell) || exit 1
+  eval "$config"
+  main=$SHIPLINE_REPO
   cd "$main"
 }
 
@@ -244,12 +254,12 @@ end_server() {
 # them, the idle mark first, for a session that has not ended.
 stop_session() {
   local name=$1 notes
-  notes=$(worktree_of "$name")/.local/workflow
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER
   if [[ $name == ticket-* ]]; then
     # Preserve provenance for workers started before the durable panel marker existed.
     if [[ -e $notes/$name.codex ]]; then
-      mkdir -p "$main/.local/workflow"
-      touch "$main/.local/workflow/codex-built-${name#ticket-}"
+      mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
+      touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name#ticket-}"
     fi
     end_server "codex-${name#ticket-}" || return 1
   fi
@@ -369,18 +379,18 @@ prepare_worktree() {
     # merge for judgment; only a recorded hand-back at the published head permits it.
     local merge_conflict=false recorded_dirty=false
     if [[ -n $(git -C "$worktree" status --porcelain) ]]; then
-      if [[ -e $main/.local/workflow/merge-review-${name#review-} &&
+      if [[ -e $main/$SHIPLINE_STATE_FOLDER/merge-review-${name#review-} &&
             -n $(git -C "$worktree" diff --name-only --diff-filter=U) ]] &&
           git -C "$worktree" rev-parse --verify MERGE_HEAD >/dev/null 2>&1; then
         merge_conflict=true
       else
-        [[ -e $main/.local/workflow/merge-review-${name#review-} ]] ||
+        [[ -e $main/$SHIPLINE_STATE_FOLDER/merge-review-${name#review-} ]] ||
           refuse_local_work "$worktree has uncommitted changes"
         recorded_dirty=true
       fi
     fi
     git fetch --quiet origin "$pr_branch" || die "cannot fetch $pr_branch for review"
-    local recovery=false request=$main/.local/workflow/merge-review-${name#review-}
+    local recovery=false request=$main/$SHIPLINE_STATE_FOLDER/merge-review-${name#review-}
     local recorded_local="" recorded_head=""
     if [[ -r $request ]]; then
       recorded_local=$(jq -r '.local_head // ""' "$request")
@@ -403,7 +413,7 @@ prepare_worktree() {
         jq -n --arg head "$(git rev-parse "origin/$pr_branch")" \
           --arg local_head "$(git -C "$worktree" rev-parse HEAD)" \
           '{head: $head, local_head: $local_head}' \
-          >"$main/.local/workflow/review-${name#review-}.local-work"
+          >"$main/$SHIPLINE_STATE_FOLDER/review-${name#review-}.local-work"
       fi
     fi
     [[ $recorded_dirty == false || $recovery == true ]] ||
@@ -415,12 +425,13 @@ prepare_worktree() {
     [[ $recovery == true || $(git -C "$worktree" rev-parse HEAD) == $(git rev-parse "origin/$pr_branch") ]] ||
       refuse_local_work "$worktree has unpushed commits; refusing to review them"
   fi
-  # What a worktree needs before it can test and push: the repository's own setup command,
-  # `scripts/setup-worktree`, when it has one. Repeated on an existing worktree: it is quick
-  # when nothing is missing, and it repairs a worktree whose first setup failed.
+  # What a worktree needs before it can test and push: the repository's own setup command
+  # (`scripts/setup-worktree` unless shipline.json names another), when it has one. Repeated
+  # on an existing worktree: it is quick when nothing is missing, and it repairs a worktree
+  # whose first setup failed.
   (
     cd "$worktree"
-    [[ ! -x scripts/setup-worktree ]] || scripts/setup-worktree
+    [[ ! -x $SHIPLINE_WORKTREE_SETUP ]] || "./$SHIPLINE_WORKTREE_SETUP"
   ) >&2
 }
 
@@ -448,7 +459,7 @@ sentence_of() {
     audit-*) echo "Audit pull request ${1#audit-} $RULES_ON_MAIN" ;;
     review-*)
       local review_sentence
-      review_sentence=$(python3 -B "$script_dir/conflict_review.py" sentence "$main/.local/workflow" "${1#review-}")
+      review_sentence=$(python3 -B "$script_dir/conflict_review.py" sentence "$main/$SHIPLINE_STATE_FOLDER" "${1#review-}")
       echo "$review_sentence $RULES_ON_MAIN"
       ;;
   esac
@@ -457,19 +468,20 @@ sentence_of() {
 # Cloud launch instructions, kept together here (replacement approved by the owner).
 cloud_sentence_of() {
   sentence_of "ticket-$1"
-  cat <<'EOF'
-Cloud differences: work in your own cloud checkout and use the pull request's branch, not a local workflow worktree. Push only to the pull request's branch, never force-push, and never skip or weaken the pre-push hook. Run the repository's setup command, scripts/setup-worktree, when it has one, before testing and pushing. A database server cannot run as root: run it as a separate unprivileged user when this container runs as root. Run long suites in the background and wait for their results. Use a reviewer subagent in place of codex review, including verdicts for unit, API and browser coverage. Use only the selected local browser tests and at most two workers. Local session protect/unprotect commands and the phone bridge are unavailable here. Every report is a comment on this pull request starting with <!-- cloud-worker -->: report the start, first push, any blocker with the exact error, any question for the owner, and ready. A question for the owner ends on its last line with the question or the short words to type back. A blocker has a line starting with Blocked and includes the exact error. Mark ready only after completing the worker's required work, then report with worker finished on the last line. Never merge. If a task explicitly asks for a comment-only smoke test, follow that task and stop after its requested comment.
+  # Unquoted for the set-up command alone: the text has no other dollar, backtick or backslash.
+  cat <<EOF
+Cloud differences: work in your own cloud checkout and use the pull request's branch, not a local workflow worktree. Push only to the pull request's branch, never force-push, and never skip or weaken the pre-push hook. Run the repository's setup command, $SHIPLINE_WORKTREE_SETUP, when it has one, before testing and pushing. A database server cannot run as root: run it as a separate unprivileged user when this container runs as root. Run long suites in the background and wait for their results. Use a reviewer subagent in place of codex review, including verdicts for unit, API and browser coverage. Use only the selected local browser tests and at most two workers. Local session protect/unprotect commands and the phone bridge are unavailable here. Every report is a comment on this pull request starting with <!-- cloud-worker -->: report the start, first push, any blocker with the exact error, any question for the owner, and ready. A question for the owner ends on its last line with the question or the short words to type back. A blocker has a line starting with Blocked and includes the exact error. Mark ready only after completing the worker's required work, then report with worker finished on the last line. Never merge. If a task explicitly asks for a comment-only smoke test, follow that task and stop after its requested comment.
 EOF
 }
 
 start_cloud_worker() {
   local number=$1 effort=$2 name="cloud-$1" prompt command launch_file status_file invoked_file waited=0
   prompt=$(cloud_sentence_of "$number")
-  launch_file=$main/.local/workflow/$name.launch
-  status_file=$main/.local/workflow/$name.exit
-  invoked_file=$main/.local/workflow/$name.invoked
+  launch_file=$main/$SHIPLINE_STATE_FOLDER/$name.launch
+  status_file=$main/$SHIPLINE_STATE_FOLDER/$name.exit
+  invoked_file=$main/$SHIPLINE_STATE_FOLDER/$name.invoked
   # Old fix-round output must not be mistaken for this attempt if we stop after reserving.
-  rm -f "$launch_file" "$status_file" "$invoked_file" "$main/.local/workflow/$name.not-invoked"
+  rm -f "$launch_file" "$status_file" "$invoked_file" "$main/$SHIPLINE_STATE_FOLDER/$name.not-invoked"
   python3 -B "$script_dir/cloud_workers.py" reserve "$main" "$number" || return 1
   # Capture before the short-lived pane exits: even a fast successful launch leaves its
   # View address on disk. Claude still has a terminal for both input and output.
@@ -521,11 +533,11 @@ cmd_start() {
   # One start at a time for a pull request. Preparing the worktree and waiting for memory take
   # minutes; without the lock a worker and an audit started in that time would both find no
   # session and end up in the same worktree.
-  mkdir -p "$main/.local/workflow"
-  exec 8>"$main/.local/workflow/start-$number.lock"
+  mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
+  exec 8>"$main/$SHIPLINE_STATE_FOLDER/start-$number.lock"
   flock --nonblock 8 || die "another start for pull request $number is under way"
 
-  if [[ -e $main/.local/workflow/cloud-$number ]]; then
+  if [[ -e $main/$SHIPLINE_STATE_FOLDER/cloud-$number ]]; then
     [[ $model == cloud ]] && python3 -B "$script_dir/cloud_workers.py" retryable "$main" "$number" ||
       die "cloud-$number is already recorded"
   fi
@@ -551,13 +563,13 @@ cmd_start() {
     # reviewer's round is not this session's. Written after `launch`, which forgets old notes.
     # A nudge given to an earlier reviewer on the same head is not this one's.
     if [[ $kind =~ ^(review|audit)$ ]]; then
-      touch "$worktree/.local/workflow/$name.started"
-      rm -f "$main/.local/workflow/$name.checks-nudged-"* \
-        "$main/.local/workflow/$name.train-nudged-"* "$main/.local/workflow/$name.conflict-nudged-"*
+      touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
+      rm -f "$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-"* \
+        "$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-"* "$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-"*
     fi
     save_link "$name" "$worktree"
     if [[ $kind == review ]]; then
-      python3 -B "$script_dir/reviewer_start.py" --started "$main/.local/workflow" "$number"
+      python3 -B "$script_dir/reviewer_start.py" --started "$main/$SHIPLINE_STATE_FOLDER" "$number"
     fi
   fi
 }
@@ -589,7 +601,7 @@ wait_for_resources() {
   local reason load ceiling processors
   while true; do
     if ! resources_short; then
-      echo "${WORKFLOW_NOW:-$(date +%s)}" >"$main/.local/workflow/last-start"
+      echo "${WORKFLOW_NOW:-$(date +%s)}" >"$main/$SHIPLINE_STATE_FOLDER/last-start"
       return 0
     fi
     # The tick must release its lock so later ticks can still maintain sessions.
@@ -642,16 +654,16 @@ launch() {
     # tmux can succeed before systemd refuses the scope. Record that definite refusal
     # outside the scope so the next tick can retry it without trusting a missing pane.
     scope=(bash -c 'invoked=$1; refused=$2; shift 2; "$@"; result=$?; if [[ ! -e $invoked ]]; then printf "%s\n" "$result" >"$refused"; fi; exit "$result"'
-      bash "$worktree/.local/workflow/$name.invoked" "$worktree/.local/workflow/$name.not-invoked"
+      bash "$worktree/$SHIPLINE_STATE_FOLDER/$name.invoked" "$worktree/$SHIPLINE_STATE_FOLDER/$name.not-invoked"
       "${scope[@]}")
   fi
-  mkdir -p "$worktree/.local/workflow"
+  mkdir -p "$worktree/$SHIPLINE_STATE_FOLDER"
   if [[ $name == ticket-* ]] && is_running "codex-${name#ticket-}"; then
     keep=keep-codex
   fi
   # The worker can finish while its bridge is starting. Keep the marker that authorizes
   # its callback, so that early turn is not discarded.
-  forget_notes "$worktree/.local/workflow/$name" "$keep"
+  forget_notes "$worktree/$SHIPLINE_STATE_FOLDER/$name" "$keep"
   # A clean environment: the caller's own CLAUDE_* variables must not reach the session.
   # TMUX_TMPDIR goes along when the caller has one, or the new server would put its socket
   # where the other commands of this script do not look.
@@ -659,7 +671,8 @@ launch() {
     HOME="$HOME" \
     USER="${USER:-$(id -un)}" \
     SHELL="${SHELL:-/bin/bash}" \
-    PATH="$script_dir/gh-bin:$PATH" \
+    PATH="$shipline_bin$script_dir/gh-bin:$PATH" \
+    SHIPLINE_REPO="$main" \
     LANG="${LANG:-C.UTF-8}" \
     TERM="${TERM:-xterm-256color}" \
     XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
@@ -682,7 +695,7 @@ save_link() {
     tmux -L "$name" kill-server 2>/dev/null || true
     return 1
   fi
-  echo "$link" >"$worktree/.local/workflow/$name.url"
+  echo "$link" >"$worktree/$SHIPLINE_STATE_FOLDER/$name.url"
   echo "$name started: $link"
 }
 
@@ -713,7 +726,7 @@ prepare_hunt_worktree() {
   fi
   (
     cd "$worktree"
-    [[ ! -x scripts/setup-worktree ]] || scripts/setup-worktree --no-push
+    [[ ! -x $SHIPLINE_WORKTREE_SETUP ]] || "./$SHIPLINE_WORKTREE_SETUP" --no-push
   ) >&2
 }
 
@@ -729,8 +742,8 @@ cmd_start_hunt() {
   # One start of a hunt at a time, whatever the names. Preparing the worktree and waiting for
   # memory take minutes; without the lock a second hunt started in that time would find none
   # running. `cleanup` takes the same lock, so it never removes a worktree that is being made.
-  mkdir -p "$main/.local/workflow"
-  exec 8>"$main/.local/workflow/start-hunt.lock"
+  mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
+  exec 8>"$main/$SHIPLINE_STATE_FOLDER/start-hunt.lock"
   flock --nonblock 8 || die "the start of another hunt is under way"
 
   # A hunt runs a browser and a copy of the application beside its model.
@@ -770,20 +783,20 @@ cmd_start_hunt() {
       rmdir "$report" 2>/dev/null || true
       exit 1
     fi
-    touch "$worktree/.local/workflow/$name.started"
+    touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
     protect_hunt "$name"
     echo "$name started: $label, no link; its screen: tmux -L $name attach"
   else
     launch "$name" "$worktree" \
       "claude --effort $HUNT_EFFORT --add-dir $report --remote-control $name \"$prompt\"" \
       "WORKFLOW_HUNT_REPORT=$report"
-    touch "$worktree/.local/workflow/$name.started"
+    touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
     if ! wait_for_link "$name"; then
       stop_session "$name"
       rmdir "$report" 2>/dev/null || true
       exit 1
     fi
-    echo "$link" >"$worktree/.local/workflow/$name.url"
+    echo "$link" >"$worktree/$SHIPLINE_STATE_FOLDER/$name.url"
     protect_hunt "$name"
     echo "$name started: $link"
   fi
@@ -815,7 +828,7 @@ stopped_on_limit() {
   local screen whole top said after notes at limit_at
   limit="" resets="" typed=""
   local target=$1
-  if [[ -e $(worktree_of "$1")/.local/workflow/$1.codex ]]; then
+  if [[ -e $(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1.codex ]]; then
     target=codex-${1#ticket-}
     codex_limit "$target" && return 0
   fi
@@ -847,7 +860,7 @@ stopped_on_limit() {
   fi
   if [[ -z $said ]] ||
     LC_ALL=C grep -qvE '^([[:space:]]*((·|✢|✳|✶|✻|✽|⎿).*)?|(>|❯)[[:space:]]*)$' <<<"$after"; then
-    notes=$(worktree_of "$1")/.local/workflow/$1
+    notes=$(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1
     [[ -e $notes.idle && -r $notes.limit ]] || return 1
     read -r at <"$notes.limit" && [[ $at =~ ^[0-9]+$ ]] || return 1
     # Written with its day and its year, so the tick reads it as the moment it is.
@@ -865,7 +878,7 @@ stopped_on_limit() {
   # Some Claude limit stops have no Stop hook. Resolve and save the day here too, before
   # the usage figures roll over to the next window. Dated and session-limit lines keep
   # their existing parser in tick; hunts and Codex's own quota use their own rules.
-  notes=$(worktree_of "$1")/.local/workflow/$1
+  notes=$(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1
   if [[ $1 != hunt-* && $limit != "session limit" ]] &&
       remember_line_reset "$notes" "$limit" "$resets"; then
     limit="usage limit"
@@ -890,12 +903,12 @@ list_sessions() {
   while read -r name; do
     [[ -n $name ]] || continue
     state=busy
-    if [[ -e $(worktree_of "$name")/.local/workflow/$name.codex ]] && ! is_running "$name"; then
+    if [[ -e $(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name.codex ]] && ! is_running "$name"; then
       state=idle
     fi
-    [[ ! -e $(worktree_of "$name")/.local/workflow/$name.idle ]] || state=idle
+    [[ ! -e $(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name.idle ]] || state=idle
     local browser_lock
-    browser_lock=$(worktree_of "$name")/.local/workflow/browser-tests.lock
+    browser_lock=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/browser-tests.lock
     if [[ -e $browser_lock ]] && ! flock -n -x "$browser_lock" true; then
       state=busy
     fi
@@ -939,7 +952,7 @@ list_sessions() {
   # Python takes tens of milliseconds to start, and the tick lists the sessions many times a run:
   # it is started only when there is a cloud worker's record to read.
   local record
-  for record in "$main"/.local/workflow/cloud-[0-9]*; do
+  for record in "$main/$SHIPLINE_STATE_FOLDER"/cloud-[0-9]*; do
     if [[ -e $record || -L $record ]]; then
       python3 -B "$script_dir/cloud_workers.py" list "$main"
       break
@@ -952,7 +965,7 @@ list_sessions() {
 cmd_resend() {
   local name=$1 limit resets typed worktree notes restarted=false sending_resend=true
   worktree=$(worktree_of "$name")
-  notes=$worktree/.local/workflow/$name
+  notes=$worktree/$SHIPLINE_STATE_FOLDER/$name
   if ! is_running "$name"; then
     [[ $name == ticket-* && -e $notes.codex ]] && is_running "codex-${name#ticket-}" ||
       die "$name is not running"
@@ -977,7 +990,7 @@ cmd_resend() {
       die "$name has text in its box that was not sent; nothing was typed into either session"
   fi
   prompt=$(sentence_of "$name")
-  if [[ $target == "$name" && -e $(worktree_of "$name")/.local/workflow/$name.codex ]]; then
+  if [[ $target == "$name" && -e $(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name.codex ]]; then
     # The bridge may have marked a question delivered before Claude hit its own limit.
     # Replay that turn; the worker instruction is never an owner's answer.
     if [[ ! -r $notes.codex-answered || ! -r $notes.codex-turn.json ]] ||
@@ -1040,7 +1053,7 @@ prompt_box_matches() {
 # Whether the box holds exactly the text this script last typed there and could not send.
 holds_own_text() {
   local name=$1 typed notes
-  notes=$(worktree_of "$name")/.local/workflow/$name
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
   [[ -r $notes.typed ]] || return 1
   read_prompt_box
   [[ -n $typed ]] && prompt_box_matches "$(cat "$notes.typed")"
@@ -1050,7 +1063,7 @@ holds_own_text() {
 # input, but must never append to or submit different text left by the owner.
 send_prompt() {
   local name=$1 prompt=$2 typed notes attempt poll appeared=false
-  notes=$(worktree_of "$name")/.local/workflow/$name
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
   read_prompt_box
   if [[ -n $typed ]]; then
     [[ -r $notes.typed ]] && prompt_box_matches "$(cat "$notes.typed")" ||
@@ -1087,7 +1100,7 @@ send_prompt() {
 
 cmd_checks_finished() {
   local name=$1 head=$2 reason=${3:-checks} notes
-  notes=$(worktree_of "$name")/.local/workflow/$name
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
   require_running "$name"
   [[ ( -e $notes.checks-wait || -e $notes.idle ) &&
     ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked && ! -e $notes.pushed ]] ||
@@ -1117,7 +1130,7 @@ cmd_checks_finished() {
 # Text of someone else's in the box exits 3, so that the tick passes over the session quietly.
 cmd_nudge_idle() {
   local name=$1 kind=$2 notes typed
-  notes=$(worktree_of "$name")/.local/workflow/$name
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
   require_running "$name"
   [[ ! -e $notes.codex ]] || die "$name is a Codex worker; its bridge relays"
   [[ ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked ]] ||
@@ -1150,7 +1163,7 @@ cmd_running() {
 # Resolve both groups before writing either; each must belong to its own tmux scope.
 session_groups() {
   group_of "$1" || return 1
-  if [[ $1 == ticket-* && -e $(worktree_of "$1")/.local/workflow/$1.codex ]]; then
+  if [[ $1 == ticket-* && -e $(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1.codex ]]; then
     group_of "codex-${1#ticket-}" || return 1
   fi
 }
@@ -1204,7 +1217,7 @@ cleanup_hunt() {
     else
       echo "$name: kept, git could not remove it"
     fi
-  ) 7>>"$main/.local/workflow/start-hunt.lock"
+  ) 7>>"$main/$SHIPLINE_STATE_FOLDER/start-hunt.lock"
 }
 
 # Claude names a project's temporary folder by replacing each non-ASCII-alphanumeric path
@@ -1220,7 +1233,7 @@ remove_scratch() {
 # With `hunts` as its word it removes only what needs no answer from GitHub.
 cmd_cleanup() {
   local only=${1:-} path branch name number session
-  mkdir -p "$main/.local/workflow"
+  mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
   while IFS=$'\t' read -r path branch; do
     name=${path##*/}
     [[ $path == "$main/.claude/worktrees/$name" ]] || continue
@@ -1235,7 +1248,7 @@ cmd_cleanup() {
       # A start takes this same lock before preparing the worktree or launching a session.
       # Hold it through the liveness checks, worktree removal and scratch removal.
       flock --nonblock 7 || exit 0
-      if [[ -e $main/.local/workflow/merge-wanted-$number ]]; then
+      if [[ -e $main/$SHIPLINE_STATE_FOLDER/merge-wanted-$number ]]; then
         echo "$name: kept, the tick has its merge handoff"
         exit 0
       fi
@@ -1273,7 +1286,7 @@ cmd_cleanup() {
         [[ -z $branch ]] || git branch --quiet -D "$branch" >&2
         echo "$name: removed, its pull request is merged"
       fi
-    ) 7>>"$main/.local/workflow/start-$number.lock"
+    ) 7>>"$main/$SHIPLINE_STATE_FOLDER/start-$number.lock"
   done < <(list_worktrees)
 }
 
@@ -1281,12 +1294,12 @@ cmd_cleanup() {
 # publish or answer for the owner. Codex's notify writes turns to the relay's mailbox.
 start_codex_worker() {
   local name=$1 worktree=$2 effort=$3 prompt=$4 command config codex_name=codex-${1#ticket-}
-  local notes=$worktree/.local/workflow/$name common real_gh push_queue
+  local notes=$worktree/$SHIPLINE_STATE_FOLDER/$name common real_gh push_queue
   push_queue=${XDG_STATE_HOME:-$HOME/.local/state}/workflow/pushes
   mkdir -p "$push_queue"
-  mkdir -p "$worktree/.local/workflow"
+  mkdir -p "$worktree/$SHIPLINE_STATE_FOLDER"
   rm -f "$notes.codex-turn.json" "$notes.codex-delivered" "$notes.codex-answered" "$notes.codex-followed-up" "$notes.codex-quota-delivered" "$notes.codex-approval-delivered" "$notes.codex-recovery-error" "$notes.owner-reply"
-  touch "$main/.local/workflow/codex-built-${name#ticket-}"
+  touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name#ticket-}"
   common=$(git rev-parse --path-format=absolute --git-common-dir)
   [[ $effort != max ]] || effort=xhigh
   # Scope the bridge flag to this process's callback. A nested `codex review` must not
@@ -1301,7 +1314,7 @@ start_codex_worker() {
 }
 
 start_codex_bridge() {
-  local name=$1 worktree=$2 on_failure=${3:-stop} command config notes=$2/.local/workflow/$1
+  local name=$1 worktree=$2 on_failure=${3:-stop} command config notes=$2/$SHIPLINE_STATE_FOLDER/$1
   config=$notes.codex-config.json
   jq -n --arg script "$script_dir/codex-bridge.mjs" --arg worktree "$worktree" --arg name "$name" \
     '{mcpServers: {codex_bridge: {command: "node", args: [$script, $worktree, $name]}}}' >"$config"
@@ -1326,7 +1339,7 @@ start_codex_bridge() {
 cmd_bridge() {
   local name=$1 worktree notes typed recovered recovery_failed=false
   worktree=$(worktree_of "$name")
-  notes=$worktree/.local/workflow/$name
+  notes=$worktree/$SHIPLINE_STATE_FOLDER/$name
   [[ -e $notes.codex ]] && is_running "codex-${name#ticket-}" || die "$name has no running Codex worker"
   if is_running "$name"; then
     bridge_parse_failed "$name" || return 0
