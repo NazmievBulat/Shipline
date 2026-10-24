@@ -507,6 +507,7 @@ def test_the_rules_name_each_command_as_shipline_command() -> None:
         assert set(re.findall(r"shipline ([a-z-]+)", text)) <= set(commands), document
     rules = (_WORKFLOW / "RULES.md").read_text()
     assert set(re.findall(r"`shipline ([a-z-]+)", rules)) == {
+        "decide",
         "install-hooks",
         "install-timer",
         "merge-when-current",
