@@ -1820,6 +1820,47 @@ def _stale_note(handed: GitHub) -> None:
     handed.save()
 
 
+def _blocked_on_its_head(handed: GitHub, *, refreshable: bool) -> None:
+    # The line as a green re-run on an older main left it: blocked under the same head.
+    path = _folder(handed.workflow) / "merge-train.json"
+    train = json.loads(path.read_text())
+    train["blocked"]["7"] = handed.head
+    train["refreshable"] = ["7"] if refreshable else []
+    path.write_text(json.dumps(train))
+
+
+def test_a_refreshable_handoff_is_kept_and_refreshed_at_its_turn(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _stale_note(handed)
+    _blocked_on_its_head(handed, refreshable=True)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "merge hand-back 7" not in done.stdout
+    assert not (_folder(workflow) / "merge-review-7").exists()
+    assert _started(workflow) == []
+    refreshed = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
+    assert refreshed != handed.head
+    assert workflow.git("rev-parse", "HEAD^2", cwd=workflow.worktree(7)) == handed.base
+    assert json.loads(_note(workflow).read_text())["head"] == refreshed
+    assert not (workflow.state / "merged").exists()
+
+
+def test_a_blocked_handoff_that_is_not_refreshable_is_handed_back(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _stale_note(handed)
+    _blocked_on_its_head(handed, refreshable=False)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "merge hand-back 7: pull request checks failed" in done.stdout
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
+    assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
+
+
 def test_a_refresh_refused_for_an_advisory_hands_back_to_one_fresh_reviewer(
     handed: GitHub,
 ) -> None:
