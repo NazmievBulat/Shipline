@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -203,35 +204,45 @@ def _time(comment: dict[str, object]) -> int:
     return int(datetime.fromisoformat(created).timestamp())
 
 
+def _writes(comment: dict[str, object], writers: dict[str, bool]) -> bool:
+    """Whether the comment's author may write to the repository. Anyone may comment on a
+    public pull request. `writers` keeps, for this run, the accounts already asked about."""
+    user = comment.get("user")
+    login = user.get("login") if isinstance(user, dict) else None
+    if not isinstance(login, str) or not LOGIN.fullmatch(login):
+        return False
+    if login not in writers:
+        asked = call(
+            "cloud-workers",
+            "api",
+            f"{workflow_config.current().api}/collaborators/{login}/permission",
+            "--jq",
+            ".permission",
+            timeout=30,
+        )
+        # An account GitHub does not know as a collaborator may not write.
+        writers[login] = asked.returncode == 0 and asked.stdout.strip() in WRITERS
+    return writers[login]
+
+
 def _answer(
     comments: list[dict[str, object]], question: int, writers: dict[str, bool]
 ) -> dict[str, object] | None:
-    """The first comment after the question that answers it. `writers` keeps, for this run,
-    whether each account asked about may write to the repository."""
+    """The first comment after the question that answers it."""
     for comment in comments:
-        body = str(comment["body"]).lstrip()
-        if int(str(comment["id"])) <= question:
+        body = str(comment["body"]).strip()
+        if int(str(comment["id"])) <= question or not body:
             continue
-        # Every other role's comment begins with its marker. The worker posts from the owner's
-        # account, and GitHub's Claude connector signs what it posts.
-        if not body.startswith(ORCHESTRATOR) and (body.startswith("<!--") or SIGNED in body):
-            continue
-        user = comment.get("user")
-        login = user.get("login") if isinstance(user, dict) else None
-        if not isinstance(login, str) or not LOGIN.fullmatch(login):
-            continue
-        if login not in writers:
-            asked = call(
-                "cloud-workers",
-                "api",
-                f"{workflow_config.current().api}/collaborators/{login}/permission",
-                "--jq",
-                ".permission",
-                timeout=30,
-            )
-            # An account GitHub does not know as a collaborator may not write.
-            writers[login] = asked.returncode == 0 and asked.stdout.strip() in WRITERS
-        if writers[login]:
+        if not body.startswith(ORCHESTRATOR):
+            # Every other role's comment begins with its marker, and a command to a bot
+            # (`@codex review`) with its name. The worker posts from the owner's account, and
+            # GitHub's Claude connector signs what it posts on its last line; a quoted reply
+            # begins with the quote, which may hold that line too.
+            if body.startswith(("<!--", "@")):
+                continue
+            if body.splitlines()[-1].strip() == SIGNED and not body.startswith(">"):
+                continue
+        if _writes(comment, writers):
             return comment
     return None
 
@@ -254,6 +265,9 @@ def _poll(notes: Path, scripts: Path) -> int:
                 if comment["id"] <= record["last_comment_id"]:
                     continue
                 if not comment["body"].startswith(MARKER):
+                    continue
+                # A marked comment from an account that may not write is no report.
+                if not _writes(comment, writers):
                     continue
                 body = comment["body"]
                 status = _status(body)
@@ -400,6 +414,7 @@ def _attach(name: str, address: str, text: str) -> str:
     if not re.fullmatch(ADDRESS, address):
         return "the recorded address is not a cloud session address"
     pane = f"wake-{name}"
+    group = None
     # A clean environment, as `session` gives its panes: nothing of the tick's own reaches the
     # client. TMUX_TMPDIR goes along, or the server would put its socket elsewhere.
     env = {
@@ -433,6 +448,9 @@ def _attach(name: str, address: str, text: str) -> str:
         )  # fmt: skip
         if started.returncode:
             return f"the pane could not be started: {started.stderr.strip()}"
+        listed = tmux("list-panes", "-t", f"={pane}", "-F", "#{pane_pid}").stdout.strip()
+        # The pane's command leads a process group of its own.
+        group = int(listed) if listed.isdigit() else None
         return _type(tmux, pane, text)
     except (OSError, subprocess.SubprocessError) as error:
         return f"the pane failed: {error}"
@@ -441,6 +459,22 @@ def _attach(name: str, address: str, text: str) -> str:
             tmux("kill-server")
         except (OSError, subprocess.SubprocessError):
             pass
+        # Ending the server hangs up the client; one that ignores the hang-up is ended too.
+        if group:
+            _end_group(group)
+
+
+def _end_group(group: int) -> None:
+    for _ in range(10):
+        try:
+            os.killpg(group, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def _wake(notes: Path, snapshot: Path) -> int:
@@ -557,6 +591,8 @@ def main() -> int:
     if args.command == "wake":
         if not args.number:
             parser.error("the tick's snapshot of the pull requests is required")
+        # A wake ended mid-attach still ends its pane, in the attach's `finally`.
+        signal.signal(signal.SIGTERM, lambda number, _frame: sys.exit(128 + number))
         return _wake(notes, Path(args.number))
     if args.command == "list":
         for path in _records(notes):

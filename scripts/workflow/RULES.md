@@ -315,9 +315,12 @@ whose draft has had no push and no report for `cloud_wake_after_minutes` of `shi
 answer), is woken once per quiet stretch: the tick attaches to its session in a short-lived
 tmux pane (`claude --cloud <address>`), waits up to 60 seconds for the input box, checks that it
 is empty, types a status check, sends it a second later and ends the pane, which ends only the
-local client. The wake log says `woke cloud-N (30 min quiet)`. An answer to its question, a
-comment starting `<!-- shipline-orchestrator -->` or an unmarked comment from an account that
-may write to the repository, wakes it at once the same way. A worker still quiet that long
+local client. The wake log says `woke cloud-N (30 min quiet)`. Only comments from an account
+that may write to the repository count, as reports and as answers: anyone may comment on a
+public pull request. An answer to its question, a comment starting
+`<!-- shipline-orchestrator -->` or an unmarked one (a reply quoting the question counts; a
+command to a bot such as `@codex review`, or any comment starting with `@`, does not), wakes it
+at once the same way. A worker still quiet that long
 after its wake is named in the wake once, `stuck? cloud-N (60 min, woken once)`, and is not
 woken again in that stretch. An attach that fails (no box, an ended or expired session, a usage
 limit shown, text already in the box) is logged once and never tried again in that stretch.
