@@ -269,21 +269,25 @@ def _answer(
 
 def _question(body: str) -> tuple[str, str, str]:
     """A question's `Owner only:` value ("missing" without the line), its recommended reply and
-    the line of that choice, as the stop hook reads a local session's question: the last such
-    line, then the first reply word after it, digits or quoted words, on one line of at most 60
-    characters that starts with a letter or a digit; without one the reply is empty. The choice's
-    line is the nearest line above `Owner only:` that begins with the reply, or empty."""
+    the line of that choice, as the stop hook reads a local session's question: one such line
+    (two or more keep it for the owner), then the first reply word on the last line after it,
+    digits or quoted words, of at most 60 characters, starting with a letter or a digit; without
+    one the reply is empty. The choice's line is the nearest line above `Owner only:` that
+    begins with the reply, or empty."""
     # Lines as jq splits them: at a newline only.
     lines = _without_attribution(body).split("\n")
-    owner = [
+    marked = [
         (at, match[1].lower())
         for at, line in enumerate(lines)
         if (match := OWNER_ONLY.fullmatch(line))
     ]
-    if not owner:
+    if not marked:
         return "missing", "", ""
-    at, value = owner[-1]
-    found = REPLY.search("\n".join(lines[at + 1 :])) if value == "no" else None
+    if len(marked) > 1:
+        return "yes", "", ""
+    at, value = marked[0]
+    end = max((n for n, line in enumerate(lines) if re.search(rf"(?!{SPACE}).", line)), default=-1)
+    found = REPLY.search(lines[end]) if value == "no" and end > at else None
     reply = next(group for group in found.groups() if group) if found else ""
     if (
         len(reply) > 60

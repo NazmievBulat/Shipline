@@ -1496,6 +1496,9 @@ _SHAPES = [
     "Pick?\nOwner only:\x1fno\nReply 1.",
     "Pick?\r\nOwner only: no\r\nReply 1.",
     "Pick?\nOwner only: yes\nOwner only: no\nReply 2.",
+    "Pick?\nOwner only: no\nReply 1.\nThanks.",
+    "Pick?\nOwner only: no\nReply 1.\n\n  \n",
+    "Pick?\nReply 1.\nOwner only: no",
 ]
 
 
