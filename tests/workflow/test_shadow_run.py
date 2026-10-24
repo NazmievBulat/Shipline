@@ -483,7 +483,7 @@ def test_a_status_check_due_between_the_shadow_and_the_real_tick_is_a_timing_dif
 
     line = "ticket-13 idle 50 min waiting for its own job or turn; status check sent"
     assert line in workflow.wake_log.read_text()
-    assert f"{_NOW} due within 60 s: {line}" in _shadow_log(workflow).read_text()
+    assert f"{_NOW} due within 180 s: {line}" in _shadow_log(workflow).read_text()
     logs = ("--shadow", str(_shadow_log(workflow)), "--wake", str(workflow.wake_log))
     compared = _compare(*logs)
     listed = _compare(*logs, "--timing")
@@ -494,24 +494,29 @@ def test_a_status_check_due_between_the_shadow_and_the_real_tick_is_a_timing_dif
     )
     assert listed.returncode == 0, listed.stdout
     assert listed.stdout.splitlines()[-3:-1] == [
-        "2026-09-21 17:00:20 ticket-13, came due after the shadow tick",
+        "2026-09-21 17:00:20 ticket-13, timing",
         f"  real:   {line.replace('50 min', 'N min')}",
     ]
 
 
-def test_a_status_check_the_shadow_saw_no_reason_for_is_still_a_difference(
-    workflow: Workflow,
+def test_a_decision_only_the_real_tick_took_that_its_shadow_did_not_note_is_still_a_difference(
+    tmp_path: Path,
 ) -> None:
-    # Due 100 s after the shadow tick reads the clock: further than it looks ahead.
-    _settled(workflow)
-    _job_waiting(workflow, _NOW - 50 * 60 + 100)
+    line = "ticket-13 idle 50 min waiting for its own job or turn; status check sent"
+    shadow = (
+        f"{_NOW} shadow tick\n"
+        f"{_NOW} due within 180 s: {line.replace('ticket-13', 'ticket-14')}\n"
+        f"{_NOW + 180} shadow tick\n"
+        f"{_NOW + 180} due within 180 s: {line}\n"
+    )
+    # The real tick after the first shadow tick sent it: the note of the second does not count.
+    wake = f"{_NOW + 90} {line}\n"
 
-    _ticks(workflow, _NOW, late=120)
+    done = _compare(*_logs(tmp_path, shadow, wake, "\n"))
 
-    assert "due within" not in _shadow_log(workflow).read_text()
-    compared = _compare("--shadow", str(_shadow_log(workflow)), "--wake", str(workflow.wake_log))
-    assert compared.returncode == 1
-    assert compared.stdout.splitlines()[2:4] == [
+    assert done.returncode == 1
+    assert done.stdout.splitlines()[:3] == [
+        "2026-09-21 17:01:30 ticket-13",
         "  shadow: (nothing)",
         "  real:   ticket-13 idle N min waiting for its own job or turn; status check sent",
     ]
@@ -533,7 +538,7 @@ def test_a_night_check_in_due_between_the_shadow_and_the_real_tick_is_no_differe
 
     _ticks(workflow, night, night + 180)
 
-    assert "  due within 60 s: every 20 minutes\n" in _shadow_log(workflow).read_text()
+    assert "  due within 180 s: every 20 minutes\n" in _shadow_log(workflow).read_text()
     compared = _compare("--shadow", str(_shadow_log(workflow)), "--wake", str(workflow.wake_log))
     assert compared.returncode == 0, compared.stdout
     assert compared.stdout.splitlines()[-1].endswith(
@@ -553,7 +558,7 @@ def test_a_reset_due_between_the_two_ticks_and_its_check_in_are_timing_differenc
     # The limit resets at 17:00:00; the shadow tick reads 16:59:40, the real one 17:00:00.
     _ticks(workflow, _NOW - 20)
 
-    assert "due within 60 s: ticket-12 was sent its instruction again" in (
+    assert "due within 180 s: ticket-12 was sent its instruction again" in (
         _shadow_log(workflow).read_text()
     )
     journal = workflow.root / "journal"
@@ -572,7 +577,7 @@ def test_a_stuck_session_due_between_the_two_ticks_and_its_check_in_are_timing_d
     tmp_path: Path,
 ) -> None:
     stuck = "stuck? ticket-14 (45 min, running: pytest tests)"
-    shadow = f"{_NOW} shadow tick\n{_NOW} due within 60 s: {stuck}\n"
+    shadow = f"{_NOW} shadow tick\n{_NOW} due within 180 s: {stuck}\n"
     wake = (
         f"{_NOW + 30} {stuck}\n"
         "2026-09-21 17:00:30  every 20 minutes\n"
@@ -634,6 +639,182 @@ def test_a_shadow_tick_stops_at_its_bound_while_the_real_tick_runs_on_time(
     )
 
 
+def test_a_cut_tick_s_own_decisions_and_the_real_ones_beside_it_are_not_compared(
+    tmp_path: Path,
+) -> None:
+    line = "ticket-13 idle 50 min waiting for its own job or turn; status check sent"
+    shadow = (
+        f"{_NOW} shadow tick\n"
+        f"{_NOW} review-10 checks finished on {'a' * 40}; reviewer nudged\n"
+        f"{_NOW + 180} shadow tick\n{_NOW + 180} {line}\n"
+        f"{_NOW + 180} shadow tick cut short after 70 s\n"
+    )
+    # The real tick before the cut one took the same as its shadow tick; the one after the cut
+    # tick took more than the shadow logged before it was stopped.
+    wake = (
+        f"{_NOW + 95} review-10 checks finished on {'a' * 40}; reviewer nudged\n"
+        f"{_NOW + 260} {line}\n"
+        f"{_NOW + 260} stuck? ticket-14 (45 min, running: pytest tests)\n"
+    )
+
+    done = _compare(*_logs(tmp_path, shadow, wake, "\n"))
+
+    assert done.returncode == 0, done.stdout
+    assert done.stdout.endswith(": none differs; 3 beside a shadow tick cut short not compared\n")
+    assert done.stdout.startswith("1 decisions compared")
+
+
+def test_a_real_tick_after_a_shadow_tick_that_did_not_run_is_counted_not_compared(
+    tmp_path: Path,
+) -> None:
+    shadow = f"{_NOW} shadow tick\n{_NOW + 360} shadow tick\n"
+    wake = f"{_NOW + 270} review-10 checks finished on {'a' * 40}; reviewer nudged\n"
+
+    done = _compare(*_logs(tmp_path, shadow, wake, "\n"))
+
+    assert done.returncode == 0, done.stdout
+    assert done.stdout.endswith(": none differs; 1 with no shadow tick beside them not compared\n")
+
+
+def test_a_check_in_with_another_line_of_its_own_is_no_timing_difference(tmp_path: Path) -> None:
+    stuck = "stuck? ticket-14 (45 min, running: pytest tests)"
+    shadow = f"{_NOW} shadow tick\n{_NOW} due within 180 s: {stuck}\n"
+    wake = (
+        f"{_NOW + 80} {stuck}\n"
+        "2026-09-21 17:01:20  every 20 minutes\n"
+        f"  {stuck}\n"
+        "  lost check: CI result of run 123 on pull request 9\n"
+        "  told Check-in: Wake check-in, 17:01.\n"
+    )
+
+    done = _compare(*_logs(tmp_path, shadow, wake, "\n"))
+
+    assert done.returncode == 1
+    assert "  real:   wake: lost check: CI result of run 123 on pull request 9" in done.stdout
+    assert done.stdout.endswith(": 3 differ; 1 came due between a shadow tick and the real one\n")
+
+
+def test_a_check_in_after_a_reset_that_came_due_is_timing_without_the_journal(
+    tmp_path: Path,
+) -> None:
+    shadow = (
+        f"{_NOW} shadow tick\n{_NOW} due within 180 s: ticket-12 was sent its instruction again\n"
+    )
+    wake = (
+        "2026-09-21 17:01:20  after a reset\n"
+        "  the tick sent its instruction again to: ticket-12\n"
+        "  told Check-in: Wake check-in, 17:01, after a reset.\n"
+    )
+
+    done = _compare(*_logs(tmp_path, shadow, wake))
+
+    assert done.returncode == 0, done.stdout
+    assert done.stdout.endswith(
+        ": none differs; 2 came due between a shadow tick and the real one\n"
+    )
+
+
+def test_a_night_check_in_the_morning_ends_before_the_real_wake_is_timing(
+    workflow: Workflow,
+) -> None:
+    morning = _NOW + 15 * 3600 - 75  # 07:58:45 UTC, the shadow tick before the 08:00 tick
+    _settled(workflow)
+    workflow.orchestrator()
+    looked = workflow.root / "home" / ".local" / "state" / "workflow" / "wake.looked"
+    looked.parent.mkdir(parents=True, exist_ok=True)
+    looked.write_text(f"{morning - 1500}\n")
+
+    _ticks(workflow, morning, late=80)
+
+    assert "  ends within 180 s: every 20 minutes\n" in _shadow_log(workflow).read_text()
+    assert not workflow.wake_log.exists() or "every 20 minutes" not in workflow.wake_log.read_text()
+    compared = _compare("--shadow", str(_shadow_log(workflow)), "--wake", str(workflow.wake_log))
+    assert compared.returncode == 0, compared.stdout
+    assert "came due between a shadow tick and the real one" in compared.stdout
+
+
+def test_the_daily_analyst_due_at_eight_is_a_timing_difference(workflow: Workflow) -> None:
+    eight = 1_792_828_800  # 2026-10-24 08:00 UTC
+    report = workflow.repo / ".local" / "analyses" / "metrics-2026-10-24.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("# Workflow metrics\n")
+    workflow.usage(40, datetime.fromtimestamp(eight + 3 * 3600, UTC).isoformat())
+    cache = workflow.root / "home" / ".claude" / "MEMORY" / "STATE" / "usage-cache.json"
+    os.utime(cache, (eight, eight))
+    _settled(workflow)
+    daily = {"WORKFLOW_ANALYST_DAILY_AT": "08:00"}
+
+    shadow = workflow.run_script(
+        "tick", "--shadow", env={**daily, "TZ": "UTC", "WORKFLOW_NOW": str(eight - 75)}
+    )
+    real = workflow.run_script("tick", env={**daily, "TZ": "UTC", "WORKFLOW_NOW": str(eight + 10)})
+
+    assert shadow.returncode == real.returncode == 0, shadow.stderr + real.stderr
+    assert workflow.is_running("analyst-day-2026-10-24")
+    assert f"{eight - 75} due within 180 s: analyst-day-2026-10-24 started" in (
+        _shadow_log(workflow).read_text()
+    )
+    journal = workflow.root / "journal"
+    journal.write_text(_journal(real.stdout, at=eight + 10))
+    compared = _compare(
+        *("--shadow", str(_shadow_log(workflow)), "--wake", str(workflow.wake_log)),
+        *("--journal", str(journal)),
+    )
+    listed = _compare(
+        *("--shadow", str(_shadow_log(workflow)), "--wake", str(workflow.wake_log)),
+        *("--journal", str(journal), "--timing"),
+    )
+    assert compared.returncode == 0, compared.stdout
+    assert "  real:   analyst-day-2026-10-24 started" in listed.stdout, listed.stdout
+    # So did the shadow wake's night look, which the morning ends before the real wake looks.
+    assert "  shadow: wake (every 20 minutes): orchestrator registration" in listed.stdout
+    assert compared.stdout.endswith("2 came due between a shadow tick and the real one\n")
+
+
+def test_the_shadow_tick_s_bound_ends_it_before_the_real_tick_starts() -> None:
+    readme = (_ROOT / "scripts" / "workflow" / "README.md").read_text()
+    tick = (_ROOT / "scripts" / "workflow" / "tick").read_text()
+
+    # The timer fires at :45 of the minute before each real tick, 75 seconds ahead of it.
+    assert re.search(r"OnCalendar=\*:1/3:45\n", readme)
+    bound = re.search(r"^SHADOW_SECONDS=\$\{WORKFLOW_SHADOW_SECONDS:-(\d+)\}$", tick, re.M)
+    assert bound and int(bound[1]) + 5 <= 75
+    assert "TimeoutStartSec=75" in readme
+    assert "every `Environment=` line" in readme
+
+
+def test_the_bounded_shadow_tick_is_shipline_s_own_whatever_folder_it_starts_in(
+    workflow: Workflow,
+) -> None:
+    home = install_shipline(workflow)
+    # The repository keeps a tick of its own, from before shadow ticks: run, it would act.
+    own = workflow.repo / "scripts" / "workflow" / "tick"
+    own.parent.mkdir(parents=True)
+    own.write_text(f'#!/bin/bash\ntouch "{workflow.state}/the-repository-s-own-tick-ran"\n')
+
+    done = subprocess.run(
+        ["bash", "scripts/workflow/tick", "--shadow"],
+        cwd=home,
+        env={**workflow.env, **_CLOCK, "SHIPLINE_REPO": str(workflow.repo)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert not (workflow.state / "the-repository-s-own-tick-ran").exists()
+    assert _shadow_log(workflow).read_text().startswith(f"{_NOW} shadow tick\n")
+
+
+def test_a_shadow_tick_takes_no_clock_but_a_time(workflow: Workflow) -> None:
+    done = workflow.run_script("tick", "--shadow", env={"SHIPLINE_SHADOW_BOUND": "$(touch x)"})
+
+    assert done.returncode == 2
+    assert done.stderr == "SHIPLINE_SHADOW_BOUND is no time\n"
+    assert not (workflow.repo / "x").exists()
+
+
 def test_the_readme_runs_the_shadow_tick_on_a_timer_of_its_own_and_bounds_it() -> None:
     readme = (_ROOT / "scripts" / "workflow" / "README.md").read_text()
 
@@ -642,9 +823,9 @@ def test_the_readme_runs_the_shadow_tick_on_a_timer_of_its_own_and_bounds_it() -
         "ExecStart=<path of the Shipline checkout>/bin/shipline --repo <checkout> tick --shadow"
         in readme
     )
-    assert "TimeoutStartSec=150" in readme
-    # 15 seconds before each of the tick's (`OnCalendar=*:0/3` in install-timer).
-    assert "OnCalendar=*:2/3:45" in readme
+    assert "TimeoutStartSec=75" in readme
+    # 75 seconds before each of the tick's (`OnCalendar=*:0/3` in install-timer).
+    assert "OnCalendar=*:1/3:45" in readme
     assert "OnCalendar=*:0/3" in (_ROOT / "scripts" / "workflow" / "install-timer").read_text()
 
 
@@ -1072,7 +1253,7 @@ def test_a_journal_line_counts_from_the_start_of_its_service(tmp_path: Path) -> 
     """A start prints its line once its session is up, minutes into the tick."""
     shadow = f"{_NOW} shadow tick\n{_NOW} ticket-7 started\n{_NOW + 890} shadow tick\n"
     journal = (
-        f"{_NOW - 1}.0 example-host systemd[1]: Starting workflow-tick.service - Workflow tick...\n"
+        f"{_NOW + 75}.0 example-host systemd[1]: Starting workflow-tick.service - Tick...\n"
         f"{_NOW + 400}.0 example-host bash[7]: ticket-7 started: https://example.com/s\n"
         f"{_NOW + 410}.0 example-host systemd[1]: Finished workflow-tick.service - Workflow tick.\n"
         f"{_NOW + 900}.0 example-host bash[8]: ticket-8 started: https://example.com/t\n"

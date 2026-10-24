@@ -134,10 +134,13 @@ checkout, readable by its owner alone, and leaves every note of the installation
 reads of GitHub are real calls, counted in the machine's shared GitHub budget beside the
 tick's own, and a reviewer's head pushed from elsewhere is fetched as the real tick fetches it.
 
-Each shadow tick runs on a timer of its own, 15 seconds before each of the installation's ticks
-(theirs runs every 3 minutes, up to 25 seconds late), so both read the same state and neither
-waits for the other. A shadow tick stops itself after 120 seconds, whatever it waits for, and
-its log says so; its service's own timeout is the last bound. The owner writes the two units:
+Each shadow tick runs on a timer of its own, 75 seconds before each of the installation's ticks
+(theirs runs every 3 minutes, up to 25 seconds late), and stops itself after 70 seconds, whatever
+it waits for, logging that it was cut short: so it reads the state the real tick will read, has
+ended before the real tick starts, and never holds it back. Its service's own timeout is the
+last bound. The owner writes the two units, the service with every `Environment=` line of the
+installation's `workflow-tick.service` (its `PATH`, its `TMUX_TMPDIR`, its own `WORKFLOW_*`
+settings), so that the shadow tick finds the same sessions and settings:
 
     # ~/.config/systemd/user/shipline-shadow.service
     [Unit]
@@ -146,13 +149,13 @@ its log says so; its service's own timeout is the last bound. The owner writes t
     [Service]
     Type=oneshot
     WorkingDirectory=<checkout>
-    Environment="PATH=<the PATH the installation's tick has>"
+    <every Environment= line of workflow-tick.service>
     ExecStart=<path of the Shipline checkout>/bin/shipline --repo <checkout> tick --shadow
-    TimeoutStartSec=150
+    TimeoutStartSec=75
 
     # ~/.config/systemd/user/shipline-shadow.timer
     [Timer]
-    OnCalendar=*:2/3:45
+    OnCalendar=*:1/3:45
     AccuracySec=1s
 
     [Install]

@@ -60,21 +60,22 @@
 # `tick --shadow` (`shipline tick --shadow`) takes the same decisions and carries out none: no push,
 # no label, no merge, no message, no session started, stopped or typed into, and no note of the
 # tick, the gate or the wake written. It runs beside an installation that still runs its own copy of
-# the scripts, on a timer of its own just before that installation's own tick, never holding it
-# back, and shows whether Shipline decides as that copy does (`tools/compare-shadow`). It stops
+# the scripts, on a timer of its own 75 seconds before that installation's own tick, ending before
+# it starts, and shows whether Shipline decides as that copy does (`tools/compare-shadow`). It stops
 # itself after SHADOW_SECONDS and logs that it was cut short. What is not yet due but comes due
-# within SHADOW_AHEAD_SECONDS, the time the real tick reads its clock later, it logs as `due within
-# 60 s: <decision>`, and so does its wake. Each decision is one line of `.local/shipline/shadow.log`
-# in the main checkout, in the words the real tick logs it in: the wake log's for the nudges, the
-# session command's for a stop, a squeeze, a resend, a bridge and a start (without its link or
-# figures), and the wake's check-in. It reads all the real tick reads, the merge line as last saved
-# (the gate's read path, without its lock), and notes the train status whenever it changed. It does
-# not run what only carries decisions out or keeps records: the metrics, the cloud workers' poll,
-# the worktree cleanup (it only drops from its list the sessions cleanup stops, of a pull request
-# closed without merging), main's report, the merge driver and the automatic ticket start. A start
-# is logged when `session start` would make it: no session of its pull request running, room for it,
-# and for a reviewer the checks of `reviewer_start.py` (and of the merge driver, for a hand-back's).
-# Its own lock keeps a second shadow tick out, and never the real one.
+# within SHADOW_AHEAD_SECONDS, before the next shadow tick, it logs as `due within 180 s:
+# <decision>`, the decision the real tick between the two may take alone; so does its wake. Each
+# decision is one line of `.local/shipline/shadow.log` in the main checkout, in the words the real
+# tick logs it in: the wake log's for the nudges, the session command's for a stop, a squeeze, a
+# resend, a bridge and a start (without its link or figures), and the wake's check-in. It reads all
+# the real tick reads, the merge line as last saved (the gate's read path, without its lock), and
+# notes the train status whenever it changed. It does not run what only carries decisions out or
+# keeps records: the metrics, the cloud workers' poll, the worktree cleanup (it only drops from its
+# list the sessions cleanup stops, of a pull request closed without merging), main's report, the
+# merge driver and the automatic ticket start. A start is logged when `session start` would make it:
+# no session of its pull request running, room for it, and for a reviewer the checks of
+# `reviewer_start.py` (and of the merge driver, for a hand-back's). Its own lock keeps a second
+# shadow tick out, and never the real one.
 set -uo pipefail
 
 # A session that holds more than this while idle is squeezed.
@@ -108,11 +109,12 @@ ANALYST_DAILY_AT=${WORKFLOW_ANALYST_DAILY_AT-08:00}
 # The 5-hour usage window above which, unless it resets within the hour, nothing starts.
 USAGE_CEILING=85
 
-# A shadow tick ends after this many seconds, whatever it waits for; a test names another.
-SHADOW_SECONDS=${WORKFLOW_SHADOW_SECONDS:-120}
-# How far past its own clock a shadow tick looks for what comes due: the real tick reads its
-# clock up to this much later.
-SHADOW_AHEAD_SECONDS=60
+# A shadow tick ends after this many seconds, whatever it waits for: it starts 75 seconds before
+# the real tick, and ends before it. A test names another.
+SHADOW_SECONDS=${WORKFLOW_SHADOW_SECONDS:-70}
+# How far past its own clock a shadow tick looks for what comes due: until the next shadow tick,
+# as the real tick between the two reads its clock later.
+SHADOW_AHEAD_SECONDS=180
 
 shadow=0
 if (($#)); then
@@ -150,17 +152,20 @@ cd "$main" || exit 1
 # A shadow tick runs under its own bound, as a tick of its own beside the real one: at its end it
 # is stopped, and its log says so, so that `compare-shadow` leaves out the real tick beside it.
 if ((shadow)) && [[ -z ${SHIPLINE_SHADOW_BOUND:-} ]]; then
-  SHIPLINE_SHADOW_BOUND=$NOW timeout --kill-after=5 "$SHADOW_SECONDS" \
-    bash "${BASH_SOURCE[0]}" --shadow
+  SECONDS=0
+  SHIPLINE_SHADOW_BOUND=$NOW timeout --kill-after=5 "$SHADOW_SECONDS" bash "$here/tick" --shadow
   status=$?
   log=$main/.local/shipline/shadow.log
-  if ((status == 124 || status == 137)) && [[ -f $log && ! -L $log ]]; then
+  # 124 when the bound stopped it, 137 when it had to be killed after that.
+  if ((status == 124 || (status == 137 && SECONDS >= SHADOW_SECONDS))) &&
+      [[ -f $log && ! -L $log ]]; then
     printf '%s shadow tick cut short after %s s\n' "$NOW" "$SHADOW_SECONDS" >>"$log"
   fi
   exit "$status"
 fi
 # The bounded tick reads the clock as the one that started it.
 if ((shadow)); then
+  [[ $SHIPLINE_SHADOW_BOUND =~ ^[0-9]+$ ]] || { echo "SHIPLINE_SHADOW_BOUND is no time" >&2; exit 2; }
   NOW=$SHIPLINE_SHADOW_BOUND
   unset SHIPLINE_SHADOW_BOUND
   # Stopped at its bound, it still removes what it made.
@@ -210,9 +215,10 @@ trap 'rm -rf "$WORKFLOW_TRAIN_TICK"' EXIT
 shadow_note() {
   printf '%s %s\n' "$NOW" "$*" >>"$SHIPLINE_SHADOW"
 }
-# What a shadow tick finds not yet due, but due within SHADOW_AHEAD_SECONDS, the time the real
-# tick reads its clock later: the decision the real tick may take alone, in its own words, on a
-# line `compare-shadow` reads as the reason. Given the seconds until it comes due.
+# What a shadow tick finds not yet due, but due within SHADOW_AHEAD_SECONDS, before the next
+# shadow tick: the decision the real tick between the two, which reads its clock later, may take
+# alone, in its own words, on a line `compare-shadow` reads as the reason. Given the seconds
+# until it comes due.
 shadow_due() {
   local until=$1
   shift
@@ -516,9 +522,16 @@ usage_allows_start() {
 # another start's lock, a fetch that failed). A start that failed otherwise is not tried again
 # that day; a session it left is noted for the wake as an analysis without its report.
 start_daily_analyst() {
-  local day name=day days=1 why last=0 failed_mark
+  local day name=day days=1 why last=0 failed_mark at due=0
   [[ $ANALYST_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] || return 0
-  ((10#$(date -u -d "@$NOW" +%H%M) >= 10#${BASH_REMATCH[1]}${BASH_REMATCH[2]})) || return 0
+  if ! ((10#$(date -u -d "@$NOW" +%H%M) >= 10#${BASH_REMATCH[1]}${BASH_REMATCH[2]})); then
+    # A shadow tick notes the start that comes due before the next one (`shadow_due`).
+    ((shadow)) || return 0
+    at=$(date -u -d "$(date -u -d "@$NOW" +%F) ${BASH_REMATCH[1]}:${BASH_REMATCH[2]}" +%s) ||
+      return 0
+    due=$((at - NOW))
+    ((due > 0 && due <= SHADOW_AHEAD_SECONDS)) || return 0
+  fi
   day=$(date -u -d "@$NOW" +%F)
   [[ -e $main/.local/analyses/metrics-$day.md ]] || return 0
   if [[ $(date -u -d "@$NOW" +%u) == 7 ]]; then
@@ -531,8 +544,14 @@ start_daily_analyst() {
   [[ ! -r $main/$SHIPLINE_STATE_FOLDER/last-start ]] ||
     read -r last _ <"$main/$SHIPLINE_STATE_FOLDER/last-start" || true
   [[ $last =~ ^[0-9]+$ ]] || last=0
+  if ((due)); then
+    usage_allows_start >/dev/null && shadow_due "$due" "analyst-$name started"
+    return 0
+  fi
   if ((NOW - last < 5 * 60)); then
     say "the daily analyst waits: a session started in the last 5 minutes"
+    ((shadow)) && usage_allows_start >/dev/null &&
+      shadow_due $((last + 5 * 60 - NOW)) "analyst-$name started"
     return 0
   fi
   if ! why=$(usage_allows_start); then
