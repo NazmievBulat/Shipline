@@ -237,6 +237,22 @@ def test_main_s_push_and_the_merge_queue_are_not_filtered() -> None:
     assert re.search(r"^  push:\n    branches: \[main\]\n  merge_group:\n\n", triggers, re.M)
 
 
+def test_a_draft_s_run_never_cancels_a_ready_run() -> None:
+    """A last push to a draft and its marking ready come moments apart: were the draft's run
+    queued second in the same group, it would cancel the ready run and leave the head with no CI.
+    A draft's runs have a group of their own; a newer push still cancels an older run."""
+    text = _CI.read_text()
+    group = re.search(r"^concurrency:\n  group: (.+)\n  cancel-in-progress: (.+)$", text, re.M)
+
+    assert group
+    assert group[1] == (
+        "ci-${{ github.event_name }}-${{ github.event_name == 'pull_request'"
+        " && format('{0}-draft-{1}', github.ref, github.event.pull_request.draft)"
+        " || github.sha }}"
+    )
+    assert group[2] == "${{ github.event_name == 'pull_request' }}"
+
+
 @pytest.fixture(scope="module")
 def gate() -> Any:
     sys.path.insert(0, str(_SCRIPTS))
