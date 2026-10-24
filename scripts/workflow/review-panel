@@ -37,6 +37,19 @@ run_one() {
   git -C "$main" worktree remove --force "$checkout" >/dev/null 2>&1 || true
 }
 
+# The tests a conflict's resolution reaches from `base`, by the repository's selection of one
+# kind (`server` or `browser`, its words after the base), given the conflicting files. Without a
+# server selection the whole server suite is reached; without a browser one no spec is selected.
+select_tests() {
+  local kind=$1 base=$2
+  shift 2
+  if (($# > 0)); then
+    "$@" "$base" --files-from .review/conflict-files.txt
+  elif [[ $kind == server ]]; then
+    jq -n '{whole: true, tests: [], total: 0, reasons: ["no server test selection is configured"]}'
+  fi
+}
+
 number=${1:-}
 [[ $number =~ ^[0-9]+$ ]] || { echo "usage: review-panel N [cursor|codex ...]" >&2; exit 2; }
 shift
@@ -86,14 +99,16 @@ if [[ $full_review == false && -f $main/$SHIPLINE_STATE_FOLDER/review-$number.co
   python3 -B "$here/conflict_review.py" panel "$main/$SHIPLINE_STATE_FOLDER" "$number" "$inputs" "$head" <<<"$reviews"
   scope_result=$?
   if ((scope_result == 0)); then
-    # The repository's own test selectors, in its main checkout's `scripts/workflow`.
-    if ! (cd "$inputs" && python3 -B "$main/scripts/workflow/server_tests_for_changes.py" "$head^1" --files-from .review/conflict-files.txt > .review/server-tests.json &&
-        python3 -B "$main/scripts/workflow/browser_tests_for_changes.py" "$head^1" --files-from .review/conflict-files.txt > .review/browser-tests.txt); then
+    # The repository's own test selections (`shipline.json`).
+    if ! (cd "$inputs" && select_tests server "$head^1" "${SHIPLINE_COMMAND_SERVER_TESTS_FOR_CHANGES[@]}" > .review/server-tests.json &&
+        select_tests browser "$head^1" "${SHIPLINE_COMMAND_BROWSER_TESTS_FOR_CHANGES[@]}" > .review/browser-tests.txt); then
       git worktree remove --force "$inputs" >/dev/null 2>&1
       echo "could not select tests for the conflict resolution" >&2
       exit 1
     fi
     cp "$inputs/.review/"{diff.patch,task.md,weaker-tests.md,conflict-files.txt,server-tests.json,browser-tests.txt} "$root/"
+    ((${#SHIPLINE_COMMAND_BROWSER_TESTS_FOR_CHANGES[@]} > 0)) ||
+      echo "no browser test selection is configured, so CI runs the whole browser suite"
     scope_key=$(sha256sum "$root/task.md" "$root/diff.patch" | sha256sum | cut -d' ' -f1)
   elif ((scope_result == 2)); then
     cp "$inputs/.review/task.md" "$root/task.md"

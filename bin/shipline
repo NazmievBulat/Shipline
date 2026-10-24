@@ -30,9 +30,24 @@ COMMANDS=(
   weaker-tests
 )
 
+# The repository's own commands its `shipline.json` names under `commands` (`hunt-app` for
+# `hunt_app`), run with the arguments given in the current folder.
+CONFIGURED=(
+  browser-tests-for-changes
+  server-tests-for-changes
+  pre-train-checks
+  mechanical-conflicts
+  browser-plan
+  hunt-app
+  hunt-browser
+  hunt-cursor
+  advisory-watch
+  push-checkout
+)
+
 usage() {
   echo "usage: shipline [--repo <path>] <command> [arguments]" >&2
-  echo "commands: ${COMMANDS[*]}" >&2
+  echo "commands: ${COMMANDS[*]} ${CONFIGURED[*]}" >&2
   exit 2
 }
 
@@ -74,6 +89,23 @@ command=$1
 shift
 for known in "${COMMANDS[@]}"; do
   [[ $command != "$known" ]] || exec bash "$home/scripts/workflow/$command" "$@"
+done
+for known in "${CONFIGURED[@]}"; do
+  [[ $command == "$known" ]] || continue
+  config=$(python3 "$home/scripts/workflow/workflow_config.py" shell) || exit 1
+  eval "$config"
+  key=${command//-/_}
+  declare -n words="SHIPLINE_COMMAND_${key^^}"
+  if ((${#words[@]} > 0)); then
+    exec "${words[@]}" "$@"
+  fi
+  # Without a selection nothing is selected, which is no failure: CI runs the whole suite.
+  if [[ $command == *-tests-for-changes ]]; then
+    echo "this repository names no $key command in shipline.json: no test is selected, and CI runs the whole suite" >&2
+    exit 0
+  fi
+  echo "this repository names no $key command in shipline.json" >&2
+  exit 1
 done
 echo "shipline: unknown command $command" >&2
 usage

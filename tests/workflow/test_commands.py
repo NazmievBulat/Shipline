@@ -6,11 +6,17 @@ folder and what it read, and answers as the test says. Each is tried named and l
 
 import importlib.util
 import json
+import re
+import shlex
 import subprocess
 import textwrap
 from pathlib import Path
 
 import pytest
+from workflow.test_conflict_review import (  # pyright: ignore[reportPrivateUsage]
+    _panel_conflict,
+    _resolve,
+)
 from workflow.test_merge_driver import (  # pyright: ignore[reportPrivateUsage]
     _mechanical_conflict,
     _started,
@@ -18,7 +24,7 @@ from workflow.test_merge_driver import (  # pyright: ignore[reportPrivateUsage]
 from workflow.test_merge_driver import handed as handed_fixture
 from workflow.test_merge_when_current import GitHub
 from workflow.test_merge_when_current import github as github_fixture
-from workflow_harness import Workflow
+from workflow_harness import Workflow, install_shipline, session_arguments
 
 github = github_fixture
 handed = handed_fixture
@@ -788,3 +794,232 @@ def test_without_an_advisory_watch_no_audit_is_read_as_an_outage(github: GitHub)
 
     assert done.stdout == "None False\n", done.stderr
     assert not [call for call in github.workflow.calls("gh") if "annotations" in call]
+
+
+# The review panel's tests reached by a conflict's resolution
+
+
+def _conflict_round(workflow: Workflow) -> Path:
+    """A conflict round of pull request 7 the panel can prove; its panel folder."""
+    _panel_conflict(workflow)
+    resolved = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", resolved)
+    return workflow.repo / ".local/workflow/reviews/7" / resolved
+
+
+def test_the_panel_asks_the_repository_which_tests_a_resolution_reaches(
+    workflow: Workflow,
+) -> None:
+    _stand_in(workflow, "example-server-tests", '{"whole": false, "tests": ["tests/test_a.py"]}')
+    _stand_in(workflow, "example-browser-tests", "tests/browser/a.spec.ts\n")
+    _configure(
+        workflow,
+        server_tests_for_changes="example-server-tests --quiet",
+        browser_tests_for_changes="example-browser-tests",
+    )
+    root = _conflict_round(workflow)
+    head = root.name
+
+    done = workflow.run_script("review-panel", "7")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (root / "server-tests.json").read_text() == (
+        '{"whole": false, "tests": ["tests/test_a.py"]}'
+    )
+    assert (root / "browser-tests.txt").read_text() == "tests/browser/a.spec.ts\n"
+    calls = workflow.calls("example-")
+    words = f"{head}^1 --files-from .review/conflict-files.txt"
+    assert [re.sub(r"\(in .*/inputs\.\w+\)$", "(in inputs)", call) for call in calls] == [
+        f"example-server-tests --quiet {words} (in inputs)",
+        f"example-browser-tests {words} (in inputs)",
+    ]
+
+
+def test_without_test_selections_the_panel_says_the_whole_suites_run(workflow: Workflow) -> None:
+    _configure(workflow, server_tests_for_changes=None, browser_tests_for_changes=None)
+    root = _conflict_round(workflow)
+
+    done = workflow.run_script("review-panel", "7")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert json.loads((root / "server-tests.json").read_text()) == {
+        "whole": True,
+        "tests": [],
+        "total": 0,
+        "reasons": ["no server test selection is configured"],
+    }
+    assert (root / "browser-tests.txt").read_text() == ""
+    assert "no browser test selection is configured, so CI runs the whole browser suite" in (
+        done.stdout
+    )
+
+
+def test_a_test_selection_that_fails_stops_the_panel(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-server-tests", "cannot read the tests", status=1)
+    _configure(workflow, server_tests_for_changes="example-server-tests")
+    _conflict_round(workflow)
+
+    done = workflow.run_script("review-panel", "7")
+
+    assert done.returncode == 1
+    assert "could not select tests for the conflict resolution" in done.stderr
+
+
+# Hunts
+
+
+def test_without_a_hunt_app_a_hunt_is_refused_in_a_sentence(workflow: Workflow) -> None:
+    _configure(workflow, hunt_app=None)
+
+    done = workflow.run("start", "hunt", "phone-1")
+
+    assert done.returncode == 1
+    assert done.stderr.strip() == (
+        "this repository names no hunt_app command in shipline.json, so a hunt has no app to use"
+    )
+    assert not workflow.hunt_worktree("phone-1").exists()
+    assert not workflow.calls("tmux")
+
+
+def test_without_a_cursor_hunter_a_cursor_hunt_is_refused_in_a_sentence(
+    workflow: Workflow,
+) -> None:
+    _stand_in(workflow, "example-hunt-app")
+    _configure(workflow, hunt_app="example-hunt-app", hunt_cursor=None)
+
+    done = workflow.run("start", "hunt", "phone-1", "plan", "cursor")
+
+    assert done.returncode == 1
+    assert done.stderr.strip() == (
+        "this repository names no hunt_cursor command in shipline.json, so it has no Cursor hunter"
+    )
+    assert not workflow.calls("tmux")
+
+
+def _hunt_command(workflow: Workflow, name: str) -> str:
+    """The command line a hunt's `tmux` session was started with."""
+    return session_arguments(workflow.state, name)[-1]
+
+
+def test_a_cursor_hunt_runs_the_repository_s_cursor_hunter(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-hunt-app")
+    _configure(workflow, hunt_app="example-hunt-app", hunt_cursor="example-cursor --sandbox")
+
+    done = workflow.run("start", "hunt", "phone-1", "plan", "cursor")
+
+    worktree = workflow.hunt_worktree("phone-1")
+    report = workflow.hunt_report("phone-1")
+    command = _hunt_command(workflow, "hunt-phone-1")
+    assert command.startswith("example-cursor --sandbox "), done.stdout + done.stderr
+    words = shlex.split(command.split(" 2>&1 | tee ")[0])
+    assert words == [
+        "example-cursor",
+        "--sandbox",
+        str(worktree),
+        str(report),
+        "Hunt for bugs with a plan, as hunt-phone-1, "
+        "by the section Hunt for bugs of AGENTS.md in this worktree",
+    ]
+    assert command.endswith(f" 2>&1 | tee {report}/cursor.log")
+
+
+@pytest.mark.parametrize("browser", [None, "tools/shipline/hunt-browser.mjs"])
+def test_a_hunter_is_told_to_drive_the_browser_with_the_repository_s_command(
+    workflow: Workflow, browser: str | None
+) -> None:
+    _stand_in(workflow, "example-hunt-app")
+    _configure(workflow, hunt_app="example-hunt-app", hunt_browser=browser)
+
+    done = workflow.run("start", "hunt", "phone-1")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    sentence = (
+        "Hunt for bugs with a plan, as hunt-phone-1, "
+        "by the section Hunt for bugs of AGENTS.md in this worktree"
+    )
+    if browser:
+        sentence += "; drive the browser with shipline hunt-browser"
+    assert _hunt_command(workflow, "hunt-phone-1").endswith(f'"{sentence}"')
+
+
+def test_a_stopped_hunt_s_application_is_stopped_by_the_repository_s_command(
+    workflow: Workflow,
+) -> None:
+    _stand_in(workflow, "example-hunt-app")
+    _configure(workflow, hunt_app="example-hunt-app --quiet")
+    workflow.add_hunt("phone-1")
+    workflow.running("hunt-phone-1")
+
+    done = workflow.run("stop", "hunt-phone-1")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("example-hunt-app") == [
+        f"example-hunt-app --quiet stop (in {workflow.repo})"
+    ]
+
+
+def test_without_a_hunt_app_a_stopped_hunt_stops_no_application(workflow: Workflow) -> None:
+    _configure(workflow, hunt_app=None)
+    workflow.add_hunt("phone-1")
+    workflow.running("hunt-phone-1")
+
+    done = workflow.run("stop", "hunt-phone-1")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+# `shipline <command>`, as a session runs the repository's commands
+
+
+def test_shipline_runs_the_repository_s_command_by_its_name(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    _stand_in(workflow, "example-selection", "tests/browser/a.spec.ts\n")
+    _configure(workflow, browser_tests_for_changes="example-selection --local")
+    worktree = workflow.add_worktree(7)
+
+    done = workflow.shipline(
+        "browser-tests-for-changes",
+        "origin/main",
+        "--run",
+        cwd=worktree,
+        env={"SHIPLINE_REPO": str(workflow.repo)},
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "tests/browser/a.spec.ts\n"
+    assert workflow.calls("example-selection") == [
+        f"example-selection --local origin/main --run (in {worktree})"
+    ]
+
+
+@pytest.mark.parametrize("name", ["browser-tests-for-changes", "server-tests-for-changes"])
+def test_without_a_selection_shipline_selects_nothing_and_says_the_whole_suite_runs(
+    workflow: Workflow, name: str
+) -> None:
+    install_shipline(workflow)
+
+    done = workflow.shipline(name, "origin/main")
+
+    key = name.replace("-", "_")
+    assert done.returncode == 0
+    assert done.stdout == ""
+    assert done.stderr == (
+        f"this repository names no {key} command in shipline.json: "
+        "no test is selected, and CI runs the whole suite\n"
+    )
+
+
+def test_without_a_command_shipline_says_the_repository_has_none(workflow: Workflow) -> None:
+    install_shipline(workflow)
+
+    done = workflow.shipline("hunt-browser", "open", "/")
+
+    assert done.returncode == 1
+    assert done.stderr == "this repository names no hunt_browser command in shipline.json\n"
+
+
+def test_shipline_knows_every_command_a_repository_may_name() -> None:
+    launcher = (_WORKFLOW.parents[1] / "bin" / "shipline").read_text()
+    listed = launcher.split("CONFIGURED=(\n", 1)[1].split(")", 1)[0].split()
+
+    assert listed == [name.replace("_", "-") for name in _COMMANDS]
