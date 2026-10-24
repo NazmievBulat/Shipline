@@ -451,6 +451,31 @@ done
 """
 
 
+# Placed first on the scripts' `PYTHONPATH` by `Workflow.refuse_write`. It finds the file each
+# `os.write` goes to through `/proc/self/fd` and raises for the files the test named. It hides
+# a `sitecustomize` the system Python may bring, which the scripts do not need.
+_REFUSING_WRITE = """import json
+import os
+
+with open(@REFUSED@) as refused_file:
+    _refused = json.load(refused_file)
+_write = os.write
+
+
+def _refusing_write(fd, data, /):
+    try:
+        target = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        target = None
+    if target in _refused:
+        raise OSError(_refused[target], os.strerror(_refused[target]))
+    return _write(fd, data)
+
+
+os.write = _refusing_write
+"""
+
+
 @dataclass
 class Push:
     """One call of the stand-in `curl`."""
@@ -616,6 +641,23 @@ class Workflow:
         self.hunt_report(name).mkdir(parents=True)
         return path
 
+    def analyst_worktree(self, name: str) -> Path:
+        """The worktree of the analyst `analyst-<name>`: a copy of `main`, on no branch."""
+        return self.repo / ".claude" / "worktrees" / f"analyst-{name}"
+
+    def analysis_report(self, name: str) -> Path:
+        """Where the analyst `analyst-<name>` leaves its report: in the main checkout, kept."""
+        return self.repo / ".local" / "analyses" / name
+
+    def add_analyst(self, name: str) -> Path:
+        """An analyst whose worktree and report folder already exist, as after `start analyst`."""
+        path = self.analyst_worktree(name)
+        self.git("worktree", "add", "--quiet", "--detach", str(path), "origin/main")
+        (path / ".local" / "workflow").mkdir(parents=True)
+        (path / ".local" / "workflow" / f"analyst-{name}.started").touch()
+        self.analysis_report(name).mkdir(parents=True)
+        return path
+
     def add_pull_request(
         self,
         number: int,
@@ -766,6 +808,21 @@ class Workflow:
     def wake_log(self) -> Path:
         return self.root / "home" / ".local" / "state" / "workflow" / "wake.log"
 
+    def refuse_write(self, file: Path, error: int) -> None:
+        """Makes each `os.write` of the scripts' Python to `file` raise a real `OSError(error)`.
+
+        Writes to every other file go through.
+        """
+        hooks = self.root / "python-hooks"
+        hooks.mkdir(exist_ok=True)
+        listed = hooks / "refused.json"
+        refused = json.loads(listed.read_text()) if listed.exists() else {}
+        refused[str(file.resolve())] = error
+        listed.write_text(json.dumps(refused))
+        hook = _REFUSING_WRITE.replace("@REFUSED@", repr(str(listed)))
+        (hooks / "sitecustomize.py").write_text(hook)
+        self.env["PYTHONPATH"] = str(hooks)
+
     def fake(self, tool: str, text: str) -> None:
         path = self.bin / tool
         path.write_text(text.replace("@STATE@", str(self.state)).replace("@TOOL@", tool))
@@ -824,6 +881,8 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
         # The tick's daily metrics run reads GitHub in the background; a test that wants it names
         # its time.
         "WORKFLOW_METRICS_DAILY_AT": "",
+        # Nor does the tick start its daily analyst unless a test names the time.
+        "WORKFLOW_ANALYST_DAILY_AT": "",
     }
     made = Workflow(root=tmp_path, repo=tmp_path / "repo", state=state, bin=bin_folder, env=env)
     made.fake("gh", _FAKE_GH)
