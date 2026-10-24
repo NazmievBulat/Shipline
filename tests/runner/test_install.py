@@ -6,6 +6,7 @@ they were asked: nothing is installed on the machine the tests run on."""
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -341,6 +342,64 @@ def test_a_count_that_is_not_a_number_is_refused(machine: Path) -> None:
 
     assert done.returncode != 0
     assert not _installed(machine).exists()
+
+
+@pytest.mark.parametrize(
+    ("named", "folder"),
+    [(None, ".config/shipline-runner"), ("~/.config/example-app-runner", ".config/example-app-runner")],
+)
+def test_the_runners_read_their_identity_where_the_repository_names_it(
+    machine: Path, named: str | None, folder: str
+) -> None:
+    """An installation keeps the runners' GitHub identity it has: the installed runner programs
+    read it in the folder `runner.identity_folder` names, `~/.config/shipline-runner` by default."""
+    runner = _RUNNER if named is None else {**_RUNNER, "identity_folder": named}
+    _repository(machine, runner)
+    _settings(machine)
+    identity = machine / "home" / folder
+    identity.mkdir(parents=True, mode=0o700)
+    (identity / "token").write_text("example-identity\n")
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    seen = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]); import github_identity; "
+            "print(github_identity.folder()); print(github_identity.configured())",
+            str(_installed(machine)),
+        ],
+        env=_env(machine),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert seen == [str(identity), "True"]
+    assert f"their own GitHub identity, from {identity}." in done.stdout
+
+
+def test_a_service_that_restarts_while_the_images_build_finds_its_settings(machine: Path) -> None:
+    """install.sh copies the new scripts before the images build, which takes minutes, and stops
+    the running services after it: one that restarts meanwhile runs the new scripts, and finds the
+    names they need beside them."""
+    restart = (
+        'cd "$RUNNER_FILES" && '
+        'sh -c ". ./settings.sh; . ./pool-settings.sh; . ./names.sh; echo \\$container" >> "$BUILT"'
+    )
+    _repository(machine, {**_RUNNER, "image_build": restart})
+    _settings(machine)
+    # What an install before the prefix wrote.
+    _installed(machine).mkdir(parents=True)
+    (_installed(machine) / "pool-settings.sh").write_text(
+        "machine=home\nroles='main ordinary planner'\nother_machines='office'\nordinary_jobs=2\n"
+    )
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert (machine / "built").read_text() == "example-app-runner\n"
 
 
 _BOUNDS = "balance_ordinary=2-5\nbalance_docker=0-1\nbalance off\n"

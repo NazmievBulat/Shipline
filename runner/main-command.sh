@@ -32,23 +32,30 @@ on_main() {
       ;;
   esac
   files=$HOME/.local/state/$prefix-runner/main/$key${1:+-$1}
-  commit=$(git -C "$from" rev-parse refs/remotes/origin/main)
-  if [ "$(cat "$files.commit" 2>/dev/null)" != "$commit" ]; then
-    rm -rf "$files" "$files.commit"
-    mkdir -p "$files"
-    git -C "$from" archive --format=tar "$commit" | tar -x -C "$files"
-    printf '%s\n' "$commit" >"$files.commit"
-  fi
-  command=
-  if [ -f "$files/shipline.json" ]; then
-    command=$(jq -r --arg key "$key" '.runner[$key] // empty' "$files/shipline.json")
-  fi
-  if [ -z "$command" ]; then
-    echo "main's shipline.json names no runner.$key (runner/README.md)" >&2
-    return 1
-  fi
+  mkdir -p "${files%/*}"
+  # One run of a folder at a time: a second one (the install's build while the timer's runs) waits,
+  # so it never takes away the files of the run under way. The command itself does not hold the
+  # lock's descriptor, so nothing it leaves running keeps the lock; it is not the subshell's last
+  # command either, which sh would run in the subshell's place and so let the lock go.
   (
+    flock 9
+    commit=$(git -C "$from" rev-parse refs/remotes/origin/main)
+    if [ "$(cat "$files.commit" 2>/dev/null)" != "$commit" ]; then
+      rm -rf "$files" "$files.commit"
+      mkdir -p "$files"
+      git -C "$from" archive --format=tar "$commit" | tar -x -C "$files"
+      printf '%s\n' "$commit" >"$files.commit"
+    fi
+    command=
+    if [ -f "$files/shipline.json" ]; then
+      command=$(jq -r --arg key "$key" '.runner[$key] // empty' "$files/shipline.json")
+    fi
+    if [ -z "$command" ]; then
+      echo "main's shipline.json names no runner.$key (runner/README.md)" >&2
+      exit 1
+    fi
     cd "$files"
-    RUNNER_PREFIX=$prefix RUNNER_FILES=$here bash -c "$command \"\$@\"" "runner.$key" "$@"
-  )
+    RUNNER_PREFIX=$prefix RUNNER_FILES=$here bash -c "$command \"\$@\"" "runner.$key" "$@" 9>&- ||
+      exit
+  ) 9>"$files.lock"
 }

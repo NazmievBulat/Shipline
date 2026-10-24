@@ -72,7 +72,11 @@ def folder() -> Path:
     try:
         import workflow_config
     except ImportError:
-        # The runner install's copy has no config reader beside it, and keeps the default.
+        # The runner install's copy has no config reader beside it: install.sh writes the folder
+        # `runner.identity_folder` names into `identity-folder` beside it.
+        named = Path(__file__).with_name("identity-folder")
+        if named.is_file():
+            return Path(named.read_text().strip()).expanduser()
         return Path.home() / ".config/shipline-runner"
     return workflow_config.current().runner.identity_path
 

@@ -81,6 +81,7 @@ jobs:
               tests/runner/test_layout.py
               tests/runner/test_programs.py
               tests/runner/test_rendering.py
+              tests/tools/test_parity.py
               tests/workflow/test_browser_test_slots.py
               tests/workflow/test_github_identity.py
               tests/workflow/test_install_hooks.py
@@ -122,6 +123,7 @@ jobs:
             files: >-
               tests/runner/test_balance_runners.py
               tests/workflow/test_checks_finished.py
+              tests/workflow/test_flow_page.py
               tests/workflow/test_ci_minutes.py
               tests/workflow/test_ci_proof.py
               tests/workflow/test_independent_review.py
@@ -156,8 +158,8 @@ jobs:
             command -v "$tool" >/dev/null || { echo "missing: $tool"; exit 1; }
           done
       # Ubuntu's tmux is built with systemd support: it moves each new pane into a scope of its
-      # own, racing the memory-limited scope a session starts its command in, and the first
-      # session can lose its limit (#41). The tests run the scripts with a tmux built without it.
+      # own. The tests run the scripts with a tmux built without it, on the PATH, and the tests of
+      # the sessions' memory limits with both builds (the one with systemd is built below).
       - name: Cache tmux without systemd
         id: tmux
         uses: actions/cache@v4
@@ -183,6 +185,32 @@ jobs:
           export PATH="$HOME/.local/tmux/bin:$PATH"
           tmux -V
           if ldd "$(command -v tmux)" | grep -q libsystemd; then echo "tmux uses systemd"; exit 1; fi
+      - name: Cache tmux with systemd
+        id: tmux-systemd
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/tmux-systemd
+          key: tmux-3.4-systemd-${{ env.ImageOS }}-${{ runner.arch }}
+      - name: Build tmux with systemd
+        if: steps.tmux-systemd.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq libevent-dev libncurses-dev libsystemd-dev pkg-config
+          curl -fsSL --connect-timeout 20 --max-time 300 -o "$RUNNER_TEMP/tmux-systemd.tar.gz" \
+            https://github.com/tmux/tmux/releases/download/3.4/tmux-3.4.tar.gz
+          echo "551ab8dea0bf505c0ad6b7bb35ef567cdde0ccb84357df142c254f35a23e19aa  $RUNNER_TEMP/tmux-systemd.tar.gz" |
+            sha256sum -c -
+          mkdir "$RUNNER_TEMP/tmux-systemd"
+          tar -xzf "$RUNNER_TEMP/tmux-systemd.tar.gz" -C "$RUNNER_TEMP/tmux-systemd"
+          cd "$RUNNER_TEMP/tmux-systemd/tmux-3.4"
+          ./configure --prefix="$HOME/.local/tmux-systemd" --enable-systemd
+          make -j4 && make install
+      # Not on the PATH: named to the tests that start sessions with it.
+      - name: Name tmux with systemd to the tests
+        run: |
+          tmux_with_systemd="$HOME/.local/tmux-systemd/bin/tmux"
+          "$tmux_with_systemd" -V
+          ldd "$tmux_with_systemd" | grep -q libsystemd || { echo "tmux does not use systemd"; exit 1; }
+          echo "WORKFLOW_TEST_TMUX_WITH_SYSTEMD=$tmux_with_systemd" >> "$GITHUB_ENV"
       - name: The test tools
         run: python -m pip install --require-hashes -r requirements-test.txt
       # The test command shipline.json names (commands.test), with this shard's own words.
