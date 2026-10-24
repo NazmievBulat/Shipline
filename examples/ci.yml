@@ -1,0 +1,98 @@
+# The CI of a repository that uses Shipline, as `.github/workflows/ci.yml` (`workflows.ci` in
+# shipline.json): a planner that writes the notes the merge gate reads, one job that runs the
+# repository's own tests (`commands.test`), and the check that sums them up. The job names are
+# the defaults of shipline.json's `checks`; a repository that names others names its jobs so.
+# Every job runs on GitHub's own runners.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The merge gate runs every suite on a scratch branch of its own with `gh workflow run`.
+  workflow_dispatch:
+
+# Read-only for every run; a pull request from a fork gets no secrets either, as GitHub gives
+# `pull_request` runs of forks none.
+permissions:
+  contents: read
+
+# A pull request's newer push cancels its older run. Every commit of main and every scratch run
+# keeps its own: the merge gate reads each of them.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    # The gate reads its notes from this job alone (`checks.ci_plan`).
+    name: "CI: what to run"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # On main, reading the runs a squash's proof names, with their jobs and notes.
+      actions: read
+      checks: read
+    outputs:
+      inherited: ${{ steps.inherited.outputs.inherited || '[]' }}
+    steps:
+      # On a pull request this is GitHub's merge of it into main: the merge the gate checks.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: The notes the merge gate reads
+        # Every run runs the whole suite; a repository that runs a selection notes it with
+        # `--selected server_tests N M files`, and one that needs none with `--none`.
+        run: python3 scripts/workflow/ci_proof.py notes --whole server_tests
+      # A squash the gate made carries its proof: main skips a job that passed, whole, on the
+      # identical tree, and names the run it inherited. Any other push runs everything.
+      - name: The jobs main inherits from its squash's proof
+        id: inherited
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/workflow/ci_proof.py inherited ci
+
+  tests:
+    # The gate's name for the job that runs every server test.
+    name: "CI: server tests"
+    needs: plan
+    # Folded: the job's name holds a colon, which a plain YAML value may not.
+    if: >-
+      ${{ !contains(fromJSON(needs.plan.outputs.inherited), 'CI: server tests') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      # Whatever the repository's tests need installed comes before this.
+      - name: Tests
+        run: python3 scripts/workflow/ci_proof.py test
+
+  result:
+    # The check the gate judges a run by (`checks.ci_result`): it passes only when every job
+    # that ran passed, the planner among them.
+    name: CI result
+    if: always()
+    needs: [plan, tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job that ran passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) echo "a job ended: $result"; exit 1 ;;
+            esac
+          done
