@@ -1201,3 +1201,218 @@ def test_without_pre_train_checks_shipline_has_none_to_fail(workflow: Workflow) 
         "this repository names no pre_train_checks command in shipline.json: "
         "there is no check to fail\n"
     )
+
+
+# Existing repository scripts can answer in their own form.
+
+
+def _module(workflow: Workflow, source: str, name: str = "command.py") -> str:
+    folder = workflow.repo / "tools" / "forms"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / name).write_text(textwrap.dedent(source))
+    return f"tools/forms/{name}"
+
+
+def test_function_conflicts_match_the_documented_answers(workflow: Workflow) -> None:
+    module = _module(workflow, '''
+        import subprocess
+        def resolve(head, main):
+            assert (head, main) == ("HEAD", "origin/main")
+            subprocess.run(["git", "add", "resolved.txt"], check=True)
+            return ["resolved.txt"]
+        def renumber_migrations(head, main):
+            if head == "broken":
+                raise RuntimeError("cannot move db/0002_example.py")
+            return {"db/0002_example.py": "db/0003_example.py"}
+        def taken_migrations(head, main):
+            return ["db/0002_example.py"]
+    ''')
+    _configure(workflow, mechanical_conflicts={
+        "run": module, "form": "functions", "functions": {
+            "resolve": "resolve", "renumber": "renumber_migrations", "taken": "taken_migrations",
+        },
+    })
+    worktree = workflow.add_worktree(7)
+    (worktree / "resolved.txt").write_text("resolved\n")
+    # A pull request's copy must never supply the functions.
+    (worktree / module).parent.mkdir(parents=True, exist_ok=True)
+    (worktree / module).write_text("raise RuntimeError('untrusted copy')\n")
+    done = _gate(workflow, '''
+        import json
+        answers = []
+        for sub, head in [("resolve", "HEAD"), ("renumber", "HEAD"),
+                          ("taken", "HEAD"), ("renumber", "broken")]:
+            done = g.repository_command("mechanical_conflicts", sub, head, "origin/main")
+            answers.append([done.returncode, done.stdout, done.stderr])
+        print(json.dumps(answers))
+    ''', worktree)
+    assert done.returncode == 0, done.stderr
+    answers = json.loads(done.stdout)
+    assert answers[:3] == [
+        [0, "resolved.txt\n", ""],
+        [0, "db/0002_example.py db/0003_example.py\n", ""],
+        [0, "db/0002_example.py\n", ""],
+    ]
+    assert answers[3] == [1, "", "cannot move db/0002_example.py\n"]
+    assert workflow.git("diff", "--cached", "--name-only", cwd=worktree) == "resolved.txt"
+
+
+def test_function_advisories_import_their_own_sibling_first(workflow: Workflow) -> None:
+    _module(workflow, 'SERVICE = "example-service"\n', "merge_handoff.py")
+    module = _module(workflow, '''
+        import merge_handoff
+        def unreachable(output):
+            return merge_handoff.SERVICE if output == "down\\n" else None
+        def answers(service):
+            return service == merge_handoff.SERVICE
+    ''')
+    _configure(workflow, advisory_watch={
+        "run": module, "form": "functions",
+        "functions": {"unreachable": "unreachable", "answers": "answers"},
+    })
+    done = _gate(workflow, '''
+        import json
+        print(json.dumps([g.unreachable_service("down\\n"), g.unreachable_service("ok"),
+                          g.service_answers("example-service"), g.service_answers("other")]))
+    ''')
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == ["example-service", None, True, False]
+
+
+def test_function_checkout_converts_paths_and_orders_refusal_arguments(workflow: Workflow) -> None:
+    module = _module(workflow, '''
+        from pathlib import Path
+        def install_if_changed(checkout):
+            assert isinstance(checkout, Path)
+            return "lockfile is broken" if (checkout / "broken-install").exists() else None
+        def refusal(output, checkout):
+            assert isinstance(checkout, Path)
+            assert (checkout / "shared.txt").exists()
+            return "step: " + output.splitlines()[-1]
+    ''')
+    _configure(workflow, push_checkout={
+        "run": module, "form": "functions",
+        "functions": {"install": "install_if_changed", "refusal": "refusal"},
+    })
+    worktree = workflow.add_worktree(7)
+    _failing_hook(workflow, ["check failed"])
+    assert _push(workflow, worktree) == {"returncode": 1, "refusal": "step: check failed"}
+    (worktree / "broken-install").touch()
+    assert _push(workflow, worktree) == {
+        "waiting": "PackagesWaiting", "reason": "lockfile is broken",
+    }
+
+
+@pytest.mark.parametrize("path, needed", [("docs/example.md", False), ("web/example.ts", True)])
+def test_function_browser_plan_reads_byte_paths(workflow: Workflow, path: str, needed: bool) -> None:
+    module = _module(workflow, '''
+        def browser_needed(changed):
+            assert all(isinstance(path, bytes) for path in changed)
+            return not all(path.endswith(b".md") for path in changed)
+    ''')
+    _configure(workflow, browser_plan={
+        "run": module, "form": "functions", "functions": {"browser_plan": "browser_needed"},
+    })
+    _changes(workflow, path)
+    assert _browser_needed(workflow).strip() == str(needed)
+
+
+def test_function_browser_plan_preserves_non_utf8_paths(workflow: Workflow) -> None:
+    module = _module(workflow, '''
+        def browser_needed(changed):
+            assert changed == [b"web/\\xff.ts"]
+            return False
+    ''')
+    _configure(workflow, browser_plan={
+        "run": module, "form": "functions", "functions": {"browser_plan": "browser_needed"},
+    })
+    done = _gate(workflow, '''
+        done = g.repository_command("browser_plan", input="web/\\udcff.ts\\0", errors="surrogateescape")
+        print(done.returncode, done.stdout.strip())
+    ''')
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "0 none\n"
+
+
+def test_json_selectors_and_leading_arguments_reach_the_panel(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-server-tests", json.dumps({
+        "all": False, "selected": ["tests/test_a.py"], "count": 3, "why": ["changed"],
+    }))
+    _stand_in(workflow, "example-browser-tests", '{"specs": ["tests/browser/a.spec.ts"]}')
+    _configure(workflow,
+        server_tests_for_changes={
+            "run": "example-server-tests", "form": "json", "args": ["--mode", "test selection"],
+            "fields": {"whole": "all", "tests": "selected", "total": "count", "reasons": "why"},
+        },
+        browser_tests_for_changes={
+            "run": "example-browser-tests", "form": "json", "field": "specs",
+        },
+    )
+    root = _conflict_round(workflow)
+    done = workflow.run_script("review-panel", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert json.loads((root / "server-tests.json").read_text()) == {
+        "whole": False, "tests": ["tests/test_a.py"], "total": 3, "reasons": ["changed"],
+    }
+    assert (root / "browser-tests.txt").read_text() == "tests/browser/a.spec.ts\n"
+    assert "--mode test selection " + root.name + "^1 --files-from" in workflow.calls("example-server-tests")[0]
+
+
+@pytest.mark.parametrize("form", ["lines", "exit"])
+def test_explicit_forms_preserve_output_exit_and_literal_arguments(workflow: Workflow, form: str) -> None:
+    install_shipline(workflow)
+    _stand_in(workflow, "example-command", "check output\n", status=3)
+    name = "browser_tests_for_changes" if form == "lines" else "pre_train_checks"
+    _configure(workflow, **{name: {
+        "run": "example-command --first", "form": form, "args": ["$(touch nope)", "two words"],
+    }})
+    done = workflow.shipline(name.replace("_", "-"), "origin/main")
+    assert done.returncode == 3, done.stderr
+    assert done.stdout == "check output\n"
+    assert "--first $(touch nope) two words origin/main" in workflow.calls("example-command")[0]
+    assert not (workflow.repo / "nope").exists()
+
+
+@pytest.mark.parametrize("answer", ['{"specs": "wrong"}', '{"other": []}', 'not json'])
+def test_bad_json_selection_is_a_failure(workflow: Workflow, answer: str) -> None:
+    install_shipline(workflow)
+    _stand_in(workflow, "example-browser-tests", answer)
+    _configure(workflow, browser_tests_for_changes={
+        "run": "example-browser-tests", "form": "json", "field": "specs",
+    })
+    done = workflow.shipline("browser-tests-for-changes", "origin/main")
+    assert done.returncode != 0
+    assert "browser_tests_for_changes" in done.stderr
+
+
+@pytest.mark.parametrize("name, entry", [
+    ("pre_train_checks", {"run": "example-check", "form": "json"}),
+    ("browser_plan", {"run": "example-check", "form": "exit"}),
+    ("hunt_app", {"run": "example-check", "form": "functions", "functions": {}}),
+    ("browser_tests_for_changes", {"run": "example-check", "form": "json"}),
+    ("server_tests_for_changes", {"run": "example-check", "form": "json", "fields": {"unknown": "all"}}),
+    ("pre_train_checks", {"run": "example-check", "form": "exit", "args": "--fast"}),
+    ("pre_train_checks", {"run": "example-check", "form": "exit", "extra": True}),
+    ("pre_train_checks", {"run": "", "form": "exit"}),
+])
+def test_unsupported_or_malformed_forms_name_the_command(tmp_path: Path, name: str, entry: dict) -> None:
+    repo = _repository(tmp_path)
+    (repo / "shipline.json").write_text(json.dumps({"commands": {name: entry}}))
+    with pytest.raises(workflow_config.ConfigError, match=f"commands.{name}"):
+        workflow_config.load(repo)
+
+
+def test_missing_function_is_refused_without_executing_the_module(workflow: Workflow) -> None:
+    module = _module(workflow, '''
+        from pathlib import Path
+        Path("executed").touch()
+        def unreachable(output):
+            return None
+    ''')
+    _configure(workflow, advisory_watch={
+        "run": module, "form": "functions",
+        "functions": {"unreachable": "unreachable", "answers": "missing"},
+    })
+    with pytest.raises(workflow_config.ConfigError, match="commands.advisory_watch.*missing"):
+        workflow_config.load(workflow.repo)
+    assert not (workflow.repo / "executed").exists()
