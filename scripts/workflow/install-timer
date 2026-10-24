@@ -16,6 +16,9 @@
 #   systemctl --user disable --now workflow-tick.timer   switch it off
 set -euo pipefail
 
+# How long one call to GitHub may take.
+GITHUB_SECONDS=30
+
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$here/launcher-link"
 find_launcher
@@ -31,13 +34,14 @@ if [[ -f $budget_installer ]]; then
 fi
 units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 
+# A label is there in any case, as GitHub holds one per name in any case.
 create_label() {
   local name=$1 color=$2 description=$3
-  grep -qxF "$name" <<<"$labels" ||
-    gh label create "$name" --color "$color" --description "$description"
+  grep -qixF -- "$name" <<<"$labels" ||
+    timeout "$GITHUB_SECONDS" gh label create "$name" --color "$color" --description "$description"
 }
 
-labels=$(gh label list --limit 1000 --json name --jq '.[].name') || {
+labels=$(timeout "$GITHUB_SECONDS" gh label list --limit 1000 --json name --jq '.[].name') || {
   echo "cannot read the labels from GitHub; nothing was installed" >&2
   exit 1
 }
