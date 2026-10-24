@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Every difference between Shipline and an installation that runs the workflow from its own copy
+of the scripts, except the ones the installation lists as known.
+
+    tools/parity [--summary] CHECKOUT
+
+Shipline's trees are compared with their places in the checkout:
+
+    scripts/workflow/RULES.md   AGENTS.md
+    scripts/workflow/           scripts/workflow/
+    tests/workflow/             the checkout's workflow tests: `parity.workflow_tests` of its
+                                shipline.json, else `tests/workflow/`
+    tests/runner/               the checkout's runner tests: `parity.runner_tests`, else
+                                `tests/runner/`
+    runner/                     .github/runner/
+
+Each side is read as git's index holds it: the files git tracks, with their modes, as they were
+last added; a checkout in the middle of a merge is refused. The checkout's shipline.json and
+known list are read as they are on disk.
+
+Every changed, added or removed line is printed as a unified diff, Shipline's side first; a file
+on one side only as a diff with /dev/null, even when it is empty; a changed mode (executable or
+not, a symlink, a submodule) as a `mode:` line. With `--summary`, one line per file instead:
+`<added>+ <removed>- <shipline path> <checkout path>`, `-` for a side it is not on.
+
+The known differences are the installation's, in the file `parity.known` of its shipline.json
+names; without one, nothing is known. `tools/parity-known.txt` is an example. Each entry is one
+line, directly below a `#` line that gives its reason:
+
+    # Why the checkout keeps its hunts in a folder of their own.
+    rename scripts/workflow/hunts/ scripts/hunts/
+    # Why the checkout names the repository where Shipline reads its config.
+    rewrite scripts/workflow/tick |"$SHIPLINE_REPOSITORY"|"example-owner/example-app"|
+
+A rename pairs a Shipline path with a checkout path: a file, or a folder ending in `/` with
+everything below it; `-` on one side says the file or folder is on the other side only. The most
+specific pairing wins, a rename over a tree of the same path. A rewrite replaces, in the
+Shipline files its path matches (`*` matches any characters, `/` too), every FROM text by the TO
+text the checkout has, before they are compared; rewrites do not apply to each other's results.
+The first character after the path is the delimiter, which neither text holds; in them `\\n` is
+a line break and `\\\\` a backslash. Nothing else is ignored, and an entry that matches nothing
+is printed too.
+
+Exits 0 when nothing was printed, 1 when something was, 2 when it cannot compare.
+"""
+
+import difflib
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts/workflow"))
+import workflow_config  # noqa: E402
+
+GIT_SECONDS = 60
+MODES = {
+    "100644": "a file",
+    "100755": "an executable file",
+    "120000": "a symlink",
+    "160000": "a submodule",
+}
+
+
+class Refused(Exception):
+    """The comparison cannot be made; the message says why."""
+
+
+class TooLong(Refused):
+    """Git took more than GIT_SECONDS."""
+
+
+@dataclass
+class Entry:
+    line: int
+    text: str
+    used: bool = False
+
+
+@dataclass
+class Rename(Entry):
+    # A path on each side, or "-" for none.
+    shipline: str = ""
+    checkout: str = ""
+
+
+@dataclass
+class Rewrite(Entry):
+    pattern: str = ""
+    before: str = ""
+    after: str = ""
+
+
+@dataclass(frozen=True)
+class File:
+    mode: str
+    # The blob git holds, or for a submodule the commit.
+    sha: str
+
+
+@dataclass
+class Difference:
+    shipline: str | None
+    checkout: str | None
+    printed: list[str]
+    added: int = 0
+    removed: int = 0
+
+    def summary(self) -> str:
+        ours, theirs = self.shipline or "-", self.checkout or "-"
+        return f"{self.added}+ {self.removed}- {ours} {theirs}\n"
+
+
+def _inside(path: str, where: str) -> str:
+    """The path as git names it: `./a//b/` is `a/b/`."""
+    pure = PurePosixPath(path)
+    if pure.is_absolute() or ".." in pure.parts or str(pure) == ".":
+        raise Refused(f"{where}: {path} is not a path inside a checkout")
+    return str(pure) + ("/" if path.endswith("/") else "")
+
+
+def _unescaped(text: str) -> str:
+    return re.sub(r"\\([n\\])", lambda found: "\n" if found[1] == "n" else "\\", text)
+
+
+def read_known(path: Path, name: str) -> list[Entry]:
+    """The entries of the known list at `path`, called `name` in what is printed."""
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise Refused(f"{name}: cannot be read: {error}") from None
+    entries: list[Entry] = []
+    reason = False
+    for number, line in enumerate(lines, 1):
+        where = f"{name}: line {number}"
+        if line.startswith("#"):
+            reason = bool(line[1:].strip())
+            continue
+        if not line.strip():
+            reason = False
+            continue
+        if not reason:
+            raise Refused(f"{where}: no reason above it")
+        reason = False
+        kind, _, rest = line.partition(" ")
+        if kind == "rename":
+            paths = rest.split()
+            if len(paths) != 2 or paths == ["-", "-"]:
+                raise Refused(f"{where}: a rename names two paths")
+            paths = [side if side == "-" else _inside(side, where) for side in paths]
+            if len({side.endswith("/") for side in paths if side != "-"}) > 1:
+                raise Refused(f"{where}: a folder is renamed to a folder")
+            entries.append(Rename(number, line, shipline=paths[0], checkout=paths[1]))
+        elif kind == "rewrite":
+            pattern, _, spec = rest.partition(" ")
+            parts = spec[1:].split(spec[0]) if spec else []
+            if not pattern or len(parts) != 3 or parts[2]:
+                raise Refused(f"{where}: a rewrite is PATH |FROM|TO|")
+            before, after = _unescaped(parts[0]), _unescaped(parts[1])
+            if not before or before == after:
+                raise Refused(f"{where}: a rewrite changes its text")
+            pattern = _inside(pattern, where)
+            entries.append(Rewrite(number, line, pattern=pattern, before=before, after=after))
+        else:
+            raise Refused(f"{where}: not a rename or a rewrite")
+    return entries
+
+
+def parity_of(checkout: Path) -> workflow_config.Parity:
+    """The `parity` section of the checkout's config; the rest of its file may hold what only
+    its own copy of the scripts reads."""
+    name = workflow_config.FILE
+    try:
+        text = (checkout / name).read_text()
+    except FileNotFoundError:
+        text = "{}"
+    except (OSError, UnicodeDecodeError) as error:
+        raise Refused(f"{name}: cannot be read: {error}") from None
+    try:
+        given = json.loads(text)
+    except ValueError as error:
+        raise Refused(f"{name} is not JSON: {error}") from None
+    try:
+        return workflow_config.parity_of(given)
+    except workflow_config.ConfigError as error:
+        raise Refused(str(error)) from None
+
+
+def _git(checkout: Path, *arguments: str, given: bytes | None = None) -> bytes:
+    try:
+        done = subprocess.run(
+            # A file monitor the checkout's own git config names is not run.
+            ["git", "-c", "core.fsmonitor=false", "-C", str(checkout), *arguments],
+            input=given,
+            capture_output=True,
+            timeout=GIT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise TooLong(
+            f"git {arguments[0]} took more than {GIT_SECONDS} seconds in {checkout}"
+        ) from None
+    if done.returncode:
+        error = done.stderr.decode(errors="replace").strip()
+        raise Refused(f"git {arguments[0]} failed in {checkout}: {error}")
+    return done.stdout
+
+
+def contents(checkout: Path, files: list[File]) -> dict[str, bytes]:
+    """What each file holds, by its sha, read by one `git cat-file`. A submodule is its commit,
+    as `git diff` shows it."""
+    held = {
+        file.sha: f"Subproject commit {file.sha}\n".encode()
+        for file in files
+        if file.mode == "160000"
+    }
+    blobs = sorted({file.sha for file in files if file.mode != "160000"})
+    given = "".join(f"{sha}\n" for sha in blobs).encode()
+    out = _git(checkout, "cat-file", "--batch", given=given)
+    at = 0
+    while at < len(out):
+        header_end = out.index(b"\n", at)
+        header = out[at:header_end].decode(errors="replace").split()
+        if len(header) != 3:
+            raise Refused(f"git cannot read {' '.join(header)} in {checkout}")
+        start = header_end + 1
+        held[header[0]] = out[start : start + int(header[2])]
+        at = start + int(header[2]) + 1
+    missing = [sha for sha in blobs if sha not in held]
+    if missing:
+        raise Refused(f"git cannot read {missing[0]} in {checkout}")
+    return held
+
+
+def tracked(checkout: Path) -> dict[str, File]:
+    """Every file git's index holds in a checkout, by its path."""
+    try:
+        top = _git(checkout, "rev-parse", "--show-toplevel").decode().strip()
+    except TooLong:
+        raise
+    except Refused:
+        top = ""
+    if not top or Path(top).resolve() != checkout.resolve():
+        raise Refused(f"{checkout} is not a git checkout")
+    files = {}
+    for record in _git(checkout, "ls-files", "-s", "-z").split(b"\0"):
+        if record:
+            fields, _, raw = record.partition(b"\t")
+            mode, sha, stage = fields.decode().split()
+            path = raw.decode(errors="surrogateescape")
+            if stage != "0":
+                raise Refused(f"{checkout} is in the middle of a merge: {path} is not resolved")
+            files[path] = File(mode, sha)
+    return files
+
+
+Rule = tuple[str, str, Rename | None]
+
+
+def _where(path: str, rules: list[Rule]) -> str:
+    """Where the most specific rule takes `path`: a path, "-", or "" when no rule names it. A
+    rename wins over a tree of the same path, and is marked used."""
+    best: tuple[int, bool, str, Rename | None] = (-1, False, "", None)
+    for source, target, entry in rules:
+        if source == path:
+            length, found = len(source) + 1, target
+        elif source.endswith("/") and path.startswith(source):
+            length, found = len(source), "-" if target == "-" else target + path[len(source) :]
+        else:
+            continue
+        if (length, entry is not None) > best[:2]:
+            best = (length, entry is not None, found, entry)
+    if best[3] is not None:
+        best[3].used = True
+    return best[2]
+
+
+def _rewritten(text: str, path: str, rewrites: list[Rewrite]) -> str:
+    """`text` with every rewrite of `path` made at once, so none applies to another's result."""
+    by_text: dict[str, Rewrite] = {}
+    for rewrite in rewrites:
+        pattern = ".*".join(re.escape(part) for part in rewrite.pattern.split("*"))
+        if re.fullmatch(pattern, path):
+            by_text.setdefault(rewrite.before, rewrite)
+    if not by_text:
+        return text
+
+    def replaced(found: re.Match[str]) -> str:
+        rewrite = by_text[found[0]]
+        rewrite.used = True
+        return rewrite.after
+
+    longest_first = sorted(by_text, key=len, reverse=True)
+    return re.sub("|".join(map(re.escape, longest_first)), replaced, text)
+
+
+def _lines(text: str) -> list[str]:
+    lines = [line + "\n" for line in text.split("\n")]
+    last = lines.pop()
+    if last != "\n":
+        lines.append(last[:-1] + "\n\\ No newline at end of file\n")
+    return lines
+
+
+def _difference(
+    names: tuple[str | None, str | None],
+    ours: File | None,
+    theirs: File | None,
+    held: tuple[dict[str, bytes], dict[str, bytes]],
+    rewrites: list[Rewrite],
+) -> Difference | None:
+    a_label = f"shipline/{names[0]}" if names[0] else "/dev/null"
+    b_label = f"checkout/{names[1]}" if names[1] else "/dev/null"
+    a = held[0][ours.sha] if ours else b""
+    b = held[1][theirs.sha] if theirs else b""
+    difference = Difference(*names, printed=[])
+    try:
+        a_text, b_text = a.decode(), b.decode()
+    except UnicodeDecodeError:
+        if a != b or ours is None or theirs is None:
+            difference.printed.append(f"binary files differ: {a_label} {b_label}\n")
+    else:
+        if ours and theirs and names[0]:
+            a_text = _rewritten(a_text, names[0], rewrites)
+        lines = list(difflib.unified_diff(_lines(a_text), _lines(b_text), a_label, b_label))
+        body = [line[0] for line in lines[2:] if line[0] in "+-"]
+        difference.added, difference.removed = body.count("+"), body.count("-")
+        difference.printed.extend(lines)
+        if not lines and (ours is None or theirs is None):
+            # An empty file on one side only.
+            difference.printed += [f"--- {a_label}\n", f"+++ {b_label}\n"]
+    if ours and theirs and ours.mode != theirs.mode:
+        said = [MODES.get(mode, f"mode {mode}") for mode in (ours.mode, theirs.mode)]
+        difference.printed.append(f"mode: {a_label} is {said[0]}, {b_label} is {said[1]}\n")
+    return difference if difference.printed else None
+
+
+def compare(shipline: Path, checkout: Path) -> tuple[list[Difference], list[Entry], str]:
+    """What differs, file by file; the installation's known entries; and its known list's name."""
+    parity = parity_of(checkout)
+    known = read_known(checkout / parity.known, parity.known) if parity.known else []
+    trees = [
+        ("scripts/workflow/RULES.md", "AGENTS.md"),
+        ("scripts/workflow/", "scripts/workflow/"),
+        ("tests/workflow/", parity.workflow_tests.rstrip("/") + "/"),
+        ("tests/runner/", parity.runner_tests.rstrip("/") + "/"),
+        ("runner/", ".github/runner/"),
+    ]
+    renames = [entry for entry in known if isinstance(entry, Rename)]
+    forward: list[Rule] = [(ours, theirs, None) for ours, theirs in trees]
+    forward += [(e.shipline, e.checkout, e) for e in renames if e.shipline != "-"]
+    inverse: list[Rule] = [(theirs, ours, None) for ours, theirs in trees]
+    inverse += [(e.checkout, e.shipline, e) for e in renames if e.checkout != "-"]
+
+    ours_all, theirs_all = tracked(shipline), tracked(checkout)
+    ours = {name: there for name in ours_all if (there := _where(name, forward))}
+    theirs = {name: there for name in theirs_all if (there := _where(name, inverse))}
+    # A file pairs with its place on the other side when that place pairs back with it.
+    pairs: set[tuple[str | None, str | None]] = set()
+    for name, there in ours.items():
+        if there != "-":
+            pairs.add((name, there if theirs.get(there) == name else None))
+    for name, there in theirs.items():
+        if there != "-":
+            pairs.add((there if ours.get(there) == name else None, name))
+
+    rewrites = [entry for entry in known if isinstance(entry, Rewrite)]
+    # Only the compared files are read.
+    held = (
+        contents(shipline, [ours_all[name] for name, _ in pairs if name]),
+        contents(checkout, [theirs_all[name] for _, name in pairs if name]),
+    )
+    differences = []
+    for pair in sorted(pairs, key=lambda pair: (pair[0] or pair[1] or "", pair[0] or "")):
+        ours_file = ours_all[pair[0]] if pair[0] else None
+        theirs_file = theirs_all[pair[1]] if pair[1] else None
+        if found := _difference(pair, ours_file, theirs_file, held, rewrites):
+            differences.append(found)
+    return differences, known, parity.known or ""
+
+
+def main(arguments: list[str]) -> int:
+    # A path git holds that is not UTF-8 is printed escaped, never a crash.
+    sys.stdout.reconfigure(errors="backslashreplace")
+    summary = arguments[:1] == ["--summary"]
+    if summary:
+        arguments = arguments[1:]
+    if len(arguments) != 1 or arguments[0].startswith("-"):
+        print("usage: tools/parity [--summary] CHECKOUT", file=sys.stderr)
+        return 2
+    try:
+        differences, known, known_name = compare(ROOT, Path(arguments[0]))
+    except Refused as error:
+        print(error, file=sys.stderr)
+        return 2
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"cannot compare: {error}", file=sys.stderr)
+        return 2
+    printed = [
+        line
+        for difference in differences
+        for line in ([difference.summary()] if summary else difference.printed)
+    ]
+    printed += [
+        f"unused: {known_name}:{entry.line}: {entry.text}\n" for entry in known if not entry.used
+    ]
+    sys.stdout.writelines(printed)
+    return 1 if printed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
