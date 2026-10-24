@@ -61,6 +61,7 @@
     "image_build": "tools/shipline/build-runner-images",
     "hub_cache": "tools/shipline/hub-cache"
   },
+  "cloud_wake_after_minutes": 45,
   "parity": {
     "workflow_tests": "tools/shipline/tests",
     "runner_tests": "tools/runner/tests",

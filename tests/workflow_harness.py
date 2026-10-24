@@ -180,6 +180,16 @@ if [ "$1 $2" = "api graphql" ]; then
   fi
   exit 0
 fi
+# Whether an account may write to the repository: `permission-<login>` names its level. Without
+# one it may, as the owner's account, which the worker's reports come from, does.
+if [[ $1 == api && $2 == repos/*/collaborators/*/permission ]]; then
+  [ "$3 $4" = "--jq .permission" ] || exit 1
+  [ ! -e "@STATE@/fail-gh-permission" ] || exit 1
+  login=${2%/permission}
+  login=${login##*/}
+  if [ -f "@STATE@/permission-$login" ]; then cat "@STATE@/permission-$login"; else echo admin; fi
+  exit 0
+fi
 if [ "$1 $2" = "api --paginate" ]; then
   number=${3%/reviews}
   number=${number##*/}
@@ -291,6 +301,11 @@ if [[ "$1 $2 $3 $5" == "api -X POST -f" && $4 == repos/*/issues/*/labels ]]; the
   read -r draft labels < "@STATE@/listing/$number"
   echo "$draft $labels ${6#labels[]=}" > "@STATE@/listing/$number"
   echo "$number" >> "@STATE@/labelled"
+  exit 0
+fi
+# The runs of a pull request's branch, for the CI demand forecast: none.
+if [[ "$1" == api && $2 == repos/*/actions/runs[?]branch=*'&per_page=30' && $# -eq 2 ]]; then
+  echo '{"total_count": 0, "workflow_runs": []}'
   exit 0
 fi
 asked="label list --limit 1000 --json name --jq ${8}"
@@ -650,6 +665,21 @@ class Workflow:
         return subprocess.run(
             ["bash", str(self.script.parent / script), *args],
             cwd=cwd or self.repo,
+            env={**self.env, **(env or {})},
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+    def run_python(
+        self, script: str, *args: str, env: dict[str, str] | None = None, stdin: str = ""
+    ) -> subprocess.CompletedProcess[str]:
+        """A Python script of `scripts/workflow`, run as the tick runs it."""
+        return subprocess.run(
+            ["python3", "-B", str(self.script.parent / script), *args],
+            cwd=self.repo,
             env={**self.env, **(env or {})},
             input=stdin,
             capture_output=True,

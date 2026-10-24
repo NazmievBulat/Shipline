@@ -46,6 +46,9 @@
 # So do the findings of the tick's daily metrics run (`workflow-metrics --daily` notes them), once
 # per day: `Workflow metrics findings (report .local/analyses/metrics-<date>.md): <line>; <line>.`
 #
+# So does the last change of the machine's runner balancer (the tick notes it from
+# `runner-balance.log`), once: `Runner balance, last change: <line>.`
+#
 # An analysis the tick stopped (its analyst said "analysis finished", or its 40 minutes ran out)
 # is told once, at any hour and busy or not, tried again every 5 minutes until the message is
 # sent: `Workflow analysis day-<date> (report <link>): 1. <proposal>; 2. <proposal>.`, or that it
@@ -170,6 +173,17 @@ if [[ -d $metrics ]]; then
       metrics_lines+=("$line")
     fi
   done < <(find "$metrics" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+fi
+balance=$main/$SHIPLINE_STATE_FOLDER/runner-balance.pending
+balance_files=()
+balance_lines=()
+if [[ -d $balance ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '"Runner balance, last change: \(.line | strings | select(length > 0))."' "$event"); then
+      balance_files+=("$event")
+      balance_lines+=("$line")
+    fi
+  done < <(find "$balance" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
 analyses=$main/$SHIPLINE_STATE_FOLDER/analyses.pending
 analysis_files=()
@@ -492,7 +506,8 @@ if ((${#resent[@]} == 0 && ${#handback_files[@]} == 0 && ${#cloud_files[@]} == 0
     exit "$failed"
   fi
   if [[ -r $TOLD && $(<"$TOLD") == "$seen" ]] &&
-      ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0 && ${#decision_events[@]} == 0)); then
+      ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0 && ${#balance_files[@]} == 0 &&
+        ${#decision_events[@]} == 0)); then
     log "  nothing changed since the last check-in; $name not told"
     exit "$failed"
   fi
@@ -520,7 +535,7 @@ if ((${#decision_held[@]} + ${#decision_events[@]})); then
   joined=$(printf '%s; ' "${decision_held[@]}" "${decision_events[@]}")
   message+=" Decisions: ${joined%; }."
 fi
-for line in "${metrics_lines[@]}" "${analysis_lines[@]}"; do
+for line in "${metrics_lines[@]}" "${analysis_lines[@]}" "${balance_lines[@]}"; do
   message+=" $line"
 done
 if [[ -n $service_line ]]; then
@@ -535,7 +550,8 @@ if send_to "$name" "$message"; then
     grep -xF -f <(asking_notes all; echo) >"$ASKED.new"
   mv "$ASKED.new" "$ASKED"
   rm -f "$PENDING"
-  for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${analysis_files[@]}"; do
+  for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${analysis_files[@]}" \
+      "${balance_files[@]}"; do
     rm -f -- "$event"
   done
   if [[ -n $decision_cursor ]]; then
