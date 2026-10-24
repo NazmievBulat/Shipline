@@ -174,11 +174,15 @@ are written from the measured reports, never from guesses.
    install of each, by the machine's owner and on the owner's word, the receiving machine first:
    - The receiving machine raises its `ordinary_jobs` by the slots that move, and may name its
      own `job_memory` (`6g`). `install.sh` refuses to raise it by more than the room its last
-     week measured (`usage.py room`).
+     week measured (`usage.py room`), or when its usage cannot be read; a first install is not
+     checked.
    - Once its runners are online with the base label, the giving machine lowers its
      `ordinary_jobs` by as many and installs. `install.sh` refuses to lower it while GitHub
-     lists no online ordinary runner of another machine with the base label, or cannot be read:
-     with the receiving machine down, unreachable or not installed, both counts stay as they are.
+     lists no online ordinary runner of another machine with the base label: with the receiving
+     machine down, unreachable or not installed, both counts stay as they are.
+   - In a pool of several machines, `install.sh` reads GitHub's runners before it changes
+     anything, and an install whose list cannot be read is refused, raising or lowering alike.
+     A machine alone in its pool is not checked.
    - Moving slots back is the same, the other way round.
 
    Nothing names where the jobs go: every machine's runners carry the same labels, so GitHub

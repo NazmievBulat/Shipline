@@ -159,9 +159,11 @@ class Machine:
         alone: bool = False,
         job_memory: str | None = None,
         spares: int | None = None,
+        extra: str = "",
     ) -> None:
         """Write the machine's local settings: its ordinary pull request slots, whether it is
-        the only machine of the pool, the memory cap of one ordinary job, and its spares."""
+        the only machine of the pool, the memory cap of one ordinary job, its spares, and any
+        other line."""
         settings = self.root / "home" / ".config" / "shipline" / "runner.sh"
         settings.parent.mkdir(parents=True, exist_ok=True)
         lines = [
@@ -174,6 +176,8 @@ class Machine:
             lines.append(f"job_memory={job_memory}")
         if spares is not None:
             lines.append(f"ordinary_spares={spares}")
+        if extra:
+            lines.append(extra)
         settings.write_text("\n".join(lines) + "\n")
 
     def runners(self, *listed: tuple[str, str, list[str]]) -> None:
@@ -205,12 +209,14 @@ class Machine:
         writes it: this much memory available and this CPU pressure throughout."""
         folder = self.root / "home" / ".local" / "state" / "ci-runner"
         folder.mkdir(parents=True, exist_ok=True)
-        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        # Up to this hour, and a day more than asked: the report looks back from when it runs,
+        # which may be past midnight UTC by then.
+        this_hour = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
         lines = [
-            f"{(today - timedelta(hours=hour)).strftime('%Y-%m-%dT%H:%M:%SZ')}"
+            f"{(this_hour - timedelta(hours=hour)).strftime('%Y-%m-%dT%H:%M:%SZ')}"
             f" free_mb=1024 available_mb={int(available_gib * 1024)} swap_in_mb_s=0.0"
             f" swap_out_mb_s=0.0 cpu_pressure_60s={pressure} load_1m=1.0 busy=none"
-            for hour in range(days * 24, 0, -1)
+            for hour in range((days + 1) * 24, -1, -1)
         ]
         (folder / "usage.log").write_text("".join(f"{line}\n" for line in lines))
 
@@ -233,8 +239,20 @@ class Machine:
             check=False,
         )
 
-    def install(self) -> subprocess.CompletedProcess[str]:
-        return self._run("sh", str(RUNNER / "install.sh"), cwd=self.checkout)
+    def install(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return self._run("sh", str(RUNNER / "install.sh"), *arguments, cwd=self.checkout)
+
+    def installation(self) -> dict[str, bytes]:
+        """Every file the install put in place: the installed copy, the units and the runners'
+        GitHub identity."""
+        home = self.root / "home"
+        folders = [self.installed, home / ".config/systemd/user", home / ".config/shipline-runner"]
+        return {
+            str(path): path.read_bytes()
+            for folder in folders
+            for path in sorted(folder.rglob("*"))
+            if path.is_file()
+        }
 
     def installed_as(self, slots: int, **settings: str | int) -> None:
         """Install the machine with its settings, then forget what the install called."""

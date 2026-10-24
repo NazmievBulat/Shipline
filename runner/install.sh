@@ -115,6 +115,8 @@ if [ -f "$installed/pool-settings.sh" ]; then
     . "$installed/pool-settings.sh"
     printf '%s' "$ordinary_jobs"
   )
+  # A count that is no number is no record of one.
+  case "$recorded_jobs" in '' | *[!0-9]*) recorded_jobs= ;; esac
 fi
 # Two machines with the same name would take each other's runner registrations (`--replace`) and
 # retire each other's runners, so a machine is never taken to be one it was not named.
@@ -204,14 +206,6 @@ cp -L "$here/github_identity.py" "$here/github_budget.py" "$tools/"
 # The units for this prefix, rendered from systemd/.
 RUNNER_PREFIX=$prefix bash "$here/render-units.sh" "$tools/units"
 
-# Before anything is stopped or copied: a refused identity leaves the machine as it was. The
-# services running now take the new one at their next call.
-if [ -n "$github_token" ]; then
-  python3 "$tools/github_identity.py" install --repository "$repository" --token "$github_token"
-elif [ -n "$github_app_id" ]; then
-  python3 "$tools/github_identity.py" install --repository "$repository" \
-    --app "$github_app_id" "$github_app_key"
-fi
 # This script's own calls are the runner programs' too.
 gh() {
   python3 "$tools/github_budget.py" wait --identity runner runner-install &&
@@ -249,6 +243,13 @@ if [ -n "$other_machines" ]; then
   # of use measured room for, in jobs of its own cap (usage.py room).
   if [ -n "$recorded_jobs" ] && [ "$runners" -gt "$recorded_jobs" ]; then
     cap=${job_memory:-$memory}
+    case "$cap" in
+      [1-9]*g) ;;
+      *)
+        echo "$machine_settings: the room is counted in jobs of whole gigabytes, and memory is '$cap': name job_memory, such as 6g." >&2
+        exit 1
+        ;;
+    esac
     if ! room=$(python3 "$here/usage.py" room --days 7 --job-memory "$cap"); then
       echo "Could not read this machine's usage, so $machine cannot tell whether it has room for more PR slots: nothing was changed." >&2
       exit 1
@@ -258,6 +259,16 @@ if [ -n "$other_machines" ]; then
       exit 1
     fi
   fi
+fi
+
+# After the move's checks, which refuse with nothing changed, and before anything is stopped or
+# copied: a refused identity leaves the machine as it was. The services running now take the new
+# one at their next call.
+if [ -n "$github_token" ]; then
+  python3 "$tools/github_identity.py" install --repository "$repository" --token "$github_token"
+elif [ -n "$github_app_id" ]; then
+  python3 "$tools/github_identity.py" install --repository "$repository" \
+    --app "$github_app_id" "$github_app_key"
 fi
 
 mkdir -p "$installed" "$units"

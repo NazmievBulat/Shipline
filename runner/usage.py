@@ -174,12 +174,22 @@ def _megabytes(size: str) -> int:
     return int(size[:-1]) * 1024
 
 
+def _whole_gigabytes(size: str) -> str:
+    """The cap as the command line gives it, refused at once when it is no whole gigabytes."""
+    try:
+        _megabytes(size)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+    return size
+
+
 def jobs_with_room(room: bool, least_available_mb: int, job_memory: str) -> int:
     """How many more ordinary jobs of `job_memory` each the measured room holds: what was least
     available at a busiest hour, less the margin. None without room every day."""
+    job_mb = _megabytes(job_memory)
     if not room:
         return 0
-    return max(0, (least_available_mb - LEAST_AVAILABLE_MB) // _megabytes(job_memory))
+    return max(0, (least_available_mb - LEAST_AVAILABLE_MB) // job_mb)
 
 
 def report(
@@ -266,7 +276,7 @@ if __name__ == "__main__":
     for name in ("report", "room"):
         command = commands.add_parser(name)
         command.add_argument("--days", type=int, default=7)
-        command.add_argument("--job-memory", default=JOB_MEMORY)
+        command.add_argument("--job-memory", default=JOB_MEMORY, type=_whole_gigabytes)
     arguments = parser.parse_args()
     if arguments.command == "sample":
         sample(arguments.machine)
