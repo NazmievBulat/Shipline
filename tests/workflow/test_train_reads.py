@@ -534,3 +534,16 @@ def test_an_owner_question_noted_during_the_scan_is_not_hidden_by_the_reconcile_
     reused = workflow.run_script("merge-when-current", "--train-status", env=env)
     assert reused.stdout == uncached.stdout
     assert workflow.calls("gh") == before
+
+
+
+def test_a_queue_mutation_invalidates_the_ticks_cached_runs_and_jobs(
+    reads_module: ModuleType, tmp_path: Path,
+) -> None:
+    reads = reads_module.Reads(tmp_path, "base")
+    path = f"{_API}/actions/runs/100/jobs?per_page=100"
+    assert reads.api(path, lambda: ["queued"]) == ["queued"]
+    reads.invalidate()
+    assert reads.api(path, lambda: ["cancelled"]) == ["cancelled"]
+    reads.finish()
+    assert reads_module.Reads(tmp_path, "base").api(path, lambda: ["unexpected"]) == ["cancelled"]

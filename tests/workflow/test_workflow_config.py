@@ -97,6 +97,7 @@ _DEFAULTS = {
     "review": {"high_effort_paths": []},
     "answer_for_owner_after_minutes": 15,
     "cloud_wake_after_minutes": 30,
+    "merge_train": {"queued_limit_minutes": 20},
     "cloud_pre_push": {"suites": {}},
 }
 
@@ -1624,3 +1625,18 @@ def test_a_second_tick_waits_for_the_first_across_a_change_of_the_state_folder(
     assert done.returncode == 0, done.stderr
     assert "the tick before this one is still running" in done.stdout, done.stdout + done.stderr
     assert not workflow.calls("gh")
+
+
+@pytest.mark.parametrize("minutes", [0, 5, 1440])
+def test_the_prefix_queue_limit_is_configurable(tmp_path: Path, minutes: int) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"merge_train": {"queued_limit_minutes": minutes}})
+    assert workflow_config.load(repo).merge_train.queued_limit_minutes == minutes
+
+
+@pytest.mark.parametrize("minutes", [-1, 1441, True, 1.5, "20"])
+def test_an_invalid_prefix_queue_limit_is_refused(tmp_path: Path, minutes: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"merge_train": {"queued_limit_minutes": minutes}})
+    with pytest.raises(workflow_config.ConfigError, match="merge_train.queued_limit_minutes"):
+        workflow_config.load(repo)
