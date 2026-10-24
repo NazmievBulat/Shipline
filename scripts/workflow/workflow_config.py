@@ -11,7 +11,8 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix; a quiet cloud worker is woken after 30 minutes; a question to the owner
+runner prefix; no test command, which a repository names for its CI's test job
+(`ci_proof.py test`); a quiet cloud worker is woken after 30 minutes; a question to the owner
 marked `Owner only: no` gets its recommended reply after 15 minutes.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
@@ -81,6 +82,10 @@ DEFAULTS: dict[str, Any] = {
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
     },
+    "commands": {
+        # The command line that runs the repository's tests, from the root of its checkout.
+        "test": None,
+    },
     # Minutes without a push or a report after which the tick wakes a cloud worker; 0 never does.
     "cloud_wake_after_minutes": 30,
     # Minutes a question to the owner marked `Owner only: no` waits before the tick types its
@@ -146,6 +151,12 @@ class Runner:
 
 
 @dataclass(frozen=True)
+class Commands:
+    # None when the file names none.
+    test: str | None
+
+
+@dataclass(frozen=True)
 class Config:
     # None when nothing names it: an error only for a script that needs it.
     found_repository: str | None
@@ -156,6 +167,7 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    commands: Commands
     cloud_wake_after_minutes: int
     answer_for_owner_after_minutes: int
     # The file as it was read, without the defaults: `{}` when there is none.
@@ -329,6 +341,7 @@ def load(start: Path = HERE) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
+        commands=Commands(**values["commands"]),
         cloud_wake_after_minutes=values["cloud_wake_after_minutes"],
         answer_for_owner_after_minutes=values["answer_for_owner_after_minutes"],
         given=given,
@@ -361,6 +374,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
         },
+        "commands": vars(config.commands).copy(),
         "cloud_wake_after_minutes": config.cloud_wake_after_minutes,
         "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
     }

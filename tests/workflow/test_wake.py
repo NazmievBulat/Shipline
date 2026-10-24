@@ -3,6 +3,7 @@
 import json
 import subprocess
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -825,3 +826,75 @@ def test_an_answer_the_wake_could_not_send_is_sent_later(day: Workflow) -> None:
 
     assert '\nanswered for the owner: review-7, "1" (14:00)\n' in day.sent()[-1]
     assert not list((day.repo / ".local/workflow/answered-for-owner.pending").iterdir())
+
+
+def _analysis(workflow: Workflow, url: str, proposals: list[str]) -> Path:
+    pending = workflow.repo / ".local/workflow/analyses.pending"
+    pending.mkdir(parents=True, exist_ok=True)
+    event = pending / "day-2026-10-13.json"
+    event.write_text(
+        json.dumps(
+            {
+                "name": "day-2026-10-13",
+                "report": ".local/analyses/day-2026-10-13/report.md",
+                "url": url,
+                "proposals": proposals,
+            }
+        )
+    )
+    # A note the tick is still writing is not read.
+    (pending / ".day-2026-10-14.json").write_text("{")
+    return event
+
+
+def test_a_finished_analysis_is_told_once_by_day_with_its_link_and_proposals(
+    night: Workflow,
+) -> None:
+    night.orchestrator("busy")
+    event = _analysis(
+        night,
+        "https://docs.example.com/analysis-1",
+        ["1. The tick starts tickets by itself", "2. A lost check is re-run by the gate"],
+    )
+    (night.state / "send-fails").touch()
+
+    failed = _wake(night, at=_at(9, 0))
+    assert failed.returncode == 1
+    assert event.exists()
+    (night.state / "send-fails").unlink()
+    first = _wake(night, at=_at(9, 5))
+    second = _wake(night, at=_at(9, 10))
+
+    assert first.returncode == second.returncode == 0, first.stderr
+    [_, prompt] = night.sent()  # one failed attempt, then one delivered message
+    assert (
+        " Workflow analysis day-2026-10-13 (report https://docs.example.com/analysis-1): "
+        "1. The tick starts tickets by itself; 2. A lost check is re-run by the gate." in prompt
+    )
+    assert not event.exists()
+
+
+def test_an_analysis_without_proposals_says_so(night: Workflow) -> None:
+    night.orchestrator("idle")
+    _analysis(night, "https://docs.example.com/analysis-2", [])
+
+    done = _wake(night, at=_at(9, 0))
+
+    assert done.returncode == 0, done.stderr
+    assert (
+        " Workflow analysis day-2026-10-13 (report https://docs.example.com/analysis-2): "
+        "no proposals." in night.sent()[-1]
+    )
+
+
+def test_an_analysis_that_ended_without_its_report_is_told(night: Workflow) -> None:
+    night.orchestrator("idle")
+    _analysis(night, "", [])
+
+    done = _wake(night, at=_at(9, 0))
+
+    assert done.returncode == 0, done.stderr
+    assert (
+        " Workflow analysis day-2026-10-13 ended without publishing its report "
+        "(.local/analyses/day-2026-10-13/report.md)." in night.sent()[-1]
+    )
