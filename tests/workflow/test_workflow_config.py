@@ -997,6 +997,7 @@ def test_without_a_repository_only_what_needs_one_stops(workflow: Workflow) -> N
     scripts = workflow.repo / "scripts/workflow"
     shell = subprocess.run(
         ["python3", str(scripts / "workflow_config.py"), "shell"],
+        cwd=workflow.repo,
         env=workflow.env,
         capture_output=True,
         text=True,

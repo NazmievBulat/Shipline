@@ -80,8 +80,12 @@ if [[ -z $SHIPLINE_REPOSITORY ]]; then
 fi
 # priority.jq reads the label names from it.
 export SHIPLINE_CONFIG
-common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir) || exit 1
-main=$(dirname "$common")
+# The repository's main checkout (`SHIPLINE_REPO`, else the one of the current folder), never
+# the checkout these scripts are in.
+main=$SHIPLINE_REPO
+common=$(git -C "$main" rev-parse --path-format=absolute --git-common-dir) || exit 1
+# What the tick and the gate ask git, they ask of the repository, whichever folder ran it.
+cd "$main" || exit 1
 
 # A second tick exits while the first still runs. The lock is in the git common directory, where
 # no change of shipline.json moves it: a tick that reads a new state folder still waits for one

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# The one command a repository calls Shipline by. Its rules, hooks and package scripts name
+# `shipline <command>`, never a path inside Shipline's checkout:
+#
+#   shipline [--repo <path>] <command> [arguments]
+#
+# The repository is the one whose checkout `--repo` names, else `SHIPLINE_REPO`, else the one
+# the current directory is in (`workflow_config.py`); it is passed on as `SHIPLINE_REPO`.
+# The scripts are those of the Shipline checkout this file is in, links followed, so a link
+# `~/.local/bin/shipline` runs the checkout it points into. A copy kept outside any checkout runs
+# the one `SHIPLINE_HOME` names, `~/.local/share/shipline` when it names none.
+set -euo pipefail
+
+# Every command a rule, a hook or the timer names. The others in `scripts/workflow` are the
+# scripts' own parts.
+COMMANDS=(
+  install-hooks
+  install-timer
+  main-status
+  merge-train-metrics
+  merge-when-current
+  notify
+  review-panel
+  session
+  test-run
+  tick
+  ticket-files
+  usage
+  wake
+  weaker-tests
+)
+
+usage() {
+  echo "usage: shipline [--repo <path>] <command> [arguments]" >&2
+  echo "commands: ${COMMANDS[*]}" >&2
+  exit 2
+}
+
+self=$(readlink -f -- "${BASH_SOURCE[0]}")
+home=$(cd "$(dirname "$self")/.." && pwd)
+[[ -f $home/scripts/workflow/session ]] || home=${SHIPLINE_HOME:-$HOME/.local/share/shipline}
+if [[ ! -f $home/scripts/workflow/session ]]; then
+  echo "no Shipline checkout at $home: clone Shipline there, or name its checkout with SHIPLINE_HOME" >&2
+  exit 1
+fi
+
+case ${1:-} in
+  --repo)
+    [[ $# -ge 2 && -n $2 ]] || usage
+    SHIPLINE_REPO=$2
+    shift 2
+    ;;
+  --repo=?*)
+    SHIPLINE_REPO=${1#--repo=}
+    shift
+    ;;
+esac
+if [[ -n ${SHIPLINE_REPO:-} ]]; then
+  # Absolute, so a script that changes its folder still names the same repository.
+  [[ $SHIPLINE_REPO == /* ]] || SHIPLINE_REPO=$PWD/$SHIPLINE_REPO
+  export SHIPLINE_REPO
+  # The command runs in the repository: in the current folder when it is one of the
+  # repository's checkouts, else in its main checkout. A name that is no repository is left to
+  # the scripts, which say so.
+  named=$(git -C "$SHIPLINE_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || named=""
+  current=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || current=""
+  if [[ -n $named && $named != "$current" ]]; then
+    cd "$(dirname "$named")"
+  fi
+fi
+
+[[ $# -ge 1 ]] || usage
+command=$1
+shift
+for known in "${COMMANDS[@]}"; do
+  [[ $command != "$known" ]] || exec bash "$home/scripts/workflow/$command" "$@"
+done
+echo "shipline: unknown command $command" >&2
+usage
