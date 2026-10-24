@@ -101,6 +101,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 Change `merge.scratch_prefix` only while the merge line is empty: the gate deletes, and cancels
 the runs of, only the scratch branches of the prefix it reads, so those of the old one would stay.
 | `commands.*`, the others | the repository's own commands Shipline calls, each split into words (below) | none |
+| `review.high_effort_paths` | regular expressions searched for in every path a pull request changes, both sides of a rename or deletion; a match runs its independent reviewer at high effort, not medium (`review-effort N`): stored data, text sent to a model, background work, locks and queues, account boundaries and security | none: only Shipline's own concurrent scripts and a description with the line `Review: high` |
 | `answer_for_owner_after_minutes` | how long a question to the owner marked `Owner only: no` waits before the tick types its recommended reply (see `RULES.md`, "Asking the owner"); `0` turns that off, and it is at most `1440`, a day | `15` |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and

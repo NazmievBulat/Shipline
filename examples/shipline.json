@@ -79,5 +79,13 @@
     },
     "plans": "docs/hunt-plans.md"
   },
+  "review": {
+    "high_effort_paths": [
+      "^db/migrations/", "^db/schema\\.sql$", "^app/models/",
+      "^prompts/", "(^|/)AGENTS\\.md$", "\\.prompt\\.md$",
+      "^app/jobs/", "^app/queues/", "(^|/)locks?\\.py$",
+      "^app/auth/", "^app/permissions/", "^config/secrets"
+    ]
+  },
   "answer_for_owner_after_minutes": 15
 }
