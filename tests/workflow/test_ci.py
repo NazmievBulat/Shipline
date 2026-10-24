@@ -147,14 +147,28 @@ def test_the_summing_up_check_passes_only_when_every_job_that_ran_passed(ended: 
     assert done.returncode == (0 if ended == "success skipped" else 1), done.stdout
 
 
+# Where each workflow finds `ci_proof.py`: Shipline in its own tree; a repository that uses it,
+# which holds none of its scripts, in a clone of Shipline made by the job.
+_PROOF = {
+    _CI: "scripts/workflow/ci_proof.py",
+    _EXAMPLE: '"$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py"',
+}
+_CLONE = (
+    "      - name: Shipline\n"
+    "        run: git clone --quiet --depth 1 https://github.com/NazmievBulat/Shipline.git"
+    ' "$RUNNER_TEMP/shipline"\n'
+)
+
+
 @pytest.mark.parametrize("path", [_CI, _EXAMPLE], ids=["own", "example"])
 def test_the_planner_writes_the_gate_s_notes_and_main_s_inheritance(path: Path) -> None:
     plan = _job(path, "plan")
+    proof = _PROOF[path]
 
     assert re.search(r'^    name: "CI: what to run"$', plan, re.M)
-    assert "run: python3 scripts/workflow/ci_proof.py notes --whole server_tests\n" in plan
+    assert f"run: python3 {proof} notes --whole server_tests\n" in plan
     assert "        if: github.event_name == 'push'\n" in plan
-    assert "run: python3 scripts/workflow/ci_proof.py inherited ci\n" in plan
+    assert f"run: python3 {proof} inherited ci\n" in plan
     assert "inherited: ${{ steps.inherited.outputs.inherited || '[]' }}" in plan
     # The only job that reads more than the repository, and only what main's inheritance reads.
     assert re.search(r"^    permissions:\n      contents: read\n(?:      #.*\n)*"
@@ -173,13 +187,40 @@ def test_the_test_job_runs_the_config_s_command_unless_main_inherited_it(path: P
     selection = ("&& contains(fromJSON(needs.plan.outputs.needed), 'server_whole') "
                  "&& !contains(fromJSON(needs.plan.outputs.prefix_only), 'server_whole') ") if path == _EXAMPLE else ""
     assert _condition(tests) == f"${{{{ ({_NOT_A_DRAFT}) {selection}&& {_NOT_INHERITED} }}}}"
-    assert "python3 scripts/workflow/ci_proof.py test" in tests
+    assert f"python3 {_PROOF[path]} test" in tests
 
 
 def test_shipline_names_its_own_test_command() -> None:
     config = json.loads((_ROOT / "shipline.json").read_text())
 
     assert config["commands"]["test"] == "python -m pytest -rs"
+
+
+# How the example's Python steps name the same clone.
+_PROOF_IN_PYTHON = "os.environ['RUNNER_TEMP'] + '/shipline/scripts/workflow/ci_proof.py'"
+
+
+@pytest.mark.parametrize("job", ["plan", "tests", "selected"])
+def test_the_example_s_jobs_fetch_shipline_before_they_run_its_scripts(job: str) -> None:
+    text = _job(_EXAMPLE, job)
+    calls = [text.find(_PROOF[_EXAMPLE]), text.find(_PROOF_IN_PYTHON)]
+
+    assert text.count(_CLONE) == 1
+    assert text.index(_CLONE) < min(call for call in calls if call >= 0)
+    assert "scripts/workflow" not in text.replace(_PROOF[_EXAMPLE], "").replace(
+        _PROOF_IN_PYTHON, ""
+    )
+
+
+def test_the_example_runs_each_of_ci_proof_s_commands_from_the_clone() -> None:
+    plan, selected = _job(_EXAMPLE, "plan"), _job(_EXAMPLE, "selected")
+
+    assert f"subprocess.run(['python3', {_PROOF_IN_PYTHON}, 'prefix-only', *args]" in plan
+    assert f'python3 {_PROOF[_EXAMPLE]} notes --selected server_tests "$ran" "$TOTAL" files' in plan
+    assert f"run: python3 {_PROOF[_EXAMPLE]} notes --none server_tests\n" in plan
+    assert f"subprocess.run(['python3', {_PROOF_IN_PYTHON}, 'test', *files]" in selected
+    # The fast checks are the repository's own tool: no Shipline there.
+    assert "shipline" not in _job(_EXAMPLE, "fast").lower()
 
 
 def test_the_example_s_jobs_carry_the_config_s_default_names() -> None:

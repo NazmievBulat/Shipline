@@ -1077,3 +1077,85 @@ def test_a_tick_whose_whole_group_is_stopped_counts_neither_way(
     trial = json.loads((home / ".local" / "shipline" / "trial.json").read_text())
     assert trial["tick_failures"] == trial["ticks"] == 0
     assert not (runs / str(tick.pid)).exists()
+
+
+def test_installation_state_folder_keeps_a_held_gate_lock_from_being_updated(
+    shipline: Shipline,
+) -> None:
+    import fcntl
+
+    config = shipline.root / "installation.json"
+    config.write_text('{"state_folder": ".installed/state"}')
+    shipline.env["SHIPLINE_CONFIG"] = str(config)
+    shipline.good()
+    landed = shipline.land()
+    shipline.later(10)
+    folder = shipline.repo / ".installed/state"
+    folder.mkdir(parents=True)
+    with (folder / "merge.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert shipline.tick() == 0
+        assert shipline.head == shipline.first
+    shipline.later(10)
+    assert shipline.tick() == _MOVED
+    assert shipline.head == landed
+
+
+@pytest.mark.parametrize("kind", ["missing", "json", "schema"])
+def test_installation_config_refusals_stop_updates_without_counting_as_crashes(
+    shipline: Shipline, kind: str
+) -> None:
+    shipline.good()
+    active = shipline.land()
+    shipline.later(10)
+    assert shipline.tick() == _MOVED
+    available = shipline.land()
+    config = shipline.root / "installation.json"
+    if kind == "json":
+        config.write_text("{")
+    elif kind == "schema":
+        config.write_text('{"state_folder": 42}')
+    shipline.env["SHIPLINE_CONFIG"] = str(config)
+    pid = str(os.getpid())
+    reads = shipline.ci_reads()
+
+    for _ in range(3):
+        shipline.later(10)
+        started = shipline.run("start", pid)
+        assert started.returncode == 1, started.stderr
+        assert str(config) in started.stderr
+        assert "Traceback" not in started.stderr
+        assert not (shipline.notes / "runs" / f"{pid}.crash").exists()
+        assert shipline.head == active
+        assert shipline.ci_reads() == reads
+        assert shipline.run("end", pid, "1").returncode == 0
+        trial = json.loads((shipline.notes / "trial.json").read_text())
+        assert trial["tick_failures"] == 0
+
+    config.write_text("{}")
+    assert shipline.tick() == _MOVED
+    assert shipline.head == available
+    assert shipline.notices() == []
+
+
+def test_a_config_key_only_a_newer_shipline_knows_does_not_stop_the_update(
+    shipline: Shipline,
+) -> None:
+    import fcntl
+
+    config = shipline.root / "installation.json"
+    config.write_text('{"state_folder": ".installed/state", "only_in_a_newer_shipline": true}')
+    shipline.env["SHIPLINE_CONFIG"] = str(config)
+    shipline.good()
+    landed = shipline.land()
+    shipline.later(10)
+    folder = shipline.repo / ".installed/state"
+    folder.mkdir(parents=True)
+    # The state folder is still read from the file: a held gate lock there keeps the move back.
+    with (folder / "merge.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert shipline.tick() == 0
+        assert shipline.head == shipline.first
+    shipline.later(10)
+    assert shipline.tick() == _MOVED
+    assert shipline.head == landed

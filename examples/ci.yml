@@ -58,6 +58,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+      # Shipline's own scripts, which the repository does not hold: its main as it is now.
+      - name: Shipline
+        run: git clone --quiet --depth 1 https://github.com/NazmievBulat/Shipline.git "$RUNNER_TEMP/shipline"
       - name: The repository's existing selection
         id: selection
         run: |
@@ -81,13 +84,13 @@ jobs:
           python3 - <<'PY'
           import json, os, subprocess
           args = [word for group in json.loads(os.environ['NEEDED']) for word in ('--needed', group)]
-          subprocess.run(['python3', 'scripts/workflow/ci_proof.py', 'prefix-only', *args], check=True)
+          subprocess.run(['python3', os.environ['RUNNER_TEMP'] + '/shipline/scripts/workflow/ci_proof.py', 'prefix-only', *args], check=True)
           PY
       - name: The notes the merge gate reads
         if: contains(fromJSON(steps.selection.outputs.needed), 'server_whole') && !contains(fromJSON(steps.deferred.outputs.prefix_only), 'server_whole')
         # Every run runs the whole suite; a repository that runs a selection notes it with
         # `--selected server_tests N M files`, and one that needs none with `--none`.
-        run: python3 scripts/workflow/ci_proof.py notes --whole server_tests
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes --whole server_tests
       - name: Note the selected server tests
         if: contains(fromJSON(steps.deferred.outputs.prefix_only), 'server_whole')
         env:
@@ -95,10 +98,10 @@ jobs:
           TOTAL: ${{ steps.selection.outputs.server_total }}
         run: |
           ran=$(python3 -c 'import json, os; print(len(json.loads(os.environ["FILES"])))')
-          python3 scripts/workflow/ci_proof.py notes --selected server_tests "$ran" "$TOTAL" files
+          python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes --selected server_tests "$ran" "$TOTAL" files
       - name: Note that no server test is needed
         if: "!contains(fromJSON(steps.selection.outputs.needed), 'server_whole')"
-        run: python3 scripts/workflow/ci_proof.py notes --none server_tests
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes --none server_tests
       # A squash the gate made carries its proof: main skips a job that passed, whole, on the
       # identical tree, and names the run it inherited. Any other push runs everything.
       - name: The jobs main inherits from its squash's proof
@@ -106,7 +109,7 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/workflow/ci_proof.py inherited ci
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" inherited ci
 
   tests:
     # The gate's name for the job that runs every server test.
@@ -128,9 +131,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+      # Shipline's own scripts, which the repository does not hold: its main as it is now.
+      - name: Shipline
+        run: git clone --quiet --depth 1 https://github.com/NazmievBulat/Shipline.git "$RUNNER_TEMP/shipline"
       # Whatever the repository's tests need installed comes before this.
       - name: Tests
-        run: python3 scripts/workflow/ci_proof.py test
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" test
 
   selected:
     name: "CI: selected server tests"
@@ -147,6 +153,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+      # Shipline's own scripts, which the repository does not hold: its main as it is now.
+      - name: Shipline
+        run: git clone --quiet --depth 1 https://github.com/NazmievBulat/Shipline.git "$RUNNER_TEMP/shipline"
       - name: Only the existing selection
         env:
           FILES: ${{ needs.plan.outputs.server_files }}
@@ -155,7 +164,7 @@ jobs:
           import json, os, subprocess
           files = json.loads(os.environ['FILES'])
           if files:
-              subprocess.run(['python3', 'scripts/workflow/ci_proof.py', 'test', *files], check=True)
+              subprocess.run(['python3', os.environ['RUNNER_TEMP'] + '/shipline/scripts/workflow/ci_proof.py', 'test', *files], check=True)
           PY
 
   fast:

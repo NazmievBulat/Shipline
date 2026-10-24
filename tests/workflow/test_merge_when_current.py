@@ -14,7 +14,8 @@ import sys
 import time
 from collections.abc import Iterator
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -213,9 +214,21 @@ def answer(args, cwd, env, out, err):
             (state / "batch-state-during-dispatch").write_text(train.read_text())
         if (state / "reject-batch-dispatch").exists():
             sys.exit("workflow dispatch rejected")
+    elif args[:2] == ["run", "view"] and "--log-failed" in args:
+        job = args[args.index("--job") + 1]
+        log = state / "job-logs" / job
+        if not log.exists():
+            sys.exit("failed to get run log: log not found")
+        print(log.read_text())
     elif args[:2] == ["run", "rerun"]:
+        unavailable = state / "rerun-unavailable"
+        if unavailable.exists():
+            # GitHub fails this re-run once, as in an outage.
+            message = unavailable.read_text()
+            unavailable.unlink()
+            sys.exit(message)
         if (state / "fail-rerun").exists():
-            sys.exit("rerun refused")
+            sys.exit((state / "fail-rerun").read_text().strip() or "rerun refused")
     elif args[:2] == ["run", "cancel"]:
         # Each cancel is written down with the scratch branches GitHub still has at that moment.
         listed = check_output(["git", "--git-dir", data["origin"], "for-each-ref",
@@ -232,6 +245,9 @@ def answer(args, cwd, env, out, err):
             sys.exit("HTTP 502: Bad Gateway")
     elif args[0] == "api":
         path = args[-1]
+        # GitHub knows no workflow the repository does not hold.
+        if any(f"/actions/workflows/{name}/" in path for name in data.get("missing_workflows", [])):
+            sys.exit("gh: Not Found (HTTP 404)")
         if path not in data["api"]:
             if "event=workflow_dispatch" in path or "/actions/runs?branch=" in path:
                 print('{"workflow_runs": []}')
@@ -298,6 +314,8 @@ class GitHub:
     # The runs whose cancel GitHub refuses, and those whose next cancel fails in an outage.
     refuse_cancel: list[int] = field(default_factory=list[int])
     cancel_unavailable: list[int] = field(default_factory=list[int])
+    # The workflow files the repository does not hold, whose runs GitHub cannot list.
+    missing_workflows: list[str] = field(default_factory=list[str])
 
     def save(self) -> None:
         (self.workflow.state / "github.json").write_text(
@@ -319,6 +337,7 @@ class GitHub:
                     "push_after_view": self.push_after_view,
                     "refuse_cancel": self.refuse_cancel,
                     "cancel_unavailable": self.cancel_unavailable,
+                    "missing_workflows": self.missing_workflows,
                 }
             )
         )
@@ -1014,6 +1033,152 @@ def test_the_train_serves_by_priority_then_by_the_order_of_joining(
     assert saved["waiting"] == ["7", "8"]
 
 
+def _members_changing(github: GitHub, changes: dict[str, str]) -> None:
+    """Members joined in this order, each one commit on main changing its own file."""
+    workflow = github.workflow
+    names = {"7": "seven", "8": "eight", "9": "nine", "10": "ten"}
+    for run, (number, path) in enumerate(changes.items()):
+        branch = f"ticket/{names[number]}"
+        checkout = workflow.repo if number == "7" else workflow.root / names[number]
+        if number != "7":
+            workflow.running(f"review-{number}")
+            workflow.git("worktree", "add", "-b", branch, str(checkout), github.base)
+        (checkout / path).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / path).write_text(f"changed by {number}\n")
+        workflow.git("add", path, cwd=checkout)
+        workflow.git("commit", "--quiet", "-m", f"feat: {number}", cwd=checkout)
+        head = workflow.git("rev-parse", "HEAD", cwd=checkout)
+        workflow.git("push", "--quiet", "origin", f"HEAD:{branch}", cwd=checkout)
+        github.pulls[number] = {
+            **deepcopy(github.pulls["7"]),
+            "headRefOid": head,
+            "headRefName": branch,
+        }
+        if number == "7":
+            github.head = head
+        github.ci(github.base, head, run_id=20 + 10 * run)
+    github.save()
+    _line(github, list(changes))
+
+
+def _hot(github: GitHub, *paths: str) -> None:
+    config = github.workflow.repo / "shipline.json"
+    config.write_text(json.dumps({**json.loads(config.read_text()), "hot_paths": list(paths)}))
+
+
+@pytest.mark.parametrize("hot", [True, False], ids=["hot path", "no hot paths"])
+def test_members_sharing_a_hot_path_are_served_back_to_back(github: GitHub, hot: bool) -> None:
+    """9 is refreshed once on 7's squash instead of conflicting with it after 8's."""
+    if hot:
+        _hot(github, "web/src/pages/**")
+    _members_changing(
+        github,
+        {
+            "7": "web/src/pages/menu.tsx",
+            "8": "src/example_app/other.py",
+            "9": "web/src/pages/settings.tsx",
+            "10": "web/src/pages/menu.tsx",
+        },
+    )
+
+    train = _train(github)
+
+    assert train["waiting"] == (["7", "9", "10", "8"] if hot else ["7", "8", "9", "10"])
+    if hot:
+        assert train["hot_paths"] == {
+            "7": "web/src/pages/**",
+            "9": "web/src/pages/**",
+            "10": "web/src/pages/**",
+        }
+    else:
+        assert "hot_paths" not in train
+    # The order of joining is kept, so a member leaving the group restores it.
+    saved = json.loads((github.workflow.repo / ".local/workflow/merge-train.json").read_text())
+    assert saved["waiting"] == ["7", "8", "9", "10"]
+    # Without hot paths the line is saved as before.
+    assert ("hot_paths" in saved) == hot
+
+
+def test_a_hot_path_never_moves_a_member_across_priorities(github: GitHub) -> None:
+    _hot(github, "web/src/pages/**")
+    _members_changing(
+        github,
+        {
+            "7": "web/src/pages/menu.tsx",
+            "8": "src/example_app/other.py",
+            "9": "web/src/pages/settings.tsx",
+        },
+    )
+    _labelled(github, {"7": ["priority: high"], "8": ["priority: high"]})
+
+    train = _train(github)
+
+    # 9 is medium: it shares 7's hot path but stays behind every high member.
+    assert train["waiting"] == ["7", "8", "9"]
+    assert train["hot_paths"] == {}
+
+
+@pytest.mark.parametrize("failing", ["ls-remote", "fetch"])
+def test_a_stalled_github_is_waited_for_once_when_hot_paths_are_read(
+    gate: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failing: str
+) -> None:
+    """Each read of GitHub may take minutes under the merge lock: thirty members with new
+    heads wait for one stalled read, not one each."""
+    monkeypatch.setattr(gate, "CONFIG", replace(gate.CONFIG, hot_paths=("web/src/pages/**",)))
+    numbers = [str(100 + index) for index in range(30)]
+    train = gate.Train(tmp_path)
+    train.queue = numbers
+    pulls = {number: {"headRefOid": f"{int(number):040x}"} for number in numbers}
+    calls: list[str] = []
+
+    def git(*args: str) -> str:
+        calls.append(args[0])
+        if args[0] == failing:
+            raise gate.Waiting(f"git {args[0]} timed out")
+        return "f" * 40 + "\trefs/heads/main"
+
+    monkeypatch.setattr(gate, "git", git)
+    # No member's head is in the local store yet: each would be fetched.
+    monkeypatch.setattr(
+        gate, "command", lambda *args, **_: subprocess.CompletedProcess(args, 1, "", "")
+    )
+
+    train.read_hot_paths(pulls)
+
+    assert calls.count(failing) == 1
+    # Unread, each is served as without hot paths and read again at the next turn.
+    assert train.hot == {}
+
+
+def test_a_member_whose_new_head_leaves_the_hot_path_is_served_by_joining_again(
+    github: GitHub,
+) -> None:
+    _hot(github, "web/src/pages/**")
+    _members_changing(
+        github,
+        {
+            "7": "web/src/pages/menu.tsx",
+            "8": "src/example_app/other.py",
+            "9": "web/src/pages/settings.tsx",
+        },
+    )
+    assert _train(github)["waiting"] == ["7", "9", "8"]
+
+    # 9 drops its change to the page: its new head changes another file.
+    nine = github.workflow.root / "nine"
+    github.workflow.git("rm", "--quiet", "web/src/pages/settings.tsx", cwd=nine)
+    (nine / "docs.md").write_text("docs\n")
+    github.workflow.git("add", "docs.md", cwd=nine)
+    github.workflow.git("commit", "--quiet", "-m", "fix: docs only", cwd=nine)
+    head = github.workflow.git("rev-parse", "HEAD", cwd=nine)
+    github.workflow.git("push", "--quiet", "origin", "HEAD:ticket/nine", cwd=nine)
+    github.pulls["9"]["headRefOid"] = head
+    github.ci(github.base, head, run_id=90)
+    github.save()
+
+    assert _train(github)["waiting"] == ["7", "8", "9"]
+
+
 def test_a_label_changed_while_waiting_moves_the_pull_request_at_the_next_turn(
     github: GitHub,
 ) -> None:
@@ -1304,6 +1469,42 @@ def test_a_fresh_pull_request_merges_with_its_head_pinned(github: GitHub) -> Non
         f"--squash --match-head-commit {github.head}" in call
         for call in github.workflow.calls("gh pr merge")
     )
+
+
+def test_a_repository_without_an_image_or_browser_workflow_merges_without_their_checks(
+    github: GitHub,
+) -> None:
+    """A repository set up from nothing keeps only its CI workflow: GitHub lists no runs of a
+    workflow it does not hold, and no change needs its checks."""
+    workflow = github.workflow
+    workflow.git("checkout", "main")
+    workflow.git("rm", "--quiet", ".github/workflows/images.yml")
+    workflow.git("commit", "--quiet", "-m", "ci: no images")
+    workflow.git("push", "--quiet", "origin", "main")
+    github.base = workflow.git("rev-parse", "main")
+    workflow.git("checkout", "ticket/seven")
+    workflow.git("merge", "--quiet", "--no-edit", "main")
+    github.head = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "--quiet", "origin", "HEAD:ticket/seven")
+    github.pulls["7"]["headRefOid"] = github.head
+    github.main()
+    github.ci(github.base, github.head)
+    github.missing_workflows = ["images.yml", "e2e.yml"]
+
+    done = github.run()
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "merged").read_text() == "7"
+
+
+def test_a_repository_without_its_ci_workflow_never_merges(github: GitHub) -> None:
+    github.missing_workflows = ["ci.yml"]
+
+    done = github.run()
+
+    assert done.returncode != 0
+    assert "HTTP 404" in done.stdout + done.stderr
+    assert not (github.workflow.state / "merged").exists()
 
 
 def _notes_by_ci_proof(github: GitHub, checked_out: str, *suites: str) -> None:
@@ -4707,6 +4908,7 @@ def _batch_setup(
     count: int = 3,
     conflict: bool = False,
     images: bool = False,
+    images_member: int = 7,
     migration: bool = False,
     compatibility: str | None = None,
     selected: bool = False,
@@ -4720,7 +4922,7 @@ def _batch_setup(
         if number != 7:
             workflow.git("checkout", "-b", f"ticket/{number}", original)
         filename = "shared.txt" if conflict and number in (7, 9) else f"change-{number}.txt"
-        if images and number == 7:
+        if images and number == images_member:
             filename = "docker/change.txt"
             (workflow.repo / "docker").mkdir()
         if (migration and number in (8, 9)) or str(number) == compatibility:
@@ -4743,7 +4945,9 @@ def _batch_setup(
         github.ci(original, head, run_id=number * 1000)
     github.head = github.pulls["7"]["headRefOid"]
     if images:
+        github.head = github.pulls[str(images_member)]["headRefOid"]
         _images(github)
+        github.head = github.pulls["7"]["headRefOid"]
     workflow.git("checkout", "ticket/seven")
     # Each reviewer calls the actual gate. Pending main prevents a premature first merge.
     github.main()
@@ -5809,9 +6013,301 @@ def test_a_green_scratch_rerun_restores_the_isolated_members_earlier_place(
     # On the same main, the passed rerun is its prefix: it merges without another run.
     assert done.returncode == (2 if moved else 0), done.stdout + done.stderr
     assert _merges(github) == ([] if moved else ["7"])
-    # 7, 8 and 9; 8 and 9 again behind the new front after the failure; and, once 7 is back in
-    # front of them, 8 and 9 once more on top of it. A refresh dispatches nothing.
-    assert len(github.workflow.calls("gh workflow run ci.yml")) == (5 if moved else 7)
+    # 7, 8 and 9; then 8 and 9 without the failed member. Restoring 7 starts no replacement
+    # runs on the old main. If 7 merges, its new main is where 8 and 9 are tested next.
+    assert len(github.workflow.calls("gh workflow run ci.yml")) == 5
+    if not moved:
+        base = github.workflow.git("rev-parse", "origin/main")
+        done = _batch_call(github, "8")
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert len(github.workflow.calls("gh workflow run ci.yml")) == 7
+        assert _scratch(github, "8")["under"] == github.workflow.git(
+            "rev-parse", f"{base}^{{tree}}"
+        )
+
+
+def _restored_before_eight(
+    github: GitHub, *, passed: bool, reconciled: bool = False, count: int = 3, late: bool = False
+) -> dict[str, Any]:
+    """Restore 7 on unchanged main, with a proof shortfall and 8 already tested alone."""
+    _batch_setup(github, count=count, images=True, images_member=8)
+    if late:
+        # 9 has not joined the ready line. A one-slot window starts 8 alone after 7 fails.
+        github.pulls["9"]["isDraft"] = True
+        saved = _batch_state(github)
+        saved["window"] = 2
+        (github.workflow.repo / ".local/workflow/merge-train.json").write_text(json.dumps(saved))
+    assert _batch_call(github).returncode == 3
+    isolated = _prefixes(github)[0]
+    _finish_prefix(github, "7", conclusion="failure")
+    assert _batch_call(github).returncode == 1
+    kept = next(member for member in _prefixes(github) if member["number"] == "8")
+    _finish_prefix(github, "8", run_id=1100)
+    if not passed:
+        for workflow in kept["scratch"]["workflows"]:
+            key = (
+                f"{_REPO}/actions/workflows/{workflow}.yml/runs"
+                f"?head_sha={kept['scratch']['head']}&event=workflow_dispatch&per_page=100"
+            )
+            github.api[key]["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    # Exercise a state written before kept prefixes and their dependencies were recorded.
+    path = github.workflow.repo / ".local/workflow/merge-train.json"
+    saved = _batch_state(github)
+    saved.pop("restored", None)
+    for member in saved["prefixes"]["members"]:
+        member.pop("ahead", None)
+        member.pop("kept", None)
+    path.write_text(json.dumps(saved))
+    _finish_prefix(
+        github, "7", scratch=isolated["scratch"], tree=isolated["tree"], run_id=100
+    )
+    for workflow in isolated["scratch"]["workflows"]:
+        key = (
+            f"{_REPO}/actions/workflows/{workflow}.yml/runs"
+            f"?head_sha={isolated['scratch']['head']}&event=workflow_dispatch&per_page=100"
+        )
+        github.api[key]["workflow_runs"][0]["run_attempt"] = 2
+    github.api[f"{_REPO}/check-runs/101/annotations?per_page=100"][1]["message"] = SELECTED
+    if reconciled:
+        github.save()
+        assert _train(github)["first"] == "7"
+        saved = _batch_state(github)
+        saved.pop("restored", None)
+        for member in saved["prefixes"]["members"]:
+            member.pop("ahead", None)
+        path.write_text(json.dumps(saved))
+    return kept
+
+
+@pytest.mark.parametrize("passed", [False, True], ids=["running", "passed"])
+@pytest.mark.parametrize("reconciled", [False, True], ids=["failed-state", "proven-state"])
+def test_restoration_keeps_an_existing_prefix_across_retests_and_gate_calls(
+    github: GitHub, passed: bool, reconciled: bool
+) -> None:
+    kept = _restored_before_eight(github, passed=passed, reconciled=reconciled)
+    branch = kept["scratch"]["branch"]
+    done = _batch_call(github)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "did not prove its tested files" in done.stderr
+    assert _scratch(github, "8")["branch"] == branch
+    assert branch in _scratch_branches(github)
+
+    # The replacement prefix of 7 starts beside the kept work; a later tick cannot forget it.
+    for _ in range(3):
+        github.save()
+        status = _train(github)
+        prefixes = {entry["number"]: entry for entry in status["prefixes"]}
+        assert prefixes["8"]["kept"] is True
+        assert prefixes["8"]["branch"] == branch
+        assert prefixes["7"]["branch"] != branch
+        number = status["first"]
+        done = _batch_call(github, number)
+        if passed:
+            assert done.returncode == 0, done.stdout + done.stderr
+            break
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert _scratch(github, "8")["branch"] == branch
+        saved = _batch_state(github)
+        assert sum(
+            member["scratch"] is None or member["scratch"]["pushed"]
+            for member in saved["prefixes"]["members"]
+        ) <= saved["window"]
+    if not passed:
+        _finish_prefix(github, "8", run_id=1100)
+        github.save()
+        assert _train(github)["first"] == "8"
+        done = _batch_call(github, "8")
+        assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["8"]
+    receipt = _receipt(github)
+    assert receipt["tree"] == kept["tree"]
+    assert receipt["ci_run"] == 1100
+    assert receipt["images_run"] == 1110 and receipt["images_complete"] is True
+    # The kept branch was dispatched only once, and 7 now tests against the new main.
+    assert len([call for call in github.workflow.calls("gh workflow run") if branch in call]) == len(
+        kept["scratch"]["workflows"]
+    )
+    restored = next(member for member in _prefixes(github) if member["number"] == "7")
+    base = github.workflow.git("rev-parse", "origin/main")
+    assert restored["scratch"]["under"] == github.workflow.git("rev-parse", f"{base}^{{tree}}")
+    _finish_prefix(github, "7", run_id=2100)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["8", "7"]
+
+
+@pytest.mark.parametrize("reconciled", [False, True], ids=["failed-state", "proven-state"])
+def test_a_member_joining_during_a_restored_retest_waits_for_the_restored_front(
+    github: GitHub, reconciled: bool
+) -> None:
+    # Read the older state shape, both before and after its green rerun was recognized.
+    kept = _restored_before_eight(github, passed=False, reconciled=reconciled, late=True)
+    assert _batch_call(github).returncode == 1
+    saved = _batch_state(github)
+    saved["window"] = 2
+    (github.workflow.repo / ".local/workflow/merge-train.json").write_text(json.dumps(saved))
+    assert _batch_call(github).returncode == 3
+    restored = _scratch(github, "7")
+    assert restored and restored["pushed"]
+
+    # 9 joins while 8 is kept and 7's replacement is running. Only the existing 8 may go first.
+    github.pulls["9"]["isDraft"] = False
+    saved = _batch_state(github)
+    saved["window"] = 4
+    (github.workflow.repo / ".local/workflow/merge-train.json").write_text(json.dumps(saved))
+    done = _batch_call(github, "9")
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "9" in _batch_state(github)["waiting"]
+    for member in _prefixes(github):
+        if member["number"] == "9":
+            assert "7" in member["ahead"], member
+            assert not member.get("kept"), member
+    assert _scratch(github, "8")["branch"] == kept["scratch"]["branch"]
+
+    _finish_prefix(github, "8", run_id=1100)
+    done = _batch_call(github, "8")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["8"]
+    replacement = _scratch(github, "7")
+    assert replacement and replacement["pushed"]
+    assert replacement["branch"] != restored["branch"]
+    base = github.workflow.git("rev-parse", "origin/main")
+    assert replacement["under"] == github.workflow.git("rev-parse", f"{base}^{{tree}}")
+
+    for member in _prefixes(github):
+        if member["number"] == "9":
+            assert "7" in member["ahead"], member
+            _finish_prefix(github, "9", run_id=4100)
+    for _ in range(3):
+        for number in ("7", "9"):
+            done = _batch_call(github, number)
+            assert done.returncode == 3, done.stdout + done.stderr
+        assert _merges(github) == ["8"]
+        assert _scratch(github, "7")["branch"] == replacement["branch"]
+    _finish_prefix(github, "7", run_id=3100)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github)[:2] == ["8", "7"]
+
+
+@pytest.mark.parametrize("change", ["head", "main", "draft"])
+def test_a_kept_prefix_is_invalidated_when_its_inputs_change(github: GitHub, change: str) -> None:
+    kept = _restored_before_eight(github, passed=False)
+    assert _batch_call(github).returncode == 1
+    if change == "head":
+        github.pulls["8"]["headRefOid"] = github.pulls["9"]["headRefOid"]
+    elif change == "draft":
+        github.pulls["8"]["isDraft"] = True
+    else:
+        workflow = github.workflow
+        workflow.git("checkout", "main")
+        workflow.git("commit", "--allow-empty", "-m", "chore: main moved")
+        github.base = workflow.git("rev-parse", "HEAD")
+        workflow.git("push", "origin", "main")
+        workflow.git("checkout", "ticket/seven")
+        github.main()
+    done = _batch_call(github)
+    assert done.returncode in (1, 2, 3), done.stdout + done.stderr
+    assert kept["scratch"]["branch"] not in _scratch_branches(github)
+    assert _merges(github) == []
+
+
+def test_replacing_a_short_prefix_cancels_only_its_own_live_runs_once(github: GitHub) -> None:
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    scratch = _scratch(github)
+    _finish_batch(github)
+    github.api[f"{_REPO}/check-runs/101/annotations?per_page=100"][1]["message"] = SELECTED
+    _branch_runs(
+        github, scratch["branch"],
+        (901, "queued"), (902, "in_progress"), (903, "completed"),
+        (904, "in_progress", "main", "push"),
+        (905, "in_progress", "ticket/7", "push"),
+    )
+    done = _batch_call(github)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert list(_cancelled(github)) == ["901", "902"]
+    assert all(scratch["branch"] in branches for branches in _cancelled(github).values())
+    assert done.stdout.count("cancel requested for run 901") == 1
+    assert done.stdout.count("cancel requested for run 902") == 1
+    assert scratch["branch"] not in _scratch_branches(github)
+    done = _batch_call(github)
+    assert "cancel requested for run 901" not in done.stdout
+    assert len(github.workflow.calls("gh run cancel")) == 2
+
+
+def test_an_old_scratch_name_is_cancelled_but_other_branches_are_untouched(github: GitHub) -> None:
+    _batch_setup(github)
+    branch = "workflow/merge-batch-legacy"
+    other = "ticket/example-app"
+    for name in (branch, other):
+        github.workflow.git("push", "origin", f"{github.base}:refs/heads/{name}")
+        _branch_runs(github, name, (901 if name == branch else 902, "in_progress"))
+    _branch_runs(github, "main", (903, "in_progress"))
+    done = _batch_call(github)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert list(_cancelled(github)) == ["901"]
+    assert branch not in _scratch_branches(github)
+    assert github.workflow.git("ls-remote", "origin", f"refs/heads/{other}")
+
+
+def test_planning_a_restored_prefix_does_not_rerun_its_failed_jobs(github: GitHub) -> None:
+    _restored_before_eight(github, passed=False)
+    assert _batch_call(github).returncode == 1
+    # Room for the restored member's retest, while the kept prefix still runs.
+    github.pulls["9"]["state"] = "CLOSED"
+    assert _batch_call(github).returncode == 3
+    _finish_prefix(github, "7", run_id=200)
+    batch_dependencies_red(github, annotation=UNREACHABLE, run_id=200)
+    advisory_service_answers(github.workflow, answers=True)
+    before = github.workflow.calls("gh run rerun")
+    _train(github)
+    assert github.workflow.calls("gh run rerun") == before
+
+
+def test_a_new_priority_front_still_invalidates_the_kept_line(github: GitHub) -> None:
+    kept = _restored_before_eight(github, passed=False, count=4)
+    assert _batch_call(github).returncode == 1
+    github.pulls["10"]["labels"] = [{"name": "priority: blocker"}]
+    github.workflow.git("checkout", "ticket/10")
+    done = _batch_call(github, "10")
+    assert done.returncode in (2, 3), done.stdout + done.stderr
+    assert "waiting for the members ahead of the next prefix" not in done.stdout
+    assert kept["scratch"]["branch"] not in _scratch_branches(github)
+    assert _merges(github) == []
+
+
+@pytest.mark.parametrize("descendant_passed", [False, True], ids=["pending", "passed"])
+def test_a_failed_kept_root_frees_capacity_for_the_restored_prefix(
+    github: GitHub, descendant_passed: bool
+) -> None:
+    _restored_before_eight(github, passed=False)
+    assert _batch_call(github).returncode == 1
+    for _ in range(2):
+        assert _batch_call(github).returncode == 3
+        assert _scratch(github, "7")["pushed"] is False
+    _finish_prefix(github, "8", conclusion="failure", run_id=1100)
+    if descendant_passed:
+        _finish_prefix(github, "9", run_id=2100)
+    github.save()
+    # Status reads keep nominating the failed independent root, not its dependent result
+    # or the restored member whose scratch branch cannot start until a slot is released.
+    for _ in range(3):
+        assert _train(github)["first"] == "8"
+    done = _batch_call(github, "8")
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "prefix failed" in done.stderr
+    assert _batch_state(github)["blocked"]["8"] == github.pulls["8"]["headRefOid"]
+    restored = _scratch(github, "7")
+    assert restored["pushed"] is True
+    assert _numbers(github) == ["7"]
+    for _ in range(2):
+        assert _batch_call(github).returncode == 3
+        assert _scratch(github, "7")["branch"] == restored["branch"]
+    _finish_prefix(github, "7", run_id=3100)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7"]
 
 
 @pytest.mark.parametrize("number", ["7", "9"])
@@ -8503,3 +8999,441 @@ def test_a_read_made_old_by_a_long_wait_for_the_lock_is_made_again(
         assert (workflow.repo / ".local/workflow/merge-wanted-7").exists()
         assert _waiting(workflow) == ["7"]
     assert all(held < 5 for held in _held(workflow))
+
+
+@pytest.mark.parametrize("workflow_name", ["ci", "images", "e2e"])
+@pytest.mark.parametrize("second", ["passes", "fails again"])
+def test_prefix_transport_retry_keeps_the_prefix_until_the_second_result(
+    github: GitHub, workflow_name: str, second: str
+) -> None:
+    _batch_setup(github, images=True)
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+    scratch = _scratch(github)
+    path = (f"{_REPO}/actions/workflows/{workflow_name}.yml/runs?head_sha={scratch['head']}"
+            "&event=workflow_dispatch&per_page=100")
+    run = github.api[path]["workflow_runs"][0]
+    run.update(status="in_progress", conclusion=None, run_attempt=1)
+    jobs = github.api[f"{_REPO}/actions/runs/{run['id']}/jobs?per_page=100"]["jobs"]
+    job = next(j for j in jobs if j["name"] not in
+               ("CI: what to run", "CI result", "Docker images: what to run", "E2E: what to run"))
+    job.update(conclusion="failure", labels=["example-app-home-docker"])
+    if workflow_name == "ci":
+        # The grouped check copies the passing first part's ID; the failing log is the
+        # second part's. Classifying the grouped check would miss the transport failure.
+        job["name"] = "CI: server tests (2 of 2)"
+        jobs.insert(jobs.index(job), {
+            **job, "id": job["id"] + 100, "name": "CI: server tests (1 of 2)",
+            "conclusion": "success",
+        })
+    logs = github.workflow.state / "job-logs"
+    logs.mkdir(exist_ok=True)
+    (logs / str(job["id"])).write_text(
+        "#13 [stage 1/2] FROM example-app:latest\n"
+        "#13 ERROR: short read: expected 28249323 bytes but got 0: unexpected EOF\n")
+    github.api[f"{_REPO}/check-runs/{job['id']}/annotations?per_page=100"] = []
+    for j in jobs:
+        j.setdefault("labels", ["example-app-home-docker"])
+    github.save()
+    done = _batch_call(github)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert rerun_calls(github.workflow) == []
+    assert _scratch(github)["branch"] == scratch["branch"]
+    run = github.api[path]["workflow_runs"][0]
+    run.update(status="completed", conclusion="failure")
+    github.save()
+    for _ in range(2):
+        done = _batch_call(github)
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert rerun_calls(github.workflow) == [
+            f"gh run rerun {run['id']} -R example-org/example-app --failed"]
+        assert _scratch(github)["branch"] == scratch["branch"]
+        assert _batch_state(github)["waiting"] == ["7", "8", "9"]
+        assert "7" not in _batch_state(github)["blocked"]
+    run = github.api[path]["workflow_runs"][0]
+    jobs = github.api[f"{_REPO}/actions/runs/{run['id']}/jobs?per_page=100"]["jobs"]
+    failed_job_id = job["id"]
+    job = next(j for j in jobs if j["id"] == failed_job_id)
+    if second == "passes":
+        # The jobs endpoint has advanced to the passing retry while the run list still
+        # reports the failed first attempt. Keep the request and this exact prefix.
+        job["conclusion"] = "success"
+        done = _batch_call(github)
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert _scratch(github)["branch"] == scratch["branch"]
+        assert "7" not in _batch_state(github)["blocked"]
+        run = github.api[path]["workflow_runs"][0]
+    run.update(run_attempt=2, conclusion="success" if second == "passes" else "failure")
+    github.save()
+    done = _batch_call(github)
+    assert done.returncode == (0 if second == "passes" else 1), done.stdout + done.stderr
+    assert len(rerun_calls(github.workflow)) == 1
+    assert ("7" in _batch_state(github)["blocked"]) == (second != "passes")
+    if second != "passes":
+        assert "failed again after its runner retry" in done.stderr
+        assert f"its runners failed it again in run {run['id']}" in github.workflow.wake_log.read_text()
+
+
+@pytest.mark.parametrize("second", ["passes", "fails again"])
+@pytest.mark.parametrize("workflow_name", ["ci", "e2e"])
+def test_whole_suite_transport_retry_keeps_the_scratch_run(
+    github: GitHub, second: str, workflow_name: str
+) -> None:
+    if workflow_name == "ci":
+        tree = _selected_server_tests(github)
+    else:
+        tree = _changes(github)
+        github.e2e(github.head, tree, suite="selected: 3 of 48 spec files", run_id=900_020)
+    assert _batch_call(github).returncode == 3
+    suite = _suite(github)
+    if workflow_name == "ci":
+        github.e2e(suite["head"], tree, run_id=950_100, branch=suite["branch"])
+        github.ci_dispatched(suite["head"], suite["branch"], run_id=950_000, conclusion="failure")
+    else:
+        github.e2e(suite["head"], tree, run_id=950_000, branch=suite["branch"], conclusion="failure")
+    path = (f"{_REPO}/actions/workflows/{workflow_name}.yml/runs?head_sha={suite['head']}"
+            "&event=workflow_dispatch&per_page=100")
+    run = github.api[path]["workflow_runs"][0]
+    run["run_attempt"] = 1
+    jobs = github.api[f"{_REPO}/actions/runs/950000/jobs?per_page=100"]["jobs"]
+    for job in jobs:
+        job["labels"] = ["example-app-home-docker"]
+    logs = github.workflow.state / "job-logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "950002").write_text("failed to solve: registry: TLS handshake timeout\n")
+    github.api[f"{_REPO}/check-runs/950002/annotations?per_page=100"] = []
+    github.save()
+    for _ in range(2):
+        done = _batch_call(github)
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert _suite(github)["branch"] == suite["branch"]
+        assert "7" not in _batch_state(github)["blocked"]
+        assert rerun_calls(github.workflow) == [
+            "gh run rerun 950000 -R example-org/example-app --failed"]
+    run = github.api[path]["workflow_runs"][0]
+    jobs = github.api[f"{_REPO}/actions/runs/950000/jobs?per_page=100"]["jobs"]
+    for job in jobs[1:]:
+        job["conclusion"] = "success" if second == "passes" else "failure"
+    if second == "passes":
+        # Mixed attempt snapshots must not turn a successful retry into a hand-back.
+        done = _batch_call(github)
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert _suite(github)["branch"] == suite["branch"]
+        assert "7" not in _batch_state(github)["blocked"]
+        run = github.api[path]["workflow_runs"][0]
+    run.update(run_attempt=2, conclusion="success" if second == "passes" else "failure")
+    github.save()
+    done = _batch_call(github)
+    assert done.returncode == (0 if second == "passes" else 1), done.stdout + done.stderr
+    assert len(rerun_calls(github.workflow)) == 1
+    if second != "passes":
+        assert "failed again after its runner retry" in done.stderr
+        assert "its runners failed it again in run 950000" in github.workflow.wake_log.read_text()
+
+
+
+def test_a_transient_diagnosis_read_keeps_the_prefix_waiting(github: GitHub) -> None:
+    _batch_setup(github, images=True)
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+    scratch = _scratch(github)
+    path = (f"{_REPO}/actions/workflows/images.yml/runs?head_sha={scratch['head']}"
+            "&event=workflow_dispatch&per_page=100")
+    run = github.api[path]["workflow_runs"][0]
+    run.update(conclusion="failure", run_attempt=1)
+    jobs = github.api[f"{_REPO}/actions/runs/{run['id']}/jobs?per_page=100"]["jobs"]
+    jobs[-1].update(conclusion="failure", labels=["example-app-home-docker"])
+    github.api[f"{_REPO}/check-runs/{jobs[-1]['id']}/annotations?per_page=100"] = "HTTP 502"
+    done = _batch_call(github)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "merge waiting" in done.stderr
+    assert "Traceback" not in done.stderr
+    assert rerun_calls(github.workflow) == []
+    assert _scratch(github)["branch"] == scratch["branch"]
+    assert "7" not in _batch_state(github)["blocked"]
+
+
+# Queued scratch jobs use their own timestamps, never the age of their workflow run.
+def _queued_prefix_job(
+    github: GitHub, *, minutes: int = 21, workflow: str = "ci", attempt: int = 1,
+    label: str = "example-app-home-main-batch", number: str = "7",
+) -> dict[str, Any]:
+    member = next(member for member in _prefixes(github) if member["number"] == number)
+    scratch = member["scratch"]
+    identity = 100 if workflow == "ci" else 110
+    run = {
+        "id": identity, "head_sha": scratch["head"], "head_branch": scratch["branch"],
+        "event": "workflow_dispatch", "status": "in_progress", "conclusion": None,
+        "run_attempt": attempt,
+    }
+    github.api[
+        f"{_REPO}/actions/workflows/{workflow}.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ] = {"workflow_runs": [run]}
+    github.api[f"{_REPO}/actions/runs/{identity}/jobs?per_page=100"] = {"jobs": [{
+        "id": identity + 2, "name": "CI: server tests (2 of 3)", "status": "queued",
+        "conclusion": None, "labels": [label],
+        "created_at": datetime.fromtimestamp(time.time() - minutes * 60, UTC).isoformat(),
+    }]}
+    return run
+
+
+def _queue_config(github: GitHub, limit: int | None = None) -> None:
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config.setdefault("runner", {})["label"] = "example-app-home"
+    if limit is not None:
+        config["merge_train"] = {"queued_limit_minutes": limit}
+    path.write_text(json.dumps(config))
+    github.workflow.git("update-index", "--skip-worktree", "shipline.json")
+
+
+@pytest.mark.parametrize("suite", ["ci", "e2e"])
+def test_a_scratch_main_lane_job_past_the_default_limit_is_cancelled_then_rerun_once(
+    github: GitHub, suite: str,
+) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    run = _queued_prefix_job(github, workflow=suite)
+    identity = run["id"]
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls(f"gh run cancel {identity} ")) == 1
+    assert not github.workflow.calls(f"gh run rerun {identity} ")
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls(f"gh run cancel {identity} ")) == 1
+    # Cancellation finishes on GitHub between gate calls; a new process resumes the retry.
+    scratch = _scratch(github)
+    run = github.api[
+        f"{_REPO}/actions/workflows/{suite}.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0]
+    run.update(status="completed", conclusion="cancelled")
+    assert _batch_call(github).returncode == 3
+    assert github.workflow.calls(f"gh run rerun {identity} ") == [
+        f"gh run rerun {identity} -R example-org/example-app"
+    ]
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls(f"gh run rerun {identity} ")) == 1
+    status = github.workflow.run_script("merge-when-current", "--train-status")
+    assert status.returncode == 0, status.stderr
+    prefix = json.loads(status.stdout)["prefixes"][0]
+    assert prefix["queued_retries"][str(identity)]["state"] == "rerun requested"
+    # A successful ordinary attempt still supplies the normal merge proof.
+    _finish_batch(github)
+    github.api[
+        f"{_REPO}/actions/workflows/{suite}.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0]["run_attempt"] = 2
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
+
+
+@pytest.mark.parametrize("minutes,limit", [(19, None), (21, 25)])
+def test_a_scratch_job_under_the_queue_limit_is_left_alone(
+    github: GitHub, minutes: int, limit: int | None,
+) -> None:
+    _queue_config(github, limit)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, minutes=minutes)
+    assert _batch_call(github).returncode == 3
+    assert not github.workflow.calls("gh run cancel")
+    assert not github.workflow.calls("gh run rerun")
+
+
+@pytest.mark.parametrize("suite,label", [
+    ("images", "example-app-home-docker"), ("ci", "example-app-home"),
+    ("e2e", "home-planner"),
+])
+def test_a_long_wait_outside_the_main_batch_lane_is_not_cancelled(
+    github: GitHub, suite: str, label: str,
+) -> None:
+    _queue_config(github)
+    _batch_setup(github, images=suite == "images")
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, minutes=87, workflow=suite, label=label)
+    assert _batch_call(github).returncode == 3
+    assert not github.workflow.calls("gh run cancel")
+    assert not github.workflow.calls("gh run rerun")
+
+
+def test_a_second_attempt_stuck_in_the_lane_is_reported_once_without_a_retry(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, attempt=2)
+    first = _batch_call(github)
+    second = _batch_call(github)
+    assert first.returncode == second.returncode == 3
+    assert "run 100 attempt 2" in first.stdout
+    assert "queued past 20 minutes" in first.stdout
+    assert "queued past 20 minutes" not in second.stdout
+    assert not github.workflow.calls("gh run cancel")
+    assert not github.workflow.calls("gh run rerun")
+    pending = github.workflow.repo / ".local/workflow/prefix-queues.pending"
+    [event] = pending.glob("*.json")
+    assert "run 100 attempt 2" in json.loads(event.read_text())["line"]
+
+
+@pytest.mark.parametrize("branch,event", [("main", "push"), ("ticket/seven", "pull_request")])
+def test_no_run_outside_the_scratch_prefix_is_cancelled_for_its_queue(
+    github: GitHub, branch: str, event: str,
+) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    run = _queued_prefix_job(github)
+    run.update(head_branch=branch, event=event)
+    assert _batch_call(github).returncode == 3
+    assert not github.workflow.calls("gh run cancel")
+    assert not github.workflow.calls("gh run rerun")
+
+
+
+def test_a_retry_queued_on_ordinary_runners_is_reported_without_another_retry(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, attempt=2, label="example-app-home")
+    first = _batch_call(github)
+    assert first.returncode == 3
+    assert "run 100 attempt 2" in first.stdout
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+    assert not github.workflow.calls("gh run rerun")
+
+
+def test_a_timestamp_missing_from_a_queued_job_starts_a_durable_observation(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    part = github.api[f"{_REPO}/actions/runs/100/jobs?per_page=100"]["jobs"][0]
+    part.pop("created_at")
+    assert _batch_call(github).returncode == 3
+    assert not github.workflow.calls("gh run cancel")
+    path = github.workflow.repo / ".local/workflow/merge-train.json"
+    state = json.loads(path.read_text())
+    observation = state["prefixes"]["members"][0]["scratch"]["queued_retries"]["100"]["jobs"]
+    observation["1:102"] -= 21 * 60
+    path.write_text(json.dumps(state))
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+
+
+def test_one_queued_matrix_part_past_the_limit_retries_the_run(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    parts = github.api[f"{_REPO}/actions/runs/100/jobs?per_page=100"]["jobs"]
+    parts.insert(0, {**parts[0], "id": 103, "name": "CI: server tests (1 of 3)",
+                     "created_at": datetime.now(UTC).isoformat()})
+    parts.append({**parts[0], "id": 104, "name": "CI: server tests (3 of 3)",
+                  "status": "completed", "conclusion": "success"})
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+
+
+def test_a_cancel_lost_to_an_outage_is_retried_after_a_gate_restart(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    github.cancel_unavailable = [100]
+    _batch_call(github)
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 2
+    assert not github.workflow.calls("gh run rerun")
+
+
+@pytest.mark.parametrize("error", [
+    "HTTP 502: Bad Gateway", 'Post "https://api.github.com/x": context deadline exceeded',
+])
+def test_a_rerun_lost_to_an_outage_is_sent_again_while_the_first_attempt_stays_cancelled(
+    github: GitHub, error: str,
+) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    assert _batch_call(github).returncode == 3
+    github.api[
+        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={_scratch(github)['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0].update(status="completed", conclusion="cancelled")
+    (github.workflow.state / "rerun-unavailable").write_text(error)
+    assert "could not re-run scratch run 100 yet" in _batch_call(github).stderr
+    assert len(github.workflow.calls("gh run rerun 100 ")) == 1
+    assert not (github.workflow.repo / ".local/workflow/prefix-queues.pending").exists()
+    for _ in range(3):
+        assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run rerun 100 ")) == 2
+
+
+def test_a_recovered_run_is_still_cancelled_when_its_prefix_is_dropped(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, number="9")
+    github.save()
+    assert github.workflow.run_script("merge-when-current", "--train-status").returncode == 0
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+    dropped = _scratch(github, "9")
+    assert dropped is not None
+    github.api[
+        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={dropped['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0].update(status="completed", conclusion="cancelled")
+    github.save()
+    assert github.workflow.run_script("merge-when-current", "--train-status").returncode == 0
+    assert len(github.workflow.calls("gh run rerun 100 ")) == 1
+    # Its second attempt, the same run, holds ordinary runners when the prefix is dropped.
+    _branch_runs(github, dropped["branch"], (100, "in_progress"))
+    github.pulls["9"]["state"] = "CLOSED"
+    _batch_call(github)
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 2
+    assert dropped["branch"] not in _scratch_branches(github)
+
+
+def test_train_status_recovers_a_later_prefix_without_polluting_its_json(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, number="8")
+    github.save()
+    done = github.workflow.run_script("merge-when-current", "--train-status")
+    assert done.returncode == 0, done.stderr
+    status = json.loads(done.stdout)
+    assert status["prefixes"][1]["queued_retries"]["100"]["state"] == "cancel requested"
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+
+
+
+def test_a_stale_job_from_the_previous_attempt_does_not_report_a_new_wait(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, attempt=2)
+    github.api[f"{_REPO}/actions/runs/100/jobs?per_page=100"]["jobs"][0]["run_attempt"] = 1
+    done = _batch_call(github)
+    assert done.returncode == 3
+    assert "queued past" not in done.stdout
+    assert not (github.workflow.repo / ".local/workflow/prefix-queues.pending").exists()
+    assert not github.workflow.calls("gh run cancel")
+
+
+def test_a_custom_pool_label_and_unrelated_planner_label_do_not_change_recovery(github: GitHub) -> None:
+    _queue_config(github)
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config["runner"].update(label="example-pool", planner_label="home-planner")
+    path.write_text(json.dumps(config))
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, label="example-pool-main-batch")
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1

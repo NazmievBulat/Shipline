@@ -24,3 +24,39 @@ link_launcher() {
   ln -sfn "$launcher" "$link"
   echo "$link now runs $launcher"
 }
+
+# Remember explicit lookup settings before workflow_config.py replaces SHIPLINE_CONFIG with
+# the selected path. Timers and hooks must keep the same selection in a fresh environment.
+remember_config() {
+  named_config=${SHIPLINE_CONFIG:-}
+  named_config_home=${XDG_CONFIG_HOME:-}
+  if [[ -n $named_config_home && $named_config_home != /* ]]; then
+    named_config_home=$PWD/$named_config_home
+  fi
+}
+
+config_environment() {
+  local key value
+  for key in SHIPLINE_CONFIG XDG_CONFIG_HOME; do
+    if [[ $key == SHIPLINE_CONFIG ]]; then
+      [[ -n $named_config ]] || continue
+      value=$SHIPLINE_CONFIG
+    else
+      [[ -n $named_config_home ]] || continue
+      value=$named_config_home
+    fi
+    # Environment= uses systemd's quoted strings, including its percent placeholders.
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//%/%%}
+    printf 'Environment="%s=%s"\n' "$key" "$value"
+  done
+}
+
+config_command_prefix() {
+  [[ -z $named_config ]] || printf 'SHIPLINE_CONFIG=%q ' "$SHIPLINE_CONFIG"
+  [[ -z $named_config_home ]] || printf 'XDG_CONFIG_HOME=%q ' "$named_config_home"
+  return 0
+}

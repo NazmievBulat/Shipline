@@ -158,13 +158,13 @@ def test_each_suite_is_read_with_its_default_worker_count(tmp_path: Path) -> Non
 def test_a_suite_that_cannot_run_is_refused_by_name(
     tmp_path: Path, suites: Any, refusal: str
 ) -> None:
-    with pytest.raises(workflow_config.ConfigError, match=f"^shipline.json: {re.escape(refusal)}$"):
+    with pytest.raises(workflow_config.ConfigError, match=rf"^{re.escape(str(tmp_path / 'repo/shipline.json'))}: {re.escape(refusal)}$"):
         _config(tmp_path, {"cloud_pre_push": {"suites": suites}})
 
 
 def test_an_unknown_key_beside_the_suites_is_refused(tmp_path: Path) -> None:
     with pytest.raises(
-        workflow_config.ConfigError, match="^shipline.json: unknown key cloud_pre_push.limit$"
+        workflow_config.ConfigError, match=rf"^{re.escape(str(tmp_path / 'repo/shipline.json'))}: unknown key cloud_pre_push.limit$"
     ):
         _config(tmp_path, {"cloud_pre_push": {"limit": 3}})
 
@@ -175,7 +175,7 @@ def test_the_push_checks_are_a_command_of_the_repository(tmp_path: Path) -> None
     assert named.command("push_checks") == [str(named.main / "tools/push-checks"), "-q"]
     with pytest.raises(
         workflow_config.ConfigError,
-        match="^shipline.json: commands.push_checks cannot be split into words: ",
+        match=rf"^{re.escape(str(tmp_path / 'open/repo/shipline.json'))}: commands.push_checks cannot be split into words: ",
     ):
         _config(tmp_path / "open", {"commands": {"push_checks": "tools/push-checks 'open"}})
 

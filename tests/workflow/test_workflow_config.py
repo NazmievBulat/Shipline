@@ -34,6 +34,7 @@ _GIT_ENV = {
 
 _DEFAULTS = {
     "repository": "example-owner/example-app",
+    "install_folder": None,
     "state_folder": ".local/workflow",
     "worktree_setup": "scripts/setup-worktree",
     "refresh": {"clear_generated": []},
@@ -97,6 +98,10 @@ _DEFAULTS = {
     "review": {"high_effort_paths": []},
     "answer_for_owner_after_minutes": 15,
     "cloud_wake_after_minutes": 30,
+    # No hot paths, and the conflict reviewer of today.
+    "hot_paths": [],
+    "conflict_review": None,
+    "merge_train": {"queued_limit_minutes": 20},
     "cloud_pre_push": {"suites": {}},
 }
 
@@ -319,11 +324,18 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
 
     def keys(value: Any, prefix: str = "") -> set[str]:
         # The hunt areas and the suites are named by the repository, not by Shipline.
-        if not isinstance(value, dict) or prefix in (".hunts.areas", ".cloud_pre_push.suites"):
+        if (
+            not isinstance(value, dict)
+            or prefix in (".hunts.areas", ".cloud_pre_push.suites")
+            or prefix.startswith(".commands.")
+        ):
             return {prefix}
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 
-    assert keys(example) == keys(_DEFAULTS)
+    # The conflict reviewer is one object, named whole or left out.
+    named = {**_DEFAULTS, "conflict_review": {"effort": "", "model": "", "max_changed_lines": 0}}
+    assert keys(example) == keys(named)
+    assert example["hot_paths"]
     assert example["repository"].endswith("/example-app")
     assert example["runner"]["labels"]
     # One prefix names the runner pool, its labels among its names.
@@ -358,6 +370,118 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
 
     _write(repo, {"runner": {"prefix": ""}})
     with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be a name"):
+        workflow_config.load(repo)
+
+
+def test_hot_paths_match_by_github_s_rules(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"hot_paths": ["src/example_app/*.py", "web/src/pages/**", "docs/**/list.md"]})
+
+    config = workflow_config.load(repo)
+
+    assert config.hot_paths == ("src/example_app/*.py", "web/src/pages/**", "docs/**/list.md")
+    # `*` stays inside a folder, `**` crosses them, `**/` is zero or more folders.
+    assert config.hot_paths_of("src/example_app/models.py") == ["src/example_app/*.py"]
+    assert config.hot_paths_of("src/example_app/api/routes.py") == []
+    assert config.hot_paths_of("web/src/pages/menu/settings.tsx") == ["web/src/pages/**"]
+    assert config.hot_paths_of("web/src/app.tsx") == []
+    assert config.hot_paths_of("docs/list.md") == ["docs/**/list.md"]
+    assert config.hot_paths_of("docs/guide/list.md") == ["docs/**/list.md"]
+
+
+def test_without_hot_paths_no_file_is_hot(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+
+    config = workflow_config.load(repo)
+
+    assert config.hot_paths == ()
+    assert config.hot_paths_of("src/example_app/models.py") == []
+    assert config.conflict_review is None
+
+
+@pytest.mark.parametrize(
+    ("hot_paths", "refusal"),
+    [
+        ("src/**", "hot_paths must be a list of paths"),
+        ([""], "hot_paths must be a list of paths"),
+        (["/src/**"], "hot_paths must be paths inside the checkout"),
+        (["src/../web/**"], "hot_paths must be paths inside the checkout"),
+        (["!src/app.py"], "hot_paths must be paths inside the checkout"),
+    ],
+)
+def test_a_hot_path_that_is_not_a_path_inside_the_checkout_is_refused(
+    tmp_path: Path, hot_paths: Any, refusal: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"hot_paths": hot_paths})
+
+    with pytest.raises(workflow_config.ConfigError, match=refusal):
+        workflow_config.load(repo)
+
+
+def test_the_conflict_reviewer_is_read_whole(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    named = {"effort": "medium", "model": "claude-sonnet-5-5", "max_changed_lines": 40}
+    _write(repo, {"conflict_review": named})
+
+    config = workflow_config.load(repo)
+
+    assert config.conflict_review == workflow_config.ConflictReview(
+        effort="medium", model="claude-sonnet-5-5", max_changed_lines=40
+    )
+    assert _as_json(config)["conflict_review"] == named
+
+
+@pytest.mark.parametrize(
+    ("value", "refusal"),
+    [
+        ("medium", "conflict_review must be an object"),
+        ({"effort": "medium", "model": "sonnet"}, "conflict_review must name max_changed_lines"),
+        (
+            {"effort": "medium", "model": "sonnet", "max_changed_lines": 40, "files": 2},
+            "unknown key conflict_review.files",
+        ),
+        (
+            {"effort": "lowest", "model": "sonnet", "max_changed_lines": 40},
+            "conflict_review.effort must be one of low, medium, high, xhigh, max",
+        ),
+        (
+            {"effort": "medium", "model": "sonnet; touch nope", "max_changed_lines": 40},
+            "conflict_review.model must be a model name",
+        ),
+        (
+            {"effort": "medium", "model": "", "max_changed_lines": 40},
+            "conflict_review.model must be a model name",
+        ),
+        (
+            {"effort": "medium", "model": "codex", "max_changed_lines": 40},
+            "conflict_review.model must be a model name",
+        ),
+        (
+            {"effort": "medium", "model": "cloud", "max_changed_lines": 40},
+            "conflict_review.model must be a model name",
+        ),
+        (
+            {"effort": "medium", "model": "sonnet", "max_changed_lines": 0},
+            "conflict_review.max_changed_lines must be a whole number above 0",
+        ),
+        (
+            {"effort": "medium", "model": "sonnet", "max_changed_lines": "40"},
+            "conflict_review.max_changed_lines must be a whole number above 0",
+        ),
+        (
+            {"effort": "medium", "model": "sonnet", "max_changed_lines": True},
+            "conflict_review.max_changed_lines must be a whole number above 0",
+        ),
+    ],
+)
+def test_a_conflict_reviewer_named_wrong_is_refused(
+    tmp_path: Path, value: Any, refusal: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"conflict_review": value})
+
+    with pytest.raises(workflow_config.ConfigError, match=refusal):
         workflow_config.load(repo)
 
 
@@ -943,7 +1067,7 @@ def test_bash_without_a_file_reads_the_defaults(tmp_path: Path) -> None:
         ".local/workflow",
         "CI result",
         "0",
-        "{}",
+        "",
         "",
         "",
     ]
@@ -984,7 +1108,7 @@ def test_bash_reads_no_hunt_areas_and_no_plans_by_default(tmp_path: Path) -> Non
 def _jq(config: str | None, labels: list[str], program: str = "priority_name") -> str:
     env = {**_GIT_ENV}
     if config is not None:
-        env["SHIPLINE_CONFIG"] = config
+        env["SHIPLINE_CONFIG_JSON"] = config
     done = subprocess.run(
         ["jq", "-r", "-L", str(_WORKFLOW), f'include "priority"; {program}'],
         input=json.dumps({"labels": [{"name": name} for name in labels]}),
@@ -1012,7 +1136,7 @@ def test_bash_and_jq_read_the_same_labels(tmp_path: Path) -> None:
         repo,
         {"labels": {"workflow": "shipline", "priority": {"blocker": "p0", "low": "p3"}}},
     )
-    config = _shell(repo, 'printf "%s" "$SHIPLINE_CONFIG"')
+    config = _shell(repo, 'printf "%s" "$SHIPLINE_CONFIG_JSON"')
 
     assert _jq(config, ["p0"]) == "blocker"
     assert _jq(config, ["p3", "priority: high"]) == "high"
@@ -1264,8 +1388,13 @@ _NAMED = {
 }
 
 
-def test_python_bash_node_and_jq_read_the_same_values(workflow: Workflow) -> None:
-    _commit_on_main(workflow, {"shipline.json": json.dumps(_NAMED)})
+@pytest.mark.parametrize("source", ["checkout", "home", "xdg", "explicit"])
+def test_python_bash_node_and_jq_read_the_same_values(workflow: Workflow, source: str) -> None:
+    if source == "checkout":
+        _commit_on_main(workflow, {"shipline.json": json.dumps(_NAMED)})
+    else:
+        path = _installation(workflow, source)
+        path.write_text(json.dumps(_NAMED))
     scripts = workflow.repo / "scripts/workflow"
     python = subprocess.run(
         [
@@ -1285,7 +1414,7 @@ def test_python_bash_node_and_jq_read_the_same_values(workflow: Workflow) -> Non
         [
             "bash",
             "-c",
-            'eval "$(python3 workflow_config.py shell)"; export SHIPLINE_CONFIG; '
+            'eval "$(python3 workflow_config.py shell)"; export SHIPLINE_CONFIG_JSON; '
             'echo "$SHIPLINE_STATE_FOLDER" "$SHIPLINE_LABEL_WORKFLOW"; '
             "for name in urgent 'priority: high'; do "
             '  jq -nr -L . --arg name "$name" '
@@ -1624,3 +1753,310 @@ def test_a_second_tick_waits_for_the_first_across_a_change_of_the_state_folder(
     assert done.returncode == 0, done.stderr
     assert "the tick before this one is still running" in done.stdout, done.stdout + done.stderr
     assert not workflow.calls("gh")
+
+
+@pytest.mark.parametrize("minutes", [0, 5, 1440])
+def test_the_prefix_queue_limit_is_configurable(tmp_path: Path, minutes: int) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"merge_train": {"queued_limit_minutes": minutes}})
+    assert workflow_config.load(repo).merge_train.queued_limit_minutes == minutes
+
+
+@pytest.mark.parametrize("minutes", [-1, 1441, True, 1.5, "20"])
+def test_an_invalid_prefix_queue_limit_is_refused(tmp_path: Path, minutes: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"merge_train": {"queued_limit_minutes": minutes}})
+    with pytest.raises(workflow_config.ConfigError, match="merge_train.queued_limit_minutes"):
+        workflow_config.load(repo)
+
+
+def _installation(workflow: Workflow, source: str = "home") -> Path:
+    """A config outside the repository, found without adding any repository file."""
+    if source == "explicit":
+        path = workflow.root / "installation" / "settings.json"
+        workflow.env["SHIPLINE_CONFIG"] = str(path)
+    else:
+        base = Path(workflow.env["HOME"]) / ".config"
+        if source == "xdg":
+            base = workflow.root / "config"
+            workflow.env["XDG_CONFIG_HOME"] = str(base)
+        path = base / "shipline" / "example-org-example-app" / "shipline.json"
+    path.parent.mkdir(parents=True)
+    return path
+
+
+def _read_installation(
+    workflow: Workflow, form: str = "shell", cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["python3", str(workflow.script.parent / "workflow_config.py"), form],
+        cwd=cwd or workflow.repo,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("source", ["home", "xdg", "explicit"])
+@pytest.mark.parametrize("checkout_config", [False, True])
+def test_installation_config_is_used_without_merging_the_checkout(
+    workflow: Workflow, source: str, checkout_config: bool
+) -> None:
+    install_shipline(workflow)
+    path = _installation(workflow, source)
+    path.write_text(json.dumps({"state_folder": ".installation/state"}))
+    checkout = workflow.repo / "shipline.json"
+    if checkout_config:
+        checkout.write_text(json.dumps({"labels": {"workflow": "checkout-only"}}))
+    else:
+        workflow.git("rm", "shipline.json")
+        workflow.git("commit", "-m", "chore: no checkout configuration")
+    worktree = workflow.add_worktree(7)
+    for cwd in (workflow.repo, worktree):
+        done = _read_installation(workflow, cwd=cwd)
+        assert done.returncode == 0, done.stderr
+        assert "SHIPLINE_STATE_FOLDER=.installation/state\n" in done.stdout
+        assert "SHIPLINE_LABEL_WORKFLOW=workflow\n" in done.stdout
+        assert f"SHIPLINE_CONFIG={path}\n" in done.stdout
+        assert f"SHIPLINE_INSTALL_FOLDER={path.parent}\n" in done.stdout
+
+
+@pytest.mark.parametrize("form", ["shell", "sh"])
+def test_explicit_config_wins_and_is_exported_as_an_absolute_path(
+    workflow: Workflow, form: str
+) -> None:
+    home = _installation(workflow)
+    home.write_text('{"state_folder": ".home"}')
+    explicit = workflow.root / "selected.json"
+    explicit.write_text('{"state_folder": ".selected"}')
+    workflow.env["SHIPLINE_CONFIG"] = "../selected.json"
+    done = subprocess.run(
+        ["bash" if form == "shell" else "sh", "-c",
+         'config=$(python3 "$1" "$2") || exit 1; eval "$config"; '
+         'python3 "$1" "$2"', "config",
+         str(workflow.script.parent / "workflow_config.py"), form],
+        cwd=workflow.repo, env=workflow.env, capture_output=True, text=True, timeout=30,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "SHIPLINE_STATE_FOLDER=.selected\n" in done.stdout
+    assert f"SHIPLINE_CONFIG={explicit}\n" in done.stdout
+
+
+@pytest.mark.parametrize("source", ["home", "explicit"])
+@pytest.mark.parametrize("kind", ["missing", "json", "encoding", "key", "directory", "link"])
+def test_bad_installation_files_are_refused_with_the_selected_path(
+    workflow: Workflow, source: str, kind: str
+) -> None:
+    path = _installation(workflow, source)
+    if kind == "missing" and source == "home":
+        # An absent optional installation falls through to the checkout.
+        assert _read_installation(workflow).returncode == 0
+        return
+    if kind == "json":
+        path.write_text("{")
+    elif kind == "encoding":
+        path.write_bytes(b"\xff")
+    elif kind == "key":
+        path.write_text('{"labels": {"unknown": "refuse"}}')
+    elif kind == "directory":
+        path.mkdir()
+    elif kind == "link":
+        path.symlink_to(path.parent / "absent.json")
+    done = _read_installation(workflow)
+    assert done.returncode == 1
+    assert done.stdout == ""
+    assert done.stderr.startswith(str(path)), done.stderr
+    assert "Traceback" not in done.stderr
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+@pytest.mark.parametrize("folder", [None, "programs", "absolute"])
+def test_installation_programs_run_from_every_worktree(
+    workflow: Workflow, qualified: bool, folder: str | None
+) -> None:
+    install_shipline(workflow)
+    path = _installation(workflow)
+    installed = path.parent if folder is None else path.parent / "programs"
+    installed.mkdir(exist_ok=True)
+    program = installed / "tools" / "check.py"
+    program.parent.mkdir()
+    program.write_text("import os, sys\nprint('installation', os.getcwd(), sys.argv[1:])\n")
+    config = {"commands": {"pre_train_checks":
+        "python3 " + ("@install/" if qualified else "") + "tools/check.py"}}
+    if folder is not None:
+        config["install_folder"] = str(installed) if folder == "absolute" else folder
+    path.write_text(json.dumps(config))
+    worktrees = [workflow.repo, workflow.add_worktree(7), workflow.add_worktree(8)]
+    # Neither a program nor a config supplied by a worktree may win.
+    for worktree in worktrees[1:]:
+        (worktree / "tools").mkdir(exist_ok=True)
+        (worktree / "tools/check.py").write_text("raise RuntimeError('worktree program')\n")
+        (worktree / "shipline.json").write_text("{")
+    for worktree in worktrees:
+        done = workflow.shipline("pre-train-checks", "argument with space", cwd=worktree)
+        assert done.returncode == 0, done.stderr
+        assert done.stdout == f"installation {worktree} ['argument with space']\n"
+    # The checkout wins an unqualified lookup; @install/ always keeps the installed program.
+    program = workflow.repo / "tools/check.py"
+    program.parent.mkdir(exist_ok=True)
+    program.write_text("print('checkout')\n")
+    done = workflow.shipline("pre-train-checks", cwd=worktrees[-1])
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == (f"installation {worktrees[-1]} []\n" if qualified else "checkout\n")
+    if qualified:
+        (installed / "tools/check.py").unlink()
+        done = workflow.shipline("pre-train-checks", cwd=worktrees[-1])
+        assert done.returncode != 0
+        assert done.stdout == ""
+
+
+def test_install_only_command_without_an_installation_folder_is_refused(workflow: Workflow) -> None:
+    (workflow.repo / "shipline.json").write_text(
+        '{"commands": {"pre_train_checks": "python3 @install/tools/check.py"}}'
+    )
+    done = _read_installation(workflow)
+    assert done.returncode == 1
+    assert "@install/" in done.stderr and "install_folder" in done.stderr
+
+
+@pytest.mark.parametrize("value", ["", 3, [], "   "])
+def test_invalid_installation_folder_is_refused(workflow: Workflow, value: Any) -> None:
+    path = _installation(workflow)
+    path.write_text(json.dumps({"install_folder": value}))
+    done = _read_installation(workflow)
+    assert done.returncode == 1
+    assert done.stderr.startswith(str(path)) and "install_folder" in done.stderr
+
+
+def test_installation_config_reaches_tick_wake_gate_and_install(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    path = _installation(workflow)
+    path.write_text(json.dumps({"state_folder": ".installation/state",
+                                "labels": {"workflow": "installed", "audited": "checked"}}))
+    workflow.add_pull_request(7, labels=("installed",))
+    done = workflow.shipline("tick")
+    assert done.returncode == 0, done.stderr
+    assert workflow.is_running("ticket-7")
+    assert (workflow.worktree(7) / ".installation/state/ticket-7.url").exists()
+    done = workflow.shipline("wake")
+    assert done.returncode == 0, done.stderr
+    gate = subprocess.run(
+        ["python3", "-c", "import merge_gate; print(merge_gate.CONFIG.state_folder)"],
+        cwd=workflow.script.parent,
+        env={**workflow.env, "SHIPLINE_REPO": str(workflow.repo)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert gate.returncode == 0, gate.stderr
+    assert gate.stdout == ".installation/state\n"
+    done = workflow.shipline("install-timer")
+    assert done.returncode == 0, done.stderr
+    assert (workflow.state / "labels").read_text().split() == ["installed", "checked"]
+
+
+@pytest.mark.parametrize("source", ["explicit", "xdg"])
+def test_installed_timers_and_hooks_keep_the_config_lookup(workflow: Workflow, source: str) -> None:
+    install_shipline(workflow)
+    path = _installation(workflow, source)
+    path.write_text('{"state_folder": ".installation/state"}')
+    for command in ("install-hooks", "install-timer", "install-flow-page-timer"):
+        done = workflow.shipline(command)
+        assert done.returncode == 0, done.stderr
+    key = "SHIPLINE_CONFIG" if source == "explicit" else "XDG_CONFIG_HOME"
+    value = str(path) if source == "explicit" else workflow.env[key]
+    units = Path(workflow.env.get("XDG_CONFIG_HOME", str(Path(workflow.env["HOME"]) / ".config")))
+    for name in ("workflow-tick", "flow-page"):
+        service = (units / "systemd/user" / f"{name}.service").read_text()
+        assert f'Environment="{key}={value}"' in service.splitlines()
+    settings = json.loads((Path(workflow.env["HOME"]) / ".claude/settings.json").read_text())
+    command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+    assert command.startswith(f"{key}={value} bash ")
+    worktree = workflow.add_worktree(7)
+    clean = {k: v for k, v in workflow.env.items() if k not in ("SHIPLINE_CONFIG", "XDG_CONFIG_HOME")}
+    # Observe the config reached by the hook, even though hooks suppress consumer errors.
+    (workflow.script.parent / "notify").write_text(
+        'config=$(python3 "$(dirname "$0")/workflow_config.py" shell) || exit 1; '
+        'eval "$config"; printf %s "$SHIPLINE_STATE_FOLDER"\n'
+    )
+    done = subprocess.run(["bash", "-c", command], cwd=worktree, env=clean,
+                          input="{}", capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == ".installation/state"
+    # Reinstalling updates the same hook, rather than adding a second one.
+    assert workflow.shipline("install-hooks").returncode == 0
+    again = json.loads((Path(workflow.env["HOME"]) / ".claude/settings.json").read_text())
+    assert again == settings
+    assert workflow.shipline("uninstall").returncode == 0
+    remaining = json.loads((Path(workflow.env["HOME"]) / ".claude/settings.json").read_text())
+    assert not remaining.get("hooks")
+
+
+def test_discovered_checkout_config_does_not_become_an_installation_in_a_child(
+    workflow: Workflow,
+) -> None:
+    workflow.env["SHIPLINE_CONFIG"] = ""
+    done = subprocess.run(
+        ["sh", "-c", 'config=$(python3 "$1" sh) || exit 1; eval "$config"; '
+         'python3 "$1" sh', "config", str(workflow.script.parent / "workflow_config.py")],
+        cwd=workflow.repo, env=workflow.env, capture_output=True, text=True, timeout=30,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "SHIPLINE_INSTALL_FOLDER=''\n" in done.stdout
+
+
+def test_launcher_anchors_explicit_config_before_switching_repositories(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    path = _installation(workflow, "explicit")
+    (path.parent / "check.py").write_text("print('installed')\n")
+    path.write_text('{"commands": {"pre_train_checks": "python3 @install/check.py"}}')
+    workflow.env["SHIPLINE_CONFIG"] = "installation/settings.json"
+    done = workflow.shipline("--repo", str(workflow.repo), "pre-train-checks", cwd=workflow.root)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "installed\n"
+
+
+def test_without_any_config_the_harness_reads_the_defaults(workflow: Workflow) -> None:
+    (workflow.repo / "shipline.json").unlink()
+    done = _read_installation(workflow)
+    assert done.returncode == 0, done.stderr
+    assert "SHIPLINE_STATE_FOLDER=.local/workflow\n" in done.stdout
+    assert "SHIPLINE_INSTALL_FOLDER=''\n" in done.stdout
+    assert "SHIPLINE_CONFIG=''\n" in done.stdout
+
+
+def test_home_lookup_uses_origin_when_runner_settings_name_no_repository(workflow: Workflow) -> None:
+    settings = workflow.repo / ".github/runner/settings.sh"
+    settings.write_text("# No repository named.\n")
+    workflow.git("remote", "set-url", "origin", "https://github.com/example-org/example-app.git")
+    path = _installation(workflow)
+    # A repository named inside the file must not influence which file is selected.
+    path.write_text('{"repository": "example-owner/other-app", "state_folder": ".installed"}')
+    done = _read_installation(workflow)
+    assert done.returncode == 0, done.stderr
+    assert "SHIPLINE_STATE_FOLDER=.installed\n" in done.stdout
+    assert "SHIPLINE_REPOSITORY=example-owner/other-app\n" in done.stdout
+
+
+def test_checkout_config_can_name_an_installation_folder(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    (workflow.root / "programs").mkdir()
+    (workflow.root / "programs/check.py").write_text("print('installed')\n")
+    (workflow.repo / "shipline.json").write_text(json.dumps({
+        "install_folder": "../programs",
+        "commands": {"pre_train_checks": "python3 @install/check.py"},
+    }))
+    done = workflow.shipline("pre-train-checks", cwd=workflow.add_worktree(7))
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "installed\n"
+
+
+@pytest.mark.parametrize("path", ["@install/../outside.py", "@install/", "@install/tools/../../outside"])
+def test_install_only_programs_cannot_escape_the_installation_folder(
+    workflow: Workflow, path: str
+) -> None:
+    config = _installation(workflow)
+    config.write_text(json.dumps({"commands": {"pre_train_checks": "python3 " + path}}))
+    done = _read_installation(workflow)
+    assert done.returncode == 1
+    assert done.stderr.startswith(str(config)) and "commands.pre_train_checks" in done.stderr

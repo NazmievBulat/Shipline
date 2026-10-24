@@ -71,14 +71,32 @@ those measurements require real workers after rollout and must not be estimated.
 
 # The configuration file
 
-What differs between the repositories that use Shipline is in one file, `shipline.json`,
-at the root of the repository's main checkout. JSON, so Python, Node and jq read it with
-nothing to install. `examples/shipline.json` names every key, for a repository
-`example-app` with a server suite, a browser suite and an image check.
+Shipline reads one JSON file, using the first available source in this order:
+
+1. `SHIPLINE_CONFIG`, a file path. A relative path is relative to the caller's current folder;
+   an explicit file that is missing or unreadable is refused.
+2. `$XDG_CONFIG_HOME/shipline/<owner>-<name>/shipline.json`, with `~/.config` as the config home
+   when `XDG_CONFIG_HOME` is unset or empty. The repository identity for this lookup is the
+   runner settings' `repository`, else the GitHub `origin`, before any config is read.
+3. `shipline.json` in the repository's main checkout, as before.
+
+Only that file is read; files are never merged. Without any file the defaults apply. An invalid
+installation file is refused with its own path, without falling through to the checkout file.
+Worktrees use their main checkout's identity and config, never a worktree's config copy.
+`examples/shipline.json` names every key for `example-app` with a server suite, a browser suite
+and an image check. A repository needs no config or adapter scripts of its own.
+
+The installation folder is the parent folder of a file selected by `SHIPLINE_CONFIG` or from
+the home config folder. The optional `install_folder` key overrides it: an absolute path, or a
+path relative to the selected config file. A checkout config has no installation folder unless
+it names one. Programs and a `parity.known` file can live there. Relative program paths still
+use the main checkout first, then the installation folder; an `@install/` prefix uses only the
+installation folder, even if the checkout has a file of the same name.
 
 | Key | What it names | Default |
 | --- | --- | --- |
 | `repository` | `owner/name` on GitHub | `repository` as Bash reads it from `.github/runner/settings.sh` (sourced in a `bash` of its own, with only `PATH` and `HOME`, for at most 5 seconds), else the `origin` remote on GitHub; a script that needs it stops when neither names one |
+| `install_folder` | the folder of installation programs; absolute, or relative to the selected config file | the parent of an external config; none for a checkout config |
 | `state_folder` | the folder of the workflow's notes, in the main checkout and in each worktree | `.local/workflow` |
 | `worktree_setup` | the command that prepares a new worktree, run only when present | `scripts/setup-worktree` |
 | `refresh.clear_generated` | generated output a refresh clears in the pull request's worktree after it merges main and before it pushes: paths or globs (`*`, `?`, `[…]`, `**`) from the top of the checkout; only the ignored, untracked files under them are removed, and a path that is tracked, not ignored, outside the checkout or through a symbolic link is refused when the file is read | none: nothing is cleared |
@@ -102,10 +120,12 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `hunts.areas` | the areas of the application two hunts may keep to at once: an object of each area's name (small letters, digits and dashes) to its screens, paths starting with `/` without a space, comma, quotation mark, dollar, backtick or backslash | none: one hunt runs at a time, on every screen |
 | `hunts.plans` | the repository's file of hunt plans, which the sentence of a hunt with a plan names | none: the sentence names no file |
 | `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
-| `commands.*`, the others | the repository's own commands Shipline calls, each split into words (below) | none |
+| `commands.*`, the others | the repository's own commands and answer forms Shipline calls (below) | none |
 | `review.high_effort_paths` | regular expressions searched for in every path a pull request changes, both sides of a rename or deletion; a match runs its independent reviewer at high effort, not medium (`review-effort N`): stored data, text sent to a model, background work, locks and queues, account boundaries and security | none: only Shipline's own concurrent scripts and a description with the line `Review: high` |
 | `answer_for_owner_after_minutes` | how long a question to the owner marked `Owner only: no` waits before the tick types its recommended reply (see `RULES.md`, "Asking the owner"); `0` turns that off, and it is at most `1440`, a day | `15` |
 | `cloud_wake_after_minutes` | the minutes without a push or a report after which the tick wakes a cloud worker by typing into its session; `0` never does | `30` |
+| `hot_paths` | path patterns of the few files many tickets edit, by GitHub's path filter rules (`*` stays inside a folder, `**` crosses folders): two tickets whose files match the same one never run at once, a pull request waiting in the merge line counting as running, and the merge line serves members sharing one back to back within their priority | none |
+| `conflict_review` | `{"effort": ..., "model": ..., "max_changed_lines": N}`: the reviewer of a conflict on a handed-off pull request whose conflicting hunks, and then whose resolution, stay within `N` lines of the conflicting files and touch no other file; a larger one gets the usual reviewer | none: Claude Opus at high effort for every conflict |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the
@@ -128,12 +148,19 @@ How a script reads it:
 
   which sets `SHIPLINE_REPOSITORY`, `SHIPLINE_STATE_FOLDER`, `SHIPLINE_CI_RESULT`,
   `SHIPLINE_LABEL_WORKFLOW`, `SHIPLINE_PRIORITY_HIGH` and the rest, `SHIPLINE_CONFIG`, the
-  file itself, each command as an array of its words, `SHIPLINE_COMMAND_HUNT_APP` and the
+  selected file's absolute path (empty when no file exists), `SHIPLINE_INSTALL_FOLDER`, the
+  absolute installation folder (empty without one), `SHIPLINE_CONFIG_JSON`, the file's JSON
+  contents, each command as an array of its words, `SHIPLINE_COMMAND_HUNT_APP` and the
   others, empty when the repository names none, and exports `SHIPLINE_REPO`, the repository's
   main checkout, to every program the script starts.
-- jq includes `priority.jq`, which reads the label names from `SHIPLINE_CONFIG` in the
-  environment (export it first) with the same defaults.
-- Node (`codex-bridge.mjs`) reads the state folder from the file with the same default.
+  The installation folder and JSON payload are exported too. An explicit `SHIPLINE_CONFIG`
+  is exported as an absolute path so child processes keep it after changing folders; otherwise
+  each child uses the same lookup order. Installed hooks and timers preserve an explicit config
+  path and `XDG_CONFIG_HOME` for their future runs.
+- jq includes `priority.jq`, which reads labels from the exported `SHIPLINE_CONFIG_JSON`
+  payload with the same defaults; `SHIPLINE_CONFIG` always means a path.
+- Node (`codex-bridge.mjs`) calls `workflow_config.py json` to use the same lookup and validation,
+  then reads the state folder with the same default.
 
 The machine-wide state, `~/.local/state/workflow`, is shared by every repository on one
 machine, as is its GitHub budget, and is not part of the file.
@@ -144,10 +171,13 @@ What only the repository knows (which tests a change reaches, how its applicatio
 gives Shipline as commands, under `commands` in `shipline.json`. Each but `test` (run by `bash`
 from the root of the checkout, above) is a command line, split into words as the shell splits
 them, with nothing expanded. A first word with a `/` in it is a
-program in the repository's main checkout, whichever worktree runs it; a first word without
-one is found on the `PATH`, and then the first later word with a `/` in it that is no option
-is the script it runs, read from the main checkout too (`node tools/shipline/hunt-browser.mjs`):
-a pull request's worktree never supplies the program. The command runs in the folder its caller is in, with the
+program resolved from the repository's main checkout first, then the installation folder,
+whichever worktree runs it. A first word without one is found on the `PATH`, and then the first
+later word with a `/` in it that is no option is the script it runs, resolved the same way
+(`node tools/shipline/hunt-browser.mjs`). Use `python3 @install/tools/check.py` to require an
+installed script, or `@install/tools/check` for an installed executable; neither falls back to
+the checkout. With no installation folder, `@install/` is refused. A pull request's worktree
+never supplies the program. The command runs in the folder its caller is in, with the
 arguments below after its own words. A command the file leaves out is one the repository does
 not have, and Shipline does without it; a command it names but that cannot start stops the
 call. A session runs one as `shipline <command>`, the name with dashes
@@ -171,13 +201,97 @@ The merge gate keeps the outage an advisory watch found in its state folder:
 first push of an outage and removed when a push succeeds or the tick finds the service
 answering, and `advisory-service.pending`, the line the wake tells once.
 
-A command reads nothing but what is given on its standard input. Files a repository kept beside
-the scripts before these commands existed, `scripts/workflow/pre-train-checks`,
-`advisory_service.py`, `pushing_checkout.py`, `mechanical_conflicts.py`,
-`server_tests_for_changes.py`, `browser_tests_for_changes.py` and `scripts/e2e-plan.py`, are no
-longer read: each becomes a command named here, which answers in the form above. Its program now
-lives in the main checkout whichever worktree runs it, so one that reads the change finds the
-checkout from the folder it runs in (`git rev-parse --show-toplevel`), not from its own path.
+Each entry may instead be an object with `run` and `form`. Plain strings keep the documented
+answers above. `run` is split and located as above; optional `args` is a list of literal words
+added after `run`'s words and before Shipline's arguments. No shell expands those words.
+`commands.test` keeps its existing shell command semantics, including when written as an
+object; its `args` are still literal words passed before the job's arguments.
+
+| Form | Commands | Meaning |
+| --- | --- | --- |
+| `lines` | any | The documented answer, passed through unchanged (including the server selector's JSON). |
+| `exit` | `test`, `pre_train_checks`, `hunt_app`, `hunt_browser`, `hunt_cursor`, `push_checks` | The documented output and exit code, passed through unchanged. |
+| `functions` | `mechanical_conflicts`, `advisory_watch`, `push_checkout`, `browser_plan` | `run` is a Python file; `functions` maps the calls below to its function names. |
+| `json` | `browser_tests_for_changes` | `field` names the JSON object's list of spec paths, printed one a line. |
+| `json` | `server_tests_for_changes` | `fields` maps all four documented keys (`whole`, `tests`, `total`, `reasons`) to keys in the script's JSON object. |
+
+For example, existing selectors may print differently named JSON keys or require leading
+arguments, while checks keep their exit code:
+
+```json
+{
+  "commands": {
+    "browser_tests_for_changes": {
+      "run": "tools/select-browser", "form": "json", "field": "specs", "args": ["--ci"]
+    },
+    "server_tests_for_changes": {
+      "run": "python3 tools/select-server.py", "form": "json",
+      "fields": {"whole": "all", "tests": "selected", "total": "count", "reasons": "why"}
+    },
+    "pre_train_checks": {"run": "tools/check-change", "form": "exit"},
+    "hunt_app": {"run": "tools/hunt-app", "form": "exit"},
+    "hunt_browser": {"run": "node tools/hunt-browser.mjs", "form": "exit"},
+    "browser_plan": {"run": "tools/browser-plan", "form": "lines"}
+  }
+}
+```
+
+A function form needs no command-line entry point or adapter in the repository:
+
+```json
+{
+  "commands": {
+    "mechanical_conflicts": {
+      "run": "tools/conflicts.py", "form": "functions",
+      "functions": {"resolve": "resolve", "renumber": "renumber_files", "taken": "taken_files"}
+    },
+    "advisory_watch": {
+      "run": "tools/advisories.py", "form": "functions",
+      "functions": {"unreachable": "unreachable", "answers": "answers"}
+    },
+    "push_checkout": {
+      "run": "tools/checkout.py", "form": "functions",
+      "functions": {"install": "install_changed", "refusal": "refusal"}
+    },
+    "browser_plan": {
+      "run": "tools/plan.py", "form": "functions",
+      "functions": {"browser_plan": "browser_needed"}
+    }
+  }
+}
+```
+
+The complete function maps and their arguments are:
+
+| Command | Map keys | Python arguments |
+| --- | --- | --- |
+| `mechanical_conflicts` | `resolve`, `renumber`, `taken` | `(head: str, main: str)` |
+| `advisory_watch` | `unreachable`, `answers` | `(output: str)` for unreachable; `(service: str)` for answers |
+| `push_checkout` | `install`, `refusal` | `(checkout: Path)` for install; `(output: str, checkout: Path)` for refusal |
+| `browser_plan` | `browser_plan` | `(changed: list[bytes])`, decoded from the NUL-separated input without losing path bytes |
+
+Shipline imports the module in a separate Python process in the caller's worktree, with the
+module's own folder first on `sys.path` so its sibling imports work. `run` names only the file,
+without an interpreter or arguments, found as a program is (`@install/` included). Mapped
+functions must be synchronous functions defined at the module's top level; configuration loading
+parses the file without executing it, refusing a missing function or unsupported form with the
+command's name.
+
+A list return prints one entry a line; a mapping prints `<old> <new>` lines; a string prints
+itself; `None` and booleans print nothing. `answers` exits 0 for a true answer and non-zero for
+`None` or `False`. `install` treats a returned string as a failure reason and exits non-zero;
+`None` means success; the reason is also the last line on standard error, after the function's
+diagnostics. `browser_plan` requires a bool and prints `needed` for `True`, `none` for
+`False`. An exception exits non-zero with its message on standard error. A `renumber` exception
+with a `paths` attribute, a list of the files it cannot move, also names them on standard
+output, so they are left as a conflict. Python diagnostic
+prints go to standard error, leaving the return value as the answer. Invalid selector JSON or
+fields fail the call rather than selecting no tests.
+
+A command reads nothing but what is given on its standard input. Programs and modules live in
+the main checkout or installation folder whichever worktree runs them, so one that reads the
+change finds the checkout from the folder it runs in (`git rev-parse --show-toplevel`), not from
+its own path.
 
 # A shadow run
 

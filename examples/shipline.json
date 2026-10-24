@@ -1,5 +1,6 @@
 {
   "repository": "example-owner/example-app",
+  "install_folder": ".",
   "state_folder": ".local/shipline",
   "worktree_setup": "tools/prepare-worktree",
   "refresh": {
@@ -7,9 +8,14 @@
   },
   "commands": {
     "test": "tools/run-tests",
-    "browser_tests_for_changes": "tools/shipline/browser-tests-for-changes",
+    "browser_tests_for_changes": {
+      "run": "tools/shipline/browser-tests-for-changes",
+      "form": "json",
+      "field": "specs",
+      "args": ["--ci"]
+    },
     "server_tests_for_changes": "tools/shipline/server-tests-for-changes",
-    "pre_train_checks": "tools/shipline/pre-train-checks",
+    "pre_train_checks": {"run": "tools/shipline/pre-train-checks", "form": "exit"},
     "mechanical_conflicts": "tools/shipline/mechanical-conflicts",
     "browser_plan": "tools/shipline/browser-plan",
     "hunt_app": "tools/shipline/hunt-app",
@@ -91,7 +97,16 @@
       "^app/auth/", "^app/permissions/", "^config/secrets"
     ]
   },
+  "merge_train": {
+    "queued_limit_minutes": 20
+  },
   "answer_for_owner_after_minutes": 15,
+  "hot_paths": ["src/example_app/models.py", "web/src/pages/**"],
+  "conflict_review": {
+    "effort": "medium",
+    "model": "sonnet",
+    "max_changed_lines": 40
+  },
   "cloud_pre_push": {
     "suites": {
       "server": {

@@ -308,6 +308,22 @@ if [[ "$1" == api && $2 == repos/*/actions/runs[?]branch=*'&per_page=30' && $# -
   echo '{"total_count": 0, "workflow_runs": []}'
   exit 0
 fi
+# A comment posted on a pull request joins its comments, as GitHub lists them next, written by
+# the login `gh` uses; its id is printed.
+if [[ "$1 $2 $3 $5 $7 $8" == "api -X POST -f --jq .id" && $4 == repos/*/issues/*/comments ]]; then
+  [ ! -e "@STATE@/fail-gh-comment" ] || exit 1
+  number=${4%/comments}
+  number=${number##*/}
+  comments="@STATE@/comments-$number.json"
+  [ -f "$comments" ] || echo '[[]]' > "$comments"
+  jq --arg body "${6#body=}" '.[-1] += [{id: (([.[][].id] | max // 0) + 1), body: $body,
+    created_at: "2026-10-19T18:00:00Z", user: {login: "example-owner"}}]' "$comments" \
+    > "$comments.new" && mv "$comments.new" "$comments"
+  # GitHub kept the comment, but its answer was lost.
+  [ ! -e "@STATE@/lose-gh-comment-answer" ] || exit 1
+  jq '[.[][].id] | max' "$comments"
+  exit 0
+fi
 asked="label list --limit 1000 --json name --jq ${8}"
 if [ "$*" = "$asked" ] && [ ! -e "@STATE@/fail-gh-labels" ]; then
   touch "@STATE@/labels"
@@ -316,6 +332,19 @@ if [ "$*" = "$asked" ] && [ ! -e "@STATE@/fail-gh-labels" ]; then
 fi
 if [ "$1 $2" = "label create" ] && [ ! -e "@STATE@/fail-gh-label-create" ]; then
   echo "$3" >> "@STATE@/labels"
+  exit 0
+fi
+# Signed in, unless the test signed it out.
+if [ "$*" = "auth status" ]; then
+  [ ! -e "@STATE@/signed-out" ] || { echo "You are not logged into any GitHub hosts." >&2; exit 1; }
+  echo "Logged in to github.com account tester"
+  exit 0
+fi
+# The repository, with what the signed-in account may do in it.
+if [ $# = 2 ] && [ "$1" = api ] && [[ $2 =~ ^repos/[^/]+/[^/]+$ ]]; then
+  push=true
+  [ ! -e "@STATE@/no-push" ] || push=false
+  echo "{\\"full_name\\": \\"${2#repos/}\\", \\"permissions\\": {\\"push\\": $push}}"
   exit 0
 fi
 echo "gh: could not answer $*" >&2
