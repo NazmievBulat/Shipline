@@ -147,7 +147,7 @@ call. A session runs one as `shipline <command>`, the name with dashes
 | `server_tests_for_changes` | the same: `<base> [--files-from <file>]` | one JSON object, `{"whole": bool, "tests": [paths], "total": int, "reasons": [str]}` | the whole server suite: `{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}` |
 | `pre_train_checks` | the merge gate, before a pull request joins the merge train, in its worktree | exits non-zero when a check failed; what it prints is shown | every pull request is admitted |
 | `mechanical_conflicts` | the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch | `resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line (paths without spaces), or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took | every conflict is left to the session, nothing is renumbered and main took no number |
-| `browser_plan` | the merge gate: the changed paths on standard input, each ended by a NUL | exits 0 when the merge needs browser tests, 1 when not; anything else counts as needed | every merge that changes a file needs browser tests while the merged tree holds the E2E workflow (`workflows.e2e`), and none does without it |
+| `browser_plan` | the merge gate: the changed paths on standard input, each ended by a NUL | prints `needed` or `none` and exits 0; anything else, a crash or another exit included, counts as needed | every merge that changes a file needs browser tests while the merged tree holds the E2E workflow (`workflows.e2e`), and none does without it |
 | `hunt_app` | `session` when a hunt stops: `stop`, in the hunt's worktree; the hunter itself, by `shipline hunt-app` | | `session start hunt` refuses |
 | `hunt_browser` | the hunter, by `shipline hunt-browser`, which its sentence names | | the sentence names none |
 | `hunt_cursor` | `session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>` | what it prints is kept in the report folder's `cursor.log` | a Cursor hunt is refused |
@@ -161,5 +161,8 @@ answering, and `advisory-service.pending`, the line the wake tells once.
 
 A command reads nothing but what is given on its standard input. Files a repository kept beside
 the scripts before these commands existed, `scripts/workflow/pre-train-checks`,
-`advisory_service.py`, `pushing_checkout.py`, `mechanical_conflicts.py` and `scripts/e2e-plan.py`,
-are no longer read: each becomes a command named here, which answers in the form above.
+`advisory_service.py`, `pushing_checkout.py`, `mechanical_conflicts.py`,
+`server_tests_for_changes.py`, `browser_tests_for_changes.py` and `scripts/e2e-plan.py`, are no
+longer read: each becomes a command named here, which answers in the form above. Its program now
+lives in the main checkout whichever worktree runs it, so one that reads the change finds the
+checkout from the folder it runs in (`git rev-parse --show-toplevel`), not from its own path.

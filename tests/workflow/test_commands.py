@@ -317,11 +317,22 @@ def _browser_needed(workflow: Workflow) -> str:
     return done.stdout.strip()
 
 
-@pytest.mark.parametrize(("status", "answer"), [(0, "needed"), (1, "none"), (3, "needed")])
-def test_the_browser_plan_reads_the_changed_paths_and_answers_by_its_exit(
-    workflow: Workflow, status: int, answer: str
+@pytest.mark.parametrize(
+    ("printed", "status", "answer"),
+    [
+        ("needed\n", 0, "needed"),
+        ("none\n", 0, "none"),
+        # A crash, Python's exit 1 included, or an answer it does not give never skips them.
+        ("", 1, "needed"),
+        ("none\n", 1, "needed"),
+        ("", 0, "needed"),
+        ("no\n", 0, "needed"),
+    ],
+)
+def test_the_browser_plan_reads_the_changed_paths_and_answers_none_only_by_saying_so(
+    workflow: Workflow, printed: str, status: int, answer: str
 ) -> None:
-    _stand_in(workflow, "example-plan", status=status)
+    _stand_in(workflow, "example-plan", printed, status=status)
     _configure(workflow, browser_plan="example-plan --merge")
     _changes(workflow, "app.txt", "odd name.txt")
 
