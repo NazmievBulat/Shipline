@@ -90,6 +90,23 @@ def test_the_slot_budget_takes_the_pool_s_label_for_runs_sent_to_it(tmp_path: Pa
         ordinary_slots._used(tmp_path, datetime.now(UTC), "other-pool")
 
 
+def test_a_supervisor_of_an_earlier_install_that_names_no_label_keeps_every_slot(
+    tmp_path: Path,
+) -> None:
+    """The spare supervisor and the planner of an earlier install keep running while install.sh
+    builds the images, and call the new copy without the pool's label: it keeps every slot."""
+    done = subprocess.run(
+        [sys.executable, str(_RUNNER / "ordinary_slots.py"), "4", "1", "example-owner/example-app"],
+        env={**os.environ, "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "4\n"
+
+
 def test_the_planner_counts_the_ordinary_runners_by_their_container_names(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

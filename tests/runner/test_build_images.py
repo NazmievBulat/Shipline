@@ -7,6 +7,7 @@ never what the checkout holds."""
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -151,6 +152,33 @@ def test_the_watch_leaves_the_running_cache_s_files_alone(machine: Path) -> None
 
     assert (folders / "hub_cache/kept").exists()
     assert (folders / "hub_cache-watch/shipline.json").exists()
+
+
+def test_a_build_under_way_keeps_its_files_when_another_starts(machine: Path) -> None:
+    """The weekly timer's build is under way when main moves and the install builds too: the
+    second waits for the first, which keeps its files, then takes main's newer ones."""
+    command = 'cat step-1 >> "$BUILT"; sleep 2; cat step-2 >> "$BUILT"'
+    _main(machine, {"image_build": command}, {"step-1": "one\n", "step-2": "two\n"})
+    env = {**_GIT_ENV, "HOME": str(machine / "home"), "RUNNER_PREFIX": "example-app"}
+    env["BUILT"] = str(machine / "built")
+    first = subprocess.Popen(
+        ["sh", str(_RUNNER / "build-images.sh")],
+        cwd=machine / "checkout",
+        env=env,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 30
+    while not (machine / "built").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    _main(machine, {"image_build": command}, {"step-2": "newer\n"})
+
+    second = _run(machine, "build-images.sh")
+    _, errors = first.communicate(timeout=60)
+
+    assert first.returncode == 0, errors
+    assert second.returncode == 0, second.stderr
+    assert (machine / "built").read_text().splitlines() == ["one", "two", "one", "newer"]
 
 
 def test_without_a_hub_cache_command_there_is_no_cache(machine: Path) -> None:
