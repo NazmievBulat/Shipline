@@ -5,7 +5,14 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from workflow_harness import Workflow, make_workflow
+from workflow_harness import Workflow, install_shipline, make_workflow
+
+
+@pytest.fixture
+def workflow(workflow: Workflow) -> Workflow:
+    """Installed from a Shipline checkout of its own, as a repository installs it."""
+    install_shipline(workflow)
+    return workflow
 
 
 def _units(workflow: Workflow) -> Path:
@@ -19,7 +26,8 @@ def test_the_service_runs_the_tick_of_the_main_checkout(workflow: Workflow) -> N
     service = (_units(workflow) / "workflow-tick.service").read_text().splitlines()
     assert "Type=oneshot" in service
     assert f"WorkingDirectory={workflow.repo}" in service
-    assert f'ExecStart="{workflow.repo}/scripts/workflow/tick"' in service
+    assert f'Environment="SHIPLINE_REPO={workflow.repo}"' in service
+    assert f'ExecStart="{workflow.home}/bin/shipline" tick' in service
 
 
 def test_the_service_finds_the_same_programs_as_the_one_who_installed_it(
@@ -95,8 +103,9 @@ def test_installing_from_a_worktree_still_points_at_the_main_checkout(workflow: 
     done = workflow.run_script("install-timer", cwd=worktree)
 
     assert done.returncode == 0, done.stderr
-    service = (_units(workflow) / "workflow-tick.service").read_text()
-    assert f'ExecStart="{workflow.repo}/scripts/workflow/tick"\n' in service
+    service = (_units(workflow) / "workflow-tick.service").read_text().splitlines()
+    assert f"WorkingDirectory={workflow.repo}" in service
+    assert f'Environment="SHIPLINE_REPO={workflow.repo}"' in service
 
 
 def test_both_labels_are_created_when_they_are_missing(workflow: Workflow) -> None:
@@ -219,14 +228,17 @@ def test_a_checkout_in_a_folder_with_a_space_and_a_percent_sign_still_gets_its_t
 ) -> None:
     """systemd splits a command at a space and reads `%` as the start of a placeholder."""
     odd = make_workflow(tmp_path / "my code 100%", workflow.bin)
+    install_shipline(odd)
 
     done = odd.run_script("install-timer")
 
     assert done.returncode == 0, done.stderr
     service = (_units(odd) / "workflow-tick.service").read_text().splitlines()
     escaped = str(odd.repo).replace("%", "%%")
+    launcher = str(odd.home).replace("%", "%%") + "/bin/shipline"
     assert f"WorkingDirectory={escaped}" in service
-    assert f'ExecStart="{escaped}/scripts/workflow/tick"' in service
+    assert f'Environment="SHIPLINE_REPO={escaped}"' in service
+    assert f'ExecStart="{launcher}" tick' in service
 
 
 @_needs_systemd
@@ -234,6 +246,7 @@ def test_systemd_finds_nothing_wrong_with_a_checkout_in_an_odd_folder(
     workflow: Workflow, tmp_path: Path
 ) -> None:
     odd = make_workflow(tmp_path / "my code 100%", workflow.bin)
+    install_shipline(odd)
     odd.run_script("install-timer")
 
     read = subprocess.run(

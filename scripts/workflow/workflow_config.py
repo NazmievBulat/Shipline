@@ -1,8 +1,9 @@
 """What differs between the repositories that use Shipline, read from one file.
 
 A repository keeps `shipline.json` at the root of its main checkout: the main checkout of the
-repository being worked on, found from the git common directory, so a worktree reads the same
-file as the main checkout. A key the file leaves out keeps its default, key by key; a key the
+repository being worked on (`SHIPLINE_REPO`, else the repository of the current directory; never
+found from where these scripts are), found from the git common directory, so a worktree reads the
+same file as the main checkout. A key the file leaves out keeps its default, key by key; a key the
 file names that Shipline does not know, or a value of the wrong kind, is refused, so a typing
 error never passes as a default.
 
@@ -37,7 +38,6 @@ from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-HERE = Path(__file__).resolve().parent
 FILE = "shipline.json"
 # Where the runner pool names the repository its runners register with, and how long Bash may
 # take to read it.
@@ -245,7 +245,7 @@ class Config:
         return state.parents[len(PurePosixPath(self.state_folder).parts) - 1]
 
 
-def main_checkout(start: Path = HERE) -> Path:
+def main_checkout(start: Path) -> Path:
     done = subprocess.run(
         ["git", "-C", str(start), "rev-parse", "--path-format=absolute", "--git-common-dir"],
         capture_output=True,
@@ -255,6 +255,28 @@ def main_checkout(start: Path = HERE) -> Path:
     if done.returncode:
         raise ConfigError(f"{start} is not in a git repository: {done.stderr.strip()}")
     return Path(done.stdout.strip()).parent
+
+
+def repository_checkout() -> Path:
+    """The main checkout of the repository Shipline works on: the one `SHIPLINE_REPO` names
+    (`shipline --repo` sets it), else the one the current directory is in. Never found from
+    where these scripts are: they are in Shipline's own checkout."""
+    named = os.environ.get("SHIPLINE_REPO")
+    if named:
+        try:
+            return main_checkout(Path(named))
+        except ConfigError:
+            raise ConfigError(
+                f"SHIPLINE_REPO names {named}, which is in no git repository"
+            ) from None
+    here = Path.cwd()
+    try:
+        return main_checkout(here)
+    except ConfigError:
+        raise ConfigError(
+            f"{here} is in no git repository: run Shipline inside the checkout of the repository "
+            "it works on, or name that checkout with SHIPLINE_REPO or `shipline --repo <path>`."
+        ) from None
 
 
 def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
@@ -408,8 +430,10 @@ def _from_origin(main: Path) -> str | None:
     return found[1] if done.returncode == 0 and found else None
 
 
-def load(start: Path = HERE) -> Config:
-    main = main_checkout(start)
+def load(start: Path | None = None) -> Config:
+    """The configuration of the repository `start` is in; without one, of the repository
+    Shipline works on (`repository_checkout`)."""
+    main = repository_checkout() if start is None else main_checkout(start)
     path = main / FILE
     try:
         text = path.read_text()
@@ -471,7 +495,7 @@ def parity_of(given: Any) -> Parity:
 
 @cache
 def current() -> Config:
-    """The configuration of the repository these scripts are in, read once a run."""
+    """The configuration of the repository Shipline works on, read once a run."""
     return load()
 
 
@@ -536,6 +560,9 @@ def shell(config: Config) -> str:
     lines.append(f"SHIPLINE_HUNT_AREAS=({' '.join(shlex.quote(area) for area in areas)})")
     screens = " ".join(shlex.quote(", ".join(paths)) for paths in areas.values())
     lines.append(f"SHIPLINE_HUNT_SCREENS=({screens})")
+    # The main checkout, exported: every program the script starts works on the same repository,
+    # whatever folder it starts in.
+    lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")
     return "\n".join(lines) + "\n"
 
 
@@ -544,7 +571,7 @@ def main() -> int:
         print("usage: workflow_config.py shell [folder]", file=sys.stderr)
         return 2
     try:
-        config = load(Path(sys.argv[2]) if len(sys.argv) == 3 else HERE)
+        config = load(Path(sys.argv[2]) if len(sys.argv) == 3 else None)
     except ConfigError as error:
         print(error, file=sys.stderr)
         return 1

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from workflow_harness import Workflow
+from workflow_harness import Workflow, install_shipline
 
 _WORKFLOW = Path(__file__).resolve().parents[2] / "scripts/workflow"
 # Loaded from its file, so the scripts' folder is not put on the path of every other test.
@@ -938,6 +938,7 @@ def test_python_bash_node_and_jq_read_the_same_values(workflow: Workflow) -> Non
 def test_the_named_labels_are_what_the_tick_starts_by_and_install_timer_creates(
     workflow: Workflow,
 ) -> None:
+    install_shipline(workflow)
     _commit_on_main(
         workflow,
         {"shipline.json": json.dumps({"labels": {"workflow": "shipline", "audited": "checked"}})},
@@ -1142,6 +1143,7 @@ def test_without_a_repository_only_what_needs_one_stops(workflow: Workflow) -> N
     scripts = workflow.repo / "scripts/workflow"
     shell = subprocess.run(
         ["python3", str(scripts / "workflow_config.py"), "shell"],
+        cwd=workflow.repo,
         env=workflow.env,
         capture_output=True,
         text=True,
