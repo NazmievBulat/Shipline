@@ -1,0 +1,10 @@
+# One sample of what the pool's runners use, written for the usage report.
+[Unit]
+Description=@PREFIX@ runner usage sample
+
+[Service]
+Type=oneshot
+User=@PREFIX@-runner
+WorkingDirectory=/var/lib/@PREFIX@-runner
+ExecStart=/opt/@PREFIX@-runner/sample-usage.sh
+NoNewPrivileges=true

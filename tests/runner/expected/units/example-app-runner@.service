@@ -1,0 +1,20 @@
+# One ordinary runner of the pool, slot %i: a container of the image example-app-runner that takes
+# pull request and main jobs labelled with this machine's ordinary label.
+[Unit]
+Description=example-app ordinary runner %i
+Requires=docker.service example-app-runner-network.service
+After=docker.service example-app-runner-network.service example-app-runner-hub-cache.service
+Wants=example-app-runner-hub-cache.service
+
+[Service]
+User=example-app-runner
+WorkingDirectory=/var/lib/example-app-runner
+ExecStart=/opt/example-app-runner/start-runner.sh ordinary %i
+Restart=always
+RestartSec=10
+# A job that is running is given its time to end before the container goes.
+TimeoutStopSec=330
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

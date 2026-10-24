@@ -1,0 +1,10 @@
+[Unit]
+Description=Builds the example-app runner images every week
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

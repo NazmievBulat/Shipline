@@ -1,0 +1,18 @@
+# The planner's runner, labelled @PREFIX@-planner: it takes only the jobs that plan what CI runs,
+# so a plan never waits behind a test job.
+[Unit]
+Description=@PREFIX@ planner runner
+Requires=docker.service @PREFIX@-runner-network.service
+After=docker.service @PREFIX@-runner-network.service
+
+[Service]
+User=@PREFIX@-runner
+WorkingDirectory=/var/lib/@PREFIX@-runner
+ExecStart=/opt/@PREFIX@-runner/start-runner.sh planner 1
+Restart=always
+RestartSec=10
+TimeoutStopSec=330
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

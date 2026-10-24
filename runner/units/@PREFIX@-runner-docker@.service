@@ -1,0 +1,21 @@
+# One Docker-capable runner, slot %i: a virtual machine of the image @PREFIX@-runner-docker, for
+# the jobs that run Docker themselves, labelled with this machine's Docker label. Only on a
+# machine that has /dev/kvm.
+[Unit]
+Description=@PREFIX@ Docker runner %i
+ConditionPathExists=/dev/kvm
+Requires=docker.service @PREFIX@-runner-network.service
+After=docker.service @PREFIX@-runner-network.service @PREFIX@-runner-hub-cache.service
+Wants=@PREFIX@-runner-hub-cache.service
+
+[Service]
+User=@PREFIX@-runner
+WorkingDirectory=/var/lib/@PREFIX@-runner
+ExecStart=/opt/@PREFIX@-runner/start-runner.sh docker %i
+Restart=always
+RestartSec=10
+TimeoutStopSec=330
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
