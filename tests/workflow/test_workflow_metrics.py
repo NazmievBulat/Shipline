@@ -33,7 +33,7 @@ with open("@STATE@/calls.log", "a") as log:
 if arguments[:2] == ["api", "graphql"]:
     query = next(word for word in arguments if word.startswith("query="))
     words = next(word for word in arguments if word.startswith("q="))
-    assert "first: 100" in query and "is:merged" in words, arguments
+    assert "first: 100" in query and "is:merged base:main" in words, arguments
     after = [word for word in arguments if word.startswith("after=")]
     pages = json.loads((fixtures / "pulls.json").read_text())
     print(json.dumps(pages[1] if after == ["after=page-2"] else pages[0]))
@@ -100,7 +100,11 @@ def _notes(workflow: Workflow) -> None:
     report.parent.mkdir(parents=True)
     report.write_text("# Hunt plan-phone-2\n\nFindings: 3\n\n## One\n\nThe 4 steps.\n")
     os.utime(report, (NOW - DAY, NOW - DAY))
-    workflow.hunt_report("plan-phone-3").mkdir(parents=True)
+    # A hunt without its report, one so old it is not this week's, and a file that is no hunt.
+    for name, age in (("plan-phone-3", DAY), ("plan-phone-1", 10 * DAY)):
+        workflow.hunt_report(name).mkdir(parents=True)
+        os.utime(workflow.hunt_report(name), (NOW - age, NOW - age))
+    (workflow.repo / ".local" / "hunts" / "notes.txt").write_text("4 findings\n")
 
 
 def _measure(workflow: Workflow, *args: str) -> dict[str, Any]:
@@ -139,7 +143,7 @@ def test_the_fixtures_give_the_expected_table_and_fire_only_their_detectors(
     assert stages["total"]["median"] == 11
     assert stages["merge_line"]["share"] == pytest.approx(29 / 39.5)
     assert stages["build"]["share"] == pytest.approx(3.5 / 39.5)
-    [longest, second] = merged["gaps"]
+    [longest, second, since_the_last] = merged["gaps"]
     assert (longest["from"], longest["until"], longest["hours"]) == (
         "2026-10-22T18:00:00Z",
         "2026-10-23T20:00:00Z",
@@ -151,6 +155,13 @@ def test_the_fixtures_give_the_expected_table_and_fire_only_their_detectors(
     )
     assert second["hours"] == 10.5
     assert second["wake"] == "no check-ins"
+    # Nothing merged since: a gap that is still open at the window's end.
+    assert (since_the_last["from"], since_the_last["hours"], since_the_last["open"]) == (
+        "2026-10-24T06:30:00Z",
+        pytest.approx(4 / 3),
+        True,
+    )
+    assert not longest["open"]
 
     runs = week["runs"]
     assert runs["workflows"]["CI"] == {"runs": 7, "median_minutes": 10, "p90_minutes": 10.8}
@@ -161,7 +172,7 @@ def test_the_fixtures_give_the_expected_table_and_fire_only_their_detectors(
     assert runs["ci_runs_per_merge"] == 2
     assert (runs["cancelled"], runs["completed"]) == (2, 10)
     assert runs["cancelled_share"] == pytest.approx(0.2)
-    assert runs["runner_minutes"] == 101
+    assert runs["runner_minutes"] == 101.33
     assert day["runs"]["ci_runs"] == 4
     assert day["runs"]["cancelled_share"] == pytest.approx(0.25)
 
@@ -202,6 +213,8 @@ def test_the_fixtures_give_the_expected_table_and_fire_only_their_detectors(
     assert quality["reverts"] == [23]
     assert quality["push_refusals"] == "not recorded"
     assert "hunt report: plan-phone-3" in week["not_found"]
+    assert not [missing for missing in week["not_found"] if "plan-phone-1" in missing]
+    assert not [missing for missing in week["not_found"] if "notes.txt" in missing]
     assert "weaker tests section: 22, 23" in week["not_found"]
     assert "machine samples" in week["not_found"]
 
@@ -337,6 +350,7 @@ def test_a_busy_machine_fires_the_machine_and_session_detectors(workflow: Workfl
     assert sessions["limit_stops"] == 1
     machine = week["machine"]
     assert machine["swap_out_mb_per_second"]["max"] == pytest.approx(1_000_000 * 4096 / 180 / 2**20)
+    assert machine["swap_in_mb_per_second"]["max"] == 0
     assert machine["system_cpu_share"]["max_hour"] == pytest.approx(0.3)
     assert machine["groups"]["ticket-7"]["max_hour_cores"] == pytest.approx(2.5)
     assert machine["groups"]["workflow-tick"]["max_hour_cores"] < 0.01
@@ -355,7 +369,7 @@ def test_a_busy_machine_fires_the_machine_and_session_detectors(workflow: Workfl
     lines = [finding["line"] for finding in measured["findings"]]
     assert "questions to the owner waited over 60 min: review-9 (130 min)" in lines
     assert (
-        "sessions idle more than half their life over 7 days:"
+        "sessions idle more than 50% of their life over 7 days:"
         " review-10 (100% of 2.0 h), review-11 (100% of 2.0 h), review-9 (100% of 2.0 h)"
     ) in lines
     assert (
@@ -446,10 +460,11 @@ def test_a_sample_reads_proc_the_control_groups_and_the_sessions(workflow: Workf
     (notes / "ticket-7.asking").write_text(f"{NOW - 600} 0\n")
     machine = workflow.root / "home" / ".local" / "state" / "workflow" / "machine.jsonl"
     machine.parent.mkdir(parents=True, exist_ok=True)
-    # Nine days old: kept 8 days.
-    old = _sample(NOW - 9 * DAY)
+    # Kept 8 days: once the oldest is 9 days old, every sample older than 8 goes, so the file is
+    # written again once a day and not at every tick.
+    old, older = _sample(NOW - 8 * DAY - HOUR), _sample(NOW - 9 * DAY - HOUR)
     kept = _sample(NOW - 7 * DAY)
-    machine.write_text(json.dumps(old) + "\n" + json.dumps(kept) + "\n")
+    machine.write_text("".join(json.dumps(line) + "\n" for line in (older, old, kept)))
 
     done = workflow.run_script("workflow-metrics", "--sample", env=AT)
 
@@ -707,3 +722,99 @@ def test_the_tick_leaves_the_daily_run_alone_when_it_is_switched_off(workflow: W
     assert done.returncode == 0, done.stderr
     assert not (workflow.repo / ".local" / "analyses").exists()
     assert not [call for call in workflow.calls("gh ") if "graphql" in call]
+
+
+def test_the_daily_run_leaves_the_tick_lock_free_while_it_runs(workflow: Workflow) -> None:
+    """The next tick must not wait minutes for the daily run to read a week of runs."""
+    import fcntl
+
+    _github_beside_the_tick(workflow)
+    _notes(workflow)
+    # The metrics' first question to GitHub waits until the test lets it go on.
+    (workflow.bin / "gh-metrics").rename(workflow.bin / "gh-metrics-answers")
+    workflow.fake(
+        "gh-metrics",
+        "#!/bin/bash\ntouch '@STATE@/metrics-asking'\n"
+        "for _ in $(seq 200); do [ -e '@STATE@/metrics-go-on' ] && break; /bin/sleep 0.1; done\n"
+        'exec "$(dirname "$0")/gh-metrics-answers" "$@"\n',
+    )
+    daily = {"WORKFLOW_METRICS_DAILY_AT": "07:50", "TZ": "UTC", "WORKFLOW_NOW": str(NOW + 60)}
+
+    done = workflow.run_script("tick", env=daily)
+
+    assert done.returncode == 0, done.stderr
+    assert _wait_for(workflow.state / "metrics-asking")
+    with (workflow.repo / ".git" / "shipline-tick.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    (workflow.state / "metrics-go-on").touch()
+    assert _wait_for(workflow.repo / ".local" / "analyses" / "metrics-2026-10-24.md")
+
+
+def test_a_week_without_workers_names_no_kind_over_them(workflow: Workflow) -> None:
+    """Workers built in the cloud leave no local worker hours to compare with."""
+    _empty_github(workflow)
+    _write_samples(
+        workflow,
+        [_sample(NOW - 2 * HOUR + step * 180, sessions={"review-9": "busy"}) for step in range(41)],
+    )
+
+    measured = _measure(workflow)
+
+    assert measured["last_days"]["sessions"]["kinds"]["review"]["hours"] == 2
+    assert measured["findings"] == []
+
+
+def test_a_sample_is_pruned_only_once_its_oldest_is_nine_days_old(workflow: Workflow) -> None:
+    machine = workflow.root / "home" / ".local" / "state" / "workflow" / "machine.jsonl"
+    machine.parent.mkdir(parents=True, exist_ok=True)
+    old = _sample(NOW - 8 * DAY - HOUR)
+    machine.write_text(json.dumps(old) + "\n")
+
+    done = workflow.run_script("workflow-metrics", "--sample", env=AT)
+
+    assert done.returncode == 0, done.stderr
+    assert json.loads(machine.read_text().splitlines()[0]) == old
+
+
+def _helper(workflow: Workflow, code: str) -> str:
+    done = subprocess.run(
+        [
+            "python3",
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts/workflow'); import workflow_metrics as m\n"
+            + code,
+        ],
+        cwd=workflow.repo,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip()
+
+
+def test_names_from_github_reach_the_wake_only_as_plain_words(workflow: Workflow) -> None:
+    printed = _helper(
+        workflow, 'print(m.plain("tests (1 of 2)\\n`rm -rf` <!-- x --> " + "y" * 90))'
+    )
+
+    assert printed == "tests (1 of 2) ?rm -rf? ?!-- x --? " + "y" * 45
+
+
+def test_main_reports_are_read_as_the_gate_writes_them(workflow: Workflow) -> None:
+    assert (
+        _helper(
+            workflow,
+            'print(m.main_state("main: red since unknown time, CI result (0123456789ab)"))',
+        )
+        == "('red', ['CI result'], 'unknown time')"
+    )
+    assert (
+        _helper(
+            workflow,
+            'print(m.not_green({"green": 0.5, "unknown": 0.3, "pending": 0.1, "red": 0.1}))',
+        )
+        == "0.2"
+    )

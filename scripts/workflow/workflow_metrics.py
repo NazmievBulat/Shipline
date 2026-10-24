@@ -70,9 +70,10 @@ THRESHOLDS: dict[str, float] = {
     "swap_available_gb": 8,
     # System CPU above this share of all processors, averaged over an hour.
     "system_cpu_share": 0.25,
-    # The load per processor, in percent, more than this many times the CPU pressure (`some
-    # avg60`), both averaged over an hour: load that comes from waiting (swapping, blocked
-    # processes) rather than from CPU work.
+    # The load per processor, in percent, above this floor and more than this many times the CPU
+    # pressure (`some avg60`), both averaged over an hour: load that comes from waiting
+    # (swapping, blocked processes) rather than from CPU work.
+    "load_floor_percent": 50,
     "load_over_pressure": 2,
     # Any one service or session, the tick included, above this many cores over an hour.
     "group_cores": 2,
@@ -81,6 +82,8 @@ THRESHOLDS: dict[str, float] = {
 STATE = Path.home() / ".local" / "state" / "workflow"
 SAMPLES = STATE / "machine.jsonl"
 KEEP_SAMPLES_SECONDS = 8 * 86400
+# The file is written again only once its oldest sample is this old: once a day, not each tick.
+PRUNE_AFTER_SECONDS = 9 * 86400
 # Two samples further apart than this say nothing about what ran between them: the machine was
 # off, or the tick did not run.
 LONGEST_INTERVAL = 10 * 60
@@ -111,14 +114,20 @@ ROUND = re.compile(r"<!-- workflow-review round=(\d+)(?: result=(sent-back|passe
 CHECK_IN = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)  .+")
 TICK_LINE = re.compile(r"(\d{9,}) (.+)")
 # The wake's main report: green, pending, red or unknown; an advisory red is one that only an
-# advisory service that could not be reached made red.
+# advisory service that could not be reached made red. The gate writes "red since unknown time"
+# when it could not read when the run ended.
 MAIN = re.compile(r"; (main: (?:green|pending|red|unknown).*?); starts: ")
+RED = re.compile(r"main: red since (unknown time|\S+), (.+?) \([0-9a-f]{12}\)")
 ADVISORY = "advisory service, and nothing was found wrong with main"
 # A number or a head in a hand-back's reason: the same reason for every pull request.
 NUMBERED = re.compile(r"\b[0-9a-f]*[0-9][0-9a-f]*\b")
 HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\S")
 FINDINGS = re.compile(r"(\d+)\s+findings?\b|\bfindings?\W+(\d+)", re.IGNORECASE)
+# What of a name read from GitHub may reach a finding, and so the orchestrator's message: words
+# and plain marks, no quotes, backticks, angle brackets or new lines, at most this long.
+NOT_PLAIN = re.compile(r"[^\w .,:;()\[\]/+!#&=%-]")
+PLAIN_LENGTH = 80
 
 MERGED = """query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 100, after: $after) {
@@ -150,6 +159,10 @@ def iso(moment: float) -> str:
 
 def instant(text: str) -> float:
     return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def plain(text: str) -> str:
+    return NOT_PLAIN.sub("?", re.sub(r"\s+", " ", text))[:PLAIN_LENGTH]
 
 
 def percentile(values: list[float], percent: int) -> float:
@@ -291,13 +304,6 @@ def _first_number(path: Path) -> int | None:
     return int(words[0]) if words and words[0].isdigit() else None
 
 
-def runner_prefix(config: workflow_config.Config) -> str | None:
-    # The runner pool names its services and containers by `runner.prefix`; without the key,
-    # there are no runner figures.
-    prefix = getattr(config.runner, "prefix", None)
-    return prefix if isinstance(prefix, str) and prefix else None
-
-
 def sample() -> int:
     config = workflow_config.current()
     vmstat = _fields(PROC / "vmstat")
@@ -315,7 +321,8 @@ def sample() -> int:
             if {"usage_usec", "system_usec"} <= root.keys()
             else None
         ),
-        "groups": _groups(runner_prefix(config)),
+        # The runner pool names its services and containers by `runner.prefix`.
+        "groups": _groups(config.runner.prefix),
         "sessions": _sessions(),
         "asking": _asking(config),
     }
@@ -329,14 +336,14 @@ def sample() -> int:
 
 
 def _prune(moment: int) -> None:
-    """Samples older than 8 days are dropped, once the oldest one is."""
+    """Samples older than 8 days are dropped, once the oldest is 9 days old."""
     try:
         with SAMPLES.open() as samples:
             first = samples.readline()
     except OSError:
         return
     try:
-        if json.loads(first)["at"] >= moment - KEEP_SAMPLES_SECONDS:
+        if json.loads(first)["at"] >= moment - PRUNE_AFTER_SECONDS:
             return
     except ValueError, KeyError, TypeError:
         pass
@@ -383,7 +390,7 @@ class Sources:
     ticks: list[tuple[float, str]]
     hand_backs: list[tuple[float, str, str]]
     lost: list[tuple[float, str, str]]
-    hunts: list[tuple[float | None, str, int | None]]
+    hunts: list[tuple[float, str, int | None]]
     samples: list[dict[str, Any]]
     wake_log: bool
 
@@ -421,7 +428,7 @@ def read_wake_log() -> tuple[list[CheckIn], list[tuple[float, str]], bool]:
 
 def main_state(text: str) -> tuple[str, list[str], str | None]:
     """A main report's state, the checks it names, and since when it has been red."""
-    if red := re.match(r"main: red since (\S+), (.+?) \([0-9a-f]{12}\)", text):
+    if red := RED.match(text):
         state = "advisory" if ADVISORY in text else "red"
         return state, red[2].split(", "), red[1]
     if pending := re.match(r"main: pending, (.+?) \([0-9a-f]{12}\)", text):
@@ -443,17 +450,20 @@ def _notes(folder: Path, field: str) -> list[tuple[float, str, str]]:
     return found
 
 
-def read_hunts(main: Path) -> list[tuple[float | None, str, int | None]]:
+def read_hunts(main: Path) -> list[tuple[float, str, int | None]]:
     """Each hunt's report, as (when written, its name, the count of findings near its top)."""
-    found: list[tuple[float | None, str, int | None]] = []
+    found: list[tuple[float, str, int | None]] = []
     folder = main / ".local" / "hunts"
     for hunt in sorted(folder.iterdir()) if folder.is_dir() else []:
+        if not hunt.is_dir():
+            continue
         report = hunt / "report.md"
         try:
             top = report.read_text(errors="replace").splitlines()[:10]
-            written: float | None = report.stat().st_mtime
+            written = report.stat().st_mtime
         except OSError:
-            found.append((None, hunt.name, None))
+            # A hunt without its report, as of when its folder last changed.
+            found.append((hunt.stat().st_mtime, hunt.name, None))
             continue
         count = next(
             (int(match[1] or match[2]) for line in top if (match := FINDINGS.search(line))), None
@@ -465,7 +475,7 @@ def read_hunts(main: Path) -> list[tuple[float | None, str, int | None]]:
 def merged_pulls(since: float, until: float) -> list[dict[str, Any]]:
     from merge_gate import REPOSITORY, Refused, read_github
 
-    words = f"repo:{REPOSITORY} is:pr is:merged merged:{iso(since)}..{iso(until)}"
+    words = f"repo:{REPOSITORY} is:pr is:merged base:main merged:{iso(since)}..{iso(until)}"
     pulls: list[dict[str, Any]] = []
     after = None
     while True:
@@ -518,8 +528,10 @@ def workflow_runs(since: float, until: float) -> list[dict[str, Any]]:
         if run.get("status") != "completed":
             continue
         attempt = run.get("run_attempt") or 1
+        # By its attempt: a re-run started since the list was read has jobs of its own.
         run["jobs"] = _jobs(
-            f"{API}/actions/runs/{run['id']}/jobs?per_page=100", f"{run['id']}-{attempt}.json"
+            f"{API}/actions/runs/{run['id']}/attempts/{attempt}/jobs?per_page=100",
+            f"{run['id']}-{attempt}.json",
         )
         if attempt > 1 and run.get("conclusion") == "success":
             run["earlier_jobs"] = _jobs(
@@ -577,16 +589,22 @@ def _stages(pull: dict[str, Any], label: str) -> dict[str, float] | None:
         for event in events
         if event.get("__typename") == "ReadyForReviewEvent"
     ]
-    passed = [
-        instant(review["submittedAt"])
+    # The first passed round after the last send-back: a round again after a conflict, while the
+    # pull request waits in the merge line, is the merge line's time.
+    rounds = sorted(
+        (instant(review["submittedAt"]), found[2] == "passed")
         for review in pull["reviews"]["nodes"]
-        if (found := ROUND.match(review.get("body") or "")) and found[2] == "passed"
+        if review.get("submittedAt") and (found := ROUND.match(review.get("body") or ""))
+    )
+    sent_back = [moment for moment, passed in rounds if not passed]
+    passed = [
+        moment for moment, passed in rounds if passed and (not sent_back or moment > sent_back[-1])
     ]
     if not labelled or not passed:
         return None
     start = min(labelled)
     readied = max(min(ready) if ready else instant(pull["createdAt"]), start)
-    round_passed = max(max(passed), readied)
+    round_passed = max(passed[0], readied)
     merged = max(instant(pull["mergedAt"]), round_passed)
     return {
         "build": (readied - start) / HOUR,
@@ -647,9 +665,12 @@ def merged_numbers(window: Window, sources: Sources, label: str) -> dict[str, An
         if table[stage] is not None:
             table[stage]["share"] = sum(values) / totals if totals else None
     moments = [instant(pull["mergedAt"]) for pull in pulls]
-    gaps = sorted(
-        zip(moments, moments[1:], strict=False), key=lambda gap: gap[1] - gap[0], reverse=True
-    )[:3]
+    # The gap since the last merge is still open at the window's end. The one before the first
+    # merge is not known: the merge before it is outside the window.
+    ends = [*moments[1:], window.until] if moments else []
+    gaps = sorted(zip(moments, ends, strict=True), key=lambda gap: gap[1] - gap[0], reverse=True)[
+        :3
+    ]
     return {
         "numbers": [pull["number"] for pull in pulls],
         "per_hour": len(pulls) / ((window.until - window.since) / HOUR),
@@ -660,6 +681,7 @@ def merged_numbers(window: Window, sources: Sources, label: str) -> dict[str, An
                 "from": iso(start),
                 "until": iso(end),
                 "hours": (end - start) / HOUR,
+                "open": end == window.until,
                 "wake": _summary([c for c in sources.check_ins if start <= c.at < end]),
             }
             for start, end in gaps
@@ -704,20 +726,23 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
     slowest = None
     shares = []
     for run in completed:
+        # Jobs that ran: a skipped job takes no time, and a clock can run backwards.
         timed = [
             (minutes, job["name"])
             for job in run.get("jobs", [])
-            if (minutes := _minutes(job.get("started_at"), job.get("completed_at")))
+            if (minutes := _minutes(job.get("started_at"), job.get("completed_at"))) is not None
+            and minutes > 0
         ]
         for minutes, job in timed:
             if slowest is None or minutes > slowest["minutes"]:
                 slowest = {
-                    "workflow": run["name"],
-                    "job": job,
+                    "workflow": plain(run["name"]),
+                    "job": plain(job),
                     "run": run["id"],
                     "minutes": minutes,
                 }
-        if len(timed) >= 2:
+        # Only the three workflows Shipline knows: another one's names are anybody's.
+        if len(timed) >= 2 and run.get("path") in names:
             longest, job = max(timed)
             shares.append(
                 {
@@ -734,6 +759,8 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
     cancelled = [run["id"] for run in completed if run.get("conclusion") == "cancelled"]
     flaky: Counter[str] = Counter()
     for run in completed:
+        if run.get("path") not in names:
+            continue
         for job in run.get("earlier_jobs", []):
             if job.get("conclusion") == "failure":
                 flaky[f"{run['name']}: {job['name']}"] += 1
@@ -754,7 +781,7 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
         "failed_scratch_runs": sum(
             1
             for run in completed
-            if run.get("head_branch", "").startswith("workflow/merge-batch-")
+            if (run.get("head_branch") or "").startswith("workflow/merge-batch-")
             and run.get("conclusion") == "failure"
         ),
     }
@@ -788,7 +815,6 @@ def main_numbers(window: Window, sources: Sources) -> dict[str, Any]:
                 start = check_in.at
             current = {
                 "key": key,
-                "first": check_in.at,
                 "start": start,
                 "cause": cause,
                 "until": None,
@@ -807,7 +833,8 @@ def main_numbers(window: Window, sources: Sources) -> dict[str, Any]:
                 "cause": episode["cause"],
             }
             for episode in episodes
-            if window.holds(episode["first"])
+            if episode["start"] < window.until
+            and (episode["until"] is None or episode["until"] > window.since)
         ],
     }
 
@@ -936,6 +963,7 @@ def _peak(
 
 def machine_numbers(samples: list[dict[str, Any]]) -> dict[str, Any]:
     swaps = []
+    swaps_in = []
     system = []
     load = []
     groups: dict[str, list[tuple[float, float, tuple[float, ...]]]] = {}
@@ -946,6 +974,10 @@ def machine_numbers(samples: list[dict[str, Any]]) -> dict[str, Any]:
                 swaps.append(
                     (after["at"], pages * PAGE / elapsed / 2**20, after.get("available_kb"))
                 )
+        if before.get("pswpin") is not None and after.get("pswpin") is not None:
+            pages = after["pswpin"] - before["pswpin"]
+            if pages >= 0:
+                swaps_in.append((after["at"], pages * PAGE / elapsed / 2**20))
         processors = after.get("processors")
         if processors and before.get("cpu") and after.get("cpu"):
             used = after["cpu"]["system_usec"] - before["cpu"]["system_usec"]
@@ -976,6 +1008,9 @@ def machine_numbers(samples: list[dict[str, Any]]) -> dict[str, Any]:
             and kb is not None
             and kb / 2**20 > THRESHOLDS["swap_available_gb"]
         ]
+    if swaps_in:
+        worst_in = max(swaps_in, key=lambda swap: swap[1])
+        found["swap_in_mb_per_second"] = {"max": worst_in[1], "at": iso(worst_in[0])}
     available = [
         record["available_kb"] for record in samples if record.get("available_kb") is not None
     ]
@@ -994,7 +1029,8 @@ def machine_numbers(samples: list[dict[str, Any]]) -> dict[str, Any]:
         waiting = [
             (end, values)
             for end, values in _hours(load)
-            if values[0] > THRESHOLDS["load_over_pressure"] * values[1]
+            if values[0] > THRESHOLDS["load_floor_percent"]
+            and values[0] > THRESHOLDS["load_over_pressure"] * values[1]
         ]
         if waiting:
             ratio = THRESHOLDS["load_over_pressure"]
@@ -1038,10 +1074,11 @@ def quality_numbers(window: Window, sources: Sources) -> tuple[dict[str, Any], l
     hunts = 0
     missing = []
     for written, name, count in sources.hunts:
-        if written is None or count is None:
-            if written is None or window.holds(written):
-                missing.append(name)
-        elif window.holds(written):
+        if not window.holds(written):
+            continue
+        if count is None:
+            missing.append(name)
+        else:
             hunts += count
     not_found = []
     if without:
@@ -1094,7 +1131,12 @@ def window_numbers(window: Window, sources: Sources) -> dict[str, Any]:
 # The detectors, in the order of THRESHOLDS.
 
 
-def _numbers(values: list[Any]) -> str:
+def not_green(share: dict[str, float]) -> float:
+    """The share of check-ins with main pending or red; unknown is neither."""
+    return round(sum(share.get(state, 0) for state in ("pending", "red", "advisory")), 9)
+
+
+def _numbers(values: Any) -> str:
     return ", ".join(str(value) for value in sorted(values, key=lambda value: int(value)))
 
 
@@ -1127,7 +1169,7 @@ def detect(numbers: dict[str, Any], sources: Sources, window: Window) -> list[di
             latest = max(notes)[2]
             fire(
                 "hand_back_reason",
-                f"hand-back reason repeated {len(notes)} times {within}: {latest}"
+                f"hand-back reason repeated {len(notes)} times {within}: {plain(latest)}"
                 f" (pull requests {_numbers({number for _, number, _ in notes})})",
             )
 
@@ -1139,12 +1181,12 @@ def detect(numbers: dict[str, Any], sources: Sources, window: Window) -> list[di
         if count >= THRESHOLDS["repeats"]:
             fire(
                 "lost_check",
-                f"lost check repeated {count} times {within}: {check}"
+                f"lost check repeated {count} times {within}: {plain(check)}"
                 f" (pull requests {_numbers(checks[check])})",
             )
     for job, count in numbers["quality"]["flaky"].items():
         if count >= THRESHOLDS["repeats"]:
-            fire("flaky_test", f"flaky test repeated {count} times {within}: {job}")
+            fire("flaky_test", f"flaky test repeated {count} times {within}: {plain(job)}")
     causes: dict[str, list[str]] = {}
     for episode in numbers["main"]["red_episodes"]:
         causes.setdefault(episode["cause"], []).append(episode["since"])
@@ -1152,7 +1194,7 @@ def detect(numbers: dict[str, Any], sources: Sources, window: Window) -> list[di
         if len(since) >= THRESHOLDS["repeats"]:
             fire(
                 "red_main_cause",
-                f"red main cause repeated {len(since)} times {within}: {cause}"
+                f"red main cause repeated {len(since)} times {within}: {plain(cause)}"
                 f" (since {', '.join(since)})",
             )
 
@@ -1165,7 +1207,7 @@ def detect(numbers: dict[str, Any], sources: Sources, window: Window) -> list[di
     if waited:
         fire(
             "question_wait",
-            "questions to the owner waited over 60 min: "
+            f"questions to the owner waited over {THRESHOLDS['question_minutes']:.0f} min: "
             + ", ".join(f"{q['session']} ({q['waited_minutes']} min)" for q in waited),
         )
     idle = {
@@ -1176,7 +1218,7 @@ def detect(numbers: dict[str, Any], sources: Sources, window: Window) -> list[di
     if idle:
         fire(
             "idle_sessions",
-            f"sessions idle more than half their life {over}: "
+            f"sessions idle more than {THRESHOLDS['idle_share']:.0%} of their life {over}: "
             + ", ".join(
                 f"{name} ({found['idle_share']:.0%} of {found['hours']:.1f} h)"
                 for name, found in idle.items()
@@ -1198,14 +1240,18 @@ def detect(numbers: dict[str, Any], sources: Sources, window: Window) -> list[di
             f" {_numbers(runs['cancelled_runs'])})",
         )
 
+    # Without local workers (built in the cloud) there is nothing to compare with.
     workers = sessions["kinds"].get("ticket", {}).get("hours", 0.0)
     for kind, found in sessions["kinds"].items():
-        if kind != "ticket" and found["hours"] > THRESHOLDS["kind_hours_over_workers"] * workers:
-            times = f"{found['hours'] / workers:.1f} times " if workers else ""
+        if (
+            workers
+            and kind != "ticket"
+            and found["hours"] > THRESHOLDS["kind_hours_over_workers"] * workers
+        ):
             fire(
                 "session_kind_hours",
                 f"session kind {kind} used {found['hours']:.1f} session-hours {over},"
-                f" {times}the workers' {workers:.1f}",
+                f" {found['hours'] / workers:.1f} times the workers' {workers:.1f}",
             )
 
     shares: dict[str, list[dict[str, Any]]] = {}
@@ -1218,14 +1264,17 @@ def detect(numbers: dict[str, Any], sources: Sources, window: Window) -> list[di
             if len(found) == 1
             else f"up to {worst:.0%}, runs {_numbers([share['run'] for share in found])}"
         )
-        fire("job_share", f"one job over 60% of its run's time: {job} ({which})")
+        fire(
+            "job_share",
+            f"one job over {THRESHOLDS['job_share']:.0%} of its run's time: {plain(job)} ({which})",
+        )
 
     main = numbers["main"]
-    not_green = sum(share for state, share in main["share"].items() if state != "green")
-    if main["check_ins"] and not_green > THRESHOLDS["main_not_green_share"]:
+    share = not_green(main["share"])
+    if main["check_ins"] and share > THRESHOLDS["main_not_green_share"]:
         fire(
             "main_not_green",
-            f"main pending or red in {not_green:.0%} of {main['check_ins']} check-ins {over}",
+            f"main pending or red in {share:.0%} of {main['check_ins']} check-ins {over}",
         )
 
     machine = numbers["machine"]
@@ -1254,7 +1303,7 @@ def detect(numbers: dict[str, Any], sources: Sources, window: Window) -> list[di
         if group["max_hour_cores"] > THRESHOLDS["group_cores"]:
             fire(
                 "group_cores",
-                f"{name} used {group['max_hour_cores']:.1f} cores on average for the hour to"
+                f"{plain(name)} used {group['max_hour_cores']:.1f} cores on average for the hour to"
                 f" {group['hour_to']}",
             )
     return findings
@@ -1384,7 +1433,8 @@ def markdown(measured: dict[str, Any]) -> str:
     )
     lines += ["## Longest gaps on main", ""]
     lines += [
-        f"- {gap['from']} to {gap['until']}, {gap['hours']:.1f} h: {gap['wake']}"
+        f"- {gap['from']} to {gap['until']}{' and on' if gap['open'] else ''},"
+        f" {gap['hours']:.1f} h: {gap['wake']}"
         for gap in long["merged"]["gaps"]
     ] or ["None."]
     lines.append("")
@@ -1483,6 +1533,7 @@ def markdown(measured: dict[str, Any]) -> str:
     lines += _table(
         "Machine",
         [
+            ("swap-in, highest", machine("swap_in_mb_per_second", "{:.1f} MB/s", "max")),
             ("swap-out, highest", machine("swap_out_mb_per_second", "{:.1f} MB/s", "max")),
             ("available memory, lowest", machine("available_gb", "{:.1f} GB", "min")),
             ("system CPU, highest hour", machine("system_cpu_share", "{:.0%}")),

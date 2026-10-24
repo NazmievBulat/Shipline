@@ -2,6 +2,10 @@
   usage: 5-hour window 10% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
   sessions: none; pull requests: drafts 22; ready medium 21 (checks passing); main: red since 2026-10-16T22:00:00Z, CI result (0123456789ab); starts: allowed; tmp pressure: false
   told Check-in: Wake check-in, 23:00.
+2026-10-17 01:00:00  every 20 minutes
+  usage: 5-hour window 10% used, resets in 2h10m, weekly 30%
+  sessions: none; pull requests: none; main: green (0123456789ab); starts: allowed; tmp pressure: false
+  nothing changed since the last check-in; Check-in not told
 2026-10-23 01:00:00  every 20 minutes
   usage: 5-hour window 40% used, resets in 2h10m, weekly 30%; /tmp file slots: 10% used (100/1000); load 0.50 over 5 minutes, ceiling 6 on 4 processors; above it starts wait
   sessions: ticket-22 busy, review-21 idle; pull requests: drafts 22; ready medium 21 (checks passing); main: green (0123456789ab); starts: allowed; tmp pressure: false

@@ -68,10 +68,10 @@ READY_UNFINISHED_SECONDS=$((15 * 60))
 # A busy session whose screen has not changed for this long is named in the wake, once.
 STUCK_AFTER_SECONDS=$((45 * 60))
 # The line a session ends with, WORDS standing for its words. `notify` reads it the same way.
+FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:]]*$'
 # The time of day, UTC, from which the daily metrics run starts; empty, it never does. A test
 # names another.
 METRICS_DAILY_AT=${WORKFLOW_METRICS_DAILY_AT-07:50}
-FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:]]*$'
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 gh() { python3 "$here/github_budget.py" call tick "$@"; }
@@ -354,14 +354,19 @@ budget_ready || paused
 
 # The daily metrics read a week of runs from GitHub, minutes on a first run: they run detached,
 # under a lock of their own, and the tick goes on. The run itself leaves when one is running
-# and waits half an hour after one that failed.
+# and waits half an hour after one that failed. It is given the tick's time, so it names the
+# day the tick looked for. One command alone goes to the background: a list would fork a shell
+# that keeps the tick's lock, and its output, for as long as the run.
 if [[ $METRICS_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] &&
     ((10#$(date -u -d "@$NOW" +%H%M) >= 10#${BASH_REMATCH[1]}${BASH_REMATCH[2]})) &&
     [[ ! -e $main/.local/analyses/metrics-$(date -u -d "@$NOW" +%F).md ]]; then
-  mkdir -p "$HOME/.local/state/workflow" &&
+  if mkdir -p "$HOME/.local/state/workflow"; then
     env -u WORKFLOW_TRAIN_TICK -u WORKFLOW_SESSION_SNAPSHOT -u WORKFLOW_DEFER_START \
-      setsid bash "$here/workflow-metrics" --daily </dev/null \
+      WORKFLOW_NOW="$NOW" setsid bash "$here/workflow-metrics" --daily </dev/null \
       >>"$HOME/.local/state/workflow/metrics.log" 2>&1 9>&- &
+  else
+    failed=1
+  fi
 fi
 
 snapshot=$WORKFLOW_TRAIN_TICK/pulls.json

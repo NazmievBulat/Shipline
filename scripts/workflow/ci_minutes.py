@@ -56,7 +56,8 @@ def summarize(runs: list[dict[str, Any]], since: str, until: str) -> dict[str, A
         0.0,
     )
     for run in runs:
-        branch = run.get("head_branch", "")
+        # A run of no branch (some scheduled and dynamic runs) has a null head branch.
+        branch = run.get("head_branch") or ""
         kind = (
             "scratch"
             if branch.startswith("workflow/merge-batch-")

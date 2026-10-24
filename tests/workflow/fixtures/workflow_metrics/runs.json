@@ -144,7 +144,7 @@
   "name": "CodeQL",
   "path": ".github/workflows/codeql.yml",
   "event": "pull_request",
-  "head_branch": "ticket/two",
+  "head_branch": null,
   "head_sha": "0000000000000000000000000000000000000191",
   "status": "completed",
   "conclusion": "success",
