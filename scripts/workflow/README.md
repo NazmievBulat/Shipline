@@ -59,6 +59,10 @@ are reported once through the wake, with pending reports retained until delivery
 The owner answers cloud questions in the cloud session. Its reports are relayed
 from pull request comments, and its completion releases the reservation only once
 the pull request is ready. `session list` shows addresses and report ages.
+A cloud worker whose draft has had no push and no report for
+`cloud_wake_after_minutes` (30), with no open question, is woken once by the tick
+through `claude --cloud <address>` in a short-lived pane; an answered question wakes
+it at once. One still quiet that long after is named in the wake once.
 
 Dependency 614 supplies repository-local security rules for cloud pushes. The
 orchestrator records the first three cloud tickets' independent review round counts
@@ -77,6 +81,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `repository` | `owner/name` on GitHub | `repository` as Bash reads it from `.github/runner/settings.sh` (sourced in a `bash` of its own, with only `PATH` and `HOME`, for at most 5 seconds), else the `origin` remote on GitHub; a script that needs it stops when neither names one |
 | `state_folder` | the folder of the workflow's notes, in the main checkout and in each worktree | `.local/workflow` |
 | `worktree_setup` | the command that prepares a new worktree, run only when present | `scripts/setup-worktree` |
+| `refresh.clear_generated` | generated output a refresh clears in the pull request's worktree after it merges main and before it pushes: paths or globs (`*`, `?`, `[…]`, `**`) from the top of the checkout; only the ignored, untracked files under them are removed, and a path that is tracked, not ignored, outside the checkout or through a symbolic link is refused when the file is read | none: nothing is cleared |
 | `checks.ci_result` | the check that sums up CI | `CI result` |
 | `checks.ci_plan`, `checks.e2e_plan` | the planner checks of CI and of the browser suite | `CI: what to run`, `E2E: what to run` |
 | `checks.images` | the prefix of every image check; its planner is `<prefix>: what to run` | `Docker images` |
@@ -100,6 +105,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `commands.*`, the others | the repository's own commands Shipline calls, each split into words (below) | none |
 | `review.high_effort_paths` | regular expressions searched for in every path a pull request changes, both sides of a rename or deletion; a match runs its independent reviewer at high effort, not medium (`review-effort N`): stored data, text sent to a model, background work, locks and queues, account boundaries and security | none: only Shipline's own concurrent scripts and a description with the line `Review: high` |
 | `answer_for_owner_after_minutes` | how long a question to the owner marked `Owner only: no` waits before the tick types its recommended reply (see `RULES.md`, "Asking the owner"); `0` turns that off, and it is at most `1440`, a day | `15` |
+| `cloud_wake_after_minutes` | the minutes without a push or a report after which the tick wakes a cloud worker by typing into its session; `0` never does | `30` |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the
