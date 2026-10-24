@@ -728,7 +728,7 @@ def main() -> int:
         if len(arguments) == 3 and arguments[0] == "gate" and re.fullmatch(r"-?[0-9]+", arguments[1]):
             gate_ran(int(arguments[1]), arguments[2])
             return 0
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except (OSError, subprocess.TimeoutExpired, workflow_config.ConfigError) as error:
         print(f"shipline self-update: {error}", file=sys.stderr)
         return 1
     except Exception as error:

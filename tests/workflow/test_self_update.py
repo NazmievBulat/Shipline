@@ -1099,3 +1099,40 @@ def test_installation_state_folder_keeps_a_held_gate_lock_from_being_updated(
     shipline.later(10)
     assert shipline.tick() == _MOVED
     assert shipline.head == landed
+
+
+@pytest.mark.parametrize("kind", ["missing", "json", "schema"])
+def test_installation_config_refusals_stop_updates_without_counting_as_crashes(
+    shipline: Shipline, kind: str
+) -> None:
+    shipline.good()
+    active = shipline.land()
+    shipline.later(10)
+    assert shipline.tick() == _MOVED
+    available = shipline.land()
+    config = shipline.root / "installation.json"
+    if kind == "json":
+        config.write_text("{")
+    elif kind == "schema":
+        config.write_text('{"state_folder": 42}')
+    shipline.env["SHIPLINE_CONFIG"] = str(config)
+    pid = str(os.getpid())
+    reads = shipline.ci_reads()
+
+    for _ in range(3):
+        shipline.later(10)
+        started = shipline.run("start", pid)
+        assert started.returncode == 1, started.stderr
+        assert str(config) in started.stderr
+        assert "Traceback" not in started.stderr
+        assert not (shipline.notes / "runs" / f"{pid}.crash").exists()
+        assert shipline.head == active
+        assert shipline.ci_reads() == reads
+        assert shipline.run("end", pid, "1").returncode == 0
+        trial = json.loads((shipline.notes / "trial.json").read_text())
+        assert trial["tick_failures"] == 0
+
+    config.write_text("{}")
+    assert shipline.tick() == _MOVED
+    assert shipline.head == available
+    assert shipline.notices() == []
