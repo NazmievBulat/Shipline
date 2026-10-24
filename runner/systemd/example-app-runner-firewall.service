@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep example-app CI containers off this machine and the home network
+After=docker.service
+BindsTo=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/example-app-runner/firewall.sh
+
+[Install]
+WantedBy=docker.service

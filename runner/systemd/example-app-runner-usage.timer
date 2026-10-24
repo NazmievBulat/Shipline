@@ -1,0 +1,9 @@
+[Unit]
+Description=Sample the use of this CI machine every minute (usage.py)
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

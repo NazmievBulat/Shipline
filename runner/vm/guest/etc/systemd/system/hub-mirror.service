@@ -1,0 +1,14 @@
+[Unit]
+Description=Pull Docker Hub images through the home machine's cache when it answers
+After=network-online.target
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hub-mirror
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=docker.service
