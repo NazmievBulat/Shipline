@@ -154,6 +154,16 @@ def test_only_the_pull_request_paths_list_is_read(gate: Any) -> None:
         '      - "lint"\n'
     )
     assert gate.pull_request_paths(text) == ["docker/**", "src/*.go"]
+    # An anchor lets the push share the list; the list is still the pull request's own.
+    shared = (
+        "on:\n"
+        "  pull_request:\n"
+        "    paths: &image-paths  # shared with the push\n"
+        '      - "docker/**"\n'
+        "  push:\n"
+        "    paths: *image-paths\n"
+    )
+    assert gate.pull_request_paths(shared) == ["docker/**"]
     # Without a `paths:` list, `paths-ignore:` is never read as one.
     ignored = 'on:\n  pull_request:\n    paths-ignore:\n      - "docs/**"\n'
     with pytest.raises(gate.Refused):

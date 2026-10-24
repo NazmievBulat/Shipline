@@ -1276,7 +1276,8 @@ def pull_request_paths(workflow: str) -> list[str]:
             trigger = re.fullmatch(r"  pull_request:\s*(?:#.*)?", line) is not None
             listed = False
         elif trigger and not line.startswith("     "):
-            listed = re.fullmatch(r"    paths:\s*(?:#.*)?", line) is not None
+            # An anchor (`paths: &name`) lets the push trigger share the same list.
+            listed = re.fullmatch(r"    paths:\s*(?:&[^\s#]+\s*)?(?:#.*)?", line) is not None
         elif listed:
             entry = re.fullmatch(r'      - "((?:[^"\\]|\\.)+)"\s*(?:#.*)?', line)
             try:
