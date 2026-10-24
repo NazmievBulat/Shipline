@@ -26,7 +26,7 @@ jobs:
   # (examples/ci.yml), so Shipline proves its pieces on itself.
   plan:
     name: "CI: what to run"
-    # Skipped while the pull request is a draft, and with it every job after it.
+    # Skipped while the pull request is a draft; the jobs after it are skipped by their own check.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -57,7 +57,7 @@ jobs:
   tests:
     name: "CI: server tests (${{ matrix.shard }} of 4)"
     needs: plan
-    # Skipped while the pull request is a draft; main's push and the merge queue always run.
+    # Skipped while the pull request is a draft; no other run is filtered by that check.
     # Folded: the job's name holds a colon, which a plain YAML value may not.
     if: >-
       ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
