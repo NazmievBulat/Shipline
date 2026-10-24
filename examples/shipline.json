@@ -2,6 +2,9 @@
   "repository": "example-owner/example-app",
   "state_folder": ".local/shipline",
   "worktree_setup": "tools/prepare-worktree",
+  "refresh": {
+    "clear_generated": []
+  },
   "commands": {
     "test": "tools/run-tests",
     "browser_tests_for_changes": "tools/shipline/browser-tests-for-changes",
@@ -13,13 +16,17 @@
     "hunt_browser": "node tools/shipline/hunt-browser.mjs",
     "hunt_cursor": "tools/shipline/hunt-cursor",
     "advisory_watch": "tools/shipline/advisory-watch",
-    "push_checkout": "tools/shipline/push-checkout"
+    "push_checkout": "tools/shipline/push-checkout",
+    "push_checks": "tools/shipline/push-checks"
   },
   "checks": {
     "ci_result": "Build result",
     "ci_plan": "Build: what to run",
     "e2e_plan": "Browser: what to run",
-    "images": "Images"
+    "images": "Images",
+    "dependency_audit": "Build: dependencies",
+    "advisory_annotation": "Advisory",
+    "prefix_only": ["images", "browser_whole", "server_whole"]
   },
   "annotations": {
     "merge_tested": "Merge built",
@@ -59,6 +66,7 @@
     "image_build": "tools/shipline/build-runner-images",
     "hub_cache": "tools/shipline/hub-cache"
   },
+  "cloud_wake_after_minutes": 45,
   "parity": {
     "workflow_tests": "tools/shipline/tests",
     "runner_tests": "tools/runner/tests",
@@ -83,5 +91,24 @@
       "^app/auth/", "^app/permissions/", "^config/secrets"
     ]
   },
-  "answer_for_owner_after_minutes": 15
+  "merge_train": {
+    "queued_limit_minutes": 20
+  },
+  "answer_for_owner_after_minutes": 15,
+  "cloud_pre_push": {
+    "suites": {
+      "server": {
+        "select": "tools/shipline/server-tests-for-changes",
+        "run": "tools/shipline/server-tests --workers {workers}",
+        "workers": 4,
+        "part": "--shard {shard}/{shards}"
+      },
+      "browser": {
+        "select": "tools/shipline/browser-tests-for-changes --ci",
+        "run": "tools/shipline/browser-tests --workers {workers}",
+        "workers": 2,
+        "probe": "tools/shipline/browser-starts"
+      }
+    }
+  }
 }

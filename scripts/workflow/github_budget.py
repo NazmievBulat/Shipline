@@ -418,6 +418,53 @@ def _watch_position(arguments: tuple[str, ...]) -> int | None:
     return None
 
 
+# The gh commands that only read. A shadow run (`tick --shadow`) sends none of the others.
+READS = {
+    ("pr", "list"),
+    ("pr", "view"),
+    ("pr", "diff"),
+    ("pr", "checks"),
+    ("run", "list"),
+    ("run", "view"),
+    ("label", "list"),
+    ("repo", "view"),
+    ("issue", "list"),
+    ("issue", "view"),
+}
+_FIELDS = ("-f", "-F", "--field", "--raw-field", "--input")
+
+
+def writes(arguments: tuple[str, ...]) -> bool:
+    """Whether a gh call may change something on GitHub: all but a read of READS, an API call
+    that GETs, and a GraphQL query that is no mutation."""
+    if not arguments:
+        return False
+    if arguments[0] != "api":
+        return tuple(arguments[:2]) not in READS
+    if "graphql" in arguments[1:]:
+        # A query read from a file (`-F query=@file`, `--input`) cannot be told from a mutation.
+        return any(
+            "mutation" in argument or "=@" in argument or argument.startswith("--input")
+            for argument in arguments
+        )
+    method, fields, after = None, False, None
+    for argument in arguments[1:]:
+        if after:
+            method, after = argument, None
+        elif argument in ("-X", "--method"):
+            after = argument
+        elif argument.startswith("--method="):
+            method = argument.removeprefix("--method=")
+        elif argument.startswith("-X"):
+            method = argument.removeprefix("-X")
+        elif argument in _FIELDS or argument.startswith(tuple(f"{flag}=" for flag in _FIELDS)):
+            fields = True
+        elif argument.startswith(("-f", "-F")):
+            fields = True
+    # gh sends fields by POST unless a method is named.
+    return method.upper() != "GET" if method is not None else fields
+
+
 def call(
     program: str,
     *arguments: str,
@@ -431,6 +478,9 @@ def call(
 ) -> subprocess.CompletedProcess[str]:
     """Run gh. With identity=RUNNER it carries the runner programs' own token, when this
     machine has one (github_identity.py); without one it uses the login."""
+    if os.environ.get("SHIPLINE_SHADOW") and writes(arguments):
+        refused = f"a shadow run sends GitHub no write: gh {' '.join(arguments)}\n"
+        return subprocess.CompletedProcess([program, *arguments], 1, "", refused)
     if _watch_position(arguments) is not None:
         return _watch(program, arguments, timeout, background, execute, identity)
     token = None

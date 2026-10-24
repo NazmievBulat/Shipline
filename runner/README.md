@@ -149,7 +149,148 @@ the prefix `example-app` against `tests/runner/expected/`.
 | `<prefix>-runner-spare.service` | the spare supervisor |
 | `<prefix>-runner-lend.service` | the lender |
 | `<prefix>-runner-usage.service`, `<prefix>-runner-usage.timer` | a line of what the machine has free, every minute |
+| `<prefix>-runner-balance.service`, `<prefix>-runner-balance.timer` | the balancer (below), every minute |
 | `<prefix>-runner-image.service`, `<prefix>-runner-image.timer` | the images built again, every week |
 | `<prefix>-runner-firewall.service` | the firewall, a unit of root's |
 | `<prefix>-hub-cache.service` | the Docker Hub cache, when the repository runs one |
 | `<prefix>-hub-cache-watch.service`, `<prefix>-hub-cache-watch.timer` | the cache emptied above its limit, every 10 minutes |
+
+## Moving a machine's PR slots
+
+A machine that also runs the sessions, the planner and main's runners can go over its limit while
+another machine has room. Its ordinary PR slots may then move to the machine with room, but only
+once measured use there shows that room on every day of a week. The machine table and its reasons
+are written from the measured reports, never from guesses.
+
+1. Both machines run this version for seven whole days; `<prefix>-runner-usage.timer` writes one
+   line a minute of what each has free.
+2. On the receiving machine, run
+   `python3 ~/.local/share/<prefix>-runner/usage.py report --days 7 --job-memory <cap>`, with
+   the cap of one of its ordinary jobs (its `job_memory`, else `memory` of `settings.sh`, `10g`).
+   It prints each day's busiest hour, then `Room for <n> more PR jobs`: none unless every day had
+   room, else the least memory available at a busiest hour, less the 8 GiB margin, in jobs of
+   that cap. Only when it ends with `Room every day: yes` (exit 0) do slots move, and never more
+   than that `<n>`; main's runners and the planner never move. When it says there is no room,
+   nothing moves, and the report goes to the owner.
+3. The move is a change of each machine's own settings (`~/.config/shipline/runner.sh`) and an
+   install of each, by the machine's owner and on the owner's word, the receiving machine first:
+   - The receiving machine raises its `ordinary_jobs` by the slots that move, no more than the
+     report's `<n>`, and may name its own `job_memory` (`6g`).
+   - Once its runners are online with the base label, the giving machine lowers its
+     `ordinary_jobs` by as many and installs. `install.sh` refuses to lower it while GitHub
+     lists no online ordinary runner of another machine with the base label: with the receiving
+     machine down, unreachable or not installed, both counts stay as they are.
+   - In a pool of several machines, `install.sh` reads GitHub's runners before it changes
+     anything but the runners' GitHub identity, which it checks against GitHub before it takes
+     it; an install whose list cannot be read is refused. A machine alone in its pool is not
+     checked.
+
+   Nothing names where the jobs go: every machine's runners carry the same labels, so GitHub
+   gives a job to whichever runner is free.
+
+   Moving slots back (step 6) is the same the other way round, and is bounded by no room: the
+   slots return to the machine they came from, which raises its `ordinary_jobs` again and
+   installs first; the other machine lowers its count once those runners are online.
+4. A machine may keep no PR slot of its own (`ordinary_jobs=0`) while the pool has another
+   machine; the only machine of a pool keeps at least one, and so does at least one machine of
+   every pool: two machines with none would each take a slot and give it back as the other did.
+   PR jobs still run when no other machine has an online ordinary runner: the giving machine's
+   spare then takes one slot, and gives it back once another machine's ordinary runner is online
+   again (`keep-spare.sh`, `ordinary_slots.py`). Main's runner lent to PR jobs does not count, as
+   it is busy exactly when main has work.
+5. The pull request that records the move states, measured before and after it: the queue wait of
+   PR jobs (each job's `started_at` minus `created_at`: median, 90th percentile and longest), and
+   each machine's CPU pressure at its busiest hour.
+6. When timing-sensitive tests fail on the receiving machine while it is full, the slots go back.
+
+## The balancer
+
+`balance_runners.py` moves a machine's runners between CI and Docker, and adds or removes them,
+by the queues, the machine's load and the demand on its way. Its user timer,
+`<prefix>-runner-balance.timer`, runs it every minute beside the spare supervisor; `install.sh`
+starts it on a machine with the `ordinary` or `docker` role. It changes only that machine's own
+ordinary slots (`<prefix>-runner@<k>.service`) and Docker runners
+(`<prefix>-runner-docker@<k>.service`), never another machine's, never a main runner or the
+planner.
+
+### The bounds
+
+It changes a kind only within the bounds the machine's settings give it, in
+`~/.config/shipline/runner.sh`:
+
+```sh
+balance_ordinary=2-6
+balance_docker=0-2
+```
+
+`install.sh` carries them, and a line `balance off`, into the installed `pool-settings.sh`,
+which is what the balancer reads. A reinstall keeps the installed ones when the machine's
+settings name none.
+
+- A kind without bounds, or one the machine has no role for, keeps its installed count
+  (`ordinary_jobs`, `docker_runners`) as both bounds, so the balancer changes nothing there until
+  its owner widens them.
+- `balance off` stops it, and the counts stay as they are.
+- When it adds or removes a runner, it writes the new count to `pool-settings.sh`, and the spare
+  supervisor and the planner read it at their next round. A reinstall starts again from the
+  counts of the machine's settings.
+
+An ordinary slot is one of the `ordinary_jobs` registrations that carry the pool's label. Adding
+one starts the next unit after the slots and the spare, and only once every slot there is has
+the label. A Docker runner needs `/dev/kvm`. All the runners together never take more than
+`most_runners` places of the firewall's range.
+
+### What it does
+
+Each minute it reads, from GitHub under the runners' own identity and within the shared budget:
+
+- the queued and running jobs for the pool's labels (`label`, the first member's `first_label`
+  and `docker_label`), which every machine's runners share;
+- the pool's runners.
+
+It also reads the machine's 5-minute load against the session start ceiling (the processors
+times 1.5) and its available memory.
+
+- **Add:** an ordinary slot when ordinary jobs have queued for 5 minutes, or a Docker runner
+  when Docker jobs have, when there is room: load at least 4 under the ceiling, and at least
+  3 GB available for an ordinary slot or 8 GB for a Docker runner.
+- **Remove:** one of a kind that had nothing queued for 15 minutes while the load holds session
+  starts.
+- **The pool's last runner of a kind:** a machine stops or moves away its own last runner of a
+  kind only while a machine whose name sorts before its own lists an online runner of that kind
+  (main's runners and the spares not counted). The machine of the lowest name that has one never
+  stops its last, so two machines balancing at once never leave the pool without one.
+- **Move:** when the other kind has queued for 5 minutes, this kind has nothing queued and
+  there is no room to add, it drains one of this kind and adds one of the other in the same
+  step.
+- A runner stops only once GitHub lists it idle, never mid-job. Its registration is deleted
+  before its count is lowered and its unit stops, and GitHub refuses that while the runner runs a
+  job. A paused budget or a call that fails leaves the counts as they are. The
+  highest-numbered one goes (`<machine>-<k>`, `<machine>-docker-<k>`), and the step waits while
+  it is busy.
+- At most one change every 5 minutes. `install.sh` holds the balancer's lock while it
+  reinstalls.
+
+### The forecast
+
+Each turn the tick writes `~/.local/state/workflow/ci-demand.json`: about how many ordinary and
+Docker jobs the pushes on their way will start within 30 minutes. Those pushes come from the
+working cloud workers, the busy local workers and reviewers, the workflow's ready pull requests
+whose checks have not started, and the merge line's prefixes still to be built. Each push counts
+the jobs its pull request's last runs started. A machine's share of a kind is the forecast times
+its own slots of that kind over all the pool's online slots of that kind.
+
+- A removal waits while the machine's share would queue on one slot fewer.
+- A slot comes back before the wave when the share would queue on the slots there are and there
+  is room, never beyond the bounds.
+- A forecast older than 10 minutes is ignored, and the queues alone decide.
+
+The balancer on the tick's machine reads that file directly. Another machine reads the path its
+settings name with `balance_forecast=`, a copy its owner provides. Without one, it balances by
+the queues alone.
+
+### The log
+
+Every change is one line of `~/.local/state/workflow/runner-balance.log`: the time, what changed,
+the queues, the forecast, the load and the memory. On the tick's machine, the wake's next
+check-in names the last change once.

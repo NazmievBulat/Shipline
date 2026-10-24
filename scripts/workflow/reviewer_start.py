@@ -143,7 +143,38 @@ def start(
     return 1
 
 
+def would_start(
+    folder: Path, number: str, head: str, next_round: int, sent_back: int, branch_name: str
+) -> int:
+    """What `start` would do, for a shadow run, which writes nothing: 2 for a block it keeps
+    unchanged, 0 when it would start the reviewer."""
+    allowance = folder / f"review-{number}.allow-round"
+    if sent_back >= 2 and (
+        not allowance.exists() or allowance.read_text().strip() != str(next_round)
+    ):
+        return 2
+    refused = folder / f"review-{number}.start-refused"
+    if refused.exists():
+        worktree = gate.CONFIG.checkout_of(folder) / ".claude" / "worktrees" / f"ticket-{number}"
+        data = json.loads(refused.read_text())
+        if data["blocked"] and data["identity"] == _identity(worktree, head, branch_name):
+            return 2
+    return 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1] == "--shadow":
+        arguments = sys.argv[2:]
+        sys.exit(
+            would_start(
+                Path(arguments[0]),
+                arguments[1],
+                arguments[2],
+                int(arguments[3]),
+                int(arguments[4]),
+                arguments[5],
+            )
+        )
     if sys.argv[1] == "--started":
         _clear(Path(sys.argv[2]), Path(sys.argv[2]) / f"review-{sys.argv[3]}.start-refused")
         sys.exit(0)

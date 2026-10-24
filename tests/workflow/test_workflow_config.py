@@ -36,11 +36,15 @@ _DEFAULTS = {
     "repository": "example-owner/example-app",
     "state_folder": ".local/workflow",
     "worktree_setup": "scripts/setup-worktree",
+    "refresh": {"clear_generated": []},
     "checks": {
         "ci_result": "CI result",
         "ci_plan": "CI: what to run",
         "e2e_plan": "E2E: what to run",
         "images": "Docker images",
+        "dependency_audit": None,
+        "advisory_annotation": None,
+        "prefix_only": [],
     },
     "annotations": {
         "merge_tested": "Merge tested",
@@ -87,10 +91,14 @@ _DEFAULTS = {
             "hunt_cursor",
             "advisory_watch",
             "push_checkout",
+            "push_checks",
         )
     },
     "review": {"high_effort_paths": []},
     "answer_for_owner_after_minutes": 15,
+    "cloud_wake_after_minutes": 30,
+    "merge_train": {"queued_limit_minutes": 20},
+    "cloud_pre_push": {"suites": {}},
 }
 
 
@@ -126,6 +134,141 @@ def test_without_a_file_every_value_is_its_default(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
 
     assert _as_json(workflow_config.load(repo)) == _DEFAULTS
+
+
+@pytest.mark.parametrize("groups", [[], ["images"], ["browser_whole"], ["server_whole"],
+                                     ["images", "browser_whole", "server_whole"]])
+def test_prefix_only_groups_are_read(tmp_path: Path, groups: list[str]) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {"prefix_only": groups}})
+    config = workflow_config.load(repo)
+    assert _as_json(config)["checks"]["prefix_only"] == groups
+    mapped = config.checks.groups()
+    assert mapped["images"].workflow == "images"
+    assert mapped["browser_whole"].jobs == ("playwright",)
+    assert mapped["server_whole"].jobs == ("CI: server tests",)
+
+
+@pytest.mark.parametrize("groups", [["unknown"], ["images", "images"], "images", None, [3]])
+def test_invalid_prefix_only_groups_are_refused(tmp_path: Path, groups: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {"prefix_only": groups}})
+    with pytest.raises(workflow_config.ConfigError, match="checks.prefix_only"):
+        workflow_config.load(repo)
+
+
+def test_refresh_reads_ignored_paths_and_globs_even_before_output_exists(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("generated/\n")
+    paths = ["generated/types", "generated/cache/*"]
+    _write(repo, {"refresh": {"clear_generated": paths}})
+
+    config = workflow_config.load(repo)
+
+    assert config.refresh.clear_generated == tuple(paths)
+    assert _as_json(config)["refresh"] == {"clear_generated": paths}
+
+
+@pytest.mark.parametrize("value", [None, "generated/types", [1], [""], ["../generated"],
+                                   ["/generated"], ["."], [".git/objects"], ["generated/../other"]])
+def test_refresh_refuses_unsafe_configuration(tmp_path: Path, value: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"refresh": {"clear_generated": value}})
+
+    with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
+        workflow_config.load(repo)
+
+
+@pytest.mark.parametrize("kind", ["tracked", "not ignored", "tracked descendant", "symlink"])
+def test_refresh_refuses_unsafe_targets_when_config_is_read(tmp_path: Path, kind: str) -> None:
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("generated/\n")
+    target = repo / "generated"
+    target.mkdir()
+    if kind == "symlink":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("keep\n")
+        (target / "link").symlink_to(outside, target_is_directory=True)
+        named = "generated/link/types"
+    else:
+        (target / "types").write_text("keep\n")
+        if kind.startswith("tracked"):
+            _git(repo, "add", "-f", "generated/types")
+            _git(repo, "commit", "-m", "chore: tracked output")
+        if kind == "not ignored":
+            (repo / ".gitignore").write_text("")
+        named = "generated" if kind == "tracked descendant" else "generated/types"
+    _write(repo, {"refresh": {"clear_generated": [named]}})
+
+    with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
+        workflow_config.load(repo)
+
+    assert (target / ("link/keep" if kind == "symlink" else "types")).read_text() == "keep\n"
+
+
+@pytest.mark.parametrize("changed", ["tracked", "ignore removed", "symlink"])
+def test_refresh_rechecks_every_target_before_clearing_any(tmp_path: Path, changed: str) -> None:
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("generated/\n")
+    generated = repo / "generated"
+    generated.mkdir()
+    (generated / "first").write_text("keep until validation passes\n")
+    _write(repo, {"refresh": {"clear_generated": ["generated/first", "generated/second"]}})
+    config = workflow_config.load(repo)
+    if changed == "symlink":
+        outside = tmp_path / "outside"
+        outside.write_text("keep\n")
+        (generated / "second").symlink_to(outside)
+    else:
+        (generated / "second").write_text("keep\n")
+        if changed == "tracked":
+            _git(repo, "add", "-f", "generated/second")
+        else:
+            (repo / ".gitignore").write_text("")
+
+    with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
+        config.refresh.clear(repo)
+
+    assert (generated / "first").exists()
+    assert (generated / "second").read_text() == "keep\n"
+
+
+def test_refresh_checks_the_active_worktree_at_config_time(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("generated/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "chore: ignore generated output")
+    _write(repo, {"refresh": {"clear_generated": ["generated/types"]}})
+    worktree = tmp_path / "worktree"
+    _git(repo, "worktree", "add", "--detach", str(worktree))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (worktree / "generated").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
+        workflow_config.load(worktree)
+
+
+@pytest.mark.parametrize("named", ["generated/nested/types", "generated/**/types"])
+def test_refresh_cannot_reach_into_a_nested_worktree(tmp_path: Path, named: str) -> None:
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("generated/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "chore: ignore generated output")
+    worktree = repo / "generated/nested"
+    _git(repo, "worktree", "add", "--detach", str(worktree))
+    (worktree / "types").write_text("keep\n")
+    _write(repo, {"refresh": {"clear_generated": [named]}})
+
+    if "**" in named:
+        # Recursive discovery excludes another checkout from the matching namespace.
+        workflow_config.load(repo).refresh.clear(repo)
+    else:
+        with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
+            workflow_config.load(repo)
+
+    assert (worktree / "types").read_text() == "keep\n"
 
 
 @pytest.mark.parametrize(
@@ -176,8 +319,8 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     example = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
 
     def keys(value: Any, prefix: str = "") -> set[str]:
-        # The hunt areas are named by the repository, not by Shipline.
-        if not isinstance(value, dict) or prefix == ".hunts.areas":
+        # The hunt areas and the suites are named by the repository, not by Shipline.
+        if not isinstance(value, dict) or prefix in (".hunts.areas", ".cloud_pre_push.suites"):
             return {prefix}
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 
@@ -189,6 +332,14 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     assert all(label.startswith("example-app-") for label in example["runner"]["labels"])
     assert example["machines"]
     assert example["hunts"]["areas"]
+
+
+@pytest.mark.parametrize("minutes", [0, 45])
+def test_the_cloud_wake_wait_is_a_whole_number_of_minutes(tmp_path: Path, minutes: int) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"cloud_wake_after_minutes": minutes})
+
+    assert workflow_config.load(repo).cloud_wake_after_minutes == minutes
 
 
 @pytest.mark.parametrize("paths", [["("], "^db/", [""], [3]])
@@ -208,6 +359,22 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
 
     _write(repo, {"runner": {"prefix": ""}})
     with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be a name"):
+        workflow_config.load(repo)
+
+
+def test_the_dependency_audit_and_its_advisory_annotation_are_read(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {"dependency_audit": "Audit", "advisory_annotation": "Advisory"}})
+
+    checks = workflow_config.load(repo).checks
+    assert (checks.dependency_audit, checks.advisory_annotation) == ("Audit", "Advisory")
+
+    _write(repo, {"checks": {"dependency_audit": "Audit"}})
+    checks = workflow_config.load(repo).checks
+    assert (checks.dependency_audit, checks.advisory_annotation) == ("Audit", None)
+
+    _write(repo, {"checks": {"advisory_annotation": ""}})
+    with pytest.raises(workflow_config.ConfigError, match="checks.advisory_annotation must be"):
         workflow_config.load(repo)
 
 
@@ -593,6 +760,10 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         # Bash would wrap a number this large.
         ('{"answer_for_owner_after_minutes": 2000000000000000000}', "answer_for_owner_after_minutes"),
         ('{"answer_for_owner_after_minutes": 1441}', "answer_for_owner_after_minutes"),
+        ('{"cloud_wake_after_minutes": "30"}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": -1}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": 1.5}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": true}', "cloud_wake_after_minutes"),
     ],
 )
 def test_a_file_that_cannot_be_read_is_refused_by_name(
@@ -1042,10 +1213,12 @@ def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> d
 
 
 # The SHA-256 of each text as the scripts wrote it before they read `shipline.json`; the worker's
-# and the cloud worker's since they ask for the `Owner only:` line of a question to the owner.
+# and the cloud worker's since they ask for the `Owner only:` line of a question to the owner, and
+# the cloud worker's since it is told never to end a turn to wait for an answer.
 _TEXTS_BEFORE = {
     "worker": "325cbf877af37ce9da33010ca5fadb43199e42a93e78235e72d234068a61438c",
-    "cloud": "d86282ba765d20c2c3507b1b0ae52509e72bed886b3eee028ed2c724cd25bfbe",
+    # Since it tells a cloud worker to push as one, so its push runs CI's tests.
+    "cloud": "cd523614cb42d86a5f7b72324e18f0cd0aca26721968201015b5610c5db7252f",
     "review": "ea932fce613e8e9c075daa884a2adee29b64ee5610f1fcd922f27aa6cd39c49a",
     "wake": "af21558438c99d72e165c8fb8ab4febdd80204e43f532a399697b4131441d080",
 }
@@ -1317,6 +1490,7 @@ def test_the_gate_reads_the_named_checks_titles_workflow_files_and_runner_labels
         "ci_plan": "Build: what to run",
         "e2e_plan": "Browser: what to run",
         "images": "Images",
+        "prefix_only": [],
     }
     proven = {
         "every server test": True,
@@ -1344,7 +1518,7 @@ def test_the_gate_reads_the_named_checks_titles_workflow_files_and_runner_labels
             "shipline.json": json.dumps(
                 {
                     "annotations": {key: named[key] for key in _DEFAULTS["annotations"]},
-                    "checks": {key: named[key] for key in _DEFAULTS["checks"]},
+                    "checks": {key: named[key] for key in _DEFAULTS["checks"] if key in named},
                     "workflows": {"images": "container.yml"},
                     "runner": {"labels": ["example-app-elsewhere"]},
                 }
@@ -1451,3 +1625,18 @@ def test_a_second_tick_waits_for_the_first_across_a_change_of_the_state_folder(
     assert done.returncode == 0, done.stderr
     assert "the tick before this one is still running" in done.stdout, done.stdout + done.stderr
     assert not workflow.calls("gh")
+
+
+@pytest.mark.parametrize("minutes", [0, 5, 1440])
+def test_the_prefix_queue_limit_is_configurable(tmp_path: Path, minutes: int) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"merge_train": {"queued_limit_minutes": minutes}})
+    assert workflow_config.load(repo).merge_train.queued_limit_minutes == minutes
+
+
+@pytest.mark.parametrize("minutes", [-1, 1441, True, 1.5, "20"])
+def test_an_invalid_prefix_queue_limit_is_refused(tmp_path: Path, minutes: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"merge_train": {"queued_limit_minutes": minutes}})
+    with pytest.raises(workflow_config.ConfigError, match="merge_train.queued_limit_minutes"):
+        workflow_config.load(repo)

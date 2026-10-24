@@ -916,6 +916,61 @@ def test_a_merge_restacks_a_clean_child_and_pushes_before_starting_its_reviewer(
     assert not _note(workflow).exists()
 
 
+@pytest.mark.parametrize("stacked", [False, True], ids=["handoff", "stacked child"])
+def test_tick_refresh_clears_generated_output_only_in_the_refreshed_worktree(
+    handed: GitHub, stacked: bool
+) -> None:
+    workflow = handed.workflow
+    if stacked:
+        target, old_head = _child(handed)
+        branch = "ticket/eight"
+    else:
+        target = workflow.worktree(7)
+        old_head = handed.head
+        branch = "ticket/seven"
+        old_base = handed.base
+        workflow.git("commit", "--allow-empty", "-m", "fix: main moved")
+        handed.base = workflow.git("rev-parse", "HEAD")
+        workflow.git("push", "origin", "main")
+        handed.main()
+        handed.ci(handed.base, handed.head, tested_base=old_base)
+        handed.save()
+    config = workflow.repo / "shipline.json"
+    workflow.git("update-index", "--skip-worktree", "shipline.json")
+    given = json.loads(config.read_text())
+    given["refresh"] = {"clear_generated": ["generated/types"]}
+    config.write_text(json.dumps(given))
+    exclude = Path(workflow.git("rev-parse", "--path-format=absolute", "--git-path", "info/exclude"))
+    exclude.write_text(exclude.read_text() + "\ngenerated/\n")
+    for checkout in [workflow.repo, target, workflow.worktree(7)]:
+        generated = checkout / "generated/types"
+        generated.mkdir(parents=True, exist_ok=True)
+        (generated / "stale").write_text("obsolete route\n")
+    other = workflow.root / "other-worktree"
+    workflow.git("worktree", "add", "--detach", str(other), "main")
+    (other / "generated/types").mkdir(parents=True)
+    (other / "generated/types/stale").write_text("another worktree\n")
+    hooks = workflow.bin / "generated-hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-push"
+    hook.write_text("#!/bin/bash\nif [[ -e generated/types/stale ]]; then echo 'stale generated output' >&2; exit 1; fi\n")
+    hook.chmod(0o755)
+    workflow.git("config", "core.hooksPath", str(hooks))
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not (target / "generated/types/stale").exists()
+    assert (workflow.repo / "generated/types/stale").exists()
+    assert (other / "generated/types/stale").read_text() == "another worktree\n"
+    # A merged parent's worktree may be removed by the tick's ordinary cleanup.
+    if stacked and workflow.worktree(7).exists():
+        assert (workflow.worktree(7) / "generated/types/stale").exists()
+    remote = workflow.git("ls-remote", "origin", f"refs/heads/{branch}").split()[0]
+    assert remote != old_head
+    assert remote == workflow.git("rev-parse", "HEAD", cwd=target)
+
+
 def test_an_unlabelled_stacked_child_keeps_its_audit_path(handed: GitHub) -> None:
     workflow = handed.workflow
     worktree, head = _child(handed)

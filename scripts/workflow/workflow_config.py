@@ -18,7 +18,8 @@ runner tests `tools/parity` compares are in `tests/workflow` and `tests/runner`,
 no differences; no machines named, so `flow-page` samples only the machine it runs on; no hunt
 areas, so one hunt runs at a time, and no hunt plans file; no test command, which a repository
 names for its CI's test job (`ci_proof.py test`); a question to the owner marked `Owner only: no`
-gets its recommended reply after 15 minutes; no paths that call for a closer review.
+gets its recommended reply after 15 minutes; a quiet cloud worker is woken after 30 minutes; no
+paths that call for a closer review.
 
 `review.high_effort_paths` are regular expressions, each searched for in every path a pull
 request changes: a match runs its independent reviewer at high effort, not medium
@@ -36,14 +37,18 @@ which prints `SHIPLINE_<KEY>=value` lines quoted for `eval`, the file itself amo
 read the JSON with the same defaults.
 """
 
+import errno
+import fnmatch
+import glob
 import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -62,6 +67,7 @@ DEFAULTS: dict[str, Any] = {
     "repository": None,
     "state_folder": ".local/workflow",
     "worktree_setup": "scripts/setup-worktree",
+    "refresh": {"clear_generated": []},
     "commands": {
         # The command line that runs the repository's tests, from the root of its checkout, by
         # `bash -c` (`ci_proof.py test`).
@@ -77,6 +83,8 @@ DEFAULTS: dict[str, Any] = {
         "hunt_cursor": None,
         "advisory_watch": None,
         "push_checkout": None,
+        # The checks the repository's pre-push hook runs (`ci_tests_for_changes.py --run`).
+        "push_checks": None,
     },
     "checks": {
         "ci_result": "CI result",
@@ -84,6 +92,13 @@ DEFAULTS: dict[str, Any] = {
         "e2e_plan": "E2E: what to run",
         # The prefix of every check of the image workflow.
         "images": "Docker images",
+        # The job that audits the dependencies against published advisories (the gate reads
+        # "CI: dependencies" when none is named), and the title of the notice it writes on main
+        # when advisories alone failed it. Without the notice an advisory on main makes main red,
+        # as any other failure.
+        "dependency_audit": None,
+        "advisory_annotation": None,
+        "prefix_only": [],
     },
     # The titles of the annotations the CI planners write and the merge gate reads.
     "annotations": {
@@ -139,14 +154,25 @@ DEFAULTS: dict[str, Any] = {
         "plans": None,
     },
     "review": {"high_effort_paths": []},
+    "merge_train": {"queued_limit_minutes": 20},
     # Minutes a question to the owner marked `Owner only: no` waits before the tick types its
     # recommended reply; 0 turns that off.
     "answer_for_owner_after_minutes": 15,
+    # Minutes without a push or a report after which the tick wakes a cloud worker; 0 never does.
+    "cloud_wake_after_minutes": 30,
+    # The suites a cloud worker's push runs as CI will (`ci_tests_for_changes.py`), by name.
+    # Each is read by `_suites`, not key by key: the names are the repository's own.
+    "cloud_pre_push": {"suites": {}},
 }
 # The most such a wait may be: a day. Bash would wrap a number far larger.
 MOST_MINUTES = 24 * 60
 # The keys of one machine.
 MACHINE_KEYS = ("name", "address")
+
+# A suite's keys, and its worker count when it names none: by its name, else one.
+SUITE_KEYS = ("select", "run", "workers", "part", "probe")
+SUITE_WORKERS = {"server": 4, "browser": 2}
+_SUITE_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
@@ -166,11 +192,33 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class CheckGroup:
+    workflow: str
+    jobs: tuple[str, ...]
+    suite: str | None = None
+
+    def contains(self, name: str) -> bool:
+        # Images is a whole workflow; its repository chooses the build and test job names.
+        return any(name == job or name.startswith(job + " (") or
+                   (job.endswith(":") and name.startswith(job + " ")) for job in self.jobs)
+
+
+@dataclass(frozen=True)
 class Checks:
     ci_result: str
     ci_plan: str
     e2e_plan: str
     images: str
+    dependency_audit: str | None = None
+    advisory_annotation: str | None = None
+    prefix_only: list[str] = field(default_factory=list)
+
+    def groups(self) -> dict[str, CheckGroup]:
+        return {
+            "images": CheckGroup("images", (f"{self.images}:",)),
+            "browser_whole": CheckGroup("e2e", ("playwright",), "browser_suite"),
+            "server_whole": CheckGroup("ci", ("CI: server tests",), "server_tests"),
+        }
 
     @property
     def images_plan(self) -> str:
@@ -238,6 +286,184 @@ class Hunts:
 
 
 @dataclass(frozen=True)
+class Refresh:
+    clear_generated: tuple[str, ...]
+
+    def targets(self, checkout: Path) -> list[str]:
+        """Validate everything before deleting anything, without following symbolic links.
+
+        Check again in the refreshed worktree: its index and ignore rules may have changed
+        when main was merged. Git supplies the ignored, untracked files eligible for deletion.
+        """
+        root = checkout.resolve()
+        targets: set[str] = set()
+        for pattern in self.clear_generated:
+            _relative(pattern, "refresh.clear_generated")
+            parts = PurePosixPath(pattern).parts
+            if ".git" in parts or "\\" in pattern or any(ord(char) < 32 for char in pattern):
+                raise ConfigError(f"{FILE}: refresh.clear_generated contains an unsafe path")
+            try:
+                matches = list(_generated_matches(root, parts))
+            except OSError:
+                raise ConfigError(
+                    f"{FILE}: refresh.clear_generated could not inspect configured output"
+                ) from None
+            # A missing literal or an unmatched glob must still be covered by ignore rules.
+            for path in matches or [root / pattern]:
+                relative = path.relative_to(root).as_posix()
+                if relative == "." or ".git" in path.relative_to(root).parts:
+                    raise ConfigError(
+                        f"{FILE}: refresh.clear_generated cannot name git metadata or the checkout"
+                    )
+                _generated_no_links(root, path)
+                ignored = _generated_git(root, "check-ignore", "--no-index", "-q", "--", relative)
+                if ignored.returncode != 0:
+                    raise ConfigError(f"{FILE}: refresh.clear_generated path is not ignored: {relative}")
+                files = _generated_git(
+                    root, "ls-files", "--cached", "--others", "--exclude-standard", "-z",
+                    "--", f":(literal){relative}",
+                )
+                if files.returncode or files.stdout:
+                    raise ConfigError(
+                        f"{FILE}: refresh.clear_generated path contains tracked or "
+                        f"non-ignored files: {relative}"
+                    )
+                targets.add(relative)
+        return sorted(targets)
+
+    def clear(self, checkout: Path) -> None:
+        targets = self.targets(checkout)
+        allowed: set[str] = set()
+        for relative in targets:
+            files = _generated_git(
+                checkout, "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
+                "--", f":(literal){relative}",
+            )
+            if files.returncode:
+                raise ConfigError(f"{FILE}: refresh.clear_generated could not list ignored files")
+            for name in files.stdout.split("\0"):
+                if not name:
+                    continue
+                if name != relative and not name.startswith(relative + "/"):
+                    raise ConfigError(f"{FILE}: refresh.clear_generated file is outside its target")
+                _relative(name, "refresh.clear_generated")
+                allowed.add(name)
+        # Hold every directory open without following links. Only Git's approved files are
+        # unlinked; a newly created file is retained, along with any directory it keeps busy.
+        for relative in targets:
+            descriptor = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                parts = PurePosixPath(relative).parts
+                for part in parts[:-1]:
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=descriptor)
+                    os.close(descriptor)
+                    descriptor = child
+                _remove_generated(descriptor, parts[-1], relative, allowed)
+            except FileNotFoundError:
+                pass  # A previous, overlapping target already cleared it, or it was absent.
+            except OSError:
+                raise ConfigError(f"{FILE}: refresh.clear_generated could not clear output") from None
+            finally:
+                os.close(descriptor)
+
+
+def _remove_generated(parent: int, name: str, relative: str, allowed: set[str]) -> None:
+    mode = os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode
+    if stat.S_ISLNK(mode):
+        raise ConfigError(f"{FILE}: refresh.clear_generated cannot traverse a symbolic link")
+    if stat.S_ISDIR(mode):
+        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            children = os.listdir(descriptor)
+            if name == ".git" or ".git" in children:
+                raise ConfigError(f"{FILE}: refresh.clear_generated cannot enter a nested checkout")
+            for child in children:
+                try:
+                    _remove_generated(descriptor, child, relative + "/" + child, allowed)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(descriptor)
+        try:
+            os.rmdir(name, dir_fd=parent)
+        except OSError as error:
+            if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                raise
+    elif relative in allowed:
+        os.unlink(name, dir_fd=parent)
+
+
+def _generated_git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(checkout), *args], capture_output=True, text=True,
+            timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise ConfigError(f"{FILE}: refresh.clear_generated could not inspect the worktree") from None
+
+
+def _generated_matches(
+    root: Path, parts: tuple[str, ...], *, top: bool = True
+) -> Iterator[Path]:
+    """Shell-style segments, including **, with no traversal through a symbolic link."""
+    if root.is_symlink():
+        raise ConfigError(f"{FILE}: refresh.clear_generated cannot traverse a symbolic link")
+    if not top and (
+        root.name == ".git" or (root / ".git").is_symlink() or (root / ".git").exists()
+    ):
+        raise ConfigError(f"{FILE}: refresh.clear_generated cannot enter a nested checkout")
+    if not parts:
+        if root.exists():
+            yield root
+    elif parts[0] == "**":
+        yield from _generated_matches(root, parts[1:], top=top)
+        if root.is_dir():
+            for child in root.iterdir():
+                # Recursive discovery stays inside this checkout and never follows a link.
+                # A link or nested checkout selected explicitly is still refused above.
+                if child.name == ".git":
+                    continue
+                if child.is_symlink():
+                    if len(parts) == 1:
+                        raise ConfigError(
+                            f"{FILE}: refresh.clear_generated cannot traverse a symbolic link"
+                        )
+                    continue
+                if child.is_dir():
+                    if (child / ".git").is_symlink() or (child / ".git").exists():
+                        continue
+                    yield from _generated_matches(child, parts, top=False)
+                elif len(parts) == 1:
+                    yield child
+    elif glob.has_magic(parts[0]):
+        if root.is_dir():
+            for child in root.iterdir():
+                if fnmatch.fnmatchcase(child.name, parts[0]):
+                    yield from _generated_matches(child, parts[1:], top=False)
+    else:
+        yield from _generated_matches(root / parts[0], parts[1:], top=False)
+
+
+def _generated_no_links(root: Path, path: Path) -> None:
+    current = root
+    for part in path.relative_to(root).parts:
+        current /= part
+        if current.is_symlink():
+            raise ConfigError(f"{FILE}: refresh.clear_generated cannot traverse a symbolic link")
+        if (current / ".git").is_symlink() or (current / ".git").exists():
+            raise ConfigError(f"{FILE}: refresh.clear_generated cannot enter a nested checkout")
+    if path.is_dir():
+        for folder, directories, files in os.walk(path, followlinks=False):
+            for name in directories + files:
+                if name == ".git" or (Path(folder) / name).is_symlink():
+                    raise ConfigError(
+                        f"{FILE}: refresh.clear_generated contains git metadata or a symbolic link"
+                    )
+
+
+@dataclass(frozen=True)
 class Commands:
     # Each None when the file names none.
     test: str | None
@@ -251,6 +477,27 @@ class Commands:
     hunt_cursor: str | None
     advisory_watch: str | None
     push_checkout: str | None
+    push_checks: str | None
+
+
+@dataclass(frozen=True)
+class Suite:
+    name: str
+    # The command lines, as the file names them: `select` is given the base and the changed
+    # files, `run` the selected files, `{workers}` in it the worker count.
+    select: str
+    run: str
+    workers: int
+    # Added to `run` for one part of the suite: `{shard}` of `{shards}`.
+    part: str | None = None
+    # Exits 0 when the suite's browser can start.
+    probe: str | None = None
+
+
+@dataclass(frozen=True)
+class CloudPrePush:
+    # In the order the file names them.
+    suites: tuple[Suite, ...] = ()
 
 
 # The commands run as words, not by a shell: every one but `test`.
@@ -263,11 +510,17 @@ class Review:
 
 
 @dataclass(frozen=True)
+class MergeTrain:
+    queued_limit_minutes: int
+
+
+@dataclass(frozen=True)
 class Config:
     # None when nothing names it: an error only for a script that needs it.
     found_repository: str | None
     state_folder: str
     worktree_setup: str
+    refresh: Refresh
     checks: Checks
     annotations: Annotations
     workflows: Workflows
@@ -278,7 +531,10 @@ class Config:
     hunts: Hunts
     commands: Commands
     review: Review
+    merge_train: MergeTrain
     answer_for_owner_after_minutes: int
+    cloud_wake_after_minutes: int
+    cloud_pre_push: CloudPrePush
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -292,6 +548,15 @@ class Config:
         if line is None:
             return None
         words = _words(line, name)
+        script = _script(words)
+        if script is not None:
+            words[script] = str(self.main / words[script])
+        return words
+
+    def words(self, line: str) -> list[str]:
+        """The words a cloud pre-push suite's command line runs with: its script the main
+        checkout's, as a command's is."""
+        words = shlex.split(line)
         script = _script(words)
         if script is not None:
             words[script] = str(self.main / words[script])
@@ -369,6 +634,8 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
             merged[key] = _machines(given[key])
         elif name == "hunts.areas":
             merged[key] = _areas(given[key])
+        elif name == "cloud_pre_push.suites":
+            merged[key] = _suites(given[key])
         elif isinstance(default, dict):
             merged[key] = _merged(default, given[key], name + ".")
         elif isinstance(default, list):
@@ -443,6 +710,49 @@ def _areas(given: Any) -> dict[str, tuple[str, ...]]:
             )
         areas[area] = tuple(screens)
     return areas
+
+
+def _suites(given: Any) -> tuple[Suite, ...]:
+    where = "cloud_pre_push.suites"
+    if not isinstance(given, dict):
+        raise ConfigError(f"{FILE}: {where} must be an object")
+    suites = []
+    for name, suite in given.items():
+        if not _SUITE_NAME.fullmatch(name):
+            raise ConfigError(
+                f"{FILE}: {where}: a suite's name is letters, digits, - and _, not {name}"
+            )
+        if not isinstance(suite, dict):
+            raise ConfigError(f"{FILE}: {where}.{name} must be an object")
+        unknown = sorted(set(suite) - set(SUITE_KEYS))
+        if unknown:
+            raise ConfigError(
+                f"{FILE}: unknown key {', '.join(f'{where}.{name}.{key}' for key in unknown)}"
+            )
+        for key in ("select", "run", "part", "probe"):
+            if key in ("part", "probe") and key not in suite:
+                continue
+            value = suite.get(key)
+            try:
+                words = shlex.split(value) if isinstance(value, str) else []
+            except ValueError:
+                words = []
+            if not words:
+                raise ConfigError(f"{FILE}: {where}.{name}.{key} must be a command")
+            # The part is arguments only; the others name a program, as a command does.
+            script = None if key == "part" else _script(words)
+            if script is not None:
+                _relative(words[script], f"{where}.{name}.{key}")
+        workers = suite.get("workers", SUITE_WORKERS.get(name, 1))
+        if type(workers) is not int or workers < 1:
+            raise ConfigError(f"{FILE}: {where}.{name}.workers must be a whole number above 0")
+        part = suite.get("part")
+        if part is not None and not ("{shard}" in part and "{shards}" in part):
+            raise ConfigError(f"{FILE}: {where}.{name}.part must name {{shard}} and {{shards}}")
+        suites.append(
+            Suite(name, suite["select"], suite["run"], workers, part, suite.get("probe"))
+        )
+    return tuple(suites)
 
 
 def _relative(value: str, name: str) -> str:
@@ -582,6 +892,11 @@ def load(start: Path | None = None) -> Config:
     except ValueError as error:
         raise ConfigError(f"{FILE} is not JSON: {error}") from error
     values = _merged(DEFAULTS, given, "")
+    groups = values["checks"]["prefix_only"]
+    if len(set(groups)) != len(groups) or set(groups) - set(Checks("", "", "", "").groups()):
+        raise ConfigError(
+            f"{FILE}: checks.prefix_only must name distinct groups: images, browser_whole, server_whole"
+        )
     # Where the repository was read, so a refusal names that place.
     repository, source = values["repository"], FILE
     if not repository:
@@ -612,10 +927,24 @@ def load(start: Path | None = None) -> Config:
     for name in RUN_AS_WORDS:
         if values["commands"][name] is not None:
             _words(values["commands"][name], name)
+    refresh = Refresh(tuple(values["refresh"]["clear_generated"]))
+    if refresh.clear_generated:
+        refresh.targets(main)
+        working = start or Path.cwd()
+        try:
+            if main_checkout(working) != main:
+                working = main
+        except ConfigError:
+            working = main
+        active = _generated_git(working, "rev-parse", "--show-toplevel")
+        if active.returncode:
+            raise ConfigError(f"{FILE}: refresh.clear_generated cannot find the worktree")
+        refresh.targets(Path(active.stdout.strip()))
     return Config(
         found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),
         worktree_setup=_relative(values["worktree_setup"], "worktree_setup"),
+        refresh=refresh,
         checks=Checks(**values["checks"]),
         annotations=Annotations(**values["annotations"]),
         workflows=Workflows(**values["workflows"]),
@@ -638,7 +967,10 @@ def load(start: Path | None = None) -> Config:
                 values["review"]["high_effort_paths"], "review.high_effort_paths"
             )
         ),
+        merge_train=MergeTrain(**values["merge_train"]),
         answer_for_owner_after_minutes=values["answer_for_owner_after_minutes"],
+        cloud_wake_after_minutes=values["cloud_wake_after_minutes"],
+        cloud_pre_push=CloudPrePush(tuple(values["cloud_pre_push"]["suites"])),
         given=given,
         main=main,
     )
@@ -671,6 +1003,7 @@ def as_dict(config: Config) -> dict[str, Any]:
         "repository": config.repository,
         "state_folder": config.state_folder,
         "worktree_setup": config.worktree_setup,
+        "refresh": {"clear_generated": list(config.refresh.clear_generated)},
         "checks": vars(config.checks).copy(),
         "annotations": vars(config.annotations).copy(),
         "workflows": vars(config.workflows).copy(),
@@ -699,7 +1032,19 @@ def as_dict(config: Config) -> dict[str, Any]:
         },
         "commands": vars(config.commands).copy(),
         "review": {"high_effort_paths": list(config.review.high_effort_paths)},
+        "merge_train": vars(config.merge_train).copy(),
         "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
+        "cloud_wake_after_minutes": config.cloud_wake_after_minutes,
+        "cloud_pre_push": {
+            "suites": {
+                suite.name: {
+                    key: getattr(suite, key)
+                    for key in SUITE_KEYS
+                    if getattr(suite, key) is not None
+                }
+                for suite in config.cloud_pre_push.suites
+            }
+        },
     }
 
 

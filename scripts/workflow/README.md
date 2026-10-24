@@ -59,6 +59,10 @@ are reported once through the wake, with pending reports retained until delivery
 The owner answers cloud questions in the cloud session. Its reports are relayed
 from pull request comments, and its completion releases the reservation only once
 the pull request is ready. `session list` shows addresses and report ages.
+A cloud worker whose draft has had no push and no report for
+`cloud_wake_after_minutes` (30), with no open question, is woken once by the tick
+through `claude --cloud <address>` in a short-lived pane; an answered question wakes
+it at once. One still quiet that long after is named in the wake once.
 
 Dependency 614 supplies repository-local security rules for cloud pushes. The
 orchestrator records the first three cloud tickets' independent review round counts
@@ -77,9 +81,12 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `repository` | `owner/name` on GitHub | `repository` as Bash reads it from `.github/runner/settings.sh` (sourced in a `bash` of its own, with only `PATH` and `HOME`, for at most 5 seconds), else the `origin` remote on GitHub; a script that needs it stops when neither names one |
 | `state_folder` | the folder of the workflow's notes, in the main checkout and in each worktree | `.local/workflow` |
 | `worktree_setup` | the command that prepares a new worktree, run only when present | `scripts/setup-worktree` |
+| `refresh.clear_generated` | generated output a refresh clears in the pull request's worktree after it merges main and before it pushes: paths or globs (`*`, `?`, `[…]`, `**`) from the top of the checkout; only the ignored, untracked files under them are removed, and a path that is tracked, not ignored, outside the checkout or through a symbolic link is refused when the file is read | none: nothing is cleared |
 | `checks.ci_result` | the check that sums up CI | `CI result` |
 | `checks.ci_plan`, `checks.e2e_plan` | the planner checks of CI and of the browser suite | `CI: what to run`, `E2E: what to run` |
 | `checks.images` | the prefix of every image check; its planner is `<prefix>: what to run` | `Docker images` |
+| `checks.dependency_audit` | the job that audits the dependencies against published advisories | none: `CI: dependencies` |
+| `checks.advisory_annotation` | the title of the notice the audit writes on main when advisories alone failed it, a JSON list of `<advisory> in <package> (<summary>)`. With it, main failing only on such an advisory is `advisory`, not red, and the line keeps merging | none: an advisory makes main red |
 | `annotations.*` | the titles of the planners' annotations the merge gate reads: `merge_tested`, `files_tested`, `server_tests`, `web_suite`, `browser_suite` | `Merge tested`, `Files tested`, `Server tests`, `Web suite`, `Browser suite` |
 | `workflows.ci`, `workflows.e2e`, `workflows.images` | the workflow files under `.github/workflows/` | `ci.yml`, `e2e.yml`, `images.yml` |
 | `labels.workflow`, `labels.audited` | the label that starts a ticket, and an audit's | `workflow`, `audited` |
@@ -98,6 +105,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `commands.*`, the others | the repository's own commands Shipline calls, each split into words (below) | none |
 | `review.high_effort_paths` | regular expressions searched for in every path a pull request changes, both sides of a rename or deletion; a match runs its independent reviewer at high effort, not medium (`review-effort N`): stored data, text sent to a model, background work, locks and queues, account boundaries and security | none: only Shipline's own concurrent scripts and a description with the line `Review: high` |
 | `answer_for_owner_after_minutes` | how long a question to the owner marked `Owner only: no` waits before the tick types its recommended reply (see `RULES.md`, "Asking the owner"); `0` turns that off, and it is at most `1440`, a day | `15` |
+| `cloud_wake_after_minutes` | the minutes without a push or a report after which the tick wakes a cloud worker by typing into its session; `0` never does | `30` |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the
@@ -155,7 +163,7 @@ call. A session runs one as `shipline <command>`, the name with dashes
 | `hunt_app` | `session` when a hunt stops: `stop`, in the hunt's worktree; the hunter itself, by `shipline hunt-app` | | `session start hunt` refuses |
 | `hunt_browser` | the hunter, by `shipline hunt-browser`, which its sentence names | | the sentence names none |
 | `hunt_cursor` | `session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>` | what it prints is kept in the report folder's `cursor.log` | a Cursor hunt is refused |
-| `advisory_watch` | the merge gate: `unreachable` with a failed push's output, or a failed audit's annotations, on standard input; `answers <service>` | `unreachable` prints the advisory service the text says was unreachable, or nothing; `answers` exits 0 when the service answers again | no outage is read: a failed push is refused as it is |
+| `advisory_watch` | the merge gate: `unreachable` with a failed push's output, or a failed audit's annotations (without the advisories notice, `checks.advisory_annotation`), on standard input; `answers <service>` | `unreachable` prints the advisory service the text says was unreachable, or nothing; `answers` exits 0 when the service answers again. Beside the advisories notice, a service it names, or a failure of its own, keeps main red | no outage is read: a failed push is refused as it is, and main's advisories notice stands alone |
 | `push_checkout` | the merge gate, before each push and after one that failed: `install <checkout>`; `refusal <checkout>` with the push's whole output on standard input | `install` installs what changed since its last install and exits non-zero with the reason when it failed, which is a wait; `refusal` prints the hook's failed step with its last lines | nothing is installed, and a failed push is refused with its last 10 lines |
 
 The merge gate keeps the outage an advisory watch found in its state folder:
@@ -170,3 +178,56 @@ the scripts before these commands existed, `scripts/workflow/pre-train-checks`,
 longer read: each becomes a command named here, which answers in the form above. Its program now
 lives in the main checkout whichever worktree runs it, so one that reads the change finds the
 checkout from the folder it runs in (`git rev-parse --show-toplevel`), not from its own path.
+
+# A shadow run
+
+Before a repository that runs the workflow from its own copy of the scripts moves onto
+`shipline <command>`, Shipline is run beside it in shadow: `shipline --repo <checkout> tick
+--shadow` takes the decisions of a tick on that repository and carries out none (`tick` says
+what it reads and what it leaves). It writes them to `.local/shipline/shadow.log` of the
+checkout, readable by its owner alone, and leaves every note of the installation as it was. Its
+reads of GitHub are real calls, counted in the machine's shared GitHub budget beside the
+tick's own, and a reviewer's head pushed from elsewhere is fetched as the real tick fetches it.
+
+Each shadow tick runs on a timer of its own, 75 seconds before each of the installation's ticks
+(theirs runs every 3 minutes, up to 25 seconds late), and stops itself after 60 seconds, whatever
+it waits for, logging that it was cut short: so it reads the state the real tick will read, has
+ended before the real tick starts, and never holds it back. Its service's own timeouts are the
+last bound. A real tick still running from its last start when a shadow tick starts may be
+writing the marks the shadow reads: the shadow tick then takes nothing and logs that it was
+skipped (`SHIPLINE_SHADOW_BESIDE` names the real tick's service).
+
+The owner writes the two units, the service with every `Environment=` line of the
+installation's `workflow-tick.service` (its `PATH`, its `TMUX_TMPDIR`, its own `WORKFLOW_*`
+settings), so that the shadow tick finds the same sessions and settings:
+
+    # ~/.config/systemd/user/shipline-shadow.service
+    [Unit]
+    Description=Shipline in shadow beside the workflow tick: decides, carries out nothing
+
+    [Service]
+    Type=oneshot
+    WorkingDirectory=<checkout>
+    <every Environment= line of workflow-tick.service>
+    Environment=SHIPLINE_SHADOW_BESIDE=workflow-tick.service
+    ExecStart=<path of the Shipline checkout>/bin/shipline --repo <checkout> tick --shadow
+    TimeoutStartSec=66
+    TimeoutStopSec=2
+
+    # ~/.config/systemd/user/shipline-shadow.timer
+    [Timer]
+    OnCalendar=*:1/3:45
+    AccuracySec=1s
+
+    [Install]
+    WantedBy=timers.target
+
+and starts it with `systemctl --user enable --now shipline-shadow.timer`. After the run:
+
+    journalctl --user -u workflow-tick.service -o short-unix --since <start> >tick.journal
+    tools/compare-shadow --shadow <checkout>/.local/shipline/shadow.log \
+      --wake ~/.local/state/workflow/wake.log --journal tick.journal
+
+lists every decision the two took differently, with both versions, and exits 0 when none
+differs. A decision that came due in the seconds between the two ticks' clocks is a timing
+difference, counted on its last line and listed with `--timing`.

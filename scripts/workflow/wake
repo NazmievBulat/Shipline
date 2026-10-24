@@ -26,6 +26,10 @@
 # whose wait loop finds its own shell, `wait loop finds itself? ticket-426 (running: ...)`, each
 # ending `; nudge sent` when the tick nudged it, and one idle 50 minutes that no rule covers,
 # `idle, no rule: ticket-426 (50 min, last line: <line>)`.
+# So is what the tick's self-update of Shipline's own checkout (`self_update.py`) notes, once
+# each: `shipline rolled back: <bad sha> -> <good sha>, <reason>`, a checkout it left alone for
+# its local changes, and a pin that stops it. When several repositories share that checkout,
+# the first wake to send tells it.
 #
 # What the tick's automatic ticket start did, and why the next ticket waits, rides with the
 # next check-in, a line each, once per change (`ticket_starts.py` notes them): `started 611
@@ -41,6 +45,9 @@
 #
 # So do the findings of the tick's daily metrics run (`workflow-metrics --daily` notes them), once
 # per day: `Workflow metrics findings (report .local/analyses/metrics-<date>.md): <line>; <line>.`
+#
+# So does the last change of the machine's runner balancer (the tick notes it from
+# `runner-balance.log`), once: `Runner balance, last change: <line>.`
 #
 # An analysis the tick stopped (its analyst said "analysis finished", or its 40 minutes ran out)
 # is told once, at any hour and busy or not, tried again every 5 minutes until the message is
@@ -68,6 +75,10 @@
 # reached by a message, as one session reaches another, which only a session can send: a short
 # `claude -p` on Claude Haiku 5.5, with no settings and the one tool, sends it.
 #
+# A shadow run (`tick --shadow`) names its own log in SHIPLINE_SHADOW: the check-in goes there,
+# in the same words, and is not sent, and the wake writes no note of its own. It also reads the
+# notes the shadow tick took for it, which that tick keeps in SHIPLINE_SHADOW_NOTES.
+#
 # `gh`, `claude` and `date` are found on the PATH, so a test can replace them.
 set -uo pipefail
 
@@ -92,6 +103,10 @@ PENDING=$STATE/wake.pending
 RETRY_SECONDS=$((5 * 60))
 # The questions to the owner the orchestrator was told of, one "<session> <asked at>" a line.
 ASKED=$STATE/wake.asked
+shadow=${SHIPLINE_SHADOW:-}
+[[ -z $shadow ]] || LOG=$shadow
+# The shadow tick's own notes are read only in a shadow run.
+[[ -n $shadow ]] || unset SHIPLINE_SHADOW_NOTES
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 github_ready=1
@@ -103,8 +118,66 @@ eval "$config"
 export SHIPLINE_CONFIG
 # The repository's main checkout, never the checkout these scripts are in.
 main=$SHIPLINE_REPO
+saved_line=""
+saved_day=$(date -u -d "@$((NOW - 86400))" +%F)
+saved_sent=$main/$SHIPLINE_STATE_FOLDER/prefix-savings.sent
+# A completed UTC day is stable. Keep its line until delivery succeeds, then acknowledge it
+# with the other daily findings; unchanged check-ins must not send it twice.
+# A shadow run writes no note of its own, so it neither reads nor keeps a savings report.
+if [[ -z $shadow ]] && ((github_ready)) &&
+    jq -e '.checks.prefix_only // [] | length > 0' <<<"$SHIPLINE_CONFIG" >/dev/null &&
+    [[ ! -r $saved_sent || $(<"$saved_sent") != "$saved_day" ]]; then
+  mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
+  (umask 077; touch "$main/$SHIPLINE_STATE_FOLDER/prefix-savings.lock")
+  exec 8>"$main/$SHIPLINE_STATE_FOLDER/prefix-savings.lock"
+  if ! flock -n 8; then
+    # A parallel report owns only this work; reset names must still reach the wake below.
+    exec 8>&-
+  elif [[ -r $saved_sent && $(<"$saved_sent") == "$saved_day" ]]; then
+    exec 8>&-
+  else
+    saved_pending=$main/$SHIPLINE_STATE_FOLDER/prefix-savings-$saved_day.pending
+    # Retry an unfinished date as well as an undelivered line before starting a newer day.
+    # Shell glob order puts .pending before .progress for the same date.
+    for saved_report in "$main/$SHIPLINE_STATE_FOLDER"/prefix-savings-????-??-??.{pending,progress}; do
+      [[ -f $saved_report ]] || continue
+      candidate=${saved_report##*/prefix-savings-}
+      candidate=${candidate%.*}
+      if [[ $candidate < $saved_day || $candidate == "$saved_day" ]]; then
+        saved_day=$candidate
+        saved_pending=$main/$SHIPLINE_STATE_FOLDER/prefix-savings-$saved_day.pending
+      fi
+    done
+    saved_progress=${saved_pending%.pending}.progress
+    saved_retry=$saved_progress.retry
+    if [[ -r $saved_pending ]]; then
+      saved_line=$(<"$saved_pending")
+    else
+      saved_after=0
+      if [[ -r $saved_retry ]]; then
+        read -r saved_after <"$saved_retry"
+        [[ $saved_after =~ ^[0-9]+$ ]] || saved_after=0
+      fi
+      if ((NOW >= saved_after)); then
+        if saved_line=$(WORKFLOW_BACKGROUND_GITHUB=1 timeout 120 python3 "$here/prefix_savings.py" \
+            --date "$saved_day" --progress "$saved_progress" 9>&- 8>&-); then
+          (umask 077; printf '%s\n' "$saved_line" >"$saved_pending.tmp")
+          mv "$saved_pending.tmp" "$saved_pending"
+          rm -f "$saved_retry"
+        else
+          saved_line=""
+          (umask 077; printf '%s\n' "$((NOW + LOOK_EVERY_SECONDS))" >"$saved_retry")
+        fi
+      fi
+    fi
+  fi
+fi
 resent=("$@")
-mkdir -p "$STATE"
+[[ -n $shadow ]] || mkdir -p "$STATE"
+# Main's line as the gate published it: green, pending, red, advisory (only advisories failed
+# its dependency audit, and merging goes on) or unknown. A change into or out of red, advisory or
+# unknown is noted in main-status.pending and told at any hour. Main stays advisory through the
+# pending of each merge, its line ending "; still advisory", until it is green, red or unknown.
 main_report=$main/$SHIPLINE_STATE_FOLDER/main-status
 main_pending=$main/$SHIPLINE_STATE_FOLDER/main-status.pending
 # The first push the package audit refused because an advisory service could not be reached
@@ -163,6 +236,18 @@ if [[ -d $metrics ]]; then
     fi
   done < <(find "$metrics" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
+balance=$main/$SHIPLINE_STATE_FOLDER/runner-balance.pending
+balance_files=()
+balance_lines=()
+for folder in "$balance" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/runner-balance.pending"}; do
+  [[ -d $folder ]] || continue
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '"Runner balance, last change: \(.line | strings | select(length > 0))."' "$event"); then
+      balance_files+=("$event")
+      balance_lines+=("$line")
+    fi
+  done < <(find "$folder" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+done
 analyses=$main/$SHIPLINE_STATE_FOLDER/analyses.pending
 analysis_files=()
 analysis_lines=()
@@ -187,15 +272,16 @@ hour=$(date -d "@$NOW" +%-H)
 answered=$main/$SHIPLINE_STATE_FOLDER/answered-for-owner.pending
 answer_files=()
 answer_lines=()
-if ((hour >= NIGHT_UNTIL_HOUR && hour < NIGHT_FROM_HOUR)) && [[ -d $answered ]]; then
+for folder in "$answered" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/answered-for-owner.pending"}; do
+  ((hour >= NIGHT_UNTIL_HOUR && hour < NIGHT_FROM_HOUR)) && [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"answered for the owner: \(.name | strings), \(.reply | strings | tojson)"' "$event") &&
         at=$(jq -er '.at | numbers | floor' "$event") && at=$(date -d "@$at" +%H:%M); then
       answer_files+=("$event")
       answer_lines+=("$line ($at)")
     fi
-  done < <(find "$answered" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
-fi
+  done < <(find "$folder" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+done
 if [[ -d $handbacks ]]; then
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"pull request \(.number): \(.reason)"' "$event"); then
@@ -205,31 +291,54 @@ if [[ -d $handbacks ]]; then
   done < <(find "$handbacks" -type f -print0 | sort -z)
 fi
 
-if [[ -d $lost ]]; then
+for folder in "$lost" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/lost-checks.pending"}; do
+  [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"lost check: \(.check) of run \(.run) on pull request \(.number)"' "$event"); then
       lost_files+=("$event")
       lost_lines+=("$line")
     fi
-  done < <(find "$lost" -type f -name '*.json' -print0 | sort -z)
+  done < <(find "$folder" -type f -name '*.json' -print0 | sort -z)
+done
+# Scratch queue warnings use the same durable delivery and sent receipts as lost checks.
+queues=$main/$SHIPLINE_STATE_FOLDER/prefix-queues.pending
+if [[ -d $queues ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '.line | strings' "$event"); then
+      lost_files+=("$event")
+      lost_lines+=("$line")
+    fi
+  done < <(find "$queues" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
 # Rule breaks travel with the lost checks: told at any hour, on a line of their own.
-if [[ -d $breaks ]]; then
+for folder in "$breaks" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/rule-breaks.pending"}; do
+  [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"rule break: \(.name) said review finished without a merge handoff"' "$event"); then
       lost_files+=("$event")
       lost_lines+=("$line")
     fi
-  done < <(find "$breaks" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
-fi
+  done < <(find "$folder" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+done
 
-if [[ -d $stuck ]]; then
+for folder in "$stuck" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/stuck.pending"}; do
+  [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '.line | strings' "$event"); then
       stuck_files+=("$event")
       stuck_lines+=("$line")
     fi
-  done < <(find "$stuck" -type f -name '*.json' -print0 | sort -z)
+  done < <(find "$folder" -type f -name '*.json' -print0 | sort -z)
+done
+# The self-update's notes are in the Shipline checkout these scripts are in, not the repository's.
+shipline=$(cd "$here/../.." && pwd)/.local/shipline/wake.pending
+if [[ -d $shipline ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '.line | strings' "$event"); then
+      stuck_files+=("$event")
+      stuck_lines+=("$line")
+    fi
+  done < <(find "$shipline" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
 
 # Seconds since the last look, or a day when there was none.
@@ -311,22 +420,53 @@ if [[ -n $asking ]]; then
   untold=$(grep -vxF -f <(cat "$ASKED" 2>/dev/null; echo) <<<"$asking")
 fi
 
+# A shadow run also looks when the look comes due within SHIPLINE_SHADOW_AHEAD seconds, as far
+# as its tick looks ahead (the real tick reads its clock later), and the check-in's first line
+# says in how many: `compare-shadow` reads it as the reason only the real wake looked. A night
+# look whose night has ended by the earliest the real tick reads its clock
+# (SHIPLINE_SHADOW_REAL_FROM) says so too: only the shadow looked.
+ahead=0
+[[ -z $shadow ]] || ahead=${SHIPLINE_SHADOW_AHEAD:-0}
+real_from=${SHIPLINE_SHADOW_REAL_FROM:-$NOW}
+[[ $real_from =~ ^[0-9]+$ ]] || real_from=$NOW
+due=""
+# The seconds until it is night, 0 at night.
+night_in() {
+  local hour start
+  hour=$(date -d "@$1" +%-H)
+  ((hour >= NIGHT_FROM_HOUR || hour < NIGHT_UNTIL_HOUR)) && { echo 0; return; }
+  start=$(date -d "$(date -d "@$1" +%F) $NIGHT_FROM_HOUR:00" +%s)
+  echo $((start - $1))
+}
+# Whether this many seconds have passed since the last look, or will within `ahead`; and, when
+# the look comes due later, in how many seconds, at the soonest after `$2` (the night's start).
+looked_before() {
+  local wait=$(($1 - $(since_last_look) - 30)) after=${2:-0}
+  ((wait <= 0 && after == 0)) && return 0
+  ((wait > after)) || wait=$after
+  ((ahead && wait <= ahead)) || return 1
+  due="due within $wait s: "
+}
 if ((${#resent[@]} == 0)); then
   if [[ -s $PENDING || -s $main_pending || -n $service_line || ${#handback_files[@]} -gt 0 || ${#cloud_files[@]} -gt 0 || ${#analysis_files[@]} -gt 0 || ${#lost_files[@]} -gt 0 || ${#stuck_files[@]} -gt 0 || ${#answer_files[@]} -gt 0 || $tmp_alert == true || -n $untold ]]; then
-    (($(since_last_look) + 30 >= RETRY_SECONDS)) || exit 0
+    looked_before "$RETRY_SECONDS" || exit 0
   else
-    ((hour >= NIGHT_FROM_HOUR || hour < NIGHT_UNTIL_HOUR)) || exit 0
-    (($(since_last_look) + 30 >= LOOK_EVERY_SECONDS)) || exit 0
+    night=$(night_in "$NOW")
+    ((night == 0 || ahead)) || exit 0
+    looked_before "$LOOK_EVERY_SECONDS" "$night" || exit 0
+    if [[ -n $shadow && $night == 0 && $(night_in "$real_from") != 0 ]]; then
+      due="ends within $((real_from - NOW)) s: "
+    fi
   fi
 fi
-echo "$NOW" >"$LOOKED"
+[[ -n $shadow ]] || echo "$NOW" >"$LOOKED"
 # The names not yet told go first, without the ones woken again since.
 if [[ -s $PENDING ]]; then
   mapfile -t waiting < <(grep -vxF -f <(printf '%s\n' "${resent[@]}" "") "$PENDING")
   resent=("${waiting[@]}" "${resent[@]}")
 fi
 # Written down before anything can fail; removed once the orchestrator was told.
-((${#resent[@]} == 0)) || printf '%s\n' "${resent[@]}" >"$PENDING"
+[[ -n $shadow ]] || ((${#resent[@]} == 0)) || printf '%s\n' "${resent[@]}" >"$PENDING"
 
 log() {
   printf '%s\n' "$@" >>"$LOG"
@@ -419,6 +559,7 @@ find_orchestrator() {
 # waits 3 seconds for it and says so.
 send_to() {
   local to=$1 message=$2 answer
+  [[ -z $shadow ]] || return 0
   answer=$(cd "$STATE" && timeout "$SEND_SECONDS" claude -p --model "$CHAT_MODEL" --setting-sources "" \
     --tools SendMessage --output-format stream-json --verbose \
     --system-prompt "You deliver one message between Claude sessions. Call SendMessage exactly once, with the recipient and the text given, the text unchanged. Then answer with one word: sent." \
@@ -451,7 +592,7 @@ seen="sessions: $(sessions_line "$sessions"); pull requests: $pulls; starts: $ga
 
 reason="every 20 minutes"
 ((${#resent[@]} == 0)) || reason="after a reset"
-log "$(date -d "@$NOW" '+%Y-%m-%d %H:%M:%S')  $reason" \
+log "$(date -d "@$NOW" '+%Y-%m-%d %H:%M:%S')  $due$reason" \
   "  usage: $usage" "  $seen"
 ((${#resent[@]} == 0)) || log "  the tick sent its instruction again to: ${resent[*]}"
 [[ -z $asking_line ]] || log "  asking the owner: $asking_line"
@@ -474,7 +615,8 @@ if ((${#resent[@]} == 0 && ${#handback_files[@]} == 0 && ${#cloud_files[@]} == 0
     exit "$failed"
   fi
   if [[ -r $TOLD && $(<"$TOLD") == "$seen" ]] &&
-      ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0 && ${#decision_events[@]} == 0)); then
+      ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0 && ${#balance_files[@]} == 0 &&
+        ${#decision_events[@]} == 0)) && [[ -z $saved_line ]]; then
     log "  nothing changed since the last check-in; $name not told"
     exit "$failed"
   fi
@@ -502,14 +644,23 @@ if ((${#decision_held[@]} + ${#decision_events[@]})); then
   joined=$(printf '%s; ' "${decision_held[@]}" "${decision_events[@]}")
   message+=" Decisions: ${joined%; }."
 fi
-for line in "${metrics_lines[@]}" "${analysis_lines[@]}"; do
+for line in "${metrics_lines[@]}" "${analysis_lines[@]}" "${balance_lines[@]}"; do
   message+=" $line"
 done
+[[ -z $saved_line ]] || message+=$'\n'"$saved_line"
 if [[ -n $service_line ]]; then
   message+=" Package audit: $service_line; pushes wait for it, nothing was found wrong."
 fi
 
 if send_to "$name" "$message"; then
+  if [[ -n $shadow ]]; then
+    log "  told $name: $message"
+    exit "$failed"
+  fi
+  if [[ -n $saved_line ]]; then
+    (umask 077; printf '%s\n' "$saved_day" >"$saved_sent")
+    rm -f "$saved_pending" "$saved_progress" "$saved_retry"
+  fi
   echo "$seen" >"$TOLD"
   # A question told before stays told while it is open, also while its session works again on
   # its own job and so is not in this check-in.
@@ -517,7 +668,8 @@ if send_to "$name" "$message"; then
     grep -xF -f <(asking_notes all; echo) >"$ASKED.new"
   mv "$ASKED.new" "$ASKED"
   rm -f "$PENDING"
-  for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${analysis_files[@]}"; do
+  for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${analysis_files[@]}" \
+      "${balance_files[@]}"; do
     rm -f -- "$event"
   done
   if [[ -n $decision_cursor ]]; then
@@ -537,9 +689,12 @@ if send_to "$name" "$message"; then
     done
   fi
   if ((${#stuck_files[@]})); then
-    mkdir -p "$main/$SHIPLINE_STATE_FOLDER/stuck.sent"
+    # stuck.pending to stuck.sent, and the self-update's wake.pending to wake.sent.
     for event in "${stuck_files[@]}"; do
-      mv -- "$event" "$main/$SHIPLINE_STATE_FOLDER/stuck.sent/${event##*/}"
+      sent=${event%/*}
+      sent=${sent%.pending}.sent
+      mkdir -p "$sent"
+      mv -- "$event" "$sent/${event##*/}"
     done
   fi
   if ((${#answer_files[@]})); then

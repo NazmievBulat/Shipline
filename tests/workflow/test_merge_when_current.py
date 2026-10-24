@@ -15,6 +15,7 @@ import time
 from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -214,6 +215,12 @@ def answer(args, cwd, env, out, err):
         if (state / "reject-batch-dispatch").exists():
             sys.exit("workflow dispatch rejected")
     elif args[:2] == ["run", "rerun"]:
+        unavailable = state / "rerun-unavailable"
+        if unavailable.exists():
+            # GitHub fails this re-run once, as in an outage.
+            message = unavailable.read_text()
+            unavailable.unlink()
+            sys.exit(message)
         if (state / "fail-rerun").exists():
             sys.exit("rerun refused")
     elif args[:2] == ["run", "cancel"]:
@@ -1809,6 +1816,417 @@ def test_an_audit_passed_over_mains_advisory_is_not_inherited_by_main(github: Gi
     _main_jobs(github, (_DEPENDENCIES, "completed", "failure"))
     status = github.workflow.run_script("main-status")
     assert status.stdout.startswith("main: red"), status.stdout
+
+
+# A repository that names its dependency audit and the notice the audit writes on main when only
+# advisories failed it (shipline.json, checks.dependency_audit and checks.advisory_annotation).
+_AUDIT = "CI: audit"
+_ADVISORIES_ONLY = "Dependency audit: advisories only"
+_ADVISORY_LINES = ["GHSA-1 in vite (path traversal)", "GHSA-2 in esbuild (open dev server)"]
+
+
+def _advisory_config(github: GitHub) -> None:
+    """Names the audit and its notice, beside the harness's runner labels; git keeps the file as
+    committed, so the checkout stays clean."""
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config["checks"] = {"dependency_audit": _AUDIT, "advisory_annotation": _ADVISORIES_ONLY}
+    path.write_text(json.dumps(config))
+    github.workflow.git("update-index", "--skip-worktree", "shipline.json")
+
+
+def _advisory_watch(github: GitHub) -> None:
+    """The repository's advisory watch (`commands.advisory_watch`): it names the service an
+    output says could not be reached, as "<service>'s advisory service could not be reached"."""
+    github.workflow.fake(
+        "example-advisory",
+        "#!/bin/bash\n"
+        'echo "example-advisory $* (in $PWD)" >> "@STATE@/calls.log"\n'
+        "case $1 in\n"
+        "  unreachable) grep -o \"[A-Za-z]*'s advisory service could not be reached\" "
+        "| head -n 1 | cut -d \"'\" -f 1 ;;\n"
+        "  answers) exit 1 ;;\n"
+        "esac\n",
+    )
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config.setdefault("commands", {})["advisory_watch"] = "example-advisory"
+    path.write_text(json.dumps(config))
+    github.workflow.git("update-index", "--skip-worktree", "shipline.json")
+
+
+def _main_audit_failed(
+    github: GitHub, *notes: dict[str, Any], audit: str = _AUDIT, others: tuple[str, ...] = ()
+) -> None:
+    """Main's CI failed in its dependency audit, with `notes` on it, and in `others`."""
+    github.main("failure")
+    github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"] = [
+        {"id": 11, "name": "CI result", "status": "completed", "conclusion": "failure"},
+        {"id": 12, "name": audit, "status": "completed", "conclusion": "failure"},
+        *(
+            {"id": 13 + index, "name": name, "status": "completed", "conclusion": "failure"}
+            for index, name in enumerate(others)
+        ),
+    ]
+    github.api[f"{_REPO}/check-runs/12/annotations?per_page=100"] = list(notes)
+    github.save()
+
+
+def _advisories_notice(lines: list[str] = _ADVISORY_LINES) -> dict[str, Any]:
+    return {
+        "title": _ADVISORIES_ONLY,
+        "annotation_level": "notice",
+        "message": json.dumps(lines),
+    }
+
+
+def _pull_passed_over_mains_advisory(github: GitHub, audit: str = _AUDIT) -> None:
+    """The pull request's own audit passed, warning of the advisory main has too."""
+    _pr_job(github, audit, "success")
+    github.api[f"{_REPO}/check-runs/29/annotations?per_page=100"] = [
+        {
+            "title": "Advisory on main",
+            "annotation_level": "warning",
+            "message": "GHSA-1 in vite (path traversal) is on main too, so this branch is not "
+            "refused for it; main's own check fails for it until a pull request fixes it there.",
+        }
+    ]
+
+
+def test_main_failing_only_on_an_advisory_lets_a_green_pull_request_merge(
+    github: GitHub,
+) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice())
+    _pull_passed_over_mains_advisory(github)
+
+    done = github.run()
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (github.workflow.state / "merged").read_text() == "7"
+    assert "main: advisory since 2026-10-16T09:00:00Z" in done.stdout
+
+
+def test_main_failing_on_another_check_besides_an_advisory_still_stops(github: GitHub) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice(), others=("CI: web",))
+    _pull_passed_over_mains_advisory(github)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    assert "merging stopped: main: red" in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        # A lock file it could not audit, or a tool that failed: no advisories notice.
+        [],
+        [{"title": "Advisory service unreachable", "annotation_level": "failure", "message": "npm"}],
+        [{"title": None, "annotation_level": "failure", "message": "Process completed with exit code 2."}],
+        # A notice that names no advisory, or cannot be read, proves nothing.
+        [_advisories_notice([])],
+        [{"title": _ADVISORIES_ONLY, "annotation_level": "notice", "message": "not a list"}],
+    ],
+    ids=["no notes", "service", "tool error", "empty notice", "unreadable notice"],
+)
+def test_an_audit_failing_for_another_reason_than_an_advisory_still_stops(
+    github: GitHub, notes: list[dict[str, Any]]
+) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, *notes)
+    _pull_passed_over_mains_advisory(github)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    assert "merging stopped: main: red" in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_without_the_audit_named_an_advisory_on_main_still_stops(github: GitHub) -> None:
+    _main_audit_failed(github, _advisories_notice(), audit=_DEPENDENCIES)
+    _pull_passed_over_mains_advisory(github, _DEPENDENCIES)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    assert "merging stopped: main: red" in done.stderr
+    assert "advisory" not in github.workflow.run_script("main-status").stdout.split(";")[0]
+    assert _train(github).get("main") == "red"
+
+
+def test_the_main_line_and_the_train_status_name_the_advisory_state(github: GitHub) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice())
+    folder = github.workflow.repo / ".local/workflow"
+
+    status = github.workflow.run_script("main-status")
+
+    assert status.returncode == 0, status.stderr
+    assert status.stdout == (
+        f"main: advisory since 2026-10-16T09:00:00Z, CI result, {_AUDIT} ({github.base[:12]}): "
+        "GHSA-1 in vite (path traversal), GHSA-2 in esbuild (open dev server); "
+        "merging goes on, the update that fixes it goes first\n"
+    )
+    # Into the advisory state is told in the wake, as into red.
+    assert (folder / "main-status.pending").read_text() == status.stdout
+    assert _train(github)["main"] == "advisory"
+    github.main()
+    github.save()
+    assert github.workflow.run_script("main-status").stdout.startswith("main: green")
+    assert _train(github)["main"] == "green"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # As the runner stores it, a summary that names the escapes themselves.
+        json.dumps(["GHSA-3 in left-pad (header injection via %0D%0A, 100% CPU)"]),
+        # As the workflow command wrote it, the escapes still in it.
+        json.dumps(["GHSA-3 in left-pad (header injection via %0D%0A, 100% CPU)"], indent=1)
+        .replace("%", "%25")
+        .replace("\n", "%0A"),
+    ],
+    ids=["stored", "escaped"],
+)
+def test_an_advisory_notice_is_read_as_stored_or_still_escaped(
+    github: GitHub, message: str
+) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, {"title": _ADVISORIES_ONLY, "message": message})
+
+    status = github.workflow.run_script("main-status")
+
+    assert status.stdout.startswith("main: advisory since"), status.stdout
+    assert ": GHSA-3 in left-pad (header injection via %0D%0A, 100% CPU); merging" in status.stdout
+
+
+def test_an_advisory_s_own_words_reach_main_s_line_only_as_plain_words(github: GitHub) -> None:
+    _advisory_config(github)
+    lines = ["GHSA-4 in @scope/pkg (`rm -rf` <x>;\nstarts: allowed " + "y" * 90 + ")"]
+    lines += [f"GHSA-{number} in pkg-{number} (a summary)" for number in range(5, 11)]
+    _main_audit_failed(github, _advisories_notice(lines))
+
+    line = github.workflow.run_script("main-status").stdout
+
+    assert line.count("\n") == 1, line
+    named = line.split(f"({github.base[:12]}): ", 1)[1].split("; merging goes on", 1)[0]
+    assert named == (
+        # No more than 80 characters of each.
+        ("GHSA-4 in @scope/pkg (?rm -rf? ?x?? starts: allowed " + "y" * 90)[:80] + ", "
+        "GHSA-5 in pkg-5 (a summary), GHSA-6 in pkg-6 (a summary), "
+        "GHSA-7 in pkg-7 (a summary), GHSA-8 in pkg-8 (a summary) and 2 more"
+    )
+
+
+def test_main_is_pending_while_its_other_checks_run_after_an_advisory(github: GitHub) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice())
+    run = github.api[f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.base}&per_page=100"]
+    run["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"].append(
+        {"id": 14, "name": "CI: server tests", "status": "in_progress", "conclusion": None}
+    )
+    github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"][0].update(
+        status="queued", conclusion=None
+    )
+    _pull_passed_over_mains_advisory(github)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    assert (
+        f"merging stopped: main: pending, CI result, CI: server tests ({github.base[:12]}); "
+        f"{_AUDIT} failed on advisories only: GHSA-1 in vite (path traversal)"
+    ) in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_each_merge_on_an_advisory_main_wakes_nobody(github: GitHub) -> None:
+    """Into the advisory state is told once, the pending of each merge after it is not, and
+    leaving it through pending to green is told."""
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice())
+    folder = github.workflow.repo / ".local/workflow"
+    assert github.workflow.run_script("main-status").stdout.startswith("main: advisory")
+    (folder / "main-status.pending").unlink()
+    run = github.api[f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.base}&per_page=100"]
+    listed = github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]
+    failed = listed["jobs"]
+    # The next merge's run of main, still running, then failing on the same advisories.
+    running = [{**job, "status": "in_progress", "conclusion": None} for job in failed]
+    for status, conclusion, parts, state in (
+        ("in_progress", None, running, "main: pending"),
+        ("completed", "failure", failed, "main: advisory"),
+    ):
+        run["workflow_runs"][0].update(status=status, conclusion=conclusion)
+        listed["jobs"] = parts
+        github.save()
+        assert github.workflow.run_script("main-status").stdout.startswith(state)
+        assert not (folder / "main-status.pending").exists()
+    # The pending line it published said that main stays advisory.
+    assert (folder / "main-status").read_text().startswith("main: advisory")
+
+    # The update lands: main's run on it goes on for a while, then passes. Leaving the advisory
+    # state is told once main is green.
+    run["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    listed["jobs"] = running
+    github.save()
+    assert github.workflow.run_script("main-status").stdout.startswith("main: pending")
+    assert not (folder / "main-status.pending").exists()
+    assert (folder / "main-status").read_text().endswith("; still advisory\n")
+    github.main()
+    github.save()
+    assert github.workflow.run_script("main-status").stdout.startswith("main: green")
+    assert (folder / "main-status.pending").read_text().startswith("main: green")
+
+
+def test_an_advisory_main_published_before_its_state_was_kept_wakes_nobody_at_a_merge(
+    github: GitHub,
+) -> None:
+    """A main already advisory, published by a gate that did not keep the state through pending:
+    its next merge is not told either."""
+    _advisory_config(github)
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "main-status").write_text(
+        "main: advisory since 2026-10-16T08:00:00Z, CI result, CI: audit (0123456789ab): "
+        "GHSA-1 in vite (path traversal); merging goes on, the update that fixes it goes first\n"
+    )
+    github.main()
+    run = github.api[f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.base}&per_page=100"]
+    run["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    for job in github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"]:
+        job.update(status="in_progress", conclusion=None)
+    github.save()
+
+    assert github.workflow.run_script("main-status").stdout.startswith("main: pending")
+    assert not (folder / "main-status.pending").exists()
+
+
+def test_an_outage_beside_mains_advisories_is_red_and_says_what_was_found(
+    github: GitHub,
+) -> None:
+    _advisory_config(github)
+    _advisory_watch(github)
+    outage = {
+        "title": "Advisory service unreachable",
+        "annotation_level": "failure",
+        "message": "Refused because PyPI's advisory service could not be reached.",
+    }
+    _main_audit_failed(github, outage, _advisories_notice(_ADVISORY_LINES[:1]))
+
+    line = github.workflow.run_script("main-status").stdout
+
+    assert line.startswith("main: red"), line
+    assert (
+        f"; {_AUDIT} could not reach PyPI's advisory service, and found advisories: "
+        "GHSA-1 in vite (path traversal)"
+    ) in line
+    assert "nothing was found wrong" not in line
+
+
+def test_an_advisory_watch_that_fails_beside_mains_advisories_keeps_main_red(
+    github: GitHub,
+) -> None:
+    """A watch that could not read the audit's annotations proves no lock file was audited whole:
+    main is not advisory, and merging stops."""
+    _advisory_config(github)
+    _advisory_watch(github)
+    github.workflow.fake("example-advisory", "#!/bin/bash\necho 'cannot read' >&2\nexit 1\n")
+    outage = {
+        "title": "Advisory service unreachable",
+        "annotation_level": "failure",
+        "message": "Refused because PyPI's advisory service could not be reached.",
+    }
+    _main_audit_failed(github, outage, _advisories_notice(_ADVISORY_LINES[:1]))
+    _pull_passed_over_mains_advisory(github)
+
+    line = github.workflow.run_script("main-status").stdout
+    done = github.run()
+
+    assert line.startswith("main: red"), line
+    assert done.returncode == 1
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_an_advisory_whose_own_words_name_an_outage_is_still_advisories_alone(
+    github: GitHub,
+) -> None:
+    """A published advisory's summary may say anything; only the audit's other annotations are
+    read for an outage."""
+    _advisory_config(github)
+    _advisory_watch(github)
+    lines = ["GHSA-5 in example-lib (fails when npm's advisory service could not be reached)"]
+    _main_audit_failed(github, _advisories_notice(lines))
+
+    line = github.workflow.run_script("main-status").stdout
+
+    assert line.startswith("main: advisory since"), line
+    assert "could not reach" not in line
+
+
+@pytest.mark.parametrize("warned", [True, False])
+def test_the_update_that_fixes_mains_advisory_is_a_blocker_and_goes_first(
+    github: GitHub, warned: bool
+) -> None:
+    _advisory_config(github)
+    _two_stale_pulls(github)
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(github.base, head, run_id=30)
+    github.api[f"{_REPO}/actions/runs/30/jobs?per_page=100"]["jobs"].append(
+        {"id": 39, "name": _AUDIT, "status": "completed", "conclusion": "success"}
+    )
+    github.api[f"{_REPO}/check-runs/39/annotations?per_page=100"] = (
+        [{"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}]
+        if warned
+        else []
+    )
+    _main_audit_failed(github, _advisories_notice())
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+
+    assert github.workflow.run_script("main-status").returncode == 0
+
+    train = _train(github)
+    # Only a clean audit is the update: a pass over main's own advisory is not.
+    assert train["first"] == ("7" if warned else "8")
+    assert (train["priorities"]["8"] == "blocker") is not warned
+
+
+@pytest.mark.parametrize("warned", [True, False])
+def test_the_update_tested_on_an_earlier_main_is_the_fix_only_with_a_clean_audit(
+    github: GitHub, warned: bool
+) -> None:
+    """Main moved under the update while the line kept merging: its latest green run with a
+    clean audit proves it, whatever main that run tested."""
+    _advisory_config(github)
+    earlier = github.base
+    _two_stale_pulls(github)
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(github.base, head, run_id=30, tested_base=earlier)
+    github.api[f"{_REPO}/actions/runs/30/jobs?per_page=100"]["jobs"].append(
+        {"id": 39, "name": _AUDIT, "status": "completed", "conclusion": "success"}
+    )
+    github.api[f"{_REPO}/check-runs/39/annotations?per_page=100"] = (
+        [{"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}]
+        if warned
+        else []
+    )
+    _main_audit_failed(github, _advisories_notice())
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+
+    assert github.workflow.run_script("main-status").returncode == 0
+
+    train = _train(github)
+    assert train["first"] == ("7" if warned else "8")
+    assert (train["priorities"]["8"] == "blocker") is not warned
 
 
 def test_a_clean_audit_is_inherited_by_main(github: GitHub) -> None:
@@ -6859,6 +7277,145 @@ def _suite(github: GitHub) -> dict[str, Any]:
     return _batch_state(github)["suites"]["7"]
 
 
+def _prefix_only(github: GitHub, groups: list[str]) -> None:
+    # Keep the repository's commands: its browser plan decides whether a change needs E2E.
+    config = github.workflow.repo / "shipline.json"
+    data = json.loads(config.read_text()) if config.exists() else {}
+    data.setdefault("checks", {})["prefix_only"] = groups
+    config.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize("group,workflow_name,path", [
+    ("images", "images", "docker/change.txt"),
+    ("browser_whole", "e2e", "web/src/example.ts"),
+    ("server_whole", "ci", "src/example_app/reader.py"),
+])
+@pytest.mark.parametrize("listed", [False, True])
+def test_prefix_only_first_member_uses_scratch_proof_and_main_inherits(
+    github: GitHub, group: str, workflow_name: str, path: str, listed: bool,
+) -> None:
+    tree = _changes(github, path)
+    _prefix_only(github, [group] if listed else [])
+    if group == "images" and not listed:
+        _images(github)
+    # Even an own whole-suite result cannot replace a configured group's scratch run.
+    done = _batch_call(github)
+    if not listed:
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert not github.workflow.calls("gh workflow run")
+        return
+    assert done.returncode == 3, done.stdout + done.stderr
+    scratch = _suite(github)
+    assert scratch["workflows"] == [workflow_name]
+    _finish_prefix(github, "7", scratch=scratch, tree=tree, run_id=800)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    squash = github.workflow.git("rev-parse", "origin/main")
+    message = github.workflow.git("show", "-s", "--format=%B", squash)
+    proof = json.loads(next(line.removeprefix("Workflow-Proof: ")
+                            for line in message.splitlines() if line.startswith("Workflow-Proof: ")))
+    assert {"workflow": workflow_name, "run": 800} in [
+        {"workflow": source["workflow"], "run": source["run"]} for source in proof["sources"]
+    ]
+    assert proof["tree"] == tree
+    receipt = json.loads((github.workflow.repo / ".local/workflow/main-tree-green.json").read_text())
+    if group == "images":
+        assert receipt["images_run"] == 800 and receipt["images_complete"]
+        assert not github.workflow.calls(f"gh api --paginate {_REPO}/actions/workflows/images.yml/runs?head_sha={github.head}&event=pull_request")
+    if group == "server_whole":
+        assert "CI: server tests" in receipt["ci_passed"]
+
+
+@pytest.mark.parametrize("groups", [[], ["images"], ["browser_whole"], ["server_whole"]])
+def test_prefix_only_path_filters_need_no_group_run(github: GitHub, groups: list[str]) -> None:
+    _prefix_only(github, groups)
+    github.ci(github.base, github.head, server="none")
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not github.workflow.calls("gh workflow run")
+
+
+@pytest.mark.parametrize("group", ["images", "browser_whole", "server_whole"])
+def test_prefix_only_line_waits_on_its_prefix_and_records_its_groups(github: GitHub, group: str) -> None:
+    _batch_setup(github, count=2, images=group == "images", selected=True)
+    _prefix_only(github, [group])
+    done = _batch_call(github)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert _numbers(github) == ["7", "8"]
+    assert all(member["scratch"] for member in _prefixes(github))
+    status = github.workflow.run_script("merge-when-current", "--train-status")
+    assert json.loads(status.stdout)["prefix_only"] == [group]
+    _finish_batch(github)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert all(pull["state"] == "MERGED" for pull in github.pulls.values())
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "in_progress", "wrong tree"])
+def test_deferred_images_require_passing_proof_on_the_tested_tree(
+    github: GitHub, conclusion: str,
+) -> None:
+    tree = _changes(github, "docker/change.txt")
+    _prefix_only(github, ["images"])
+    assert _batch_call(github).returncode == 3
+    scratch = _suite(github)
+    _finish_prefix(github, "7", scratch=scratch, tree=tree, run_id=800)
+    if conclusion == "wrong tree":
+        github.api[f"{_REPO}/check-runs/801/annotations?per_page=100"][0]["message"] = "0" * 40
+    elif conclusion == "in_progress":
+        github.api[f"{_REPO}/actions/workflows/images.yml/runs?head_sha={scratch['head']}&event=workflow_dispatch&per_page=100"]["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    else:
+        github.api[f"{_REPO}/actions/runs/800/jobs?per_page=100"]["jobs"][1]["conclusion"] = "failure"
+    done = _batch_call(github)
+    assert done.returncode != 0
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_a_deferred_image_prefix_cannot_pass_with_only_its_planner(github: GitHub) -> None:
+    _batch_setup(github, count=2, images=True, selected=True)
+    _prefix_only(github, ["images"])
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+    scratch = _scratch(github)
+    assert scratch is not None
+    image_run = github.api[
+        f"{_REPO}/actions/workflows/images.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0]
+    for job in github.api[f"{_REPO}/actions/runs/{image_run['id']}/jobs?per_page=100"]["jobs"]:
+        if job["name"] != "Docker images: what to run":
+            job["conclusion"] = "skipped"
+    done = _batch_call(github)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_a_scratch_run_finishing_or_rerunning_rejudges_red_main_fix_priority(github: GitHub) -> None:
+    tree = _changes(github, "docker/change.txt")
+    _prefix_only(github, ["images"])
+    _images(github, pull=False, conclusion="failure", release_conclusion="success")
+    assert _batch_call(github).returncode == 3
+    scratch = _suite(github)
+    assert _batch_state(github)["proofs"]["7"][1] is False
+    _finish_prefix(github, "7", scratch=scratch, tree=tree, run_id=800)
+    github.save()
+    assert _train(github)["priorities"]["7"] == "blocker"
+    assert _batch_state(github)["proofs"]["7"][1] is True
+    run = github.api[
+        f"{_REPO}/actions/workflows/images.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0]
+    run.update(run_attempt=2, status="in_progress", conclusion=None)
+    github.save()
+    assert _train(github)["priorities"]["7"] == "medium"
+    assert _batch_state(github)["proofs"]["7"][1] is False
+    run.update(status="completed", conclusion="success")
+    github.save()
+    assert _train(github)["priorities"]["7"] == "blocker"
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
 @pytest.mark.parametrize(
     "own",
     [
@@ -8188,3 +8745,289 @@ def test_a_read_made_old_by_a_long_wait_for_the_lock_is_made_again(
         assert (workflow.repo / ".local/workflow/merge-wanted-7").exists()
         assert _waiting(workflow) == ["7"]
     assert all(held < 5 for held in _held(workflow))
+
+
+# Queued scratch jobs use their own timestamps, never the age of their workflow run.
+def _queued_prefix_job(
+    github: GitHub, *, minutes: int = 21, workflow: str = "ci", attempt: int = 1,
+    label: str = "example-app-home-main-batch", number: str = "7",
+) -> dict[str, Any]:
+    member = next(member for member in _prefixes(github) if member["number"] == number)
+    scratch = member["scratch"]
+    identity = 100 if workflow == "ci" else 110
+    run = {
+        "id": identity, "head_sha": scratch["head"], "head_branch": scratch["branch"],
+        "event": "workflow_dispatch", "status": "in_progress", "conclusion": None,
+        "run_attempt": attempt,
+    }
+    github.api[
+        f"{_REPO}/actions/workflows/{workflow}.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ] = {"workflow_runs": [run]}
+    github.api[f"{_REPO}/actions/runs/{identity}/jobs?per_page=100"] = {"jobs": [{
+        "id": identity + 2, "name": "CI: server tests (2 of 3)", "status": "queued",
+        "conclusion": None, "labels": [label],
+        "created_at": datetime.fromtimestamp(time.time() - minutes * 60, UTC).isoformat(),
+    }]}
+    return run
+
+
+def _queue_config(github: GitHub, limit: int | None = None) -> None:
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config.setdefault("runner", {})["label"] = "example-app-home"
+    if limit is not None:
+        config["merge_train"] = {"queued_limit_minutes": limit}
+    path.write_text(json.dumps(config))
+    github.workflow.git("update-index", "--skip-worktree", "shipline.json")
+
+
+@pytest.mark.parametrize("suite", ["ci", "e2e"])
+def test_a_scratch_main_lane_job_past_the_default_limit_is_cancelled_then_rerun_once(
+    github: GitHub, suite: str,
+) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    run = _queued_prefix_job(github, workflow=suite)
+    identity = run["id"]
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls(f"gh run cancel {identity} ")) == 1
+    assert not github.workflow.calls(f"gh run rerun {identity} ")
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls(f"gh run cancel {identity} ")) == 1
+    # Cancellation finishes on GitHub between gate calls; a new process resumes the retry.
+    scratch = _scratch(github)
+    run = github.api[
+        f"{_REPO}/actions/workflows/{suite}.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0]
+    run.update(status="completed", conclusion="cancelled")
+    assert _batch_call(github).returncode == 3
+    assert github.workflow.calls(f"gh run rerun {identity} ") == [
+        f"gh run rerun {identity} -R example-org/example-app"
+    ]
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls(f"gh run rerun {identity} ")) == 1
+    status = github.workflow.run_script("merge-when-current", "--train-status")
+    assert status.returncode == 0, status.stderr
+    prefix = json.loads(status.stdout)["prefixes"][0]
+    assert prefix["queued_retries"][str(identity)]["state"] == "rerun requested"
+    # A successful ordinary attempt still supplies the normal merge proof.
+    _finish_batch(github)
+    github.api[
+        f"{_REPO}/actions/workflows/{suite}.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0]["run_attempt"] = 2
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
+
+
+@pytest.mark.parametrize("minutes,limit", [(19, None), (21, 25)])
+def test_a_scratch_job_under_the_queue_limit_is_left_alone(
+    github: GitHub, minutes: int, limit: int | None,
+) -> None:
+    _queue_config(github, limit)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, minutes=minutes)
+    assert _batch_call(github).returncode == 3
+    assert not github.workflow.calls("gh run cancel")
+    assert not github.workflow.calls("gh run rerun")
+
+
+@pytest.mark.parametrize("suite,label", [
+    ("images", "example-app-home-docker"), ("ci", "example-app-home"),
+    ("e2e", "home-planner"),
+])
+def test_a_long_wait_outside_the_main_batch_lane_is_not_cancelled(
+    github: GitHub, suite: str, label: str,
+) -> None:
+    _queue_config(github)
+    _batch_setup(github, images=suite == "images")
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, minutes=87, workflow=suite, label=label)
+    assert _batch_call(github).returncode == 3
+    assert not github.workflow.calls("gh run cancel")
+    assert not github.workflow.calls("gh run rerun")
+
+
+def test_a_second_attempt_stuck_in_the_lane_is_reported_once_without_a_retry(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, attempt=2)
+    first = _batch_call(github)
+    second = _batch_call(github)
+    assert first.returncode == second.returncode == 3
+    assert "run 100 attempt 2" in first.stdout
+    assert "queued past 20 minutes" in first.stdout
+    assert "queued past 20 minutes" not in second.stdout
+    assert not github.workflow.calls("gh run cancel")
+    assert not github.workflow.calls("gh run rerun")
+    pending = github.workflow.repo / ".local/workflow/prefix-queues.pending"
+    [event] = pending.glob("*.json")
+    assert "run 100 attempt 2" in json.loads(event.read_text())["line"]
+
+
+@pytest.mark.parametrize("branch,event", [("main", "push"), ("ticket/seven", "pull_request")])
+def test_no_run_outside_the_scratch_prefix_is_cancelled_for_its_queue(
+    github: GitHub, branch: str, event: str,
+) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    run = _queued_prefix_job(github)
+    run.update(head_branch=branch, event=event)
+    assert _batch_call(github).returncode == 3
+    assert not github.workflow.calls("gh run cancel")
+    assert not github.workflow.calls("gh run rerun")
+
+
+
+def test_a_retry_queued_on_ordinary_runners_is_reported_without_another_retry(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, attempt=2, label="example-app-home")
+    first = _batch_call(github)
+    assert first.returncode == 3
+    assert "run 100 attempt 2" in first.stdout
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+    assert not github.workflow.calls("gh run rerun")
+
+
+def test_a_timestamp_missing_from_a_queued_job_starts_a_durable_observation(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    part = github.api[f"{_REPO}/actions/runs/100/jobs?per_page=100"]["jobs"][0]
+    part.pop("created_at")
+    assert _batch_call(github).returncode == 3
+    assert not github.workflow.calls("gh run cancel")
+    path = github.workflow.repo / ".local/workflow/merge-train.json"
+    state = json.loads(path.read_text())
+    observation = state["prefixes"]["members"][0]["scratch"]["queued_retries"]["100"]["jobs"]
+    observation["1:102"] -= 21 * 60
+    path.write_text(json.dumps(state))
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+
+
+def test_one_queued_matrix_part_past_the_limit_retries_the_run(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    parts = github.api[f"{_REPO}/actions/runs/100/jobs?per_page=100"]["jobs"]
+    parts.insert(0, {**parts[0], "id": 103, "name": "CI: server tests (1 of 3)",
+                     "created_at": datetime.now(UTC).isoformat()})
+    parts.append({**parts[0], "id": 104, "name": "CI: server tests (3 of 3)",
+                  "status": "completed", "conclusion": "success"})
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+
+
+def test_a_cancel_lost_to_an_outage_is_retried_after_a_gate_restart(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    github.cancel_unavailable = [100]
+    _batch_call(github)
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 2
+    assert not github.workflow.calls("gh run rerun")
+
+
+@pytest.mark.parametrize("error", [
+    "HTTP 502: Bad Gateway", 'Post "https://api.github.com/x": context deadline exceeded',
+])
+def test_a_rerun_lost_to_an_outage_is_sent_again_while_the_first_attempt_stays_cancelled(
+    github: GitHub, error: str,
+) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    assert _batch_call(github).returncode == 3
+    github.api[
+        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={_scratch(github)['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0].update(status="completed", conclusion="cancelled")
+    (github.workflow.state / "rerun-unavailable").write_text(error)
+    assert "could not re-run scratch run 100 yet" in _batch_call(github).stderr
+    assert len(github.workflow.calls("gh run rerun 100 ")) == 1
+    assert not (github.workflow.repo / ".local/workflow/prefix-queues.pending").exists()
+    for _ in range(3):
+        assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run rerun 100 ")) == 2
+
+
+def test_a_recovered_run_is_still_cancelled_when_its_prefix_is_dropped(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, number="9")
+    github.save()
+    assert github.workflow.run_script("merge-when-current", "--train-status").returncode == 0
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+    dropped = _scratch(github, "9")
+    assert dropped is not None
+    github.api[
+        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={dropped['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0].update(status="completed", conclusion="cancelled")
+    github.save()
+    assert github.workflow.run_script("merge-when-current", "--train-status").returncode == 0
+    assert len(github.workflow.calls("gh run rerun 100 ")) == 1
+    # Its second attempt, the same run, holds ordinary runners when the prefix is dropped.
+    _branch_runs(github, dropped["branch"], (100, "in_progress"))
+    github.pulls["9"]["state"] = "CLOSED"
+    _batch_call(github)
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 2
+    assert dropped["branch"] not in _scratch_branches(github)
+
+
+def test_train_status_recovers_a_later_prefix_without_polluting_its_json(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, number="8")
+    github.save()
+    done = github.workflow.run_script("merge-when-current", "--train-status")
+    assert done.returncode == 0, done.stderr
+    status = json.loads(done.stdout)
+    assert status["prefixes"][1]["queued_retries"]["100"]["state"] == "cancel requested"
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+
+
+
+def test_a_stale_job_from_the_previous_attempt_does_not_report_a_new_wait(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, attempt=2)
+    github.api[f"{_REPO}/actions/runs/100/jobs?per_page=100"]["jobs"][0]["run_attempt"] = 1
+    done = _batch_call(github)
+    assert done.returncode == 3
+    assert "queued past" not in done.stdout
+    assert not (github.workflow.repo / ".local/workflow/prefix-queues.pending").exists()
+    assert not github.workflow.calls("gh run cancel")
+
+
+def test_a_custom_pool_label_and_unrelated_planner_label_do_not_change_recovery(github: GitHub) -> None:
+    _queue_config(github)
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config["runner"].update(label="example-pool", planner_label="home-planner")
+    path.write_text(json.dumps(config))
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, label="example-pool-main-batch")
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1

@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Lists every decision a shadow tick and the real tick of an installation took differently.
+
+    tools/compare-shadow [--shadow <log>] [--wake <log>] [--journal <file>]
+                         [--from <time>] [--until <time>] [--window <seconds>] [--timing]
+
+`--shadow` is the log `shipline tick --shadow` writes (`.local/shipline/shadow.log` of the
+current folder by default), `--wake` the real tick's wake log (`~/.local/state/workflow/wake.log`
+by default), and `--journal` what the real tick printed, as `journalctl -o short-unix` shows it:
+
+    journalctl --user -u workflow-tick.service -o short-unix --since -1d >tick.journal
+
+A time is seconds since the epoch or an ISO date and time, read in the machine's zone. The
+hours compared run from the first shadow tick of the log to its last, or as `--from` and
+`--until` name them.
+
+A decision is one line in the words its side logs it in: the tick's lines of the wake log (a
+reviewer nudged, a status check sent, a stuck session), the lines the session commands print
+(`ticket-7 started`, `audit-9 stopped`, `ticket-11 squeezed`, a start held for memory), and
+each check-in of the wake (whom it told, or why it told nobody, and its lines of their own). A
+figure that moves between two ticks (minutes waited, megabytes held, a session's link) is left
+out.
+
+Each real decision is compared with the shadow tick that ran last before it: the shadow tick
+runs on a timer of its own 75 seconds before each real one and ends before it starts, so the
+real tick and its wake, up to the next shadow tick, are that shadow tick's. Two decisions match
+when they are the same words beside the same shadow tick. A real decision more than `--window`
+seconds (175 by default) after the last shadow tick had no shadow tick beside it, and is not
+compared; the last line counts it. A line of the journal counts from the start of the service it
+was printed in, when the journal shows systemd starting it.
+
+The real tick reads its clock later than its shadow tick, and a wait that crosses its threshold
+in between is the real tick's alone: its mark then hides it from the shadow ticks after it. A
+shadow tick notes what comes due before the next one, in how many seconds (`due within 42 s:
+<decision>`), and so does its wake, on a check-in's first line; a night look whose night has
+ended by the earliest the real tick reads its clock is marked `ends within`. A decision only the
+real side took that a note of its own shadow tick names, taken once that note's time had come,
+and a check-in of the real wake that only such decisions brought about (sessions sent their
+instruction again after a reset, stuck sessions, and no other line of its own), is a timing
+difference; so is a check-in only the shadow took that was marked to end. They are counted on
+the last line, listed with `--timing`, and no difference otherwise. A shadow tick stopped at its
+bound says so in its log (`shadow tick cut short`), and so does one that took nothing beside a
+real tick still running from its last start (`shadow tick skipped`): its decisions and the real
+ones beside it are not compared, and the last line counts them. The last shadow tick of the log
+is compared only once its real tick has run: within `--window` seconds of it, the hours compared
+end at the one before it.
+
+What only one side logs is not compared: the real installation's merge gate and automatic
+ticket starts, which a shadow tick does not run, the nudge of a session whose pull request the
+merge driver merged in a batch, and its worktree cleanup; a reviewer's start, which the real
+tick prints no line for (`reviewer_start.py` keeps the session's words to itself); and the
+train status a shadow tick notes for explaining a difference. Without `--journal` the lines of
+the session commands are not compared either.
+
+Some differences follow from what a shadow tick does not run, or from the 75 to 100 seconds
+between the two clocks, and are explained by them, not counted as timing: a nudge for a new
+turn of the merge line or a new state of main, which the real tick's own reconcile and report
+refresh make in the same tick (the shadow tick reads the line and the report as the tick before
+left them); a check-in that tells the orchestrator of a hand-back, a cloud worker's report or
+an analyst's report the real tick noted in the same tick; and what changed outside Shipline in
+between, a check that finished, a push, a session that went idle. The wake log is the
+machine's, one for every repository on it: compare a run on a machine that works on one
+repository only.
+
+Each difference is printed with both versions, the decision of the same session or of the wake
+paired when both sides took one, `(nothing)` for the side that took none. The last line counts
+the decisions compared, the timing differences and the real decisions not compared. The exit
+status is 0 when none differs but by timing, 1 when some do, 2 when the logs or the arguments
+cannot be read.
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import re
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+WINDOW_SECONDS = 175
+
+# A line of the tick in the wake log, and of the shadow log: the moment, then the words.
+_STAMPED = re.compile(r"^(\d+) (.+)$")
+# What a shadow tick, or its wake, found coming due within the seconds it looks ahead.
+_DUE = re.compile(r"^(due|ends) within (\d+) s: (.+)$")
+# A shadow tick its bound stopped, and one that took nothing beside a real tick still running.
+_CUT = re.compile(r"^shadow tick (?:cut short after \d+ s|skipped: \S+ is \S+)$")
+# The real side's clock is read up to this long before what it decided came due by it.
+SLACK_SECONDS = 5
+# A check-in of the wake: its local time, why it looked, then its lines, indented.
+_CHECK_IN = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)  (.+)$")
+# `journalctl -o short-unix`: the moment, the host, the program and its process, the words.
+_JOURNAL = re.compile(r"^(\d+(?:\.\d+)?) \S+ ([^\s:]+?)(?:\[\d+\])?: (.*)$")
+
+_NAME = r"(?:ticket|review|audit|cloud)-\d+|(?:hunt|analyst)-[a-z0-9][a-z0-9-]*"
+# The lines of the session commands and of the tick that a journal holds: the session they name,
+# and the words compared.
+_SESSION_LINES = [
+    (re.compile(rf"^(?P<who>{_NAME}) stopped$"), None),
+    (re.compile(r"^(?P<who>(?:hunt|analyst)-[a-z0-9][a-z0-9-]*) is over its time$"), None),
+    (re.compile(rf"^(?P<who>{_NAME}) squeezed(?:: .*)?$"), "{who} squeezed"),
+    (re.compile(rf"^(?P<who>{_NAME}) was sent its instruction again$"), None),
+    (re.compile(r"^(?P<who>ticket-\d+): its bridge was started again$"), None),
+    (
+        re.compile(r"^(?P<who>(?:ticket|cloud)-\d+|analyst-[a-z0-9][a-z0-9-]*) started(?:: .*)?$"),
+        "{who} started",
+    ),
+    (re.compile(r"^the daily (?P<who>analyst) waits: .*$"), None),
+    (re.compile(r"^(?P<who>)\S.*; the next tick tries this start again$"), None),
+]
+# The tick's own lines of the wake log.
+_TICK_LINES = [
+    re.compile(
+        rf"^(?P<who>{_NAME}) (?:merge conflict on \S+; "
+        r"reviewer nudged|checks finished on \S+; reviewer nudged|lost check on \S+; "
+        r"reviewer nudged|wake failed: .*)$"
+    ),
+    re.compile(
+        rf"^(?P<who>{_NAME}) idle \d+ min waiting for its own job or turn; status check sent$"
+    ),
+    re.compile(rf"^(?P<who>{_NAME}) status check failed: .*$"),
+    re.compile(
+        rf"^(?P<who>{_NAME}) idle on ready pull request \d+ without worker finished; "
+        r"told to finish$"
+    ),
+    re.compile(rf"^(?P<who>{_NAME}) finish message failed: .*$"),
+    re.compile(rf"^wait loop finds itself\? (?P<who>{_NAME}) \(running: .*$"),
+    # With what the tick did of it after the bracket: "; nudge sent", "; nudge failed".
+    re.compile(rf"^stuck\? (?P<who>{_NAME}) \((?:\d+ min, running: |nudge not taken).*$"),
+    re.compile(rf"^idle, no rule: (?P<who>{_NAME}) \(\d+ min, last line: .*\)$"),
+    re.compile(r"^(?P<who>worker-program-\d+) names no worker program .*$"),
+    re.compile(rf"^answered for the owner: (?P<who>{_NAME}), .*$"),
+    re.compile(rf"^(?P<who>{_NAME}) asks the owner without (?:a reply word|the Owner only line); "),
+    re.compile(rf"^(?P<who>{_NAME}) answer for the owner failed: .*$"),
+    re.compile(
+        rf"^(?P<who>{_NAME}) (?:still|loop|stuck) nudge "
+        r"(?:failed|failed again|sent again|not taken).*$"
+    ),
+]
+# What a check-in did: told the orchestrator, or why it told nobody.
+_OUTCOMES = [
+    (re.compile(r"^told (.+?): "), "told {0}"),
+    (re.compile(r"^.+ is \S+; not told$"), None),
+    (re.compile(r"^nothing changed since the last check-in; .+ not told$"), None),
+    (re.compile(r"^the check-in could not be sent to .+$"), None),
+    (re.compile(r"^(?:named )?orchestrator .*nobody was told$"), None),
+]
+# A check-in's lines of their own.
+_OWN_LINES = ("the tick sent its instruction again to: ", "asking the owner: ", "lost check: ")
+_OWN_LINES += ("rule break: ", "stuck? ", "wait loop finds itself? ", "idle, no rule: ")
+_RESENT = "wake: the tick sent its instruction again to: "
+
+
+@dataclass(eq=False)
+class Decision:
+    at: float
+    who: str
+    words: str
+    # The kind a journal holds; compared only when the real side's journal is read.
+    session: bool = False
+    # A shadow's note of a decision due within this many seconds, not a decision taken.
+    due: float | None = None
+    # A check-in a shadow wake took that stops being due before the real wake looks.
+    ends: bool = False
+    # The check-in it is a line of, numbered in its log.
+    check_in: int | None = None
+    # The shadow tick it is compared beside.
+    run: float | None = None
+
+
+@dataclass
+class Log:
+    decisions: list[Decision]
+    due: list[Decision]
+    # When its shadow ticks ran, and when one was stopped at its bound.
+    runs: list[float]
+    cut: list[float]
+
+
+def _figures_out(words: str) -> str:
+    """The words without the figures that move between two ticks."""
+    words = re.sub(r" idle \d+ min waiting", " idle N min waiting", words)
+    words = re.sub(
+        r"^the processors are overloaded: .*(; the next tick)",
+        r"the processors are overloaded\1",
+        words,
+    )
+    return re.sub(r"\((\d+) min([,)])", r"(N min\2", words)
+
+
+def _session_line(words: str, at: float) -> Decision | None:
+    for pattern, kept in _SESSION_LINES:
+        if found := pattern.match(words):
+            text = kept.format(**found.groupdict()) if kept else _figures_out(words)
+            return Decision(at, found["who"] or "start", text, session=True)
+    return None
+
+
+def _tick_line(words: str, at: float) -> Decision | None:
+    for pattern in _TICK_LINES:
+        if found := pattern.match(words):
+            return Decision(at, found["who"], _figures_out(words))
+    return _session_line(words, at)
+
+
+def _check_in_line(reason: str, words: str, at: float) -> Decision | None:
+    for pattern, kept in _OUTCOMES:
+        if found := pattern.match(words):
+            text = kept.format(*found.groups()) if kept else words
+            return Decision(at, "wake", f"wake ({reason}): {text}")
+    if words.startswith(_OWN_LINES):
+        # Paired with the same kind of line of the other side, not with whom the wake told.
+        kind = next(line for line in _OWN_LINES if words.startswith(line))
+        return Decision(at, f"wake, {kind.rstrip(': ')}", f"wake: {_figures_out(words)}")
+    return None
+
+
+class Unreadable(Exception):
+    """A log or an argument cannot be read."""
+
+
+def _lines(path: Path) -> list[str]:
+    try:
+        return path.read_text(errors="replace").splitlines()
+    except OSError as error:
+        raise Unreadable(f"{error.strerror}: cannot read {path}") from None
+
+
+def read_log(path: Path) -> Log:
+    """The decisions of a wake log or a shadow log, what came due, and when its shadow ticks ran."""
+    log = Log([], [], [], [])
+    check_in: tuple[float, str, float | None, bool, int] | None = None
+    check_ins = 0
+    for line in _lines(path):
+        if found := _STAMPED.match(line):
+            check_in = None
+            at, words = float(found[1]), found[2]
+            due = None
+            if (ahead := _DUE.match(words)) and ahead[1] == "due":
+                due, words = float(ahead[2]), ahead[3]
+            if words == "shadow tick":
+                log.runs.append(at)
+            elif _CUT.match(words):
+                log.cut.append(at)
+            elif decision := _tick_line(words, at):
+                decision.due = due
+                (log.decisions if due is None else log.due).append(decision)
+        elif found := _CHECK_IN.match(line):
+            local = datetime.strptime(found[1], "%Y-%m-%d %H:%M:%S")
+            reason, due, ends = found[2], None, False
+            if ahead := _DUE.match(reason):
+                reason = ahead[3]
+                if ahead[1] == "due":
+                    due = float(ahead[2])
+                else:
+                    ends = True
+            check_ins += 1
+            check_in = (time.mktime(local.timetuple()), reason, due, ends, check_ins)
+        elif check_in and line.startswith("  "):
+            if decision := _check_in_line(check_in[1], line.strip(), check_in[0]):
+                decision.due, decision.ends, decision.check_in = check_in[2:5]
+                (log.decisions if decision.due is None else log.due).append(decision)
+        else:
+            check_in = None
+    return log
+
+
+def read_journal(path: Path) -> list[Decision]:
+    """The lines of the session commands the real tick printed, each at the start of the
+    service it was printed in, when the journal shows it."""
+    decisions = []
+    started: float | None = None
+    for line in _lines(path):
+        if not (found := _JOURNAL.match(line)):
+            continue
+        at, program, words = float(found[1]), found[2], found[3].strip()
+        if program == "systemd":
+            if words.startswith("Starting "):
+                started = at
+            elif words.startswith(("Finished ", "Failed ")) or words.endswith(" failed."):
+                started = None
+        elif decision := _session_line(words, at if started is None else started):
+            decisions.append(decision)
+    return decisions
+
+
+def _moment_of(decision: Decision) -> float:
+    return decision.at
+
+
+def timing(real: list[Decision], due: list[Decision], notes: list[Decision]) -> list[Decision]:
+    """Of the decisions only the real side took, those a note of their own shadow tick says came
+    due by the time the real side took them, and the check-ins only those brought about. The
+    `notes` (all of them, a resend's too, which a journal holds) explain a check-in with or
+    without the journal."""
+
+    def noted(decision: Decision, words: str, among: list[Decision]) -> bool:
+        return any(
+            note.run == decision.run
+            and note.words == words
+            and decision.at + SLACK_SECONDS >= note.at + (note.due or 0)
+            for note in among
+        )
+
+    found = [decision for decision in real if noted(decision, decision.words, due)]
+    check_ins: dict[int, list[Decision]] = {}
+    for decision in real:
+        if decision.check_in is not None:
+            check_ins.setdefault(decision.check_in, []).append(decision)
+    for lines in check_ins.values():
+        # What made the wake look at once: the sessions sent their instruction again after a
+        # reset, and the stuck ones; with no other line of its own, and each of them noted as
+        # due, the check-in came due too.
+        own = [line for line in lines if line.who.startswith("wake, ")]
+        reasons: list[str] = []
+        for line in own:
+            if line.words.startswith(_RESENT):
+                names = line.words.removeprefix(_RESENT).split()
+                reasons += [f"{name} was sent its instruction again" for name in names]
+            elif line.words.startswith(
+                ("wake: stuck? ", "wake: idle, no rule: ", "wake: wait loop finds itself? ")
+            ):
+                reasons.append(line.words.removeprefix("wake: "))
+            else:
+                reasons = []
+                break
+        if reasons and all(noted(lines[0], reason, notes) for reason in reasons):
+            found += [line for line in lines if line not in found]
+    return found
+
+
+def compare(
+    shadow: list[Decision], real: list[Decision]
+) -> tuple[int, list[tuple[Decision | None, Decision | None]]]:
+    """How many decisions were compared, and each difference as (shadow's, real's): the same
+    words beside the same shadow tick match; what is left of one session or of the wake beside
+    one shadow tick is paired."""
+    unmatched = sorted(real, key=_moment_of)
+    left: list[Decision] = []
+    compared = 0
+    for decision in sorted(shadow, key=_moment_of):
+        compared += 1
+        same = next(
+            (o for o in unmatched if o.run == decision.run and o.words == decision.words), None
+        )
+        if same:
+            unmatched.remove(same)
+        else:
+            left.append(decision)
+    compared += len(unmatched)
+    differences: list[tuple[Decision | None, Decision | None]] = []
+    for decision in left:
+        other = next(
+            (o for o in unmatched if o.run == decision.run and o.who == decision.who), None
+        )
+        if other:
+            unmatched.remove(other)
+            compared -= 1
+        differences.append((decision, other))
+    differences += [(None, decision) for decision in unmatched]
+    differences.sort(key=lambda pair: min(d.at for d in pair if d))
+    return compared, differences
+
+
+def _moment(text: str, name: str) -> float:
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        return float(text)
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        raise Unreadable(f"{name}: {text} is not a time") from None
+
+
+def _shown(at: float) -> str:
+    return datetime.fromtimestamp(at).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="List every decision a shadow tick and the real tick took differently."
+    )
+    parser.add_argument("--shadow", type=Path, default=Path(".local/shipline/shadow.log"))
+    parser.add_argument("--wake", type=Path, default=Path.home() / ".local/state/workflow/wake.log")
+    parser.add_argument("--journal", type=Path)
+    parser.add_argument("--from", dest="start")
+    parser.add_argument("--until", dest="end")
+    parser.add_argument("--window", default=str(WINDOW_SECONDS))
+    parser.add_argument("--timing", action="store_true", help="list the timing differences")
+    args = parser.parse_args()
+    try:
+        try:
+            window = float(args.window)
+        except ValueError:
+            raise Unreadable(f"--window: {args.window} is not a number of seconds") from None
+        start = _moment(args.start, "--from") if args.start else None
+        end = _moment(args.end, "--until") if args.end else None
+        log = read_log(args.shadow)
+        shadow, due, runs = log.decisions, log.due, log.runs
+        real = read_log(args.wake).decisions
+        if args.journal:
+            real += read_journal(args.journal)
+    except Unreadable as error:
+        print(f"compare-shadow: {error}", file=sys.stderr)
+        return 2
+    if not runs:
+        print("the shadow log holds no shadow tick: nothing to compare", file=sys.stderr)
+        return 2
+    if start is None:
+        start = min(runs)
+    if end is None:
+        # The last shadow tick's real tick may not have run yet: then it is left for later.
+        end = max(runs)
+        if time.time() - end < window and len(runs) > 1:
+            end = sorted(runs)[-2]
+    if not args.journal:
+        print(
+            "the lines of the session commands (stopped, started, squeezed, sent again, bridged, "
+            "start held) are not compared: no --journal"
+        )
+        shadow = [decision for decision in shadow if not decision.session]
+        real = [decision for decision in real if not decision.session]
+        due = [decision for decision in due if not decision.session]
+    every_due = list(log.due)
+    ticks = sorted(runs)
+    cut_short = set(log.cut)
+
+    def run_of(at: float) -> float | None:
+        before = bisect.bisect_right(ticks, at)
+        return ticks[before - 1] if before else None
+
+    for decision in (*shadow, *log.due, *real):
+        decision.run = run_of(decision.at)
+    shown = [d for d in (*shadow, *due) if d.run is not None and start <= d.run <= end]
+    shadow = [d for d in shown if d.due is None and d.run not in cut_short]
+    due = [d for d in shown if d.due is not None]
+    every_due = [d for d in every_due if d.run is not None and start <= d.run <= end]
+    cut = [d for d in shown if d.due is None and d.run in cut_short]
+    unpaired = []
+    kept = []
+    for decision in real:
+        if decision.run is None or decision.at - decision.run > window:
+            # No shadow tick ran beside it: within the hours compared, it is counted.
+            if start <= decision.at <= end + window:
+                unpaired.append(decision)
+        elif start <= decision.run <= end:
+            (cut if decision.run in cut_short else kept).append(decision)
+    real = kept
+    compared, differences = compare(shadow, real)
+    only_real = [theirs for ours, theirs in differences if ours is None and theirs]
+    late = timing(only_real, due, every_due)
+    late += [ours for ours, theirs in differences if ours and theirs is None and ours.ends]
+    differences = [pair for pair in differences if not any(d in late for d in pair if d)]
+    if args.timing:
+        for decision in sorted(late, key=_moment_of):
+            side = "shadow" if decision.ends else "real"
+            print(f"{_shown(decision.at)} {decision.who}, timing")
+            print(f"  {side + ':':<7} {decision.words}")
+    for ours, theirs in differences:
+        taken = [decision for decision in (ours, theirs) if decision]
+        print(f"{_shown(min(map(_moment_of, taken)))} {taken[0].who}")
+        print(f"  shadow: {ours.words if ours else '(nothing)'}")
+        print(f"  real:   {theirs.words if theirs else '(nothing)'}")
+    summary = f"{len(differences)} differ" if differences else "none differs"
+    if late:
+        summary += f"; {len(late)} came due between a shadow tick and the real one"
+    if cut:
+        summary += f"; {len(cut)} beside a shadow tick cut short or skipped not compared"
+    if unpaired:
+        summary += f"; {len(unpaired)} with no shadow tick beside them not compared"
+    print(f"{compared} decisions compared from {_shown(start)} to {_shown(end)}: {summary}")
+    return 1 if differences else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

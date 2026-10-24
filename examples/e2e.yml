@@ -1,0 +1,90 @@
+# Install as workflows.e2e. tools/ci-plan also returns browser_files and browser_total;
+# it keeps the repository's existing browser selector and path filters in every event mode.
+name: E2E
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  plan:
+    name: "E2E: what to run"
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    outputs:
+      needed: ${{ steps.selection.outputs.needed }}
+      files: ${{ steps.selection.outputs.files }}
+      prefix_only: ${{ steps.deferred.outputs.prefix_only || '[]' }}
+      inherited: ${{ steps.inherited.outputs.inherited || '[]' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: The existing browser selection
+        id: selection
+        run: |
+          tools/ci-plan > "$RUNNER_TEMP/selection.json"
+          echo "needed=$(jq -c '.needed | index("browser_whole") != null' "$RUNNER_TEMP/selection.json")" >> "$GITHUB_OUTPUT"
+          echo "files=$(jq -c '.browser_files' "$RUNNER_TEMP/selection.json")" >> "$GITHUB_OUTPUT"
+      - name: Defer the whole suite only for a pull request
+        id: deferred
+        if: steps.selection.outputs.needed == 'true'
+        run: python3 scripts/workflow/ci_proof.py prefix-only --needed browser_whole
+      - name: The notes the gate reads
+        env:
+          DEFERRED: ${{ steps.deferred.outputs.prefix_only || '[]' }}
+          NEEDED: ${{ steps.selection.outputs.needed }}
+        run: |
+          if [[ $NEEDED != true ]]; then
+            python3 scripts/workflow/ci_proof.py notes --none browser_suite
+          elif jq -e 'index("browser_whole") != null' <<< "$DEFERRED" >/dev/null; then
+            ran=$(jq '.browser_files | length' "$RUNNER_TEMP/selection.json")
+            total=$(jq '.browser_total' "$RUNNER_TEMP/selection.json")
+            python3 scripts/workflow/ci_proof.py notes --selected browser_suite "$ran" "$total" files
+          else
+            python3 scripts/workflow/ci_proof.py notes --whole browser_suite
+          fi
+      - name: Browser tests main inherits on the identical tree
+        id: inherited
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/workflow/ci_proof.py inherited e2e
+  browser:
+    name: playwright
+    needs: plan
+    if: >-
+      ${{ needs.plan.outputs.needed == 'true'
+      && !contains(fromJSON(needs.plan.outputs.inherited), 'playwright') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Whole on scratch and main, selected on a deferred PR
+        env:
+          DEFERRED: ${{ needs.plan.outputs.prefix_only }}
+          FILES: ${{ needs.plan.outputs.files }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          selected = 'browser_whole' in json.loads(os.environ['DEFERRED'])
+          files = json.loads(os.environ['FILES'])
+          if not selected or files:
+              subprocess.run(['tools/browser-tests', *files] if selected else ['tools/browser-tests'], check=True)
+          PY
