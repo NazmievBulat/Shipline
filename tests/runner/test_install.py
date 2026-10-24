@@ -1,17 +1,11 @@
-"""`install.sh` installs a machine with no ordinary slot of its own when another machine takes its
-pull request jobs, and writes the machine's own memory cap of one ordinary job."""
+"""`install.sh` installs a machine with no ordinary slot of its own when the pool has another
+machine to take its pull request jobs, and writes the machine's own memory cap of one ordinary
+job."""
 
 from pathlib import Path
 
 import pytest
-from slot_stand_ins import (
-    ORDINARY_UNIT,
-    OTHER,
-    SHARED_JOB_MEMORY,
-    SPARE_UNIT,
-    Machine,
-    make_machine,
-)
+from slot_stand_ins import ORDINARY_UNIT, SHARED_JOB_MEMORY, SPARE_UNIT, Machine, make_machine
 
 
 @pytest.fixture
@@ -19,10 +13,8 @@ def machine(tmp_path: Path) -> Machine:
     return make_machine(tmp_path)
 
 
-def test_a_machine_whose_jobs_go_to_another_machine_installs_with_no_ordinary_slot(
-    machine: Machine,
-) -> None:
-    machine.settle(slots=0, jobs_on=OTHER)
+def test_a_machine_of_a_pool_of_several_installs_with_no_ordinary_slot(machine: Machine) -> None:
+    machine.settle(slots=0)
 
     done = machine.install()
 
@@ -32,27 +24,13 @@ def test_a_machine_whose_jobs_go_to_another_machine_installs_with_no_ordinary_sl
     assert ORDINARY_UNIT not in enabled
 
 
-def test_a_machine_with_no_ordinary_slot_and_no_other_machine_for_its_jobs_is_refused(
-    machine: Machine,
-) -> None:
-    machine.settle(slots=0)
+def test_the_only_machine_of_the_pool_is_refused_with_no_ordinary_slot(machine: Machine) -> None:
+    machine.settle(slots=0, alone=True)
 
     done = machine.install()
 
     assert done.returncode != 0
     assert "There must be at least 1 ordinary runner" in done.stderr
-    assert machine.calls("systemctl") == []
-
-
-def test_a_machine_whose_jobs_go_to_a_machine_outside_the_pool_is_refused(
-    machine: Machine,
-) -> None:
-    machine.settle(slots=0, jobs_on="machine-elsewhere")
-
-    done = machine.install()
-
-    assert done.returncode != 0
-    assert "machine-elsewhere" in done.stderr
     assert machine.calls("systemctl") == []
 
 
