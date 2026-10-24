@@ -288,8 +288,6 @@ def test_real_codex_and_bridge_are_started_and_stopped_together(real_tmux: Workf
 
 # Environment prerequisite: a user's systemd that makes scopes; CI's runners have none.
 @pytest.mark.skipif(not _has_user_scopes(), reason="no user systemd to make scopes")  # noqa: TID251
-# The real kernel and systemd, which other tests' sessions and runs share.
-@pytest.mark.serial
 def test_a_runaway_test_run_is_stopped_at_its_session_limit_and_the_others_go_on(
     real_tmux: Workflow,
 ) -> None:
