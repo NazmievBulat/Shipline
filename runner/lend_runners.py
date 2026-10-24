@@ -49,6 +49,12 @@ class Labels:
     first: str
     main: str
 
+    @property
+    def main_batch(self) -> str:
+        """The merge line's lane on main's runners: the merge gate's first run of a prefix asks
+        for it (examples/ci.yml) when the planner reads here that a runner carries it free."""
+        return f"{self.main}-batch"
+
 
 @dataclass(frozen=True)
 class Registration:
@@ -198,10 +204,38 @@ def main_waiting(api: Api, repository: str, labels: Labels) -> bool:
         *_active(api, f"{dispatched}in_progress"),
     ]
     return any(
-        labels.main in job["labels"]
+        labels.main in job["labels"] or labels.main_batch in job["labels"]
         for run in runs
         for job in _jobs_under_way(api, repository, run)
     )
+
+
+def main_queued(api: Api, repository: str, labels: Labels) -> bool:
+    """A job of a push to main waits for one of main's runners."""
+    return any(
+        labels.main in job["labels"] and job["status"] == "queued"
+        for run in _active(
+            api, f"repos/{repository}/actions/runs?event=push&branch=main&per_page=10"
+        )
+        for job in _jobs_under_way(api, repository, run)
+    )
+
+
+def lane(
+    runners: list[Registration], labels: Labels, *, main_queued: bool
+) -> list[tuple[str, int, str]]:
+    """The label changes that keep main's place on its runners: each idle online main runner
+    carries the merge line's lane while no push to main waits, and loses it while one does, so
+    a prefix's job never takes a runner ahead of main's. A busy runner is never relabelled."""
+    changes: list[tuple[str, int, str]] = []
+    for runner in runners:
+        if labels.main not in runner.labels or not runner.online or runner.busy:
+            continue
+        if main_queued and labels.main_batch in runner.labels:
+            changes.append(("remove", runner.id, labels.main_batch))
+        elif not main_queued and labels.main_batch not in runner.labels:
+            changes.append(("add", runner.id, labels.main_batch))
+    return changes
 
 
 class First:
@@ -419,8 +453,10 @@ def round_once(
         if labels.main not in runner.labels or runner.name.startswith(own)
     ]
     waiting = main_waiting(api, repository, labels)
+    queued = main_queued(api, repository, labels)
     changes = lending(runners, labels, main_waiting=waiting, first_waiting=first_waiting, most=most)
-    for change, runner, label in changes:
+    lane_changes = lane(runners, labels, main_queued=queued)
+    for change, runner, label in changes + lane_changes:
         if change == "add":
             api(
                 "-X",
@@ -458,6 +494,21 @@ def round_once(
         )
         for runner in runners
     )
+    # The merge gate's first run of a prefix takes the lane only while one is free (the planner
+    # reads this: `ci_proof.py main-lane`), so it never waits on main's runners.
+    batch_free = sum(
+        labels.main in runner.labels
+        and runner.online
+        and not runner.busy
+        and (
+            ("add", runner.id, labels.main_batch) in lane_changes
+            or (
+                labels.main_batch in runner.labels
+                and ("remove", runner.id, labels.main_batch) not in lane_changes
+            )
+        )
+        for runner in runners
+    )
     # The planner reads this; an old copy means nobody labels runners for the first member.
     # Readable by the planner's container, whose user is not this one.
     # Serialize with the gate's identity update. A round that read the old first member
@@ -473,6 +524,7 @@ def round_once(
                 **record,
                 "free": free,
                 "first_free": first_free,
+                "batch_free": batch_free,
                 "updated_at": datetime.now(UTC).isoformat(),
             },
             0o644,

@@ -3,12 +3,16 @@
 # repository's own tests (`commands.test`), and the check that sums them up. The job names are
 # the defaults of shipline.json's `checks`; a repository that names others names its jobs so.
 #
-# Every job runs on GitHub's own runners, except when the repository has a runner pool and turns
-# main's runners on with the repository variable `CI_MAIN_RUNNER` set to `on`: then a push to
-# main, and the merge gate's dispatch on a scratch branch of its own, run on main's runners, so a
-# prefix of the merge line never waits behind pull requests' own CI. Each job names that choice:
-# `refs/heads/` and `merge.scratch_prefix`, and main's label, `<runner.label>-main` (here the
-# defaults, `<runner.prefix>-home` with the runner prefix `example-app`).
+# Every job runs on GitHub's own runners, the ordinary choice, except when the repository has a
+# runner pool and turns main's runners on with the repository variable `CI_MAIN_RUNNER` set to
+# `on`. Then a push to main runs on main's runners, `<runner.label>-main`. The merge gate's first
+# run of a prefix, its dispatch on a scratch branch of its own (`merge.scratch_prefix`), runs in
+# the merge line's lane on them, `<runner.label>-main-batch`, when its planner finds one of them
+# free there, so a prefix never waits behind pull requests' own CI; else, and on any re-run,
+# it takes the ordinary choice, so it never waits on main's runners either. Main's runners carry
+# the lane only while no push to main waits (runner/lend_runners.py), so main keeps its place.
+# The labels here are the defaults, `<runner.prefix>-home` with the runner prefix `example-app`;
+# a repository with a pool puts its own choice where this says `ubuntu-latest`.
 #
 # The choice keeps every other run of this workflow, a pull request's among them, off main's
 # runners, but not a branch's own copy of the workflow: a scratch run runs the merge line's
@@ -47,9 +51,9 @@ jobs:
     name: "CI: what to run"
     # Skipped while the pull request is a draft; the jobs after it are skipped by their own check.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # A push to main on main's runners; the planner of every other run on the ordinary choice.
     runs-on: >-
-      ${{ vars.CI_MAIN_RUNNER == 'on' && (github.event_name == 'push' && github.ref == 'refs/heads/main'
-      || github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-'))
+      ${{ vars.CI_MAIN_RUNNER == 'on' && github.event_name == 'push' && github.ref == 'refs/heads/main'
       && fromJSON('["self-hosted", "example-app-home-main"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
@@ -59,6 +63,7 @@ jobs:
       checks: read
     outputs:
       inherited: ${{ steps.inherited.outputs.inherited || '[]' }}
+      main_lane: ${{ steps.lane.outputs.main_lane || 'false' }}
     steps:
       # On a pull request this is GitHub's merge of it into main: the merge the gate checks.
       - uses: actions/checkout@v5
@@ -71,6 +76,16 @@ jobs:
         # Every run runs the whole suite; a repository that runs a selection notes it with
         # `--selected server_tests N M files`, and one that needs none with `--none`.
         run: python3 scripts/workflow/ci_proof.py notes --whole server_tests
+      # The merge gate's first run of a prefix takes the merge line's lane on main's runners only
+      # when the pool's lender notes one of them online and idle with it (`ci_proof.py
+      # main-lane`). Only the pool's planner runner sees that note: elsewhere the lane is never
+      # taken.
+      - name: Whether the prefix takes main's lane
+        id: lane
+        if: >-
+          vars.CI_MAIN_RUNNER == 'on' && github.event_name == 'workflow_dispatch'
+          && github.run_attempt == '1' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-')
+        run: python3 scripts/workflow/ci_proof.py main-lane
       # A squash the gate made carries its proof: main skips a job that passed, whole, on the
       # identical tree, and names the run it inherited. Any other push runs everything.
       - name: The jobs main inherits from its squash's proof
@@ -89,10 +104,13 @@ jobs:
     if: >-
       ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
       && !contains(fromJSON(needs.plan.outputs.inherited), 'CI: server tests') }}
+    # A push to main on main's runners; the gate's first run of a prefix in the merge line's lane
+    # when its planner found it free; every other run on the ordinary choice.
     runs-on: >-
       ${{ vars.CI_MAIN_RUNNER == 'on' && (github.event_name == 'push' && github.ref == 'refs/heads/main'
-      || github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-'))
-      && fromJSON('["self-hosted", "example-app-home-main"]') || 'ubuntu-latest' }}
+      && fromJSON('["self-hosted", "example-app-home-main"]') || github.run_attempt == '1'
+      && needs.plan.outputs.main_lane == 'true' && fromJSON('["self-hosted", "example-app-home-main-batch"]'))
+      || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
@@ -112,10 +130,13 @@ jobs:
     # Skipped with the others on a draft: a skipped result is no pass to the merge gate.
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     needs: [plan, tests]
+    # A push to main on main's runners; the gate's first run of a prefix in the merge line's lane
+    # when its planner found it free; every other run on the ordinary choice.
     runs-on: >-
       ${{ vars.CI_MAIN_RUNNER == 'on' && (github.event_name == 'push' && github.ref == 'refs/heads/main'
-      || github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-'))
-      && fromJSON('["self-hosted", "example-app-home-main"]') || 'ubuntu-latest' }}
+      && fromJSON('["self-hosted", "example-app-home-main"]') || github.run_attempt == '1'
+      && needs.plan.outputs.main_lane == 'true' && fromJSON('["self-hosted", "example-app-home-main-batch"]'))
+      || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Every job that ran passed

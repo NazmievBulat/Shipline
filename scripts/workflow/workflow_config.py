@@ -236,6 +236,12 @@ class Runner:
         """The label of main's runners; None without a runner pool."""
         return None if self.label is None else f"{self.label}-main"
 
+    @property
+    def main_batch_label(self) -> str | None:
+        """The merge line's lane on main's runners, which they carry while no push to main
+        waits (runner/lend_runners.py); None without a runner pool."""
+        return None if self.label is None else f"{self.label}-main-batch"
+
 
 @dataclass(frozen=True)
 class Merge:
@@ -568,13 +574,14 @@ def _from_runner_settings(main: Path) -> str | None:
 def runner_labels(label: str, planner_label: str | None = None) -> tuple[str, ...]:
     """The labels every machine's runners carry, so GitHub gives a job to whichever machine has
     one free: the base label, a spare's before it takes a slot, the merge train's first
-    member's, main's runners', the Docker runners' and the planner's, `<label>-planner` unless
-    the file names another."""
+    member's, main's runners', the merge line's lane on them, the Docker runners' and the
+    planner's, `<label>-planner` unless the file names another."""
     return (
         label,
         f"{label}-standby",
         f"{label}-first",
         f"{label}-main",
+        f"{label}-main-batch",
         f"{label}-docker",
         planner_label or f"{label}-planner",
     )

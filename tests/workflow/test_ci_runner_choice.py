@@ -1,8 +1,10 @@
-"""Where each job of the example workflows runs (examples/ci.yml, examples/e2e.yml): the merge
-gate's scratch runs and a push to main on main's runners when the repository turns them on
-(`vars.CI_MAIN_RUNNER == 'on'`), so a prefix never waits behind pull requests' own CI; every
-other run on GitHub's own runners. Each job's `runs-on` is read from the file and worked out as
-GitHub would (`github_expression.py`)."""
+"""Where each job of the example workflows runs (examples/ci.yml, examples/e2e.yml), when the
+repository turns main's runners on (`vars.CI_MAIN_RUNNER == 'on'`): a push to main on main's
+runners; the merge gate's first run of a prefix in the merge line's lane on them, but only when
+its planner found one free there (`ci_proof.py main-lane`), so a prefix never waits on main's
+runners nor ahead of a push to main; every other run, and every run with the switch off, on the
+ordinary choice, GitHub's own runners in the examples. Each `runs-on` and condition is read from
+the file and worked out as GitHub would (`github_expression.py`)."""
 
 import importlib.util
 import json
@@ -28,15 +30,17 @@ HOSTED = "ubuntu-latest"
 # runner prefix, which has no default itself.
 PREFIX = workflow_config.DEFAULTS["merge"]["scratch_prefix"]
 _EXAMPLE_RUNNER = json.loads((_ROOT / "examples/shipline.json").read_text())["runner"]
-MAIN = [
-    "self-hosted",
-    workflow_config.Runner(
-        labels=(),
-        identity_folder="",
-        prefix=_EXAMPLE_RUNNER["prefix"],
-        label=_EXAMPLE_RUNNER["label"],
-    ).main_label,
-]
+_POOL = workflow_config.Runner(
+    labels=(), identity_folder="", prefix=_EXAMPLE_RUNNER["prefix"], label=_EXAMPLE_RUNNER["label"]
+)
+MAIN = ["self-hosted", _POOL.main_label]
+LANE = ["self-hosted", _POOL.main_batch_label]
+
+
+def _folded(text: str) -> str:
+    if not text.startswith(">-"):
+        return text
+    return " ".join(part.strip() for part in text.splitlines()[1:])
 
 
 def _runs_on(path: Path) -> dict[str, str]:
@@ -46,92 +50,155 @@ def _runs_on(path: Path) -> dict[str, str]:
     for job in re.finditer(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:$|\Z)", jobs, re.M | re.S):
         line = re.search(r"^    runs-on: (>-\n(?:      .*\n)+|[^>\n].*)", job[2], re.M)
         assert line, f"{path.name}: job {job[1]} names no runner"
-        text = line[1]
-        if text.startswith(">-"):
-            text = " ".join(part.strip() for part in text.splitlines()[1:])
-        found[job[1]] = text
+        found[job[1]] = _folded(line[1])
     return found
 
 
-def _github(event: str, ref: str, switch: str | None) -> dict[str, Any]:
+def _lane_step(path: Path) -> str:
+    """The condition of the planner's step that looks for main's lane."""
+    plan = path.read_text().split("\n  plan:\n", 1)[1].split("\n\n  ", 1)[0]
+    step = re.search(
+        r"^      - name: [^\n]*\n(?:        (?!run:).*\n)*?"
+        r"        if: (>-\n(?:          .*\n)+|.*\n)"
+        r"(?:        (?!run:).*\n)*        run: python3 scripts/workflow/ci_proof.py main-lane\n",
+        plan,
+        re.M,
+    )
+    assert step, f"{path.name}: no planner step looks for main's lane"
+    return _folded(step[1].rstrip("\n"))
+
+
+def _github(
+    event: str, ref: str, switch: str | None, attempt: int = 1, lane: str | None = None
+) -> dict[str, Any]:
     return {
-        "github": {"event_name": event, "ref": ref},
+        # GitHub gives the attempt as text.
+        "github": {"event_name": event, "ref": ref, "run_attempt": str(attempt)},
         "vars": {} if switch is None else {"CI_MAIN_RUNNER": switch},
+        "needs": {"plan": {"outputs": {} if lane is None else {"main_lane": lane}}},
     }
 
 
 _BATCH = f"refs/heads/{PREFIX}0123456789abcdef0123456789abcdef"
+_DISPATCH = "workflow_dispatch"
 
-# (event, ref, the switch, where every job runs)
+# (event, ref, the switch, the attempt, the planner's `main_lane`, where the planner runs,
+# where every other job runs)
 _CASES = {
-    "a merge-line dispatch": ("workflow_dispatch", _BATCH, "on", MAIN),
-    "a push to main": ("push", "refs/heads/main", "on", MAIN),
-    "a pull request": ("pull_request", "refs/pull/7/merge", "on", HOSTED),
-    "a manual dispatch on another branch": (
-        "workflow_dispatch",
-        "refs/heads/feature/example",
-        "on",
-        HOSTED,
+    "a merge-line dispatch, main's lane free": (_DISPATCH, _BATCH, "on", 1, "true", HOSTED, LANE),
+    # Main's runners offline, busy, or held for a push to main: the ordinary choice.
+    "a merge-line dispatch, main's lane not free": (
+        _DISPATCH, _BATCH, "on", 1, "false", HOSTED, HOSTED
     ),
-    "a manual dispatch on main": ("workflow_dispatch", "refs/heads/main", "on", HOSTED),
-    "a merge-line dispatch, main's runners off": ("workflow_dispatch", _BATCH, "off", HOSTED),
-    "a merge-line dispatch, no switch": ("workflow_dispatch", _BATCH, None, HOSTED),
-    "a push to main, main's runners off": ("push", "refs/heads/main", None, HOSTED),
-    # Only the gate's own branches: a tag, or a branch that only holds the prefix, is not one.
-    "a dispatch on a tag of the prefix's name": (
-        "workflow_dispatch",
-        f"refs/tags/{PREFIX}0123",
-        "on",
-        HOSTED,
+    # A re-run, of the whole run or of its failed jobs, keeps the planner's first answer: it
+    # takes the ordinary choice, so no attempt but the first can wait on main's runners.
+    "a merge-line re-run": (_DISPATCH, _BATCH, "on", 2, "true", HOSTED, HOSTED),
+    "a merge-line dispatch, main's runners off": (
+        _DISPATCH, _BATCH, "off", 1, "true", HOSTED, HOSTED
     ),
-    "a dispatch on a branch holding the prefix": (
-        "workflow_dispatch",
-        f"refs/heads/old/{PREFIX}0123",
-        "on",
-        HOSTED,
+    "a merge-line dispatch, no switch": (_DISPATCH, _BATCH, None, 1, "true", HOSTED, HOSTED),
+    "a push to main": ("push", "refs/heads/main", "on", 1, None, MAIN, MAIN),
+    "a push to main run again": ("push", "refs/heads/main", "on", 2, None, MAIN, MAIN),
+    "a push to main, main's runners off": (
+        "push", "refs/heads/main", None, 1, None, HOSTED, HOSTED
     ),
-    # A push to a scratch branch is not the gate's dispatch.
-    "a push to a scratch branch": ("push", _BATCH, "on", HOSTED),
+    "a pull request": ("pull_request", "refs/pull/7/merge", "on", 1, None, HOSTED, HOSTED),
+    "a manual dispatch on main": (_DISPATCH, "refs/heads/main", "on", 1, None, HOSTED, HOSTED),
+    "a push to a scratch branch": ("push", _BATCH, "on", 1, None, HOSTED, HOSTED),
 }
 
 
 @pytest.mark.parametrize("path", _EXAMPLES, ids=lambda path: path.name)
 @pytest.mark.parametrize("case", _CASES)
 def test_each_job_runs_where_its_run_belongs(path: Path, case: str) -> None:
-    event, ref, switch, expected = _CASES[case]
+    event, ref, switch, attempt, lane, planner, others = _CASES[case]
     jobs = _runs_on(path)
 
-    assert jobs
+    assert "plan" in jobs and len(jobs) > 1
+    context = _github(event, ref, switch, attempt, lane)
     for job, runner in jobs.items():
-        assert value(runner, _github(event, ref, switch)) == expected, job
+        assert value(runner, context) == (planner if job == "plan" else others), job
+
+
+# (event, ref, the switch, the attempt, whether the planner looks for main's lane)
+_LOOKS = {
+    "the gate's first dispatch": (_DISPATCH, _BATCH, "on", 1, True),
+    "its re-run": (_DISPATCH, _BATCH, "on", 2, False),
+    "the switch off": (_DISPATCH, _BATCH, "off", 1, False),
+    "no switch": (_DISPATCH, _BATCH, None, 1, False),
+    "a pull request": ("pull_request", "refs/pull/7/merge", "on", 1, False),
+    "a push to main": ("push", "refs/heads/main", "on", 1, False),
+    "a push to a scratch branch": ("push", _BATCH, "on", 1, False),
+    "a manual dispatch on another branch": (
+        _DISPATCH, "refs/heads/feature/example", "on", 1, False
+    ),
+    # Only the gate's own branches: a tag, or a branch that only holds the prefix, is not one.
+    "a dispatch on a tag of the prefix's name": (
+        _DISPATCH, f"refs/tags/{PREFIX}0123", "on", 1, False
+    ),
+    "a dispatch on a branch holding the prefix": (
+        _DISPATCH, f"refs/heads/old/{PREFIX}0123", "on", 1, False
+    ),
+}
+
+
+@pytest.mark.parametrize("path", _EXAMPLES, ids=lambda path: path.name)
+@pytest.mark.parametrize("case", _LOOKS)
+def test_the_planner_looks_for_main_s_lane_only_on_the_gate_s_first_dispatch(
+    path: Path, case: str
+) -> None:
+    event, ref, switch, attempt, looks = _LOOKS[case]
+
+    assert bool(evaluate(_lane_step(path), _github(event, ref, switch, attempt))) is looks
 
 
 @pytest.mark.parametrize("path", _EXAMPLES, ids=lambda path: path.name)
 def test_github_reads_the_scratch_prefix_without_its_case(path: Path) -> None:
     """So the examples tell a repository to keep every case of it to the gate's identity."""
     ref = "refs/heads/" + _BATCH.removeprefix("refs/heads/").upper()
-    context = _github("workflow_dispatch", ref, "on")
 
-    for job, runner in _runs_on(path).items():
-        assert value(runner, context) == MAIN, job
+    assert evaluate(_lane_step(path), _github(_DISPATCH, ref, "on"))
     assert "in any case" in path.read_text()
 
 
 @pytest.mark.parametrize("path", _EXAMPLES, ids=lambda path: path.name)
-def test_the_examples_name_the_config_s_default_prefix_and_label(path: Path) -> None:
+def test_a_prefix_falls_back_to_the_repository_s_own_choice(path: Path) -> None:
+    """A repository with a pool puts its own choice where the examples say GitHub's runners:
+    with the lane not free, on a re-run, or with the switch off, a prefix's job takes it."""
+    own = "example-app-home"
+    for job, runner in _runs_on(path).items():
+        assert runner.count(f"'{HOSTED}'") == 1, job
+        copied = runner.replace(f"'{HOSTED}'", f"'{own}'")
+        for attempt, lane, switch in ((1, "false", "on"), (2, "true", "on"), (1, "true", "off")):
+            assert value(copied, _github(_DISPATCH, _BATCH, switch, attempt, lane)) == own, job
+
+
+@pytest.mark.parametrize("path", _EXAMPLES, ids=lambda path: path.name)
+def test_main_and_the_merge_line_ask_for_labels_of_their_own(path: Path) -> None:
+    """Main keeps its place: no prefix job asks for main's label, so a push to main never waits
+    behind one; the lender takes the lane off main's idle runners while a push to main waits."""
     text = path.read_text()
+    named = {
+        job: re.findall(r'"self-hosted", "([^"]+)"', runner)
+        for job, runner in _runs_on(path).items()
+    }
 
     assert _EXAMPLE_RUNNER["label"] == f"{_EXAMPLE_RUNNER['prefix']}-home"
-
     assert f"'refs/heads/{PREFIX}'" in text
-    assert re.findall(r'"self-hosted", "([^"]+)"', text) == [MAIN[1]] * len(_runs_on(path))
+    assert named.pop("plan") == [MAIN[1]]
+    assert named and all(labels == [MAIN[1], LANE[1]] for labels in named.values())
+    assert LANE[1] in _EXAMPLE_RUNNER["labels"]
 
 
 def test_the_rules_say_where_the_gate_s_scratch_runs_run() -> None:
     rules = (_ROOT / "scripts/workflow/RULES.md").read_text()
     prefixes = next(part for part in rules.split("\n\n") if "each as a prefix" in part)
 
-    assert re.search(r"scratch runs use main's runners\s+when the repository has them", prefixes)
+    assert re.search(
+        r"first run of a prefix takes main's runners when the\s+repository has them and one is"
+        r"\s+free",
+        prefixes,
+    )
 
 
 @pytest.mark.parametrize(

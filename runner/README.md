@@ -4,8 +4,9 @@ A repository that uses Shipline can run its CI on its own machines. This folder 
 machine runs:
 - the keepers that register the runners, one fresh container a job (`keep-runner.sh`);
 - the spare and the ordinary slots (`keep-spare.sh`, `ordinary_slots.py`);
-- the lender of main's runners to pull request jobs while main has none (`keep-lending.sh`,
-  `lend_runners.py`);
+- the lender of main's runners to pull request jobs while neither main nor the merge line has a
+  job for them, which also gives them the merge line's lane while no push to main waits
+  (`keep-lending.sh`, `lend_runners.py`);
 - the planner's runner and its state (`keep-planner.sh`, `planner-state.py`);
 - the usage sampler (`sample-usage.sh`, `usage.py`);
 - the firewall that shuts the jobs in (`firewall.sh`, `install-firewall.sh`);
@@ -63,6 +64,7 @@ one free. They come from the base label, `runner.label`, `<prefix>-home` when it
 | `<label>-standby` | an ordinary runner before it takes a slot, the spare among them |
 | `<label>-first` | the slots, and the main runner lent to the merge train's first member |
 | `<label>-main` | main's runners, on the main machine only |
+| `<label>-main-batch` | main's idle runners while no push to main waits: the lane the merge gate's first run of a prefix takes when its planner finds one free (`examples/ci.yml`) |
 | `<label>-docker` | the Docker-capable runners |
 | `runner.planner_label` | the planner's runner; `<label>-planner` when it names none |
 

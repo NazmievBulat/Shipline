@@ -7,6 +7,7 @@ import subprocess
 import sys
 import textwrap
 import urllib.parse
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -701,3 +702,61 @@ def test_a_repository_without_a_test_command_fails_its_test_job_saying_so(
         f"shipline.json names no commands.{command}, "
         f"the command that runs this repository's {tests}\n"
     )
+
+
+def _lane(workflow: Workflow, home: Path, note: str | None) -> subprocess.CompletedProcess[str]:
+    """`main-lane` with the lender's note in `home`, as the pool's planner sees it."""
+    if note is not None:
+        path = home / ".local/state/ci-overflow/home/first.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(note)
+    return _proof(workflow, "main-lane", env={"HOME": str(home), "GITHUB_OUTPUT": ""})
+
+
+def _note(free: object, seconds_ago: float = 5) -> str:
+    at = datetime.now(UTC) - timedelta(seconds=seconds_ago)
+    return json.dumps(
+        {"number": None, "batch": None, "batch_free": free, "updated_at": at.isoformat()}
+    )
+
+
+@pytest.mark.parametrize(
+    "note,lane",
+    [
+        # The lender saw one of main's runners online and idle with the merge line's lane.
+        (_note(1), "true"),
+        (_note(2), "true"),
+        # None free: the prefix takes the ordinary choice and never waits on main's runners.
+        (_note(0), "false"),
+        # An old note: nobody labels main's runners now.
+        (_note(1, seconds_ago=300), "false"),
+        # On GitHub's own runners there is no note; nor is a broken one read as free.
+        (None, "false"),
+        ("{", "false"),
+        (_note("1"), "false"),
+        (_note(True), "false"),
+        (json.dumps({"batch_free": 1}), "false"),
+        (json.dumps({"batch_free": 1, "updated_at": "yesterday"}), "false"),
+        (json.dumps([1]), "false"),
+    ],
+    ids=[
+        "one free",
+        "two free",
+        "none free",
+        "an old note",
+        "no note",
+        "a broken note",
+        "a count as text",
+        "a count as true",
+        "no time",
+        "a time that is none",
+        "not an object",
+    ],
+)
+def test_the_planner_takes_main_s_lane_only_when_the_lender_saw_it_free(
+    workflow: Workflow, tmp_path: Path, note: str | None, lane: str
+) -> None:
+    done = _lane(workflow, tmp_path / "home", note)
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == f"main_lane={lane}\n"

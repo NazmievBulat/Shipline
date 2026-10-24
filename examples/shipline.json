@@ -50,6 +50,7 @@
       "example-app-home-standby",
       "example-app-home-first",
       "example-app-home-main",
+      "example-app-home-main-batch",
       "example-app-home-docker",
       "example-app-home-planner"
     ],

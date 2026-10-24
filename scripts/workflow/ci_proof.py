@@ -30,6 +30,14 @@ everything checks out; whatever cannot be read means every job runs.
 runs the repository's own test command (`commands.test`), or its browser command
 (`commands.browser`), from the root of the checkout it is called in, with the job's arguments
 after it.
+
+    ci_proof.py main-lane
+
+hands on, as the step output `main_lane`, whether the merge gate's first run of a prefix takes
+the merge line's lane on main's runners: only when the runner pool's lender noted, at most
+LANE_SECONDS ago, that one of main's runners is online and idle with it. The pool's planner
+reads that note; on GitHub's own runners there is none, and the prefix takes the ordinary
+choice.
 """
 
 import argparse
@@ -39,6 +47,8 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import workflow_config
@@ -59,6 +69,10 @@ SUITE_JOBS = {
 # The workflows a proof may name, by the gate's own names for them.
 PROVEN = ("ci", "e2e")
 READ_TIMEOUT = 30
+# The lender's note to the pool's planner, in its home (runner/lend_runners.py), and how old it
+# may be: the lender writes it every round, a few seconds apart.
+LANE_NOTE = ".local/state/ci-overflow/home/first.json"
+LANE_SECONDS = 60
 _SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -333,15 +347,40 @@ def _run_command(name: str, args: list[str]) -> int:
     ).returncode
 
 
+def main_lane(home: Path, now: datetime | None = None) -> bool:
+    """Whether the lender noted, at most LANE_SECONDS ago, that one of main's runners is online
+    and idle with the merge line's lane. A missing, old or unreadable note says no."""
+    try:
+        note = json.loads((home / LANE_NOTE).read_text())
+        free = note["batch_free"]
+        age = (now or datetime.now(UTC)) - datetime.fromisoformat(note["updated_at"])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"main's lane is not taken: {error!r}", file=sys.stderr)
+        return False
+    return type(free) is int and free > 0 and 0 <= age.total_seconds() <= LANE_SECONDS
+
+
+def _main_lane(args: list[str]) -> int:
+    argparse.ArgumentParser(prog="ci_proof.py main-lane").parse_args(args)
+    line = f"main_lane={'true' if main_lane(Path.home()) else 'false'}\n"
+    if output := os.environ.get("GITHUB_OUTPUT"):
+        with open(output, "a") as handed:
+            handed.write(line)
+    else:
+        sys.stdout.write(line)
+    return 0
+
+
 def main() -> int:
     commands = {
         "notes": _main_notes,
         "inherited": _main_inherited,
         "test": lambda args: _run_command("test", args),
         "browser": lambda args: _run_command("browser", args),
+        "main-lane": _main_lane,
     }
     if len(sys.argv) < 2 or sys.argv[1] not in commands:
-        print("usage: ci_proof.py notes|inherited|test|browser ...", file=sys.stderr)
+        print("usage: ci_proof.py notes|inherited|test|browser|main-lane ...", file=sys.stderr)
         return 2
     try:
         return commands[sys.argv[1]](sys.argv[2:])

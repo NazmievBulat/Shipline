@@ -225,13 +225,15 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
 def test_main_s_runners_carry_the_runner_label_and_main(
     tmp_path: Path, runner: dict[str, str], main: str | None
 ) -> None:
-    """The label the example workflows name for main's jobs, which the gate may re-run."""
+    """The labels the example workflows name for main's jobs and for the merge line's lane on
+    main's runners, both of which the gate may re-run."""
     repo = _repository(tmp_path)
     _write(repo, {"runner": runner})
     loaded = workflow_config.load(repo).runner
 
     assert loaded.main_label == main
-    assert main is None or main in loaded.labels
+    assert loaded.main_batch_label == (main and f"{main}-batch")
+    assert main is None or {main, f"{main}-batch"} <= set(loaded.labels)
 
 
 def test_the_example_s_main_label_is_one_of_its_runner_labels() -> None:
@@ -240,6 +242,7 @@ def test_the_example_s_main_label_is_one_of_its_runner_labels() -> None:
 
     assert runner["label"] == f"{runner['prefix']}-home"
     assert f"{runner['label']}-main" in runner["labels"]
+    assert f"{runner['label']}-main-batch" in runner["labels"]
 
 
 def test_the_scratch_prefix_is_read_and_must_name_branches_of_the_gate_s_own(
@@ -314,6 +317,7 @@ _LABELS = (
     "example-app-home-standby",
     "example-app-home-first",
     "example-app-home-main",
+    "example-app-home-main-batch",
     "example-app-home-docker",
     "example-app-home-planner",
 )
@@ -339,6 +343,7 @@ def test_a_named_runner_label_builds_the_labels(tmp_path: Path) -> None:
         "example-pool-standby",
         "example-pool-first",
         "example-pool-main",
+        "example-pool-main-batch",
         "example-pool-docker",
         "example-pool-planner",
     )
