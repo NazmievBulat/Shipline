@@ -73,6 +73,16 @@ job the pull request skipped, which main always runs, waits for main's own succe
 nothing merges meanwhile, so no later push cancels that run. The squash commit carries the
 gate's proof (a `Workflow-Proof` line): main's CI and E2E skip a job that line shows passed,
 whole, on the identical tree, and name the run they inherited.
+`checks.prefix_only` in `shipline.json` lists the groups `images` (the image workflow's jobs),
+`browser_whole` (E2E's `playwright` job) and `server_whole` (CI's `CI: server tests` job).
+For a listed group, a pull request's ready, push and refresh runs keep the fast checks and
+the tests selected by its change; the whole group runs only on its prefix or, for a first
+member merging alone, the gate's scratch branch. The gate waits for that scratch proof,
+records it in the squash and lets main inherit it on the identical tree, including image jobs.
+A group the path filters need none of runs nowhere; an absent or empty list keeps the usual
+checks. The wake reports the previous UTC day's runner minutes saved once a day: each
+merged pull request's proven scratch group job minutes times its own CI runs whose planner
+recorded that group as deferred, with reruns of the same run counted once.
 Main's other checks still run, and any failure makes main red as before. A push to main the
 gate did not make runs everything. A different tree waits for main's own checks, then the
 gate is called again; a stale pull request is refreshed meanwhile. The tick reports a red, advisory or unreadable main in the
@@ -87,16 +97,26 @@ as medium, and one with several as the most urgent of them. The fix of a red mai
 update included, counts as a blocker whatever its label, and goes before every other blocker.
 
 Ready pull requests merge in queue order, in a merge train: by priority first (blocker, high,
-medium, low), then in the order they joined within one priority. A pull request whose priority
+medium, low), then in the order they joined within one priority. Members of one priority whose
+changes touch the same hot path that `shipline.json` names (`hot_paths`) are served back to
+back, at the place of the earliest of them, so a later one is refreshed once on the earlier
+one's squash; a hot path never moves a member past another priority. A pull request whose priority
 label changes while it waits moves at the next turn. The gate tests the first members of
 the line at once, each as a prefix: main and every member ahead of it, merged with this one,
 on a scratch branch of its own, with its CI, the whole browser suite's E2E run and any
-required image checks. How many it tests, the window, starts at 4, grows by one after each
+required image checks. A scratch CI or E2E job asking for `<label>-main-batch` that queues
+longer than `merge_train.queued_limit_minutes` (default 20) has its first attempt cancelled
+and its whole run re-run once, so attempt 2 takes the ordinary runner choice; a job past the
+limit on a later attempt is reported once in the gate's output and wake, and keeps waiting.
+Image jobs and jobs outside that lane do not trigger this retry; the gate remembers the
+recovery across restarts, and `--train-status` shows it with the prefix.
+How many it tests, the window, starts at 4, grows by one after each
 merge and halves after a failed prefix, never below 1 and never above 4 (`WINDOW_CEILING` in
 `scripts/workflow/merge_gate.py`). A member merges as soon as its own prefix passed and every
 member ahead of it merged; its squash must match its prefix's tree, and main inherits that
 prefix's green result. A first member whose own CI tested its merge with the current main
-merges by its own checks and needs no prefix. Each member must still have a passed review
+merges by its own checks; any listed `checks.prefix_only` groups must first pass on its
+prefix or the gate's scratch run. Each member must still have a passed review
 and a gate call on its current head. A member whose prefix failed once every member ahead of
 it merged is blocked as a failed check, and its own gate call reports it; the prefixes behind
 it hold its change, so they are built again from the new front without it, and their failure
@@ -121,8 +141,8 @@ Calling the gate says that the
 review passed, and puts the pull request at the back of its priority in the line; the line is
 kept in `.local/workflow/merge-train.json` of the main checkout, and
 `merge-when-current --train-status` shows the first, the waiting in the order served, the
-blocked, each member's priority, the turn, the window and each member's prefix with the state
-of its runs.
+blocked, each member's priority, the hot path that served a member beside another (with hot
+paths named), the turn, the window and each member's prefix with the state of its runs.
 The first eligible member refreshes or merges; when its checks are still running or queued,
 later members with green checks tested on current main may go first, including by a prefix,
 while it keeps its place and regains priority when green. A pull request keeps its place but
@@ -538,8 +558,14 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
 
 ## "Review conflict resolution for pull request N extending passed head H in files F"
 
-The tick starts this fresh Claude Opus reviewer at high effort only after a non-mechanical
-conflict on a handed-off pull request with a passed independent round on H. F names every
+The tick starts this fresh reviewer only after a non-mechanical conflict on a handed-off pull
+request with a passed independent round on H: Claude Opus at high effort, or the effort and
+model `conflict_review` in `shipline.json` names when both sides of every conflicting hunk
+together are at most its `max_changed_lines` lines. For that cheaper reviewer, a resolution
+that writes more lines than that in F, changes another file or lines outside the hunks, and any
+full-review fallback, are the usual reviewer's: when the gate refuses the handoff for it, end
+with `review finished` and the tick starts the usual reviewer, which reviews the pushed
+resolution. F names every
 unmerged file in the kept worktree. Read the task, the earlier passed round on H, and the
 current rules from main. The earlier round stands for everything the resolution does not
 touch; do not repeat its whole-change review.
@@ -911,7 +937,10 @@ The orchestrator session does what needs judgment:
   record: a pull request only waiting in the merge train is not running), that is based on
   `main`, and that no line of
   `.local/workflow/start-plan` in the main checkout holds back, so tickets that touch the same
-  files run one after another. It gets the label `workflow`,
+  files run one after another. A ticket whose files match a hot path of `shipline.json`
+  (`hot_paths`) also waits while another ticket matching the same one runs, a pull request
+  waiting in the merge train counting as running then, with or without a session; the wake
+  says so as `<N> waits: hot path <path> with <M>`. It gets the label `workflow`,
   and the worker starts as for any labelled draft. At most one a tick, and only when memory
   and the load have been under the ceilings of `session start` for 10 minutes, nothing started
   in the last 5, and the 5-hour usage window allows starts (as in the check-in rule below).

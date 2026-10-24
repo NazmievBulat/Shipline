@@ -1163,7 +1163,9 @@ def test_each_shadow_tick_marks_its_run_and_the_train_status_when_it_changes(
 
     lines = _shadow_log(workflow).read_text().splitlines()
     assert lines[0] == f"{_NOW} shadow tick"
-    assert lines[1].startswith(f'{_NOW} train status: {{"main": null, "first": null, "waiting": []')
+    assert lines[1].startswith(
+        f'{_NOW} train status: {{"main": null, "first": null, "prefix_only": [], "waiting": []'
+    )
     assert lines[2:] == [f"{_NOW + 180} shadow tick"]
 
 

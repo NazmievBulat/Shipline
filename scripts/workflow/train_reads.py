@@ -97,6 +97,7 @@ class Reads:
                 "main": self.base,
                 "head": head,
                 "checks": member.get("statusCheckRollup"),
+                "prefix_only": workflow_config.current().checks.prefix_only,
             }
         )
         rollup = member.get("statusCheckRollup") or []
@@ -164,6 +165,12 @@ class Reads:
             ):
                 self.previous[path] = {"token": token, "value": value}
         return value
+
+    def invalidate(self) -> None:
+        """A cancel or retry may have changed GitHub even when its response was lost."""
+        self.responses.clear()
+        if self.tick:
+            save(self.tick / "api.json", {})
 
     def finish(self) -> None:
         tokens = set(self.tokens.values())
