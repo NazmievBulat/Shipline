@@ -162,7 +162,10 @@ def heading_files(body: str) -> list[str]:
 
 def model_files(body: str, main: Path) -> list[str] | None:
     """Ask the model once; None when it gave no path."""
-    folders = git(main, "ls-tree", "-r", "-d", "--name-only", "HEAD")
+    try:
+        folders = git(main, "ls-tree", "-r", "-d", "--name-only", "HEAD")
+    except OSError:
+        return None
     question = (
         f"The directories of the repository:\n{folders}\n\n"
         f"The description of the change, between the lines of dashes:\n----------\n{body}\n"
@@ -418,7 +421,11 @@ def train_numbers(notes: Path) -> set[str]:
 def machine_wait(notes: Path, moment: int) -> str | None:
     """Why the machine holds a start now, or None. Counts the minutes of room as it goes."""
     room = subprocess.run(
-        ["bash", str(here / "session"), "room"], capture_output=True, text=True, check=False
+        ["bash", str(here / "session"), "room"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=GIT_SECONDS,
     )
     record = notes / "room"
     try:

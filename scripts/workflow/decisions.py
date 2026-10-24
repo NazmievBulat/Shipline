@@ -73,7 +73,7 @@ from typing import Any
 
 import priority
 import workflow_config
-from github_budget import call
+from github_budget import Limited, call
 
 KINDS = ("start", "hold", "answer", "allowance", "hand-back", "restart", "program")
 # The heading of RULES.md each kind follows.
@@ -402,10 +402,11 @@ def check_start(context: Context, number: int, after: int | None, owner: str | N
     import ticket_starts
 
     pull = context.pull(number)
-    if not pull.get("isDraft"):
-        raise Refused(f"{number} is not a draft")
+    # Before the draft check: a started ticket its worker marked ready is started all the same.
     if LABEL in labels_of(pull):
         raise AlreadyStarted(f"already started: {number} has the label {LABEL}")
+    if not pull.get("isDraft"):
+        raise Refused(f"{number} is not a draft")
     names = CONFIG.labels.priority
     if not any(names[name] in labels_of(pull) for name in priority.PRIORITIES):
         raise Refused(f"{number} has no priority label")
@@ -929,6 +930,9 @@ if __name__ == "__main__":
     except Failed as error:
         print(f"decide: {error}", file=sys.stderr)
         sys.exit(3)
+    except Limited:
+        print("decide: the GitHub budget is low; nothing new was decided", file=sys.stderr)
+        sys.exit(75)
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
         print(f"decide: {error}", file=sys.stderr)
         sys.exit(3)

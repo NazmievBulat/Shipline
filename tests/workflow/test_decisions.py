@@ -875,7 +875,7 @@ def test_a_stalled_fetch_ends_the_decision_as_files_not_known(team: Workflow) ->
         "git",
         "#!/bin/bash\n"
         'for word in "$@"; do [ "$word" = fetch ] && { echo x >> "@STATE@/fetches"; '
-        "/usr/bin/sleep 300; }; done\n"
+        "exec /usr/bin/sleep 300; }; done\n"
         f'exec {real} "$@"\n',
     )
     started = time.monotonic()
@@ -898,3 +898,15 @@ def test_owner_words_left_blank_are_no_word_of_his(team: Workflow) -> None:
 
     assert done.returncode == 1
     assert "only the owner answers" in done.stderr
+
+
+def test_a_start_again_of_a_started_ticket_marked_ready_is_told_as_already_started(
+    team: Workflow,
+) -> None:
+    _ticket(team, 8, "docs/two", draft=False, labels=("workflow", "priority:+medium"))
+
+    again = _decide(team, "start", "8")
+
+    assert again.returncode == 1
+    assert "already started: 8 has the label workflow" in again.stderr
+    assert _records(team)[-1]["details"] == {"already_started": True}
