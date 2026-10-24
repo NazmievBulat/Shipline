@@ -308,15 +308,16 @@ pull request's comments every three minutes instead. The tick relays the reports
 model: a final question rings the phone once through `notify` and appears in the wake as `asking
 the owner: cloud-N`; a `Blocked` report is told to the orchestrator once. A question marked
 `Owner only: no` with no answer after `answer_for_owner_after_minutes` gets its recommended
-reply as in "Asking the owner", once, in a comment of the tick, `<!-- shipline-orchestrator -->
-answered for the owner: <reply word>`, quoting that choice's line, and its worker is woken as
-after any answer. An answer from the owner or the orchestrator that comes first wins, and only a
-question from an account that may write to the repository is answered. One without the line, or
-without a reply word, waits for the owner and is named in the wake once; the morning check-in
-lists the answers. A final `worker finished` removes the record only once the pull request is
-ready, letting the normal independent review start. Reports and failed deliveries are remembered
-locally. The workflow does not read cloud transcripts or stop cloud sessions; the owner answers
-in the cloud session or on the pull request.
+reply as in "Asking the owner", once for the same words, in a comment of the tick,
+`<!-- shipline-orchestrator --> answered for the owner: <reply word>`, quoting that choice's line
+when it has one, and its worker is woken as after any answer. An answer from the owner or the
+orchestrator that comes first wins, and only a question from an account that may write to the
+repository is answered. One without the line, or without a reply word, waits for the owner and
+is named in the wake once; the morning check-in lists the answers. A final `worker finished`
+removes the record only once the pull request is ready, letting the normal independent review
+start. Reports and failed deliveries are remembered locally. The workflow does not read cloud
+transcripts or stop cloud sessions; the owner answers in the cloud session or on the pull
+request.
 
 A cloud session that ends its turn stays stopped until something types into it. The tick keeps,
 in each record, when it first saw the draft's head and the time of the last report. A worker

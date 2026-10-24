@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -48,12 +49,19 @@ LIMIT_LINE = re.compile(r"^\s*(?:⎿|●)?\s*You.{1,3}ve hit your (?:[A-Za-z0-9-
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 # A question's line `Owner only: yes` or `Owner only: no`, and the first reply word after it,
 # read as the stop hook reads a local session's question (`notify`, `question_of`).
-OWNER_ONLY = re.compile(r"[\s>*_`-]*owner only:[\s*_`]*(yes|no)[\s*_`.!]*", re.IGNORECASE)
+# Python's `\s` also takes \x1c-\x1f, which jq's does not.
+SPACE = r"[^\S\x1c-\x1f]"
+OWNER_ONLY = re.compile(
+    rf"(?:{SPACE}|[>*_`-])*owner only:(?:{SPACE}|[*_`])*(yes|no)(?:{SPACE}|[*_`.!])*",
+    re.IGNORECASE,
+)
 REPLY = re.compile(
-    r"""(?:^|[\W\d_])(?:reply|type|write|answer|say|choose)(?:\s+with)?\s+[*_]*"""
+    rf"""(?:^|[\W\d_])(?:reply|type|write|answer|say|choose)(?:{SPACE}+with)?{SPACE}+[*_]*"""
     r"""(?:"([^"\n]+)"|“([^”\n]+)”|`([^`\n]+)`|([0-9]+)(?![^\W_]))""",
     re.IGNORECASE,
 )
+# How the tick's answer for the owner begins.
+ANSWERED_FOR_OWNER = f"{ORCHESTRATOR} answered for the owner: "
 
 
 def _write(path: Path, value: dict[str, object]) -> None:
@@ -259,7 +267,8 @@ def _question(body: str) -> tuple[str, str, str]:
     line, then the first reply word after it, digits or quoted words, on one line of at most 60
     characters that starts with a letter or a digit; without one the reply is empty. The choice's
     line is the nearest line above `Owner only:` that begins with the reply, or empty."""
-    lines = _without_attribution(body).splitlines()
+    # Lines as jq splits them: at a newline only.
+    lines = _without_attribution(body).split("\n")
     owner = [
         (at, match[1].lower())
         for at, line in enumerate(lines)
@@ -270,11 +279,35 @@ def _question(body: str) -> tuple[str, str, str]:
     at, value = owner[-1]
     found = REPLY.search("\n".join(lines[at + 1 :])) if value == "no" else None
     reply = next(group for group in found.groups() if group) if found else ""
-    if len(reply) > 60 or not re.match(r"[^\W_]", reply) or re.search(r"[\x00-\x1f\x7f]", reply):
+    if (
+        len(reply) > 60
+        or not re.match(r"[^\W_]", reply)
+        or re.search(r"[\x00-\x1f\x7f-\x9f]", reply)
+    ):
         return value, "", ""
-    begins = re.compile(rf"""[\s>*_•-]*[("'“`]?{re.escape(reply)}(?![^\W_])""")
+    begins = re.compile(rf"""(?:{SPACE}|[>*_•-])*[("'“`]?{re.escape(reply)}(?![^\W_])""")
     line = next((line.strip() for line in reversed(lines[:at]) if begins.match(line)), "")
     return value, reply, line
+
+
+def _words(body: str) -> str:
+    """What a question says, as the mark of an answer given for the owner: the same words asked
+    again after it wait for him, as a local session's do."""
+    return hashlib.sha256(_without_attribution(body).strip().encode()).hexdigest()
+
+
+def _answered_for_owner(
+    notes: Path, path: Path, record: dict[str, object], reply: str, at: int
+) -> None:
+    """Notes an answer posted for the owner: in the record, for the wake's check-in, which lists
+    them so the owner can overrule them, and in the wake's log."""
+    record["answered_for_owner"] = _words(str(record["message"]))
+    _write(path, record)
+    (notes / f"{path.name}.asking").unlink(missing_ok=True)
+    answered = notes / "answered-for-owner.pending"
+    answered.mkdir(exist_ok=True)
+    _write(answered / f"{at}-{path.name}.json", {"name": path.name, "reply": reply, "at": at})
+    _log(f'answered for the owner: {path.name}, "{reply}"')
 
 
 def _answer_for_owner(
@@ -292,7 +325,7 @@ def _answer_for_owner(
     an answer goes at once."""
     question = record["last_comment_id"]
     minutes = workflow_config.current().answer_for_owner_after_minutes
-    if record.get("answered_for_owner") == question or not minutes:
+    if record.get("answered_for_owner") == _words(str(record["message"])) or not minutes:
         return
     asked = next((comment for comment in comments if comment["id"] == question), None)
     # Anyone can comment on a public pull request, the marker included.
@@ -322,7 +355,7 @@ def _answer_for_owner(
         comment["id"] > question and str(comment["body"]).startswith(MARKER) for comment in fresh
     ):
         return
-    text = f"{ORCHESTRATOR} answered for the owner: {reply}" + (f"\n\n> {line}" if line else "")
+    text = ANSWERED_FOR_OWNER + reply + (f"\n\n> {line}" if line else "")
     posted = call(
         "cloud-workers",
         "api",
@@ -334,16 +367,12 @@ def _answer_for_owner(
         "--jq",
         ".id",
     )
+    if posted.returncode:
+        _log(f"{path.name} answer for the owner failed: {posted.stderr.strip()}")
     posted.check_returncode()
-    # The posted comment is itself an answer, so even a lost record answers no second time.
-    record.update(answered_for_owner=question, answer_id=int(posted.stdout), answered_at=now)
-    _write(path, record)
-    (notes / f"{path.name}.asking").unlink(missing_ok=True)
-    _log(f'answered for the owner: {path.name}, "{reply}"')
-    # For the wake's check-in, which lists them so the owner can overrule them.
-    answered = notes / "answered-for-owner.pending"
-    answered.mkdir(exist_ok=True)
-    _write(answered / f"{now}-{path.name}.json", {"name": path.name, "reply": reply, "at": now})
+    # The posted comment is itself an answer: a tick that loses what follows finishes it (`_poll`).
+    record.update(answer_id=int(posted.stdout), answered_at=now)
+    _answered_for_owner(notes, path, record, reply, now)
     print(f'{path.name}: answered for the owner: "{reply}"')
 
 
@@ -402,6 +431,13 @@ def _poll(notes: Path, scripts: Path) -> int:
                     # Answered, it waits for the owner no longer.
                     (notes / f"{path.name}.asking").unlink(missing_ok=True)
                     print(f"{path.name}: question answered (comment {answer['id']})")
+                    # The tick's own answer, posted by a tick that could not note it.
+                    body = str(answer["body"])
+                    if body.startswith(ANSWERED_FOR_OWNER) and record.get(
+                        "answered_for_owner"
+                    ) != _words(str(record["message"])):
+                        reply = body.removeprefix(ANSWERED_FOR_OWNER).split("\n", 1)[0]
+                        _answered_for_owner(notes, path, record, reply, _time(answer))
             # Retry a failed phone push through notify's existing deduplication path.
             if record["status"] == "asking" and not record.get("answer_id") and not notified:
                 _notify(

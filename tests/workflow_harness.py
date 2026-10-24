@@ -276,6 +276,8 @@ if [[ "$1 $2 $3 $5 $7 $8" == "api -X POST -f --jq .id" && $4 == repos/*/issues/*
   jq --arg body "${6#body=}" '.[-1] += [{id: (([.[][].id] | max // 0) + 1), body: $body,
     created_at: "2026-10-19T18:00:00Z", user: {login: "example-owner"}}]' "$comments" \
     > "$comments.new" && mv "$comments.new" "$comments"
+  # GitHub kept the comment, but its answer was lost.
+  [ ! -e "@STATE@/lose-gh-comment-answer" ] || exit 1
   jq '[.[][].id] | max' "$comments"
   exit 0
 fi
