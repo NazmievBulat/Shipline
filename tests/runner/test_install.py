@@ -136,7 +136,10 @@ def test_a_machine_s_runners_are_installed_by_the_prefix_and_its_own_settings(
         "roles='main ordinary planner'",
         "other_machines='office'",
         "ordinary_jobs=2",
+        "installed_slots=2",
         "ordinary_blacksmith_jobs=1",
+        "ordinary_spares=1",
+        "docker_runners=0",
     ]
     # The repository's own command built the images, on main's files.
     assert (machine / "built").read_text() == "built\n"
@@ -162,6 +165,7 @@ def test_a_machine_s_runners_are_installed_by_the_prefix_and_its_own_settings(
         "--user enable --now example-app-runner@3.service",
         "--user enable --now example-app-runner-spare.service",
         "--user enable --now example-app-runner-lend.service",
+        "--user enable --now example-app-runner-balance.timer",
     ]
     # The programs that use GitHub are copies, not links into the checkout.
     assert not (_installed(machine) / "github_budget.py").is_symlink()
@@ -409,6 +413,65 @@ def test_a_service_that_restarts_while_the_images_build_finds_its_settings(machi
 
     assert done.returncode == 0, done.stderr
     assert (machine / "built").read_text() == "example-app-runner\n"
+
+
+_BOUNDS = "balance_ordinary=2-5\nbalance_docker=0-1\nbalance off\n"
+
+
+def test_the_balancers_bounds_go_from_the_machine_settings_into_the_installed_ones(
+    machine: Path,
+) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine, _SETTINGS + _BOUNDS)
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert (_installed(machine) / "pool-settings.sh").read_text().endswith(_BOUNDS)
+
+
+def test_a_reinstall_keeps_the_installed_bounds_when_the_machine_settings_name_none(
+    machine: Path,
+) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine)
+    assert _install(machine).returncode == 0
+    installed = _installed(machine) / "pool-settings.sh"
+    # The balancer moved a slot meanwhile, and its owner set bounds there.
+    installed.write_text(installed.read_text().replace("ordinary_jobs=2", "ordinary_jobs=3") + _BOUNDS)
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    text = installed.read_text()
+    # The counts are the machine settings' again; the bounds stay.
+    assert "ordinary_jobs=2\n" in text
+    assert text.endswith(_BOUNDS)
+
+
+def test_the_balancer_leaves_the_runners_alone_while_they_are_installed(machine: Path) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine)
+    lock = machine / "home/.local/state/workflow/runner-balance.lock"
+    # Docker is asked while the runners are down: a balancer run then would find them gone.
+    (machine / "bin/docker").write_text(
+        f'#!/bin/sh\nif flock -n "{lock}" true; then echo free; else echo held; fi >> "$CALLS.lock"\n'
+    )
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert set((machine / "calls.log.lock").read_text().split()) == {"held"}
+
+
+def test_a_machine_with_neither_kind_of_runner_gets_no_balancer(machine: Path) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine, "machine=home\nroles='planner'\n")
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert not [call for call in _calls(machine, "systemctl") if "balance" in call]
 
 
 # A machine that gives all its PR slots to the other machines of its pool, and a machine's own
@@ -736,3 +799,31 @@ def test_an_identity_github_refuses_stops_the_install_with_nothing_changed(
     assert "Resource not accessible" in done.stderr
     assert pool_machine.installation() == before
     assert pool_machine.calls("systemctl") == []
+
+
+def test_a_reinstall_at_the_count_the_balancer_changed_is_no_move(pool_machine: Machine) -> None:
+    """The balancer raised ordinary_jobs from the machine's 4 to 5; installing its 4 again gives
+    up no slot of the machine's own, though the other machine is off."""
+    _installed_with_four(pool_machine, _holding(OTHER, 1, "offline"))
+    settings = pool_machine.pool_settings
+    settings.write_text(settings.read_text().replace("\nordinary_jobs=4\n", "\nordinary_jobs=5\n"))
+    pool_machine.settle(slots=4)
+
+    done = pool_machine.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "ordinary_jobs=4" in settings.read_text().splitlines()
+
+
+def test_a_move_below_the_installed_count_is_checked_whatever_the_balancer_wrote(
+    pool_machine: Machine,
+) -> None:
+    _installed_with_four(pool_machine, _holding(OTHER, 1, "offline"))
+    settings = pool_machine.pool_settings
+    settings.write_text(settings.read_text().replace("\nordinary_jobs=4\n", "\nordinary_jobs=2\n"))
+    pool_machine.settle(slots=2)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "would give up 2 PR slots (4 to 2)" in done.stderr

@@ -110,10 +110,14 @@ if [ -f "$installed/pool-settings.sh" ]; then
     . "$installed/pool-settings.sh"
     printf '%s' "$machine"
   )
+  # The PR slots this machine's own settings gave at its last install. The balancer changes
+  # ordinary_jobs as it runs (balance_runners.py), which is no move; a record written before
+  # installed_slots has only that.
   recorded_jobs=$(
     ordinary_jobs=
+    installed_slots=
     . "$installed/pool-settings.sh"
-    printf '%s' "$ordinary_jobs"
+    printf '%s' "${installed_slots:-$ordinary_jobs}"
   )
   # A count that is no number is no record of one.
   case "$recorded_jobs" in '' | *[!0-9]*) recorded_jobs= ;; esac
@@ -256,6 +260,18 @@ fi
 
 mkdir -p "$installed" "$units"
 prefix=$prefix sh "$here/install-github-budget.sh"
+# The runner balancer leaves the runners alone until the install ends: it would find them stopped
+# and start more, or read pool-settings.sh half written. It holds the same lock while it changes
+# them, for at most the few minutes a runner takes to start.
+mkdir -p "$HOME/.local/state/workflow"
+exec 8>>"$HOME/.local/state/workflow/runner-balance.lock"
+flock -w 300 8 || { echo "The runner balancer did not let go of its lock in 5 minutes." >&2; exit 1; }
+# The runner balancer's own lines (its bounds, `balance off`): the machine settings', or, when
+# they name none, the installed ones, which outlast a reinstall. The counts are the ones this
+# install was given.
+balance_lines=$(python3 "$here/balance_runners.py" kept "$machine_settings")
+[ -n "$balance_lines" ] ||
+  balance_lines=$(python3 "$here/balance_runners.py" kept "$installed/pool-settings.sh")
 # What every script of this machine reads after settings.sh: the repository's names, its main
 # checkout, which machine this is and its counts. Each value is quoted for sh. Written before the
 # scripts are copied: a running service that restarts before this install stops it runs the new
@@ -271,7 +287,11 @@ quoted() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
   printf 'roles=%s\n' "$(quoted "$roles")"
   printf 'other_machines=%s\n' "$(quoted "$other_machines")"
   printf 'ordinary_jobs=%s\n' "$runners"
+  printf 'installed_slots=%s\n' "$runners"
   printf 'ordinary_blacksmith_jobs=%s\n' "$ordinary_blacksmith_jobs"
+  printf 'ordinary_spares=%s\n' "$spares"
+  printf 'docker_runners=%s\n' "$docker_runners"
+  [ -z "$balance_lines" ] || printf '%s\n' "$balance_lines"
   [ -z "$job_memory" ] || printf 'job_memory=%s\n' "$job_memory"
 } >"$installed/pool-settings.tmp"
 mv "$installed/pool-settings.tmp" "$installed/pool-settings.sh"
@@ -285,7 +305,8 @@ cp "$rendered/$container-firewall.service" "$installed/systemd/"
 cp "$rendered/$container-planner.service" "$rendered/$container"-main*.service "$units/"
 cp "$rendered/$container@.service" "$rendered/$container-docker@.service" \
   "$rendered/$container-spare.service" "$rendered/$container-lend.service" \
-  "$rendered/$container"-image.* "$rendered/$container"-usage.* "$units/"
+  "$rendered/$container"-image.* "$rendered/$container"-usage.* \
+  "$rendered/$container"-balance.* "$units/"
 if [ -n "$hub_cache" ]; then
   cp "$rendered/$hub_cache_container.service" "$rendered/$hub_cache_container"-watch.* "$units/"
 fi
@@ -392,6 +413,7 @@ has_role main || rm -f "$units"/default.target.wants/$container-main.service \
   "$units"/default.target.wants/$container-main-2.service \
   "$units"/default.target.wants/$container-lend.service
 has_role ordinary || rm -f "$units"/default.target.wants/$container-spare.service
+has_role ordinary || has_role docker || rm -f "$units"/timers.target.wants/$container-balance.timer
 systemctl --user daemon-reload
 
 # The mirror is an optimization, never a runner dependency. Its service retries if Docker Hub
@@ -434,6 +456,11 @@ while [ "$number" -le "$docker_runners" ]; do
   systemctl --user enable --now "$container-docker@$number.service"
   number=$((number + 1))
 done
+# After the runners it counts: it moves them between the kinds within the bounds of
+# pool-settings.sh, and changes nothing without them (balance_runners.py).
+if has_role ordinary || has_role docker; then
+  systemctl --user enable --now "$container-balance.timer"
+fi
 
 main_runners=0
 ! has_role main || main_runners=2

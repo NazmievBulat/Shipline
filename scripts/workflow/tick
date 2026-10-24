@@ -48,6 +48,10 @@
 #      gets its recommended reply once it has waited `answer_for_owner_after_minutes` (15),
 #      once for the same words, and the wake is told; one without that line, or without a
 #      reply word, waits for the owner and is named in the wake once.
+#      A cloud worker whose draft had no push and no report for `cloud_wake_after_minutes`,
+#      with no open question, is woken once through `claude --cloud` and named in the wake if
+#      still quiet that long after; one whose question was answered is woken at once
+#      (`cloud_workers.py wake`).
 #   9. After the starts of step 6, the next draft without the label gets it when one may start
 #      (`ticket_starts.py`: by priority, then the older ticket, when its files overlap no running
 #      ticket's, nothing in `start-plan` holds it back, the machine has had room for 10
@@ -59,6 +63,10 @@
 #  11. From 08:00 UTC, once the day's metrics report is written, one analyst a day
 #      (`session start analyst day-<date>`, on Sunday `week-<date>` over 7 days), when the
 #      5-hour usage window allows a start: not above 85% unless it resets within the hour.
+#  12. `ci_demand.py`: the CI and image jobs the pushes on their way will start within half an
+#      hour (working cloud workers, busy local workers and reviewers, ready pull requests whose
+#      checks have not started, the merge line's prefixes still to be built), written to
+#      ~/.local/state/workflow/ci-demand.json for the runner balancer.
 #
 # Steps 1 and 2 are the one place a session is closed, and only when its work no longer exists.
 # The starts come last because the steps before them may free memory they need.
@@ -1037,6 +1045,10 @@ while read -r name state _; do
   fi
 done <<<"$running"
 
+# A cloud worker whose draft had no push and no report for `cloud_wake_after_minutes`, with no
+# open question, is woken once per quiet stretch, and one whose question was answered at once.
+python3 -B "$here/cloud_workers.py" wake "$main" "$snapshot" 9>&- || failed=1
+
 # A question to the owner marked `Owner only: no` gets its recommended reply once it has waited,
 # from the notes the stop hook wrote (`notify`): the time it was asked and the reply. Once for
 # the same words: asked again after the answer, the question waits for the owner. His own reply
@@ -1284,6 +1296,32 @@ exec 8>&-
 # Step 11, after the starts the tickets wait for, and not while one waits for memory.
 if ((local_starts_held == 0 && started != 75)); then
   start_daily_analyst || failed=1
+fi
+
+# Step 12, after this tick's starts: the CI demand on its way, for the runner balancer.
+if running=$(session list); then
+  # 75: the GitHub budget is paused; the forecast is written again at a later tick.
+  python3 -B "$here/ci_demand.py" write "$main" "$snapshot" <<<"$running" 9>&- ||
+    (($? == 75)) || failed=1
+else
+  failed=1
+fi
+# The last change of this machine's runner balancer, once, for the wake's next check-in. One
+# older than a day (a first tick after an install, say) is no news.
+balance_log=$HOME/.local/state/workflow/runner-balance.log
+balance_told=$main/$SHIPLINE_STATE_FOLDER/runner-balance.told
+if [[ -s $balance_log ]] && balance_line=$(tail -n 1 "$balance_log") &&
+    [[ -n $balance_line && $balance_line != "$(cat "$balance_told" 2>/dev/null)" ]] &&
+    balance_at=$(date -u -d "${balance_line%% *}" +%s 2>/dev/null) &&
+    ((NOW - balance_at < 86400)); then
+  balance_pending=$main/$SHIPLINE_STATE_FOLDER/runner-balance.pending
+  if mkdir -p "$balance_pending" &&
+      jq -n --arg line "$balance_line" '{line: $line}' >"$balance_pending/.balance.json" &&
+      mv -- "$balance_pending/.balance.json" "$balance_pending/balance.json"; then
+    printf '%s\n' "$balance_line" >"$balance_told" || failed=1
+  else
+    failed=1
+  fi
 fi
 
 wake_done=1

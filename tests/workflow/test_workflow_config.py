@@ -93,6 +93,7 @@ _DEFAULTS = {
     },
     "review": {"high_effort_paths": []},
     "answer_for_owner_after_minutes": 15,
+    "cloud_wake_after_minutes": 30,
 }
 
 
@@ -191,6 +192,14 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     assert all(label.startswith("example-app-") for label in example["runner"]["labels"])
     assert example["machines"]
     assert example["hunts"]["areas"]
+
+
+@pytest.mark.parametrize("minutes", [0, 45])
+def test_the_cloud_wake_wait_is_a_whole_number_of_minutes(tmp_path: Path, minutes: int) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"cloud_wake_after_minutes": minutes})
+
+    assert workflow_config.load(repo).cloud_wake_after_minutes == minutes
 
 
 @pytest.mark.parametrize("paths", [["("], "^db/", [""], [3]])
@@ -611,6 +620,10 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         # Bash would wrap a number this large.
         ('{"answer_for_owner_after_minutes": 2000000000000000000}', "answer_for_owner_after_minutes"),
         ('{"answer_for_owner_after_minutes": 1441}', "answer_for_owner_after_minutes"),
+        ('{"cloud_wake_after_minutes": "30"}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": -1}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": 1.5}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": true}', "cloud_wake_after_minutes"),
     ],
 )
 def test_a_file_that_cannot_be_read_is_refused_by_name(
@@ -1060,10 +1073,11 @@ def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> d
 
 
 # The SHA-256 of each text as the scripts wrote it before they read `shipline.json`; the worker's
-# and the cloud worker's since they ask for the `Owner only:` line of a question to the owner.
+# and the cloud worker's since they ask for the `Owner only:` line of a question to the owner, and
+# the cloud worker's since it is told never to end a turn to wait for an answer.
 _TEXTS_BEFORE = {
     "worker": "325cbf877af37ce9da33010ca5fadb43199e42a93e78235e72d234068a61438c",
-    "cloud": "d86282ba765d20c2c3507b1b0ae52509e72bed886b3eee028ed2c724cd25bfbe",
+    "cloud": "a331c8a4ccec16eeaf7cf29fc4b5177e6ef0c6e9ef2efc0edb924ad8ce8f90a7",
     "review": "ea932fce613e8e9c075daa884a2adee29b64ee5610f1fcd922f27aa6cd39c49a",
     "wake": "af21558438c99d72e165c8fb8ab4febdd80204e43f532a399697b4131441d080",
 }
