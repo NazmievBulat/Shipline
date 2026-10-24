@@ -127,7 +127,10 @@ head and current main lifts a failed-check block and restores the pull request's
 queue position, and a green re-run on an older main is refreshed in that place when its turn
 comes. A re-run of only the failed jobs keeps the run's proof of the merge it tested, as a
 full re-run does. A pull request that merged, closed, became a draft or left `main` as its
-base leaves the line. When the gate says the pull request waits behind another (or for main to change),
+base leaves the line. One exception: a pull request whose failing test the tick gave to a
+worker (see "Fix the failed check of pull request N") keeps its place as a blocked member, as
+a draft and on its fix, until its fresh reviewer calls the gate; then it regains that place,
+and is served there once its fix's CI is green. When the gate says the pull request waits behind another (or for main to change),
 it has already run `shipline notify waiting` itself: end the turn. The tick wakes
 that reviewer or audit when its pull request is first and all checks on its head have
 finished, once for each turn of the line, state of main and head. One whose checks failed
@@ -162,6 +165,19 @@ worker, reviewer and audit alike:
 
 - A question to the owner is plain text at the end of a turn: the recommendation first, then
   the other choices, ending with the short words he can type back ("1", "merge it").
+- Just before those words the question carries one line of its own: `Owner only: yes` or
+  `Owner only: no`. `Owner only: yes` is required for money, privacy, legal text, text sent to
+  a model, and any product decision these rules keep for the owner; anything else is
+  `Owner only: no`. A question without the line counts as `Owner only: yes`, waits for him and
+  is named to the orchestrator once.
+- A question marked `Owner only: no` that has waited `answer_for_owner_after_minutes` in
+  `shipline.json` (15 by default; 0 turns it off) gets its recommended reply from the tick:
+  the first reply word after the line (so the recommended one comes first, a number or words
+  in quotes, never a command such as `/clear`), typed into the session once, as if he had
+  typed it.
+  His own reply, if it comes first, wins; so does text he has not sent yet. The wake's morning
+  check-in lists the questions answered for him overnight, with the reply given, so he can
+  overrule them. A Codex bridge relays and is never answered for him.
 - The question tool is not used.
 - The owner is never handed a shell command to run. What has to be run, the session runs.
 - A change to a screen still publishes the artifact with the options and gives the link; the
@@ -192,7 +208,7 @@ worker, reviewer and audit alike:
 - Start with brainstorming. A change to a screen publishes an options page (as in "Asking the
   owner") and ends the turn with the card's title, choices, reply words and link in text;
   nothing is built until the owner answers. A backend choice that is a product decision is
-  asked in text, recommendation first.
+  asked in text, recommendation first, with the `Owner only:` line of "Asking the owner".
   Any other choice is made and written into the pull request description.
 - Run the repository's fast pre-train checks, `shipline pre-train-checks`, from the pull
   request's worktree before marking ready. They also run before a handoff or gate call
@@ -334,6 +350,23 @@ refuses. It unsets it once it is not needed.
 Reports and failed deliveries are remembered locally. The workflow does not read cloud
 transcripts or stop cloud sessions; the owner answers in the cloud session.
 
+## "Fix the failed check of pull request N: job J of run R, first failing test T"
+
+A worker the tick starts at medium effort when a test of the pull request's own failed on its
+handed-off head, usually after main was merged in. It is the worker of "Implement pull request
+N" with these differences:
+
+- The task is the failed check. Read the description, then the failed log of run R with
+  `gh run view R --log-failed`. T is "not reported" when no test line could be read.
+- Find why the test fails on this head and fix it within the task of the pull request: the
+  code, or a test whose expectation main's change made wrong. Never weaken or skip a test to
+  make it pass. Run that test and the repository's fast pre-train checks.
+- There is no review to fix and no brainstorming; a fix that needs a product decision, or more
+  than a fix, is asked as any worker asks.
+- Commit, push without force, mark ready and say "worker finished". The pull request kept its
+  place in the merge train; a fresh reviewer reviews the fix as a normal round and hands it
+  off, and it is served in that place once its CI is green.
+
 ## "Review pull request N"
 
 A fresh context, always Claude Opus at high effort, started by `session start review N`.
@@ -402,7 +435,8 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
    A restart does not reset the count: read the published reviews. After the owner authorizes another round, the
    orchestrator writes its number to `.local/workflow/review-N.allow-round` in the main
    checkout. This permits that exact round only. Record the authorization with its review.
-5. Ask product decisions in text, recommendation first. A job longer than this pull request
+5. Ask product decisions in text, recommendation first, with the `Owner only:` line of
+   "Asking the owner". A job longer than this pull request
    becomes a draft ticket as in audit step 5, without the label `workflow`. No question or
    unaddressed finding may remain before merging.
    When a watch for GitHub checks was stopped, run `shipline notify waiting` before
@@ -441,7 +475,8 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
   The tick keeps the worktree, retries expected waits, refreshes through the gate and merges
   through the gate, including batches. A gate refresh advances the note to its own pushed
   head; any other head change, a failed check, a conflict or another refusal revokes the
-  handoff and starts a fresh reviewer. Main being red or pending still follows the gate's
+  handoff and starts a fresh reviewer. A failed check that is the pull request's own failing
+  test goes to a worker instead (see "For the orchestrator session"). Main being red or pending still follows the gate's
   existing stop and fix rules. Stacked pull requests are moved mechanically as below;
   anything requiring judgment is returned to their own session or a fresh reviewer.
 - A branch merges `main` in only when it needs to, not because `main` moved: when GitHub
@@ -648,6 +683,27 @@ repository that configures none has no recognized conflict.
 A failed check, unrecognized conflict, unrelated head change or gate refusal needing judgment drops the
 note, revokes batch approval and requests one fresh reviewer. A child with its own session
 is left to that session; an unlabelled child keeps its orchestrator-managed audit path.
+A handed-off pull request whose checks failed is first read: the latest CI, image and E2E runs
+of its head (it waits while one still runs), and for each failed, timed-out or cancelled job
+(not the jobs whose name ends in "result") its failed log and its annotations. The first
+failing test is the first pytest line `FAILED <file>.py::<test>` (or `ERROR`), else the first
+Vitest `FAIL <file>.test.<ext> > <name>`, else the first Playwright
+`1) [project] › <file>.spec.ts:L:C › <name>`; with none, it is "not reported". A job failed
+for its runners when it timed out, or when it names no test and its log or annotations say
+that the runner was lost, disconnected or shut down, lost communication or could not be
+contacted, that the job exceeded its time, or "Failed to download action" or "Internal server
+error".
+- A job that failed on a test of its own: the tick makes the pull request a draft, revokes its
+  handoff, keeps its place in the line as a blocked member, and starts a worker at medium
+  effort whose sentence names the job, its run and the first failing test (below). The wake
+  names it once as a hand-back. Its fix gets a fresh reviewer as any ready pull request does.
+- Only the runners failed it: each failed run is re-run once, its failed jobs only, under the
+  rules of main's retry (the run completed at its first attempt, every job completed, its
+  failed jobs ran on the repository's own runners, no planner failed). The handoff waits for
+  the re-run. A run that may not be re-run, or fails again, goes to one fresh reviewer.
+- Anything else goes to one fresh reviewer, as before: a cancelled job, a failed job with no
+  log or annotation to read, a failure no run of the head shows, and a second failing test in
+  a row, one on the head the worker's fix made before a handed-off head of it passed.
 A recorded hand-back preserves local work at its recorded head, unresolved merge conflicts
 and local refresh commits after a failed push for its reviewer to inspect and finish
 pushing and checking. It does not
@@ -831,7 +887,12 @@ The orchestrator session does what needs judgment:
   stop rang the phone (see "Phone pushes") is named on a line of its own with how long it has
   waited, `asking the owner: review-156 (8 min)`, until he answers; a new question reaches the
   orchestrator once, at any hour and busy or not. A `stuck?`, `wait loop finds itself?` or
-  `idle, no rule:` line of the tick reaches it the same way, once. The
+  `idle, no rule:` line of the tick reaches it the same way, once, and so does `owner question
+  without the Owner only line: ticket-426` (or `without a reply word`). A question the tick
+  answered for the owner (see "Asking the owner") is named `answered for the owner: ticket-426,
+  "1" (03:12)`: one answered at night in the first check-in from 8:00, which lists every answer
+  since 20:00, one answered in the day at the next look. The orchestrator passes them on to the
+  owner, who may overrule them. The
   check-in names the usage, the `/tmp` file slots, the sessions and the open pull requests; it is delivered as a
   message from a short `claude -p` on Claude Haiku 5.5. The wake itself starts,
   merges and pushes nothing. What it saw and did is in `~/.local/state/workflow/wake.log`. A
