@@ -126,27 +126,55 @@ def test_the_switch_replaces_each_old_hook_and_keeps_the_owner_s(switched: Workf
     assert _settings(switched)["model"] == "example-model"
 
 
-def test_going_back_with_the_old_installer_leaves_one_hook_per_event(switched: Workflow) -> None:
-    """Going back is one step: the repository's own `install-hooks` points the hooks at its
-    scripts again. Afterwards each event must still run `notify` once."""
+def test_going_back_with_shipline_uninstall_leaves_one_hook_per_event(switched: Workflow) -> None:
+    """Going back is one step: `shipline uninstall` takes Shipline's hooks out and puts back
+    the exact hooks it replaced. Afterwards each event must still run `notify` once."""
+    _owner_settings(switched)
     assert _old(switched, "install-hooks").returncode == 0
     assert switched.shipline("install-hooks").returncode == 0
 
-    back = _old(switched, "install-hooks")
+    back = switched.shipline("uninstall")
 
     assert back.returncode == 0, back.stderr
+    old = f"bash {switched.repo}/scripts/workflow/notify 2>/dev/null || true"
+    assert _hooks(switched) == {
+        "Stop": ["true # mine", old],
+        **{event: [old] for event in EVENTS[1:]},
+    }
+    assert _settings(switched)["model"] == "example-model"
+
+
+def test_the_old_installer_after_going_back_still_leaves_one_hook_per_event(
+    switched: Workflow,
+) -> None:
+    assert _old(switched, "install-hooks").returncode == 0
+    assert switched.shipline("install-hooks").returncode == 0
+    assert switched.shipline("uninstall").returncode == 0
+
+    again = _old(switched, "install-hooks")
+
+    assert again.returncode == 0, again.stderr
     old = f"bash {switched.repo}/scripts/workflow/notify 2>/dev/null || true"
     assert _hooks(switched) == {event: [old] for event in EVENTS}
 
 
+def test_going_back_without_hooks_before_takes_out_only_shipline_s(switched: Workflow) -> None:
+    _owner_settings(switched)
+    assert switched.shipline("install-hooks").returncode == 0
+
+    back = switched.shipline("uninstall")
+
+    assert back.returncode == 0, back.stderr
+    assert _hooks(switched) == {"Stop": ["true # mine"]}
+
+
 def test_after_going_back_a_permission_prompt_rings_the_phone_once(switched: Workflow) -> None:
     """What the owner's phone gets from one permission prompt once the hooks were pointed back
-    with the repository's own installer: every hook command of the event runs, as Claude runs
-    them."""
+    with `shipline uninstall`: every hook command of the event runs, as Claude runs them."""
     worktree = _phone(switched)
     assert _old(switched, "install-hooks").returncode == 0
     assert switched.shipline("install-hooks").returncode == 0
-    assert _old(switched, "install-hooks").returncode == 0
+    assert switched.shipline("uninstall").returncode == 0
 
     event = {
         "hook_event_name": "Notification",
@@ -167,6 +195,37 @@ def test_after_going_back_a_permission_prompt_rings_the_phone_once(switched: Wor
         assert done.returncode == 0
 
     assert len(switched.pushes()) == 1
+
+
+def test_going_back_with_shipline_uninstall_restores_the_timer(switched: Workflow) -> None:
+    units = Path(switched.env["HOME"]) / ".config" / "systemd" / "user"
+    assert _old(switched, "install-timer").returncode == 0
+    before = (units / "workflow-tick.service").read_text()
+    assert switched.shipline("install-timer").returncode == 0
+
+    back = switched.shipline("uninstall")
+
+    assert back.returncode == 0, back.stderr
+    assert (units / "workflow-tick.service").read_text() == before
+    assert switched.calls("systemctl")[-2:] == [
+        "systemctl --user daemon-reload",
+        "systemctl --user enable --now workflow-tick.timer",
+    ]
+
+
+def test_going_back_without_a_timer_before_switches_shipline_s_off(switched: Workflow) -> None:
+    units = Path(switched.env["HOME"]) / ".config" / "systemd" / "user"
+    assert switched.shipline("install-timer").returncode == 0
+
+    back = switched.shipline("uninstall")
+
+    assert back.returncode == 0, back.stderr
+    assert not (units / "workflow-tick.service").exists()
+    assert not (units / "workflow-tick.timer").exists()
+    assert switched.calls("systemctl")[-2:] == [
+        "systemctl --user disable --now workflow-tick.timer",
+        "systemctl --user daemon-reload",
+    ]
 
 
 def test_going_back_with_the_old_timer_installer_is_one_step(switched: Workflow) -> None:
@@ -305,13 +364,14 @@ def test_a_session_started_before_the_switch_can_run_what_the_status_check_tells
     switched: Workflow, local_bin_on_path: bool
 ) -> None:
     """The tick of Shipline's checkout asks every waiting session, old ones too, to run
-    `shipline notify waiting`. A session started by the repository's own tick has neither
-    Shipline's `bin` nor `SHIPLINE_REPO`: it finds `shipline` only through the link
-    `~/.local/bin/shipline`, when that folder was on the PATH the old timer was installed with."""
+    `notify waiting` through the launcher. A session started by the repository's own tick has
+    neither Shipline's `bin` nor `SHIPLINE_REPO`, so the sentence names the launcher by its
+    absolute path."""
     worktree = switched.add_worktree(7)
     assert switched.shipline("install-hooks").returncode == 0
     command = _status_check_command(switched)
-    assert command == "shipline notify waiting"
+    # The launcher by its absolute path: nothing of the session's PATH is needed.
+    assert command == f"{switched.home}/bin/shipline notify waiting"
     local_bin = Path(switched.env["HOME"]) / ".local" / "bin"
     path = switched.env["PATH"]
     if local_bin_on_path:

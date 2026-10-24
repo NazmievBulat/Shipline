@@ -8,7 +8,8 @@
 # Writes a systemd user service and timer, `workflow-tick`, that run `shipline tick` of this
 # Shipline checkout on the repository's main checkout every 3 minutes, points the link
 # `~/.local/bin/shipline` at that launcher (`launcher-link`), and creates the labels `workflow`
-# and `audited` on GitHub when they are missing.
+# and `audited` on GitHub when they are missing. Units it replaces that were not Shipline's are
+# kept beside them as `*.before-shipline`: `shipline uninstall` puts them back.
 #
 #   systemctl --user list-timers workflow-tick.timer     when it runs next
 #   journalctl --user -u workflow-tick.service           what each tick did
@@ -43,6 +44,12 @@ create_label "$SHIPLINE_LABEL_WORKFLOW" 1D76DB "Picked up by the workflow: gets 
 create_label "$SHIPLINE_LABEL_AUDITED" 0E8A16 "Its audit left nothing open"
 
 mkdir -p "$units"
+# Units written by a copy of the scripts in the repository's tree are kept as they were, once.
+if [[ -e $units/workflow-tick.service ]] && ! grep -q '/bin/shipline" tick$' "$units/workflow-tick.service"; then
+  for unit in workflow-tick.service workflow-tick.timer; do
+    [[ ! -e $units/$unit || -e $units/$unit.before-shipline ]] || cp -p "$units/$unit" "$units/$unit.before-shipline"
+  done
+fi
 
 # systemd gives a service a short PATH. The tick needs the one that finds `gh`, `tmux`,
 # `claude` and the repository's own tools, which is the PATH of whoever runs this. A `%` is

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Takes Shipline off again, in one step: the way back of `install-hooks` and `install-timer`.
+#
+#   shipline uninstall
+#
+# Shipline's hooks leave the owner's Claude settings, and the hooks they replaced, kept exactly
+# in `settings.json.shipline-replaced`, are put back where they were, one an event; every other
+# setting and hook is left as it is. The timer's units that `install-timer` replaced, kept as
+# `*.before-shipline`, are put back and switched on again; without them Shipline's timer is
+# switched off and its units removed. The link `~/.local/bin/shipline` goes when it is this
+# checkout's. Running the repository's own `install-hooks` afterwards adds nothing twice.
+set -euo pipefail
+
+[[ $# == 0 ]] || { echo "usage: uninstall" >&2; exit 2; }
+settings=$HOME/.claude/settings.json
+record=$settings.shipline-replaced
+units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+launcher=$(cd "$here/../.." && pwd)/bin/shipline
+
+if [[ -e $settings ]]; then
+  before=$(jq . "$settings" 2>/dev/null) && jq -e 'type == "object"' >/dev/null <<<"$before" || {
+    echo "$settings is not a JSON object; nothing was changed" >&2
+    exit 1
+  }
+  replaced='{}'
+  [[ ! -e $record ]] || replaced=$(jq -c . "$record")
+  # Keep the file's own indentation, as `install-hooks` does.
+  spaces=$(sed -n '/^\( \{1,7\}\)".*/{s//\1/p;q}' "$settings")
+  indent=${#spaces}
+  ((indent > 0)) || indent=2
+  # shellcheck disable=SC2016  # the dollars belong to jq
+  after=$(jq --indent "$indent" --argjson replaced "$replaced" '
+    # A hook of exactly the shape `install-hooks` writes, whatever checkouts it names.
+    def is_shipline:
+      (.command // "") | test("^bash ([^;&|\\\\ ]|\\\\.)+/bin/shipline --repo ([^;&|\\\\ ]|\\\\.)+ notify 2>/dev/null \\|\\| true$");
+    if (.hooks | type) != "object" then . else
+      .hooks |= with_entries(
+        .key as $event
+        | .value |= (
+            map((.matcher // "") as $matcher
+              | .hooks |= map(
+                  if is_shipline then
+                    ($replaced[$event] | select(. != null and .matcher == $matcher) | .hook) // empty
+                  else . end))
+            | map(select((.hooks | length) > 0))))
+      | .hooks |= with_entries(select(.value | length > 0))
+      | if .hooks == {} then del(.hooks) else . end
+    end' <<<"$before")
+  if [[ $(jq -S . <<<"$after") != "$(jq -S . <<<"$before")" ]]; then
+    # Written through the file's own name, so a settings file that is a link stays one.
+    printf '%s\n' "$after" >"$settings"
+    echo "took Shipline's hooks out of $settings and put back the ones they replaced"
+  fi
+  rm -f "$record"
+fi
+
+service=$units/workflow-tick.service
+if [[ -e $service.before-shipline ]]; then
+  mv "$service.before-shipline" "$service"
+  [[ ! -e $units/workflow-tick.timer.before-shipline ]] ||
+    mv "$units/workflow-tick.timer.before-shipline" "$units/workflow-tick.timer"
+  systemctl --user daemon-reload
+  systemctl --user enable --now workflow-tick.timer
+  echo "workflow-tick runs as it did before Shipline"
+elif [[ -e $service ]] && grep -q '/bin/shipline" tick$' "$service"; then
+  systemctl --user disable --now workflow-tick.timer
+  rm -f "$service" "$units/workflow-tick.timer"
+  systemctl --user daemon-reload
+  echo "workflow-tick is switched off"
+fi
+
+link=$HOME/.local/bin/shipline
+if [[ -L $link && $(readlink "$link") == "$launcher" ]]; then
+  rm -f "$link"
+  echo "removed $link"
+fi
