@@ -907,6 +907,29 @@ def test_the_last_shadow_tick_waits_for_its_real_tick(tmp_path: Path) -> None:
     assert done.stdout.startswith("0 decisions compared")
 
 
+def test_a_stuck_session_is_nudged_in_the_real_tick_and_logged_by_the_shadow(
+    workflow: Workflow,
+) -> None:
+    workflow.add_worktree(20)
+    workflow.running("ticket-20")
+    workflow.screen("● Working on change 20.\n  Running tests" + _BOX, "ticket-20")
+    _settled(workflow)
+    workflow.orchestrator()
+    # The real tick read the screen an hour ago; it has not changed since.
+    first = workflow.run_script("tick", env={"TZ": "UTC", "WORKFLOW_NOW": str(_NOW - 3600)})
+    assert first.returncode == 0, first.stderr
+    typed = len(workflow.calls("tmux ticket-20 send-keys"))
+
+    _ticks(workflow, _NOW, late=80)
+
+    log = _shadow_log(workflow).read_text()
+    assert f"{_NOW} stuck? ticket-20 (60 min, running: no command); nudge sent\n" in log
+    # Only the real tick typed into it.
+    assert len(workflow.calls("tmux ticket-20 send-keys")) > typed
+    compared = _compare("--shadow", str(_shadow_log(workflow)), "--wake", str(workflow.wake_log))
+    assert compared.returncode == 0, compared.stdout
+
+
 def test_the_readme_runs_the_shadow_tick_on_a_timer_of_its_own_and_bounds_it() -> None:
     readme = (_ROOT / "scripts" / "workflow" / "README.md").read_text()
 

@@ -128,7 +128,13 @@ _TICK_LINES = [
     ),
     re.compile(rf"^(?P<who>{_NAME}) finish message failed: .*$"),
     re.compile(rf"^(?P<who>{_NAME}) runs a wait loop that finds its own shell: .*$"),
-    re.compile(rf"^stuck\? (?P<who>{_NAME}) \(\d+ min, running: .*\)$"),
+    re.compile(rf"^wait loop finds itself\? (?P<who>{_NAME}) \(running: .*$"),
+    # With what the tick did of it after the bracket: "; nudge sent", "; nudge failed".
+    re.compile(rf"^stuck\? (?P<who>{_NAME}) \((?:\d+ min, running: |nudge not taken).*$"),
+    re.compile(rf"^idle, no rule: (?P<who>{_NAME}) \(\d+ min, last line: .*\)$"),
+    re.compile(
+        rf"^(?P<who>{_NAME}) (?:still|loop) nudge (?:failed|failed again|sent again|not taken).*$"
+    ),
 ]
 # What a check-in did: told the orchestrator, or why it told nobody.
 _OUTCOMES = [
@@ -140,7 +146,7 @@ _OUTCOMES = [
 ]
 # A check-in's lines of their own.
 _OWN_LINES = ("the tick sent its instruction again to: ", "asking the owner: ", "lost check: ")
-_OWN_LINES += ("rule break: ", "stuck? ", "wait loop finds itself? ")
+_OWN_LINES += ("rule break: ", "stuck? ", "wait loop finds itself? ", "idle, no rule: ")
 _RESENT = "wake: the tick sent its instruction again to: "
 
 
@@ -312,7 +318,7 @@ def timing(real: list[Decision], due: list[Decision], notes: list[Decision]) -> 
             if line.words.startswith(_RESENT):
                 names = line.words.removeprefix(_RESENT).split()
                 reasons += [f"{name} was sent its instruction again" for name in names]
-            elif line.words.startswith("wake: stuck? "):
+            elif line.words.startswith(("wake: stuck? ", "wake: idle, no rule: ")):
                 reasons.append(line.words.removeprefix("wake: "))
             else:
                 reasons = []
