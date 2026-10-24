@@ -125,11 +125,12 @@ one waiting for the owner. So a pull request waiting for the owner does not hold
 failed checks joins at the back when the gate is called again; a green CI re-run on the same
 head and current main lifts a failed-check block and restores the pull request's earlier
 queue position, and a green re-run on an older main is refreshed in that place when its turn
-comes. A pull request that merged, closed, became a draft or left `main` as its base leaves
-the line. One exception: a pull request whose failing test the tick gave to a worker (see
-"Fix the failed check of pull request N") keeps its place as a blocked member, as a draft and
-on its fix, until its fresh reviewer calls the gate; then it regains that place, and is served
-there once its fix's CI is green. When the gate says the pull request waits behind another (or for main to change),
+comes. A re-run of only the failed jobs keeps the run's proof of the merge it tested, as a
+full re-run does. A pull request that merged, closed, became a draft or left `main` as its
+base leaves the line. One exception: a pull request whose failing test the tick gave to a
+worker (see "Fix the failed check of pull request N") keeps its place as a blocked member, as
+a draft and on its fix, until its fresh reviewer calls the gate; then it regains that place,
+and is served there once its fix's CI is green. When the gate says the pull request waits behind another (or for main to change),
 it has already run `scripts/workflow/notify waiting` itself: end the turn. The tick wakes
 that reviewer or audit when its pull request is first and all checks on its head have
 finished, once for each turn of the line, state of main and head. One whose checks failed
@@ -199,6 +200,8 @@ worker, reviewer and audit alike:
 - Run the repository's fast pre-train checks from the pull request's worktree before marking
   ready. They also run before a handoff or gate call admits it to the merge train; a failure
   refuses admission. They supplement CI, which still runs its normal checks.
+- A draft pull request runs no CI: its run starts when it is marked ready, on the head it then
+  has, and each later push runs again. So run the tests in the session before marking ready.
 - Run `scripts/workflow/weaker-tests --base <base> --working-tree` before marking ready.
   Explain each item in the description: why the change is correct and how the test still
   catches its original bug, ideally with a failing run on a deliberately broken version.

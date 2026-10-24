@@ -1,0 +1,30 @@
+[
+ {
+  "data": {
+   "search": {
+    "pageInfo": {
+     "hasNextPage": false,
+     "endCursor": null
+    },
+    "nodes": [
+     {
+      "number": 30,
+      "mergedAt": "2026-10-23T13:00:00Z"
+     },
+     {
+      "number": 31,
+      "mergedAt": "2026-10-23T20:00:00Z"
+     },
+     {
+      "number": 32,
+      "mergedAt": "2026-10-24T05:00:00Z"
+     },
+     {
+      "number": 33,
+      "mergedAt": "2026-10-24T06:00:00Z"
+     }
+    ]
+   }
+  }
+ }
+]
