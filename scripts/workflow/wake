@@ -125,7 +125,7 @@ saved_sent=$main/$SHIPLINE_STATE_FOLDER/prefix-savings.sent
 # with the other daily findings; unchanged check-ins must not send it twice.
 # A shadow run writes no note of its own, so it neither reads nor keeps a savings report.
 if [[ -z $shadow ]] && ((github_ready)) &&
-    jq -e '.checks.prefix_only // [] | length > 0' <<<"$SHIPLINE_CONFIG" >/dev/null &&
+    jq -e '.checks.prefix_only // [] | length > 0' <<<"$SHIPLINE_CONFIG_JSON" >/dev/null &&
     [[ ! -r $saved_sent || $(<"$saved_sent") != "$saved_day" ]]; then
   mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
   (umask 077; touch "$main/$SHIPLINE_STATE_FOLDER/prefix-savings.lock")

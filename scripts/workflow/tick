@@ -1051,7 +1051,7 @@ while read -r name state _; do
   # GitHub keeps skipped draft checks beside the ready run on the same head.
   if [[ $lost == false ]] && { [[ $only_lost == true ]] || ! jq -e --arg result "$SHIPLINE_CI_RESULT" \
     --arg images "$SHIPLINE_IMAGES_PLAN" --arg images_prefix "$SHIPLINE_IMAGES" \
-    --argjson prefix_only "$(jq -c '.checks.prefix_only // []' <<<"$SHIPLINE_CONFIG")" '
+    --argjson prefix_only "$(jq -c '.checks.prefix_only // []' <<<"$SHIPLINE_CONFIG_JSON")" '
     .statusCheckRollup | if type == "array" then
       map(select(((($prefix_only | index("images")) != null) and
         ((.name // "") == $images_prefix or ((.name // "") | startswith($images_prefix + ":")))) | not))
