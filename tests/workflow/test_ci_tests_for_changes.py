@@ -5,7 +5,9 @@ import importlib.util
 import json
 import os
 import re
+import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +138,10 @@ def test_each_suite_is_read_with_its_default_worker_count(tmp_path: Path) -> Non
             "cloud_pre_push.suites.server.workers must be a whole number above 0",
         ),
         (
+            {"server": {"select": "x", "run": "y 'open"}},
+            "cloud_pre_push.suites.server.run must be a command",
+        ),
+        (
             {"server": {"select": "x", "run": "y", "probe": " "}},
             "cloud_pre_push.suites.server.probe must be a command",
         ),
@@ -167,6 +173,11 @@ def test_the_push_checks_are_a_command_of_the_repository(tmp_path: Path) -> None
     assert _config(tmp_path, {}).commands.push_checks is None
     named = _config(tmp_path / "named", {"commands": {"push_checks": "tools/push-checks"}})
     assert named.commands.push_checks == "tools/push-checks"
+    with pytest.raises(
+        workflow_config.ConfigError,
+        match="^shipline.json: commands.push_checks must be a command$",
+    ):
+        _config(tmp_path / "open", {"commands": {"push_checks": "tools/push-checks 'open"}})
 
 
 # A stand-in for a repository's selector, as CI would choose: a change to a workflow or to the
@@ -198,13 +209,16 @@ _RUNNER = """#!/bin/bash
 name=$1
 echo "run $* as=${RAN_AS:-self}" >> "@STATE@/calls.log"
 if [ -e "@STATE@/ignore-term-$name" ]; then trap '' TERM; fi
-if [ -e "@STATE@/hang-$name" ]; then /bin/sleep 30 & wait; /bin/sleep 30 & wait; fi
+if [ -e "@STATE@/hang-$name" ]; then
+  for _ in 1 2; do /bin/sleep 30 & echo $! >> "@STATE@/pids-$name"; wait; done
+fi
 if [ -e "@STATE@/fail-$name" ]; then echo "$name: 1 test failed"; exit 1; fi
 echo "$name: all passed"
 """
 
 _PROBE = """#!/bin/bash
 echo "probe as=${RAN_AS:-self}" >> "@STATE@/calls.log"
+if [ -e "@STATE@/probe-hangs" ]; then /bin/sleep 30; fi
 if [ -e "@STATE@/no-browser" ]; then echo "Failed to launch the browser: no display" >&2; exit 1; fi
 """
 
@@ -504,20 +518,20 @@ def test_as_root_every_suite_and_the_probe_run_as_the_test_account(workflow: Wor
     done = _run(
         workflow,
         "--run",
-        env={**_CLOUD, "WORKFLOW_EUID": "0", "SHIPLINE_CLOUD_TEST_USER": "tests"},
+        env={**_CLOUD, "WORKFLOW_EUID": "0", "SHIPLINE_CLOUD_TEST_USER": "nobody"},
     )
 
     assert done.returncode == 0, done.stdout + done.stderr
     assert workflow.calls("push-checks") == ["push-checks --quick"]
-    assert workflow.calls("probe") == ["probe as=tests"]
+    assert workflow.calls("probe") == ["probe as=nobody"]
     assert _runs(workflow) == [
-        "run server --workers 4 server/orders_test.py as=tests",
-        "run browser --workers=2 web/cart.spec.ts as=tests",
+        "run server --workers 4 server/orders_test.py as=nobody",
+        "run browser --workers=2 web/cart.spec.ts as=nobody",
     ]
     assert workflow.calls("runuser") == [
-        "runuser -u tests -- suite-run server --workers 4 server/orders_test.py",
-        "runuser -u tests -- browser-starts",
-        "runuser -u tests -- suite-run browser --workers=2 web/cart.spec.ts",
+        "runuser -u nobody -- suite-run server --workers 4 server/orders_test.py",
+        "runuser -u nobody -- browser-starts",
+        "runuser -u nobody -- suite-run browser --workers=2 web/cart.spec.ts",
     ]
 
 
@@ -556,6 +570,16 @@ def test_a_suite_past_its_limit_is_stopped_and_refuses_with_its_duration(
         r"^server: timed out after 0m [12]s, the limit is 0m 1s$", done.stdout, re.MULTILINE
     ), done.stdout
     assert done.stdout.endswith("the push is refused: server timed out\n")
+    _assert_gone(workflow, "server")
+
+
+def _assert_gone(workflow: Workflow, name: str) -> None:
+    """Every process the suite started has ended."""
+    pids = (workflow.state / f"pids-{name}").read_text().split()
+    assert pids
+    for pid in pids:
+        stat = Path(f"/proc/{pid}/stat")
+        assert not stat.exists() or stat.read_text().rpartition(")")[2].split()[0] == "Z", pid
 
 
 @pytest.mark.parametrize("named_by", ["argument", "environment"])
@@ -601,4 +625,127 @@ def test_a_part_that_is_no_part_is_refused(workflow: Workflow, part: str) -> Non
 
     assert done.returncode == 2
     assert '"K of N"' in done.stderr
+    assert _runs(workflow) == []
+
+
+def test_a_stopped_push_stops_its_suite(workflow: Workflow) -> None:
+    _cloud_repository(workflow, {"server": _SUITES["server"]})
+    _change(workflow, "server/orders.py")
+    (workflow.state / "hang-server").touch()
+    push = subprocess.Popen(
+        ["bash", str(workflow.repo / "scripts/workflow/ci-tests-for-changes"), "--run",
+         "--extra-only"],
+        cwd=workflow.repo,
+        env={**workflow.env, **_CLOUD},
+        stdout=subprocess.PIPE,
+        text=True,
+    )  # fmt: skip
+    try:
+        pids = workflow.state / "pids-server"
+        deadline = time.monotonic() + 30
+        while not pids.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        push.send_signal(signal.SIGTERM)
+        push.communicate(timeout=30)
+    finally:
+        push.kill()
+
+    assert push.returncode == 128 + signal.SIGTERM
+    _assert_gone(workflow, "server")
+
+
+def test_a_local_push_with_a_part_left_set_runs_no_extra_suite(workflow: Workflow) -> None:
+    _cloud_repository(workflow)
+    _change(workflow, "server/orders.py")
+
+    done = _run(workflow, "--run", "--extra-only", env={"SHIPLINE_CLOUD_SERVER_PART": "1/4"})
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _runs(workflow) == []
+
+
+def test_a_part_applies_only_to_the_whole_server_suite(workflow: Workflow) -> None:
+    _cloud_repository(workflow, {"server": _SUITES["server"]})
+    _change(workflow, "server/orders.py")
+
+    done = _run(workflow, "--run", "--extra-only", "--server-part", "1 of 4", env=_CLOUD)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _runs(workflow) == ["run server --workers 4 server/orders_test.py as=self"]
+    assert "server: a selection, not the whole suite, so no part of it is named" in done.stdout
+
+
+@pytest.mark.parametrize(
+    "selector,refusal",
+    [
+        ("false", "the push is refused: server: the selection failed (exit 1): "),
+        ("echo whole", "the push is refused: server: the selection failed: it printed 'whole "),
+        (
+            "echo {\"whole\": false, \"tests\": [], \"total\": 1}",
+            "the push is refused: server: the selection failed: it printed",
+        ),
+        ("no-such-selector", "the push is refused: server: the selection failed: "),
+    ],
+)
+def test_a_selection_that_cannot_be_read_refuses_the_push(
+    workflow: Workflow, selector: str, refusal: str
+) -> None:
+    _cloud_repository(workflow, {"server": {**_SUITES["server"], "select": selector}})
+    _change(workflow, "server/orders.py")
+
+    done = _run(workflow, "--run", "--extra-only", env=_CLOUD)
+
+    assert done.returncode == 1
+    assert refusal in done.stdout, done.stdout
+    assert _runs(workflow) == []
+
+
+def test_a_suite_whose_command_cannot_start_refuses_after_the_others_ran(
+    workflow: Workflow,
+) -> None:
+    _cloud_repository(
+        workflow,
+        {"server": {**_SUITES["server"], "run": "no-such-runner"}, "docs": _SUITES["docs"]},
+    )
+    _change(workflow, "server/orders.py", "docs/guide.md")
+
+    done = _run(workflow, "--run", "--extra-only", env=_CLOUD)
+
+    assert done.returncode == 1
+    assert "cannot start no-such-runner server/orders_test.py" in done.stdout
+    assert _runs(workflow) == ["run docs docs/guide_check.py as=self"]
+    assert done.stdout.endswith("the push is refused: server failed\n")
+
+
+def test_a_probe_that_does_not_answer_leaves_the_browser_suite_to_ci(workflow: Workflow) -> None:
+    _cloud_repository(workflow, {"browser": _SUITES["browser"]})
+    _change(workflow, "web/cart.ts")
+    (workflow.state / "probe-hangs").touch()
+
+    done = _run(
+        workflow, "--run", "--extra-only", env={**_CLOUD, "WORKFLOW_CLOUD_PROBE_SECONDS": "1"}
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "browser: left to CI: no browser can start as this user: " in done.stdout
+    assert "the probe did not answer in 0m 1s" in done.stdout
+    assert _runs(workflow) == []
+
+
+@pytest.mark.parametrize("account", ["no-such-account", "root", "-x"])
+def test_as_root_an_account_that_is_no_unprivileged_one_is_refused(
+    workflow: Workflow, account: str
+) -> None:
+    _cloud_repository(workflow)
+    _change(workflow, "server/orders.py")
+
+    done = _run(
+        workflow,
+        "--run",
+        env={**_CLOUD, "WORKFLOW_EUID": "0", "SHIPLINE_CLOUD_TEST_USER": account},
+    )
+
+    assert done.returncode == 1
+    assert f"SHIPLINE_CLOUD_TEST_USER names no unprivileged account: {account!r}" in done.stdout
+    assert workflow.calls("push-checks") == []
     assert _runs(workflow) == []

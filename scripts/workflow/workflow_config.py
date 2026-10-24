@@ -277,6 +277,14 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
     return merged
 
 
+def _command(value: Any) -> bool:
+    """Whether a value is a command line: words a shell would split, at least one."""
+    try:
+        return isinstance(value, str) and bool(shlex.split(value))
+    except ValueError:
+        return False
+
+
 def _suites(given: Any) -> tuple[Suite, ...]:
     where = "cloud_pre_push.suites"
     if not isinstance(given, dict):
@@ -297,8 +305,7 @@ def _suites(given: Any) -> tuple[Suite, ...]:
         for key in ("select", "run", "part", "probe"):
             if key in ("part", "probe") and key not in suite:
                 continue
-            value = suite.get(key)
-            if not isinstance(value, str) or not value.strip():
+            if not _command(suite.get(key)):
                 raise ConfigError(f"{FILE}: {where}.{name}.{key} must be a command")
         workers = suite.get("workers", SUITE_WORKERS.get(name, 1))
         if type(workers) is not int or workers < 1:
@@ -310,6 +317,13 @@ def _suites(given: Any) -> tuple[Suite, ...]:
             Suite(name, suite["select"], suite["run"], workers, part, suite.get("probe"))
         )
     return tuple(suites)
+
+
+def _commands(values: dict[str, Any], name: str) -> str | None:
+    value = values["commands"][name]
+    if value is not None and not _command(value):
+        raise ConfigError(f"{FILE}: commands.{name} must be a command")
+    return value
 
 
 def _relative(value: str, name: str) -> str:
@@ -415,7 +429,7 @@ def load(start: Path | None = None) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
-        commands=Commands(**values["commands"]),
+        commands=Commands(**{name: _commands(values, name) for name in values["commands"]}),
         cloud_pre_push=CloudPrePush(_suites(suites)),
         given=given,
         main=main,

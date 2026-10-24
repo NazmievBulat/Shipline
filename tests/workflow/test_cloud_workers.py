@@ -94,7 +94,8 @@ def test_the_cloud_worker_is_told_to_push_as_one_so_its_push_runs_cis_tests(
     assert (
         "Export SHIPLINE_CLOUD_WORKER=1 in every shell before pushing: the pre-push hook then "
         "also runs the tests CI will run for this change, as "
-        "shipline ci-tests-for-changes shows them."
+        "shipline ci-tests-for-changes shows them; run each push in the background and wait "
+        "for it, since each suite may take up to 25 minutes."
     ) in sentence
     assert (
         "When this container runs as root, also export SHIPLINE_CLOUD_TEST_USER naming the "

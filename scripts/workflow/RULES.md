@@ -290,7 +290,8 @@ record only once the pull request is ready, letting the normal independent revie
 
 A cloud worker's push also runs the tests CI will run for its change: its machine is its own,
 so the slower suites cost no local machine anything. It exports `SHIPLINE_CLOUD_WORKER=1` in
-every shell before pushing, and the repository's pre-push hook ends with
+every shell before pushing, runs each push in the background and waits for it, and the
+repository's pre-push hook ends with
 `shipline ci-tests-for-changes --run --extra-only`, which runs nothing unless that is set. A
 local worker, a reviewer, the gate and the tick push as before, and nothing that runs today
 is skipped for anyone. The suites are the `cloud_pre_push.suites` of `shipline.json`, each

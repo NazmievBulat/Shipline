@@ -24,8 +24,9 @@ names (`runuser -u <account> --`); without one, nothing runs. A suite with a `pr
 when its probe says a browser can start, and is otherwise left to CI. Each suite reports its
 time and has LIMIT_SECONDS; past it, it gets a TERM, and a KILL GRACE_SECONDS later, and counts
 as timed out. After a timeout of the whole server suite, `--server-part "K of N"` (or
-`SHIPLINE_CLOUD_SERVER_PART`) runs only that part, by the server suite's `part` argument, as CI
-parts it; CI runs the rest. A failed or timed-out suite refuses the push, once every suite ran.
+`SHIPLINE_CLOUD_SERVER_PART`) runs only that part of it, by the server suite's `part`
+argument, as CI parts it; CI runs the rest. A failed or timed-out suite refuses the push, once
+every suite ran.
 
 Exits 0 when the push may go, 1 when it is refused, 2 on a wrong call.
 """
@@ -33,9 +34,9 @@ Exits 0 when the push may go, 1 when it is refused, 2 on a wrong call.
 import argparse
 import json
 import os
+import pwd
 import re
 import shlex
-import signal
 import subprocess
 import sys
 import tempfile
@@ -44,13 +45,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import workflow_config
+from workflow_commands import CommandTimeout, install_signal_handlers, run, run_shown
 from workflow_config import Suite
 
 # How long one suite may run, and how long it has to stop after a TERM.
 LIMIT_SECONDS = 25 * 60
 GRACE_SECONDS = 60
-# How long fetching main may take.
+# How long fetching main, a selection and a browser probe may take.
 FETCH_SECONDS = 120
+SELECT_SECONDS = 300
+PROBE_SECONDS = 120
 # How many of a refused probe's last lines are told.
 PROBE_LINES = 3
 SERVER = "server"
@@ -59,7 +63,7 @@ _ACCOUNT = re.compile(r"[a-z_][a-z0-9_-]*\$?")
 
 
 class Refused(Exception):
-    """The push is refused before any suite ran, for the reason given."""
+    """The push is refused, for the reason given."""
 
 
 @dataclass(frozen=True)
@@ -76,17 +80,20 @@ class Selection:
             said = "none"
         else:
             said = f"{len(self.files)} of {self.total} files: {' '.join(self.files)}"
-        return "".join([said, *(f"\n  because: {'; '.join(self.reasons)}",) * bool(self.reasons)])
+        if self.reasons:
+            said += f"\n  because: {'; '.join(self.reasons)}"
+        return said
 
 
 def _say(text: str) -> None:
     print(text, flush=True)
 
 
-def _git(checkout: Path, *args: str, timeout: float | None = None) -> str:
+def _git(*args: str, timeout: float | None = None) -> str:
     try:
         done = subprocess.run(
-            ["git", "-C", str(checkout), *args],
+            ["git", *args],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -105,7 +112,7 @@ def _duration(seconds: float) -> str:
 
 
 def _part(given: str | None) -> tuple[int, int] | None:
-    if given is None or given == "":
+    if not given:
         return None
     found = _PART.fullmatch(given.strip())
     if not found or not 1 <= int(found[1]) <= int(found[2]):
@@ -120,10 +127,19 @@ def _words(command: str, values: dict[str, str]) -> list[str]:
     return words
 
 
-def _select(suite: Suite, checkout: Path, base: str, listing: Path) -> Selection:
-    words = shlex.split(suite.select) + [base, "--files-from", str(listing)]
-    done = subprocess.run(words, cwd=checkout, capture_output=True, text=True, check=False)
+def _select(suite: Suite, base: str, listing: Path) -> Selection:
     failed = f"{suite.name}: the selection failed"
+    try:
+        done = run(
+            *shlex.split(suite.select),
+            base,
+            "--files-from",
+            str(listing),
+            timeout=SELECT_SECONDS,
+            errors="replace",
+        )
+    except (CommandTimeout, OSError) as error:
+        raise Refused(f"{failed}: {error}") from None
     if done.returncode:
         raise Refused(f"{failed} (exit {done.returncode}): {done.stderr.strip()}")
     try:
@@ -138,7 +154,7 @@ def _select(suite: Suite, checkout: Path, base: str, listing: Path) -> Selection
             and all(isinstance(reason, str) for reason in answer["reasons"])
         ):
             raise ValueError
-    except (ValueError, KeyError, AttributeError, TypeError):
+    except ValueError, KeyError, AttributeError, TypeError:
         raise Refused(f"{failed}: it printed {done.stdout.strip()!r}") from None
     return Selection(answer["whole"], tuple(files), answer["total"], tuple(answer["reasons"]))
 
@@ -147,53 +163,39 @@ def _as_tester(words: list[str], account: str | None) -> list[str]:
     return ["runuser", "-u", account, "--", *words] if account else words
 
 
-def _stop(process: subprocess.Popen[bytes], grace: float) -> None:
-    """TERM to the run and every process it started; KILL to those left after the grace."""
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-    except ProcessLookupError:
-        process.wait()
-
-
-def _run(words: list[str], checkout: Path, limit: float, grace: float) -> tuple[str, float]:
+def _run(words: list[str], limit: float | None, grace: float) -> tuple[str, float]:
     """Runs a suite, its output told as it comes: passed, failed or timed out, and its time."""
     started = time.monotonic()
-    # A session of its own, so a stop reaches the processes the suite started.
-    process = subprocess.Popen(
-        words, cwd=checkout, stderr=subprocess.STDOUT, start_new_session=True
-    )
     try:
-        code = process.wait(timeout=limit)
-    except subprocess.TimeoutExpired:
-        _stop(process, grace)
-        return "timed out", time.monotonic() - started
-    return ("passed" if code == 0 else "failed"), time.monotonic() - started
+        code = run_shown(*words, timeout=limit, grace=grace)
+    except OSError as error:
+        _say(f"cannot start {shlex.join(words)}: {error}")
+        return "failed", time.monotonic() - started
+    outcome = "timed out" if code is None else "passed" if code == 0 else "failed"
+    return outcome, time.monotonic() - started
 
 
-def _probe(suite: Suite, checkout: Path, account: str | None) -> str | None:
+def _probe(suite: Suite, account: str | None) -> str | None:
     """None when the suite's browser can start, else what the probe said."""
     assert suite.probe
-    done = subprocess.run(
-        _as_tester(shlex.split(suite.probe), account),
-        cwd=checkout,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=LIMIT_SECONDS,
-        check=False,
-    )
+    seconds = float(os.environ.get("WORKFLOW_CLOUD_PROBE_SECONDS", PROBE_SECONDS))
+    try:
+        done = run(
+            *_as_tester(shlex.split(suite.probe), account),
+            timeout=seconds,
+            errors="replace",
+        )
+    except CommandTimeout:
+        return f"the probe did not answer in {_duration(seconds)}"
+    except OSError as error:
+        return str(error)
     if done.returncode == 0:
         return None
-    lines = done.stdout.strip().splitlines()[-PROBE_LINES:]
+    lines = (done.stdout + done.stderr).strip().splitlines()[-PROBE_LINES:]
     return " / ".join(lines) or f"it exited {done.returncode}"
 
 
-def _arguments(argv: list[str]) -> argparse.Namespace:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="shipline ci-tests-for-changes",
         description="The tests CI will run for this change; with --run, run them.",
@@ -204,80 +206,91 @@ def _arguments(argv: list[str]) -> argparse.Namespace:
         "--extra-only", action="store_true", help="with --run: the suites only, for a cloud push"
     )
     parser.add_argument("--server-part", metavar='"K of N"', help="one part of the server suite")
-    arguments = parser.parse_args(argv)
-    if arguments.extra_only and not arguments.run:
-        parser.error("--extra-only goes with --run")
-    try:
-        arguments.part = _part(
-            arguments.server_part
-            if arguments.server_part is not None
-            else os.environ.get("SHIPLINE_CLOUD_SERVER_PART")
-        )
-    except ValueError as error:
-        parser.error(str(error))
-    return arguments
+    return parser
 
 
-def _checkout() -> Path:
-    return Path(_git(Path.cwd(), "rev-parse", "--show-toplevel").strip())
-
-
-def _base(checkout: Path, named: str | None) -> tuple[str, str]:
+def _base(named: str | None) -> tuple[str, str]:
     """Where the change starts, and how to say it."""
     if named is None:
-        _git(checkout, "fetch", "--quiet", "origin", "main", timeout=FETCH_SECONDS)
+        # Named in full: a single-branch clone's fetch would not update `origin/main`.
+        _git(
+            "fetch",
+            "--quiet",
+            "origin",
+            "+refs/heads/main:refs/remotes/origin/main",
+            timeout=FETCH_SECONDS,
+        )
         named = "origin/main"
-    base = _git(checkout, "merge-base", named, "HEAD").strip()
+    base = _git("merge-base", named, "HEAD").strip()
     return base, f"against {base[:12]}, where this branch left {named}"
 
 
+def _account(run_tests: bool) -> str | None:
+    """The account the suites run as: None for the user this runs as, which is not root."""
+    if not run_tests or int(os.environ.get("WORKFLOW_EUID", os.geteuid())) != 0:
+        return None
+    account = os.environ.get("SHIPLINE_CLOUD_TEST_USER") or None
+    if account is None:
+        raise Refused(
+            "running as root: name the unprivileged account the tests run as in "
+            "SHIPLINE_CLOUD_TEST_USER, so no test runs as root"
+        )
+    try:
+        if not _ACCOUNT.fullmatch(account) or pwd.getpwnam(account).pw_uid == 0:
+            raise KeyError
+    except KeyError:
+        raise Refused(
+            f"SHIPLINE_CLOUD_TEST_USER names no unprivileged account: {account!r}"
+        ) from None
+    return account
+
+
 def main(argv: list[str]) -> int:
-    arguments = _arguments(argv)
+    parser = _parser()
+    arguments = parser.parse_args(argv)
+    if arguments.extra_only and not arguments.run:
+        parser.error("--extra-only goes with --run")
     if arguments.extra_only and os.environ.get("SHIPLINE_CLOUD_WORKER") != "1":
         _say("ci-tests-for-changes: not a cloud worker, so the push runs no extra suite")
         return 0
     try:
-        config = workflow_config.current()
-        account = os.environ.get("SHIPLINE_CLOUD_TEST_USER") or None
+        part = _part(
+            arguments.server_part
+            if arguments.server_part is not None
+            else os.environ.get("SHIPLINE_CLOUD_SERVER_PART")
+        )
         limit = float(os.environ.get("WORKFLOW_CLOUD_SUITE_SECONDS", LIMIT_SECONDS))
         grace = float(os.environ.get("WORKFLOW_CLOUD_SUITE_GRACE", GRACE_SECONDS))
+    except ValueError as error:
+        parser.error(str(error))
+    # A stopped push stops its suites with it.
+    install_signal_handlers()
+    # Nothing it starts reads the push's input: git's list of refs in the hook, or a person's keys.
+    os.dup2(os.open(os.devnull, os.O_RDONLY), sys.stdin.fileno())
+    try:
+        config = workflow_config.current()
         suites = config.cloud_pre_push.suites
-        if arguments.part:
-            server = next((suite for suite in suites if suite.name == SERVER), None)
-            if server is None or server.part is None:
-                raise Refused(
-                    "a server part was named, but shipline.json names no "
-                    f"cloud_pre_push.suites.{SERVER}.part"
-                )
-        if arguments.run:
-            if int(os.environ.get("WORKFLOW_EUID", os.geteuid())) != 0:
-                account = None
-            elif account is None:
-                raise Refused(
-                    "running as root: name the unprivileged account the tests run as in "
-                    "SHIPLINE_CLOUD_TEST_USER, so no test runs as root"
-                )
-            elif not _ACCOUNT.fullmatch(account):
-                raise Refused(f"SHIPLINE_CLOUD_TEST_USER is no account name: {account!r}")
-        checkout = _checkout()
+        if part and not any(suite.name == SERVER and suite.part for suite in suites):
+            raise Refused(
+                "a server part was named, but shipline.json names no "
+                f"cloud_pre_push.suites.{SERVER}.part"
+            )
+        account = _account(arguments.run)
+        os.chdir(_git("rev-parse", "--show-toplevel").strip())
         if arguments.run and not arguments.extra_only and config.commands.push_checks:
             _say("push checks: running")
-            outcome, took = _run(
-                shlex.split(config.commands.push_checks), checkout, float("inf"), grace
-            )
+            outcome, took = _run(shlex.split(config.commands.push_checks), None, grace)
             _say(f"push checks: {outcome} in {_duration(took)}")
             if outcome != "passed":
                 raise Refused("the push checks failed")
-        base, against = _base(checkout, arguments.base)
-        changed = _git(checkout, "diff", "--name-only", "--no-renames", "-z", base).split("\0")
+        base, against = _base(arguments.base)
+        changed = _git("diff", "--name-only", "--no-renames", "-z", base).split("\0")
         changed = [path for path in changed if path]
         _say(f"ci-tests-for-changes: {against}, {len(changed)} changed files")
         with tempfile.NamedTemporaryFile("w", prefix="ci-tests-", suffix=".txt") as listing:
             listing.write("".join(f"{path}\n" for path in changed))
             listing.flush()
-            selections = [
-                (suite, _select(suite, checkout, base, Path(listing.name))) for suite in suites
-            ]
+            selections = [(suite, _select(suite, base, Path(listing.name))) for suite in suites]
         for suite, selection in selections:
             _say(f"{suite.name}: {selection}")
         if not arguments.run:
@@ -287,30 +300,32 @@ def main(argv: list[str]) -> int:
             if not selection.whole and not selection.files:
                 continue
             if suite.probe:
-                error = _probe(suite, checkout, account)
+                error = _probe(suite, account)
                 if error is not None:
                     who = account or "this user"
                     _say(f"{suite.name}: left to CI: no browser can start as {who}: {error}")
                     continue
             words = _words(suite.run, {"workers": str(suite.workers)})
-            part = arguments.part if suite.name == SERVER else None
-            if part:
+            # CI parts the whole suite; a selection runs whole, whatever part is named.
+            shard = part if suite.name == SERVER and selection.whole else None
+            if shard:
                 assert suite.part
-                shard, shards = (str(number) for number in part)
-                words += _words(suite.part, {"shards": shards, "shard": shard})
+                words += _words(suite.part, {"shards": str(shard[1]), "shard": str(shard[0])})
+            elif suite.name == SERVER and part:
+                _say(f"{suite.name}: a selection, not the whole suite, so no part of it is named")
             if not selection.whole:
                 words += selection.files
             _say(f"{suite.name}: running" + (f" as {account}" if account else ""))
-            outcome, took = _run(_as_tester(words, account), checkout, limit, grace)
+            outcome, took = _run(_as_tester(words, account), limit, grace)
             if outcome == "timed out":
                 _say(
                     f"{suite.name}: timed out after {_duration(took)}, "
                     f"the limit is {_duration(limit)}"
                 )
-            elif part:
+            elif shard:
                 rest = "; CI runs the rest" if outcome == "passed" else ""
                 _say(
-                    f"{suite.name}: part {part[0]} of {part[1]} {outcome} "
+                    f"{suite.name}: part {shard[0]} of {shard[1]} {outcome} "
                     f"in {_duration(took)}{rest}"
                 )
             else:
