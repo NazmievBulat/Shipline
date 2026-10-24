@@ -201,6 +201,12 @@ recover_runners() {
 trap recover_runners EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# The runner balancer leaves the runners alone until the install ends: it would find them stopped
+# and start more, or read pool-settings.sh half written. It holds the same lock while it changes
+# them, for at most the few minutes a runner takes to start.
+mkdir -p "$HOME/.local/state/workflow"
+exec 8>>"$HOME/.local/state/workflow/runner-balance.lock"
+flock -w 300 8 || { echo "The runner balancer did not let go of its lock in 5 minutes." >&2; exit 1; }
 # The runner balancer's own lines (its bounds, `balance off`) outlast a reinstall; the counts are
 # the ones this install was given.
 balance_lines=$(python3 "$here/balance_runners.py" kept "$installed/pool-settings.sh")
@@ -212,6 +218,7 @@ systemctl --user stop example-app-runner-main.service example-app-runner-main-2.
   printf "other_machines='%s'\n" "$other_machines"
   printf 'ordinary_jobs=%s\n' "$runners"
   printf 'ordinary_blacksmith_jobs=%s\n' "$ordinary_blacksmith_jobs"
+  printf 'ordinary_spares=%s\n' "$spares"
   printf 'docker_runners=%s\n' "$docker_runners"
   [ -z "$balance_lines" ] || printf '%s\n' "$balance_lines"
 } >"$installed/pool-settings.sh"

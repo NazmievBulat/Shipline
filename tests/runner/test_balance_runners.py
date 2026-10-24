@@ -995,8 +995,15 @@ def test_a_reinstall_keeps_the_bounds_and_writes_the_docker_count(machine: Machi
     (source / "machines/other.sh").write_text(
         "roles='ordinary'\nordinary_jobs=1\ndocker_runners=0\n"
     )
-    for tool in ("docker", "loginctl"):
-        machine.fake(tool, f'#!/bin/bash\necho "{tool} $*" >> "@STATE@/calls.log"\n')
+    machine.fake("loginctl", '#!/bin/bash\necho "loginctl $*" >> "@STATE@/calls.log"\n')
+    # Docker is asked while the runners are down: a balancer run then would find them gone.
+    lock = machine.home / ".local/state/workflow/runner-balance.lock"
+    machine.fake(
+        "docker",
+        "#!/bin/bash\n"
+        f'if flock -n "{lock}" true 2>/dev/null; then echo free; else echo held; fi'
+        ' >> "@STATE@/balancer-lock"\n',
+    )
     # The machine as the balancer left it: other counts, and its own lines.
     machine.settings(
         ordinary=4,
@@ -1018,6 +1025,9 @@ def test_a_reinstall_keeps_the_bounds_and_writes_the_docker_count(machine: Machi
     settings = machine.settings_file.read_text()
     # The counts are the machine's from machines/box.sh again; the balancer's lines stay.
     assert "ordinary_jobs=2\n" in settings and "docker_runners=1\n" in settings
+    # The units the balancer numbers after the slots.
+    assert "ordinary_spares=1\n" in settings
+    assert set((machine.state / "balancer-lock").read_text().split()) == {"held"}
     assert settings.endswith("balance_ordinary=2-5\nbalance_docker=0-2\nbalance off\n")
     units = machine.home / ".config/systemd/user"
     assert (units / "example-app-runner-balance.timer").is_file()
