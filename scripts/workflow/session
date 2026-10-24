@@ -22,7 +22,9 @@
 #                               memory and its memory limit. The state is `busy`, `idle` (it ended its turn) or
 #                               `limit` (the usage limit stopped it; the line then ends with
 #                               which limit and when it resets, as the screen says it, or
-#                               `usage limit` and the reset the stop hook noted, in UTC)
+#                               `usage limit` and the reset the stop hook noted, in UTC).
+#                               Before that, once the tick has read its screen, when the
+#                               screen last changed, in UTC: the time its 45-minute rule counts from
 #   session load                the 5-minute load average and the ceiling above which a start
 #                               waits, as it waits while memory is short
 #   session room                succeeds when a start would not wait for memory or the
@@ -40,6 +42,10 @@
 #                               whether that wait is over (the tick does this, to keep its cache)
 #   session finish-ready <ticket-N>
 #                               tell an idle worker whose pull request is ready to finish
+#   session nudge-busy <ticket-N|review-N> <still|loop>
+#                               press Escape in a busy Claude session whose screen has not
+#                               changed for 45 minutes, or whose wait loop finds itself, and
+#                               tell it so (the tick does this, once)
 #   session running <name>      what the session's Bash tool runs, as JSON, and whether it is
 #                               a wait loop that finds itself (`running_command.py`)
 #   session bridge <ticket-N>   start the bridge of a Codex worker again when it ended while
@@ -129,6 +135,7 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session batch-merged <review-N> <squash>
        session status-check <ticket-N|review-N>
        session finish-ready <ticket-N>
+       session nudge-busy <ticket-N|review-N> <still|loop>
        session running <ticket-N|audit-N|review-N|hunt-name>
        session bridge <ticket-N>
        session cleanup [hunts]
@@ -906,6 +913,12 @@ list_sessions() {
     if [[ -e $browser_lock ]] && ! flock -n -x "$browser_lock" true; then
       state=busy
     fi
+    # When the tick last saw the screen change (its `.screen-seen` note: the sum and the time).
+    local seen="" sum changed
+    if { read -r sum changed <"$main/$SHIPLINE_STATE_FOLDER/$name.screen-seen"; } 2>/dev/null &&
+        [[ $changed =~ ^[0-9]{1,12}$ ]]; then
+      seen="  screen changed $(LC_ALL=C TZ=UTC date -d "@$changed" '+%b %-d, %Y, %-I:%M%P') (UTC)"
+    fi
     stopped=""
     if stopped_on_limit "$name" without-box; then
       state=limit
@@ -938,9 +951,9 @@ list_sessions() {
       limits=" ($limits)"
     fi
     if [[ $known == true ]]; then
-      echo "$name  $state  $(megabytes "$total_held") held$limits  $(megabytes "$total_swapped") in swap$stopped"
+      echo "$name  $state  $(megabytes "$total_held") held$limits  $(megabytes "$total_swapped") in swap$seen$stopped"
     else
-      echo "$name  $state  memory unknown$stopped"
+      echo "$name  $state  memory unknown$seen$stopped"
     fi
   done < <(list_running)
   # Python takes tens of milliseconds to start, and the tick lists the sessions many times a run:
@@ -1143,6 +1156,53 @@ cmd_nudge_idle() {
   fi
   [[ -e $notes.idle ]] || die "$name is busy"
   send_prompt "$name" "Pull request ${name#ticket-} is ready, but you have not finished. Finish by the rules: when nothing is left to do, name each ticket pull request this session opened and say that it waits for the owner's start, then say \`worker finished\` on a line of its own."
+}
+
+# The tick's two messages to a busy Claude worker or reviewer that does not move: its screen has
+# not changed for 45 minutes, or its wait loop finds its own command line. Escape interrupts
+# what it runs, and the message tells it why. A session that waits for the owner, ended its
+# turn, shows a permission dialog (Escape would answer it) or has any text in its box exits 3
+# with nothing pressed. When Escape puts a message queued while it worked back into the box,
+# nothing is typed after it: exit 4, the session interrupted.
+cmd_nudge_busy() {
+  local name=$1 kind=$2 notes typed poll screen
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  require_running "$name"
+  [[ ! -e $notes.codex ]] || die "$name is a Codex worker; its bridge relays"
+  ! stopped_on_limit "$name" || die "$name is stopped on the usage limit"
+  if [[ -e $notes.owner-blocked || -e $notes.interaction-blocked || -e $notes.asking ]]; then
+    echo "$name is waiting for the owner; nothing was pressed" >&2
+    exit 3
+  fi
+  if [[ -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]]; then
+    echo "$name is not busy; nothing was pressed" >&2
+    exit 3
+  fi
+  screen=$(tmux -L "$name" capture-pane -p -t "=$name:" 2>/dev/null) || die "cannot read the screen of $name"
+  if LC_ALL=C grep -qE '^[[:space:]│]*Do you want to [^?]*\?' <<<"$screen"; then
+    echo "$name shows a permission dialog; nothing was pressed" >&2
+    exit 3
+  fi
+  read_prompt_box
+  if [[ -n $typed ]]; then
+    echo "$name has text in its box that was not sent; nothing was pressed" >&2
+    exit 3
+  fi
+  tmux -L "$name" send-keys -t "=$name:" Escape 2>/dev/null || die "Escape could not be sent to $name"
+  # Claude draws the interrupt, and puts back into the box what was queued while it worked.
+  for ((poll=0; poll<10; poll++)); do
+    sleep 0.2
+    read_prompt_box
+    if [[ -n $typed ]]; then
+      echo "$name has text in its box after Escape; nothing was typed into it" >&2
+      exit 4
+    fi
+  done
+  if [[ $kind == still ]]; then
+    send_prompt "$name" "The command has produced nothing for 45 minutes. Check whether it is still running and go on."
+  else
+    send_prompt "$name" "That loop finds its own command line and never ends. Check the process by its number."
+  fi
 }
 
 # What the session's Bash tool runs, as JSON (`running_command.py`).
@@ -1464,6 +1524,11 @@ case ${1:-} in
     [[ $# -eq 2 && $2 =~ ^ticket-[0-9]+$ ]] || usage
     find_main_checkout
     cmd_nudge_idle "$2" finish
+    ;;
+  nudge-busy)
+    [[ $# -eq 3 && $2 =~ ^(ticket|review)-[0-9]+$ && $3 =~ ^(still|loop)$ ]] || usage
+    find_main_checkout
+    cmd_nudge_busy "$2" "$3"
     ;;
   running)
     [[ $# -eq 2 ]] && is_session_name "$2" || usage

@@ -370,6 +370,13 @@ BOX
         after="@STATE@/screen-after-enter-$name"
         [ ! -f "$after" ] || mv "$after" "@STATE@/screen/$name"
       fi
+    elif [ "$3" = Escape ]; then
+      # What Escape puts back into the box (a message queued while the session worked), and
+      # what the session draws once interrupted, when a test gives them.
+      queued="@STATE@/input-after-escape-$name"
+      [ ! -f "$queued" ] || mv "$queued" "@STATE@/input-$name"
+      after="@STATE@/screen-after-escape-$name"
+      [ ! -f "$after" ] || mv "$after" "@STATE@/screen/$name"
     fi
     ;;
   *) exit 1 ;;
