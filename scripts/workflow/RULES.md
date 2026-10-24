@@ -103,9 +103,15 @@ the line at once, each as a prefix: main and every member ahead of it, merged wi
 on a scratch branch of its own, with its CI, the whole browser suite's E2E run and any
 required image checks. The gate's first run of a prefix takes main's runners when the
 repository has them and one is free, in a lane of its own that a push to main goes ahead of, so
-a prefix never waits behind pull requests' own CI. How many it tests, the window, starts at 4,
-grows by one after each merge and halves after a failed prefix, never below 1 and never above 4
-(`WINDOW_CEILING` in
+a prefix never waits behind pull requests' own CI.
+A scratch CI or E2E job asking for `<label>-main-batch` that queues
+longer than `merge_train.queued_limit_minutes` (default 20) has its first attempt cancelled
+and its whole run re-run once, so attempt 2 takes the ordinary runner choice; a job past the
+limit on a later attempt is reported once in the gate's output and wake, and keeps waiting.
+Image jobs and jobs outside that lane do not trigger this retry; the gate remembers the
+recovery across restarts, and `--train-status` shows it with the prefix.
+How many it tests, the window, starts at 4, grows by one after each
+merge and halves after a failed prefix, never below 1 and never above 4 (`WINDOW_CEILING` in
 `scripts/workflow/merge_gate.py`). A member merges as soon as its own prefix passed and every
 member ahead of it merged; its squash must match its prefix's tree, and main inherits that
 prefix's green result. A first member whose own CI tested its merge with the current main

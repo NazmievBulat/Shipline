@@ -642,6 +642,78 @@ def test_the_tick_notes_when_a_screen_last_changed_for_session_list(workflow: Wo
     ]
 
 
+@pytest.mark.parametrize("name", ["ticket-7", "review-7", "audit-7"])
+def test_a_session_stopped_and_cleaned_up_is_skipped_even_in_a_stale_list(
+    workflow: Workflow, name: str
+) -> None:
+    worktree = workflow.add_worktree(7, state="MERGED", draft=False)
+    workflow.running(name)
+    notes = workflow.notes(7)
+    notes.mkdir(parents=True)
+    (notes / f"{name}.idle").touch()
+    words = {"ticket-7": "worker", "review-7": "review", "audit-7": "audit"}[name]
+    workflow.screen(f"● All done.\n\n{words} finished\n" + _BOX, name)
+    # Keep the observation from before stop/cleanup, as an in-memory caller can do.
+    real = workflow.script.with_name("session.real")
+    workflow.script.rename(real)
+    workflow.script.write_text(
+        '#!/bin/bash\n'
+        'if [[ $1 == list ]]; then\n'
+        f'  cached={shlex.quote(str(workflow.state / "cached-sessions"))}\n'
+        f'  [[ -f $cached ]] || bash {shlex.quote(str(real))} list >"$cached"\n'
+        '  cat "$cached"\n'
+        'else\n'
+        f'  exec bash {shlex.quote(str(real))} "$@"\n'
+        'fi\n'
+    )
+
+    done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert done.returncode == 0, done.stderr
+    assert not workflow.is_running(name)
+    assert not worktree.exists()
+    assert not (workflow.repo / ".local/workflow" / f"{name}.screen-seen").exists()
+    assert workflow.calls(f"tmux {name} send-keys") == []
+
+
+def test_notes_removed_during_a_screen_check_are_not_recreated_by_later_loops(
+    workflow: Workflow,
+) -> None:
+    _session(workflow, draft=False)
+    folder = workflow.repo / ".local/workflow"
+    workflow.fake(
+        "cksum",
+        f'#!/bin/bash\nrm -rf -- {shlex.quote(str(folder))}\nexec /usr/bin/cksum "$@"\n',
+    )
+
+    done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert done.returncode == 0, done.stderr
+    assert "No such file or directory" not in done.stderr
+    assert not list(folder.glob("ticket-7.*"))
+    assert workflow.calls("tmux ticket-7 send-keys") == []
+
+
+def test_a_state_folder_that_exists_but_cannot_be_written_still_fails_the_tick(
+    workflow: Workflow,
+) -> None:
+    _session(workflow)
+    folder = workflow.repo / ".local/workflow"
+    workflow.fake(
+        "cksum",
+        f'#!/bin/bash\nchmod 555 -- {shlex.quote(str(folder))}\nexec /usr/bin/cksum "$@"\n',
+    )
+
+    try:
+        done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW)})
+    finally:
+        folder.chmod(0o755)
+
+    assert done.returncode == 1
+    assert "ticket-7.screen-seen: Permission denied" in done.stderr
+    assert not (folder / "ticket-7.screen-seen").exists()
+
+
 def test_a_screen_that_changes_starts_the_45_minutes_again(workflow: Workflow) -> None:
     _session(workflow)
     workflow.screen(_busy_screen("1m"), "ticket-7")
