@@ -2354,3 +2354,23 @@ def test_docs_refuses_broken_markers_before_writing_anything(tmp_path: Path, dam
         workflow_config.documentation(root)
     assert (scripts / "README.md").read_text() == changed
     assert not (root / "examples/shipline.json").exists()
+
+
+def test_config_sections_keep_existing_positional_constructors() -> None:
+    checks = workflow_config.Checks("result", "ci", "e2e", "images", "audit", "notice", ["images"])
+    assert (checks.ci_result, checks.ci_plan, checks.e2e_plan, checks.images) == (
+        "result", "ci", "e2e", "images"
+    )
+    assert (checks.dependency_audit, checks.advisory_annotation, checks.prefix_only) == (
+        "audit", "notice", ["images"]
+    )
+    runner = workflow_config.Runner(("runner",), "identity", "prefix", "label", "planner", "build", "cache")
+    assert (runner.labels, runner.identity_folder, runner.prefix, runner.label,
+            runner.planner_label, runner.image_build, runner.hub_cache) == (
+        ("runner",), "identity", "prefix", "label", "planner", "build", "cache"
+    )
+    parity = workflow_config.Parity("workflow-tests", "runner-tests", "known")
+    assert (parity.workflow_tests, parity.runner_tests, parity.known) == (
+        "workflow-tests", "runner-tests", "known"
+    )
+    assert workflow_config.CloudPrePush().suites == ()

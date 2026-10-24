@@ -155,9 +155,9 @@ installation folder, even if the checkout has a file of the same name.
 | `runner.hub_cache` | name | The command running the Docker Hub cache; omitted means direct pulls. | none |
 | `runner.identity_folder` | name | The folder holding the runner programs' own GitHub identity. | `"~/.config/shipline-runner"` |
 | `runner.image_build` | name | The command that builds runner images; omitted means the pool cannot be installed. | none |
-| `runner.label` | name | The base runner label; derived as <prefix>-home when omitted. | none |
+| `runner.label` | name | The base runner label; derived as `<prefix>-home` when omitted. | none |
 | `runner.labels` | names | The runner labels eligible for failed-job reruns; derived from the base label when omitted. | `[]` |
-| `runner.planner_label` | name | The planner runner label; derived as <label>-planner when omitted. | none |
+| `runner.planner_label` | name | The planner runner label; derived as `<label>-planner` when omitted. | none |
 | `runner.prefix` | name | The word naming runner images, services, network and containers; omitted means no runner figures. | none |
 | `state_folder` | name | The folder of workflow notes in the main checkout and each worktree. | `".local/workflow"` |
 | `workflows.ci` | name | The CI workflow file under .github/workflows/. | `"ci.yml"` |

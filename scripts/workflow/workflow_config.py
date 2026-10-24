@@ -40,7 +40,7 @@ import sys
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -126,22 +126,41 @@ def option(
     convert: Callable[[Any], Any] | None = None,
     serialize: Callable[[Any], Any] | None = None,
     command_docs: tuple[str, str, str] | None = None, optional: bool = False,
+    position: int = sys.maxsize,
 ) -> Any:
     """A config key's validation kind, default, documentation and outward interfaces."""
     setting = Setting(kind, default, meaning, default if example is _UNSET else example,
                       name, shell, derived_shell, convert, serialize, command_docs)
-    arguments: dict[str, Any] = {"metadata": {"setting": setting}}
+    arguments: dict[str, Any] = {"metadata": {"setting": setting, "position": position}}
     if optional:
-        # These fields already had constructor defaults; keep them without putting optional
-        # fields ahead of required ones in the positional constructor after sorting by name.
-        arguments.update(kw_only=True, default_factory=lambda: (
+        arguments.update(default_factory=lambda: (
             convert(deepcopy(default)) if convert else deepcopy(default)
         ))
     return field(**arguments)
 
 
-def section(cls: type | None = None, *, mapping: bool = False) -> Any:
-    return field(metadata={"section": cls, "mapping": mapping})
+def section(
+    cls: type | None = None, *, mapping: bool = False, position: int = sys.maxsize,
+) -> Any:
+    return field(metadata={"section": cls, "mapping": mapping, "position": position})
+
+
+def config_section(cls: type) -> type:
+    """Keep existing positional constructors while declarations are alphabetic in source."""
+    def order(name: str) -> tuple[bool, int]:
+        item = getattr(cls, name)
+        optional = item.default is not MISSING or item.default_factory is not MISSING
+        return optional, item.metadata["position"]
+
+    cls.__annotations__ = dict(sorted(cls.__annotations__.items(), key=lambda pair: order(pair[0])))
+    return dataclass(frozen=True)(cls)
+
+
+def _declared_fields(cls: type) -> list[Any]:
+    return sorted(fields(cls), key=lambda item: (
+        item.metadata["setting"].name or item.name
+        if "setting" in item.metadata else item.name
+    ))
 
 
 @dataclass(frozen=True)
@@ -156,15 +175,15 @@ class CheckGroup:
                    (job.endswith(":") and name.startswith(job + " ")) for job in self.jobs)
 
 
-@dataclass(frozen=True)
+@config_section
 class Checks:
-    advisory_annotation: str | None = option('name', None, 'The advisory notice title on main; omitted means advisories make main red.', example='Advisory', optional=True)
-    ci_plan: str = option('name', 'CI: what to run', 'The CI planner check name.', example='Build: what to run', shell=(5, 'CI_PLAN'))
-    ci_result: str = option('name', 'CI result', 'The check that sums up CI.', example='Build result', shell=(4, 'CI_RESULT'))
-    dependency_audit: str | None = option('name', None, 'The dependency audit job name; omitted means CI: dependencies.', example='Build: dependencies', optional=True)
-    e2e_plan: str = option('name', 'E2E: what to run', 'The browser suite planner check name.', example='Browser: what to run', shell=(6, 'E2E_PLAN'))
-    images: str = option('name', 'Docker images', 'The prefix of image checks; its planner appends : what to run.', example='Images', shell=(7, 'IMAGES'), derived_shell=(8, 'IMAGES_PLAN', 'images_plan'))
-    prefix_only: list[str] = option('names', [], 'Distinct groups run only in merge prefixes: images, browser_whole and server_whole.', example=['images', 'browser_whole', 'server_whole'], optional=True)
+    advisory_annotation: str | None = option('name', None, 'The advisory notice title on main; omitted means advisories make main red.', example='Advisory', optional=True, position=5)
+    ci_plan: str = option('name', 'CI: what to run', 'The CI planner check name.', example='Build: what to run', shell=(5, 'CI_PLAN'), position=1)
+    ci_result: str = option('name', 'CI result', 'The check that sums up CI.', example='Build result', shell=(4, 'CI_RESULT'), position=0)
+    dependency_audit: str | None = option('name', None, 'The dependency audit job name; omitted means CI: dependencies.', example='Build: dependencies', optional=True, position=4)
+    e2e_plan: str = option('name', 'E2E: what to run', 'The browser suite planner check name.', example='Browser: what to run', shell=(6, 'E2E_PLAN'), position=2)
+    images: str = option('name', 'Docker images', 'The prefix of image checks; its planner appends : what to run.', example='Images', shell=(7, 'IMAGES'), derived_shell=(8, 'IMAGES_PLAN', 'images_plan'), position=3)
+    prefix_only: list[str] = option('names', [], 'Distinct groups run only in merge prefixes: images, browser_whole and server_whole.', example=['images', 'browser_whole', 'server_whole'], optional=True, position=6)
 
     def groups(self) -> dict[str, CheckGroup]:
         return {
@@ -178,46 +197,46 @@ class Checks:
         return f"{self.images}: what to run"
 
 
-@dataclass(frozen=True)
+@config_section
 class Annotations:
-    browser_suite: str = option('name', 'Browser suite', 'The browser suite annotation title read by the merge gate.', example='Browser specs', shell=(13, 'ANNOTATION_BROWSER_SUITE'))
-    files_tested: str = option('name', 'Files tested', 'The tested tree annotation title read by the merge gate.', example='Tree tested', shell=(10, 'ANNOTATION_FILES_TESTED'))
-    merge_tested: str = option('name', 'Merge tested', 'The tested merge annotation title read by the merge gate.', example='Merge built', shell=(9, 'ANNOTATION_MERGE_TESTED'))
-    server_tests: str = option('name', 'Server tests', 'The server tests annotation title read by the merge gate.', example='Server suite', shell=(11, 'ANNOTATION_SERVER_TESTS'))
-    web_suite: str = option('name', 'Web suite', 'The web suite annotation title read by the merge gate.', example='Web unit suite', shell=(12, 'ANNOTATION_WEB_SUITE'))
+    browser_suite: str = option('name', 'Browser suite', 'The browser suite annotation title read by the merge gate.', example='Browser specs', shell=(13, 'ANNOTATION_BROWSER_SUITE'), position=4)
+    files_tested: str = option('name', 'Files tested', 'The tested tree annotation title read by the merge gate.', example='Tree tested', shell=(10, 'ANNOTATION_FILES_TESTED'), position=1)
+    merge_tested: str = option('name', 'Merge tested', 'The tested merge annotation title read by the merge gate.', example='Merge built', shell=(9, 'ANNOTATION_MERGE_TESTED'), position=0)
+    server_tests: str = option('name', 'Server tests', 'The server tests annotation title read by the merge gate.', example='Server suite', shell=(11, 'ANNOTATION_SERVER_TESTS'), position=2)
+    web_suite: str = option('name', 'Web suite', 'The web suite annotation title read by the merge gate.', example='Web unit suite', shell=(12, 'ANNOTATION_WEB_SUITE'), position=3)
 
 
-@dataclass(frozen=True)
+@config_section
 class Workflows:
-    ci: str = option('name', 'ci.yml', 'The CI workflow file under .github/workflows/.', example='build.yml', shell=(14, 'WORKFLOW_CI'))
-    e2e: str = option('name', 'e2e.yml', 'The browser workflow file under .github/workflows/.', example='browser.yml', shell=(15, 'WORKFLOW_E2E'))
-    images: str = option('name', 'images.yml', 'The image workflow file under .github/workflows/.', shell=(16, 'WORKFLOW_IMAGES'))
+    ci: str = option('name', 'ci.yml', 'The CI workflow file under .github/workflows/.', example='build.yml', shell=(14, 'WORKFLOW_CI'), position=0)
+    e2e: str = option('name', 'e2e.yml', 'The browser workflow file under .github/workflows/.', example='browser.yml', shell=(15, 'WORKFLOW_E2E'), position=1)
+    images: str = option('name', 'images.yml', 'The image workflow file under .github/workflows/.', shell=(16, 'WORKFLOW_IMAGES'), position=2)
 
 
-@dataclass(frozen=True)
+@config_section
 class Priorities:
-    blocker: str = option('name', 'priority: blocker', 'The blocker priority label.', shell=(19, 'PRIORITY_BLOCKER'))
-    high: str = option('name', 'priority: high', 'The high priority label.', shell=(20, 'PRIORITY_HIGH'))
-    low: str = option('name', 'priority: low', 'The low priority label.', shell=(22, 'PRIORITY_LOW'))
-    medium: str = option('name', 'priority: medium', 'The medium priority label.', shell=(21, 'PRIORITY_MEDIUM'))
+    blocker: str = option('name', 'priority: blocker', 'The blocker priority label.', shell=(19, 'PRIORITY_BLOCKER'), position=0)
+    high: str = option('name', 'priority: high', 'The high priority label.', shell=(20, 'PRIORITY_HIGH'), position=1)
+    low: str = option('name', 'priority: low', 'The low priority label.', shell=(22, 'PRIORITY_LOW'), position=3)
+    medium: str = option('name', 'priority: medium', 'The medium priority label.', shell=(21, 'PRIORITY_MEDIUM'), position=2)
 
 
-@dataclass(frozen=True)
+@config_section
 class Labels:
-    audited: str = option('name', 'audited', 'The label that marks an audit.', shell=(18, 'LABEL_AUDITED'))
-    priority: dict[str, str] = section(Priorities, mapping=True)
-    workflow: str = option('name', 'workflow', 'The label that starts a ticket.', example='shipline', shell=(17, 'LABEL_WORKFLOW'))
+    audited: str = option('name', 'audited', 'The label that marks an audit.', shell=(18, 'LABEL_AUDITED'), position=1)
+    priority: dict[str, str] = section(Priorities, mapping=True, position=2)
+    workflow: str = option('name', 'workflow', 'The label that starts a ticket.', example='shipline', shell=(17, 'LABEL_WORKFLOW'), position=0)
 
 
-@dataclass(frozen=True)
+@config_section
 class Runner:
-    hub_cache: str | None = option('name', None, 'The command running the Docker Hub cache; omitted means direct pulls.', example='tools/shipline/hub-cache', optional=True, shell=(28, 'RUNNER_HUB_CACHE'))
-    identity_folder: str = option('name', '~/.config/shipline-runner', "The folder holding the runner programs' own GitHub identity.", shell=(23, 'IDENTITY_FOLDER'))
-    image_build: str | None = option('name', None, 'The command that builds runner images; omitted means the pool cannot be installed.', example='tools/shipline/build-runner-images', optional=True, shell=(27, 'RUNNER_IMAGE_BUILD'))
-    label: str | None = option('name', None, 'The base runner label; derived as <prefix>-home when omitted.', example='example-app-home', optional=True, shell=(25, 'RUNNER_LABEL'))
-    labels: tuple[str, ...] = option('names', [], 'The runner labels eligible for failed-job reruns; derived from the base label when omitted.', example=['example-app-home', 'example-app-home-standby', 'example-app-home-first', 'example-app-home-main', 'example-app-home-main-batch', 'example-app-home-docker', 'example-app-home-planner'], shell=(34, 'RUNNER_LABELS'))
-    planner_label: str | None = option('name', None, 'The planner runner label; derived as <label>-planner when omitted.', example='example-app-home-planner', optional=True, shell=(26, 'RUNNER_PLANNER_LABEL'))
-    prefix: str | None = option('name', None, 'The word naming runner images, services, network and containers; omitted means no runner figures.', example='example-app', optional=True, shell=(24, 'RUNNER_PREFIX'))
+    hub_cache: str | None = option('name', None, 'The command running the Docker Hub cache; omitted means direct pulls.', example='tools/shipline/hub-cache', optional=True, shell=(28, 'RUNNER_HUB_CACHE'), position=6)
+    identity_folder: str = option('name', '~/.config/shipline-runner', "The folder holding the runner programs' own GitHub identity.", shell=(23, 'IDENTITY_FOLDER'), position=1)
+    image_build: str | None = option('name', None, 'The command that builds runner images; omitted means the pool cannot be installed.', example='tools/shipline/build-runner-images', optional=True, shell=(27, 'RUNNER_IMAGE_BUILD'), position=5)
+    label: str | None = option('name', None, 'The base runner label; derived as `<prefix>-home` when omitted.', example='example-app-home', optional=True, shell=(25, 'RUNNER_LABEL'), position=3)
+    labels: tuple[str, ...] = option('names', [], 'The runner labels eligible for failed-job reruns; derived from the base label when omitted.', example=['example-app-home', 'example-app-home-standby', 'example-app-home-first', 'example-app-home-main', 'example-app-home-main-batch', 'example-app-home-docker', 'example-app-home-planner'], shell=(34, 'RUNNER_LABELS'), position=0)
+    planner_label: str | None = option('name', None, 'The planner runner label; derived as `<label>-planner` when omitted.', example='example-app-home-planner', optional=True, shell=(26, 'RUNNER_PLANNER_LABEL'), position=4)
+    prefix: str | None = option('name', None, 'The word naming runner images, services, network and containers; omitted means no runner figures.', example='example-app', optional=True, shell=(24, 'RUNNER_PREFIX'), position=2)
 
     @property
     def identity_path(self) -> Path:
@@ -235,16 +254,16 @@ class Runner:
         return None if self.label is None else f"{self.label}-main-batch"
 
 
-@dataclass(frozen=True)
+@config_section
 class Merge:
-    scratch_prefix: str = option('name', 'workflow/merge-batch-', 'The beginning of scratch branch names for tested merge prefixes, ended by - or /.')
+    scratch_prefix: str = option('name', 'workflow/merge-batch-', 'The beginning of scratch branch names for tested merge prefixes, ended by - or /.', position=0)
 
 
-@dataclass(frozen=True)
+@config_section
 class Parity:
-    known: str | None = option('name', None, 'The expected differences file read by tools/parity; @install/ requires an installation folder.', example='tools/shipline/parity-known.txt', optional=True)
-    runner_tests: str = option('name', 'tests/runner', 'The runner tests folder compared by tools/parity.', example='tools/runner/tests')
-    workflow_tests: str = option('name', 'tests/workflow', 'The workflow tests folder compared by tools/parity.', example='tools/shipline/tests')
+    known: str | None = option('name', None, 'The expected differences file read by tools/parity; @install/ requires an installation folder.', example='tools/shipline/parity-known.txt', optional=True, position=2)
+    runner_tests: str = option('name', 'tests/runner', 'The runner tests folder compared by tools/parity.', example='tools/runner/tests', position=1)
+    workflow_tests: str = option('name', 'tests/workflow', 'The workflow tests folder compared by tools/parity.', example='tools/shipline/tests', position=0)
 
 
 @dataclass(frozen=True)
@@ -254,17 +273,17 @@ class Machine:
     address: str | None = None
 
 
-@dataclass(frozen=True)
+@config_section
 class Hunts:
     # In the order the file names them.
-    areas: dict[str, tuple[str, ...]] = option('areas', {}, 'Area names mapped to lists of screen paths; omitted means one hunt runs on every screen.', example={'phone': ['/calls', '/contacts'], 'billing': ['/invoices', '/settings/billing']}, shell=(35, 'HUNT_AREAS'))
-    plans: str | None = option('name', None, 'The checkout path of hunt plans named in a hunt sentence.', example='docs/hunt-plans.md', optional=True, shell=(29, 'HUNT_PLANS'), convert=lambda value: _plans(value))
+    areas: dict[str, tuple[str, ...]] = option('areas', {}, 'Area names mapped to lists of screen paths; omitted means one hunt runs on every screen.', example={'phone': ['/calls', '/contacts'], 'billing': ['/invoices', '/settings/billing']}, shell=(35, 'HUNT_AREAS'), position=0)
+    plans: str | None = option('name', None, 'The checkout path of hunt plans named in a hunt sentence.', example='docs/hunt-plans.md', optional=True, shell=(29, 'HUNT_PLANS'), convert=lambda value: _plans(value), position=1)
 
 
-@dataclass(frozen=True)
+@config_section
 class Refresh:
-    clear_generated: tuple[str, ...] = option('names', [], 'Ignored, untracked generated paths or globs cleared after a refresh; tracked paths, links and paths outside the checkout are refused.', convert=tuple)
-    config_file: Path | str = FILE
+    clear_generated: tuple[str, ...] = option('names', [], 'Ignored, untracked generated paths or globs cleared after a refresh; tracked paths, links and paths outside the checkout are refused.', convert=tuple, position=0)
+    config_file: Path | str = field(default=FILE, metadata={"position": 1})
 
     def targets(self, checkout: Path) -> list[str]:
         """Validate everything before deleting anything, without following symbolic links.
@@ -448,22 +467,22 @@ def _generated_no_links(root: Path, path: Path) -> None:
                     )
 
 
-@dataclass(frozen=True)
+@config_section
 class Commands:
     # Each None when the file names none.
-    advisory_watch: str | dict[str, Any] | None = option('command', None, 'The command that detects an advisory service outage and checks whether the service answers again.', example='tools/shipline/advisory-watch', shell=(45, 'COMMAND_ADVISORY_WATCH'), command_docs=("the merge gate: `unreachable` with a failed push's output, or a failed audit's annotations (without the advisories notice, `checks.advisory_annotation`), on standard input; `answers <service>`", '`unreachable` prints the advisory service the text says was unreachable, or nothing; `answers` exits 0 when the service answers again. Beside the advisories notice, a service it names, or a failure of its own, keeps main red', "no outage is read: a failed push is refused as it is, and main's advisories notice stands alone"))
-    browser: str | dict[str, Any] | None = option('command', None, "The repository browser test command run by bash from the checkout with the E2E job's arguments.", example='tools/run-browser-tests', command_docs=("E2E's browser job: the job's own arguments.", "The command's output and exit code.", 'The browser job fails and asks for commands.browser.'))
-    browser_plan: str | dict[str, Any] | None = option('command', None, 'The command that reads NUL-ended changed paths and prints needed or none.', example='tools/shipline/browser-plan', shell=(41, 'COMMAND_BROWSER_PLAN'), command_docs=('the merge gate: the changed paths on standard input, each ended by a NUL', 'prints `needed` or `none` and exits 0; anything else, a crash or another exit included, counts as needed', 'every merge that changes a file needs browser tests while the merged tree holds the E2E workflow (`workflows.e2e`), and none does without it'))
-    browser_tests_for_changes: str | dict[str, Any] | None = option('command', None, 'The command that selects browser spec paths for a changed base.', example={'run': 'tools/shipline/browser-tests-for-changes', 'form': 'json', 'field': 'specs', 'args': ['--ci']}, shell=(37, 'COMMAND_BROWSER_TESTS_FOR_CHANGES'), command_docs=("the review panel in a conflict round, and sessions: `<base> [--files-from <file>]` and the session's own words", 'the browser specs the change reaches, one path a line', 'nothing is selected, and CI runs the whole browser suite'))
-    hunt_app: str | dict[str, Any] | None = option('command', None, 'The command that manages the application under a hunt, including stop.', example='tools/shipline/hunt-app', shell=(42, 'COMMAND_HUNT_APP'), command_docs=("`session` when a hunt stops: `stop`, in the hunt's worktree; the hunter itself, by `shipline hunt-app`", '', '`session start hunt` refuses'))
-    hunt_browser: str | dict[str, Any] | None = option('command', None, 'The browser command named in a hunt sentence.', example='node tools/shipline/hunt-browser.mjs', shell=(43, 'COMMAND_HUNT_BROWSER'), command_docs=('the hunter, by `shipline hunt-browser`, which its sentence names', '', 'the sentence names none'))
-    hunt_cursor: str | dict[str, Any] | None = option('command', None, 'The command that starts a Cursor hunt with its worktree, report folder and sentence.', example='tools/shipline/hunt-cursor', shell=(44, 'COMMAND_HUNT_CURSOR'), command_docs=('`session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>`', "what it prints is kept in the report folder's `cursor.log`", 'a Cursor hunt is refused'))
-    mechanical_conflicts: str | dict[str, Any] | None = option('command', None, 'The command that resolves conflicts, renumbers files and reports taken numbers.', example='tools/shipline/mechanical-conflicts', shell=(40, 'COMMAND_MECHANICAL_CONFLICTS'), command_docs=("the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch", "`resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line (paths without spaces), or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took", 'every conflict is left to the session, nothing is renumbered and main took no number'))
-    pre_train_checks: str | dict[str, Any] | None = option('command', None, 'The checks run before a pull request is admitted to the merge train.', example={'run': 'tools/shipline/pre-train-checks', 'form': 'exit'}, shell=(39, 'COMMAND_PRE_TRAIN_CHECKS'), command_docs=('the merge gate, before a pull request joins the merge train, in its worktree', 'exits non-zero when a check failed; what it prints is shown', 'every pull request is admitted'))
-    push_checkout: str | dict[str, Any] | None = option('command', None, 'The command that installs changed checkout files and explains a failed push hook.', example='tools/shipline/push-checkout', shell=(46, 'COMMAND_PUSH_CHECKOUT'), command_docs=("the merge gate, before each push and after one that failed: `install <checkout>`; `refusal <checkout>` with the push's whole output on standard input", "`install` installs what changed since its last install and exits non-zero with the reason when it failed, which is a wait; `refusal` prints the hook's failed step with its last lines", 'nothing is installed, and a failed push is refused with its last 10 lines'))
-    push_checks: str | dict[str, Any] | None = option('command', None, "The checks run by the repository's pre-push hook.", example='tools/shipline/push-checks', shell=(47, 'COMMAND_PUSH_CHECKS'), command_docs=('The pre-push hook: the selected changes.', "The command's output and exit code.", 'No additional push checks run.'))
-    server_tests_for_changes: str | dict[str, Any] | None = option('command', None, 'The command that selects server tests and returns whole, tests, total and reasons.', example='tools/shipline/server-tests-for-changes', shell=(38, 'COMMAND_SERVER_TESTS_FOR_CHANGES'), command_docs=('the review panel in a conflict round, and sessions: `<base> [--files-from <file>]`', 'one JSON object, `{"whole": bool, "tests": [paths], "total": int, "reasons": [str]}`', 'the whole server suite: `{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}`'))
-    test: str | dict[str, Any] | None = option('command', None, "The repository test command run by bash from the checkout with the CI job's arguments.", example='tools/run-tests', command_docs=("CI's test job: the job's own arguments.", "The command's output and exit code.", 'The test job fails and asks for commands.test.'))
+    advisory_watch: str | dict[str, Any] | None = option('command', None, 'The command that detects an advisory service outage and checks whether the service answers again.', example='tools/shipline/advisory-watch', shell=(45, 'COMMAND_ADVISORY_WATCH'), command_docs=("the merge gate: `unreachable` with a failed push's output, or a failed audit's annotations (without the advisories notice, `checks.advisory_annotation`), on standard input; `answers <service>`", '`unreachable` prints the advisory service the text says was unreachable, or nothing; `answers` exits 0 when the service answers again. Beside the advisories notice, a service it names, or a failure of its own, keeps main red', "no outage is read: a failed push is refused as it is, and main's advisories notice stands alone"), position=10)
+    browser: str | dict[str, Any] | None = option('command', None, "The repository browser test command run by bash from the checkout with the E2E job's arguments.", example='tools/run-browser-tests', command_docs=("E2E's browser job: the job's own arguments.", "The command's output and exit code.", 'The browser job fails and asks for commands.browser.'), position=1)
+    browser_plan: str | dict[str, Any] | None = option('command', None, 'The command that reads NUL-ended changed paths and prints needed or none.', example='tools/shipline/browser-plan', shell=(41, 'COMMAND_BROWSER_PLAN'), command_docs=('the merge gate: the changed paths on standard input, each ended by a NUL', 'prints `needed` or `none` and exits 0; anything else, a crash or another exit included, counts as needed', 'every merge that changes a file needs browser tests while the merged tree holds the E2E workflow (`workflows.e2e`), and none does without it'), position=6)
+    browser_tests_for_changes: str | dict[str, Any] | None = option('command', None, 'The command that selects browser spec paths for a changed base.', example={'run': 'tools/shipline/browser-tests-for-changes', 'form': 'json', 'field': 'specs', 'args': ['--ci']}, shell=(37, 'COMMAND_BROWSER_TESTS_FOR_CHANGES'), command_docs=("the review panel in a conflict round, and sessions: `<base> [--files-from <file>]` and the session's own words", 'the browser specs the change reaches, one path a line', 'nothing is selected, and CI runs the whole browser suite'), position=2)
+    hunt_app: str | dict[str, Any] | None = option('command', None, 'The command that manages the application under a hunt, including stop.', example='tools/shipline/hunt-app', shell=(42, 'COMMAND_HUNT_APP'), command_docs=("`session` when a hunt stops: `stop`, in the hunt's worktree; the hunter itself, by `shipline hunt-app`", '', '`session start hunt` refuses'), position=7)
+    hunt_browser: str | dict[str, Any] | None = option('command', None, 'The browser command named in a hunt sentence.', example='node tools/shipline/hunt-browser.mjs', shell=(43, 'COMMAND_HUNT_BROWSER'), command_docs=('the hunter, by `shipline hunt-browser`, which its sentence names', '', 'the sentence names none'), position=8)
+    hunt_cursor: str | dict[str, Any] | None = option('command', None, 'The command that starts a Cursor hunt with its worktree, report folder and sentence.', example='tools/shipline/hunt-cursor', shell=(44, 'COMMAND_HUNT_CURSOR'), command_docs=('`session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>`', "what it prints is kept in the report folder's `cursor.log`", 'a Cursor hunt is refused'), position=9)
+    mechanical_conflicts: str | dict[str, Any] | None = option('command', None, 'The command that resolves conflicts, renumbers files and reports taken numbers.', example='tools/shipline/mechanical-conflicts', shell=(40, 'COMMAND_MECHANICAL_CONFLICTS'), command_docs=("the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch", "`resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line (paths without spaces), or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took", 'every conflict is left to the session, nothing is renumbered and main took no number'), position=5)
+    pre_train_checks: str | dict[str, Any] | None = option('command', None, 'The checks run before a pull request is admitted to the merge train.', example={'run': 'tools/shipline/pre-train-checks', 'form': 'exit'}, shell=(39, 'COMMAND_PRE_TRAIN_CHECKS'), command_docs=('the merge gate, before a pull request joins the merge train, in its worktree', 'exits non-zero when a check failed; what it prints is shown', 'every pull request is admitted'), position=4)
+    push_checkout: str | dict[str, Any] | None = option('command', None, 'The command that installs changed checkout files and explains a failed push hook.', example='tools/shipline/push-checkout', shell=(46, 'COMMAND_PUSH_CHECKOUT'), command_docs=("the merge gate, before each push and after one that failed: `install <checkout>`; `refusal <checkout>` with the push's whole output on standard input", "`install` installs what changed since its last install and exits non-zero with the reason when it failed, which is a wait; `refusal` prints the hook's failed step with its last lines", 'nothing is installed, and a failed push is refused with its last 10 lines'), position=11)
+    push_checks: str | dict[str, Any] | None = option('command', None, "The checks run by the repository's pre-push hook.", example='tools/shipline/push-checks', shell=(47, 'COMMAND_PUSH_CHECKS'), command_docs=('The pre-push hook: the selected changes.', "The command's output and exit code.", 'No additional push checks run.'), position=12)
+    server_tests_for_changes: str | dict[str, Any] | None = option('command', None, 'The command that selects server tests and returns whole, tests, total and reasons.', example='tools/shipline/server-tests-for-changes', shell=(38, 'COMMAND_SERVER_TESTS_FOR_CHANGES'), command_docs=('the review panel in a conflict round, and sessions: `<base> [--files-from <file>]`', 'one JSON object, `{"whole": bool, "tests": [paths], "total": int, "reasons": [str]}`', 'the whole server suite: `{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}`'), position=3)
+    test: str | dict[str, Any] | None = option('command', None, "The repository test command run by bash from the checkout with the CI job's arguments.", example='tools/run-tests', command_docs=("CI's test job: the job's own arguments.", "The command's output and exit code.", 'The test job fails and asks for commands.test.'), position=0)
 
 
 @dataclass(frozen=True)
@@ -480,15 +499,15 @@ class Suite:
     probe: str | None = None
 
 
-@dataclass(frozen=True)
+@config_section
 class CloudPrePush:
     # In the order the file names them.
-    suites: tuple[Suite, ...] = option('suites', {}, 'Named cloud pre-push suites with select, run, workers and optional part and probe commands.', example={'server': {'select': 'tools/shipline/server-tests-for-changes', 'run': 'tools/shipline/server-tests --workers {workers}', 'workers': 4, 'part': '--shard {shard}/{shards}'}, 'browser': {'select': 'tools/shipline/browser-tests-for-changes --ci', 'run': 'tools/shipline/browser-tests --workers {workers}', 'workers': 2, 'probe': 'tools/shipline/browser-starts'}}, optional=True, convert=tuple, serialize=lambda config: {suite.name: {key: getattr(suite, key) for key in SUITE_KEYS if getattr(suite, key) is not None} for suite in config.suites})
+    suites: tuple[Suite, ...] = option('suites', {}, 'Named cloud pre-push suites with select, run, workers and optional part and probe commands.', example={'server': {'select': 'tools/shipline/server-tests-for-changes', 'run': 'tools/shipline/server-tests --workers {workers}', 'workers': 4, 'part': '--shard {shard}/{shards}'}, 'browser': {'select': 'tools/shipline/browser-tests-for-changes --ci', 'run': 'tools/shipline/browser-tests --workers {workers}', 'workers': 2, 'probe': 'tools/shipline/browser-starts'}}, optional=True, convert=tuple, serialize=lambda config: {suite.name: {key: getattr(suite, key) for key in SUITE_KEYS if getattr(suite, key) is not None} for suite in config.suites}, position=0)
 
 
-@dataclass(frozen=True)
+@config_section
 class Review:
-    high_effort_paths: tuple[str, ...] = option('names', [], 'Regular expressions selecting changed paths for an independent review at high effort.', example=['^db/migrations/', '^db/schema\\.sql$', '^app/models/', '^prompts/', '(^|/)AGENTS\\.md$', '\\.prompt\\.md$', '^app/jobs/', '^app/queues/', '(^|/)locks?\\.py$', '^app/auth/', '^app/permissions/', '^config/secrets'], convert=lambda value: _patterns(value, "review.high_effort_paths"))
+    high_effort_paths: tuple[str, ...] = option('names', [], 'Regular expressions selecting changed paths for an independent review at high effort.', example=['^db/migrations/', '^db/schema\\.sql$', '^app/models/', '^prompts/', '(^|/)AGENTS\\.md$', '\\.prompt\\.md$', '^app/jobs/', '^app/queues/', '(^|/)locks?\\.py$', '^app/auth/', '^app/permissions/', '^config/secrets'], convert=lambda value: _patterns(value, "review.high_effort_paths"), position=0)
 
 
 @dataclass(frozen=True)
@@ -499,39 +518,39 @@ class ConflictReview:
     max_changed_lines: int
 
 
-@dataclass(frozen=True)
+@config_section
 class MergeTrain:
-    queued_limit_minutes: int = option('minutes', 20, 'Minutes a scratch CI run may remain queued before its wait is bounded.')
+    queued_limit_minutes: int = option('minutes', 20, 'Minutes a scratch CI run may remain queued before its wait is bounded.', position=0)
 
 
-@dataclass(frozen=True)
+@config_section
 class Config:
-    annotations: Annotations = section()
-    answer_for_owner_after_minutes: int = option('minutes', 15, 'Minutes before the tick answers a question marked Owner only: no; 0 disables it, at most 1440.', shell=(30, 'ANSWER_FOR_OWNER_AFTER_MINUTES'))
-    checks: Checks = section()
-    cloud_pre_push: CloudPrePush = section()
-    cloud_wake_after_minutes: int = option('minutes', 30, 'Minutes without a push or report before a cloud worker is woken; 0 disables it.', example=45)
-    commands: Commands = section()
-    conflict_review: ConflictReview | None = option('conflict', None, 'The effort, model and max_changed_lines for a small handed-off conflict; omitted means the usual reviewer.', example={'effort': 'medium', 'model': 'sonnet', 'max_changed_lines': 40})
-    hot_paths: tuple[str, ...] = option('paths', [], 'GitHub path patterns whose matching tickets run separately and merge back to back within their priority.', example=['src/example_app/models.py', 'web/src/pages/**'], convert=tuple)
-    hunts: Hunts = section()
-    install_folder: Path | None = option('name', None, 'The installation folder, resolved against the selected file; external configs use their parent when omitted.', example='.', serialize=lambda config: config.given.get("install_folder"))
-    labels: Labels = section()
-    machines: tuple[Machine, ...] = option('machines', [], 'Machines sampled by flow-page, each with a name and optional SSH address; omitted samples this machine.', example=[{'name': 'this machine'}, {'name': 'runner-1', 'address': 'runner@runner-1.example'}])
-    merge: Merge = section()
-    merge_train: MergeTrain = section()
-    parity: Parity = section()
-    refresh: Refresh = section()
-    found_repository: str | None = option('name', None, 'The GitHub repository as owner/name; discovered from runner settings, then origin when omitted.', example='example-owner/example-app', name='repository', shell=(1, 'REPOSITORY'))
-    review: Review = section()
-    runner: Runner = section()
-    state_folder: str = option('name', '.local/workflow', 'The folder of workflow notes in the main checkout and each worktree.', example='.local/shipline', shell=(2, 'STATE_FOLDER'), convert=lambda value: _relative(value, "state_folder"))
-    workflows: Workflows = section()
-    worktree_setup: str = option('name', 'scripts/setup-worktree', 'The command that prepares a new worktree, run only when present.', example='tools/prepare-worktree', shell=(3, 'WORKTREE_SETUP'), convert=lambda value: _relative(value, "worktree_setup"))
+    annotations: Annotations = section(position=5)
+    answer_for_owner_after_minutes: int = option('minutes', 15, 'Minutes before the tick answers a question marked Owner only: no; 0 disables it, at most 1440.', shell=(30, 'ANSWER_FOR_OWNER_AFTER_MINUTES'), position=18)
+    checks: Checks = section(position=4)
+    cloud_pre_push: CloudPrePush = section(position=20)
+    cloud_wake_after_minutes: int = option('minutes', 30, 'Minutes without a push or report before a cloud worker is woken; 0 disables it.', example=45, position=19)
+    commands: Commands = section(position=13)
+    conflict_review: ConflictReview | None = option('conflict', None, 'The effort, model and max_changed_lines for a small handed-off conflict; omitted means the usual reviewer.', example={'effort': 'medium', 'model': 'sonnet', 'max_changed_lines': 40}, position=15)
+    hot_paths: tuple[str, ...] = option('paths', [], 'GitHub path patterns whose matching tickets run separately and merge back to back within their priority.', example=['src/example_app/models.py', 'web/src/pages/**'], convert=tuple, position=14)
+    hunts: Hunts = section(position=12)
+    install_folder: Path | None = option('name', None, 'The installation folder, resolved against the selected file; external configs use their parent when omitted.', example='.', serialize=lambda config: config.given.get("install_folder"), position=24)
+    labels: Labels = section(position=7)
+    machines: tuple[Machine, ...] = option('machines', [], 'Machines sampled by flow-page, each with a name and optional SSH address; omitted samples this machine.', example=[{'name': 'this machine'}, {'name': 'runner-1', 'address': 'runner@runner-1.example'}], position=11)
+    merge: Merge = section(position=9)
+    merge_train: MergeTrain = section(position=17)
+    parity: Parity = section(position=10)
+    refresh: Refresh = section(position=3)
+    found_repository: str | None = option('name', None, 'The GitHub repository as owner/name; discovered from runner settings, then origin when omitted.', example='example-owner/example-app', name='repository', shell=(1, 'REPOSITORY'), position=0)
+    review: Review = section(position=16)
+    runner: Runner = section(position=8)
+    state_folder: str = option('name', '.local/workflow', 'The folder of workflow notes in the main checkout and each worktree.', example='.local/shipline', shell=(2, 'STATE_FOLDER'), convert=lambda value: _relative(value, "state_folder"), position=1)
+    workflows: Workflows = section(position=6)
+    worktree_setup: str = option('name', 'scripts/setup-worktree', 'The command that prepares a new worktree, run only when present.', example='tools/prepare-worktree', shell=(3, 'WORKTREE_SETUP'), convert=lambda value: _relative(value, "worktree_setup"), position=2)
     # The file as read, without defaults. Context fields are not config declarations.
-    given: dict[str, Any]
-    main: Path
-    path: Path
+    given: dict[str, Any] = field(metadata={"position": 21})
+    main: Path = field(metadata={"position": 22})
+    path: Path = field(metadata={"position": 23})
 
     def command(self, name: str) -> list[str] | None:
         """A command's words, with its script resolved from main or the installation folder.
@@ -600,7 +619,7 @@ class Config:
 
 
 def _declarations(cls: type = Config, prefix: str = "") -> Iterator[tuple[str, Setting]]:
-    for item in fields(cls):
+    for item in _declared_fields(cls):
         if setting := item.metadata.get("setting"):
             yield prefix + (setting.name or item.name), setting
         elif "section" in item.metadata:
@@ -1279,7 +1298,7 @@ def _load(main: Path, start: Path | None, document: ConfigFile) -> Config:
     given = document.given
     values = _merged(DEFAULTS, given, "")
     groups = values["checks"]["prefix_only"]
-    if len(set(groups)) != len(groups) or set(groups) - set(Checks("", "", "", "").groups()):
+    if len(set(groups)) != len(groups) or set(groups) - set(_configured(Checks, values["checks"]).groups()):
         raise ConfigError(
             f"{FILE}: checks.prefix_only must name distinct groups: images, browser_whole, server_whole"
         )
@@ -1459,7 +1478,7 @@ _COMMAND_MARKERS = ("<!-- shipline-commands:start -->", "<!-- shipline-commands:
 def _example(cls: type = Config, indent: int = 0) -> str:
     """One declared key per line; opaque user-named maps retain their meaningful order."""
     lines = []
-    for item in fields(cls):
+    for item in _declared_fields(cls):
         if setting := item.metadata.get("setting"):
             key = setting.name or item.name
             value = json.dumps(setting.example, ensure_ascii=False)
