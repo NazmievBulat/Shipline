@@ -107,6 +107,20 @@ def test_only_unchanged_terminal_members_reuse_reads_between_ticks(
     assert len(calls) == (1 if change == "none" else 2)
 
 
+def test_a_fresh_read_asks_github_again_and_later_reads_share_it(
+    reads_module: ModuleType, tmp_path: Path
+) -> None:
+    _snapshot(tmp_path)
+    path = f"{_API}/actions/workflows/ci.yml/runs?head_sha=abc&event=pull_request&per_page=100"
+    answers = [[], [{"id": 1, "status": "completed", "conclusion": "success"}]]
+    reads = reads_module.Reads(tmp_path, "main")
+    assert reads.api(path, lambda: answers.pop(0)) == []
+    assert reads.api(path, lambda: answers.pop(0)) == []
+    assert reads.api(path, lambda: answers.pop(0), fresh=True)[0]["id"] == 1
+    assert reads.api(path, lambda: answers.pop(0))[0]["id"] == 1
+    assert answers == []
+
+
 def test_scratch_runs_are_polled_each_tick(reads_module: ModuleType, tmp_path: Path) -> None:
     _snapshot(tmp_path)
     path = f"{_API}/actions/workflows/ci.yml/runs?head_sha=scratch&event=workflow_dispatch"
