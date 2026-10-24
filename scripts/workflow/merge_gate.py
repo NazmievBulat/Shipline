@@ -3247,19 +3247,28 @@ def _queued_prefix(
                         _planning_reads.invalidate()
                 return
             if run.get("conclusion") == "cancelled":
-                # Claim first: a lost response must never send another full retry.
+                # Claim first: an interrupted request is not sent again. One lost to a GitHub
+                # outage or a stall is: only a fresh read of this cancelled first attempt leads
+                # back here, and a retry GitHub took has made attempt 2.
                 entry["state"] = "rerun requested"
                 train.save()
                 try:
                     done = command("gh", "run", "rerun", key, "-R", REPOSITORY, check=False)
+                    error = (done.stderr.strip() or done.stdout.strip()) if done.returncode else ""
                 except BudgetWaiting:
                     entry["state"] = "cancel requested"
                     train.save()
                     raise
+                except Refused as failure:
+                    error = str(failure)
                 finally:
                     if _planning_reads is not None:
                         _planning_reads.invalidate()
-                if done.returncode:
+                if error and transient(error):
+                    entry["state"] = "cancel requested"
+                    train.save()
+                    raise Waiting(f"could not re-run scratch run {key} yet: {error}")
+                if error:
                     entry["state"] = "rerun refused"
                     train.save()
                     _queue_warning(folder, run, f"scratch run {key} queue recovery rerun refused")

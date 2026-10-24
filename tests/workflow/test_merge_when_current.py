@@ -215,6 +215,12 @@ def answer(args, cwd, env, out, err):
         if (state / "reject-batch-dispatch").exists():
             sys.exit("workflow dispatch rejected")
     elif args[:2] == ["run", "rerun"]:
+        unavailable = state / "rerun-unavailable"
+        if unavailable.exists():
+            # GitHub fails this re-run once, as in an outage.
+            message = unavailable.read_text()
+            unavailable.unlink()
+            sys.exit(message)
         if (state / "fail-rerun").exists():
             sys.exit("rerun refused")
     elif args[:2] == ["run", "cancel"]:
@@ -8562,6 +8568,30 @@ def test_a_cancel_lost_to_an_outage_is_retried_after_a_gate_restart(github: GitH
     assert _batch_call(github).returncode == 3
     assert len(github.workflow.calls("gh run cancel 100 ")) == 2
     assert not github.workflow.calls("gh run rerun")
+
+
+@pytest.mark.parametrize("error", [
+    "HTTP 502: Bad Gateway", 'Post "https://api.github.com/x": context deadline exceeded',
+])
+def test_a_rerun_lost_to_an_outage_is_sent_again_while_the_first_attempt_stays_cancelled(
+    github: GitHub, error: str,
+) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github)
+    assert _batch_call(github).returncode == 3
+    github.api[
+        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={_scratch(github)['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0].update(status="completed", conclusion="cancelled")
+    (github.workflow.state / "rerun-unavailable").write_text(error)
+    assert "could not re-run scratch run 100 yet" in _batch_call(github).stderr
+    assert len(github.workflow.calls("gh run rerun 100 ")) == 1
+    assert not (github.workflow.repo / ".local/workflow/prefix-queues.pending").exists()
+    for _ in range(3):
+        assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh run rerun 100 ")) == 2
 
 
 def test_train_status_recovers_a_later_prefix_without_polluting_its_json(github: GitHub) -> None:
