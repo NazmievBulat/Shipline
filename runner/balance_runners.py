@@ -3,9 +3,9 @@ its load and the demand on its way.
 
 A systemd user timer runs it every minute (`systemd/@PREFIX@-runner-balance.timer`), installed
 beside the spare supervisor (`keep-spare.sh`) and reading what it reads: `settings.sh`, the
-machine's own `pool-settings.sh` that `install.sh` writes beside it, then `names.sh`. It changes only this machine's own
-ordinary slots and Docker runners, never another machine's, never a main runner or the planner,
-and only within the bounds of `pool-settings.sh`:
+machine's own `pool-settings.sh` that `install.sh` writes beside it, then `names.sh`. It
+changes only this machine's own ordinary slots and Docker runners, never another machine's,
+never a main runner or the planner, and only within the bounds of `pool-settings.sh`:
 
     balance_ordinary=MIN-MAX
     balance_docker=MIN-MAX
@@ -37,10 +37,14 @@ available memory.
   one, then adds one of the other in the same step, when the memory the drained one frees is
   enough for the other.
 - A runner goes only once GitHub lists it online and idle, never mid-job: its registration is
-  deleted before its unit stops, which GitHub refuses while it runs a job. The highest numbered
-  one goes (`<machine>-<k>`, `<machine>-docker-<k>`, as `names.sh` names them), and the step
-  waits while it is busy. A count is written before a runner stops and after a new one starts,
-  each put back when the other half fails.
+  deleted before its count is lowered and its unit stops, which GitHub refuses while it runs a
+  job, and a paused budget or a call that fails leaves the counts as they are. The highest
+  numbered one goes (`<machine>-<k>`, `<machine>-docker-<k>`, as `names.sh` names them), and the
+  step waits while it is busy. A new runner's count is written after it starts, and put back
+  when the write fails.
+- A machine stops or moves away its last runner of a kind only while a machine whose name sorts
+  before its own lists an online runner of that kind: the pool is never left without one, also
+  by machines balancing at once.
 - At most one change every 5 minutes.
 - The forecast the tick writes (`~/.local/state/workflow/ci-demand.json`, or the path of
   `balance_forecast`) says how many ordinary and Docker jobs come within 30 minutes. This
@@ -131,6 +135,7 @@ SETTINGS_READ = (
     "ordinary_spares",
     "docker_runners",
     "most_runners",
+    "other_machines",
     "balance_ordinary",
     "balance_docker",
     "balance_forecast",
@@ -217,6 +222,8 @@ class Machine:
     main_label: str
     counts: dict[str, int]
     bounds: dict[str, tuple[int, int]]
+    # The other machines of the pool, by their names.
+    others: tuple[str, ...]
     # The registered ordinary runners beyond the slots, and the most runners of all kinds.
     spares: int
     most: int
@@ -285,6 +292,9 @@ def machine() -> Machine:
         main_label=main_label,
         counts=counts,
         bounds=bounds,
+        others=tuple(
+            name for name in values.get("other_machines", "").split() if MACHINE.fullmatch(name)
+        ),
         spares=(_number(values, "ordinary_spares", 0) or 0) if "ordinary" in roles else 0,
         most=_number(values, "most_runners", 0) or 0,
         off=values.get("balance_off") == "1",
@@ -436,6 +446,25 @@ def _label(label: Any) -> str:
     return str(label.get("name", "")) if isinstance(label, dict) else ""
 
 
+def may_empty(box: Machine, listed: list[dict[str, Any]], kind: str) -> bool:
+    """Whether this machine may stop its last runner of the kind: only while a machine whose name
+    sorts before its own lists an online runner of that kind (a main runner, also a lent one, and
+    a spare not counted). The machine of the lowest name that has one never stops its last, so
+    machines that read the same listing at once can never leave the pool without one."""
+    before = [name for name in box.others if name < box.name]
+    if not before:
+        return False
+    names = re.compile(
+        rf"({'|'.join(map(re.escape, before))})-{'docker-' if kind == 'docker' else ''}[0-9]+"
+    )
+    return any(
+        names.fullmatch(str(runner.get("name")))
+        and runner.get("status") == "online"
+        and box.label(kind) in {_label(label) for label in runner.get("labels") or []}
+        for runner in listed
+    )
+
+
 def labelled_slots(box: Machine, listed: list[dict[str, Any]]) -> int:
     """This machine's registrations that carry the pool's label (keep-spare.sh gives it to as
     many as the slots), busy or offline ones too."""
@@ -492,6 +521,8 @@ class View:
     # and once one of the other kind is gone.
     can_add: dict[str, bool]
     can_move_into: dict[str, bool]
+    # Whether the machine's last runner of a kind may go (may_empty).
+    may_empty: dict[str, bool]
     forecast: dict[str, float] | None = None
     # The share a first slot of each kind would take, for a kind the machine has none of.
     first_share: dict[str, float] | None = None
@@ -539,7 +570,11 @@ def decide(view: View) -> tuple[str, ...] | None:
             return ("add", kind)
     for kind in KINDS:
         other = "ordinary" if kind == "docker" else "docker"
-        if view.counts[kind] <= view.bounds[kind][0] or view.held_for_wave(kind):
+        if (
+            view.counts[kind] <= view.bounds[kind][0]
+            or view.held_for_wave(kind)
+            or (view.counts[kind] == 1 and not view.may_empty[kind])
+        ):
             continue
         if (
             view.waiting(other)
@@ -653,15 +688,15 @@ def _start(box: Machine, kind: str) -> None:
 
 
 def _stop(box: Machine, kind: str, runner: dict[str, Any]) -> bool:
-    """Write the count one lower, delete the highest runner's registration and stop its unit;
-    False, with the count put back, when GitHub refuses because the runner took a job. A
-    runner that does not stop gets its count back too."""
+    """Delete the highest runner's registration, then write the count one lower and stop its
+    unit; False when GitHub refuses because the runner took a job. Nothing is written before the
+    registration is gone: a paused budget, or a call that fails or runs out of time, leaves the
+    counts as they are. A unit that does not stop gets its count back."""
     count, unit = box.counts[kind], box.unit(kind, box.highest(kind))
+    if not deregister(box, runner):
+        return False
     write_count(kind, count - 1)
     try:
-        if not deregister(box, runner):
-            write_count(kind, count)
-            return False
         systemctl("disable", "--now", unit)
     except Refused:
         write_count(kind, count)
@@ -767,6 +802,7 @@ def balance() -> int:
         last_change=state.get("last_change"),
         can_add={kind: _fits(box, kind, listed) for kind in KINDS},
         can_move_into={kind: _fits(box, kind, listed, freed=1) for kind in KINDS},
+        may_empty={kind: may_empty(box, listed, kind) for kind in KINDS},
         forecast=forecast,
         first_share=first_share,
     )

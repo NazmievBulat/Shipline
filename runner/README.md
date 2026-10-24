@@ -206,11 +206,16 @@ times 1.5) and its available memory.
   3 GB available for an ordinary slot or 8 GB for a Docker runner.
 - **Remove:** one of a kind that had nothing queued for 15 minutes while the load holds session
   starts.
+- **The pool's last runner of a kind:** a machine stops or moves away its own last runner of a
+  kind only while a machine whose name sorts before its own lists an online runner of that kind
+  (main's runners and the spares not counted). The machine of the lowest name that has one never
+  stops its last, so two machines balancing at once never leave the pool without one.
 - **Move:** when the other kind has queued for 5 minutes, this kind has nothing queued and
   there is no room to add, it drains one of this kind and adds one of the other in the same
   step.
 - A runner stops only once GitHub lists it idle, never mid-job. Its registration is deleted
-  before its unit stops, and GitHub refuses that while the runner runs a job. The
+  before its count is lowered and its unit stops, and GitHub refuses that while the runner runs a
+  job. A paused budget or a call that fails leaves the counts as they are. The
   highest-numbered one goes (`<machine>-<k>`, `<machine>-docker-<k>`), and the step waits while
   it is busy.
 - At most one change every 5 minutes. `install.sh` holds the balancer's lock while it

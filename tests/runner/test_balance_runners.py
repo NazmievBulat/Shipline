@@ -69,6 +69,12 @@ if arguments[:3] == ["api", "-X", "DELETE"]:
         sys.exit(1)
     github["runners"].remove(runner)
     (state / "github.json").write_text(json.dumps(github))
+    # The counts pool-settings.sh held when the registration went.
+    import os
+    settings = Path(os.environ["HOME"]) / ".local/share/example-app-runner/pool-settings.sh"
+    counts = [line for line in settings.read_text().splitlines() if line.startswith(("ordinary_jobs=", "docker_runners="))]
+    with open(state / "counts-at-delete", "a") as log:
+        log.write(" ".join(counts) + "\\n")
 elif found := re.fullmatch(api + r"/runs/(\\d+)/jobs\\?per_page=100", path):
     answer("jobs", github["jobs"].get(found[1], []))
 elif urlsplit(path).path == api + "/runs":
@@ -146,7 +152,7 @@ class Machine:
             "label='example-app-home'\n"
             "machine=box\n"
             "roles='ordinary docker'\n"
-            "other_machines='other'\n"
+            "other_machines='abc other'\n"
             f"ordinary_jobs={ordinary}\n"
             f"ordinary_blacksmith_jobs={ordinary}\n"
             + ("" if docker is None else f"docker_runners={docker}\n")
@@ -181,10 +187,12 @@ class Machine:
         busy: tuple[str, ...] = (),
         unlabelled: tuple[str, ...] = (),
         lent: bool = False,
+        before: bool = True,
     ) -> None:
         """The runners GitHub lists: this machine's slots and its spare, its Docker runners, its
         main runner (`lent`: with the pool's label beside its own), the planner and another
-        machine's two slots. A slot named in `unlabelled` waits for keep-spare.sh's label."""
+        machine's two slots; with `before`, a Docker runner of a machine whose name sorts before
+        this one's. A slot named in `unlabelled` waits for keep-spare.sh's label."""
         names = [
             (f"box-{k}", STANDBY if f"box-{k}" in unlabelled else ORDINARY)
             for k in range(1, ordinary + 1)
@@ -197,6 +205,7 @@ class Machine:
             ("other-1", ORDINARY),
             ("other-2", ORDINARY),
         ]
+        names += [("abc-docker-1", DOCKER)] if before else []
         self.runners = [
             {
                 "id": number,
@@ -1018,3 +1027,75 @@ def test_a_queue_not_watched_for_fifteen_minutes_is_watched_again(machine: Machi
     machine.run(after_minutes=16)
 
     assert machine.calls("systemctl") == []
+
+
+def test_the_count_goes_down_only_once_the_registration_is_gone(machine: Machine) -> None:
+    _held_by_load(machine)
+
+    machine.run()
+
+    # When GitHub deleted it, the count still held the runner; it was lowered after.
+    assert (machine.state / "counts-at-delete").read_text() == "ordinary_jobs=3 docker_runners=1\n"
+    assert machine.count("docker_runners") == 0
+
+
+def test_a_machine_never_moves_away_the_pools_last_docker_runner(machine: Machine) -> None:
+    # Ordinary jobs wait with no room, Docker has none queued: a move, but box-docker-1 is the
+    # pool's last Docker runner, and no machine sorting before this one has another.
+    machine.registered(ordinary=3, docker=1, before=False)
+    machine.queue(ORDINARY, 8)
+    machine.load(3.0)
+
+    machine.run()
+
+    assert machine.calls("systemctl") == []
+    assert machine.calls("gh api -X DELETE") == []
+
+
+def test_the_last_ordinary_slot_stays_with_a_minimum_of_none(machine: Machine) -> None:
+    machine.settings(ordinary=1, docker=0, bounds="balance_ordinary=0-3\n")
+    machine.registered(ordinary=1, docker=0, before=False)
+    # The other machine's slots sort after this one: they do not let it go.
+    _held_by_load(machine)
+
+    machine.run()
+
+    assert machine.calls("systemctl") == []
+    assert machine.count("ordinary_jobs") == 1
+
+
+def test_a_last_runner_goes_while_a_machine_sorting_before_has_one_online(
+    machine: Machine,
+) -> None:
+    machine.settings(ordinary=1, docker=0, bounds="balance_ordinary=0-3\n")
+    machine.registered(ordinary=1, docker=0)
+    machine.runners.append(
+        {
+            "id": 99,
+            "name": "abc-1",
+            "status": "online",
+            "busy": True,
+            "labels": [{"name": "self-hosted"}, {"name": ORDINARY}],
+        }
+    )
+    _held_by_load(machine)
+
+    machine.run()
+
+    assert machine.calls("systemctl") == [
+        "systemctl --user disable --now example-app-runner@2.service"
+    ]
+    assert machine.count("ordinary_jobs") == 0
+
+
+def test_an_offline_runner_of_a_machine_before_lets_no_last_runner_go(machine: Machine) -> None:
+    for runner in machine.runners:
+        if runner["name"] == "abc-docker-1":
+            runner["status"] = "offline"
+    _held_by_load(machine)
+
+    machine.run()
+
+    # Its Docker runner stays; an ordinary slot, not its last, goes instead.
+    assert not [call for call in machine.calls("systemctl") if "docker" in call]
+    assert machine.count("docker_runners") == 1
