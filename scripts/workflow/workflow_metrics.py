@@ -117,11 +117,11 @@ TICK_SERVICE = "workflow-tick.service"
 ROUND = re.compile(r"<!-- workflow-review round=(\d+)(?: result=(sent-back|passed))? -->")
 CHECK_IN = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)  .+")
 TICK_LINE = re.compile(r"(\d{9,}) (.+)")
-# The wake's main report: green, pending, red, advisory or unknown; an advisory main is one that
-# only advisories failed, and an advisory red one that only an advisory service that could not be
-# reached made red. The gate writes "since unknown time" when it could not read when the run ended.
-MAIN = re.compile(r"; (main: (?:green|pending|red|advisory|unknown).*?); starts: ")
-RED = re.compile(r"main: (red|advisory) since (unknown time|\S+), (.+?) \([0-9a-f]{12}\)")
+# The wake's main report: green, pending, red or unknown; an advisory red is one that only an
+# advisory service that could not be reached made red. The gate writes "red since unknown time"
+# when it could not read when the run ended.
+MAIN = re.compile(r"; (main: (?:green|pending|red|unknown).*?); starts: ")
+RED = re.compile(r"main: red since (unknown time|\S+), (.+?) \([0-9a-f]{12}\)")
 ADVISORY = "advisory service, and nothing was found wrong with main"
 # A number or a head in a hand-back's reason: the same reason for every pull request.
 NUMBERED = re.compile(r"\b[0-9a-f]*[0-9][0-9a-f]*\b")
@@ -445,8 +445,8 @@ def read_wake_log() -> tuple[list[CheckIn], list[tuple[float, str]], bool]:
 def main_state(text: str) -> tuple[str, list[str], str | None]:
     """A main report's state, the checks it names, and since when it has been red."""
     if red := RED.match(text):
-        state = "advisory" if red[1] == "advisory" or ADVISORY in text else "red"
-        return state, red[3].split(", "), red[2]
+        state = "advisory" if ADVISORY in text else "red"
+        return state, red[2].split(", "), red[1]
     if pending := re.match(r"main: pending, (.+?) \([0-9a-f]{12}\)", text):
         return "pending", pending[1].split(", "), None
     if text.startswith("main: unknown"):

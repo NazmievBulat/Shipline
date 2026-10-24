@@ -45,9 +45,9 @@ is a failed check until a rerun of it passes. A change that needs no browser tes
 server test job, needs no run of that suite. A red, pending or unreadable main stops merging, with one exception: on a red main, a
 pull request whose fresh CI on that same main ran and passed every check failing on main merges, because it
 is the fix (a skipped check does not count). An advisory on main is not a red main: when main's
-dependency audit (`checks.dependency_audit` in `shipline.json`) is its only failed check and the
-audit's notice (`checks.advisory_annotation`) names advisories alone, main is `advisory`, merging
-goes on, and the update that fixes the advisory counts as the fix of a red main. A failure of
+dependency audit (`checks.dependency_audit` in `shipline.json`) is its only failed check, its
+other checks passed, and the audit's notice (`checks.advisory_annotation`) names advisories
+alone, main is `advisory`, merging goes on, and the update that fixes the advisory counts as the fix of a red main. A failure of
 the audit for any other reason, a lock file it cannot audit or a tool error, leaves main red. A
 pull request's own audit still refuses an advisory main does not have, and passes over one main
 has, with a warning. After a squash, main inherits the green result

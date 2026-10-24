@@ -168,22 +168,20 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
         workflow_config.load(repo)
 
 
-def test_the_dependency_audit_and_its_advisory_annotation_are_read_together(
-    tmp_path: Path,
-) -> None:
+def test_the_dependency_audit_and_its_advisory_annotation_are_read(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
     _write(repo, {"checks": {"dependency_audit": "Audit", "advisory_annotation": "Advisory"}})
 
     checks = workflow_config.load(repo).checks
     assert (checks.dependency_audit, checks.advisory_annotation) == ("Audit", "Advisory")
 
-    for alone in ("dependency_audit", "advisory_annotation"):
-        _write(repo, {"checks": {alone: "Audit"}})
-        with pytest.raises(
-            workflow_config.ConfigError,
-            match="checks.dependency_audit and checks.advisory_annotation are named together",
-        ):
-            workflow_config.load(repo)
+    _write(repo, {"checks": {"dependency_audit": "Audit"}})
+    checks = workflow_config.load(repo).checks
+    assert (checks.dependency_audit, checks.advisory_annotation) == ("Audit", None)
+
+    _write(repo, {"checks": {"advisory_annotation": ""}})
+    with pytest.raises(workflow_config.ConfigError, match="checks.advisory_annotation must be"):
+        workflow_config.load(repo)
 
 
 def test_the_repository_named_in_the_file_wins_over_the_runner_settings_and_origin(

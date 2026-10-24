@@ -52,9 +52,10 @@ DEFAULTS: dict[str, Any] = {
         "e2e_plan": "E2E: what to run",
         # The prefix of every check of the image workflow.
         "images": "Docker images",
-        # The job that audits the dependencies against published advisories, and the title of
-        # its annotation that names the advisories alone failed it: named together, or neither.
-        # Without them an advisory on main makes main red, as any other failure.
+        # The job that audits the dependencies against published advisories (the gate reads
+        # "CI: dependencies" when none is named), and the title of the notice it writes on main
+        # when advisories alone failed it. Without the notice an advisory on main makes main red,
+        # as any other failure.
         "dependency_audit": None,
         "advisory_annotation": None,
     },
@@ -302,12 +303,6 @@ def load(start: Path = HERE) -> Config:
         repository, source = _from_origin(main), "origin"
     if len(set(values["labels"]["priority"].values())) != 4:
         raise ConfigError(f"{FILE}: labels.priority must name four different labels")
-    if (values["checks"]["dependency_audit"] is None) != (
-        values["checks"]["advisory_annotation"] is None
-    ):
-        raise ConfigError(
-            f"{FILE}: checks.dependency_audit and checks.advisory_annotation are named together"
-        )
     if repository is not None and not _REPOSITORY.fullmatch(repository):
         raise ConfigError(f"{source}: repository must be owner/name, not {repository}")
     return Config(

@@ -931,24 +931,6 @@ def test_names_from_github_reach_the_wake_only_as_plain_words(workflow: Workflow
     assert printed == "tests (1 of 2) ?rm -rf? ?!-- x --? " + "y" * 45
 
 
-def test_a_main_that_only_an_advisory_failed_is_read_as_advisory(workflow: Workflow) -> None:
-    report = (
-        "main: advisory since 2026-10-23T08:30:00Z, CI result, CI: audit (0123456789ab): "
-        "GHSA-1 in vite (path traversal); merging goes on, the update that fixes it goes first"
-    )
-    seen = f"  sessions: none; pull requests: none; {report}; starts: allowed; tmp pressure: false"
-
-    printed = _helper(
-        workflow,
-        f"line = {seen!r}\nreport = m.MAIN.search(line)[1]\n"
-        "print(report == line.split('; ', 2)[2].split('; starts: ')[0], m.main_state(report))",
-    )
-
-    assert printed == (
-        "True ('advisory', ['CI result', 'CI: audit'], '2026-10-23T08:30:00Z')"
-    )
-
-
 def test_main_reports_are_read_as_the_gate_writes_them(workflow: Workflow) -> None:
     assert (
         _helper(

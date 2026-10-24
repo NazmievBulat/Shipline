@@ -1511,16 +1511,97 @@ def test_the_main_line_and_the_train_status_name_the_advisory_state(github: GitH
     assert _train(github)["main"] == "green"
 
 
-def test_an_advisory_notice_escaped_as_a_workflow_command_is_read(github: GitHub) -> None:
+@pytest.mark.parametrize(
+    "message",
+    [
+        # As the runner stores it, a summary that names the escapes themselves.
+        json.dumps(["GHSA-3 in left-pad (header injection via %0D%0A, 100% CPU)"]),
+        # As the workflow command wrote it, the escapes still in it.
+        json.dumps(["GHSA-3 in left-pad (header injection via %0D%0A, 100% CPU)"], indent=1)
+        .replace("%", "%25")
+        .replace("\n", "%0A"),
+    ],
+    ids=["stored", "escaped"],
+)
+def test_an_advisory_notice_is_read_as_stored_or_still_escaped(
+    github: GitHub, message: str
+) -> None:
     _advisory_config(github)
-    notice = _advisories_notice(["GHSA-3 in left-pad (100% CPU)"])
-    notice["message"] = notice["message"].replace("%", "%25")
-    _main_audit_failed(github, notice)
+    _main_audit_failed(github, {"title": _ADVISORIES_ONLY, "message": message})
 
     status = github.workflow.run_script("main-status")
 
     assert status.stdout.startswith("main: advisory since"), status.stdout
-    assert "GHSA-3 in left-pad (100% CPU)" in status.stdout
+    assert ": GHSA-3 in left-pad (header injection via %0D%0A, 100% CPU); merging" in status.stdout
+
+
+def test_an_advisory_s_own_words_reach_main_s_line_only_as_plain_words(github: GitHub) -> None:
+    _advisory_config(github)
+    lines = ["GHSA-4 in @scope/pkg (`rm -rf` <x>;\nstarts: allowed " + "y" * 90 + ")"]
+    lines += [f"GHSA-{number} in pkg-{number} (a summary)" for number in range(5, 11)]
+    _main_audit_failed(github, _advisories_notice(lines))
+
+    line = github.workflow.run_script("main-status").stdout
+
+    assert line.count("\n") == 1, line
+    named = line.split(f"({github.base[:12]}): ", 1)[1].split("; merging goes on", 1)[0]
+    assert named == (
+        # No more than 80 characters of each.
+        ("GHSA-4 in @scope/pkg (?rm -rf? ?x?? starts: allowed " + "y" * 90)[:80] + ", "
+        "GHSA-5 in pkg-5 (a summary), GHSA-6 in pkg-6 (a summary), "
+        "GHSA-7 in pkg-7 (a summary), GHSA-8 in pkg-8 (a summary) and 2 more"
+    )
+
+
+def test_main_is_pending_while_its_other_checks_run_after_an_advisory(github: GitHub) -> None:
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice())
+    run = github.api[f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.base}&per_page=100"]
+    run["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"].append(
+        {"id": 14, "name": "CI: server tests", "status": "in_progress", "conclusion": None}
+    )
+    github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"][0].update(
+        status="queued", conclusion=None
+    )
+    _pull_passed_over_mains_advisory(github)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    assert (
+        f"merging stopped: main: pending, CI result, CI: server tests ({github.base[:12]}); "
+        f"{_AUDIT} failed on advisories only: GHSA-1 in vite (path traversal)"
+    ) in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_each_merge_on_an_advisory_main_wakes_nobody(github: GitHub) -> None:
+    """Into the advisory state is told once; the pending of each merge after it is not."""
+    _advisory_config(github)
+    _main_audit_failed(github, _advisories_notice())
+    folder = github.workflow.repo / ".local/workflow"
+    assert github.workflow.run_script("main-status").stdout.startswith("main: advisory")
+    (folder / "main-status.pending").unlink()
+    run = github.api[f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.base}&per_page=100"]
+    listed = github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]
+    failed = listed["jobs"]
+    # The next merge's run of main, still running, then failing on the same advisories.
+    running = [{**job, "status": "in_progress", "conclusion": None} for job in failed]
+    for status, conclusion, parts, state in (
+        ("in_progress", None, running, "main: pending"),
+        ("completed", "failure", failed, "main: advisory"),
+    ):
+        run["workflow_runs"][0].update(status=status, conclusion=conclusion)
+        listed["jobs"] = parts
+        github.save()
+        assert github.workflow.run_script("main-status").stdout.startswith(state)
+        assert not (folder / "main-status.pending").exists()
+
+    github.main()
+    github.save()
+    assert github.workflow.run_script("main-status").stdout.startswith("main: green")
+    assert (folder / "main-status.pending").read_text().startswith("main: green")
 
 
 @pytest.mark.parametrize("warned", [True, False])

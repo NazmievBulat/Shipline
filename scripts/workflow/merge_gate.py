@@ -619,6 +619,14 @@ def unreached_service(parts: list[dict[str, Any]]) -> str | None:
     return None
 
 
+# What of an advisory's line may reach main's line, and so the orchestrator's message: words and
+# plain marks, no quotes, backticks, angle brackets, semicolons or new lines, at most this long;
+# and at most this many advisories, the rest counted.
+_NOT_PLAIN = re.compile(r"[^\w .,:()\[\]/+!#&=%@-]")
+PLAIN_LENGTH = 80
+ADVISORIES_NAMED = 5
+
+
 def advisories_only(parts: list[dict[str, Any]]) -> list[str]:
     """The advisories that alone failed a run of main, from the audit's notice, or none.
 
@@ -635,15 +643,21 @@ def advisories_only(parts: list[dict[str, Any]]) -> list[str]:
     for note in api(f"{API}/check-runs/{job['id']}/annotations?per_page=100"):
         if note.get("title") != ADVISORIES_ONLY:
             continue
-        # A JSON list of "<advisory> in <package> (<summary>)", escaped as a workflow command.
+        # A JSON list of "<advisory> in <package> (<summary>)". The runner undoes the escapes of
+        # the workflow command that wrote it; a message that still holds them is read undone.
         message = note.get("message") or ""
-        message = message.replace("%0D", "\r").replace("%0A", "\n").replace("%25", "%")
-        try:
-            lines = json.loads(message)
-        except ValueError:
+        for text in (
+            message,
+            message.replace("%0D", "\r").replace("%0A", "\n").replace("%25", "%"),
+        ):
+            try:
+                lines = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(lines, list) and all(isinstance(line, str) and line for line in lines):
+                # Published advisories' own words reach the orchestrator only as plain words.
+                return [_NOT_PLAIN.sub("?", " ".join(line.split()))[:PLAIN_LENGTH] for line in lines]
             return []
-        if isinstance(lines, list) and all(isinstance(line, str) and line for line in lines):
-            return lines
         return []
     return []
 
@@ -887,17 +901,21 @@ def push_health(
     retry_notes: list[str] = []
     unreached = ""
     advisories: list[str] = []
+    ci_parts: list[dict[str, Any]] = []
     if ci:
-        parts = jobs(ci[0])
+        parts = ci_parts = jobs(ci[0])
         assessments.append((*verdict(ci[0], parts), ci[0]))
         if assessments[-1][0] == "red":
             try:
                 advisories = advisories_only(parts)
+            except Waiting:
+                # GitHub could not be read: main is unknown until it can be.
+                raise
             except Refused:
                 # An unread notice is no advisory: main stays red.
                 advisories = []
             try:
-                service = unreached_service(parts)
+                service = None if advisories else unreached_service(parts)
             except Waiting:
                 # Diagnostic only: main stays red as it is, and is not re-run for the service.
                 service = None
@@ -942,9 +960,23 @@ def push_health(
         since = min(run.get("updated_at", "unknown time") for _, run in failed)
         names = ", ".join(name for checks, _ in failed for name in checks)
         if advisories and len(failed) == 1:
+            named = ", ".join(advisories[:ADVISORIES_NAMED])
+            if len(advisories) > ADVISORIES_NAMED:
+                named += f" and {len(advisories) - ADVISORIES_NAMED} more"
+            # Main's other checks must pass first: until they have, main is pending.
+            running = [
+                *(job["name"] for job in ci_parts if job.get("status") != "completed"),
+                *(name for state, checks, _ in assessments if state == "pending" for name in checks),
+            ]
+            if running or ci[0].get("status") != "completed":
+                return Health(
+                    "pending",
+                    f"main: pending, {', '.join(running or [CI_RESULT])} ({head[:12]}); "
+                    f"{DEPENDENCIES} failed on advisories only: {named}",
+                )
             return Health(
                 "advisory",
-                f"main: advisory since {since}, {names} ({head[:12]}): {', '.join(advisories)}; "
+                f"main: advisory since {since}, {names} ({head[:12]}): {named}; "
                 "merging goes on, the update that fixes it goes first",
                 tuple(failed[0][0]),
             )
@@ -1224,7 +1256,12 @@ def publish(folder: Path, health: Health) -> None:
     # the change out of it, is worth waking the orchestrator for.
     before, after = (state_of(text) for text in (old, line))
     if (
-        (before != after and {"red", "advisory", "unknown"} & {before, after})
+        (
+            before != after
+            and {"red", "advisory", "unknown"} & {before, after}
+            # Each merge on an advisory main passes through pending back to advisory.
+            and {before, after} != {"advisory", "pending"}
+        )
         or (health.scheduled and health.scheduled not in old)
         or (health.retry and line != old)
     ):

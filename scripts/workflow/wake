@@ -84,8 +84,9 @@ export SHIPLINE_CONFIG
 resent=("$@")
 mkdir -p "$STATE"
 # Main's line as the gate published it: green, pending, red, advisory (only advisories failed
-# its dependency audit, and merging goes on) or unknown; a change into or out of red, advisory or
-# unknown is noted in main-status.pending, and told at any hour.
+# its dependency audit, and merging goes on) or unknown. A change into or out of red, advisory or
+# unknown, but not between advisory and the pending of each merge, is noted in
+# main-status.pending and told at any hour.
 main_report=$main/$SHIPLINE_STATE_FOLDER/main-status
 main_pending=$main/$SHIPLINE_STATE_FOLDER/main-status.pending
 # The first push the package audit refused because an advisory service could not be reached
