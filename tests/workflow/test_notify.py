@@ -1238,6 +1238,39 @@ def test_the_line_in_backticks_is_read(session: Workflow) -> None:
     assert (question["owner_only"], question["reply"]) == ("no", "1")
 
 
+@pytest.mark.parametrize("second", ["no", "yes"])
+@pytest.mark.parametrize("separator", ["\n", "\n\n"], ids=["one paragraph", "two paragraphs"])
+def test_two_questions_in_one_stop_are_the_owners(
+    session: Workflow, separator: str, second: str
+) -> None:
+    # One reply cannot answer two questions, and either may be his alone.
+    session.notify(_stop(_asked("yes").replace("Should", "A. Should") + separator + _asked(second)))
+
+    question = _question(session)
+    assert question is not None
+    assert question["owner_only"] == "yes"
+    assert question.get("reply") is None
+
+
+def test_the_reply_is_read_only_from_the_last_line_after_the_line(session: Workflow) -> None:
+    # Above the choices, against the rule: a choice's own words are not the reply.
+    message = (
+        "How should the import be tested?\n\nOwner only: no\nRecommendation: 1.\n"
+        "1. Add a test per file format\n2. Write 2 end-to-end tests only\nReply 1 or 2."
+    )
+    session.notify(_stop(message))
+
+    question = _question(session)
+    assert question is not None
+    assert (question["owner_only"], question["reply"]) == ("no", "1")
+
+    session.notify(_stop(_asked("no", "Reply 1 or 2.\nThe list stays as it is meanwhile.")))
+    question = _question(session)
+    assert question is not None
+    assert question["owner_only"] == "no"
+    assert question.get("reply") is None
+
+
 def test_a_question_without_the_line_is_noted_as_missing_it(session: Workflow) -> None:
     session.notify(_stop(_asked(None)))
 

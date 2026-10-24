@@ -181,23 +181,27 @@ asks_owner() {
 }
 
 # What the tick reads to answer a question for the owner, as JSON: the question's `asking` note,
-# `owner_only` from its line `Owner only: yes` or `Owner only: no` (the last such line; without
-# one, "missing", and the owner answers), and for `no` the recommended reply: the first reply
-# word after that line, digits or quoted words ("Reply 1 or 2", 'write "merge it"'), on one line
-# of at most 60 characters that starts with a letter or a digit: typed into Claude Code, `/clear`
-# or `!command` would run, not answer. Without one there is no `reply`, and the owner answers.
+# `owner_only` from its line `Owner only: yes` or `Owner only: no` (without one, "missing", and
+# the owner answers; with more than one, "yes": one reply cannot answer two questions, and either
+# may be his alone), and for `no` the recommended reply: the first reply word on the message's
+# last line, when that line comes after the `Owner only:` one (a choice's own words above it are
+# no reply), digits or quoted words ("Reply 1 or 2", 'write "merge it"'), of at most 60
+# characters that starts with a letter or a digit: typed into Claude Code, `/clear` or
+# `!command` would run, not answer. Without one there is no `reply`, and the owner answers.
 question_of() {
   jq -cn --arg message "$1" --arg asked "$2" '
     ($message | split("\n")) as $lines
-    | ([range(0; $lines | length)
-        | select($lines[.] | test("^[\\s>*_`-]*owner only:[\\s*_`]*(yes|no)[\\s*_`.!]*$"; "i"))]
-      | last) as $at
+    | [range(0; $lines | length)
+        | select($lines[.] | test("^[\\s>*_`-]*owner only:[\\s*_`]*(yes|no)[\\s*_`.!]*$"; "i"))] as $marked
+    | ([range(0; $lines | length) | select($lines[.] | test("\\S"))] | last) as $end
     | {asked: $asked}
-    + if $at == null then {owner_only: "missing"}
-      else ($lines[$at] | capture("(?<said>yes|no)[\\s*_`.!]*$"; "i").said | ascii_downcase) as $said
+    + if $marked == [] then {owner_only: "missing"}
+      elif ($marked | length) > 1 then {owner_only: "yes"}
+      else $marked[0] as $at
+      | ($lines[$at] | capture("(?<said>yes|no)[\\s*_`.!]*$"; "i").said | ascii_downcase) as $said
       | {owner_only: $said}
-      + if $said == "yes" then {}
-        else [$lines[$at + 1:] | join("\n")
+      + if $said == "yes" or $end <= $at then {}
+        else [$lines[$end]
           | first(match("(?:^|[^[:alpha:]])(?:reply|type|write|answer|say|choose)(?:\\s+with)?\\s+[*_]*(?:\"([^\"\\n]+)\"|“([^”\\n]+)”|`([^`\\n]+)`|([0-9]+)(?![[:alnum:]]))"; "gi"))
           | [.captures[].string | strings] | first
           | select(length <= 60 and test("^[[:alnum:]]") and (test("[[:cntrl:]]") | not))]
