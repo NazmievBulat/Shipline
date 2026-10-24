@@ -8486,3 +8486,25 @@ def test_whole_suite_transport_retry_keeps_the_scratch_run(
     if second != "passes":
         assert "failed again after its runner retry" in done.stderr
         assert "its runners failed it again in run 950000" in github.workflow.wake_log.read_text()
+
+
+
+def test_a_transient_diagnosis_read_keeps_the_prefix_waiting(github: GitHub) -> None:
+    _batch_setup(github, images=True)
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+    scratch = _scratch(github)
+    path = (f"{_REPO}/actions/workflows/images.yml/runs?head_sha={scratch['head']}"
+            "&event=workflow_dispatch&per_page=100")
+    run = github.api[path]["workflow_runs"][0]
+    run.update(conclusion="failure", run_attempt=1)
+    jobs = github.api[f"{_REPO}/actions/runs/{run['id']}/jobs?per_page=100"]["jobs"]
+    jobs[-1].update(conclusion="failure", labels=["example-app-home-docker"])
+    github.api[f"{_REPO}/check-runs/{jobs[-1]['id']}/annotations?per_page=100"] = "HTTP 502"
+    done = _batch_call(github)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "merge waiting" in done.stderr
+    assert "Traceback" not in done.stderr
+    assert rerun_calls(github.workflow) == []
+    assert _scratch(github)["branch"] == scratch["branch"]
+    assert "7" not in _batch_state(github)["blocked"]

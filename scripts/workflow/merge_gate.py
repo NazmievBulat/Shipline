@@ -4772,4 +4772,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Shared diagnosis imports this module. Keep the CLI's exception classes and cached
+    # reads: loading a second copy would turn an expected wait into an uncaught error.
+    sys.modules["merge_gate"] = sys.modules[__name__]
     sys.exit(main())
