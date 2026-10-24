@@ -18,8 +18,8 @@ runner tests `tools/parity` compares are in `tests/workflow` and `tests/runner`,
 no differences; no machines named, so `flow-page` samples only the machine it runs on; no hunt
 areas, so one hunt runs at a time, and no hunt plans file; no test command, which a repository
 names for its CI's test job (`ci_proof.py test`); a question to the owner marked `Owner only: no`
-gets its recommended reply after 15 minutes; a quiet cloud worker is woken after 30 minutes;
-no paths that call for a closer review.
+gets its recommended reply after 15 minutes; a quiet cloud worker is woken after 30 minutes; no
+paths that call for a closer review.
 
 `review.high_effort_paths` are regular expressions, each searched for in every path a pull
 request changes: a match runs its independent reviewer at high effort, not medium

@@ -74,6 +74,7 @@ jobs:
           - shard: 1
             files: >-
               tests/workflow/test_commands.py
+              tests/workflow/test_decisions.py
               tests/workflow/test_merge_when_current.py
           - shard: 2
             files: >-
