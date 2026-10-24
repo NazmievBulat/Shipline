@@ -1884,8 +1884,11 @@ def _commit_and_push(
 
 
 def clear_generated(worktree: Path) -> None:
+    if not CONFIG.refresh.clear_generated:
+        return
     try:
-        CONFIG.refresh.clear(worktree)
+        root = Path(git("-C", str(worktree), "rev-parse", "--show-toplevel"))
+        CONFIG.refresh.clear(root)
     except (workflow_config.ConfigError, OSError) as error:
         raise Refused(str(error)) from error
 

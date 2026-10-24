@@ -944,6 +944,10 @@ def test_tick_refresh_clears_generated_output_only_in_the_refreshed_worktree(
         generated = checkout / "generated/types"
         generated.mkdir(parents=True, exist_ok=True)
         (generated / "stale").write_text("obsolete route\n")
+    other = workflow.root / "other-worktree"
+    workflow.git("worktree", "add", "--detach", str(other), "main")
+    (other / "generated/types").mkdir(parents=True)
+    (other / "generated/types/stale").write_text("another worktree\n")
     hooks = workflow.bin / "generated-hooks"
     hooks.mkdir()
     hook = hooks / "pre-push"
@@ -956,7 +960,9 @@ def test_tick_refresh_clears_generated_output_only_in_the_refreshed_worktree(
     assert done.returncode == 0, done.stdout + done.stderr
     assert not (target / "generated/types/stale").exists()
     assert (workflow.repo / "generated/types/stale").exists()
-    if stacked:
+    assert (other / "generated/types/stale").read_text() == "another worktree\n"
+    # A merged parent's worktree may be removed by the tick's ordinary cleanup.
+    if stacked and workflow.worktree(7).exists():
         assert (workflow.worktree(7) / "generated/types/stale").exists()
     remote = workflow.git("ls-remote", "origin", f"refs/heads/{branch}").split()[0]
     assert remote != old_head

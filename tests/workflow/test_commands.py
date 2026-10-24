@@ -415,11 +415,12 @@ def _main_moved(github: GitHub) -> None:
     github.ci(github.base, github.head, tested_base=old)
 
 
+@pytest.mark.parametrize("subdirectory", [False, True])
 @pytest.mark.parametrize(
     "paths", [None, [], ["generated/types"], ["generated/ty*"], ["generated/**/st*"]]
 )
 def test_refresh_clears_only_configured_ignored_output_before_the_push(
-    github: GitHub, paths: list[str] | None
+    github: GitHub, paths: list[str] | None, subdirectory: bool
 ) -> None:
     workflow = github.workflow
     _main_moved(github)
@@ -447,7 +448,12 @@ def test_refresh_clears_only_configured_ignored_output_before_the_push(
     hook.chmod(0o755)
     workflow.git("config", "core.hooksPath", str(hooks))
 
-    done = github.run()
+    cwd = workflow.repo
+    if subdirectory:
+        cwd = workflow.repo / "nested"
+        cwd.mkdir()
+    github.save()
+    done = workflow.run_script("merge-when-current", "7", cwd=cwd)
 
     assert done.returncode == (2 if paths else 1), done.stdout + done.stderr
     assert (generated / "types/stale").exists() == (not bool(paths))

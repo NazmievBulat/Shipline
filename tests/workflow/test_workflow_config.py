@@ -212,6 +212,23 @@ def test_refresh_checks_the_active_worktree_at_config_time(tmp_path: Path) -> No
         workflow_config.load(worktree)
 
 
+@pytest.mark.parametrize("named", ["generated/nested/types", "generated/**/types"])
+def test_refresh_cannot_reach_into_a_nested_worktree(tmp_path: Path, named: str) -> None:
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("generated/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "chore: ignore generated output")
+    worktree = repo / "generated/nested"
+    _git(repo, "worktree", "add", "--detach", str(worktree))
+    (worktree / "types").write_text("keep\n")
+    _write(repo, {"refresh": {"clear_generated": [named]}})
+
+    with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
+        workflow_config.load(repo)
+
+    assert (worktree / "types").read_text() == "keep\n"
+
+
 @pytest.mark.parametrize(
     "origin",
     [
