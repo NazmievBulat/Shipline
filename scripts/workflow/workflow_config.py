@@ -30,7 +30,7 @@ import re
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -46,6 +46,19 @@ DEFAULTS: dict[str, Any] = {
     "repository": None,
     "state_folder": ".local/workflow",
     "worktree_setup": "scripts/setup-worktree",
+    # The repository's own commands Shipline calls, each a command line; none by default.
+    "commands": {
+        "browser_tests_for_changes": None,
+        "server_tests_for_changes": None,
+        "pre_train_checks": None,
+        "mechanical_conflicts": None,
+        "browser_plan": None,
+        "hunt_app": None,
+        "hunt_browser": None,
+        "hunt_cursor": None,
+        "advisory_watch": None,
+        "push_checkout": None,
+    },
     "checks": {
         "ci_result": "CI result",
         "ci_plan": "CI: what to run",
@@ -151,6 +164,20 @@ class Config:
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
+    # Each named command line, as written; a command the repository has none of is left out.
+    commands: dict[str, str] = field(default_factory=dict)
+
+    def command(self, name: str) -> list[str] | None:
+        """The words a command is run with, or None when the repository has none. A first word
+        with a folder in it is a program in the main checkout; one without is found on the PATH.
+        The other words are passed as written."""
+        if name not in DEFAULTS["commands"]:
+            raise KeyError(name)
+        line = self.commands.get(name)
+        if line is None:
+            return None
+        program, *words = _words(line, name)
+        return [str(self.main / program) if "/" in program else program, *words]
 
     @property
     def repository(self) -> str:
@@ -244,6 +271,18 @@ def _relative(value: str, name: str) -> str:
     return value
 
 
+def _words(line: str, name: str) -> list[str]:
+    """A command line split into words as the shell splits them, with nothing expanded."""
+    where = f"commands.{name}"
+    try:
+        words = shlex.split(line)
+    except ValueError as error:
+        raise ConfigError(f"{FILE}: {where} cannot be split into words: {error}") from None
+    if "/" in words[0]:
+        _relative(words[0], where)
+    return words
+
+
 def _from_runner_settings(main: Path) -> str | None:
     """The `repository` Bash reads from the runner settings, as `tick` and the Codex worker's
     `gh` read it when they sourced the file: in a `bash` of its own, with only PATH and HOME,
@@ -321,6 +360,9 @@ def load(start: Path | None = None) -> Config:
         raise ConfigError(f"{FILE}: labels.priority must name four different labels")
     if repository is not None and not _REPOSITORY.fullmatch(repository):
         raise ConfigError(f"{source}: repository must be owner/name, not {repository}")
+    commands = {name: line for name, line in values["commands"].items() if line is not None}
+    for name, line in commands.items():
+        _words(line, name)
     return Config(
         found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),
@@ -336,6 +378,7 @@ def load(start: Path | None = None) -> Config:
         ),
         given=given,
         main=main,
+        commands=commands,
     )
 
 
@@ -364,6 +407,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
         },
+        "commands": {name: config.commands.get(name) for name in DEFAULTS["commands"]},
     }
 
 
@@ -390,6 +434,10 @@ def shell(config: Config) -> str:
     lines = [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]
     labels = " ".join(shlex.quote(label) for label in config.runner.labels)
     lines.append(f"SHIPLINE_RUNNER_LABELS=({labels})")
+    # Each command as an array of its words, empty when the repository has none.
+    for name in DEFAULTS["commands"]:
+        words = " ".join(shlex.quote(word) for word in config.command(name) or [])
+        lines.append(f"SHIPLINE_COMMAND_{name.upper()}=({words})")
     # The main checkout, exported: every program the script starts works on the same repository,
     # whatever folder it starts in.
     lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")
