@@ -282,11 +282,16 @@ def load(start: Path = HERE) -> Config:
     except ValueError as error:
         raise ConfigError(f"{FILE} is not JSON: {error}") from error
     values = _merged(DEFAULTS, given, "")
-    repository = values["repository"] or _from_runner_settings(main) or _from_origin(main)
+    # Where the repository was read, so a refusal names that place.
+    repository, source = values["repository"], FILE
+    if not repository:
+        repository, source = _from_runner_settings(main), RUNNER_SETTINGS
+    if repository is None:
+        repository, source = _from_origin(main), "origin"
     if len(set(values["labels"]["priority"].values())) != 4:
         raise ConfigError(f"{FILE}: labels.priority must name four different labels")
     if repository is not None and not _REPOSITORY.fullmatch(repository):
-        raise ConfigError(f"{FILE}: repository must be owner/name, not {repository}")
+        raise ConfigError(f"{source}: repository must be owner/name, not {repository}")
     return Config(
         found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),

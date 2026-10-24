@@ -240,6 +240,25 @@ def test_runner_settings_that_name_a_repository_bash_cannot_read_are_refused(
         del os.environ["WORKFLOW_SECRET"]
 
 
+@pytest.mark.parametrize(
+    "settings,origin,named",
+    [
+        ("repository=no-slash\n", None, r"^\.github/runner/settings\.sh: repository"),
+        (None, "https://github.com/example-owner/..", r"^origin: repository"),
+    ],
+    ids=["runner settings", "origin"],
+)
+def test_a_repository_that_is_not_owner_name_is_refused_where_it_was_read(
+    tmp_path: Path, settings: str | None, origin: str | None, named: str
+) -> None:
+    repo = _repository(tmp_path, origin)
+    if settings is not None:
+        _settings(repo, settings)
+
+    with pytest.raises(workflow_config.ConfigError, match=named):
+        workflow_config.load(repo)
+
+
 def test_runner_settings_that_name_no_repository_leave_it_to_origin(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
     _settings(repo, "# Only the pool's own settings.\nrunner_count=2\n")
