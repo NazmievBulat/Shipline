@@ -52,6 +52,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `labels.workflow`, `labels.audited` | the label that starts a ticket, and an audit's | `workflow`, `audited` |
 | `labels.priority.blocker` … `.low` | the four priority labels | `priority: blocker` … `priority: low` |
 | `runner.labels` | the runner labels the merge gate may re-run failed jobs on | none: the gate re-runs nothing |
+| `runner.prefix` | the prefix the runner pool names its services and containers by; `workflow-metrics` reads their CPU | none: no runner figures |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
 | `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
 

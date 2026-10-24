@@ -60,7 +60,7 @@ _DEFAULTS = {
             "low": "priority: low",
         },
     },
-    "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner"},
+    "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
     "commands": {"test": None},
 }
@@ -155,6 +155,17 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     assert keys(example) == keys(_DEFAULTS)
     assert example["repository"].endswith("/example-app")
     assert example["runner"]["labels"]
+
+
+def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app-runner"}})
+
+    assert workflow_config.load(repo).runner.prefix == "example-app-runner"
+
+    _write(repo, {"runner": {"prefix": ""}})
+    with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be a name"):
+        workflow_config.load(repo)
 
 
 def test_the_repository_named_in_the_file_wins_over_the_runner_settings_and_origin(

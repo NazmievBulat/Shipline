@@ -32,7 +32,8 @@
   },
   "runner": {
     "labels": ["example-app-home", "example-app-home-main", "example-app-home-docker", "example-app-planner"],
-    "identity_folder": "~/.config/example-app-runner"
+    "identity_folder": "~/.config/example-app-runner",
+    "prefix": "example-app-runner"
   },
   "commands": {
     "test": "tools/run-tests"
