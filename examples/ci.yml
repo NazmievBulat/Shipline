@@ -6,7 +6,10 @@
 name: CI
 
 on:
+  # A draft runs no CI: its worker runs the tests in its own session. Marking it ready starts its
+  # run on the current head.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   # The merge gate runs every suite on a scratch branch of its own with `gh workflow run`.
@@ -18,15 +21,18 @@ permissions:
   contents: read
 
 # A pull request's newer push cancels its older run. Every commit of main and every scratch run
-# keeps its own: the merge gate reads each of them.
+# keeps its own: the merge gate reads each of them. A draft's runs, which run nothing, have a
+# group of their own, so one queued after the ready run never cancels it.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && format('{0}-draft-{1}', github.ref, github.event.pull_request.draft) || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   plan:
     # The gate reads its notes from this job alone (`checks.ci_plan`).
     name: "CI: what to run"
+    # Skipped while the pull request is a draft; the jobs after it are skipped by their own check.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -64,9 +70,11 @@ jobs:
     # The gate's name for the job that runs every server test.
     name: "CI: server tests"
     needs: plan
+    # Skipped while the pull request is a draft; no other run is filtered by that check.
     # Folded: the job's name holds a colon, which a plain YAML value may not.
     if: >-
-      ${{ !contains(fromJSON(needs.plan.outputs.inherited), 'CI: server tests') }}
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+      && !contains(fromJSON(needs.plan.outputs.inherited), 'CI: server tests') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -87,7 +95,8 @@ jobs:
     # The check the gate judges a run by (`checks.ci_result`): it passes only when every job
     # that ran passed, the planner among them.
     name: CI result
-    if: always()
+    # Skipped with the others on a draft: a skipped result is no pass to the merge gate.
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     needs: [plan, tests]
     runs-on: ubuntu-latest
     timeout-minutes: 5

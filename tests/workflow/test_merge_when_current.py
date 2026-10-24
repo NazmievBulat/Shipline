@@ -2,6 +2,7 @@
 
 import errno
 import fcntl
+import importlib
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import select
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from copy import deepcopy
@@ -1113,6 +1115,34 @@ def test_an_image_fix_at_the_back_takes_the_red_main_turn(github: GitHub, proof:
     assert _train(github)["first"] == ("8" if proof == "fresh" else "7")
 
 
+def test_an_image_fix_whose_failed_jobs_alone_were_rerun_takes_the_red_main_turn(
+    github: GitHub,
+) -> None:
+    _two_stale_pulls(github)
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(github.base, head, run_id=30)
+    _main_image_run(github, 60, github.base, conclusion="failure")
+    original_head = github.head
+    github.head = head
+    _images(github)
+    github.head = original_head
+    github.api[f"{_REPO}/actions/runs/40/jobs?per_page=100"]["jobs"].append(
+        {
+            "id": 44,
+            "name": "Docker images: browser tests (1 of 2)",
+            "status": "completed",
+            "conclusion": "success",
+        }
+    )
+    _rerun_failed_jobs(github, 40, head, "Docker images: what to run")
+    github.save()
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+    assert github.workflow.run_script("main-status").returncode == 0
+    assert _train(github)["first"] == "8"
+
+
 def test_the_tick_wakes_a_red_main_fix_ahead_of_the_queue(github: GitHub) -> None:
     second = _two_stale_pulls(github)
     workflow = github.workflow
@@ -1393,6 +1423,351 @@ def test_a_fix_that_passed_every_check_failing_on_red_main_merges(github: GitHub
     assert done.returncode == 0, done.stdout + done.stderr
     assert (github.workflow.state / "merged").read_text() == "7"
     assert "passed every check failing on main: CI result, CI: web" in done.stdout
+
+
+def _attempt_times(attempt: int) -> dict[str, str]:
+    """When attempt `attempt` of a run was created, started and completed: each re-run an
+    hour after the one before."""
+    hour = 8 + attempt
+    return {
+        "created_at": f"2026-10-24T{hour:02}:00:00Z",
+        "started_at": f"2026-10-24T{hour:02}:00:02Z",
+        "completed_at": f"2026-10-24T{hour:02}:05:00Z",
+    }
+
+
+def _rerun_failed_jobs(
+    github: GitHub,
+    run_id: int,
+    head: str,
+    *carried: str,
+    earlier_head: str | None = None,
+    attempts: int = 2,
+) -> None:
+    """Run `run_id` failed a job and re-ran its failed jobs alone until its last attempt,
+    `attempts`, passed. Each re-run carried the `carried` jobs from the first attempt as GitHub
+    does: in each later attempt a copy with a new job ID, that attempt's `run_attempt`, no
+    notes, the original `started_at` and `completed_at`, and the later `created_at` of the
+    re-run. The first attempt ran on `earlier_head`, the head of the run unless a test says
+    otherwise."""
+    for reply in github.api.values():
+        for run in reply.get("workflow_runs", []) if isinstance(reply, dict) else []:
+            if run["id"] == run_id:
+                run["run_attempt"] = attempts
+                run["run_started_at"] = _attempt_times(attempts)["created_at"]
+    latest = github.api[f"{_REPO}/actions/runs/{run_id}/jobs?per_page=100"]["jobs"]
+    for attempt in range(1, attempts + 1):
+        listed = deepcopy(latest) if attempt < attempts else latest
+        for job in listed:
+            job.update(
+                run_id=run_id,
+                run_attempt=attempt,
+                head_sha=earlier_head or head if attempt == 1 else head,
+                **_attempt_times(attempt),
+            )
+            if job["name"] not in carried and attempt < attempts:
+                job["conclusion"] = "failure"
+            if job["name"] in carried and attempt > 1:
+                job.update(
+                    {
+                        key: value
+                        for key, value in _attempt_times(1).items()
+                        if key != "created_at"
+                    },
+                    id=run_id + 500 * (attempt - 1) + job["id"] % 100,
+                )
+                github.api[f"{_REPO}/check-runs/{job['id']}/annotations?per_page=100"] = []
+        if attempt < attempts:
+            github.api[f"{_REPO}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100"] = {
+                "jobs": listed
+            }
+
+
+@pytest.fixture
+def gate() -> Iterator[Any]:
+    scripts = Path(__file__).resolve().parents[2] / "scripts" / "workflow"
+    sys.path.insert(0, str(scripts))
+    try:
+        yield importlib.import_module("merge_gate")
+    finally:
+        sys.path.remove(str(scripts))
+
+
+def test_a_clean_audit_that_ran_in_a_full_rerun_is_not_read_as_its_older_advisory(
+    gate: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A full re-run ran every job again: the audit's attempt is the run's latest, and a clean
+    # audit writes no notes. Its pass over main's advisory in attempt 1 is older evidence.
+    first = {"id": 39, "name": _DEPENDENCIES, "run_id": 30, "run_attempt": 1, **_attempt_times(1)}
+    replies = {
+        f"{gate.API}/check-runs/539/annotations?per_page=100": [],
+        f"{gate.API}/actions/runs/30/attempts/1/jobs?per_page=100": [
+            {**first, "head_sha": "a" * 40, "status": "completed", "conclusion": "success"}
+        ],
+        f"{gate.API}/check-runs/39/annotations?per_page=100": [
+            {"title": "Advisory on main", "message": "GHSA-1 is on main too"}
+        ],
+    }
+    monkeypatch.setattr(gate, "api", lambda path, key=None, *, paginate=True: replies[path])
+    latest = {
+        **first,
+        **_attempt_times(2),
+        "id": 539,
+        "run_attempt": 2,
+        "head_sha": "a" * 40,
+        "status": "completed",
+        "conclusion": "success",
+    }
+    assert gate.strict_jobs([latest])[0]["conclusion"] == "success"
+
+
+def _attempt_job(
+    job_id: int, attempt: int, conclusion: str | None = "success", *, ran: int | None = None
+) -> dict[str, Any]:
+    """The planner of run 30 as attempt `attempt` lists it; `ran` is the attempt it ran in,
+    `attempt` unless GitHub carried it from an earlier one."""
+    return {
+        "id": job_id,
+        "name": "CI: what to run",
+        "run_id": 30,
+        "run_attempt": attempt,
+        "head_sha": "a" * 40,
+        "status": "completed" if conclusion else "in_progress",
+        "conclusion": conclusion,
+        **{
+            key: value
+            for key, value in _attempt_times(ran or attempt).items()
+            if key != "created_at"
+        },
+        "created_at": _attempt_times(attempt)["created_at"],
+    }
+
+
+def _notes_api(
+    gate: Any, monkeypatch: pytest.MonkeyPatch, replies: dict[str, Any]
+) -> list[str]:
+    calls: list[str] = []
+
+    def api(path: str, key: str | None = None, *, paginate: bool = True) -> Any:
+        calls.append(path)
+        if isinstance(replies[path], Exception):
+            raise replies[path]
+        return replies[path]
+
+    monkeypatch.setattr(gate, "api", api)
+    return calls
+
+
+def _notes_path(gate: Any, job_id: int) -> str:
+    return f"{gate.API}/check-runs/{job_id}/annotations?per_page=100"
+
+
+def _attempt_path(gate: Any, attempt: int) -> str:
+    return f"{gate.API}/actions/runs/30/attempts/{attempt}/jobs?per_page=100"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "carried",
+        "failed copy",
+        "still running",
+        "unreadable",
+        "ran again",
+        "ran again, started the second it was created",
+        "ran again, its clock a second behind",
+    ],
+)
+def test_a_carried_job_reads_the_notes_of_the_attempt_it_ran_in(
+    gate: Any, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    # Attempt 2 re-ran the failed jobs and carried the planner, which ran in attempt 1.
+    if case.startswith("ran again"):
+        job = _attempt_job(531, 2)  # a full re-run ran it again: created before it started
+        if case.endswith("created"):
+            job["started_at"] = job["created_at"]
+        elif case.endswith("behind"):
+            # It looks carried, but no earlier copy ran at its times.
+            job["created_at"] = job["started_at"].replace(":02Z", ":03Z")
+    else:
+        job = _attempt_job(531, 2, None if case == "still running" else "success", ran=1)
+    calls = _notes_api(
+        gate,
+        monkeypatch,
+        {
+            _notes_path(gate, 531): [],
+            _attempt_path(gate, 1): gate.Waiting("gh api failed: HTTP 502")
+            if case == "unreadable"
+            else [_attempt_job(31, 1, "failure" if case == "failed copy" else "success")],
+            _notes_path(gate, 31): [{"title": "Merge tested", "message": "first"}],
+        },
+    )
+    if case == "unreadable":
+        # Unread is not unannotated: the gate waits for GitHub instead of deciding.
+        with pytest.raises(gate.Waiting):
+            gate.job_notes(job)
+        return
+    notes = gate.job_notes(job)
+    assert notes == ([{"title": "Merge tested", "message": "first"}] if case == "carried" else [])
+    if case == "still running" or case.startswith("ran again") and not case.endswith("behind"):
+        assert calls == [_notes_path(gate, 531)]
+
+
+def test_a_job_carried_twice_reads_the_attempt_it_ran_in_not_an_older_copy(
+    gate: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # It ran in attempt 2, which wrote "second"; attempt 3 carried it, and attempt 4 again.
+    # Attempt 1's copy ran at other times, so its "first" is another run of the job.
+    _notes_api(
+        gate,
+        monkeypatch,
+        {
+            _notes_path(gate, 731): [],
+            _attempt_path(gate, 3): [_attempt_job(631, 3, ran=2)],
+            _notes_path(gate, 631): [],
+            _attempt_path(gate, 2): [_attempt_job(531, 2)],
+            _notes_path(gate, 531): [{"title": "Merge tested", "message": "second"}],
+            _attempt_path(gate, 1): [_attempt_job(31, 1)],
+            _notes_path(gate, 31): [{"title": "Merge tested", "message": "first"}],
+        },
+    )
+    assert gate.job_notes(_attempt_job(731, 4, ran=2)) == [
+        {"title": "Merge tested", "message": "second"}
+    ]
+
+
+def test_a_fix_whose_full_rerun_passed_its_audit_clean_takes_the_red_main_turn(
+    github: GitHub,
+) -> None:
+    """Main is red on "CI: dependencies". Pull request 8's first attempt passed over an
+    advisory main had then; its full re-run, on the current main, passed every job and its
+    audit clean. It is the fix of the red main, as it would be with no earlier attempt."""
+    _two_stale_pulls(github)
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(github.base, head, run_id=30)
+    jobs = f"{_REPO}/actions/runs/30/jobs?per_page=100"
+    audit = {"id": 39, "name": _DEPENDENCIES, "status": "completed", "conclusion": "success"}
+    first = [*deepcopy(github.api[jobs]["jobs"]), dict(audit)]
+    for job in first:
+        job.update(run_id=30, run_attempt=1, head_sha=head, **_attempt_times(1))
+    github.api[f"{_REPO}/actions/runs/30/attempts/1/jobs?per_page=100"] = {"jobs": first}
+    github.api[f"{_REPO}/check-runs/39/annotations?per_page=100"] = [
+        {"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}
+    ]
+    # Attempt 2 ran every job again: new IDs, the planner's own notes, a clean audit.
+    latest = github.api[jobs]["jobs"]
+    latest.append(dict(audit))
+    planner_notes = github.api[f"{_REPO}/check-runs/31/annotations?per_page=100"]
+    for job in latest:
+        job.update(
+            id=500 + job["id"], run_id=30, run_attempt=2, head_sha=head, **_attempt_times(2)
+        )
+    github.api[f"{_REPO}/check-runs/531/annotations?per_page=100"] = planner_notes
+    github.api[f"{_REPO}/check-runs/532/annotations?per_page=100"] = []
+    github.api[f"{_REPO}/check-runs/539/annotations?per_page=100"] = []
+    runs = f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={head}&event=pull_request&per_page=100"
+    github.api[runs]["workflow_runs"][0]["run_attempt"] = 2
+    github.main("failure")
+    github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"] = [
+        {"id": 11, "name": "CI result", "status": "completed", "conclusion": "failure"},
+        {"id": 12, "name": _DEPENDENCIES, "status": "completed", "conclusion": "failure"},
+    ]
+    github.save()
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+    assert github.workflow.run_script("main-status").returncode == 0
+    assert _train(github)["first"] == "8"
+
+
+@pytest.mark.parametrize("earlier", ["same", "same, re-run twice", "other main", "other head"])
+def test_a_fix_whose_failed_jobs_alone_were_rerun_merges_on_red_main(
+    github: GitHub, earlier: str
+) -> None:
+    workflow = github.workflow
+    github.main("failure")
+    if earlier == "other main":
+        github.ci(github.base, github.head, tested_base=workflow.git("rev-parse", "main^"))
+    _pr_job(github, "CI: web", "success")
+    _rerun_failed_jobs(
+        github,
+        20,
+        github.head,
+        "CI: what to run",
+        earlier_head=f"{9:040x}" if earlier == "other head" else None,
+        attempts=3 if earlier == "same, re-run twice" else 2,
+    )
+
+    done = github.run()
+
+    if earlier.startswith("same"):
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert (workflow.state / "merged").read_text() == "7"
+        assert "passed every check failing on main: CI result, CI: web" in done.stdout
+    else:
+        # The first attempt tested another merge: the pull request is refreshed, not merged.
+        assert done.returncode == 2, done.stdout + done.stderr
+        assert not (workflow.state / "merged").exists()
+
+
+@pytest.mark.parametrize("earlier", ["same", "other main", "other head"])
+def test_a_fix_whose_failed_jobs_alone_were_rerun_takes_the_red_main_turn(
+    github: GitHub, earlier: str
+) -> None:
+    _two_stale_pulls(github)
+    workflow = github.workflow
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(
+        github.base,
+        head,
+        run_id=30,
+        tested_base=workflow.git("rev-parse", "main^") if earlier == "other main" else None,
+    )
+    github.api[f"{_REPO}/actions/runs/30/jobs?per_page=100"]["jobs"].append(
+        {"id": 39, "name": "CI: web", "status": "completed", "conclusion": "success"}
+    )
+    _rerun_failed_jobs(
+        github,
+        30,
+        head,
+        "CI: what to run",
+        earlier_head=f"{9:040x}" if earlier == "other head" else None,
+    )
+    github.main("failure")
+    github.save()
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+    assert workflow.run_script("main-status").returncode == 0
+    assert _train(github)["first"] == ("8" if earlier == "same" else "7")
+
+
+def test_a_pass_over_mains_advisory_carried_into_a_rerun_is_not_the_fix(
+    github: GitHub,
+) -> None:
+    _two_stale_pulls(github)
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(github.base, head, run_id=30)
+    github.api[f"{_REPO}/actions/runs/30/jobs?per_page=100"]["jobs"].append(
+        {"id": 39, "name": "CI: dependencies", "status": "completed", "conclusion": "success"}
+    )
+    github.api[f"{_REPO}/check-runs/39/annotations?per_page=100"] = [
+        {"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}
+    ]
+    # Its warning is on the first attempt; the re-run carried the job without it. The planner
+    # ran again with its notes, so the warning alone keeps 8 from being the fix.
+    _rerun_failed_jobs(github, 30, head, "CI: dependencies")
+    github.main("failure")
+    github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"] = [
+        {"id": 11, "name": "CI result", "status": "completed", "conclusion": "failure"},
+        {"id": 12, "name": "CI: dependencies", "status": "completed", "conclusion": "failure"},
+    ]
+    github.save()
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+    assert github.workflow.run_script("main-status").returncode == 0
+    assert _train(github)["first"] == "7"
 
 
 @pytest.mark.parametrize("conclusion", ["skipped", None])
@@ -1849,6 +2224,16 @@ def test_images_passed_on_the_tested_tree_allow_merging_with_unused_jobs_skipped
     assert done.returncode == 0, done.stderr
 
 
+def test_images_whose_failed_jobs_alone_were_rerun_still_prove_their_tree(
+    github: GitHub,
+) -> None:
+    _images(github)
+    _rerun_failed_jobs(github, 40, github.head, "Docker images: what to run")
+    done = github.run()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (github.workflow.state / "merged").read_text() == "7"
+
+
 def test_images_of_an_older_merge_tree_request_new_ci(github: GitHub) -> None:
     _images(github, tree="old-tree")
     done = github.run()
@@ -2262,8 +2647,9 @@ def test_the_tick_reports_a_failed_image_run_after_a_push_without_images(github:
     "filename", ["Dockerfile", "é.txt", "tab\tname.txt", "line\nname.txt", "raw\udcff.txt"]
 )
 @pytest.mark.parametrize("initial_push", [False, True])
+@pytest.mark.parametrize("rerun", [False, True])
 def test_main_waits_for_required_images_of_the_whole_push(
-    github: GitHub, filename: str, initial_push: bool
+    github: GitHub, filename: str, initial_push: bool, rerun: bool
 ) -> None:
     workflow = github.workflow
     before = "0" * 40 if initial_push else github.base
@@ -2285,6 +2671,9 @@ def test_main_waits_for_required_images_of_the_whole_push(
     github.api[f"{_REPO}/check-runs/13/annotations?per_page=100"] = [
         {"title": "Push base", "message": before}
     ]
+    if rerun:
+        # Main's CI re-ran its failed jobs alone and carried its planner without the note.
+        _rerun_failed_jobs(github, 10, github.base, "CI: what to run")
     github.save()
 
     status = workflow.run_script("main-status")
@@ -5677,8 +6066,10 @@ def test_a_batch_push_that_stalls_past_its_deadline_waits_for_the_next_call(
     hooks = workflow.bin / "hooks"
     stalled = workflow.state / "stalled"
     hooks.mkdir(exist_ok=True)
+    # Its scan ran short of memory first: a stall counts all the same, and is never retried.
     (hooks / "pre-push").write_text(
-        f'#!/bin/bash\n[ -e "{stalled}" ] && exit 0\ntouch "{stalled}"\nexec /bin/sleep 30\n'
+        f'#!/bin/bash\n[ -e "{stalled}" ] && exit 0\ntouch "{stalled}"\n'
+        f"echo {json.dumps(MEMORY_SHORTAGES[0])}\nexec /bin/sleep 30\n"
     )
     (hooks / "pre-push").chmod(0o755)
     workflow.git("config", "core.hooksPath", str(hooks))
@@ -5705,8 +6096,89 @@ def test_a_batch_push_that_stalls_past_its_deadline_waits_for_the_next_call(
     batch = _scratch(github)
     assert batch is not None
     assert batch["pushed"] is False and batch["push_failures"] == 1
+    assert workflow.calls("sleep 60") == []
     assert _batch_call(github).returncode == 3
     assert all(member["scratch"]["pushed"] for member in _prefixes(github))
+
+
+def test_a_push_that_times_out_is_handed_back_with_the_hooks_step_and_last_lines(
+    github: GitHub,
+) -> None:
+    """The tick's gate refreshes the branch, and its hook stalls in a step past the deadline."""
+    workflow = github.workflow
+    # A passed review handed off from the pull request's worktree, then main moved on.
+    workflow.git("checkout", "main")
+    workflow.git("worktree", "add", str(workflow.worktree(7)), "ticket/seven")
+    workflow.list_pull_request(7, draft=False)
+    (workflow.state / "pr" / "7").write_text(f"OPEN ticket/seven {github.head}\n")
+    github.pulls["7"]["labels"] = [{"name": "workflow"}]
+    github.api[f"{_REPO}/pulls/7/reviews"] = [
+        {
+            "body": "<!-- workflow-review round=1 result=passed -->\nReviewed.",
+            "commit_id": github.head,
+        }
+    ]
+    github.save()
+    handed = workflow.run_script("merge-when-current", "--handoff", "7", cwd=workflow.worktree(7))
+    assert handed.returncode == 0, handed.stdout + handed.stderr
+    workflow.run("stop", "review-7")
+    github.batch_mode = github.driver_mode = True
+    old = github.base
+    workflow.git("commit", "--allow-empty", "-m", "fix: main moved")
+    github.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    github.main()
+    github.ci(github.base, github.head, tested_base=old)
+    hooks = workflow.bin / "hooks"
+    hooks.mkdir(exist_ok=True)
+    (hooks / "pre-push").write_text(
+        "#!/bin/bash\n"
+        "echo '$ sh scripts/slow-check.sh'\n"
+        "echo 'checking 41 of 90' >&2\n"
+        "exec /bin/sleep 30\n"
+    )
+    (hooks / "pre-push").chmod(0o755)
+    workflow.git("config", "core.hooksPath", str(hooks))
+    # The driver runs the gate it finds beside it: this one has a short deadline of its own.
+    beside = workflow.root / "beside"
+    beside.mkdir()
+    (beside / "merge-when-current").write_text(
+        "#!/bin/bash\nexec python3 -B -c 'import sys; "
+        f'sys.path.insert(0, "{workflow.script.parent}"); '
+        "import merge_gate as g; g.COMMAND_TIMEOUT = 5; "
+        'sys.argv = ["merge-when-current", *sys.argv[1:]]; sys.exit(g.main())\' "$@"\n'
+    )
+    github.save()
+
+    done = subprocess.run(
+        [
+            "python3",
+            "-B",
+            "-c",
+            "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+            "import merge_driver as d; d.gate.HERE = Path(sys.argv[2]); "
+            "d._drive_gate(Path('.local/workflow').resolve(), '7')",
+            str(workflow.script.parent),
+            str(beside),
+        ],
+        cwd=workflow.repo,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    refusal = _refusal(subprocess.CompletedProcess([], 0, "", done.stdout))
+    assert refusal == (
+        "merge refused: could not push the refreshed branch: git push timed out after 5s"
+    ), done.stdout
+    reason = json.loads((workflow.repo / ".local/workflow/merge-review-7").read_text())["reason"]
+    assert reason.startswith(refusal), reason
+    assert "$ sh scripts/slow-check.sh\nchecking 41 of 90" in reason, reason
+    assert (
+        workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == github.head
+    )
 
 
 # The package audit's own last lines (scripts/audit-against-base.py): a service it could not
@@ -6016,6 +6488,16 @@ def test_a_failed_whole_suite_refuses_until_its_rerun_passes(github: GitHub) -> 
 
 def test_a_pull_request_whose_own_run_was_the_whole_suite_merges_at_once(github: GitHub) -> None:
     _changes(github)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert github.workflow.calls("gh workflow run") == []
+
+
+def test_an_own_whole_suite_whose_failed_jobs_alone_were_rerun_merges_at_once(
+    github: GitHub,
+) -> None:
+    _changes(github)
+    _rerun_failed_jobs(github, 900_020, github.head, "E2E: what to run")
     done = _batch_call(github)
     assert done.returncode == 0, done.stdout + done.stderr
     assert github.workflow.calls("gh workflow run") == []
