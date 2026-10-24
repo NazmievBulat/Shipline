@@ -61,6 +61,7 @@ _DEFAULTS = {
         },
     },
     "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
+    "answer_for_owner_after_minutes": 15,
 }
 
 
@@ -330,6 +331,10 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"state_folder": "../workflow"}', "state_folder"),
         ('{"repositry": "example-owner/example-app"}', "repositry"),
         ('{"checks": {"ci_results": "CI result"}}', "checks.ci_results"),
+        ('{"answer_for_owner_after_minutes": "15"}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": -1}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": 1.5}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": true}', "answer_for_owner_after_minutes"),
     ],
 )
 def test_a_file_that_cannot_be_read_is_refused_by_name(
@@ -364,6 +369,18 @@ def test_no_repository_on_github_anywhere_is_refused(tmp_path: Path, origin: str
     assert config.state_folder == ".local/workflow"
     with pytest.raises(workflow_config.ConfigError, match="cannot tell which repository"):
         config.repository
+
+
+@pytest.mark.parametrize("minutes", [0, 15, 90])
+def test_the_wait_before_answering_for_the_owner_is_read_and_reaches_bash(
+    tmp_path: Path, minutes: int
+) -> None:
+    """0 turns the answers off; Bash reads the number as it is."""
+    repo = _repository(tmp_path)
+    _write(repo, {"answer_for_owner_after_minutes": minutes})
+
+    assert workflow_config.load(repo).answer_for_owner_after_minutes == minutes
+    assert _shell(repo, 'printf "%s" "$SHIPLINE_ANSWER_FOR_OWNER_AFTER_MINUTES"') == str(minutes)
 
 
 _ODD = {
