@@ -2,8 +2,18 @@
 # A guard against workflow mistakes, not a security boundary around the real gh binary.
 set -euo pipefail
 
-# Use the runner's repository setting so both follow a repository move together.
-source "$(dirname "${BASH_SOURCE[0]}")/../../../.github/runner/settings.sh"
+# Use the runner's repository setting so both follow a repository move together, and the
+# checkout's `origin` where the repository holds no runner settings. Without either, nothing
+# names this worker's pull request, and its body update is refused.
+here=$(dirname "${BASH_SOURCE[0]}")
+settings=$here/../../../.github/runner/settings.sh
+if [[ -f $settings ]]; then
+  source "$settings"
+else
+  repository=$({ git -C "$here" config --get remote.origin.url || true; } | sed -nE 's#/$##;
+    s#\.git$##; s#^(https://([^/@]+@)?|ssh://git@|git@)github\.com[:/]([^/]+/[^/]+)$#\3#p')
+fi
+repository=${repository:-}
 
 refuse() {
   echo "Codex worker: gh permits reads, its own ready/body update, and draft tickets labelled with only a medium or high priority; this command is refused." >&2
@@ -43,7 +53,7 @@ case ${1:-} in
   label) [[ ${2:-} == list ]] || refuse ;;
   api)
     # The one writable API shape: the body of this worker's own pull request.
-    if [[ $# -ge 6 && $2 == -X && $3 == PATCH &&
+    if [[ -n $repository && $# -ge 6 && $2 == -X && $3 == PATCH &&
           $4 == "repos/$repository/pulls/${WORKFLOW_SESSION#ticket-}" &&
           $5 == -F && $6 == body=@?* ]]; then
       output_args=("${@:7}")
