@@ -6625,9 +6625,11 @@ def _suite(github: GitHub) -> dict[str, Any]:
 
 
 def _prefix_only(github: GitHub, groups: list[str]) -> None:
-    (github.workflow.repo / "shipline.json").write_text(json.dumps({
-        "checks": {"prefix_only": groups}
-    }))
+    # Keep the repository's commands: its browser plan decides whether a change needs E2E.
+    config = github.workflow.repo / "shipline.json"
+    data = json.loads(config.read_text()) if config.exists() else {}
+    data.setdefault("checks", {})["prefix_only"] = groups
+    config.write_text(json.dumps(data))
 
 
 @pytest.mark.parametrize("group,workflow_name,path", [
