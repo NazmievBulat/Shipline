@@ -3946,7 +3946,8 @@ def test_a_scratch_cancel_lost_to_an_outage_is_tried_again(github: GitHub) -> No
     assert _batch_call(github).returncode == 3
     # The branch outlives the failed cancel, so the next sweep finds its run again.
     assert dropped["branch"] in _scratch_branches(github)
-    assert not github.workflow.wake_log.exists() or "901" not in github.workflow.wake_log.read_text()
+    log = github.workflow.wake_log
+    assert not log.exists() or "901" not in log.read_text()
     assert _batch_call(github).returncode == 3
 
     assert len(github.workflow.calls("gh run cancel 901 ")) == 2
