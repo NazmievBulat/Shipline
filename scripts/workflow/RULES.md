@@ -287,6 +287,24 @@ blockers with their exact errors, owner questions and ready by pull request comm
 phone once through `notify` and appears in the wake as `asking the owner: cloud-N`; a
 `Blocked` report is told to the orchestrator once. A final `worker finished` removes the
 record only once the pull request is ready, letting the normal independent review start.
+
+A cloud worker's push also runs the tests CI will run for its change: its machine is its own,
+so the slower suites cost no local machine anything. It exports `SHIPLINE_CLOUD_WORKER=1` in
+every shell before pushing, and the repository's pre-push hook ends with
+`shipline ci-tests-for-changes --run --extra-only`, which runs nothing unless that is set. A
+local worker, a reviewer, the gate and the tick push as before, and nothing that runs today
+is skipped for anyone. The suites are the `cloud_pre_push.suites` of `shipline.json`, each
+chosen by its selection command as CI chooses it, against where the branch left main, with
+the working changes and without the local cap of three browser specs.
+`shipline ci-tests-for-changes` alone prints that choice and why, the same for anyone;
+`--run` runs the repository's push checks (`commands.push_checks`) first.
+When the worker runs as root, it exports `SHIPLINE_CLOUD_TEST_USER`, and every suite and
+browser probe runs as that unprivileged account; as root without it, the push is refused
+before any test runs. Each suite reports its time and has 25 minutes; a failed or timed-out
+suite refuses the push. When no browser can start, the browser suite is left to CI with the
+probe's error. Only after the whole server suite timed out does the worker export
+`SHIPLINE_CLOUD_SERVER_PART="1 of 4"` (or another part), which runs that part as CI parts it
+and leaves the rest to CI; a failing part still refuses. It unsets it once it is not needed.
 Reports and failed deliveries are remembered locally. The workflow does not read cloud
 transcripts or stop cloud sessions; the owner answers in the cloud session.
 
