@@ -2146,7 +2146,7 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
 def publish_first(number: str | None, batch: dict[str, Any] | None) -> None:
     """Tell the runners' lender which pull request is first, and the branch its batch is tested
     on: their CI and browser jobs get a runner before other pull requests' jobs
-    (.github/runner/lend_runners.py). The train is never held up for this note."""
+    (runner/lend_runners.py). The train is never held up for this note."""
     path = Path.home() / ".local/state/workflow/train-first.json"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
