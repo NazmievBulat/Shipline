@@ -360,7 +360,8 @@ def test_a_repository_that_cannot_be_read_installs_nothing(
         {
             "no-folder": f"{folder} is no folder",
             "no-repository": f"{folder} is in no git repository",
-            "bad-config": "shipline.json: unknown key label",
+            # The config's refusal names the file it read.
+            "bad-config": f"{folder / 'shipline.json'}: unknown key label",
         }[problem],
         "nothing was installed",
     ]
