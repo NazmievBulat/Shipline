@@ -1,0 +1,29 @@
+#!/bin/sh
+# Runs as root inside the virtual machine, once, when it has started. What to do arrives as lines
+# on a channel from the container around the machine (start-vm.sh). A line that was read is gone
+# from the channel, so the job that runs afterwards cannot read the registration token.
+set -u
+
+# Whatever happens, the machine goes off: the container around it then ends and is deleted, with
+# this machine's disk in it. Nothing has to be stopped cleanly for that.
+trap 'systemctl poweroff --force --force' EXIT
+
+# The disk file is made small and given room when the machine starts; the file system takes it here.
+resize2fs /dev/vda >/dev/null 2>&1 || echo "Could not grow the disk; the job may run out of room."
+
+exec </dev/virtio-ports/job
+IFS= read -r mode
+IFS= read -r RUNNER_REPOSITORY
+IFS= read -r RUNNER_NAME
+IFS= read -r RUNNER_LABEL
+export RUNNER_REPOSITORY RUNNER_NAME RUNNER_LABEL
+
+cd /home/runner
+as_runner="runuser --user runner -- env HOME=/home/runner USER=runner LOGNAME=runner"
+case "$mode" in
+  # The next line on the channel is the token; start-runner reads it.
+  job) $as_runner /usr/local/bin/start-runner ;;
+  # The next lines are the addresses this machine must not reach (check-docker-runner.sh).
+  check) $as_runner /usr/local/bin/check-isolation ;;
+  *) echo "No such mode: '$mode'." ;;
+esac

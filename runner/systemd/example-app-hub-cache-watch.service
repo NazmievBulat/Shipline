@@ -1,0 +1,6 @@
+[Unit]
+Description=Empty the Docker Hub cache for CI virtual machines when it holds more than its limit
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/example-app-runner/hub-cache.sh watch
