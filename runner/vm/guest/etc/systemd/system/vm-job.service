@@ -1,0 +1,17 @@
+[Unit]
+Description=Take one CI job, then switch this virtual machine off
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+# A signal or an OOM kill can bypass vm-job's EXIT trap. PID 1 still switches the VM off.
+SuccessAction=poweroff-force
+FailureAction=poweroff-force
+
+[Service]
+ExecStart=/usr/local/bin/vm-job
+StandardOutput=journal+console
+StandardError=journal+console
+# What the runner image sets for the runner; a virtual machine does not inherit an image's settings.
+Environment=RUNNER_MANUALLY_TRAP_SIG=1 ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1 ImageOS=ubuntu24 DEBIAN_FRONTEND=noninteractive
+
+[Install]
+WantedBy=multi-user.target

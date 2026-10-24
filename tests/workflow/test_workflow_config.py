@@ -60,7 +60,15 @@ _DEFAULTS = {
             "low": "priority: low",
         },
     },
-    "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
+    "runner": {
+        "labels": [],
+        "identity_folder": "~/.config/shipline-runner",
+        "prefix": None,
+        "label": None,
+        "planner_label": None,
+        "image_build": None,
+        "hub_cache": None,
+    },
     "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
     "machines": [],
     "hunts": {"areas": {}, "plans": None},
@@ -81,8 +89,8 @@ _DEFAULTS = {
             "push_checkout",
         )
     },
-    "cloud_wake_after_minutes": 30,
     "answer_for_owner_after_minutes": 15,
+    "cloud_wake_after_minutes": 30,
 }
 
 
@@ -176,6 +184,9 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     assert keys(example) == keys(_DEFAULTS)
     assert example["repository"].endswith("/example-app")
     assert example["runner"]["labels"]
+    # One prefix names the runner pool, its labels among its names.
+    assert example["runner"]["prefix"] == "example-app"
+    assert all(label.startswith("example-app-") for label in example["runner"]["labels"])
     assert example["machines"]
     assert example["hunts"]["areas"]
 
@@ -197,6 +208,141 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
     _write(repo, {"runner": {"prefix": ""}})
     with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be a name"):
         workflow_config.load(repo)
+
+
+def test_the_image_build_command_is_read_and_must_be_a_command_line(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    command = "tools/shipline/build-runner-image --pull"
+    _write(repo, {"runner": {"image_build": command}})
+
+    assert workflow_config.load(repo).runner.image_build == command
+
+    _write(repo, {"runner": {"image_build": " "}})
+    with pytest.raises(workflow_config.ConfigError, match="runner.image_build must be a name"):
+        workflow_config.load(repo)
+
+
+def test_without_an_image_build_command_there_is_none(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app"}})
+
+    assert workflow_config.load(repo).runner.image_build is None
+
+
+@pytest.mark.parametrize(
+    "prefix", ["Example-app", "example_app", "example app", "-app", "app-", "a" * 26, "app/x"]
+)
+def test_a_runner_prefix_that_cannot_name_a_unit_and_a_user_is_refused(
+    tmp_path: Path, prefix: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": prefix}})
+
+    with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be"):
+        workflow_config.load(repo)
+
+
+_LABELS = (
+    "example-app-home",
+    "example-app-home-standby",
+    "example-app-home-first",
+    "example-app-home-main",
+    "example-app-home-docker",
+    "example-app-home-planner",
+)
+
+
+def test_the_runner_label_is_the_prefix_s_home_and_the_labels_are_built_from_it(
+    tmp_path: Path,
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app"}})
+
+    runner = workflow_config.load(repo).runner
+    assert runner.label == "example-app-home"
+    assert runner.labels == _LABELS
+
+
+def test_a_named_runner_label_builds_the_labels(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app", "label": "example-pool"}})
+
+    assert workflow_config.load(repo).runner.labels == (
+        "example-pool",
+        "example-pool-standby",
+        "example-pool-first",
+        "example-pool-main",
+        "example-pool-docker",
+        "example-pool-planner",
+    )
+
+
+def test_a_named_planner_label_is_the_planner_s_label(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app", "planner_label": "example-planner"}})
+
+    runner = workflow_config.load(repo).runner
+    assert runner.planner_label == "example-planner"
+    assert runner.labels == (*_LABELS[:-1], "example-planner")
+
+
+def test_the_hub_cache_command_is_read_and_absent_by_default(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app"}})
+    assert workflow_config.load(repo).runner.hub_cache is None
+
+    _write(repo, {"runner": {"hub_cache": "tools/shipline/hub-cache"}})
+    assert workflow_config.load(repo).runner.hub_cache == "tools/shipline/hub-cache"
+
+
+def test_named_runner_labels_win_over_the_built_ones(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app", "labels": ["example-app-elsewhere"]}})
+
+    runner = workflow_config.load(repo).runner
+    assert runner.label == "example-app-home"
+    assert runner.labels == ("example-app-elsewhere",)
+
+
+def test_without_a_prefix_or_a_label_there_are_no_labels(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+
+    runner = workflow_config.load(repo).runner
+    assert runner.label is None
+    assert runner.planner_label is None
+    assert runner.labels == ()
+
+
+@pytest.mark.parametrize("key", ["label", "planner_label"])
+@pytest.mark.parametrize("label", ["Example-home", "example home", "-home", "home-", "a/b"])
+def test_a_runner_label_that_is_not_a_plain_name_is_refused(
+    tmp_path: Path, key: str, label: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app", key: label}})
+
+    with pytest.raises(workflow_config.ConfigError, match=f"runner.{key} must be"):
+        workflow_config.load(repo)
+
+
+def test_bash_reads_the_runner_label_and_the_built_labels(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app"}})
+
+    _write(repo, {"runner": {"prefix": "example-app", "hub_cache": "tools/hub 'cache'"}})
+
+    printed = _shell(
+        repo,
+        'printf "%s\\n" "$SHIPLINE_RUNNER_LABEL" "$SHIPLINE_RUNNER_PLANNER_LABEL" '
+        '"$SHIPLINE_RUNNER_HUB_CACHE" "${SHIPLINE_RUNNER_LABELS[@]}"',
+    )
+
+    assert printed.splitlines() == [
+        "example-app-home",
+        "example-app-home-planner",
+        "tools/hub 'cache'",
+        *_LABELS,
+    ]
 
 
 def test_the_test_folders_tools_parity_compares_are_read(tmp_path: Path) -> None:
@@ -425,10 +571,6 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"parity": {"known": "/srv/known.txt"}}', "parity.known"),
         ('{"repositry": "example-owner/example-app"}', "repositry"),
         ('{"checks": {"ci_results": "CI result"}}', "checks.ci_results"),
-        ('{"cloud_wake_after_minutes": "30"}', "cloud_wake_after_minutes"),
-        ('{"cloud_wake_after_minutes": -1}', "cloud_wake_after_minutes"),
-        ('{"cloud_wake_after_minutes": 1.5}', "cloud_wake_after_minutes"),
-        ('{"cloud_wake_after_minutes": true}', "cloud_wake_after_minutes"),
         ('{"hunts": {"areas": [{"name": "phone"}]}}', "hunts.areas"),
         ('{"hunts": {"areas": {"Phone": ["/calls"]}}}', "hunts.areas"),
         ('{"hunts": {"areas": {"phone app": ["/calls"]}}}', "hunts.areas"),
@@ -450,6 +592,10 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         # Bash would wrap a number this large.
         ('{"answer_for_owner_after_minutes": 2000000000000000000}', "answer_for_owner_after_minutes"),
         ('{"answer_for_owner_after_minutes": 1441}', "answer_for_owner_after_minutes"),
+        ('{"cloud_wake_after_minutes": "30"}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": -1}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": 1.5}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": true}', "cloud_wake_after_minutes"),
     ],
 )
 def test_a_file_that_cannot_be_read_is_refused_by_name(
@@ -504,7 +650,11 @@ _ODD = {
     "worktree_setup": "tools/set up 'it'",
     "checks": {"ci_result": 'Build "result" $(touch nope)'},
     "labels": {"priority": {"blocker": "p0: `now`"}},
-    "runner": {"labels": ["home one", "home-two"]},
+    "runner": {
+        "labels": ["home one", "home-two"],
+        "prefix": "odd-app",
+        "image_build": "tools/build 'image' $(touch built)",
+    },
 }
 
 
@@ -539,7 +689,7 @@ def test_bash_reads_every_value_once_quoted_for_eval(tmp_path: Path) -> None:
         '"$SHIPLINE_E2E_PLAN" "$SHIPLINE_IMAGES" "$SHIPLINE_LABEL_WORKFLOW" '
         '"$SHIPLINE_LABEL_AUDITED" "$SHIPLINE_PRIORITY_BLOCKER" "$SHIPLINE_PRIORITY_HIGH" '
         '"$SHIPLINE_PRIORITY_MEDIUM" "$SHIPLINE_PRIORITY_LOW" "${#SHIPLINE_RUNNER_LABELS[@]}" '
-        '"${SHIPLINE_RUNNER_LABELS[@]}"',
+        '"${SHIPLINE_RUNNER_LABELS[@]}" "$SHIPLINE_RUNNER_PREFIX" "$SHIPLINE_RUNNER_IMAGE_BUILD"',
     )
 
     assert printed.splitlines() == [
@@ -559,8 +709,56 @@ def test_bash_reads_every_value_once_quoted_for_eval(tmp_path: Path) -> None:
         "2",
         "home one",
         "home-two",
+        "odd-app",
+        "tools/build 'image' $(touch built)",
     ]
     assert not (repo / "nope").exists()
+    assert not (repo / "built").exists()
+
+
+def test_sh_reads_every_value_once_whatever_lines_a_value_holds(tmp_path: Path) -> None:
+    """`workflow_config.py sh` is the same for a plain sh (dash): no array, and a value of many
+    lines, or one that holds what looks like another assignment, stays one value."""
+    repo = _repository(tmp_path)
+    _write(
+        repo,
+        {
+            "annotations": {"web_suite": "x\nSHIPLINE_REPOSITORY=$(touch injected) #\ny"},
+            "runner": {
+                "prefix": "example-app",
+                "image_build": "set -e\ndocker build .\ndocker build vm",
+                "labels": ["home one", "home-two"],
+            },
+        },
+    )
+
+    done = subprocess.run(
+        [
+            "sh",
+            "-c",
+            'config=$(python3 "$1" sh "$2") || exit 1; eval "$config"; '
+            'printf "%s\\n" "$SHIPLINE_REPOSITORY" "$SHIPLINE_RUNNER_IMAGE_BUILD" '
+            '"$SHIPLINE_RUNNER_LABELS" "$SHIPLINE_REPO"',
+            "sh",
+            str(_WORKFLOW / "workflow_config.py"),
+            str(repo),
+        ],
+        cwd=repo,
+        env=_GIT_ENV,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert done.stdout.splitlines() == [
+        "example-owner/example-app",
+        "set -e",
+        "docker build .",
+        "docker build vm",
+        "'home one' home-two",
+        str(repo),
+    ]
+    assert not (repo / "injected").exists()
 
 
 def test_bash_without_a_file_reads_the_defaults(tmp_path: Path) -> None:
@@ -569,7 +767,8 @@ def test_bash_without_a_file_reads_the_defaults(tmp_path: Path) -> None:
     printed = _shell(
         repo,
         'printf "%s\\n" "$SHIPLINE_REPOSITORY" "$SHIPLINE_STATE_FOLDER" "$SHIPLINE_CI_RESULT" '
-        '"${#SHIPLINE_RUNNER_LABELS[@]}" "$SHIPLINE_CONFIG"',
+        '"${#SHIPLINE_RUNNER_LABELS[@]}" "$SHIPLINE_CONFIG" '
+        '"${SHIPLINE_RUNNER_PREFIX-unset}" "${SHIPLINE_RUNNER_IMAGE_BUILD-unset}"',
     )
 
     assert printed.splitlines() == [
@@ -578,6 +777,8 @@ def test_bash_without_a_file_reads_the_defaults(tmp_path: Path) -> None:
         "CI result",
         "0",
         "{}",
+        "",
+        "",
     ]
 
 
@@ -844,8 +1045,8 @@ def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> d
 
 
 # The SHA-256 of each text as the scripts wrote it before they read `shipline.json`; the worker's
-# and the cloud worker's since they ask for the `Owner only:` line of a question to the owner,
-# and the cloud one since its sentence on never ending a turn to wait for an answer.
+# and the cloud worker's since they ask for the `Owner only:` line of a question to the owner, and
+# the cloud worker's since it is told never to end a turn to wait for an answer.
 _TEXTS_BEFORE = {
     "worker": "325cbf877af37ce9da33010ca5fadb43199e42a93e78235e72d234068a61438c",
     "cloud": "a331c8a4ccec16eeaf7cf29fc4b5177e6ef0c6e9ef2efc0edb924ad8ce8f90a7",

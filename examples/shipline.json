@@ -46,13 +46,20 @@
   "runner": {
     "labels": [
       "example-app-home",
+      "example-app-home-standby",
+      "example-app-home-first",
       "example-app-home-main",
       "example-app-home-docker",
-      "example-app-planner"
+      "example-app-home-planner"
     ],
-    "identity_folder": "~/.config/example-app-runner",
-    "prefix": "example-app-runner"
+    "identity_folder": "~/.config/shipline-runner",
+    "prefix": "example-app",
+    "label": "example-app-home",
+    "planner_label": "example-app-home-planner",
+    "image_build": "tools/shipline/build-runner-images",
+    "hub_cache": "tools/shipline/hub-cache"
   },
+  "cloud_wake_after_minutes": 45,
   "parity": {
     "workflow_tests": "tools/shipline/tests",
     "runner_tests": "tools/runner/tests",
@@ -69,6 +76,5 @@
     },
     "plans": "docs/hunt-plans.md"
   },
-  "cloud_wake_after_minutes": 45,
   "answer_for_owner_after_minutes": 15
 }
