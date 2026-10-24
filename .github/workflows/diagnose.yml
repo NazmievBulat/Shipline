@@ -11,16 +11,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Terminal width and ps
+      - name: The test's own shell under ps
         run: |
-          env | grep -E '^(COLUMNS|LINES|TERM|PS_[A-Z]+)=' || echo "no width variables"
-          ps --version
-          echo "widest ps aux line: $(ps aux | awk '{ print length }' | sort -n | tail -1)"
-          bash -c ": a command line long enough to pass the eightieth column of a narrow terminal, then codex exec; ps aux | grep -c 'codex exec'"
-          timeout 3 bash -c "while ps aux | grep -q 'codex exec'; do sleep 0.2; done"; echo "loop exit: $?"
+          set +e
+          python3 - <<'PY'
+          import shlex, subprocess, time
+          command = "while ps aux | grep -q 'codex exec'; do sleep 0.2; done"
+          shell = [
+              "/bin/bash", "-c",
+              "source /home/tester/.claude/shell-snapshots/snapshot-bash-1-abc.sh 2>/dev/null || true"
+              " && export CLAUDE_PLUGIN_DATA='/home/tester/.claude/plugins/data/codex-openai-codex'\n"
+              f": && eval {shlex.quote(command)} < /dev/null && pwd -P >| /tmp/claude-a589-cwd",
+          ]
+          started = subprocess.Popen(shell)
+          time.sleep(1.5)
+          print("loop still running:", started.poll() is None)
+          listed = subprocess.run(["ps", "aux"], capture_output=True, text=True).stdout
+          for line in listed.splitlines():
+              if "snapshot-bash" in line:
+                  print(len(line), repr(line))
+          print("own cmdline:", open(f"/proc/{started.pid}/cmdline", "rb").read())
+          started.kill()
+          PY
       - name: tmux and scopes
         run: |
-          command -v tmux >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq tmux; }
+          set +e
           tmux -V
           ldd "$(command -v tmux)" | grep -i systemd || echo "tmux links no libsystemd"
           for name in first second third; do
