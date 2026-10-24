@@ -169,7 +169,7 @@ def _failed_log(gate: Any, run_id: int, job_id: int) -> str:
     return _COLOUR.sub("", done.stdout)
 
 
-def diagnose(pull: dict[str, Any]) -> Diagnosis:
+def diagnose(pull: dict[str, Any], *, folder: Path | None = None) -> Diagnosis:
     """Read the latest CI, image and E2E runs of the pull request's head: each failed job's
     failed log and annotations. Raises Waiting while one of those runs is still running."""
     import merge_gate as gate
@@ -179,6 +179,8 @@ def diagnose(pull: dict[str, Any]) -> Diagnosis:
     for workflow in ("ci", "images", "e2e"):
         latest = gate.runs(workflow, head, pull=True)[:1]
         for found in latest:
+            if folder is not None and retry_requested(folder, found):
+                raise gate.Waiting(_REQUESTED.format(run=found["id"]))
             if found.get("status") != "completed":
                 raise gate.Waiting(f"run {found['id']} of the failed head is still running")
             if found.get("conclusion") not in ("success", "skipped", "neutral"):
@@ -272,6 +274,8 @@ def runner_wait(
     """A red scratch run waits for completion, then gets the handoff's one runner retry."""
     import merge_gate as gate
 
+    if retry_requested(folder, found):
+        return _REQUESTED.format(run=found["id"])
     if found.get("status") != "completed" or any(
         job.get("status") != "completed" for job in parts
     ):
@@ -319,6 +323,17 @@ def _state(claim: Path) -> str:
         return "claim"
 
 
+def retry_requested(folder: Path, found: dict[str, Any]) -> bool:
+    """The run list still shows attempt 1 of a retry already claimed or requested. Its jobs
+    may already be the next attempt's; wait for matching run metadata before diagnosing."""
+    claim = marker(folder, found["id"])
+    return (
+        found.get("run_attempt") == 1
+        and claim.exists()
+        and _state(claim) in ("claim", "requested")
+    )
+
+
 def repeated(folder: Path, run_id: int) -> bool:
     """A scratch failure's hand-back must tell the wake that its runner retry failed too."""
     return _state(marker(folder, run_id)) == "repeated"
@@ -331,7 +346,9 @@ def rerun_running(folder: Path, pull: dict[str, Any]) -> str | None:
 
     for workflow in ("ci", "images", "e2e"):
         for found in gate.runs(workflow, pull["headRefOid"], pull=True)[:1]:
-            if marker(folder, found["id"]).exists() and found.get("conclusion") != "failure":
+            if marker(folder, found["id"]).exists() and (
+                retry_requested(folder, found) or found.get("conclusion") != "failure"
+            ):
                 return f"the re-run of run {found['id']} is running"
     return None
 

@@ -8425,9 +8425,16 @@ def test_prefix_transport_retry_keeps_the_prefix_until_the_second_result(
     jobs = github.api[f"{_REPO}/actions/runs/{run['id']}/jobs?per_page=100"]["jobs"]
     failed_job_id = job["id"]
     job = next(j for j in jobs if j["id"] == failed_job_id)
-    run.update(run_attempt=2, conclusion="success" if second == "passes" else "failure")
     if second == "passes":
+        # The jobs endpoint has advanced to the passing retry while the run list still
+        # reports the failed first attempt. Keep the request and this exact prefix.
         job["conclusion"] = "success"
+        done = _batch_call(github)
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert _scratch(github)["branch"] == scratch["branch"]
+        assert "7" not in _batch_state(github)["blocked"]
+        run = github.api[path]["workflow_runs"][0]
+    run.update(run_attempt=2, conclusion="success" if second == "passes" else "failure")
     github.save()
     done = _batch_call(github)
     assert done.returncode == (0 if second == "passes" else 1), done.stdout + done.stderr
@@ -8476,9 +8483,16 @@ def test_whole_suite_transport_retry_keeps_the_scratch_run(
             "gh run rerun 950000 -R example-org/example-app --failed"]
     run = github.api[path]["workflow_runs"][0]
     jobs = github.api[f"{_REPO}/actions/runs/950000/jobs?per_page=100"]["jobs"]
-    run.update(run_attempt=2, conclusion="success" if second == "passes" else "failure")
     for job in jobs[1:]:
-        job["conclusion"] = run["conclusion"]
+        job["conclusion"] = "success" if second == "passes" else "failure"
+    if second == "passes":
+        # Mixed attempt snapshots must not turn a successful retry into a hand-back.
+        done = _batch_call(github)
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert _suite(github)["branch"] == suite["branch"]
+        assert "7" not in _batch_state(github)["blocked"]
+        run = github.api[path]["workflow_runs"][0]
+    run.update(run_attempt=2, conclusion="success" if second == "passes" else "failure")
     github.save()
     done = _batch_call(github)
     assert done.returncode == (0 if second == "passes" else 1), done.stdout + done.stderr

@@ -2579,3 +2579,32 @@ def test_a_reported_test_wins_even_when_its_job_times_out(handed: GitHub) -> Non
     assert workflow.calls("gh run rerun") == []
     assert not _note(workflow).exists()
     assert workflow.calls("gh pr ready") == ["gh pr ready 7 -R example-org/example-app --undo"]
+
+
+@pytest.mark.parametrize("rollup", ["FAILURE", "SUCCESS"])
+def test_successful_retry_jobs_wait_for_the_run_metadata_before_handing_back(
+    handed: GitHub, rollup: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log="failed to solve: short read: unexpected EOF\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    for job in jobs:
+        job["conclusion"] = "success"
+    handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = rollup
+    handed.save()
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _note(workflow).exists()
+    assert _started(workflow) == []
+    assert len(workflow.calls("gh run rerun")) == 1
+    run = handed.api[_RUNS.format(head=handed.head)]["workflow_runs"][0]
+    run.update(run_attempt=2, conclusion="success")
+    handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "SUCCESS"
+    handed.save()
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "merged").read_text() == "7"
+    assert len(workflow.calls("gh run rerun")) == 1
