@@ -232,6 +232,7 @@ def run(
                         errors=errors,
                         environment=environment,
                         github_slot_fd=fd,
+                        input=input,
                     ),
                 )
             except Limited:
@@ -251,6 +252,7 @@ def run(
                 unwind_on_interrupt=unwind_on_interrupt,
                 errors=errors,
                 slot_fd=fd,
+                input=input,
             )
     return _run(
         *args,

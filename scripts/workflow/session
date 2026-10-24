@@ -232,10 +232,11 @@ forget_notes() {
 }
 
 # The copy of the application a hunt started lives outside `tmux`, so it is stopped by name, by
-# the repository's `hunt_app` command (`shipline.json`).
+# the repository's `hunt_app` command (`shipline.json`), in the hunt's worktree, where the hunter
+# started it.
 stop_hunted_application() {
-  ((${#SHIPLINE_COMMAND_HUNT_APP[@]} == 0)) ||
-    "${SHIPLINE_COMMAND_HUNT_APP[@]}" stop >/dev/null 2>&1 || true
+  ((${#SHIPLINE_COMMAND_HUNT_APP[@]} > 0)) || return 0
+  (cd "$(worktree_of "$1")" && "${SHIPLINE_COMMAND_HUNT_APP[@]}" stop) >/dev/null 2>&1 || true
 }
 
 # Ends a `tmux` server and waits a moment for it to go. A server that had already ended counts

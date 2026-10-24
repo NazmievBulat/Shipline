@@ -168,16 +168,18 @@ class Config:
     commands: dict[str, str] = field(default_factory=dict)
 
     def command(self, name: str) -> list[str] | None:
-        """The words a command is run with, or None when the repository has none. A first word
-        with a folder in it is a program in the main checkout; one without is found on the PATH.
-        The other words are passed as written."""
+        """The words a command is run with, or None when the repository has none. Its script is
+        the main checkout's (`_script`); the other words are passed as written."""
         if name not in DEFAULTS["commands"]:
             raise KeyError(name)
         line = self.commands.get(name)
         if line is None:
             return None
-        program, *words = _words(line, name)
-        return [str(self.main / program) if "/" in program else program, *words]
+        words = _words(line, name)
+        script = _script(words)
+        if script is not None:
+            words[script] = str(self.main / words[script])
+        return words
 
     @property
     def repository(self) -> str:
@@ -278,9 +280,23 @@ def _words(line: str, name: str) -> list[str]:
         words = shlex.split(line)
     except ValueError as error:
         raise ConfigError(f"{FILE}: {where} cannot be split into words: {error}") from None
-    if "/" in words[0]:
-        _relative(words[0], where)
+    script = _script(words)
+    if script is not None:
+        _relative(words[script], where)
     return words
+
+
+def _script(words: list[str]) -> int | None:
+    """Which word is the repository's own program, read from its main checkout wherever the
+    command runs, so a pull request's worktree never supplies it: a first word with a folder
+    in it, or, after a program found on the PATH (an interpreter), the first word with a folder
+    in it that is no option. None when every word is found elsewhere."""
+    if "/" in words[0]:
+        return 0
+    return next(
+        (index for index, word in enumerate(words) if "/" in word and not word.startswith("-")),
+        None,
+    )
 
 
 def _from_runner_settings(main: Path) -> str | None:

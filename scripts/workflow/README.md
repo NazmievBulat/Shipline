@@ -92,7 +92,9 @@ What only the repository knows (which tests a change reaches, how its applicatio
 gives Shipline as commands, under `commands` in `shipline.json`. Each is a command line, split
 into words as the shell splits them, with nothing expanded. A first word with a `/` in it is a
 program in the repository's main checkout, whichever worktree runs it; a first word without
-one is found on the `PATH`. The command runs in the folder its caller is in, with the
+one is found on the `PATH`, and then the first later word with a `/` in it that is no option
+is the script it runs, read from the main checkout too (`node tools/shipline/hunt-browser.mjs`):
+a pull request's worktree never supplies the program. The command runs in the folder its caller is in, with the
 arguments below after its own words. A command the file leaves out is one the repository does
 not have, and Shipline does without it; a command it names but that cannot start stops the
 call. A session runs one as `shipline <command>`, the name with dashes
@@ -103,15 +105,20 @@ call. A session runs one as `shipline <command>`, the name with dashes
 | `browser_tests_for_changes` | the review panel in a conflict round, and sessions: `<base> [--files-from <file>]` and the session's own words | the browser specs the change reaches, one path a line | nothing is selected, and CI runs the whole browser suite |
 | `server_tests_for_changes` | the same: `<base> [--files-from <file>]` | one JSON object, `{"whole": bool, "tests": [paths], "total": int, "reasons": [str]}` | the whole server suite: `{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}` |
 | `pre_train_checks` | the merge gate, before a pull request joins the merge train, in its worktree | exits non-zero when a check failed; what it prints is shown | every pull request is admitted |
-| `mechanical_conflicts` | the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch | `resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line, or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took | every conflict is left to the session, nothing is renumbered and main took no number |
-| `browser_plan` | the merge gate: the changed paths on standard input, each ended by a NUL | exits 0 when the merge needs browser tests, 1 when not; anything else counts as needed | every merge that changes a file needs browser tests |
-| `hunt_app` | `session` when a hunt stops: `stop`; the hunter itself, by `shipline hunt-app` | | `session start hunt` refuses |
+| `mechanical_conflicts` | the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch | `resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line (paths without spaces), or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took | every conflict is left to the session, nothing is renumbered and main took no number |
+| `browser_plan` | the merge gate: the changed paths on standard input, each ended by a NUL | exits 0 when the merge needs browser tests, 1 when not; anything else counts as needed | every merge that changes a file needs browser tests while the merged tree holds the E2E workflow (`workflows.e2e`), and none does without it |
+| `hunt_app` | `session` when a hunt stops: `stop`, in the hunt's worktree; the hunter itself, by `shipline hunt-app` | | `session start hunt` refuses |
 | `hunt_browser` | the hunter, by `shipline hunt-browser`, which its sentence names | | the sentence names none |
 | `hunt_cursor` | `session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>` | what it prints is kept in the report folder's `cursor.log` | a Cursor hunt is refused |
 | `advisory_watch` | the merge gate: `unreachable` with a failed push's output, or a failed audit's annotations, on standard input; `answers <service>` | `unreachable` prints the advisory service the text says was unreachable, or nothing; `answers` exits 0 when the service answers again | no outage is read: a failed push is refused as it is |
-| `push_checkout` | the merge gate, before and after each push: `install <checkout>`; `refusal <checkout>` with the push's whole output on standard input | `install` installs what changed since its last install and exits non-zero with the reason when it failed, which is a wait; `refusal` prints the hook's failed step with its last lines | nothing is installed, and a failed push is refused with its last 10 lines |
+| `push_checkout` | the merge gate, before each push and after one that failed: `install <checkout>`; `refusal <checkout>` with the push's whole output on standard input | `install` installs what changed since its last install and exits non-zero with the reason when it failed, which is a wait; `refusal` prints the hook's failed step with its last lines | nothing is installed, and a failed push is refused with its last 10 lines |
 
 The merge gate keeps the outage an advisory watch found in its state folder:
 `advisory-service-down`, `{"service": ..., "since": "YYYY-MM-DD HH:MM UTC"}`, written by the
 first push of an outage and removed when a push succeeds or the tick finds the service
 answering, and `advisory-service.pending`, the line the wake tells once.
+
+A command reads nothing but what is given on its standard input. Files a repository kept beside
+the scripts before these commands existed, `scripts/workflow/pre-train-checks`,
+`advisory_service.py`, `pushing_checkout.py`, `mechanical_conflicts.py` and `scripts/e2e-plan.py`,
+are no longer read: each becomes a command named here, which answers in the form above.

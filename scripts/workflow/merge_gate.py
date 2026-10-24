@@ -194,13 +194,14 @@ def repository_command(
     name: str, *args: str, input: str | None = None, errors: str = "strict"
 ) -> subprocess.CompletedProcess[str] | None:
     """The repository's own command `name` (`shipline.json`), run with `args` in the current
-    folder and bounded like every command; None when the repository names none. A command that
-    is named but cannot start stops the gate's call."""
+    folder and bounded like every command; None when the repository names none. It reads
+    `input`, and never the gate's own standard input. A command that is named but cannot start
+    stops the gate's call."""
     words = CONFIG.command(name)
     if words is None:
         return None
     try:
-        return command(*words, *args, check=False, input=input, errors=errors)
+        return command(*words, *args, check=False, input=input or "", errors=errors)
     except OSError as error:
         raise Refused(
             f"cannot run the repository's {name} command, {shlex.join(words)}: {error}"
@@ -1330,13 +1331,17 @@ def browser_needed(base: str, merge: str) -> bool:
     The gate reads the exact difference from main, so a merge that changes nothing needs
     none; the planner runs on an empty diff only because it cannot tell one from a misread.
     The plan reads the changed paths, each ended by a NUL, and exits 0 when browser tests are
-    needed and 1 when not. Without a plan, or when it answers otherwise, every merge needs them.
+    needed and 1 when not; any other answer counts as needed. Without a plan every merge needs
+    them while the merged tree holds the E2E workflow, and none does without that file.
     """
     changed = command(
         "git", "diff", "--no-renames", "--name-only", "-z", base, merge, errors="surrogateescape"
     ).stdout.split("\0")[:-1]
     if not changed:
         return False
+    if CONFIG.command("browser_plan") is None:
+        suite = f"{merge}:.github/workflows/{WORKFLOW_FILES['e2e']}"
+        return not command("git", "cat-file", "-e", suite, check=False).returncode
     done = repository_command(
         "browser_plan", input="".join(f"{path}\0" for path in changed), errors="surrogateescape"
     )
@@ -1346,7 +1351,7 @@ def browser_needed(base: str, merge: str) -> bool:
             file=sys.stderr,
             flush=True,
         )
-    return done is None or done.returncode != 1
+    return done is not None and done.returncode != 1
 
 
 def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> bool:
@@ -1550,7 +1555,7 @@ def refresh_pull(
             )
         if done.returncode:
             raise Refused(said(done))
-        moved = [line.split(" ") for line in nonblank_lines(done.stdout)]
+        moved = [line.split() for line in nonblank_lines(done.stdout)]
         if any(len(pair) != 2 for pair in moved):
             raise Refused(f"could not read the files the repository renumbered: {done.stdout}")
         if moved:

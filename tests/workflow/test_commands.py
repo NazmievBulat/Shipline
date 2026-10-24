@@ -133,8 +133,13 @@ def test_a_command_s_program_is_found_in_the_main_checkout_from_a_worktree(
         str(repo / "tools/shipline/pre-train-checks"),
         "--fast",
     ]
-    # A program named without a folder is found on the PATH; the words after it stay as written.
-    assert config.command("browser_plan") == ["python3", "-B", "tools/shipline/browser plan.py"]
+    # A program named without a folder is found on the PATH; the script it runs, the first word
+    # after it with a folder in it, is the main checkout's, never the pull request's copy.
+    assert config.command("browser_plan") == [
+        "python3",
+        "-B",
+        str(repo / "tools/shipline/browser plan.py"),
+    ]
     assert config.command("hunt_app") is None
     assert workflow_config.as_dict(config)["commands"]["pre_train_checks"] == (
         "tools/shipline/pre-train-checks --fast"
@@ -146,6 +151,7 @@ def test_a_command_s_program_is_found_in_the_main_checkout_from_a_worktree(
     [
         ("/opt/checks", "must be a path inside the checkout"),
         ("../checks", "must be a path inside the checkout"),
+        ("python3 -B ../checks.py", "must be a path inside the checkout"),
         ("tools/'checks", "cannot be split into words"),
         ("   ", "must be a name"),
         (["tools/checks"], "must be a name"),
@@ -209,10 +215,10 @@ def test_bash_reads_each_command_as_its_words(tmp_path: Path) -> None:
 
 
 def _gate(
-    workflow: Workflow, code: str, cwd: Path | None = None
+    workflow: Workflow, code: str, cwd: Path | None = None, stdin: str = ""
 ) -> subprocess.CompletedProcess[str]:
     """Runs `code` with the gate imported as `g`, in `cwd` (the main checkout when none is
-    named); it prints what it found."""
+    named), reading `stdin`; it prints what it found."""
     return subprocess.run(
         [
             "python3",
@@ -224,6 +230,7 @@ def _gate(
         ],
         cwd=cwd or workflow.repo,
         env={**workflow.env, "SHIPLINE_REPO": str(workflow.repo)},
+        input=stdin,
         capture_output=True,
         text=True,
         timeout=60,
@@ -260,6 +267,24 @@ def test_the_pre_train_checks_are_run_in_the_pull_request_s_worktree(workflow: W
         "a check failed\nrefused: pre-train checks failed; "
         "fix the inventory before joining the merge train\n"
     ), done.stderr
+
+
+def test_a_command_never_reads_the_gate_s_own_input(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-checks")
+    _configure(workflow, pre_train_checks="example-checks")
+
+    done = _gate(
+        workflow,
+        """
+        folder = g.main_checkout() / g.CONFIG.state_folder
+        folder.mkdir(parents=True, exist_ok=True)
+        g.pre_train_checks("7", folder)
+        """,
+        stdin="the gate's own input\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert _read(workflow, "example-checks") == ""
 
 
 def test_without_pre_train_checks_a_pull_request_is_admitted(workflow: Workflow) -> None:
@@ -305,11 +330,19 @@ def test_the_browser_plan_reads_the_changed_paths_and_answers_by_its_exit(
     assert _read(workflow, "example-plan") == "app.txt\0odd name.txt\0"
 
 
-def test_without_a_browser_plan_every_merge_needs_browser_tests(workflow: Workflow) -> None:
+@pytest.mark.parametrize("suite", [True, False])
+def test_without_a_browser_plan_a_merge_needs_browser_tests_when_there_is_a_suite(
+    workflow: Workflow, suite: bool
+) -> None:
+    """Every merge needs them while the merged tree holds the E2E workflow; without that file
+    there is no suite to run."""
     _configure(workflow, browser_plan=None)
+    if suite:
+        (workflow.repo / ".github/workflows").mkdir(parents=True, exist_ok=True)
+        (workflow.repo / ".github/workflows/e2e.yml").write_text("on: workflow_dispatch\n")
     _changes(workflow, "README.md")
 
-    assert _browser_needed(workflow) == "needed"
+    assert _browser_needed(workflow) == ("needed" if suite else "none")
 
 
 def test_a_merge_that_changes_nothing_asks_no_browser_plan(workflow: Workflow) -> None:
@@ -953,12 +986,14 @@ def test_a_stopped_hunt_s_application_is_stopped_by_the_repository_s_command(
     done = workflow.run("stop", "hunt-phone-1")
 
     assert done.returncode == 0, done.stdout + done.stderr
+    # In the hunt's worktree, where its hunter started the application.
     assert workflow.calls("example-hunt-app") == [
-        f"example-hunt-app --quiet stop (in {workflow.repo})"
+        f"example-hunt-app --quiet stop (in {workflow.hunt_worktree('phone-1')})"
     ]
 
 
 def test_without_a_hunt_app_a_stopped_hunt_stops_no_application(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-hunt-app")
     _configure(workflow, hunt_app=None)
     workflow.add_hunt("phone-1")
     workflow.running("hunt-phone-1")
@@ -966,6 +1001,8 @@ def test_without_a_hunt_app_a_stopped_hunt_stops_no_application(workflow: Workfl
     done = workflow.run("stop", "hunt-phone-1")
 
     assert done.returncode == 0, done.stdout + done.stderr
+    assert not workflow.is_running("hunt-phone-1")
+    assert workflow.calls("example-hunt-app") == []
 
 
 # `shipline <command>`, as a session runs the repository's commands
@@ -1023,3 +1060,16 @@ def test_shipline_knows_every_command_a_repository_may_name() -> None:
     listed = launcher.split("CONFIGURED=(\n", 1)[1].split(")", 1)[0].split()
 
     assert listed == [name.replace("_", "-") for name in _COMMANDS]
+
+
+def test_without_pre_train_checks_shipline_has_none_to_fail(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    _configure(workflow, pre_train_checks=None)
+
+    done = workflow.shipline("pre-train-checks")
+
+    assert done.returncode == 0
+    assert done.stderr == (
+        "this repository names no pre_train_checks command in shipline.json: "
+        "there is no check to fail\n"
+    )
