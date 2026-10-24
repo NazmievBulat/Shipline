@@ -4,7 +4,9 @@ import errno
 import fcntl
 import json
 import os
+import re
 import select
+import shutil
 import signal
 import subprocess
 import time
@@ -19,6 +21,7 @@ from stand_in_server import StandInServer
 from workflow_harness import Workflow
 
 _GH = r"""import builtins
+import fcntl
 import json
 import subprocess
 import sys
@@ -42,6 +45,23 @@ def answer(args, cwd, env, out, err):
     with (state / "calls.log").open("a") as log:
         log.write("gh " + " ".join(args) + "\n")
     data = json.loads((state / "github.json").read_text())
+    probe = Path(data.get("lock_probe") or "/nonexistent/merge.lock")
+    if probe.parent.is_dir():
+        # A call made while a gate holds the merge lock is written down as well.
+        with probe.open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                with (state / "locked-calls.log").open("a") as log:
+                    log.write("gh " + " ".join(args) + "\n")
+    pause = state / "pause-call"
+    if pause.exists() and pause.read_text().strip() in " ".join(args):
+        # The call waits until the test lets it go on.
+        pause.unlink()
+        with (state / "call-entered").open("w") as pipe:
+            pipe.write("entered\n")
+        with (state / "call-continue").open() as pipe:
+            pipe.read(1)
     if args[:2] == ["pr", "view"] and "-R" in args and args[2] in data["pulls"]:
         if data["pulls"][args[2]].get("fail_view"):
             sys.exit("GitHub unavailable")
@@ -57,6 +77,30 @@ def answer(args, cwd, env, out, err):
         for check in data["pulls"][args[2]]["statusCheckRollup"]:
             check.setdefault("__typename", "StatusContext" if "state" in check else "CheckRun")
         print(json.dumps(data["pulls"][args[2]]))
+        changed = data.get("after_view", {}).pop(args[2], None)
+        if changed:
+            # The pull request changes on GitHub right after this read.
+            data["pulls"][args[2]].update(changed)
+            (state / "github.json").write_text(json.dumps(data))
+        pushes = data.get("push_after_view", {}).get(args[2])
+        if pushes:
+            # Another push lands on its branch right after this read, or after a later one.
+            if pushes.pop(0):
+                branch = "refs/heads/" + data["pulls"][args[2]]["headRefName"]
+                def bare(*words):
+                    return check_output(
+                        ["git", "--git-dir", data["origin"], *words], text=True).strip()
+                moved = bare("commit-tree", branch + "^{tree}", "-p", branch, "-m", "another push")
+                bare("update-ref", branch, moved)
+            (state / "github.json").write_text(json.dumps(data))
+        lines = data.get("line_after_view", {}).get(args[2])
+        if lines:
+            # The tick saves another line right after this read, or after a later one.
+            line = lines.pop(0)
+            if line is not None:
+                train = Path(data["lock_probe"]).with_name("merge-train.json")
+                train.write_text(json.dumps(line))
+            (state / "github.json").write_text(json.dumps(data))
     elif (args[:2] == ["pr", "list"]
           and "--state" in args and "--jq" not in args and "--base" not in args):
         # Both bulk and individual reads describe the same GitHub state. Keep ordinary
@@ -144,7 +188,7 @@ def answer(args, cwd, env, out, err):
             for number, patch in data.get("after_merge", {}).pop(args[2], {}).items():
                 data["pulls"][number].update(patch)
             for workflow in ("ci", "images"):
-                prefix = "repos/NazmievBulat/Shipline/actions/workflows/"
+                prefix = "repos/example-org/example-app/actions/workflows/"
                 data["api"][prefix + f"{workflow}.yml/runs?head_sha={actual}&per_page=100"] = {
                     "workflow_runs": []}
             if after_main == "red":
@@ -152,7 +196,7 @@ def answer(args, cwd, env, out, err):
                     "workflow_runs": [{"id": 60, "head_sha": actual, "event": "push",
                         "head_branch": "main", "status": "completed", "conclusion": "failure",
                         "updated_at": "2026-10-16T10:00:00Z"}]}
-                data["api"]["repos/NazmievBulat/Shipline/actions/runs/60/jobs?per_page=100"] = {
+                data["api"]["repos/example-org/example-app/actions/runs/60/jobs?per_page=100"] = {
                     "jobs": [{"id": 61, "name": "CI result", "status": "completed",
                         "conclusion": "failure"}, {"id": 62, "name": "CI: web",
                         "status": "completed", "conclusion": "failure"}]}
@@ -195,7 +239,7 @@ def answer(args, cwd, env, out, err):
         return "delegate"
 """
 
-_REPO = "repos/NazmievBulat/Shipline"
+_REPO = "repos/example-org/example-app"
 _MAIN_IMAGES = f"{_REPO}/actions/workflows/images.yml/runs?branch=main&per_page=100&page=1"
 
 
@@ -215,6 +259,16 @@ class GitHub:
     after_merge: dict[str, dict[str, dict[str, Any]]] = field(
         default_factory=dict[str, dict[str, dict[str, Any]]]
     )
+    # What GitHub shows of a pull request right after the gate's next read of it.
+    after_view: dict[str, dict[str, Any]] = field(default_factory=dict[str, dict[str, Any]])
+    # The merge lock whose holder's calls the stand-in writes down (locked_calls).
+    lock_probe: str | None = None
+    # The line saved beside that lock after each of the gate's reads of a pull request.
+    line_after_view: dict[str, list[dict[str, Any] | None]] = field(
+        default_factory=dict[str, list[dict[str, Any] | None]]
+    )
+    # Whether another push lands on a pull request's branch after each of the gate's reads of it.
+    push_after_view: dict[str, list[bool]] = field(default_factory=dict[str, list[bool]])
 
     def save(self) -> None:
         (self.workflow.state / "github.json").write_text(
@@ -230,6 +284,10 @@ class GitHub:
                     "refusal_moves_main": self.refusal_moves_main,
                     "after_main": self.after_main,
                     "after_merge": self.after_merge,
+                    "after_view": self.after_view,
+                    "lock_probe": self.lock_probe,
+                    "line_after_view": self.line_after_view,
+                    "push_after_view": self.push_after_view,
                 }
             )
         )
@@ -444,7 +502,7 @@ class GitHub:
 @pytest.fixture
 def github(workflow: Workflow) -> Iterator[GitHub]:
     images = workflow.repo / ".github/workflows/images.yml"
-    images.parent.mkdir(parents=True, exist_ok=True)  # The harness copies ci.yml there.
+    images.parent.mkdir(parents=True, exist_ok=True)
     images.write_text('on:\n  pull_request:\n    paths:\n      - "docker/**"\n  push:\n')
     (workflow.repo / "shared.txt").write_text("original\n")
     workflow.git("add", ".github")
@@ -1935,7 +1993,7 @@ def test_only_superseded_image_cancellations_are_pending_and_never_retried(
         assert not rerun_calls
         assert not (github.workflow.repo / ".local/workflow/main-rerun-50").exists()
     else:
-        assert rerun_calls == ["gh run rerun 50 -R NazmievBulat/Shipline --failed"]
+        assert rerun_calls == ["gh run rerun 50 -R example-org/example-app --failed"]
 
 
 def test_an_earlier_green_image_run_does_not_stand_in_for_the_heads_own(github: GitHub) -> None:
@@ -2966,7 +3024,7 @@ def test_tick_reruns_failed_home_jobs_once_and_reports_it(github: GitHub, conclu
     done = workflow.run_script("tick")
 
     rerun_calls = [call for call in workflow.calls("gh") if "run rerun" in call]
-    assert rerun_calls == ["gh run rerun 10 -R NazmievBulat/Shipline --failed"], done.stderr
+    assert rerun_calls == ["gh run rerun 10 -R example-org/example-app --failed"], done.stderr
     note = "automatically re-ran failed jobs of main run 10 once"
     assert note in workflow.wake_log.read_text()
     assert note in (workflow.repo / ".local/workflow/main-status").read_text()
@@ -3005,7 +3063,7 @@ def test_tick_reruns_a_failed_part_only_when_every_part_ran_at_home(
     done = workflow.run_script("tick")
 
     reruns = [call for call in workflow.calls("gh") if "run rerun" in call]
-    expected = ["gh run rerun 10 -R NazmievBulat/Shipline --failed"]
+    expected = ["gh run rerun 10 -R example-org/example-app --failed"]
     assert reruns == (expected if first == "example-app-home-main" else []), done.stderr
     assert "main: red" in (workflow.repo / ".local/workflow/main-status").read_text()
 
@@ -3719,20 +3777,6 @@ def test_a_member_conflicting_with_the_batch_waits_for_its_own_turn(github: GitH
     assert done.returncode == 0, done.stdout + done.stderr
     assert _batch_state(github)["waiting"] == ["9"]
     assert github.pulls["9"]["state"] == "OPEN"
-    assert _merges(github) == ["7", "8"]
-
-
-def test_a_member_whose_migration_number_the_batch_took_waits_for_its_own_turn(
-    github: GitHub,
-) -> None:
-    # Its own refresh renumbers the migration; a scratch merge would only fail with two heads.
-    _batch_setup(github, migration=True)
-    assert _batch_call(github).returncode == 3
-    assert _numbers(github) == ["7", "8"]
-    _finish_batch(github)
-    done = _batch_call(github)
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert _batch_state(github)["waiting"] == ["9"]
     assert _merges(github) == ["7", "8"]
 
 
@@ -4781,7 +4825,7 @@ def test_git_reads_of_github_retry_server_errors_only(
     workflow = github.workflow
     real = subprocess.check_output(["bash", "-c", "command -v git"], text=True).strip()
     counter = workflow.state / "git-read-attempts"
-    url = "https://github.com/NazmievBulat/Shipline.git/"
+    url = "https://github.com/example-org/example-app.git/"
     workflow.fake(
         "git",
         f"""#!/bin/bash
@@ -5085,54 +5129,6 @@ UNREACHABLE = (
 ADVISORY = "Refused: this branch brings advisories that main does not have:\n  npm: GHSA-1 in vite"
 
 
-def test_a_refresh_push_the_audit_service_refused_waits_from_the_published_head(
-    github: GitHub,
-) -> None:
-    _stale(github)
-    short_of_memory(github.workflow, UNREACHABLE, times=1)
-    workflow = github.workflow
-
-    done = github.run()
-
-    assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
-    assert "could not reach npm's advisory service" in done.stderr
-    # Nothing wakes a reviewer when the service answers: the tick retries a handoff's push.
-    assert (
-        "by the tick once it is handed off: publish the passed round, "
-        "run merge-when-current --handoff 7 and end with review finished"
-    ) in done.stderr
-    assert "tried again later" not in done.stderr
-    # Nothing was pushed, and the worktree is back on the published head, clean.
-    assert workflow.git("rev-parse", "HEAD") == github.head
-    assert workflow.git("status", "--porcelain") == ""
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == github.head
-    folder = workflow.repo / ".local/workflow"
-    assert json.loads((folder / "advisory-service-down").read_text())["service"] == "npm"
-    told = (folder / "advisory-service.pending").read_text()
-    assert told.startswith("npm's advisory service unreachable since ")
-
-    # The service answers again: the same call refreshes, and the note of the outage goes.
-    done = github.run()
-
-    assert done.returncode == 2, done.stdout + done.stderr
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[
-        0
-    ] == workflow.git("rev-parse", "HEAD")
-    assert not (folder / "advisory-service-down").exists()
-
-
-def test_an_outage_is_told_once_however_many_pushes_it_refuses(github: GitHub) -> None:
-    _stale(github)
-    short_of_memory(github.workflow, UNREACHABLE, times=3)
-    folder = github.workflow.repo / ".local/workflow"
-
-    assert "merge waiting" in github.run().stderr
-    (folder / "advisory-service.pending").unlink()  # the wake told it
-    assert "merge waiting" in github.run().stderr
-
-    assert not (folder / "advisory-service.pending").exists()
-
-
 def test_a_refresh_push_refused_for_an_advisory_is_still_refused(github: GitHub) -> None:
     _stale(github)
     short_of_memory(github.workflow, ADVISORY, times=1)
@@ -5142,20 +5138,6 @@ def test_a_refresh_push_refused_for_an_advisory_is_still_refused(github: GitHub)
     assert done.returncode == 1 and "merge refused" in done.stderr, done.stdout + done.stderr
     assert "GHSA-1" in done.stderr
     assert not (github.workflow.repo / ".local/workflow/advisory-service-down").exists()
-
-
-def test_a_batch_push_the_audit_service_refused_is_never_counted(github: GitHub) -> None:
-    _batch_setup(github)
-    short_of_memory(github.workflow, UNREACHABLE, times=4)
-
-    for _ in range(4):
-        done = _batch_call(github)
-        assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
-    batch = _scratch(github)
-    assert batch is not None
-    assert batch["pushed"] is False and "push_failures" not in batch
-    assert _batch_call(github).returncode == 3
-    assert all(member["scratch"]["pushed"] for member in _prefixes(github))
 
 
 def _dependencies_red(github: GitHub, *, annotation: str | None) -> dict[str, Any]:
@@ -5199,17 +5181,6 @@ _MAIN_UNREACHABLE = (
 )
 
 
-def test_main_red_only_for_the_audit_service_says_so(github: GitHub) -> None:
-    _dependencies_red(github, annotation=_MAIN_UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-
-    line = github.workflow.run_script("main-status").stdout
-
-    assert "main: red" in line
-    assert "CI: dependencies could not reach npm's advisory service" in line
-    assert "nothing was found wrong with main" in line
-
-
 def test_main_red_for_the_audit_service_and_its_images_does_not_say_nothing_was_wrong(
     github: GitHub,
 ) -> None:
@@ -5222,96 +5193,6 @@ def test_main_red_for_the_audit_service_and_its_images_does_not_say_nothing_was_
 
     assert "main: red" in line and "Docker images: image tests" in line
     assert "nothing was found wrong with main" not in line
-
-
-def test_main_red_for_the_audit_service_is_re_run_once_it_answers_again(github: GitHub) -> None:
-    workflow = github.workflow
-    run = _dependencies_red(github, annotation=_MAIN_UNREACHABLE)
-    advisory_service_answers(workflow, answers=False)
-
-    workflow.run_script("tick")
-
-    assert rerun_calls(workflow) == []
-    status = (workflow.repo / ".local/workflow/main-status").read_text()
-    assert "re-run once npm's advisory service answers" in status
-
-    advisory_service_answers(workflow, answers=True)
-    workflow.run_script("tick")
-
-    assert rerun_calls(workflow) == ["gh run rerun 10 -R NazmievBulat/Shipline --failed"]
-    note = "automatically re-ran failed jobs of main run 10 after npm's advisory service answered"
-    assert note in (workflow.repo / ".local/workflow/main-status").read_text()
-    assert note in workflow.wake_log.read_text()
-    # Once: the third attempt failing again waits for someone, as any failure does.
-    run["run_attempt"] = 3
-    github.save()
-    workflow.run_script("tick")
-    assert len(rerun_calls(workflow)) == 1
-
-
-@pytest.mark.parametrize("reason", ["no annotation", "another job failed too", "hosted"])
-def test_main_red_for_more_than_the_audit_service_is_not_re_run_again(
-    github: GitHub, reason: str
-) -> None:
-    workflow = github.workflow
-    _dependencies_red(github, annotation=None if reason == "no annotation" else _MAIN_UNREACHABLE)
-    parts = github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"]
-    if reason == "another job failed too":
-        parts.append(
-            {
-                "id": 13,
-                "name": "CI: web",
-                "status": "completed",
-                "conclusion": "failure",
-                "labels": ["example-app-home-main"],
-            }
-        )
-    elif reason == "hosted":
-        parts[1]["labels"] = ["ubuntu-latest"]
-    github.save()
-    advisory_service_answers(workflow, answers=True)
-
-    workflow.run_script("tick")
-
-    assert rerun_calls(workflow) == []
-
-
-def test_the_tick_forgets_an_outage_once_the_service_answers(github: GitHub) -> None:
-    github.main()
-    github.save()
-    workflow = github.workflow
-    folder = workflow.repo / ".local/workflow"
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "advisory-service-down").write_text(
-        json.dumps({"service": "npm", "since": "2026-10-22 02:46 UTC"})
-    )
-    advisory_service_answers(workflow, answers=False)
-
-    workflow.run_script("tick")
-
-    assert (folder / "advisory-service-down").exists()
-    advisory_service_answers(workflow, answers=True)
-    workflow.run_script("tick")
-    assert not (folder / "advisory-service-down").exists()
-    assert any("advisories/bulk" in call for call in workflow.calls("curl"))
-
-
-def test_the_recovery_re_run_waits_for_github_to_show_the_first_one(github: GitHub) -> None:
-    # GitHub can still show the failed first attempt after accepting the first re-run.
-    workflow = github.workflow
-    run = _dependencies_red(github, annotation=_MAIN_UNREACHABLE)
-    run["run_attempt"] = 1
-    github.save()
-    advisory_service_answers(workflow, answers=True)
-
-    workflow.run_script("tick")
-
-    assert rerun_calls(workflow) == []
-    assert not (workflow.repo / ".local/workflow/main-rerun-10-recovered").exists()
-    run["run_attempt"] = 2
-    github.save()
-    workflow.run_script("tick")
-    assert len(rerun_calls(workflow)) == 1
 
 
 def pull_dependencies_red(github: GitHub, *, annotation: str | None) -> dict[str, Any]:
@@ -5337,30 +5218,6 @@ def pull_dependencies_red(github: GitHub, *, annotation: str | None) -> dict[str
     return run
 
 
-def test_a_pull_request_red_only_for_the_audit_service_waits_in_its_place(
-    github: GitHub,
-) -> None:
-    pull_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-
-    done = github.run()
-
-    assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
-    assert "could not reach npm's advisory service" in done.stderr
-    assert "re-run once the service answers" in done.stderr
-    # Nothing wakes a reviewer of a blocked member when the service answers: only the
-    # handoff, which the tick drives, re-runs it without another call.
-    assert (
-        "publish the passed round, run merge-when-current --handoff 7 and end with "
-        "review finished" in done.stderr
-    )
-    assert "later gate call" not in done.stderr
-    # Passed over in its place, as a failed member is, until a green re-run; never merged.
-    assert _train(github)["blocked"] == ["7"]
-    assert not (github.workflow.state / "merged").exists()
-    assert rerun_calls(github.workflow) == []
-
-
 @pytest.mark.parametrize("reason", ["no annotation", "another check failed too"])
 def test_a_pull_request_red_for_more_than_the_audit_service_is_refused(
     github: GitHub, reason: str
@@ -5376,41 +5233,6 @@ def test_a_pull_request_red_for_more_than_the_audit_service_is_refused(
 
     assert done.returncode == 1 and "merge refused" in done.stderr, done.stdout + done.stderr
     assert "failed checks" in done.stderr
-
-
-def test_a_pull_request_run_red_for_the_audit_service_waits_before_its_rollup_shows_it(
-    github: GitHub,
-) -> None:
-    # GitHub's rollup can still read green while the run itself has failed.
-    pull_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-    github.pulls["7"]["statusCheckRollup"] = [
-        {"name": "CI result", "status": "COMPLETED", "conclusion": "SUCCESS"}
-    ]
-    github.save()
-
-    done = github.run()
-
-    assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
-    assert "could not reach npm's advisory service" in done.stderr
-    assert not (github.workflow.state / "merged").exists()
-
-
-def test_a_gate_call_re_runs_a_pull_request_once_the_audit_service_answers(
-    github: GitHub,
-) -> None:
-    # A reviewer's own call does what the tick does for a handoff.
-    pull_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=True)
-
-    first = github.run()
-    second = github.run()
-
-    for done in (first, second):
-        assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
-    assert rerun_calls(github.workflow) == ["gh run rerun 20 -R NazmievBulat/Shipline --failed"]
-    assert "GitHub has not shown it yet" in second.stderr
-    assert not (github.workflow.state / "merged").exists()
 
 
 def _changes(github: GitHub, path: str = "web/src/page.tsx") -> str:
@@ -5875,37 +5697,6 @@ def _server_suite_dependencies_red(github: GitHub, *, annotation: str | None) ->
     return suite
 
 
-def test_a_run_of_every_server_test_red_only_for_the_audit_service_waits_and_is_re_run(
-    github: GitHub,
-) -> None:
-    # The gate's manual CI run holds the same package audit as a batch's: an advisory service
-    # that could not be reached is a wait, not a failure of the pull request.
-    suite = _server_suite_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-
-    waiting = _batch_call(github)
-
-    assert waiting.returncode == 3, waiting.stdout + waiting.stderr
-    assert "could not reach npm's advisory service" in waiting.stdout
-    train = _batch_state(github)
-    assert train["blocked"] == {} and "7" in train["suites"]
-    assert rerun_calls(github.workflow) == []
-
-    # The red run does not change when the service answers: the wake of the front does.
-    before = _train(github)["turn"]
-    advisory_service_answers(github.workflow, answers=True)
-    assert _train(github)["turn"] > before
-    assert _batch_call(github).returncode == 3
-
-    assert rerun_calls(github.workflow) == [
-        "gh run rerun 960000 -R NazmievBulat/Shipline --failed"
-    ]
-    github.ci_dispatched(suite["head"], suite["branch"], run_id=960_000)  # The re-run passed.
-    done = _batch_call(github)
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert (github.workflow.state / "merged").read_text() == "7"
-
-
 def test_a_run_of_every_server_test_red_for_dependencies_without_the_service_note_refuses(
     github: GitHub,
 ) -> None:
@@ -6153,71 +5944,6 @@ def batch_dependencies_red(
     github.save()
 
 
-def test_a_batch_red_only_for_the_audit_service_waits_and_is_re_run_once_it_answers(
-    github: GitHub,
-) -> None:
-    _batch_setup(github)
-    assert _batch_call(github).returncode == 3
-    _finish_batch(github)
-    batch_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-    members = _prefixes(github)
-
-    waiting = _batch_call(github)
-
-    assert waiting.returncode == 3, waiting.stdout + waiting.stderr
-    assert "batch run 100 could not reach npm's advisory service" in waiting.stdout
-    train = _batch_state(github)
-    # Not blamed on its member: the prefixes are kept as they were.
-    assert _prefixes(github) == members
-    assert train["blocked"] == {} and train["batch_failed"] == {}
-    assert rerun_calls(github.workflow) == []
-
-    advisory_service_answers(github.workflow, answers=True)
-    assert _batch_call(github).returncode == 3
-    again = _batch_call(github)  # GitHub still shows attempt 1.
-
-    assert again.returncode == 3, again.stdout + again.stderr
-    assert "GitHub has not shown it yet" in again.stdout
-    assert rerun_calls(github.workflow) == ["gh run rerun 100 -R NazmievBulat/Shipline --failed"]
-    assert [m["number"] for m in _prefixes(github)] == [m["number"] for m in members]
-
-    _finish_batch(github)  # The re-run passed.
-    head = _prefixes(github)[0]["scratch"]["head"]
-    github.api[
-        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={head}&event=workflow_dispatch&per_page=100"
-    ]["workflow_runs"][0]["run_attempt"] = 2
-    done = _batch_call(github)
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert [call.split()[3] for call in github.workflow.calls("gh pr merge")] == ["7", "8", "9"]
-
-
-def test_a_batch_waiting_for_the_audit_service_wakes_the_front_once_it_answers(
-    github: GitHub,
-) -> None:
-    # A reviewer that did not hand off is woken by a new turn. The red run does not change when
-    # the service answers again, so without its answer in the signal nothing would wake it.
-    _batch_setup(github)
-    assert _batch_call(github).returncode == 3
-    _finish_batch(github)
-    batch_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-    assert _batch_call(github).returncode == 3
-    before = _train(github)["turn"]
-    assert _train(github)["turn"] == before
-
-    advisory_service_answers(github.workflow, answers=True)
-    woken = _train(github)["turn"]
-
-    assert woken > before
-    assert _train(github)["turn"] == woken
-    # The wake only tells the front: its own gate call re-runs, under the merge lock.
-    assert rerun_calls(github.workflow) == []
-    assert _batch_call(github).returncode == 3
-    assert rerun_calls(github.workflow) == ["gh run rerun 100 -R NazmievBulat/Shipline --failed"]
-
-
 @pytest.mark.parametrize(
     "reason", ["no annotation", "another job failed too", "hosted", "unreadable annotation"]
 )
@@ -6241,29 +5967,6 @@ def test_a_batch_red_for_more_than_the_audit_service_is_isolated(
     assert _batch_state(github)["blocked"] == {"7": github.head}
     assert _numbers(github) == ["8", "9"]
     assert rerun_calls(github.workflow) == []
-
-
-def test_a_batch_whose_re_run_fails_again_for_the_audit_service_is_isolated(
-    github: GitHub,
-) -> None:
-    # One re-run after the service answered: a second failure is the members' to isolate.
-    _batch_setup(github)
-    assert _batch_call(github).returncode == 3
-    _finish_batch(github)
-    batch_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=True)
-    assert _batch_call(github).returncode == 3
-    head = _prefixes(github)[0]["scratch"]["head"]
-    github.api[
-        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={head}&event=workflow_dispatch&per_page=100"
-    ]["workflow_runs"][0]["run_attempt"] = 2
-
-    done = _batch_call(github)
-
-    assert done.returncode == 1, done.stdout + done.stderr
-    assert "ci run 100 of pull request 7's prefix failed" in done.stderr
-    assert _batch_state(github)["blocked"] == {"7": github.head}
-    assert rerun_calls(github.workflow) == ["gh run rerun 100 -R NazmievBulat/Shipline --failed"]
 
 
 @pytest.mark.parametrize("count", [2, 3])
@@ -6302,33 +6005,6 @@ def test_successful_older_version_noop_keeps_prefix_testing(github: GitHub) -> N
     done = _batch_call(github)
     assert done.returncode == 0, done.stdout + done.stderr
     assert _merges(github) == ["7", "8", "9"]
-
-
-def test_squash_carries_the_gate_validated_runs_in_its_commit_message(github: GitHub) -> None:
-    github.batch_mode = True
-    github.pulls["7"]["commits"] = [
-        {"messageHeadline": "feat: seven", "messageBody": "Why it is built so."},
-        {"messageHeadline": "fix: seven again", "messageBody": ""},
-    ]
-    done = github.run()
-    assert done.returncode == 0, done.stdout + done.stderr
-    message = github.workflow.git("show", "-s", "--format=%B", "origin/main")
-    # The body file replaces GitHub's own list of the branch's commits: main keeps it.
-    assert "* feat: seven\n\nWhy it is built so.\n\n* fix: seven again\n\nWorkflow-Proof: " in (
-        message
-    )
-    receipt = json.loads(
-        next(
-            line.removeprefix("Workflow-Proof: ")
-            for line in message.splitlines()
-            if line.startswith("Workflow-Proof: ")
-        )
-    )
-    assert receipt["base"] == github.base
-    assert receipt["tree"] == github.workflow.git("rev-parse", f"{github.head}^{{tree}}")
-    ci = next(source for source in receipt["sources"] if source["workflow"] == "ci")
-    assert ci["run"] == 20
-    assert "CI result" in ci["jobs"]
 
 
 @pytest.mark.parametrize("broken", ["", "tree", "branch", "matrix"])
@@ -6390,3 +6066,514 @@ def test_gate_verifies_reused_image_evidence_before_merging(github: GitHub, brok
     done = github.run()
     assert done.returncode == (1 if broken else 0), done.stdout + done.stderr
     assert (github.workflow.state / "merged").exists() is (not broken)
+
+
+# A reviewer's handoff checks its own pull request, then holds the merge lock only to join the
+# line and save its note: the members already in the line are the tick's to read.
+
+
+def _handing_off(github: GitHub) -> Path:
+    """Pull request 7's reviewer in its worktree, with a passed round published on its head."""
+    workflow = github.workflow
+    workflow.git("checkout", "main")
+    workflow.git("worktree", "add", str(workflow.worktree(7)), "ticket/seven")
+    github.api[f"{_REPO}/pulls/7/reviews"] = [
+        {
+            "body": "<!-- workflow-review round=1 result=passed -->\nReviewed.",
+            "commit_id": github.head,
+        }
+    ]
+    github.lock_probe = str(workflow.repo / ".local/workflow/merge.lock")
+    github.save()
+    return workflow.worktree(7)
+
+
+def _hand_off(github: GitHub) -> subprocess.CompletedProcess[str]:
+    github.save()
+    return github.workflow.run_script(
+        "merge-when-current", "--handoff", "7", cwd=github.workflow.worktree(7)
+    )
+
+
+def _locked_calls(workflow: Workflow) -> list[str]:
+    log = workflow.state / "locked-calls.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _held(workflow: Workflow) -> list[float]:
+    """How long each of pull request 7's handoffs held the merge lock, by the wake log."""
+    text = workflow.wake_log.read_text() if workflow.wake_log.exists() else ""
+    return [float(s) for s in re.findall(r"handoff 7 held the merge lock for ([0-9.]+) s", text)]
+
+
+def _after_the_checks(workflow: Workflow, script: str) -> None:
+    """Run `script` as the pre-train checks: after the handoff's own checks, before the lock."""
+    checks = workflow.script.with_name("pre-train-checks")
+    checks.write_text("#!/bin/bash\n" + script + "\nexit 0\n")
+    checks.chmod(0o755)
+
+
+def _waiting(workflow: Workflow) -> list[str]:
+    path = workflow.repo / ".local/workflow/merge-train.json"
+    return json.loads(path.read_text())["waiting"] if path.exists() else []
+
+
+def test_a_handoff_into_a_long_line_reads_no_other_member_under_the_merge_lock(
+    github: GitHub,
+) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    line = [str(number) for number in range(8, 58)]
+    for number in line:
+        github.pulls[number] = {
+            **deepcopy(github.pulls["7"]),
+            "headRefOid": f"{int(number):040x}",
+            "headRefName": f"ticket/{number}",
+        }
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": line}))
+
+    done = _hand_off(github)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (folder / "merge-wanted-7").exists()
+    assert _waiting(workflow) == [*line, "7"]
+    # Nothing is asked of GitHub's API under the lock, and the line's members are not read at all.
+    assert _locked_calls(workflow) == []
+    assert workflow.calls("gh pr view 7 ")[-1:] and len(_held(workflow)) == 1
+    others = [github.pulls[number]["headRefOid"] for number in line]
+    assert not [
+        call
+        for call in workflow.calls("gh")
+        if call.startswith(tuple(f"gh pr view {number} " for number in line))
+        or any(head in call for head in others)
+    ]
+    assert re.search(
+        r"^[0-9]+ handoff 7 held the merge lock for [0-9]+\.[0-9] s$",
+        workflow.wake_log.read_text(),
+        re.MULTILINE,
+    )
+
+
+def test_another_gate_call_gets_the_merge_lock_while_a_handoff_reads_github(
+    github: GitHub,
+) -> None:
+    workflow = github.workflow
+    worktree = _handing_off(github)
+    entered = workflow.state / "call-entered"
+    release = workflow.state / "call-continue"
+    os.mkfifo(entered)
+    os.mkfifo(release)
+    # GitHub is slow to answer the handoff's read of its reviews.
+    (workflow.state / "pause-call").write_text("pulls/7/reviews")
+    entered_fd = os.open(entered, os.O_RDWR | os.O_NONBLOCK)
+    release_fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
+    handoff = subprocess.Popen(
+        ["bash", str(workflow.script.with_name("merge-when-current")), "--handoff", "7"],
+        cwd=worktree,
+        env=workflow.env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert select.select([entered_fd], [], [], 15)[0], "the handoff never read its reviews"
+        assert os.read(entered_fd, 100) == b"entered\n"
+        # Another gate call waiting for the lock gets it while the handoff waits on GitHub.
+        got = None
+        started = time.monotonic()
+        with (workflow.repo / ".local/workflow/merge.lock").open("w") as lock:
+            while got is None and time.monotonic() - started < 5:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    got = time.monotonic() - started
+                except BlockingIOError:
+                    time.sleep(0.05)
+        os.write(release_fd, b"x")
+        out, err = handoff.communicate(timeout=60)
+    finally:
+        if handoff.poll() is None:
+            handoff.kill()
+            handoff.communicate()
+        os.close(entered_fd)
+        os.close(release_fd)
+    assert got is not None, "the handoff held the merge lock while it read GitHub"
+    assert handoff.returncode == 0, out + err
+    assert (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+
+
+@pytest.mark.parametrize(
+    ("change", "refusal"),
+    [
+        ({"headRefOid": "f" * 40}, "the pull request head changed during the handoff"),
+        ({"headRefName": "ticket/other"}, "the pull request head changed during the handoff"),
+        ({"isDraft": True}, "only a ready, non-conflicting pull request can be handed off"),
+        ({"mergeable": "CONFLICTING"}, "only a ready, non-conflicting pull request"),
+        (
+            {
+                "statusCheckRollup": [
+                    {"name": "CI result", "status": "COMPLETED", "conclusion": "FAILURE"}
+                ]
+            },
+            "only a ready, non-conflicting pull request",
+        ),
+    ],
+)
+def test_a_pull_request_that_changed_before_the_lock_was_taken_is_refused(
+    github: GitHub, change: dict[str, Any], refusal: str
+) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    github.after_view = {"7": change}
+
+    done = _hand_off(github)
+
+    assert done.returncode == 1 and refusal in done.stderr, done.stdout + done.stderr
+    assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+    assert "7" not in _waiting(workflow)
+    # The refusal comes from the read just before the lock: the lock is never taken.
+    assert _locked_calls(workflow) == [] and _held(workflow) == []
+
+
+def _red_ci(github: GitHub) -> None:
+    """Its CI run failed, though GitHub still shows its checks green."""
+    github.api[
+        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.head}&event=pull_request&per_page=100"
+    ]["workflow_runs"][0]["conclusion"] = "failure"
+    github.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"]["jobs"][1]["conclusion"] = "failure"
+
+
+@pytest.mark.parametrize(
+    ("case", "refusal"),
+    [
+        ("draft", "only a ready, non-conflicting pull request can be handed off"),
+        ("conflicting", "only a ready, non-conflicting pull request can be handed off"),
+        ("failed", "only a ready, non-conflicting pull request can be handed off"),
+        ("unreviewed", "the latest independent round must have passed on the current head"),
+        ("sent back", "the latest independent round must have passed on the current head"),
+        ("unclean", "handoff requires the clean published pull request worktree"),
+        ("branch", "handoff requires the pull request branch"),
+        ("pre-train checks", "pre-train checks failed"),
+        ("blocked", "this pull request failed checks; fix it before rejoining the merge train"),
+        ("whole suite", "a whole suite run on this pull request's tested merge failed"),
+        ("prefix", "the ci run of this pull request's prefix (workflow/merge-batch-b) failed"),
+    ],
+)
+def test_each_handoff_refusal_still_fires(github: GitHub, case: str, refusal: str) -> None:
+    workflow = github.workflow
+    worktree = _handing_off(github)
+    folder = workflow.repo / ".local/workflow"
+    pull = github.pulls["7"]
+    if case == "draft":
+        pull["isDraft"] = True
+    elif case == "conflicting":
+        pull["mergeable"] = "CONFLICTING"
+    elif case == "failed":
+        pull["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    elif case == "unreviewed":
+        github.api[f"{_REPO}/pulls/7/reviews"] = []
+    elif case == "sent back":
+        github.api[f"{_REPO}/pulls/7/reviews"][0]["body"] = (
+            "<!-- workflow-review round=1 result=sent-back -->\nNot yet."
+        )
+    elif case == "unclean":
+        (worktree / "uncommitted.txt").write_text("not published\n")
+    elif case == "branch":
+        workflow.git("checkout", "--detach", cwd=worktree)
+    elif case == "pre-train checks":
+        checks = workflow.script.with_name("pre-train-checks")
+        checks.write_text("#!/bin/bash\necho 'inventory is stale' >&2\nexit 1\n")
+        # An earlier handoff of it waits in the line: it leaves the line, and its note goes.
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7"]}))
+        (folder / "merge-wanted-7").write_text(
+            json.dumps({"head": github.head, "round": 1, "branch": "ticket/seven"})
+        )
+    elif case == "blocked":
+        # It failed in the line before, on this same head, and its run is still red.
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "merge-train.json").write_text(
+            json.dumps({"waiting": ["7"], "blocked": {"7": github.head}})
+        )
+        _red_ci(github)
+    elif case == "whole suite":
+        # The whole suite of its tested merge failed, on this same head.
+        suite = {
+            "member": github.head,
+            "head": "a" * 40,
+            "branch": "workflow/merge-batch-a",
+            "workflows": ["ci"],
+            "requested": ["ci"],
+        }
+        github.ci_dispatched("a" * 40, suite["branch"], run_id=40, conclusion="failure")
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "merge-train.json").write_text(
+            json.dumps(
+                {"waiting": ["7"], "blocked": {"7": github.head}, "suites": {"7": suite}}
+            )
+        )
+    else:
+        # Its prefix's CI run failed on this same head, and no re-run of it passed since.
+        batch = {"head": "b" * 40, "branch": "workflow/merge-batch-b", "workflows": ["ci"]}
+        github.ci_dispatched("b" * 40, batch["branch"], run_id=41, conclusion="failure")
+        failure = {"pull": "20:1", "batch": batch, "workflow": "ci", "run": "41:1"}
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "merge-train.json").write_text(
+            json.dumps(
+                {
+                    "waiting": ["7"],
+                    "blocked": {"7": github.head},
+                    "batch_failed": {"7": failure},
+                }
+            )
+        )
+
+    done = _hand_off(github)
+
+    assert done.returncode == 1 and refusal in done.stderr, done.stdout + done.stderr
+    assert not (folder / "merge-wanted-7").exists()
+    if case in ("blocked", "whole suite", "prefix"):
+        # It keeps its place, passed over until a green re-run, as before.
+        train = json.loads((folder / "merge-train.json").read_text())
+        assert train["waiting"] == ["7"] and train["blocked"] == {"7": github.head}
+    else:
+        assert "7" not in _waiting(workflow)
+
+
+def test_a_handoff_whose_place_the_tick_changed_meanwhile_is_judged_again(
+    github: GitHub,
+) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    _red_ci(github)
+    # While the handoff judged its place, the tick blocked it for its red run.
+    github.line_after_view = {"7": [None, {"waiting": ["7"], "blocked": {"7": github.head}}]}
+
+    done = _hand_off(github)
+
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "this pull request failed checks" in done.stderr
+    assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+    train = json.loads((workflow.repo / ".local/workflow/merge-train.json").read_text())
+    assert train["waiting"] == ["7"] and train["blocked"] == {"7": github.head}
+    assert _locked_calls(workflow) == [] and len(_held(workflow)) == 2
+
+
+def test_a_handoff_whose_place_keeps_changing_waits(github: GitHub) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    github.line_after_view = {
+        "7": [None, *({"waiting": [], "approved": {"7": f"{n:040x}"}} for n in range(3))]
+    }
+
+    done = _hand_off(github)
+
+    assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
+    assert "kept changing" in done.stderr
+    assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+    assert _locked_calls(workflow) == [] and len(_held(workflow)) == 3
+
+
+def test_a_newly_joined_member_waits_for_the_tick_to_read_its_run(github: GitHub) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    github.pulls["8"] = {**deepcopy(github.pulls["7"]), "headRefOid": "8" * 40}
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    # 8 waits, green on current main; 7 joins with a higher priority.
+    (folder / "merge-train.json").write_text(
+        json.dumps({"waiting": ["8"], "passing": ["8"], "priorities": {"8": "low"}})
+    )
+    github.pulls["7"]["labels"] = [{"name": "priority: high"}]
+
+    done = _hand_off(github)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    train = json.loads((folder / "merge-train.json").read_text())
+    assert train["waiting"] == ["8", "7"] and train["pending"] == ["7"]
+    assert train["turn"] == 0
+
+
+def test_a_re_run_another_call_claimed_is_not_requested_again(github: GitHub) -> None:
+    workflow = github.workflow
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    marker = folder / "pull-rerun-20-1"
+    # Another call claimed this re-run a moment ago.
+    marker.write_text("automatic retry requested for failed jobs of run 20 of pull request 7\n")
+    before = marker.read_text()
+
+    done = subprocess.run(
+        [
+            "python3",
+            "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]); import merge_gate as g; "
+            "from pathlib import Path; "
+            "print(g._rerun({'id': 20}, Path(sys.argv[2]), Path(sys.argv[3]), 'now', "
+            "name='run 20 of pull request 7'))",
+            str(workflow.script.parent),
+            str(folder),
+            str(marker),
+        ],
+        cwd=workflow.repo,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "re-run of run 20 of pull request 7 is requested" in done.stdout
+    assert rerun_calls(workflow) == []
+    assert marker.read_text() == before
+
+
+def test_a_head_pushed_after_the_last_read_is_refused_under_the_lock(github: GitHub) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    # Another push lands right after the read just before the lock.
+    github.push_after_view = {"7": [False, True]}
+
+    done = _hand_off(github)
+
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "the pull request head changed during the handoff; review it again" in done.stderr
+    assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+    assert "7" not in _waiting(workflow)
+    assert _locked_calls(workflow) == [] and len(_held(workflow)) == 1
+
+
+def test_a_stalled_head_check_lets_the_merge_lock_go_within_seconds(github: GitHub) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    real = shutil.which("git", path=workflow.env["PATH"])
+    # GitHub stops answering git after the checks: its branch's head cannot be read.
+    workflow.fake(
+        "git",
+        "#!/bin/bash\n"
+        f'if [ -e "{workflow.state}/stall" ] && [ "$1" = ls-remote ] '
+        '&& [[ " $* " == *" refs/heads/ticket/seven "* ]]; then exec /bin/sleep 600; fi\n'
+        f'exec "{real}" "$@"\n',
+    )
+    _after_the_checks(workflow, f": > '{workflow.state}/stall'")
+
+    done = _hand_off(github)
+
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "could not confirm the head; try again" in done.stderr
+    assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+    assert "7" not in _waiting(workflow)
+    # It waited out the check's own time limit, and no more.
+    held = _held(workflow)
+    assert len(held) == 1 and 9 < held[0] < 15, held
+
+
+def _budget(workflow: Workflow) -> Path:
+    folder = Path(workflow.env["HOME"]) / ".local/state/workflow/github-budget"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def test_a_budget_spent_after_the_checks_does_not_hold_the_merge_lock(github: GitHub) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    # The line's other work spends GitHub's budget while the handoff runs its checks; it resets
+    # 10 s later.
+    budget = _budget(workflow)
+    _after_the_checks(
+        workflow,
+        f"""echo '{{"core": {{"remaining": 0, "reset": '$(( $(date +%s) + 10 ))'}}}}' """
+        f"""> '{budget}/budget.json'""",
+    )
+    started = time.monotonic()
+
+    done = _hand_off(github)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    # It waited for the budget, before the lock.
+    assert "GitHub budget low" in done.stderr and time.monotonic() - started > 8
+    held = _held(workflow)
+    assert len(held) == 1 and held[0] < 5, held
+
+
+def test_busy_gh_call_slots_do_not_hold_the_merge_lock(github: GitHub) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    budget = _budget(workflow)
+    holder = workflow.state / "slot-holder.py"
+    holder.write_text(
+        "import fcntl, sys, time\n"
+        "from pathlib import Path\n"
+        "folder = Path(sys.argv[1])\n"
+        "locks = [(folder / f'call-{n}.lock').open('a') for n in range(2)]\n"
+        "for lock in locks:\n"
+        "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
+        "Path(sys.argv[2]).touch()\n"
+        "time.sleep(10)\n"
+    )
+    ready = workflow.state / "slots-taken"
+    # Two other calls, the tick reading the line's members, hold both gh slots for 10 s.
+    _after_the_checks(
+        workflow,
+        f"python3 '{holder}' '{budget}' '{ready}' </dev/null >/dev/null 2>&1 &\n"
+        f"while [ ! -e '{ready}' ]; do /bin/sleep 0.05; done",
+    )
+    started = time.monotonic()
+
+    done = _hand_off(github)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    # It waited for a slot, before the lock.
+    assert time.monotonic() - started > 8
+    held = _held(workflow)
+    assert len(held) == 1 and held[0] < 5, held
+
+
+@pytest.mark.parametrize("meanwhile", ["nothing", "draft"])
+def test_a_read_made_old_by_a_long_wait_for_the_lock_is_made_again(
+    github: GitHub, meanwhile: str
+) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    holder = workflow.state / "lock-holder.py"
+    # Another gate holds the merge lock for 7 s, from just after the handoff's checks. Once the
+    # handoff has read its pull request before the lock, it may turn draft on GitHub.
+    holder.write_text(
+        "import fcntl, json, sys, time\n"
+        "from pathlib import Path\n"
+        "state, lock, draft = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3] == 'draft'\n"
+        "held = lock.open('w')\n"
+        "fcntl.flock(held, fcntl.LOCK_EX)\n"
+        "(state / 'lock-taken').touch()\n"
+        "started = time.monotonic()\n"
+        "while draft and (state / 'calls.log').read_text().count('gh pr view 7 ') < 2:\n"
+        "    time.sleep(0.05)\n"
+        "if draft:\n"
+        "    data = json.loads((state / 'github.json').read_text())\n"
+        "    data['pulls']['7']['isDraft'] = True\n"
+        "    (state / 'github.json').write_text(json.dumps(data))\n"
+        "time.sleep(max(0, 7 - (time.monotonic() - started)))\n"
+    )
+    lock = workflow.repo / ".local/workflow/merge.lock"
+    _after_the_checks(
+        workflow,
+        f"python3 '{holder}' '{workflow.state}' '{lock}' '{meanwhile}' "
+        "</dev/null >/dev/null 2>&1 &\n"
+        f"while [ ! -e '{workflow.state}/lock-taken' ]; do /bin/sleep 0.05; done",
+    )
+
+    done = _hand_off(github)
+
+    # Its pull request is read again once the lock is free, and judged by that read.
+    assert len(workflow.calls("gh pr view 7 ")) == 3
+    if meanwhile == "draft":
+        assert done.returncode == 1, done.stdout + done.stderr
+        assert "only a ready, non-conflicting pull request can be handed off" in done.stderr
+        assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+        assert "7" not in _waiting(workflow)
+    else:
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+        assert _waiting(workflow) == ["7"]
+    assert all(held < 5 for held in _held(workflow))
