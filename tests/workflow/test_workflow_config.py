@@ -61,6 +61,8 @@ _DEFAULTS = {
         },
     },
     "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
+    "commands": {"push_checks": None},
+    "cloud_pre_push": {"suites": {}},
 }
 
 
@@ -146,7 +148,8 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     example = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
 
     def keys(value: Any, prefix: str = "") -> set[str]:
-        if not isinstance(value, dict):
+        # The suites are named by the repository: the example names some, the defaults none.
+        if not isinstance(value, dict) or prefix == ".cloud_pre_push.suites":
             return {prefix}
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 

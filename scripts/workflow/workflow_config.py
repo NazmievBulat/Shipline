@@ -80,7 +80,20 @@ DEFAULTS: dict[str, Any] = {
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
     },
+    # The repository's own commands, each a command line run in its checkout; absent, none runs.
+    "commands": {
+        # The checks the repository's pre-push hook runs (`ci_tests_for_changes.py --run`).
+        "push_checks": None,
+    },
+    # The suites a cloud worker's push runs as CI will (`ci_tests_for_changes.py`), by name.
+    # Each is read by `_suites`, not key by key: the names are the repository's own.
+    "cloud_pre_push": {"suites": {}},
 }
+
+# A suite's keys, and its worker count when it names none: by its name, else one.
+SUITE_KEYS = ("select", "run", "workers", "part", "probe")
+SUITE_WORKERS = {"server": 4, "browser": 2}
+_SUITE_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
@@ -138,6 +151,31 @@ class Runner:
 
 
 @dataclass(frozen=True)
+class Commands:
+    push_checks: str | None = None
+
+
+@dataclass(frozen=True)
+class Suite:
+    name: str
+    # The command lines, as the file names them: `select` is given the base and the changed
+    # files, `run` the selected files, `{workers}` in it the worker count.
+    select: str
+    run: str
+    workers: int
+    # Added to `run` for one part of the suite: `{shard}` of `{shards}`.
+    part: str | None = None
+    # Exits 0 when the suite's browser can start.
+    probe: str | None = None
+
+
+@dataclass(frozen=True)
+class CloudPrePush:
+    # In the order the file names them.
+    suites: tuple[Suite, ...] = ()
+
+
+@dataclass(frozen=True)
 class Config:
     # None when nothing names it: an error only for a script that needs it.
     found_repository: str | None
@@ -148,6 +186,8 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    commands: Commands
+    cloud_pre_push: CloudPrePush
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -237,6 +277,41 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
     return merged
 
 
+def _suites(given: Any) -> tuple[Suite, ...]:
+    where = "cloud_pre_push.suites"
+    if not isinstance(given, dict):
+        raise ConfigError(f"{FILE}: {where} must be an object")
+    suites = []
+    for name, suite in given.items():
+        if not _SUITE_NAME.fullmatch(name):
+            raise ConfigError(
+                f"{FILE}: {where}: a suite's name is letters, digits, - and _, not {name}"
+            )
+        if not isinstance(suite, dict):
+            raise ConfigError(f"{FILE}: {where}.{name} must be an object")
+        unknown = sorted(set(suite) - set(SUITE_KEYS))
+        if unknown:
+            raise ConfigError(
+                f"{FILE}: unknown key {', '.join(f'{where}.{name}.{key}' for key in unknown)}"
+            )
+        for key in ("select", "run", "part", "probe"):
+            if key in ("part", "probe") and key not in suite:
+                continue
+            value = suite.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"{FILE}: {where}.{name}.{key} must be a command")
+        workers = suite.get("workers", SUITE_WORKERS.get(name, 1))
+        if type(workers) is not int or workers < 1:
+            raise ConfigError(f"{FILE}: {where}.{name}.workers must be a whole number above 0")
+        part = suite.get("part")
+        if part is not None and not ("{shard}" in part and "{shards}" in part):
+            raise ConfigError(f"{FILE}: {where}.{name}.part must name {{shard}} and {{shards}}")
+        suites.append(
+            Suite(name, suite["select"], suite["run"], workers, part, suite.get("probe"))
+        )
+    return tuple(suites)
+
+
 def _relative(value: str, name: str) -> str:
     path = PurePosixPath(value)
     if path.is_absolute() or ".." in path.parts or str(path) == ".":
@@ -310,7 +385,13 @@ def load(start: Path | None = None) -> Config:
         given = json.loads(text)
     except ValueError as error:
         raise ConfigError(f"{FILE} is not JSON: {error}") from error
-    values = _merged(DEFAULTS, given, "")
+    # The suites are read on their own, since their names are not Shipline's.
+    plain, suites = given, {}
+    if isinstance(given, dict) and isinstance(given.get("cloud_pre_push"), dict):
+        pre_push = dict(given["cloud_pre_push"])
+        suites = pre_push.pop("suites", {})
+        plain = {**given, "cloud_pre_push": pre_push}
+    values = _merged(DEFAULTS, plain, "")
     # Where the repository was read, so a refusal names that place.
     repository, source = values["repository"], FILE
     if not repository:
@@ -334,6 +415,8 @@ def load(start: Path | None = None) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
+        commands=Commands(**values["commands"]),
+        cloud_pre_push=CloudPrePush(_suites(suites)),
         given=given,
         main=main,
     )
@@ -363,6 +446,17 @@ def as_dict(config: Config) -> dict[str, Any]:
             "labels": list(config.runner.labels),
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
+        },
+        "commands": vars(config.commands).copy(),
+        "cloud_pre_push": {
+            "suites": {
+                suite.name: {
+                    key: getattr(suite, key)
+                    for key in SUITE_KEYS
+                    if getattr(suite, key) is not None
+                }
+                for suite in config.cloud_pre_push.suites
+            }
         },
     }
 

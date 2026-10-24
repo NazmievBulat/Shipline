@@ -34,5 +34,24 @@
     "labels": ["example-app-home", "example-app-home-main", "example-app-home-docker", "example-app-planner"],
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app-runner"
+  },
+  "commands": {
+    "push_checks": "tools/shipline/push-checks"
+  },
+  "cloud_pre_push": {
+    "suites": {
+      "server": {
+        "select": "tools/shipline/server-tests-for-changes",
+        "run": "tools/shipline/server-tests --workers {workers}",
+        "workers": 4,
+        "part": "--shard {shard}/{shards}"
+      },
+      "browser": {
+        "select": "tools/shipline/browser-tests-for-changes --ci",
+        "run": "tools/shipline/browser-tests --workers {workers}",
+        "workers": 2,
+        "probe": "tools/shipline/browser-starts"
+      }
+    }
   }
 }
