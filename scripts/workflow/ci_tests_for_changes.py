@@ -120,8 +120,8 @@ def _part(given: str | None) -> tuple[int, int] | None:
     return int(found[1]), int(found[2])
 
 
-def _words(command: str, values: dict[str, str]) -> list[str]:
-    words = shlex.split(command)
+def _filled(words: list[str], values: dict[str, str]) -> list[str]:
+    """The words with each `{name}` in them filled in."""
     for name, value in values.items():
         words = [word.replace("{" + name + "}", value) for word in words]
     return words
@@ -131,7 +131,7 @@ def _select(suite: Suite, base: str, listing: Path) -> Selection:
     failed = f"{suite.name}: the selection failed"
     try:
         done = run(
-            *shlex.split(suite.select),
+            *workflow_config.current().words(suite.select),
             base,
             "--files-from",
             str(listing),
@@ -181,7 +181,7 @@ def _probe(suite: Suite, account: str | None) -> str | None:
     seconds = float(os.environ.get("WORKFLOW_CLOUD_PROBE_SECONDS", PROBE_SECONDS))
     try:
         done = run(
-            *_as_tester(shlex.split(suite.probe), account),
+            *_as_tester(workflow_config.current().words(suite.probe), account),
             timeout=seconds,
             errors="replace",
         )
@@ -277,9 +277,10 @@ def main(argv: list[str]) -> int:
             )
         account = _account(arguments.run)
         os.chdir(_git("rev-parse", "--show-toplevel").strip())
-        if arguments.run and not arguments.extra_only and config.commands.push_checks:
+        push_checks = config.command("push_checks")
+        if arguments.run and not arguments.extra_only and push_checks:
             _say("push checks: running")
-            outcome, took = _run(shlex.split(config.commands.push_checks), None, grace)
+            outcome, took = _run(push_checks, None, grace)
             _say(f"push checks: {outcome} in {_duration(took)}")
             if outcome != "passed":
                 raise Refused("the push checks failed")
@@ -305,12 +306,14 @@ def main(argv: list[str]) -> int:
                     who = account or "this user"
                     _say(f"{suite.name}: left to CI: no browser can start as {who}: {error}")
                     continue
-            words = _words(suite.run, {"workers": str(suite.workers)})
+            words = _filled(config.words(suite.run), {"workers": str(suite.workers)})
             # CI parts the whole suite; a selection runs whole, whatever part is named.
             shard = part if suite.name == SERVER and selection.whole else None
             if shard:
                 assert suite.part
-                words += _words(suite.part, {"shards": str(shard[1]), "shard": str(shard[0])})
+                words += _filled(
+                    shlex.split(suite.part), {"shards": str(shard[1]), "shard": str(shard[0])}
+                )
             elif suite.name == SERVER and part:
                 _say(f"{suite.name}: a selection, not the whole suite, so no part of it is named")
             if not selection.whole:

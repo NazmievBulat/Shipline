@@ -1,4 +1,8 @@
 {
+  "commands": {
+    "pre_train_checks": "pre-train-checks",
+    "browser_plan": "browser-plan"
+  },
   "runner": {
     "labels": ["example-app-home", "example-app-home-main", "example-app-home-docker", "home-planner"]
   }

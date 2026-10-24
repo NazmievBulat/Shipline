@@ -1,0 +1,1076 @@
+"""A repository plugs its own checks into Shipline by commands named in `shipline.json`.
+
+Each command is a stand-in on the test's `PATH` that writes down its arguments, its working
+folder and what it read, and answers as the test says. Each is tried named and left out.
+"""
+
+import importlib.util
+import json
+import re
+import shlex
+import subprocess
+import textwrap
+from pathlib import Path
+
+import pytest
+from workflow.test_conflict_review import (  # pyright: ignore[reportPrivateUsage]
+    _panel_conflict,
+    _resolve,
+)
+from workflow.test_merge_driver import (  # pyright: ignore[reportPrivateUsage]
+    _mechanical_conflict,
+    _started,
+)
+from workflow.test_merge_driver import handed as handed_fixture
+from workflow.test_merge_when_current import GitHub
+from workflow.test_merge_when_current import github as github_fixture
+from workflow_harness import Workflow, install_shipline, session_arguments
+
+github = github_fixture
+handed = handed_fixture
+
+_WORKFLOW = Path(__file__).resolve().parents[2] / "scripts/workflow"
+# Loaded from its file, so the scripts' folder is not put on the path of every other test.
+_SPEC = importlib.util.spec_from_file_location("workflow_config", _WORKFLOW / "workflow_config.py")
+assert _SPEC and _SPEC.loader
+workflow_config = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(workflow_config)
+
+_COMMANDS = (
+    "browser_tests_for_changes",
+    "server_tests_for_changes",
+    "pre_train_checks",
+    "mechanical_conflicts",
+    "browser_plan",
+    "hunt_app",
+    "hunt_browser",
+    "hunt_cursor",
+    "advisory_watch",
+    "push_checkout",
+    "push_checks",
+)
+
+
+def _configure(workflow: Workflow, **commands: str | None) -> None:
+    """Names `commands` in the main checkout's `shipline.json`; None leaves one out. Git looks
+    past the changed file, so a gate that runs in the main checkout finds it clean."""
+    path = workflow.repo / "shipline.json"
+    workflow.git("update-index", "--skip-worktree", "shipline.json")
+    config = json.loads(path.read_text())
+    named = config.setdefault("commands", {})
+    for name, line in commands.items():
+        if line is None:
+            named.pop(name, None)
+        else:
+            named[name] = line
+    path.write_text(json.dumps(config))
+
+
+def _stand_in(workflow: Workflow, program: str, answer: str = "", status: int = 0) -> None:
+    """A command on the `PATH` that writes down how it was called, prints `answer` and exits
+    with `status`. What it read on standard input is kept in `<state>/<program>.input`."""
+    workflow.fake(
+        program,
+        "#!/bin/bash\n"
+        f'printf "%s\\n" "{program} $* (in $PWD)" >> "@STATE@/calls.log"\n'
+        f'cat > "@STATE@/{program}.input"\n'
+        f"printf %b {json.dumps(answer)}\n"
+        f"exit {status}\n",
+    )
+
+
+def _read(workflow: Workflow, program: str) -> str:
+    return (workflow.state / f"{program}.input").read_text()
+
+
+# The file
+
+
+def _repository(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (
+        ["init", "--quiet", "--initial-branch=main"],
+        ["remote", "add", "origin", "https://github.com/example-owner/example-app.git"],
+        ["-c", "user.name=Tester", "-c", "user.email=tester@example.com", "commit",
+         "--quiet", "--allow-empty", "-m", "chore: start"],
+    ):  # fmt: skip
+        subprocess.run(["git", *args], cwd=repo, capture_output=True, check=True)
+    return repo
+
+
+def test_without_commands_none_is_named(tmp_path: Path) -> None:
+    config = workflow_config.load(_repository(tmp_path))
+
+    assert [config.command(name) for name in _COMMANDS] == [None] * len(_COMMANDS)
+    assert workflow_config.as_dict(config)["commands"] == dict.fromkeys(_COMMANDS)
+
+
+def test_a_command_s_program_is_found_in_the_main_checkout_from_a_worktree(
+    tmp_path: Path,
+) -> None:
+    repo = _repository(tmp_path)
+    (repo / "shipline.json").write_text(
+        json.dumps(
+            {
+                "commands": {
+                    "pre_train_checks": "tools/shipline/pre-train-checks --fast",
+                    "browser_plan": "python3 -B 'tools/shipline/browser plan.py'",
+                }
+            }
+        )
+    )
+    worktree = tmp_path / "worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "--quiet", "--detach", str(worktree)],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    )
+
+    config = workflow_config.load(worktree)
+
+    assert config.command("pre_train_checks") == [
+        str(repo / "tools/shipline/pre-train-checks"),
+        "--fast",
+    ]
+    # A program named without a folder is found on the PATH; the script it runs, the first word
+    # after it with a folder in it, is the main checkout's, never the pull request's copy.
+    assert config.command("browser_plan") == [
+        "python3",
+        "-B",
+        str(repo / "tools/shipline/browser plan.py"),
+    ]
+    assert config.command("hunt_app") is None
+    assert workflow_config.as_dict(config)["commands"]["pre_train_checks"] == (
+        "tools/shipline/pre-train-checks --fast"
+    )
+
+
+@pytest.mark.parametrize(
+    ("line", "refusal"),
+    [
+        ("/opt/checks", "must be a path inside the checkout"),
+        ("../checks", "must be a path inside the checkout"),
+        ("python3 -B ../checks.py", "must be a path inside the checkout"),
+        ("tools/'checks", "cannot be split into words"),
+        ("   ", "must be a name"),
+        (["tools/checks"], "must be a name"),
+    ],
+)
+def test_a_command_that_cannot_be_run_from_the_checkout_is_refused(
+    tmp_path: Path, line: object, refusal: str
+) -> None:
+    repo = _repository(tmp_path)
+    (repo / "shipline.json").write_text(json.dumps({"commands": {"pre_train_checks": line}}))
+
+    with pytest.raises(workflow_config.ConfigError, match=f"commands.pre_train_checks {refusal}"):
+        workflow_config.load(repo)
+
+
+def test_an_unknown_command_is_refused(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    (repo / "shipline.json").write_text(json.dumps({"commands": {"pre_train_check": "x"}}))
+
+    with pytest.raises(workflow_config.ConfigError, match="unknown key commands.pre_train_check"):
+        workflow_config.load(repo)
+
+
+def test_bash_reads_each_command_as_its_words(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    (repo / "shipline.json").write_text(
+        json.dumps({"commands": {"hunt_app": "tools/hunt app --port '8 0' $(touch nope)"}})
+    )
+
+    done = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'eval "$(python3 "$1" shell "$2")" || exit 1; '
+            'printf "%s\\n" "${#SHIPLINE_COMMAND_HUNT_APP[@]}" "${SHIPLINE_COMMAND_HUNT_APP[@]}" '
+            '"${#SHIPLINE_COMMAND_PRE_TRAIN_CHECKS[@]}"',
+            "bash",
+            str(_WORKFLOW / "workflow_config.py"),
+            str(repo),
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert done.stdout.splitlines() == [
+        "6",
+        str(repo / "tools/hunt"),
+        "app",
+        "--port",
+        "8 0",
+        "$(touch",
+        "nope)",
+        "0",
+    ]
+    assert not (repo / "nope").exists()
+
+
+# The merge gate
+
+
+def _gate(
+    workflow: Workflow, code: str, cwd: Path | None = None, stdin: str = ""
+) -> subprocess.CompletedProcess[str]:
+    """Runs `code` with the gate imported as `g`, in `cwd` (the main checkout when none is
+    named), reading `stdin`; it prints what it found."""
+    return subprocess.run(
+        [
+            "python3",
+            "-B",
+            "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]); import merge_gate as g\n"
+            + textwrap.dedent(code),
+            str(workflow.script.parent),
+        ],
+        cwd=cwd or workflow.repo,
+        env={**workflow.env, "SHIPLINE_REPO": str(workflow.repo)},
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def _pre_train_checks(workflow: Workflow, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return _gate(
+        workflow,
+        """
+        folder = g.main_checkout() / g.CONFIG.state_folder
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            g.pre_train_checks("7", folder)
+        except g.Refused as error:
+            print("refused:", error)
+        else:
+            print("passed")
+        """,
+        cwd,
+    )
+
+
+def test_the_pre_train_checks_are_run_in_the_pull_request_s_worktree(workflow: Workflow) -> None:
+    worktree = workflow.add_worktree(7)
+    _stand_in(workflow, "example-checks", "a check failed\n", status=1)
+    _configure(workflow, pre_train_checks="example-checks --fast")
+
+    done = _pre_train_checks(workflow, worktree)
+
+    assert workflow.calls("example-checks") == [f"example-checks --fast (in {worktree})"]
+    assert done.stdout == (
+        "a check failed\nrefused: pre-train checks failed; "
+        "fix the inventory before joining the merge train\n"
+    ), done.stderr
+
+
+def test_a_command_never_reads_the_gate_s_own_input(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-checks")
+    _configure(workflow, pre_train_checks="example-checks")
+
+    done = _gate(
+        workflow,
+        """
+        folder = g.main_checkout() / g.CONFIG.state_folder
+        folder.mkdir(parents=True, exist_ok=True)
+        g.pre_train_checks("7", folder)
+        """,
+        stdin="the gate's own input\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert _read(workflow, "example-checks") == ""
+
+
+def test_without_pre_train_checks_a_pull_request_is_admitted(workflow: Workflow) -> None:
+    _configure(workflow, pre_train_checks=None)
+
+    done = _pre_train_checks(workflow, workflow.add_worktree(7))
+
+    assert done.stdout == "passed\n", done.stderr
+    assert done.stderr == ""
+
+
+def test_pre_train_checks_named_but_missing_stop_the_gate(workflow: Workflow) -> None:
+    _configure(workflow, pre_train_checks="tools/shipline/pre-train-checks")
+
+    done = _pre_train_checks(workflow, workflow.repo)
+
+    assert "refused: cannot run the repository's pre_train_checks command" in done.stdout
+
+
+def _changes(workflow: Workflow, *paths: str) -> None:
+    for path in paths:
+        (workflow.repo / path).write_text("changed\n")
+    workflow.git("add", "-A")
+    workflow.git("commit", "--quiet", "--allow-empty", "-m", "feat: a change")
+
+
+def _browser_needed(workflow: Workflow) -> str:
+    done = _gate(workflow, 'print("needed" if g.browser_needed("HEAD~1", "HEAD") else "none")')
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip()
+
+
+@pytest.mark.parametrize(("status", "answer"), [(0, "needed"), (1, "none"), (3, "needed")])
+def test_the_browser_plan_reads_the_changed_paths_and_answers_by_its_exit(
+    workflow: Workflow, status: int, answer: str
+) -> None:
+    _stand_in(workflow, "example-plan", status=status)
+    _configure(workflow, browser_plan="example-plan --merge")
+    _changes(workflow, "app.txt", "odd name.txt")
+
+    assert _browser_needed(workflow) == answer
+    assert workflow.calls("example-plan") == [f"example-plan --merge (in {workflow.repo})"]
+    assert _read(workflow, "example-plan") == "app.txt\0odd name.txt\0"
+
+
+@pytest.mark.parametrize("suite", [True, False])
+def test_without_a_browser_plan_a_merge_needs_browser_tests_when_there_is_a_suite(
+    workflow: Workflow, suite: bool
+) -> None:
+    """Every merge needs them while the merged tree holds the E2E workflow; without that file
+    there is no suite to run."""
+    _configure(workflow, browser_plan=None)
+    if suite:
+        (workflow.repo / ".github/workflows").mkdir(parents=True, exist_ok=True)
+        (workflow.repo / ".github/workflows/e2e.yml").write_text("on: workflow_dispatch\n")
+    _changes(workflow, "README.md")
+
+    assert _browser_needed(workflow) == ("needed" if suite else "none")
+
+
+def test_a_merge_that_changes_nothing_asks_no_browser_plan(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-plan")
+    _configure(workflow, browser_plan="example-plan")
+    _changes(workflow)
+
+    assert _browser_needed(workflow) == "none"
+    assert workflow.calls("example-plan") == []
+
+
+def test_the_numbers_main_took_are_asked_of_the_conflict_command(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-conflicts", "migrations/0002_taken.py\n")
+    _configure(workflow, mechanical_conflicts="example-conflicts")
+
+    done = _gate(workflow, 'print(g._taken_migrations("abc", "def"))')
+
+    assert done.stdout == "['migrations/0002_taken.py']\n", done.stderr
+    assert workflow.calls("example-conflicts") == [
+        f"example-conflicts taken abc def (in {workflow.repo})"
+    ]
+
+
+def test_a_failed_question_of_the_numbers_main_took_is_a_refusal(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-conflicts", "cannot read main\n", status=2)
+    _configure(workflow, mechanical_conflicts="example-conflicts")
+
+    done = _gate(
+        workflow,
+        """
+        try:
+            g._taken_migrations("abc", "def")
+        except g.Refused as error:
+            print("refused:", error)
+        """,
+    )
+
+    assert done.stdout == "refused: could not compare numbered files: cannot read main\n"
+
+
+def test_without_a_conflict_command_main_took_no_number(workflow: Workflow) -> None:
+    _configure(workflow, mechanical_conflicts=None)
+
+    done = _gate(workflow, 'print(g._taken_migrations("abc", "def"))')
+
+    assert done.stdout == "[]\n", done.stderr
+
+
+def _main_moved(github: GitHub) -> None:
+    """Main moves on after pull request 7's CI tested it, so the gate refreshes it."""
+    workflow = github.workflow
+    old = github.base
+    workflow.git("checkout", "main")
+    workflow.git("commit", "--allow-empty", "-m", "fix: main moved")
+    github.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    workflow.git("checkout", "ticket/seven")
+    github.main()
+    github.ci(github.base, github.head, tested_base=old)
+
+
+def test_a_clean_refresh_asks_the_conflict_command_to_renumber(github: GitHub) -> None:
+    workflow = github.workflow
+    _stand_in(workflow, "example-conflicts", "db/0002_seven.py db/0003_seven.py\n")
+    _configure(workflow, mechanical_conflicts="example-conflicts")
+    _main_moved(github)
+
+    done = github.run()
+
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert workflow.calls("example-conflicts") == [
+        f"example-conflicts renumber {github.head} {github.base} (in {workflow.repo})"
+    ]
+    assert workflow.git("log", "-1", "--format=%s") == (
+        "merge main: renumber migration 0002_seven.py to 0003_seven.py"
+    )
+
+
+def test_a_number_main_took_that_cannot_be_moved_is_left_as_a_conflict(github: GitHub) -> None:
+    workflow = github.workflow
+    workflow.fake(
+        "example-conflicts",
+        "#!/bin/bash\necho db/0002_seven.py\necho 'its number is used twice' >&2\nexit 1\n",
+    )
+    _configure(workflow, mechanical_conflicts="example-conflicts")
+    _main_moved(github)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    assert (
+        "main took the number of db/0002_seven.py and it cannot be renumbered mechanically "
+        "(its number is used twice); renumber the branch's numbered files after main's last, "
+        "commit with 'merge main: conflict in db/0002_seven.py', push, then wait for CI"
+    ) in done.stdout + done.stderr
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == github.head
+
+
+def test_a_conflict_command_that_cannot_renumber_refuses_the_refresh(github: GitHub) -> None:
+    workflow = github.workflow
+    workflow.fake("example-conflicts", "#!/bin/bash\necho 'cannot read the chain' >&2\nexit 1\n")
+    _configure(workflow, mechanical_conflicts="example-conflicts")
+    _main_moved(github)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    assert "cannot read the chain" in done.stdout + done.stderr
+    assert "merge main: conflict in" not in done.stdout + done.stderr
+
+
+def test_without_a_conflict_command_a_clean_refresh_renumbers_nothing(github: GitHub) -> None:
+    workflow = github.workflow
+    _configure(workflow, mechanical_conflicts=None)
+    _main_moved(github)
+
+    done = github.run()
+
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert workflow.git("log", "-1", "--format=%s") == "chore: test against current main"
+
+
+# A resolver that takes main's side of every conflicted file, stages it and names it.
+_RESOLVER = (
+    "#!/bin/bash\n"
+    'echo "example-conflicts $* (in $PWD)" >> "@STATE@/calls.log"\n'
+    "git diff --name-only --diff-filter=U > \"@STATE@/conflicted\"\n"
+    'while IFS= read -r file; do git checkout --theirs -- "$file" && git add -- "$file"; done '
+    '< "@STATE@/conflicted"\n'
+    'cat "@STATE@/conflicted"\n'
+)
+
+
+def test_a_conflict_the_command_resolves_is_pushed_by_the_tick(handed: GitHub) -> None:
+    workflow = handed.workflow
+    workflow.fake("example-conflicts", _RESOLVER)
+    _configure(workflow, mechanical_conflicts="example-conflicts")
+    _mechanical_conflict(handed, "list")
+    branch = workflow.worktree(7)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    resolved = [call for call in workflow.calls("example-conflicts") if " resolve " in call]
+    assert resolved == [f"example-conflicts resolve {handed.head} {handed.base} (in {branch})"]
+    assert workflow.git("log", "-1", "--format=%s", cwd=branch) == (
+        "merge main: mechanical conflict in docs/list.md"
+    )
+    pushed = workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0]
+    assert pushed == workflow.git("rev-parse", "HEAD", cwd=branch)
+    assert _started(workflow) == []
+
+
+def test_a_conflict_the_command_cannot_resolve_is_left_for_a_reviewer(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _stand_in(workflow, "example-conflicts", "two edits of one line\n", status=1)
+    _configure(workflow, mechanical_conflicts="example-conflicts")
+    _mechanical_conflict(handed, "list")
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _started(workflow) == ["review-7"]
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
+    assert [call for call in workflow.calls("example-conflicts") if " resolve " in call]
+
+
+def test_without_a_conflict_command_a_conflict_is_left_for_a_reviewer(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _configure(workflow, mechanical_conflicts=None)
+    _mechanical_conflict(handed, "list")
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _started(workflow) == ["review-7"]
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
+
+
+def _failing_hook(workflow: Workflow, lines: list[str]) -> None:
+    """A pre-push hook that prints `lines` and refuses; it lives in `workflow.bin`, where it
+    may run."""
+    hooks = workflow.bin / "hooks"
+    hooks.mkdir(exist_ok=True)
+    hook = hooks / "pre-push"
+    printed = "".join(f"echo {json.dumps(line)}\n" for line in lines)
+    hook.write_text(f"#!/bin/bash\n{printed}exit 1\n")
+    hook.chmod(0o755)
+    workflow.git("config", "core.hooksPath", str(hooks))
+
+
+def _push(workflow: Workflow, cwd: Path | None = None) -> dict[str, object]:
+    """The gate pushes a new branch from `cwd`; what came back, or the wait it raised."""
+    workflow.git("commit", "--quiet", "--allow-empty", "-m", "feat: pushed by the gate", cwd=cwd)
+    done = _gate(
+        workflow,
+        """
+        import json
+        try:
+            pushed = g.push("origin", "HEAD:refs/heads/ticket/pushed")
+        except g.Waiting as error:
+            print(json.dumps({"waiting": type(error).__name__, "reason": str(error)}))
+        else:
+            print(json.dumps({"returncode": pushed.returncode, "refusal": pushed.refusal}))
+        """,
+        cwd,
+    )
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+# A push checkout that installs nothing and words a refusal by the last line it read.
+_PUSH_CHECKOUT = (
+    "#!/bin/bash\n"
+    'echo "example-checkout $* (in $PWD)" >> "@STATE@/calls.log"\n'
+    'case $1 in\n'
+    '  install) [[ ! -e "@STATE@/install-fails" ]] || { echo "lockfile is broken"; exit 1; } ;;\n'
+    '  refusal) cat > "@STATE@/example-checkout.input"\n'
+    '    echo "step: $(grep -m 1 secret "@STATE@/example-checkout.input")" ;;\n'
+    "esac\n"
+)
+
+
+def test_the_push_checkout_installs_first_and_words_a_refusal(workflow: Workflow) -> None:
+    worktree = workflow.add_worktree(7)
+    workflow.fake("example-checkout", _PUSH_CHECKOUT)
+    _configure(workflow, push_checkout="example-checkout")
+    _failing_hook(workflow, ["secret found in config.py", "and more"])
+
+    pushed = _push(workflow, worktree / "scripts")
+
+    assert pushed["refusal"] == "step: secret found in config.py"
+    # The checkout's top, found with git, from a folder inside it.
+    assert workflow.calls("example-checkout") == [
+        f"example-checkout install {worktree} (in {worktree / 'scripts'})",
+        f"example-checkout refusal {worktree} (in {worktree / 'scripts'})",
+    ]
+    read = _read(workflow, "example-checkout")
+    assert "secret found in config.py\nand more\n" in read and "failed to push" in read
+
+
+def test_a_failed_install_of_the_push_checkout_is_a_wait(workflow: Workflow) -> None:
+    workflow.fake("example-checkout", _PUSH_CHECKOUT)
+    _configure(workflow, push_checkout="example-checkout")
+    (workflow.state / "install-fails").touch()
+
+    pushed = _push(workflow)
+
+    assert pushed == {"waiting": "PackagesWaiting", "reason": "lockfile is broken"}
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/pushed") == ""
+
+
+def test_without_a_push_checkout_a_failed_push_is_refused_with_its_last_lines(
+    workflow: Workflow,
+) -> None:
+    _configure(workflow, push_checkout=None)
+    _failing_hook(workflow, [f"step {number}" for number in range(1, 16)])
+
+    pushed = _push(workflow)
+
+    refused = str(pushed["refusal"]).splitlines()
+    assert len(refused) == 10 and "step 1" not in refused and "failed to push" in refused[-1]
+
+
+# What a scan that could not reach an advisory service says.
+_UNREACHED = "npm's advisory service could not be reached"
+# An advisory watch that names npm when the text says so, and finds npm answering when
+# `<state>/npm-answers` is there.
+_ADVISORY_WATCH = (
+    "#!/bin/bash\n"
+    'echo "example-advisory $* (in $PWD)" >> "@STATE@/calls.log"\n'
+    'case $1 in\n'
+    '  unreachable) cat > "@STATE@/example-advisory.input"\n'
+    f'    ! grep -q {json.dumps(_UNREACHED)} "@STATE@/example-advisory.input" || echo npm ;;\n'
+    '  answers) [[ -e "@STATE@/$2-answers" ]] ;;\n'
+    "esac\n"
+)
+
+
+def test_a_push_the_advisory_watch_finds_unreachable_is_a_wait(workflow: Workflow) -> None:
+    workflow.fake("example-advisory", _ADVISORY_WATCH)
+    _configure(workflow, advisory_watch="example-advisory")
+    _failing_hook(workflow, [_UNREACHED])
+
+    pushed = _push(workflow)
+
+    assert pushed["waiting"] == "ServiceWaiting"
+    assert "could not reach npm's advisory service" in str(pushed["reason"])
+    assert workflow.calls("example-advisory") == [
+        f"example-advisory unreachable (in {workflow.repo})"
+    ]
+
+
+def _outage(workflow: Workflow) -> tuple[Path, Path]:
+    """The gate's note of a service that is down, and the line the wake tells once."""
+    folder = workflow.repo / ".local/workflow"
+    return folder / "advisory-service-down", folder / "advisory-service.pending"
+
+
+def test_the_first_unreachable_push_of_an_outage_notes_it_once(workflow: Workflow) -> None:
+    workflow.fake("example-advisory", _ADVISORY_WATCH)
+    _configure(workflow, advisory_watch="example-advisory")
+    _failing_hook(workflow, [_UNREACHED])
+    down, pending = _outage(workflow)
+
+    # 2026-10-22 02:46 UTC, then a push a day later.
+    first = _gate_at(workflow, 1792637160)
+    pending.unlink()
+    second = _gate_at(workflow, 1792723560)
+
+    assert first == second == "ServiceWaiting"
+    assert json.loads(down.read_text()) == {"service": "npm", "since": "2026-10-22 02:46 UTC"}
+    # Told once an outage: the wake removed the line, and the same outage writes none again.
+    assert not pending.exists()
+
+
+def test_an_outage_is_told_to_the_wake_in_one_line(workflow: Workflow) -> None:
+    workflow.fake("example-advisory", _ADVISORY_WATCH)
+    _configure(workflow, advisory_watch="example-advisory")
+    _failing_hook(workflow, [_UNREACHED])
+
+    _gate_at(workflow, 1792637160)
+
+    assert _outage(workflow)[1].read_text() == (
+        "npm's advisory service unreachable since 2026-10-22 02:46 UTC\n"
+    )
+
+
+@pytest.mark.parametrize("note", ["not json", '{"since": "2026-10-22 02:46 UTC"}', "[]"])
+def test_an_unreadable_outage_note_counts_as_none(workflow: Workflow, note: str) -> None:
+    workflow.fake("example-advisory", _ADVISORY_WATCH)
+    _configure(workflow, advisory_watch="example-advisory")
+    _failing_hook(workflow, [_UNREACHED])
+    down, pending = _outage(workflow)
+    down.parent.mkdir(parents=True, exist_ok=True)
+    down.write_text(note)
+
+    _gate_at(workflow, 1792637160)
+
+    assert json.loads(down.read_text())["service"] == "npm"
+    assert pending.exists()
+
+
+def test_a_successful_push_ends_the_outage(workflow: Workflow) -> None:
+    workflow.fake("example-advisory", _ADVISORY_WATCH)
+    _configure(workflow, advisory_watch="example-advisory")
+    down, _ = _outage(workflow)
+    down.parent.mkdir(parents=True, exist_ok=True)
+    down.write_text(json.dumps({"service": "npm", "since": "2026-10-22 02:46 UTC"}))
+
+    pushed = _push(workflow)
+
+    assert pushed == {"returncode": 0, "refusal": ""}
+    assert not down.exists()
+
+
+@pytest.mark.parametrize("answers", [True, False])
+def test_the_tick_s_refresh_ends_an_outage_once_the_service_answers(
+    workflow: Workflow, answers: bool
+) -> None:
+    workflow.fake("example-advisory", _ADVISORY_WATCH)
+    _configure(workflow, advisory_watch="example-advisory")
+    down, _ = _outage(workflow)
+    down.parent.mkdir(parents=True, exist_ok=True)
+    down.write_text(json.dumps({"service": "npm", "since": "2026-10-22 02:46 UTC"}))
+    if answers:
+        (workflow.state / "npm-answers").touch()
+
+    _gate(
+        workflow,
+        """
+        g.git = lambda *args: (_ for _ in ()).throw(g.Refused("no main in this test"))
+        g._refresh_health(g.main_checkout() / g.CONFIG.state_folder, retry=True)
+        """,
+    )
+
+    assert down.exists() is not answers
+    assert workflow.calls("example-advisory") == [
+        f"example-advisory answers npm (in {workflow.repo})"
+    ]
+
+
+def _gate_at(workflow: Workflow, now: int) -> object:
+    """A push the hook refuses, made at `now`; the wait it raised, or what came back."""
+    workflow.git("commit", "--quiet", "--allow-empty", "-m", "feat: pushed by the gate")
+    done = subprocess.run(
+        [
+            "python3",
+            "-B",
+            "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]); import merge_gate as g\n"
+            "try:\n"
+            "    print(g.push('origin', 'HEAD:refs/heads/ticket/pushed').returncode)\n"
+            "except g.Waiting as error:\n"
+            "    print(type(error).__name__)\n",
+            str(workflow.script.parent),
+        ],
+        cwd=workflow.repo,
+        env={**workflow.env, "SHIPLINE_REPO": str(workflow.repo), "WORKFLOW_NOW": str(now)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip()
+
+
+def test_a_failed_push_the_advisory_watch_names_no_service_for_is_refused(
+    workflow: Workflow,
+) -> None:
+    workflow.fake("example-advisory", _ADVISORY_WATCH)
+    _configure(workflow, advisory_watch="example-advisory")
+    _failing_hook(workflow, ["a secret was found"])
+
+    pushed = _push(workflow)
+
+    assert "a secret was found" in str(pushed["refusal"])
+
+
+def test_without_an_advisory_watch_no_outage_is_read(workflow: Workflow) -> None:
+    _configure(workflow, advisory_watch=None)
+    _failing_hook(workflow, [_UNREACHED])
+
+    pushed = _push(workflow)
+
+    assert "waiting" not in pushed
+    assert _UNREACHED in str(pushed["refusal"])
+
+
+def test_the_advisory_watch_is_asked_whether_a_service_answers(workflow: Workflow) -> None:
+    workflow.fake("example-advisory", _ADVISORY_WATCH)
+    _configure(workflow, advisory_watch="example-advisory")
+
+    before = _gate(workflow, 'print(g.service_answers("npm"))')
+    (workflow.state / "npm-answers").touch()
+    after = _gate(workflow, 'print(g.service_answers("npm"))')
+
+    assert (before.stdout, after.stdout) == ("False\n", "True\n"), before.stderr
+    assert workflow.calls("example-advisory") == [
+        f"example-advisory answers npm (in {workflow.repo})"
+    ] * 2
+
+
+def test_the_advisory_watch_reads_the_annotations_of_a_failed_audit(github: GitHub) -> None:
+    workflow = github.workflow
+    workflow.fake("example-advisory", _ADVISORY_WATCH)
+    _configure(workflow, advisory_watch="example-advisory")
+    github.api["repos/example-org/example-app/check-runs/12/annotations?per_page=100"] = [
+        {"title": "Audit", "message": f"Refused because {_UNREACHED}."}
+    ]
+    github.save()
+
+    done = _gate(
+        workflow,
+        """
+        parts = [
+            {"id": 11, "name": "CI result", "status": "completed", "conclusion": "failure"},
+            {"id": 12, "name": "CI: dependencies", "status": "completed", "conclusion": "failure"},
+        ]
+        print(g.unreached_service(parts))
+        """,
+    )
+
+    assert done.stdout == "npm\n", done.stderr
+    assert _read(workflow, "example-advisory") == f"Refused because {_UNREACHED}.\n"
+
+
+def test_without_an_advisory_watch_no_audit_is_read_as_an_outage(github: GitHub) -> None:
+    _configure(github.workflow, advisory_watch=None)
+
+    done = _gate(
+        github.workflow,
+        """
+        parts = [
+            {"id": 11, "name": "CI result", "status": "completed", "conclusion": "failure"},
+            {"id": 12, "name": "CI: dependencies", "status": "completed", "conclusion": "failure"},
+        ]
+        print(g.unreached_service(parts), g.service_answers("npm"))
+        """,
+    )
+
+    assert done.stdout == "None False\n", done.stderr
+    assert not [call for call in github.workflow.calls("gh") if "annotations" in call]
+
+
+# The review panel's tests reached by a conflict's resolution
+
+
+def _conflict_round(workflow: Workflow) -> Path:
+    """A conflict round of pull request 7 the panel can prove; its panel folder."""
+    _panel_conflict(workflow)
+    resolved = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", resolved)
+    return workflow.repo / ".local/workflow/reviews/7" / resolved
+
+
+def test_the_panel_asks_the_repository_which_tests_a_resolution_reaches(
+    workflow: Workflow,
+) -> None:
+    _stand_in(workflow, "example-server-tests", '{"whole": false, "tests": ["tests/test_a.py"]}')
+    _stand_in(workflow, "example-browser-tests", "tests/browser/a.spec.ts\n")
+    _configure(
+        workflow,
+        server_tests_for_changes="example-server-tests --quiet",
+        browser_tests_for_changes="example-browser-tests",
+    )
+    root = _conflict_round(workflow)
+    head = root.name
+
+    done = workflow.run_script("review-panel", "7")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (root / "server-tests.json").read_text() == (
+        '{"whole": false, "tests": ["tests/test_a.py"]}'
+    )
+    assert (root / "browser-tests.txt").read_text() == "tests/browser/a.spec.ts\n"
+    calls = workflow.calls("example-")
+    words = f"{head}^1 --files-from .review/conflict-files.txt"
+    assert [re.sub(r"\(in .*/inputs\.\w+\)$", "(in inputs)", call) for call in calls] == [
+        f"example-server-tests --quiet {words} (in inputs)",
+        f"example-browser-tests {words} (in inputs)",
+    ]
+
+
+def test_without_test_selections_the_panel_says_the_whole_suites_run(workflow: Workflow) -> None:
+    _configure(workflow, server_tests_for_changes=None, browser_tests_for_changes=None)
+    root = _conflict_round(workflow)
+
+    done = workflow.run_script("review-panel", "7")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert json.loads((root / "server-tests.json").read_text()) == {
+        "whole": True,
+        "tests": [],
+        "total": 0,
+        "reasons": ["no server test selection is configured"],
+    }
+    assert (root / "browser-tests.txt").read_text() == ""
+    assert (root / "task.md").read_text().endswith(
+        "\nNo browser test selection is configured: CI runs the whole browser suite.\n"
+    )
+
+
+def test_a_test_selection_that_fails_stops_the_panel(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-server-tests", "cannot read the tests", status=1)
+    _configure(workflow, server_tests_for_changes="example-server-tests")
+    _conflict_round(workflow)
+
+    done = workflow.run_script("review-panel", "7")
+
+    assert done.returncode == 1
+    assert "could not select tests for the conflict resolution" in done.stderr
+
+
+# Hunts
+
+
+def test_without_a_hunt_app_a_hunt_is_refused_in_a_sentence(workflow: Workflow) -> None:
+    _configure(workflow, hunt_app=None)
+
+    done = workflow.run("start", "hunt", "phone-1")
+
+    assert done.returncode == 1
+    assert done.stderr.strip() == (
+        "this repository names no hunt_app command in shipline.json, so a hunt has no app to use"
+    )
+    assert not workflow.hunt_worktree("phone-1").exists()
+    assert not workflow.calls("tmux")
+
+
+def test_without_a_cursor_hunter_a_cursor_hunt_is_refused_in_a_sentence(
+    workflow: Workflow,
+) -> None:
+    _stand_in(workflow, "example-hunt-app")
+    _configure(workflow, hunt_app="example-hunt-app", hunt_cursor=None)
+
+    done = workflow.run("start", "hunt", "phone-1", "plan", "cursor")
+
+    assert done.returncode == 1
+    assert done.stderr.strip() == (
+        "this repository names no hunt_cursor command in shipline.json, so it has no Cursor hunter"
+    )
+    assert not workflow.calls("tmux")
+
+
+def _hunt_command(workflow: Workflow, name: str) -> str:
+    """The command line a hunt's `tmux` session was started with."""
+    return session_arguments(workflow.state, name)[-1]
+
+
+def test_a_cursor_hunt_runs_the_repository_s_cursor_hunter(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-hunt-app")
+    _configure(workflow, hunt_app="example-hunt-app", hunt_cursor="example-cursor --sandbox")
+
+    done = workflow.run("start", "hunt", "phone-1", "plan", "cursor")
+
+    worktree = workflow.hunt_worktree("phone-1")
+    report = workflow.hunt_report("phone-1")
+    command = _hunt_command(workflow, "hunt-phone-1")
+    assert command.startswith("example-cursor --sandbox "), done.stdout + done.stderr
+    words = shlex.split(command.split(" 2>&1 | tee ")[0])
+    assert words == [
+        "example-cursor",
+        "--sandbox",
+        str(worktree),
+        str(report),
+        "Hunt for bugs with a plan, as hunt-phone-1, "
+        "by the section Hunt for bugs of AGENTS.md in this worktree",
+    ]
+    assert command.endswith(f" 2>&1 | tee {report}/cursor.log")
+
+
+@pytest.mark.parametrize("browser", [None, "tools/shipline/hunt-browser.mjs"])
+def test_a_hunter_is_told_to_drive_the_browser_with_the_repository_s_command(
+    workflow: Workflow, browser: str | None
+) -> None:
+    _stand_in(workflow, "example-hunt-app")
+    _configure(workflow, hunt_app="example-hunt-app", hunt_browser=browser)
+
+    done = workflow.run("start", "hunt", "phone-1")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    sentence = (
+        "Hunt for bugs with a plan, as hunt-phone-1, "
+        "by the section Hunt for bugs of AGENTS.md in this worktree"
+    )
+    if browser:
+        sentence += "; drive the browser with shipline hunt-browser"
+    assert _hunt_command(workflow, "hunt-phone-1").endswith(f'"{sentence}"')
+
+
+def test_a_stopped_hunt_s_application_is_stopped_by_the_repository_s_command(
+    workflow: Workflow,
+) -> None:
+    _stand_in(workflow, "example-hunt-app")
+    _configure(workflow, hunt_app="example-hunt-app --quiet")
+    workflow.add_hunt("phone-1")
+    workflow.running("hunt-phone-1")
+
+    done = workflow.run("stop", "hunt-phone-1")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    # In the hunt's worktree, where its hunter started the application.
+    assert workflow.calls("example-hunt-app") == [
+        f"example-hunt-app --quiet stop (in {workflow.hunt_worktree('phone-1')})"
+    ]
+
+
+def test_without_a_hunt_app_a_stopped_hunt_stops_no_application(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-hunt-app")
+    _configure(workflow, hunt_app=None)
+    workflow.add_hunt("phone-1")
+    workflow.running("hunt-phone-1")
+
+    done = workflow.run("stop", "hunt-phone-1")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not workflow.is_running("hunt-phone-1")
+    assert workflow.calls("example-hunt-app") == []
+
+
+# `shipline <command>`, as a session runs the repository's commands
+
+
+def test_shipline_runs_the_repository_s_command_by_its_name(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    _stand_in(workflow, "example-selection", "tests/browser/a.spec.ts\n")
+    _configure(workflow, browser_tests_for_changes="example-selection --local")
+    worktree = workflow.add_worktree(7)
+
+    done = workflow.shipline(
+        "browser-tests-for-changes",
+        "origin/main",
+        "--run",
+        cwd=worktree,
+        env={"SHIPLINE_REPO": str(workflow.repo)},
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "tests/browser/a.spec.ts\n"
+    assert workflow.calls("example-selection") == [
+        f"example-selection --local origin/main --run (in {worktree})"
+    ]
+
+
+@pytest.mark.parametrize("name", ["browser-tests-for-changes", "server-tests-for-changes"])
+def test_without_a_selection_shipline_selects_nothing_and_says_the_whole_suite_runs(
+    workflow: Workflow, name: str
+) -> None:
+    install_shipline(workflow)
+
+    done = workflow.shipline(name, "origin/main")
+
+    key = name.replace("-", "_")
+    assert done.returncode == 0
+    assert done.stdout == ""
+    assert done.stderr == (
+        f"this repository names no {key} command in shipline.json: "
+        "no test is selected, and CI runs the whole suite\n"
+    )
+
+
+def test_without_a_command_shipline_says_the_repository_has_none(workflow: Workflow) -> None:
+    install_shipline(workflow)
+
+    done = workflow.shipline("hunt-browser", "open", "/")
+
+    assert done.returncode == 1
+    assert done.stderr == "this repository names no hunt_browser command in shipline.json\n"
+
+
+def test_shipline_knows_every_command_a_repository_may_name() -> None:
+    launcher = (_WORKFLOW.parents[1] / "bin" / "shipline").read_text()
+    listed = launcher.split("CONFIGURED=(\n", 1)[1].split(")", 1)[0].split()
+
+    assert listed == [name.replace("_", "-") for name in _COMMANDS]
+
+
+def test_without_pre_train_checks_shipline_has_none_to_fail(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    _configure(workflow, pre_train_checks=None)
+
+    done = workflow.shipline("pre-train-checks")
+
+    assert done.returncode == 0
+    assert done.stderr == (
+        "this repository names no pre_train_checks command in shipline.json: "
+        "there is no check to fail\n"
+    )

@@ -61,7 +61,22 @@ _DEFAULTS = {
         },
     },
     "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
-    "commands": {"push_checks": None},
+    "commands": {
+        name: None
+        for name in (
+            "browser_tests_for_changes",
+            "server_tests_for_changes",
+            "pre_train_checks",
+            "mechanical_conflicts",
+            "browser_plan",
+            "hunt_app",
+            "hunt_browser",
+            "hunt_cursor",
+            "advisory_watch",
+            "push_checkout",
+            "push_checks",
+        )
+    },
     "cloud_pre_push": {"suites": {}},
 }
 

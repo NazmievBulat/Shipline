@@ -1,8 +1,8 @@
 """What differs between the repositories that use Shipline, read from one file.
 
 A repository keeps `shipline.json` at the root of its main checkout: the main checkout of the
-repository being worked on (`SHIPLINE_REPO`, else the repository of the current directory, never
-the checkout these scripts are in), found from the git common directory, so a worktree reads the
+repository being worked on (`SHIPLINE_REPO`, else the repository of the current directory; never
+found from where these scripts are), found from the git common directory, so a worktree reads the
 same file as the main checkout. A key the file leaves out keeps its default, key by key; a key the
 file names that Shipline does not know, or a value of the wrong kind, is refused, so a typing
 error never passes as a default.
@@ -30,7 +30,7 @@ import re
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -46,6 +46,21 @@ DEFAULTS: dict[str, Any] = {
     "repository": None,
     "state_folder": ".local/workflow",
     "worktree_setup": "scripts/setup-worktree",
+    # The repository's own commands Shipline calls, each a command line; none by default.
+    "commands": {
+        "browser_tests_for_changes": None,
+        "server_tests_for_changes": None,
+        "pre_train_checks": None,
+        "mechanical_conflicts": None,
+        "browser_plan": None,
+        "hunt_app": None,
+        "hunt_browser": None,
+        "hunt_cursor": None,
+        "advisory_watch": None,
+        "push_checkout": None,
+        # The checks the repository's pre-push hook runs (`ci_tests_for_changes.py --run`).
+        "push_checks": None,
+    },
     "checks": {
         "ci_result": "CI result",
         "ci_plan": "CI: what to run",
@@ -79,11 +94,6 @@ DEFAULTS: dict[str, Any] = {
         # The prefix the runner pool names its services and containers by; without it, there are
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
-    },
-    # The repository's own commands, each a command line run in its checkout; absent, none runs.
-    "commands": {
-        # The checks the repository's pre-push hook runs (`ci_tests_for_changes.py --run`).
-        "push_checks": None,
     },
     # The suites a cloud worker's push runs as CI will (`ci_tests_for_changes.py`), by name.
     # Each is read by `_suites`, not key by key: the names are the repository's own.
@@ -151,11 +161,6 @@ class Runner:
 
 
 @dataclass(frozen=True)
-class Commands:
-    push_checks: str | None = None
-
-
-@dataclass(frozen=True)
 class Suite:
     name: str
     # The command lines, as the file names them: `select` is given the base and the changed
@@ -186,11 +191,35 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
-    commands: Commands
     cloud_pre_push: CloudPrePush
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
+    # Each named command line, as written; a command the repository has none of is left out.
+    commands: dict[str, str] = field(default_factory=dict)
+
+    def command(self, name: str) -> list[str] | None:
+        """The words a command is run with, or None when the repository has none. Its script is
+        the main checkout's (`_script`); the other words are passed as written."""
+        if name not in DEFAULTS["commands"]:
+            raise KeyError(name)
+        line = self.commands.get(name)
+        if line is None:
+            return None
+        words = _words(line, name)
+        script = _script(words)
+        if script is not None:
+            words[script] = str(self.main / words[script])
+        return words
+
+    def words(self, line: str) -> list[str]:
+        """The words a cloud pre-push suite's command line runs with: its script the main
+        checkout's, as a command's is."""
+        words = shlex.split(line)
+        script = _script(words)
+        if script is not None:
+            words[script] = str(self.main / words[script])
+        return words
 
     @property
     def repository(self) -> str:
@@ -229,8 +258,8 @@ def main_checkout(start: Path) -> Path:
 
 def repository_checkout() -> Path:
     """The main checkout of the repository Shipline works on: the one `SHIPLINE_REPO` names
-    (`shipline --repo` sets it), else the one the current directory is in. Never the checkout
-    these scripts are in, which is Shipline's own."""
+    (`shipline --repo` sets it), else the one the current directory is in. Never found from
+    where these scripts are: they are in Shipline's own checkout."""
     named = os.environ.get("SHIPLINE_REPO")
     if named:
         try:
@@ -277,14 +306,6 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
     return merged
 
 
-def _command(value: Any) -> bool:
-    """Whether a value is a command line: words a shell would split, at least one."""
-    try:
-        return isinstance(value, str) and bool(shlex.split(value))
-    except ValueError:
-        return False
-
-
 def _suites(given: Any) -> tuple[Suite, ...]:
     where = "cloud_pre_push.suites"
     if not isinstance(given, dict):
@@ -305,8 +326,17 @@ def _suites(given: Any) -> tuple[Suite, ...]:
         for key in ("select", "run", "part", "probe"):
             if key in ("part", "probe") and key not in suite:
                 continue
-            if not _command(suite.get(key)):
+            value = suite.get(key)
+            try:
+                words = shlex.split(value) if isinstance(value, str) else []
+            except ValueError:
+                words = []
+            if not words:
                 raise ConfigError(f"{FILE}: {where}.{name}.{key} must be a command")
+            # The part is arguments only; the others name a program, as a command does.
+            script = None if key == "part" else _script(words)
+            if script is not None:
+                _relative(words[script], f"{where}.{name}.{key}")
         workers = suite.get("workers", SUITE_WORKERS.get(name, 1))
         if type(workers) is not int or workers < 1:
             raise ConfigError(f"{FILE}: {where}.{name}.workers must be a whole number above 0")
@@ -319,18 +349,37 @@ def _suites(given: Any) -> tuple[Suite, ...]:
     return tuple(suites)
 
 
-def _commands(values: dict[str, Any], name: str) -> str | None:
-    value = values["commands"][name]
-    if value is not None and not _command(value):
-        raise ConfigError(f"{FILE}: commands.{name} must be a command")
-    return value
-
-
 def _relative(value: str, name: str) -> str:
     path = PurePosixPath(value)
     if path.is_absolute() or ".." in path.parts or str(path) == ".":
         raise ConfigError(f"{FILE}: {name} must be a path inside the checkout, not {value}")
     return value
+
+
+def _words(line: str, name: str) -> list[str]:
+    """A command line split into words as the shell splits them, with nothing expanded."""
+    where = f"commands.{name}"
+    try:
+        words = shlex.split(line)
+    except ValueError as error:
+        raise ConfigError(f"{FILE}: {where} cannot be split into words: {error}") from None
+    script = _script(words)
+    if script is not None:
+        _relative(words[script], where)
+    return words
+
+
+def _script(words: list[str]) -> int | None:
+    """Which word is the repository's own program, read from its main checkout wherever the
+    command runs, so a pull request's worktree never supplies it: a first word with a folder
+    in it, or, after a program found on the PATH (an interpreter), the first word with a folder
+    in it that is no option. None when every word is found elsewhere."""
+    if "/" in words[0]:
+        return 0
+    return next(
+        (index for index, word in enumerate(words) if "/" in word and not word.startswith("-")),
+        None,
+    )
 
 
 def _from_runner_settings(main: Path) -> str | None:
@@ -416,6 +465,9 @@ def load(start: Path | None = None) -> Config:
         raise ConfigError(f"{FILE}: labels.priority must name four different labels")
     if repository is not None and not _REPOSITORY.fullmatch(repository):
         raise ConfigError(f"{source}: repository must be owner/name, not {repository}")
+    commands = {name: line for name, line in values["commands"].items() if line is not None}
+    for name, line in commands.items():
+        _words(line, name)
     return Config(
         found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),
@@ -429,10 +481,10 @@ def load(start: Path | None = None) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
-        commands=Commands(**{name: _commands(values, name) for name in values["commands"]}),
         cloud_pre_push=CloudPrePush(_suites(suites)),
         given=given,
         main=main,
+        commands=commands,
     )
 
 
@@ -461,7 +513,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
         },
-        "commands": vars(config.commands).copy(),
+        "commands": {name: config.commands.get(name) for name in DEFAULTS["commands"]},
         "cloud_pre_push": {
             "suites": {
                 suite.name: {
@@ -498,6 +550,10 @@ def shell(config: Config) -> str:
     lines = [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]
     labels = " ".join(shlex.quote(label) for label in config.runner.labels)
     lines.append(f"SHIPLINE_RUNNER_LABELS=({labels})")
+    # Each command as an array of its words, empty when the repository has none.
+    for name in DEFAULTS["commands"]:
+        words = " ".join(shlex.quote(word) for word in config.command(name) or [])
+        lines.append(f"SHIPLINE_COMMAND_{name.upper()}=({words})")
     # The main checkout, exported: every program the script starts works on the same repository,
     # whatever folder it starts in.
     lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")

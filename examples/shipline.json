@@ -2,6 +2,19 @@
   "repository": "example-owner/example-app",
   "state_folder": ".local/shipline",
   "worktree_setup": "tools/prepare-worktree",
+  "commands": {
+    "browser_tests_for_changes": "tools/shipline/browser-tests-for-changes",
+    "server_tests_for_changes": "tools/shipline/server-tests-for-changes",
+    "pre_train_checks": "tools/shipline/pre-train-checks",
+    "mechanical_conflicts": "tools/shipline/mechanical-conflicts",
+    "browser_plan": "tools/shipline/browser-plan",
+    "hunt_app": "tools/shipline/hunt-app",
+    "hunt_browser": "node tools/shipline/hunt-browser.mjs",
+    "hunt_cursor": "tools/shipline/hunt-cursor",
+    "advisory_watch": "tools/shipline/advisory-watch",
+    "push_checkout": "tools/shipline/push-checkout",
+    "push_checks": "tools/shipline/push-checks"
+  },
   "checks": {
     "ci_result": "Build result",
     "ci_plan": "Build: what to run",
@@ -31,12 +44,14 @@
     }
   },
   "runner": {
-    "labels": ["example-app-home", "example-app-home-main", "example-app-home-docker", "example-app-planner"],
+    "labels": [
+      "example-app-home",
+      "example-app-home-main",
+      "example-app-home-docker",
+      "example-app-planner"
+    ],
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app-runner"
-  },
-  "commands": {
-    "push_checks": "tools/shipline/push-checks"
   },
   "cloud_pre_push": {
     "suites": {

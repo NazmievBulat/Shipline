@@ -170,12 +170,12 @@ def test_an_unknown_key_beside_the_suites_is_refused(tmp_path: Path) -> None:
 
 
 def test_the_push_checks_are_a_command_of_the_repository(tmp_path: Path) -> None:
-    assert _config(tmp_path, {}).commands.push_checks is None
-    named = _config(tmp_path / "named", {"commands": {"push_checks": "tools/push-checks"}})
-    assert named.commands.push_checks == "tools/push-checks"
+    assert _config(tmp_path, {}).command("push_checks") is None
+    named = _config(tmp_path / "named", {"commands": {"push_checks": "tools/push-checks -q"}})
+    assert named.command("push_checks") == [str(named.main / "tools/push-checks"), "-q"]
     with pytest.raises(
         workflow_config.ConfigError,
-        match="^shipline.json: commands.push_checks must be a command$",
+        match="^shipline.json: commands.push_checks cannot be split into words: ",
     ):
         _config(tmp_path / "open", {"commands": {"push_checks": "tools/push-checks 'open"}})
 
