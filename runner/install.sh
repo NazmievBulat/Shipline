@@ -14,9 +14,9 @@
 # two main runners are added, and with the role `ordinary` one PR spare.
 #
 # --github-token and --github-app give the runner programs a GitHub identity of their own
-# (github_identity.py): the file is checked against GitHub and copied to
-# ~/.config/shipline-runner, for this user alone, and never printed. Once given, a later install
-# keeps it. Without one they use your gh login.
+# (github_identity.py): the file is checked against GitHub and copied to the folder
+# `runner.identity_folder` names (~/.config/shipline-runner by default), for this user alone, and
+# never printed. Once given, a later install keeps it. Without one they use your gh login.
 #
 # It copies these files out of the checkout, renders the units for the prefix (render-units.sh),
 # builds the images and starts the runners as services of your user. The copy matters: what runs
@@ -197,12 +197,14 @@ if [ -n "$SHIPLINE_RUNNER_HUB_CACHE" ] && has_role docker; then
 fi
 
 # The GitHub programs as the installed runner programs run them: a copy with no config reader
-# beside it, so they keep their identity where those read it (github_identity.py). Gone at the end.
+# beside it, which reads the identity's folder, `runner.identity_folder`, from the file
+# identity-folder beside it (github_identity.py). Gone at the end.
 tools=$(mktemp -d)
 trap 'rm -rf "$tools"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 cp -L "$here/github_identity.py" "$here/github_budget.py" "$tools/"
+printf '%s\n' "$SHIPLINE_IDENTITY_FOLDER" >"$tools/identity-folder"
 # The units for this prefix, rendered from systemd/.
 RUNNER_PREFIX=$prefix bash "$here/render-units.sh" "$tools/units"
 
@@ -273,7 +275,27 @@ fi
 
 mkdir -p "$installed" "$units"
 prefix=$prefix sh "$here/install-github-budget.sh"
+# What every script of this machine reads after settings.sh: the repository's names, its main
+# checkout, which machine this is and its counts. Each value is quoted for sh. Written before the
+# scripts are copied: a running service that restarts before this install stops it runs the new
+# scripts, which need these names.
+quoted() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+{
+  printf 'repository=%s\n' "$(quoted "$repository")"
+  printf 'prefix=%s\n' "$(quoted "$prefix")"
+  printf 'label=%s\n' "$(quoted "$label")"
+  printf 'planner_label=%s\n' "$(quoted "$planner_label")"
+  printf 'checkout=%s\n' "$(quoted "$checkout")"
+  printf 'machine=%s\n' "$(quoted "$machine")"
+  printf 'roles=%s\n' "$(quoted "$roles")"
+  printf 'other_machines=%s\n' "$(quoted "$other_machines")"
+  printf 'ordinary_jobs=%s\n' "$runners"
+  printf 'ordinary_blacksmith_jobs=%s\n' "$ordinary_blacksmith_jobs"
+  [ -z "$job_memory" ] || printf 'job_memory=%s\n' "$job_memory"
+} >"$installed/pool-settings.tmp"
+mv "$installed/pool-settings.tmp" "$installed/pool-settings.sh"
 cp -L "$here"/*.sh "$here"/*.py "$installed/"
+cp "$tools/identity-folder" "$installed/"
 rm -rf "$installed/vm" "$installed/systemd"
 cp -R "$here/vm" "$installed/vm"
 cp -R "$here/systemd" "$installed/systemd"
@@ -332,22 +354,6 @@ trap recover_runners EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 systemctl --user stop $container-main.service $container-main-2.service $container-planner.service $container-spare.service $container-lend.service "$container@*.service" "$container-docker@*.service"
-# What every script of this machine reads after settings.sh: the repository's names, its main
-# checkout, which machine this is and its counts. Each value is quoted for sh.
-quoted() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
-{
-  printf 'repository=%s\n' "$(quoted "$repository")"
-  printf 'prefix=%s\n' "$(quoted "$prefix")"
-  printf 'label=%s\n' "$(quoted "$label")"
-  printf 'planner_label=%s\n' "$(quoted "$planner_label")"
-  printf 'checkout=%s\n' "$(quoted "$checkout")"
-  printf 'machine=%s\n' "$(quoted "$machine")"
-  printf 'roles=%s\n' "$(quoted "$roles")"
-  printf 'other_machines=%s\n' "$(quoted "$other_machines")"
-  printf 'ordinary_jobs=%s\n' "$runners"
-  printf 'ordinary_blacksmith_jobs=%s\n' "$ordinary_blacksmith_jobs"
-  [ -z "$job_memory" ] || printf 'job_memory=%s\n' "$job_memory"
-} >"$installed/pool-settings.sh"
 # The planner's network goes too: it starts again on one made from the current `subnet`.
 for old_network in $(docker network ls --quiet --filter "name=^$network"); do
   docker network rm "$old_network" >/dev/null
@@ -452,7 +458,7 @@ main_runners=0
 ! has_role main || main_runners=2
 echo "Installed on $machine: $runners PR job slots, $spares spare, $main_runners reserved for main, and $docker_runners with Docker."
 ! has_role planner || echo "This machine also runs the CI planner."
-identity=$HOME/.config/shipline-runner
+identity=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import github_identity; print(github_identity.folder())' "$installed")
 if [ -e "$identity/token" ] || [ -e "$identity/app-id" ]; then
   echo "GitHub: the runner programs use their own GitHub identity, from $identity."
 else

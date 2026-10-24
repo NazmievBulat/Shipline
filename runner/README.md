@@ -113,8 +113,9 @@ ordinary_blacksmith_jobs=1
 
 How many runners a machine has is its own choice. Two machines must never have the same name:
 they would take each other's registrations. A machine runs one pool: the addresses of the
-runners' networks and of the cache (`settings.sh`), the runners' GitHub identity
-(`~/.config/shipline-runner`) and the planner's notes are the machine's, not a prefix's.
+runners' networks and of the cache (`settings.sh`), the runners' GitHub identity (in the folder
+`runner.identity_folder` names, `~/.config/shipline-runner` by default) and the planner's notes
+are the machine's, not a prefix's.
 
 ## Installing a machine
 
