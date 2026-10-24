@@ -434,6 +434,51 @@ def jobs(run: dict[str, Any]) -> list[dict[str, Any]]:
     return checks(api(f"{API}/actions/runs/{run['id']}/jobs?per_page=100", "jobs"))
 
 
+def carried(job: dict[str, Any]) -> bool:
+    """Whether GitHub carried this job into its attempt from an earlier one, without running it.
+
+    A re-run of only the failed jobs lists each job that passed before as a copy in the new
+    attempt: a new ID, the new attempt's `run_attempt`, no notes, and the `started_at` and
+    `completed_at` of the attempt it ran in, but the `created_at` of the re-run. A job that ran
+    in its attempt started after it was created.
+    """
+    started, created = _seconds(job.get("started_at")), _seconds(job.get("created_at"))
+    return started is not None and created is not None and started < created
+
+
+def job_notes(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """The notes of a job, from the attempt of its run where it ran.
+
+    A job carried into a re-run has no notes of its own. Its notes are those of the copy, in an
+    earlier attempt of the same run, with the same name, head and times, that passed and ran
+    there; a job carried by two re-runs has a carried copy in the attempt between. A job that
+    ran in its own attempt has only its own notes, however few.
+    """
+    notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+    attempt, run, head = job.get("run_attempt"), job.get("run_id"), job.get("head_sha")
+    if (
+        notes
+        or job.get("conclusion") != "success"
+        or not carried(job)
+        or not isinstance(attempt, int)
+        or run is None
+        or not head
+    ):
+        return notes
+    for earlier in range(attempt - 1, 0, -1):
+        for copy in api(f"{API}/actions/runs/{run}/attempts/{earlier}/jobs?per_page=100", "jobs"):
+            if (
+                copy.get("name") == job["name"]
+                and copy.get("head_sha") == head
+                and copy.get("conclusion") == "success"
+                and copy.get("started_at") == job.get("started_at")
+                and copy.get("completed_at") == job.get("completed_at")
+                and not carried(copy)
+            ):
+                return api(f"{API}/check-runs/{copy['id']}/annotations?per_page=100")
+    return []
+
+
 # A CI job that runs in parts is named with its part by GitHub, "CI: server tests (1 of 2)", and with
 # its name alone when it was skipped (.github/workflows/ci.yml).
 _PART = re.compile(r"(CI: [^()]+) \((\d+) of (\d+)\)")
@@ -1087,7 +1132,7 @@ def strict_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     strict: list[dict[str, Any]] = []
     for job in parts:
         if job["name"] == "CI: dependencies" and job.get("conclusion") == "success":
-            notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+            notes = job_notes(job)
             if any(note.get("title") == "Advisory on main" for note in notes):
                 job = {**job, "conclusion": "passed over an advisory on main"}
         strict.append(job)
@@ -1214,7 +1259,7 @@ def main_images_needed(head: str, ci: list[dict[str, Any]]) -> bool:
         for job in jobs(push):
             if job["name"] != CI_PLAN:
                 continue
-            notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+            notes = job_notes(job)
             before = next(
                 (note["message"].strip() for note in notes if note.get("title") == "Push base"),
                 None,
@@ -1415,12 +1460,9 @@ def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> 
         job["name"] == "playwright" and job.get("conclusion") == "success" for job in parts
     ):
         return False
-    planner = next(job for job in parts if job["name"] == E2E_PLAN)
-    notes = {
-        (note.get("title"), note["message"].strip())
-        for note in api(f"{API}/check-runs/{planner['id']}/annotations?per_page=100")
-    }
-    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= notes
+    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= _planner_notes(
+        parts, E2E_PLAN
+    )
 
 
 def inherited_image_jobs(
@@ -1464,10 +1506,7 @@ def inherited_image_jobs(
 
 def _planner_notes(parts: list[dict[str, Any]], plan: str) -> set[tuple[Any, str]]:
     planner = next(job for job in parts if job["name"] == plan)
-    return {
-        (note.get("title"), note["message"].strip())
-        for note in api(f"{API}/check-runs/{planner['id']}/annotations?per_page=100")
-    }
+    return {(note.get("title"), note["message"].strip()) for note in job_notes(planner)}
 
 
 def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
@@ -1506,8 +1545,7 @@ def tested_merge(parts: list[dict[str, Any]], base: str, head: str) -> str | Non
     for job in parts:
         if job["name"] != CI_PLAN:
             continue
-        notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
-        for note in notes:
+        for note in job_notes(job):
             if note.get("title") != NOTES.merge_tested:
                 continue
             merge = note["message"].strip()
@@ -1890,7 +1928,7 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
             return False
         tree = api(f"{API}/git/commits/{merge}")["tree"]["sha"]
         plan = next(job for job in image_jobs if job["name"] == IMAGES_PLAN)
-        notes = api(f"{API}/check-runs/{plan['id']}/annotations?per_page=100")
+        notes = job_notes(plan)
         if not any(
             note.get("title") == NOTES.files_tested and note["message"].strip() == tree
             for note in notes
@@ -2120,10 +2158,10 @@ class Train:
             base = git("ls-remote", "origin", "refs/heads/main").split()[0]
             train_reads.save(context / "main.json", {"head": base})
 
-        def signature() -> str:
+        def inputs(queue: list[str]) -> list[Any]:
             # Local authorizations and owner questions can change while the tick runs.
             notes = []
-            for number in self.queue:
+            for number in queue:
                 root = CONFIG.state(
                     CONFIG.checkout_of(self.path.parent) / ".claude/worktrees" / f"ticket-{number}"
                 )
@@ -2137,15 +2175,16 @@ class Train:
                     self.path.parent / f"merge-review-{number}",
                 ]
                 notes += [(str(path), path.stat().st_mtime_ns) for path in paths if path.exists()]
+            return [
+                health.read_text() if health.exists() else "",
+                sorted(notes),
+                (context / "sessions").read_text(),
+            ]
+
+        def signature() -> str:
             return train_reads.digest(
-                [
-                    self.path.read_text() if self.path.exists() else "",
-                    base,
-                    health.read_text() if health.exists() else "",
-                    pulls,
-                    sorted(notes),
-                    (context / "sessions").read_text(),
-                ]
+                [self.path.read_text() if self.path.exists() else "", base, pulls]
+                + inputs(self.queue)
             )
 
         previous = train_reads.load(context / "reconciled.json")
@@ -2153,6 +2192,9 @@ class Train:
         if delegated and previous.get("signature") == signature():
             self.suite_states = previous["suite_states"]
             return
+        # The members the scan reads, blocked ones included.
+        queue = list(dict.fromkeys([*self.queue, *self.blocked]))
+        seen = inputs(queue)
         reads = train_reads.Reads(self.path.parent, base)
         _planning_reads = reads
         try:
@@ -2161,10 +2203,16 @@ class Train:
             reads.finish()
         finally:
             _planning_reads = None
+        # A note created or cleared while the scan ran may not be what it read: keep the
+        # result only for the inputs it saw, so the next reconcile computes it again. The key
+        # is taken first: a note changed after it leaves the key on the old note, a miss.
+        key = signature()
+        if inputs(queue) != seen:
+            return
         train_reads.save(
             context / "reconciled.json",
             {
-                "signature": signature(),
+                "signature": key,
                 "at": time.time(),
                 "suite_states": self.suite_states,
             },
@@ -4115,7 +4163,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             image_plan = next(
                 job for job in image_jobs if job["name"] == IMAGES_PLAN
             )
-            image_notes = api(f"{API}/check-runs/{image_plan['id']}/annotations?per_page=100")
+            image_notes = job_notes(image_plan)
             if not any(
                 note.get("title") == NOTES.files_tested and note["message"].strip() == tree
                 for note in image_notes

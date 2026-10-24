@@ -36,6 +36,13 @@
     "prefix": "example-app-runner"
   },
   "cloud_wake_after_minutes": 45,
+  "hunts": {
+    "areas": {
+      "phone": ["/calls", "/contacts"],
+      "billing": ["/invoices", "/settings/billing"]
+    },
+    "plans": "docs/hunt-plans.md"
+  },
   "commands": {
     "test": "tools/run-tests"
   }

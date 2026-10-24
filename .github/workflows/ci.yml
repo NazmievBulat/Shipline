@@ -111,6 +111,7 @@ jobs:
               tests/workflow/test_lost_check.py
               tests/workflow/test_merge_train_metrics.py
               tests/workflow/test_running_command.py
+              tests/workflow/test_session_hunt.py
               tests/workflow/test_session_limit.py
               tests/workflow/test_session_with_real_tmux.py
               tests/workflow/test_stand_alone.py
