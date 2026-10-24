@@ -1,0 +1,3 @@
+# The differences `tools/parity` expects between Shipline and an installation's own copy of the
+# scripts. Each entry is one line, below a line of its reason; `tools/parity` says how to write
+# a rename and a rewrite.

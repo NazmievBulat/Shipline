@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Every difference between Shipline and an installation that runs the workflow from its own copy
+of the scripts, except the known ones.
+
+    tools/parity CHECKOUT
+
+Shipline's trees are compared with their places in the checkout:
+
+    scripts/workflow/RULES.md   AGENTS.md
+    scripts/workflow/           scripts/workflow/
+    tests/workflow/             the checkout's workflow tests, `tests/workflow/` unless its
+                                shipline.json names `parity.workflow_tests`
+    tests/runner/               the checkout's runner tests, `tests/runner/` unless it names
+                                `parity.runner_tests`
+    runner/                     .github/runner/
+
+Only the files git tracks on each side are compared. Every changed, added or removed line is
+printed as a unified diff (Shipline's side first), a file on one side only as a diff with
+/dev/null, and a lost or gained executable bit as a line of its own.
+
+`tools/parity-known.txt` lists the differences that are expected, one per line, each below a
+`#` line that gives its reason:
+
+    # Why the checkout keeps its hunt in a folder of its own.
+    rename scripts/workflow/hunts/ scripts/hunts/
+    # Why the checkout names the repository where Shipline reads its config.
+    rewrite scripts/workflow/tick |"$SHIPLINE_REPOSITORY"|"example-owner/example-app"|
+
+A rename pairs a Shipline path with a checkout path: a file, or a folder ending in `/` with
+everything below it; `-` on one side says the file or folder is on the other side only. A
+rewrite replaces, in the Shipline files its path matches (`*` matches any characters, `/`
+too), every FROM text by the TO text the checkout has. Its first character after the path is
+the delimiter, which neither text holds; in them `\\n` is a line break and `\\\\` a backslash.
+Nothing else is ignored, and an entry that matches nothing is printed too.
+
+Exits 0 when nothing was printed, 1 when something was, 2 when it cannot compare.
+"""
+
+import difflib
+import fnmatch
+import json
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts/workflow"))
+import workflow_config  # noqa: E402
+
+KNOWN = "tools/parity-known.txt"
+GIT_SECONDS = 60
+
+
+class Refused(Exception):
+    """The comparison cannot be made; the message says why."""
+
+
+@dataclass
+class Entry:
+    line: int
+    text: str
+    used: bool = False
+
+
+@dataclass
+class Rename(Entry):
+    # A path on each side, or "-" for none.
+    shipline: str = ""
+    checkout: str = ""
+
+
+@dataclass
+class Rewrite(Entry):
+    pattern: str = ""
+    before: str = ""
+    after: str = ""
+
+
+def _inside(path: str, line: int) -> str:
+    pure = PurePosixPath(path)
+    if pure.is_absolute() or ".." in pure.parts or str(pure) == ".":
+        raise Refused(f"{KNOWN}: line {line}: {path} is not a path inside a checkout")
+    return path
+
+
+def _unescaped(text: str) -> str:
+    out, chars = [], iter(text)
+    for char in chars:
+        if char == "\\":
+            following = next(chars, "")
+            if following == "n":
+                out.append("\n")
+            elif following == "\\":
+                out.append("\\")
+            else:
+                out.append(char + following)
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def read_known(path: Path) -> list[Entry]:
+    entries: list[Entry] = []
+    reason = False
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        if line.startswith("#"):
+            reason = True
+            continue
+        if not line.strip():
+            reason = False
+            continue
+        if not reason:
+            raise Refused(f"{KNOWN}: line {number}: no reason above it")
+        kind, _, rest = line.partition(" ")
+        if kind == "rename":
+            paths = rest.split()
+            if len(paths) != 2 or paths == ["-", "-"]:
+                raise Refused(f"{KNOWN}: line {number}: a rename names two paths")
+            for side in paths:
+                if side != "-":
+                    _inside(side, number)
+            folders = {side.endswith("/") for side in paths if side != "-"}
+            if len(folders) > 1:
+                raise Refused(f"{KNOWN}: line {number}: a folder is renamed to a folder")
+            entries.append(Rename(number, line, shipline=paths[0], checkout=paths[1]))
+        elif kind == "rewrite":
+            pattern, _, spec = rest.partition(" ")
+            parts = spec[1:].split(spec[:1]) if spec else []
+            if not pattern or len(parts) != 3 or parts[2]:
+                raise Refused(f"{KNOWN}: line {number}: a rewrite is PATH |FROM|TO|")
+            before, after = _unescaped(parts[0]), _unescaped(parts[1])
+            if not before or before == after:
+                raise Refused(f"{KNOWN}: line {number}: a rewrite changes its text")
+            entries.append(
+                Rewrite(number, line, pattern=_inside(pattern, number), before=before, after=after)
+            )
+        else:
+            raise Refused(f"{KNOWN}: line {number}: not a rename or a rewrite")
+        reason = False
+    return entries
+
+
+def test_folders(checkout: Path) -> dict[str, str]:
+    """Where the checkout keeps its workflow and runner tests, as its config names them. Only
+    `parity` is read: the rest of the file may hold what its own copy of the scripts reads."""
+    name = workflow_config.FILE
+    try:
+        text = (checkout / name).read_text()
+    except FileNotFoundError:
+        text = "{}"
+    except OSError as error:
+        raise Refused(f"{name}: cannot be read: {error}") from error
+    try:
+        given = json.loads(text)
+    except ValueError as error:
+        raise Refused(f"{name} is not JSON: {error}") from error
+    if not isinstance(given, dict):
+        raise Refused(f"{name}: the file must be an object")
+    # Read as Shipline reads the file, with the same refusals.
+    only = {"parity": given.get("parity", {})}
+    try:
+        values = workflow_config._merged(workflow_config.DEFAULTS, only, "")["parity"]
+        return {
+            key: str(PurePosixPath(workflow_config._relative(value, f"parity.{key}")))
+            for key, value in values.items()
+        }
+    except workflow_config.ConfigError as error:
+        raise Refused(str(error)) from None
+
+
+def trees(checkout: Path) -> list[tuple[str, str]]:
+    """Each Shipline file or folder with its place in the checkout."""
+    folders = test_folders(checkout)
+    return [
+        ("scripts/workflow/RULES.md", "AGENTS.md"),
+        ("scripts/workflow/", "scripts/workflow/"),
+        ("tests/workflow/", folders["workflow_tests"] + "/"),
+        ("tests/runner/", folders["runner_tests"] + "/"),
+        ("runner/", ".github/runner/"),
+    ]
+
+
+def tracked(checkout: Path) -> set[str]:
+    """The files git tracks in a checkout that are there."""
+    try:
+        top = subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_SECONDS,
+            check=False,
+        )
+        if top.returncode or Path(top.stdout.strip()).resolve() != checkout.resolve():
+            raise Refused(f"{checkout} is not a git checkout")
+        files = subprocess.run(
+            ["git", "-C", str(checkout), "ls-files", "-z", "--cached"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise Refused(f"git did not list {checkout} in {GIT_SECONDS} seconds") from None
+    if files.returncode:
+        raise Refused(f"git cannot list {checkout}: {files.stderr.strip()}")
+    names = {name for name in files.stdout.split("\0") if name}
+    return {name for name in names if os.path.lexists(checkout / name)}
+
+
+def _mapped(path: str, rules: list[tuple[str, str, Entry | None]]) -> tuple[str, Entry | None]:
+    """Where the most specific rule takes `path`: a path, "-" or "" when no rule names it."""
+    best: tuple[int, str, Entry | None] = (-1, "", None)
+    for source, target, entry in rules:
+        if source == path:
+            length, found = len(source) + 1, target
+        elif source.endswith("/") and path.startswith(source):
+            length, found = len(source), "-" if target == "-" else target + path[len(source) :]
+        else:
+            continue
+        if length > best[0]:
+            best = (length, found, entry)
+    return best[1], best[2]
+
+
+def _where(path: str, renames: list[tuple[str, str, Entry | None]], tree_rules) -> str:
+    target, entry = _mapped(path, renames)
+    if entry is not None:
+        entry.used = True
+        return target
+    return _mapped(path, tree_rules)[0]
+
+
+def _content(path: Path) -> bytes:
+    if path.is_symlink():
+        return f"symlink to {os.readlink(path)}\n".encode()
+    return path.read_bytes()
+
+
+def _lines(text: str) -> list[str]:
+    lines = [line + "\n" for line in text.split("\n")]
+    last = lines.pop()
+    if last != "\n":
+        lines.append(last[:-1] + "\n\\ No newline at end of file\n")
+    return lines
+
+
+def _executable(path: Path) -> bool:
+    return not path.is_symlink() and bool(path.stat().st_mode & 0o111)
+
+
+def compare(shipline: Path, checkout: Path, known: list[Entry]) -> list[str]:
+    """What differs, as the lines to print."""
+    tree_rules = [(ours, theirs, None) for ours, theirs in trees(checkout)]
+    inverse_trees = [(theirs, ours, None) for ours, theirs, _ in tree_rules]
+    renames = [entry for entry in known if isinstance(entry, Rename)]
+    forward = [(e.shipline, e.checkout, e) for e in renames if e.shipline != "-"]
+    inverse = [(e.checkout, e.shipline, e) for e in renames if e.checkout != "-"]
+
+    ours = {name for name in tracked(shipline) if _where(name, forward, tree_rules)}
+    theirs = {name for name in tracked(checkout) if _where(name, inverse, inverse_trees)}
+    pairs: set[tuple[str | None, str | None]] = set()
+    for name in ours:
+        other = _where(name, forward, tree_rules)
+        if other == "-":
+            continue
+        paired = other in theirs and _where(other, inverse, inverse_trees) == name
+        pairs.add((name, other if paired else None))
+    for name in theirs:
+        other = _where(name, inverse, inverse_trees)
+        if other == "-":
+            continue
+        paired = other in ours and _where(other, forward, tree_rules) == name
+        pairs.add((other if paired else None, name))
+
+    rewrites = [entry for entry in known if isinstance(entry, Rewrite)]
+    printed: list[str] = []
+    for our_name, their_name in sorted(pairs, key=lambda pair: pair[0] or pair[1] or ""):
+        a = _content(shipline / our_name) if our_name else b""
+        b = _content(checkout / their_name) if their_name else b""
+        a_label = f"shipline/{our_name}" if our_name else "/dev/null"
+        b_label = f"checkout/{their_name}" if their_name else "/dev/null"
+        try:
+            a_text, b_text = a.decode(), b.decode()
+        except UnicodeDecodeError:
+            if a != b:
+                printed.append(f"binary files differ: {a_label} {b_label}\n")
+        else:
+            if our_name and their_name:
+                for rewrite in rewrites:
+                    if fnmatch.fnmatchcase(our_name, rewrite.pattern) and rewrite.before in a_text:
+                        a_text = a_text.replace(rewrite.before, rewrite.after)
+                        rewrite.used = True
+            if a_text != b_text:
+                printed.extend(
+                    difflib.unified_diff(_lines(a_text), _lines(b_text), a_label, b_label)
+                )
+        if our_name and their_name:
+            runs = _executable(shipline / our_name), _executable(checkout / their_name)
+            if runs[0] != runs[1]:
+                said = ["executable" if one else "not executable" for one in runs]
+                printed.append(f"mode: {a_label} is {said[0]}, {b_label} is {said[1]}\n")
+    printed.extend(
+        f"unused: {KNOWN}:{entry.line}: {entry.text}\n" for entry in known if not entry.used
+    )
+    return printed
+
+
+def main(arguments: list[str]) -> int:
+    if len(arguments) != 1:
+        print("usage: tools/parity CHECKOUT", file=sys.stderr)
+        return 2
+    try:
+        printed = compare(ROOT, Path(arguments[0]), read_known(ROOT / KNOWN))
+    except Refused as error:
+        print(error, file=sys.stderr)
+        return 2
+    sys.stdout.writelines(printed)
+    return 1 if printed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

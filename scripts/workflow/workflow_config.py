@@ -11,7 +11,8 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix.
+runner prefix; the workflow and runner tests `tools/parity` compares are in `tests/workflow` and
+`tests/runner`.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -80,6 +81,8 @@ DEFAULTS: dict[str, Any] = {
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
     },
+    # Where the repository keeps its own copy's workflow and runner tests, for `tools/parity`.
+    "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner"},
 }
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
@@ -138,6 +141,12 @@ class Runner:
 
 
 @dataclass(frozen=True)
+class Parity:
+    workflow_tests: str
+    runner_tests: str
+
+
+@dataclass(frozen=True)
 class Config:
     # None when nothing names it: an error only for a script that needs it.
     found_repository: str | None
@@ -148,6 +157,7 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    parity: Parity
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -310,6 +320,12 @@ def load(start: Path = HERE) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
+        parity=Parity(
+            **{
+                key: _relative(value, f"parity.{key}")
+                for key, value in values["parity"].items()
+            }
+        ),
         given=given,
         main=main,
     )
@@ -340,6 +356,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
         },
+        "parity": vars(config.parity).copy(),
     }
 
 
