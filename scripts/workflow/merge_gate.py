@@ -2271,7 +2271,7 @@ class Train:
         pulls: dict[str, Any] = {}
         suite_states: dict[str, str | None] = {}
         lost: dict[str, dict[str, Any]] = {}
-        self.refreshable = set()
+        marked, self.refreshable = self.refreshable, set()
         # Use the same session state and owner-question notes as the tick. A background
         # job leaves its session running and must not lose its turn merely for waiting.
         sessions = {
@@ -2388,7 +2388,10 @@ class Train:
                             # Still blocked, but its turn may refresh the stale green run.
                             self.refreshable.add(number)
                 except Refused, KeyError, TypeError, ValueError, IndexError:
-                    pass
+                    # An unread run changes nothing: a green re-run on this same head keeps
+                    # its mark, so its turn still refreshes it.
+                    if number in marked and self.blocked.get(number) == pull["headRefOid"]:
+                        self.refreshable.add(number)
             remaining.append(number)
         self.queue = remaining
         # A label changed while waiting moves its pull request at this turn.
