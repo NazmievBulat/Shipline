@@ -563,6 +563,51 @@ def test_a_conflict_command_that_cannot_renumber_refuses_the_refresh(github: Git
     assert "merge main: conflict in" not in done.stdout + done.stderr
 
 
+@pytest.mark.parametrize("carries_paths", [True, False])
+def test_a_renumber_function_raising_with_paths_leaves_them_as_a_conflict(
+    github: GitHub, carries_paths: bool
+) -> None:
+    """The function form's answer is the documented form's: an exception carrying the files
+    it cannot move leaves them as a conflict; one without them refuses the refresh."""
+    workflow = github.workflow
+    exclude = Path(workflow.git("rev-parse", "--path-format=absolute", "--git-path", "info/exclude"))
+    exclude.write_text(exclude.read_text() + "\ntools/forms/\n__pycache__/\n")
+    module = _module(workflow, f'''
+        class CannotMove(Exception):
+            pass
+        def renumber_migrations(head, main):
+            error = CannotMove("its number is used twice")
+            if {carries_paths}:
+                error.paths = ["db/0002_seven.py"]
+            raise error
+        def resolve(head, main):
+            return []
+        def taken_migrations(head, main):
+            return []
+    ''')
+    _configure(workflow, mechanical_conflicts={
+        "run": module, "form": "functions", "functions": {
+            "resolve": "resolve", "renumber": "renumber_migrations", "taken": "taken_migrations",
+        },
+    })
+    _main_moved(github)
+
+    done = github.run()
+
+    assert done.returncode == 1
+    conflict = (
+        "main took the number of db/0002_seven.py and it cannot be renumbered mechanically "
+        "(its number is used twice); renumber the branch's numbered files after main's last, "
+        "commit with 'merge main: conflict in db/0002_seven.py', push, then wait for CI"
+    )
+    if carries_paths:
+        assert conflict in done.stdout + done.stderr
+    else:
+        assert "its number is used twice" in done.stdout + done.stderr
+        assert "merge main: conflict in" not in done.stdout + done.stderr
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == github.head
+
+
 def test_without_a_conflict_command_a_clean_refresh_renumbers_nothing(github: GitHub) -> None:
     workflow = github.workflow
     _configure(workflow, mechanical_conflicts=None)
@@ -1285,6 +1330,7 @@ def test_function_checkout_converts_paths_and_orders_refusal_arguments(workflow:
         from pathlib import Path
         def install_if_changed(checkout):
             assert isinstance(checkout, Path)
+            print("installing the changed packages")
             return "lockfile is broken" if (checkout / "broken-install").exists() else None
         def refusal(output, checkout):
             assert isinstance(checkout, Path)
@@ -1299,9 +1345,9 @@ def test_function_checkout_converts_paths_and_orders_refusal_arguments(workflow:
     _failing_hook(workflow, ["check failed"])
     assert _push(workflow, worktree) == {"returncode": 1, "refusal": "step: check failed"}
     (worktree / "broken-install").touch()
-    assert _push(workflow, worktree) == {
-        "waiting": "PackagesWaiting", "reason": "lockfile is broken",
-    }
+    pushed = _push(workflow, worktree)
+    assert pushed["waiting"] == "PackagesWaiting", pushed
+    assert pushed["reason"].splitlines()[-1] == "lockfile is broken", pushed
 
 
 @pytest.mark.parametrize("path, needed", [("docs/example.md", False), ("web/example.ts", True)])

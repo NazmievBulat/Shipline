@@ -249,8 +249,11 @@ missing function or unsupported form with the command's name.
 A list return prints one entry a line; a mapping prints `<old> <new>` lines; a string prints
 itself; `None` and booleans print nothing. `answers` exits 0 for a true answer and non-zero for
 `None` or `False`. `install` treats a returned string as a failure reason and exits non-zero;
-`None` means success. `browser_plan` requires a bool and prints `needed` for `True`, `none` for
-`False`. An exception exits non-zero with its message on standard error. Python diagnostic
+`None` means success; the reason is also the last line on standard error, after the function's
+diagnostics. `browser_plan` requires a bool and prints `needed` for `True`, `none` for
+`False`. An exception exits non-zero with its message on standard error. A `renumber` exception
+with a `paths` attribute, a list of the files it cannot move, also names them on standard
+output, so they are left as a conflict. Python diagnostic
 prints go to standard error, leaving the return value as the answer. Invalid selector JSON or
 fields fail the call rather than selecting no tests.
 

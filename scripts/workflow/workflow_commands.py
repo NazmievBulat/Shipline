@@ -384,7 +384,25 @@ def _function_answer(name: str, entry: dict, words: list[str]) -> int:
     # Diagnostics printed by a module are not part of its returned answer.
     with contextlib.redirect_stdout(sys.stderr):
         spec.loader.exec_module(module)
-        result = getattr(module, entry["functions"][subcommand])(*call_args)
+        try:
+            result = getattr(module, entry["functions"][subcommand])(*call_args)
+        except Exception as error:
+            # A renumber that cannot move some files raises with them in `paths`: they are
+            # named on standard output and left as a conflict, as the documented form does.
+            paths = getattr(error, "paths", None)
+            if (
+                name != "mechanical_conflicts"
+                or subcommand != "renumber"
+                or isinstance(paths, (str, bytes))
+                or not isinstance(paths, (list, tuple, set, frozenset))
+                or not paths
+                or not all(isinstance(path, str) and path.strip() for path in paths)
+            ):
+                raise
+            for path in paths:
+                print(path, file=sys.__stdout__)
+            print(error, file=sys.stderr)
+            return 1
     if name == "browser_plan":
         if type(result) is not bool:
             raise ValueError("browser_plan must return a bool")
@@ -396,6 +414,8 @@ def _function_answer(name: str, entry: dict, words: list[str]) -> int:
     elif isinstance(result, str):
         print(result)
         if name == "push_checkout" and subcommand == "install":
+            # The gate reads a failure's standard error first, where diagnostics went.
+            print(result, file=sys.stderr)
             return 1
     elif isinstance(result, Mapping):
         for old, new in result.items():
