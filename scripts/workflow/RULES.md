@@ -162,6 +162,19 @@ worker, reviewer and audit alike:
 
 - A question to the owner is plain text at the end of a turn: the recommendation first, then
   the other choices, ending with the short words he can type back ("1", "merge it").
+- Just before those words the question carries one line of its own: `Owner only: yes` or
+  `Owner only: no`. `Owner only: yes` is required for money, privacy, legal text, text sent to
+  a model, and any product decision these rules keep for the owner; anything else is
+  `Owner only: no`. A question without the line counts as `Owner only: yes`, waits for him and
+  is named to the orchestrator once.
+- A question marked `Owner only: no` that has waited `answer_for_owner_after_minutes` in
+  `shipline.json` (15 by default; 0 turns it off) gets its recommended reply from the tick:
+  the first reply word after the line (so the recommended one comes first, a number or words
+  in quotes, never a command such as `/clear`), typed into the session once, as if he had
+  typed it.
+  His own reply, if it comes first, wins; so does text he has not sent yet. The wake's morning
+  check-in lists the questions answered for him overnight, with the reply given, so he can
+  overrule them. A Codex bridge relays and is never answered for him.
 - The question tool is not used.
 - The owner is never handed a shell command to run. What has to be run, the session runs.
 - A change to a screen still publishes the artifact with the options and gives the link; the
@@ -192,7 +205,7 @@ worker, reviewer and audit alike:
 - Start with brainstorming. A change to a screen publishes an options page (as in "Asking the
   owner") and ends the turn with the card's title, choices, reply words and link in text;
   nothing is built until the owner answers. A backend choice that is a product decision is
-  asked in text, recommendation first.
+  asked in text, recommendation first, with the `Owner only:` line of "Asking the owner".
   Any other choice is made and written into the pull request description.
 - Run the repository's fast pre-train checks, `shipline pre-train-checks`, from the pull
   request's worktree before marking ready. They also run before a handoff or gate call
@@ -382,7 +395,8 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
    A restart does not reset the count: read the published reviews. After the owner authorizes another round, the
    orchestrator writes its number to `.local/workflow/review-N.allow-round` in the main
    checkout. This permits that exact round only. Record the authorization with its review.
-5. Ask product decisions in text, recommendation first. A job longer than this pull request
+5. Ask product decisions in text, recommendation first, with the `Owner only:` line of
+   "Asking the owner". A job longer than this pull request
    becomes a draft ticket as in audit step 5, without the label `workflow`. No question or
    unaddressed finding may remain before merging.
    When a watch for GitHub checks was stopped, run `shipline notify waiting` before
@@ -816,7 +830,12 @@ The orchestrator session does what needs judgment:
   stop rang the phone (see "Phone pushes") is named on a line of its own with how long it has
   waited, `asking the owner: review-156 (8 min)`, until he answers; a new question reaches the
   orchestrator once, at any hour and busy or not. A `stuck?`, `wait loop finds itself?` or
-  `idle, no rule:` line of the tick reaches it the same way, once. The
+  `idle, no rule:` line of the tick reaches it the same way, once, and so does `owner question
+  without the Owner only line: ticket-426` (or `without a reply word`). A question the tick
+  answered for the owner (see "Asking the owner") is named `answered for the owner: ticket-426,
+  "1" (03:12)`: one answered at night in the first check-in from 8:00, which lists every answer
+  since 20:00, one answered in the day at the next look. The orchestrator passes them on to the
+  owner, who may overrule them. The
   check-in names the usage, the `/tmp` file slots, the sessions and the open pull requests; it is delivered as a
   message from a short `claude -p` on Claude Haiku 5.5. The wake itself starts,
   merges and pushes nothing. What it saw and did is in `~/.local/state/workflow/wake.log`. A

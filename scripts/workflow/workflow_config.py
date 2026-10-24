@@ -15,7 +15,8 @@ set-up command, run only when present, is `scripts/setup-worktree`; no runner la
 runner prefix; the workflow and runner tests `tools/parity` compares are in `tests/workflow` and
 `tests/runner`, and it knows of no differences; no machines named, so `flow-page` samples only
 the machine it runs on; no hunt areas, so one hunt runs at a time, and no hunt plans file; no
-test command, which a repository names for its CI's test job (`ci_proof.py test`); no paths that
+test command, which a repository names for its CI's test job (`ci_proof.py test`); a question
+to the owner marked `Owner only: no` gets its recommended reply after 15 minutes; no paths that
 call for a closer review.
 
 `review.high_effort_paths` are regular expressions, each searched for in every path a pull
@@ -119,7 +120,12 @@ DEFAULTS: dict[str, Any] = {
         "plans": None,
     },
     "review": {"high_effort_paths": []},
+    # Minutes a question to the owner marked `Owner only: no` waits before the tick types its
+    # recommended reply; 0 turns that off.
+    "answer_for_owner_after_minutes": 15,
 }
+# The most such a wait may be: a day. Bash would wrap a number far larger.
+MOST_MINUTES = 24 * 60
 # The keys of one machine.
 MACHINE_KEYS = ("name", "address")
 
@@ -249,6 +255,7 @@ class Config:
     hunts: Hunts
     commands: Commands
     review: Review
+    answer_for_owner_after_minutes: int
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -347,6 +354,15 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
                 isinstance(item, str) and item for item in value
             ):
                 raise ConfigError(f"{FILE}: {name} must be a list of names")
+            merged[key] = value
+        elif isinstance(default, int):
+            value = given[key]
+            # `true` is an int to Python, and no number of minutes.
+            if type(value) is not int or not 0 <= value <= MOST_MINUTES:
+                raise ConfigError(
+                    f"{FILE}: {name} must be a whole number from 0 to {MOST_MINUTES}, "
+                    f"not {json.dumps(value)}"
+                )
             merged[key] = value
         else:
             value = given[key]
@@ -563,6 +579,7 @@ def load(start: Path | None = None) -> Config:
                 values["review"]["high_effort_paths"], "review.high_effort_paths"
             )
         ),
+        answer_for_owner_after_minutes=values["answer_for_owner_after_minutes"],
         given=given,
         main=main,
     )
@@ -619,6 +636,7 @@ def as_dict(config: Config) -> dict[str, Any]:
         },
         "commands": vars(config.commands).copy(),
         "review": {"high_effort_paths": list(config.review.high_effort_paths)},
+        "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
     }
 
 
@@ -641,6 +659,7 @@ def shell(config: Config) -> str:
         **{f"PRIORITY_{key.upper()}": value for key, value in config.labels.priority.items()},
         "IDENTITY_FOLDER": config.runner.identity_folder,
         "HUNT_PLANS": config.hunts.plans or "",
+        "ANSWER_FOR_OWNER_AFTER_MINUTES": str(config.answer_for_owner_after_minutes),
         "CONFIG": json.dumps(config.given, separators=(",", ":")),
     }
     lines = [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]
