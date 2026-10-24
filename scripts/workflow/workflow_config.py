@@ -1475,20 +1475,15 @@ _CONFIG_MARKERS = ("<!-- shipline-config:start -->", "<!-- shipline-config:end -
 _COMMAND_MARKERS = ("<!-- shipline-commands:start -->", "<!-- shipline-commands:end -->")
 
 
-def _example(cls: type = Config, indent: int = 0) -> str:
-    """One declared key per line; opaque user-named maps retain their meaningful order."""
-    lines = []
+def _example(cls: type = Config) -> dict[str, Any]:
+    """Declared key order, retaining the meaningful order of user-named maps."""
+    result = {}
     for item in _declared_fields(cls):
         if setting := item.metadata.get("setting"):
-            key = setting.name or item.name
-            value = json.dumps(setting.example, ensure_ascii=False)
+            result[setting.name or item.name] = deepcopy(setting.example)
         elif "section" in item.metadata:
-            key = item.name
-            value = _example(item.metadata["section"] or item.type, indent + 2)
-        else:
-            continue
-        lines.append(" " * (indent + 2) + json.dumps(key) + ": " + value)
-    return "{\n" + ",\n".join(lines) + "\n" + " " * indent + "}"
+            result[item.name] = _example(item.metadata["section"] or item.type)
+    return result
 
 
 def _cell(text: str) -> str:
@@ -1524,7 +1519,8 @@ def documentation(root: Path) -> dict[Path, str]:
     readme = root / "scripts/workflow/README.md"
     text = _replace_block(readme.read_text(), _CONFIG_MARKERS, "\n".join(keys))
     text = _replace_block(text, _COMMAND_MARKERS, "\n".join(commands))
-    return {root / "examples/shipline.json": _example() + "\n", readme: text}
+    return {root / "examples/shipline.json": json.dumps(_example(), indent=2, ensure_ascii=False) + "\n",
+            readme: text}
 
 
 def docs(*, write: bool = False) -> int:
