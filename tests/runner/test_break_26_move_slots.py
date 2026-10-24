@@ -69,6 +69,28 @@ def _office_runner(status: str, number: int = 1, labels: list[str] | None = None
     return (runner_name(OFFICE, number=number), status, labels or [STANDBY, LABEL, FIRST])
 
 
+def _github_deletes_registrations(home: Machine) -> None:
+    # The shared gh stand-in removes labels only; here GitHub also removes a registration.
+    stand_in = home.root / "bin" / "gh"
+    stand_in.rename(home.root / "bin" / "gh-labels")
+    stand_in.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, re, sys\n"
+        f"state = {str(home.state)!r}\n"
+        "words = sys.argv[1:]\n"
+        "path = next((w for w in words if w.startswith('repos/')), '')\n"
+        "found = re.search(r'/actions/runners/([0-9]+)$', path)\n"
+        "if found and '-X' in words and words[words.index('-X') + 1] == 'DELETE':\n"
+        "    open(f'{state}/calls.log', 'a').write(' '.join(['gh', *words]) + '\\n')\n"
+        "    runners = json.load(open(f'{state}/runners.json'))\n"
+        "    runners['runners'] = [r for r in runners['runners'] if r['id'] != int(found[1])]\n"
+        "    json.dump(runners, open(f'{state}/runners.json', 'w'))\n"
+        "    sys.exit(0)\n"
+        "os.execv(os.path.join(os.path.dirname(__file__), 'gh-labels'), ['gh', *words])\n"
+    )
+    stand_in.chmod(0o755)
+
+
 def _installed_home(home: Machine) -> Machine:
     _home_settings(home, 0)
     done = home.install()
@@ -115,25 +137,7 @@ def test_the_move_retires_homes_old_slot_registrations_and_nothing_else(home: Ma
         _office_runner("online", 1),
         _office_runner("online", 2),
     )
-    # The shared gh stand-in removes labels only; here GitHub also removes a registration.
-    stand_in = home.root / "bin" / "gh"
-    stand_in.rename(home.root / "bin" / "gh-labels")
-    stand_in.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, os, re, sys\n"
-        f"state = {str(home.state)!r}\n"
-        "words = sys.argv[1:]\n"
-        "path = next((w for w in words if w.startswith('repos/')), '')\n"
-        "found = re.search(r'/actions/runners/([0-9]+)$', path)\n"
-        "if found and '-X' in words and words[words.index('-X') + 1] == 'DELETE':\n"
-        "    open(f'{state}/calls.log', 'a').write(' '.join(['gh', *words]) + '\\n')\n"
-        "    runners = json.load(open(f'{state}/runners.json'))\n"
-        "    runners['runners'] = [r for r in runners['runners'] if r['id'] != int(found[1])]\n"
-        "    json.dump(runners, open(f'{state}/runners.json', 'w'))\n"
-        "    sys.exit(0)\n"
-        "os.execv(os.path.join(os.path.dirname(__file__), 'gh-labels'), ['gh', *words])\n"
-    )
-    stand_in.chmod(0o755)
+    _github_deletes_registrations(home)
     _home_settings(home, 0)
 
     done = home.install()
@@ -470,6 +474,7 @@ def test_home_moving_its_slots_while_office_is_down_is_refused(home: Machine) ->
         _office_runner("offline", 1),
         _office_runner("offline", 2),
     )
+    _github_deletes_registrations(home)
     _home_settings(home, 0)
 
     done = home.install()
