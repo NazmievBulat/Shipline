@@ -344,7 +344,12 @@ N" with these differences:
 
 ## "Review pull request N"
 
-A fresh context, always Claude Opus at high effort, started by `session start review N`.
+A fresh context, always Claude Opus, started by `session start review N`. It runs at medium
+effort, and at high when the change touches a path `review.high_effort_paths` of
+`shipline.json` names (stored data, text sent to a model, background work, locks and queues,
+account boundaries and security) or one of Shipline's own concurrent scripts, or when the
+description has the line `Review: high` on its own; `review-effort N` says which and why, and
+says high whenever it cannot tell.
 It knows only the description (the task), diff against the base, commits, code and rules
 from main. Do not read worker logs, transcripts, own reviews or ask the worker for a handover.
 Local `.local/workflow` session files are control notes, not review evidence. Panel reports
@@ -757,8 +762,13 @@ The orchestrator session does what needs judgment:
   number: `session start <worker|audit|review> N <level>`. `low` for a mechanical change (a rename, a
   one-line fix); `medium` for work whose description is complete and testable; `high` for work
   that touches stored data, text sent to a model, concurrency, or a design the description
-  leaves open. Audits and independent reviewers run at `high`. Without a level a worker gets `medium` and an audit
-  `high`; the tick starts workers with no level.
+  leaves open. Audits run at `high`. Without a level a worker gets `medium`, an audit `high`
+  and an independent reviewer `medium`, or `high` for the paths `review.high_effort_paths`
+  names, for Shipline's own concurrent scripts and for a description with the line
+  `Review: high` (`review-effort N`); a level given by hand wins, and a conflict resolution's
+  reviewer runs at `high`. The tick starts workers and reviewers with no level. When it opens a
+  ticket whose review needs `high` that no path shows (text sent to a model, say), it writes
+  `Review: high` on a line of its own in the description.
 - It may choose the model as the word after the level: `opus` or `sonnet`. The default model is
   Opus. `sonnet` is used only when all of these hold: the change is mechanical; the description
   names exactly what changes; existing tests would catch a mistake; it does not touch stored

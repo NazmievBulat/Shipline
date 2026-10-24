@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# The effort level of pull request N's independent reviewer, `high` or `medium`, and on
+# standard error why when it is `high` (`review_effort.py`); read-only.
+#
+#   review-effort N
+#
+# `session start review N` runs its reviewer at this level when no level is given.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec python3 -B "$here/review_effort.py" "$@"
