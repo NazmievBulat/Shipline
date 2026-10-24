@@ -65,6 +65,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import workflow_config
+
 HOME = Path(__file__).resolve().parents[2]
 NOTES = HOME / ".local" / "shipline"
 FETCH_EVERY_SECONDS = 10 * 60
@@ -389,13 +391,8 @@ def register_locks() -> None:
     if common is None:
         return
     main = common.parent if common.name == ".git" else repository.resolve()
-    state = ".local/workflow"
-    try:
-        given = json.loads((main / "shipline.json").read_text()).get("state_folder", state)
-        if isinstance(given, str) and given and not given.startswith("/") and ".." not in given:
-            state = given
-    except OSError, ValueError, AttributeError:
-        pass
+    # A bad config must stop the update before it could move an unrecorded gate's files.
+    state = workflow_config.load(main).state_folder
     known = (NOTES / "locks").read_text().splitlines() if (NOTES / "locks").exists() else []
     wanted = [str(common / "shipline-tick.lock"), str(main / state / "merge.lock")]
     wanted = [path for path in wanted if "\n" not in path and path not in known]

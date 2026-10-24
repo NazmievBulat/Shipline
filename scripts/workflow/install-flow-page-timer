@@ -21,6 +21,7 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$here/launcher-link"
 find_launcher
+remember_config
 # The repository (`workflow_config.py`): SHIPLINE_REPO, else the one of the current folder.
 config=$(python3 "$here/workflow_config.py" shell)
 eval "$config"
@@ -46,6 +47,7 @@ Description=Flow page: where the workflow's time goes and which stage is the bot
 Type=oneshot
 WorkingDirectory=$escaped
 Environment="PATH=${PATH//%/%%}"
+$(config_environment)
 ExecStart=$command
 UNIT
 
@@ -77,6 +79,7 @@ Description=Serves the flow page on the address and port of the machine's local 
 [Service]
 WorkingDirectory=$escaped
 Environment="PATH=${PATH//%/%%}"
+$(config_environment)
 ExecStart=$command --serve ${served#* }
 Restart=always
 RestartSec=30

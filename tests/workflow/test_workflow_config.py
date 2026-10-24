@@ -34,6 +34,7 @@ _GIT_ENV = {
 
 _DEFAULTS = {
     "repository": "example-owner/example-app",
+    "install_folder": None,
     "state_folder": ".local/workflow",
     "worktree_setup": "scripts/setup-worktree",
     "refresh": {"clear_generated": []},
@@ -921,7 +922,7 @@ def test_bash_without_a_file_reads_the_defaults(tmp_path: Path) -> None:
         ".local/workflow",
         "CI result",
         "0",
-        "{}",
+        "",
         "",
         "",
     ]
@@ -962,7 +963,7 @@ def test_bash_reads_no_hunt_areas_and_no_plans_by_default(tmp_path: Path) -> Non
 def _jq(config: str | None, labels: list[str], program: str = "priority_name") -> str:
     env = {**_GIT_ENV}
     if config is not None:
-        env["SHIPLINE_CONFIG"] = config
+        env["SHIPLINE_CONFIG_JSON"] = config
     done = subprocess.run(
         ["jq", "-r", "-L", str(_WORKFLOW), f'include "priority"; {program}'],
         input=json.dumps({"labels": [{"name": name} for name in labels]}),
@@ -990,7 +991,7 @@ def test_bash_and_jq_read_the_same_labels(tmp_path: Path) -> None:
         repo,
         {"labels": {"workflow": "shipline", "priority": {"blocker": "p0", "low": "p3"}}},
     )
-    config = _shell(repo, 'printf "%s" "$SHIPLINE_CONFIG"')
+    config = _shell(repo, 'printf "%s" "$SHIPLINE_CONFIG_JSON"')
 
     assert _jq(config, ["p0"]) == "blocker"
     assert _jq(config, ["p3", "priority: high"]) == "high"
@@ -1242,8 +1243,13 @@ _NAMED = {
 }
 
 
-def test_python_bash_node_and_jq_read_the_same_values(workflow: Workflow) -> None:
-    _commit_on_main(workflow, {"shipline.json": json.dumps(_NAMED)})
+@pytest.mark.parametrize("source", ["checkout", "home", "xdg", "explicit"])
+def test_python_bash_node_and_jq_read_the_same_values(workflow: Workflow, source: str) -> None:
+    if source == "checkout":
+        _commit_on_main(workflow, {"shipline.json": json.dumps(_NAMED)})
+    else:
+        path = _installation(workflow, source)
+        path.write_text(json.dumps(_NAMED))
     scripts = workflow.repo / "scripts/workflow"
     python = subprocess.run(
         [
@@ -1263,7 +1269,7 @@ def test_python_bash_node_and_jq_read_the_same_values(workflow: Workflow) -> Non
         [
             "bash",
             "-c",
-            'eval "$(python3 workflow_config.py shell)"; export SHIPLINE_CONFIG; '
+            'eval "$(python3 workflow_config.py shell)"; export SHIPLINE_CONFIG_JSON; '
             'echo "$SHIPLINE_STATE_FOLDER" "$SHIPLINE_LABEL_WORKFLOW"; '
             "for name in urgent 'priority: high'; do "
             '  jq -nr -L . --arg name "$name" '
@@ -1618,7 +1624,9 @@ def _installation(workflow: Workflow, source: str = "home") -> Path:
     return path
 
 
-def _read_installation(workflow: Workflow, form: str = "shell", cwd: Path | None = None):
+def _read_installation(
+    workflow: Workflow, form: str = "shell", cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["python3", str(workflow.script.parent / "workflow_config.py"), form],
         cwd=cwd or workflow.repo,
@@ -1784,3 +1792,104 @@ def test_installation_config_reaches_tick_wake_gate_and_install(workflow: Workfl
     done = workflow.shipline("install-timer")
     assert done.returncode == 0, done.stderr
     assert (workflow.state / "labels").read_text().split() == ["installed", "checked"]
+
+
+@pytest.mark.parametrize("source", ["explicit", "xdg"])
+def test_installed_timers_and_hooks_keep_the_config_lookup(workflow: Workflow, source: str) -> None:
+    install_shipline(workflow)
+    path = _installation(workflow, source)
+    path.write_text('{"state_folder": ".installation/state"}')
+    for command in ("install-hooks", "install-timer", "install-flow-page-timer"):
+        done = workflow.shipline(command)
+        assert done.returncode == 0, done.stderr
+    key = "SHIPLINE_CONFIG" if source == "explicit" else "XDG_CONFIG_HOME"
+    value = str(path) if source == "explicit" else workflow.env[key]
+    units = Path(workflow.env.get("XDG_CONFIG_HOME", str(Path(workflow.env["HOME"]) / ".config")))
+    for name in ("workflow-tick", "flow-page"):
+        service = (units / "systemd/user" / f"{name}.service").read_text()
+        assert f'Environment="{key}={value}"' in service.splitlines()
+    settings = json.loads((Path(workflow.env["HOME"]) / ".claude/settings.json").read_text())
+    command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+    assert command.startswith(f"{key}={value} bash ")
+    worktree = workflow.add_worktree(7)
+    clean = {k: v for k, v in workflow.env.items() if k not in ("SHIPLINE_CONFIG", "XDG_CONFIG_HOME")}
+    done = subprocess.run(["bash", "-c", command], cwd=worktree, env=clean,
+                          input="{}", capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    # Reinstalling updates the same hook, rather than adding a second one.
+    assert workflow.shipline("install-hooks").returncode == 0
+    again = json.loads((Path(workflow.env["HOME"]) / ".claude/settings.json").read_text())
+    assert again == settings
+    assert workflow.shipline("uninstall").returncode == 0
+    remaining = json.loads((Path(workflow.env["HOME"]) / ".claude/settings.json").read_text())
+    assert not remaining.get("hooks")
+
+
+def test_discovered_checkout_config_does_not_become_an_installation_in_a_child(
+    workflow: Workflow,
+) -> None:
+    workflow.env["SHIPLINE_CONFIG"] = ""
+    done = subprocess.run(
+        ["sh", "-c", 'config=$(python3 "$1" sh) || exit 1; eval "$config"; '
+         'python3 "$1" sh', "config", str(workflow.script.parent / "workflow_config.py")],
+        cwd=workflow.repo, env=workflow.env, capture_output=True, text=True, timeout=30,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "SHIPLINE_INSTALL_FOLDER=''\n" in done.stdout
+
+
+def test_launcher_anchors_explicit_config_before_switching_repositories(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    path = _installation(workflow, "explicit")
+    (path.parent / "check.py").write_text("print('installed')\n")
+    path.write_text('{"commands": {"pre_train_checks": "python3 @install/check.py"}}')
+    workflow.env["SHIPLINE_CONFIG"] = "installation/settings.json"
+    done = workflow.shipline("--repo", str(workflow.repo), "pre-train-checks", cwd=workflow.root)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "installed\n"
+
+
+def test_without_any_config_the_harness_reads_the_defaults(workflow: Workflow) -> None:
+    (workflow.repo / "shipline.json").unlink()
+    done = _read_installation(workflow)
+    assert done.returncode == 0, done.stderr
+    assert "SHIPLINE_STATE_FOLDER=.local/workflow\n" in done.stdout
+    assert "SHIPLINE_INSTALL_FOLDER=''\n" in done.stdout
+    assert "SHIPLINE_CONFIG=''\n" in done.stdout
+
+
+def test_home_lookup_uses_origin_when_runner_settings_name_no_repository(workflow: Workflow) -> None:
+    settings = workflow.repo / ".github/runner/settings.sh"
+    settings.write_text("# No repository named.\n")
+    workflow.git("remote", "set-url", "origin", "https://github.com/example-org/example-app.git")
+    path = _installation(workflow)
+    # A repository named inside the file must not influence which file is selected.
+    path.write_text('{"repository": "example-owner/other-app", "state_folder": ".installed"}')
+    done = _read_installation(workflow)
+    assert done.returncode == 0, done.stderr
+    assert "SHIPLINE_STATE_FOLDER=.installed\n" in done.stdout
+    assert "SHIPLINE_REPOSITORY=example-owner/other-app\n" in done.stdout
+
+
+def test_checkout_config_can_name_an_installation_folder(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    (workflow.root / "programs").mkdir()
+    (workflow.root / "programs/check.py").write_text("print('installed')\n")
+    (workflow.repo / "shipline.json").write_text(json.dumps({
+        "install_folder": "../programs",
+        "commands": {"pre_train_checks": "python3 @install/check.py"},
+    }))
+    done = workflow.shipline("pre-train-checks", cwd=workflow.add_worktree(7))
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "installed\n"
+
+
+@pytest.mark.parametrize("path", ["@install/../outside.py", "@install/", "@install/tools/../../outside"])
+def test_install_only_programs_cannot_escape_the_installation_folder(
+    workflow: Workflow, path: str
+) -> None:
+    config = _installation(workflow)
+    config.write_text(json.dumps({"commands": {"pre_train_checks": "python3 " + path}}))
+    done = _read_installation(workflow)
+    assert done.returncode == 1
+    assert done.stderr.startswith(str(config)) and "commands.pre_train_checks" in done.stderr

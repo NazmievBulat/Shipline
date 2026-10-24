@@ -937,9 +937,9 @@ cmd_start_hunt() {
   local screens
   # A hunt uses a copy of the application, which the repository's own command runs.
   ((${#SHIPLINE_COMMAND_HUNT_APP[@]} > 0)) ||
-    die "this repository names no hunt_app command in shipline.json, so a hunt has no app to use"
+    die "this repository names no hunt_app command in ${SHIPLINE_CONFIG:-shipline.json}, so a hunt has no app to use"
   [[ $program != cursor || ${#SHIPLINE_COMMAND_HUNT_CURSOR[@]} -gt 0 ]] ||
-    die "this repository names no hunt_cursor command in shipline.json, so it has no Cursor hunter"
+    die "this repository names no hunt_cursor command in ${SHIPLINE_CONFIG:-shipline.json}, so it has no Cursor hunter"
   case $kind in
     plan) prompt="Hunt for bugs with a plan, as $name, $HUNT_RULES" ;;
     explore) prompt="Hunt for bugs exploring, as $name, $HUNT_RULES" ;;
@@ -951,8 +951,8 @@ cmd_start_hunt() {
   if [[ -n $area ]]; then
     if ! screens=$(screens_of "$area"); then
       ((${#SHIPLINE_HUNT_AREAS[@]})) ||
-        die "$area is not a hunt area: shipline.json names none under hunts.areas"
-      die "$area is not a hunt area: shipline.json names ${SHIPLINE_HUNT_AREAS[*]}" \
+        die "$area is not a hunt area: ${SHIPLINE_CONFIG:-shipline.json} names none under hunts.areas"
+      die "$area is not a hunt area: ${SHIPLINE_CONFIG:-shipline.json} names ${SHIPLINE_HUNT_AREAS[*]}" \
         "under hunts.areas"
     fi
     [[ $prompt == *. ]] || prompt+=.

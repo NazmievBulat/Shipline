@@ -677,5 +677,5 @@ def test_a_repository_without_a_test_command_fails_its_test_job_saying_so(
 
     assert done.returncode == 1
     assert done.stderr == (
-        "shipline.json names no commands.test, the command that runs this repository's tests\n"
+        f"{workflow.repo / 'shipline.json'} names no commands.test, the command that runs this repository's tests\n"
     )

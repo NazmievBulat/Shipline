@@ -1169,7 +1169,7 @@ def test_without_a_selection_shipline_selects_nothing_and_says_the_whole_suite_r
     assert done.returncode == 0
     assert done.stdout == ""
     assert done.stderr == (
-        f"this repository names no {key} command in shipline.json: "
+        f"this repository names no {key} command in {workflow.repo / 'shipline.json'}: "
         "no test is selected, and CI runs the whole suite\n"
     )
 
@@ -1180,7 +1180,7 @@ def test_without_a_command_shipline_says_the_repository_has_none(workflow: Workf
     done = workflow.shipline("hunt-browser", "open", "/")
 
     assert done.returncode == 1
-    assert done.stderr == "this repository names no hunt_browser command in shipline.json\n"
+    assert done.stderr == f"this repository names no hunt_browser command in {workflow.repo / 'shipline.json'}\n"
 
 
 def test_shipline_knows_every_command_a_repository_may_name() -> None:

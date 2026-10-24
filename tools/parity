@@ -15,8 +15,9 @@ Shipline's trees are compared with their places in the checkout:
     runner/                     .github/runner/
 
 Each side is read as git's index holds it: the files git tracks, with their modes, as they were
-last added; a checkout in the middle of a merge is refused. The checkout's shipline.json and
-known list are read as they are on disk.
+last added; a checkout in the middle of a merge is refused. The config uses Shipline's normal
+lookup (SHIPLINE_CONFIG, the home installation, then the main checkout); it and the known list
+are read as they are on disk.
 
 Every changed, added or removed line is printed as a unified diff, Shipline's side first; a file
 on one side only as a diff with /dev/null, even when it is empty; a changed mode (executable or
@@ -24,7 +25,8 @@ not, a symlink, a submodule) as a `mode:` line. With `--summary`, one line per f
 `<added>+ <removed>- <shipline path> <checkout path>`, `-` for a side it is not on.
 
 The known differences are the installation's, in the file `parity.known` of its shipline.json
-names; without one, nothing is known. `tools/parity-known.txt` is an example. Each entry is one
+names; a relative path uses the main checkout first, then the installation folder, and
+`@install/` uses only the installation folder. Without one, nothing is known. `tools/parity-known.txt` is an example. Each entry is one
 line, directly below a `#` line that gives its reason:
 
     # Why the checkout keeps its hunts in a folder of their own.
@@ -169,22 +171,19 @@ def read_known(path: Path, name: str) -> list[Entry]:
     return entries
 
 
-def parity_of(checkout: Path) -> workflow_config.Parity:
-    """The `parity` section of the checkout's config; the rest of its file may hold what only
-    its own copy of the scripts reads."""
-    name = workflow_config.FILE
+def parity_of(checkout: Path) -> tuple[workflow_config.Parity, Path | None]:
+    """The shared file selection, with only parity's own values validated."""
     try:
-        text = (checkout / name).read_text()
-    except FileNotFoundError:
-        text = "{}"
-    except (OSError, UnicodeDecodeError) as error:
-        raise Refused(f"{name}: cannot be read: {error}") from None
-    try:
-        given = json.loads(text)
-    except ValueError as error:
-        raise Refused(f"{name} is not JSON: {error}") from None
-    try:
-        return workflow_config.parity_of(given)
+        main = workflow_config.main_checkout(checkout)
+        document = workflow_config.read_config(main)
+        with workflow_config._file_errors(document.path):
+            parity = workflow_config.parity_of(document.given)
+        known = None
+        if parity.known is not None:
+            known = workflow_config.resolve_file(
+                parity.known, main, document.install_folder, document.path
+            )
+        return parity, known
     except workflow_config.ConfigError as error:
         raise Refused(str(error)) from None
 
@@ -340,8 +339,9 @@ def _difference(
 
 def compare(shipline: Path, checkout: Path) -> tuple[list[Difference], list[Entry], str]:
     """What differs, file by file; the installation's known entries; and its known list's name."""
-    parity = parity_of(checkout)
-    known = read_known(checkout / parity.known, parity.known) if parity.known else []
+    parity, known_path = parity_of(checkout)
+    known_name = str(known_path) if known_path else ""
+    known = read_known(known_path, known_name) if known_path else []
     trees = [
         ("scripts/workflow/RULES.md", "AGENTS.md"),
         ("scripts/workflow/", "scripts/workflow/"),
@@ -379,7 +379,7 @@ def compare(shipline: Path, checkout: Path) -> tuple[list[Difference], list[Entr
         theirs_file = theirs_all[pair[1]] if pair[1] else None
         if found := _difference(pair, ours_file, theirs_file, held, rewrites):
             differences.append(found)
-    return differences, known, parity.known or ""
+    return differences, known, known_name
 
 
 def main(arguments: list[str]) -> int:

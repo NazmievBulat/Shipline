@@ -313,7 +313,7 @@ def _main_test(args: list[str]) -> int:
     config = workflow_config.current()
     if config.commands.test is None:
         print(
-            f"{workflow_config.FILE} names no commands.test, "
+            f"{config.path} names no commands.test, "
             "the command that runs this repository's tests",
             file=sys.stderr,
         )
