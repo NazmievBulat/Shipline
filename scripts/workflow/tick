@@ -48,6 +48,10 @@
 #      gets its recommended reply once it has waited `answer_for_owner_after_minutes` (15),
 #      once for the same words, and the wake is told; one without that line, or without a
 #      reply word, waits for the owner and is named in the wake once.
+#      A cloud worker whose draft had no push and no report for `cloud_wake_after_minutes`,
+#      with no open question, is woken once through `claude --cloud` and named in the wake if
+#      still quiet that long after; one whose question was answered is woken at once
+#      (`cloud_workers.py wake`).
 #   9. After the starts of step 6, the next draft without the label gets it when one may start
 #      (`ticket_starts.py`: by priority, then the older ticket, when its files overlap no running
 #      ticket's, nothing in `start-plan` holds it back, the machine has had room for 10
@@ -83,10 +87,11 @@
 # resend, a bridge and a start (without its link or figures), and the wake's check-in. It reads all
 # the real tick reads, the merge line as last saved (the gate's read path, without its lock), and
 # notes the train status whenever it changed. It does not run what only carries decisions out or
-# keeps records: the metrics, the cloud workers' poll, the worktree cleanup (it only drops from its
-# list the sessions cleanup stops, of a pull request closed without merging), main's report, the
-# merge driver, the automatic ticket start and the CI demand forecast. A start is logged when `session start` would make it:
-# no session of its pull request running, room for it, and for a reviewer the checks of
+# keeps records: the metrics, the cloud workers' poll and wake, the worktree cleanup (it only
+# drops from its list the sessions cleanup stops, of a pull request closed without merging),
+# main's report, the merge driver, the automatic ticket start and the CI demand forecast. A start
+# is logged when `session start` would make it: no session of its pull request running, room for
+# it, and for a reviewer the checks of
 # `reviewer_start.py` (and of the merge driver, for a hand-back's). Its own lock keeps a second
 # shadow tick out, and never the real one, nor a decision of `decide`.
 set -uo pipefail
@@ -1416,6 +1421,11 @@ while read -r name state _; do
     failed=1
   fi
 done <<<"$running"
+
+# A cloud worker whose draft had no push and no report for `cloud_wake_after_minutes`, with no
+# open question, is woken once per quiet stretch, and one whose question was answered at once.
+# A shadow tick wakes none: the wake is sent and noted by `cloud_workers.py` itself.
+((shadow)) || python3 -B "$here/cloud_workers.py" wake "$main" "$snapshot" 9>&- || failed=1
 
 # A question to the owner marked `Owner only: no` gets its recommended reply once it has waited,
 # from the notes the stop hook wrote (`notify`): the time it was asked and the reply. Once for

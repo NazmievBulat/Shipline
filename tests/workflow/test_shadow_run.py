@@ -348,6 +348,33 @@ def test_the_runner_balancer_s_change_is_told_by_the_shadow_s_wake_and_no_foreca
     assert (state / "runner-balance.told").read_text() == change + "\n"
 
 
+def test_a_shadow_tick_neither_polls_nor_wakes_a_cloud_worker(workflow: Workflow) -> None:
+    # The cloud workers' poll and wake send and note what they find themselves: a shadow tick
+    # runs neither, and the real tick both.
+    workers = workflow.script.with_name("cloud_workers.py")
+    os.replace(workers, workers.with_name("cloud_workers.real.py"))
+    workers.write_text(
+        "import os, subprocess, sys\n"
+        "if sys.argv[1] in ('poll', 'wake'):\n"
+        "    with open(os.environ['CLOUD_CALLS'], 'a') as calls:\n"
+        "        calls.write(sys.argv[1] + '\\n')\n"
+        "sys.exit(subprocess.call([sys.executable, '-B', __file__.replace('cloud_workers.py',"
+        " 'cloud_workers.real.py'), *sys.argv[1:]]))\n"
+    )
+    calls = workflow.root / "cloud-calls"
+    env = {**_CLOCK, "CLOUD_CALLS": str(calls)}
+
+    shadow = workflow.run_script("tick", "--shadow", env=env)
+
+    assert shadow.returncode == 0, shadow.stdout + shadow.stderr
+    assert not calls.exists()
+
+    real = workflow.run_script("tick", env=env)
+
+    assert real.returncode == 0, real.stdout + real.stderr
+    assert calls.read_text().split() == ["poll", "wake"]
+
+
 @pytest.mark.parametrize(("five", "starts"), [(40, True), (90, False)], ids=["room", "held"])
 def test_the_daily_analyst_starts_in_a_shadow_tick_as_in_the_real_one(
     workflow: Workflow, five: int, starts: bool
