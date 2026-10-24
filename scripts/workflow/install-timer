@@ -19,6 +19,7 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$here/launcher-link"
 find_launcher
+remember_config
 # The repository (`workflow_config.py`): SHIPLINE_REPO, else the one of the current folder.
 config=$(python3 "$here/workflow_config.py" shell)
 eval "$config"
@@ -75,6 +76,7 @@ Description=Workflow tick: starts workers, squeezes idle sessions, removes what 
 Type=oneshot
 WorkingDirectory=$escaped
 Environment="PATH=${PATH//%/%%}"
+$(config_environment)
 Environment="SHIPLINE_REPO=$escaped"
 ${TMUX_TMPDIR:+Environment=\"TMUX_TMPDIR=${TMUX_TMPDIR//%/%%}\"}
 ExecStart="${escaped_launcher//\$/\$\$}" tick

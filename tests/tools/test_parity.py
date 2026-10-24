@@ -47,10 +47,13 @@ def _shipline(tmp_path: Path, files: dict[str, str]) -> Path:
     return root
 
 
-def _parity(shipline: Path, checkout: Path, *options: str) -> subprocess.CompletedProcess[str]:
+def _parity(
+    shipline: Path, checkout: Path, *options: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     # Run by the interpreter: CI's temporary folders may not run programs.
     return subprocess.run(
         [sys.executable, "-B", str(shipline / "tools/parity"), *options, str(checkout)],
+        env=env,
         capture_output=True,
         text=True,
         timeout=60,
@@ -162,7 +165,7 @@ def test_a_checkout_config_it_cannot_read_is_refused(
 
     assert done.returncode == 2
     assert done.stdout == ""
-    assert done.stderr.startswith(refusal)
+    assert done.stderr.startswith(str(tmp_path / "app") + "/" + refusal)
 
 
 def test_files_outside_the_trees_are_not_compared(tmp_path: Path) -> None:
@@ -467,7 +470,7 @@ def test_only_a_star_is_a_wildcard_in_a_rewrite_s_path(tmp_path: Path) -> None:
 
     assert done.returncode == 1
     assert "-a" in done.stdout.splitlines()
-    assert done.stdout.splitlines()[-1].startswith(f"unused: {_AT}:2: ")
+    assert done.stdout.splitlines()[-1].startswith(f"unused: {tmp_path / 'app' / _AT}:2: ")
 
 
 def test_a_rename_of_the_scripts_folder_leaves_the_rules_paired_with_agents_md(
@@ -563,8 +566,8 @@ def test_a_known_difference_found_nowhere_is_printed(tmp_path: Path) -> None:
 
     assert done.returncode == 1
     assert done.stdout == (
-        f"unused: {_AT}:2: rewrite scripts/workflow/tick |$SHIPLINE_NOWHERE|example/app|\n"
-        f"unused: {_AT}:5: rename scripts/workflow/old scripts/workflow/older\n"
+        f"unused: {tmp_path / 'app' / _AT}:2: rewrite scripts/workflow/tick |$SHIPLINE_NOWHERE|example/app|\n"
+        f"unused: {tmp_path / 'app' / _AT}:5: rename scripts/workflow/old scripts/workflow/older\n"
     )
 
 
@@ -596,7 +599,7 @@ def test_a_known_list_it_cannot_read_is_refused(tmp_path: Path, known: str, refu
 
     assert done.returncode == 2
     assert done.stdout == ""
-    assert done.stderr.startswith(f"{_AT}: {refusal}")
+    assert done.stderr.startswith(f"{tmp_path / 'app' / _AT}: {refusal}")
 
 
 def test_a_folder_that_is_no_checkout_is_refused(tmp_path: Path) -> None:
@@ -760,7 +763,7 @@ def test_a_known_list_the_config_names_but_that_is_not_there_is_refused(tmp_path
 
     assert done.returncode == 2
     assert done.stdout == ""
-    assert done.stderr.startswith(f"{_AT}: cannot be read")
+    assert done.stderr.startswith(f"{tmp_path / 'app' / _AT}: cannot be read")
 
 
 def test_the_summary_gives_one_line_per_file(tmp_path: Path) -> None:
@@ -780,7 +783,7 @@ def test_the_summary_gives_one_line_per_file(tmp_path: Path) -> None:
         "0+ 2- scripts/workflow/gone -\n"
         "2+ 1- scripts/workflow/tick scripts/workflow/tick\n"
         "1+ 0- - tests/workflow/test_new.py\n"
-        f"unused: {_AT}:2: rename scripts/workflow/old scripts/workflow/older\n"
+        f"unused: {tmp_path / 'app' / _AT}:2: rename scripts/workflow/old scripts/workflow/older\n"
     )
 
 
@@ -797,7 +800,7 @@ def test_shipline_s_example_known_list_is_read(tmp_path: Path) -> None:
     assert entries
     assert (done.returncode, done.stderr) == (1, "")
     assert done.stdout.splitlines() == [
-        f"unused: {_AT}:{number}: {line}"
+        f"unused: {tmp_path / 'app' / _AT}:{number}: {line}"
         for number, line in enumerate(_KNOWN.read_text().splitlines(), 1)
         if line in entries
     ]
@@ -812,3 +815,46 @@ def test_shipline_s_tool_runs() -> None:
         check=True,
     )
     assert done.stdout.startswith("100755 ")
+
+
+@pytest.mark.parametrize("source", ["home", "xdg", "explicit"])
+@pytest.mark.parametrize("qualified", [False, True])
+def test_parity_reads_an_installation_config_and_its_known_list(
+    tmp_path: Path, source: str, qualified: bool
+) -> None:
+    shipline = _shipline(tmp_path, {"scripts/workflow/tick": "before\n"})
+    checkout = _checkout(tmp_path / "app", {"scripts/workflow/tick": "after\n",
+                                            "shipline.json": "{"})
+    subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin",
+                    "https://github.com/example-org/example-app.git"], check=True)
+    env = {**os.environ, "HOME": str(tmp_path / "home")}
+    env.pop("SHIPLINE_CONFIG", None)
+    env.pop("XDG_CONFIG_HOME", None)
+    if source == "explicit":
+        path = tmp_path / "installation" / "settings.json"
+        env["SHIPLINE_CONFIG"] = str(path)
+    else:
+        base = tmp_path / "home" / ".config"
+        if source == "xdg":
+            base = tmp_path / "config"
+            env["XDG_CONFIG_HOME"] = str(base)
+        path = base / "shipline/example-org-example-app/shipline.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"install_folder": "programs", "parity": {
+        "known": ("@install/" if qualified else "") + "parity.known"},
+        "installation_only_key": "parity ignores other sections"}))
+    installed = path.parent / "programs"
+    installed.mkdir()
+    known = installed / "parity.known"
+    known.write_text("# Expected installation change.\nrewrite scripts/workflow/tick |before|after|\n")
+    done = _parity(shipline, checkout, env=env)
+    assert (done.returncode, done.stdout, done.stderr) == (0, "", "")
+    # The normal checkout-first order still applies, unless @install/ was requested.
+    (checkout / "parity.known").write_text("")
+    done = _parity(shipline, checkout, env=env)
+    assert done.returncode == (0 if qualified else 1), done.stderr
+    if qualified:
+        known.unlink()
+        done = _parity(shipline, checkout, env=env)
+        assert done.returncode == 2
+        assert done.stderr.startswith(str(known) + ": cannot be read")
