@@ -2727,12 +2727,11 @@ class Train:
                     and (member.get("kept") or number in self.restored)
                 ):
                     # A restored prefix's own PR checks stay green while its replacement runs.
-                    # Only an independent, passed prefix may take that pending turn.
-                    state = _suite_state(member["scratch"])
-                    if state in (None, "pending"):
+                    # A completed independent prefix takes a turn to prove its tree or have
+                    # its failure handled by the gate; planning never authorizes its merge.
+                    prefix = _suite_state(member["scratch"])
+                    if prefix in (None, "pending"):
                         self.pending.append(number)
-                        continue
-                    if state != "green":
                         continue
                 images = runs("images", head, pull=True)
                 if images:
@@ -2755,10 +2754,12 @@ class Train:
                 # Unreadable evidence never grants a later member a turn.
                 continue
         # A prefix cannot go past a pending member it contains. Independent kept work can.
+        kept = any(member.get("kept") for member in members)
         batched = {
             member["number"]
             for member in members
-            if not set(member["ahead"]) & set(self.pending)
+            if not member["ahead"]
+            or (not kept and not set(member["ahead"]) & set(self.pending))
         }
         if self.pending:
             # Only a member behind a pending one takes its turn. A green member ahead of

@@ -5605,6 +5605,39 @@ def test_a_new_priority_front_still_invalidates_the_kept_line(github: GitHub) ->
     assert _merges(github) == []
 
 
+@pytest.mark.parametrize("descendant_passed", [False, True], ids=["pending", "passed"])
+def test_a_failed_kept_root_frees_capacity_for_the_restored_prefix(
+    github: GitHub, descendant_passed: bool
+) -> None:
+    _restored_before_eight(github, passed=False)
+    assert _batch_call(github).returncode == 1
+    for _ in range(2):
+        assert _batch_call(github).returncode == 3
+        assert _scratch(github, "7")["pushed"] is False
+    _finish_prefix(github, "8", conclusion="failure", run_id=1100)
+    if descendant_passed:
+        _finish_prefix(github, "9", run_id=2100)
+    github.save()
+    # Status reads keep nominating the failed independent root, not its dependent result
+    # or the restored member whose scratch branch cannot start until a slot is released.
+    for _ in range(3):
+        assert _train(github)["first"] == "8"
+    done = _batch_call(github, "8")
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "prefix failed" in done.stderr
+    assert _batch_state(github)["blocked"]["8"] == github.pulls["8"]["headRefOid"]
+    restored = _scratch(github, "7")
+    assert restored["pushed"] is True
+    assert _numbers(github) == ["7"]
+    for _ in range(2):
+        assert _batch_call(github).returncode == 3
+        assert _scratch(github, "7")["branch"] == restored["branch"]
+    _finish_prefix(github, "7", run_id=3100)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7"]
+
+
 @pytest.mark.parametrize("number", ["7", "9"])
 def test_a_member_requiring_migration_compatibility_uses_the_single_path(
     github: GitHub, number: str
