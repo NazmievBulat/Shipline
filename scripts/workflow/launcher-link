@@ -1,0 +1,26 @@
+# Sourced by `install-hooks` and `install-timer`. Where the scripts' checkout keeps its launcher,
+# and the link `~/.local/bin/shipline` to it, so `shipline` is found on the owner's PATH.
+
+# Sets home and launcher: the Shipline checkout these scripts are in, and its `bin/shipline`.
+find_launcher() {
+  home=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+  launcher=$home/bin/shipline
+  [[ -f $launcher ]] || {
+    echo "$home has no bin/shipline: run this from a checkout of Shipline" >&2
+    exit 1
+  }
+}
+
+# A link that points elsewhere, an older checkout's, is pointed at this one. A file of the
+# owner's own at that place is left as it is.
+link_launcher() {
+  local link=$HOME/.local/bin/shipline
+  if [[ -e $link && ! -L $link ]]; then
+    echo "$link is not a link to Shipline; it was left as it is" >&2
+    return 0
+  fi
+  [[ $(readlink "$link" 2>/dev/null) != "$launcher" ]] || return 0
+  mkdir -p "$(dirname "$link")"
+  ln -sfn "$launcher" "$link"
+  echo "$link now runs $launcher"
+}

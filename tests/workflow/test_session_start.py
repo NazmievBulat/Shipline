@@ -27,6 +27,8 @@ _ALLOWED_VARIABLES = {
     "XDG_RUNTIME_DIR",
     "XDG_STATE_HOME",
     "WORKFLOW_SESSION",
+    # The repository's main checkout, for `shipline` and the hooks in the session.
+    "SHIPLINE_REPO",
 }
 # What the shell that runs the stand-in `tmux` adds by itself.
 _SHELL_VARIABLES = {"PWD", "SHLVL", "_", "OLDPWD"}
@@ -193,6 +195,7 @@ def test_the_session_sees_only_the_listed_variables(workflow: Workflow) -> None:
     assert set(seen) - _SHELL_VARIABLES == _ALLOWED_VARIABLES | {"TMUX_TMPDIR"}
     assert seen["WORKFLOW_SESSION"] == "ticket-7"
     assert seen["HOME"] == workflow.env["HOME"]
+    assert seen["SHIPLINE_REPO"] == str(workflow.repo)
     gh_bin = workflow.script.parent / "gh-bin"
     assert seen["PATH"] == f"{gh_bin}:{workflow.env['PATH']}"
 
@@ -497,6 +500,46 @@ def test_a_bad_load_ceiling_does_not_stop_the_listing_the_tick_reads(
 
     assert done.returncode == 0, done.stderr
     assert "WORKFLOW_LOAD_PER_PROCESSOR" not in done.stderr
+
+
+def _screen_seen(workflow: Workflow, name: str, at: int) -> None:
+    """The tick's note: the sum of the screen and when it last changed, in seconds."""
+    folder = workflow.repo / ".local" / "workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{name}.screen-seen").write_text(f"123456 {at}\n")
+
+
+def test_the_listing_shows_when_the_tick_last_saw_a_screen_change(workflow: Workflow) -> None:
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    workflow.running("audit-8")
+    _screen_seen(workflow, "ticket-7", 1_790_000_000)
+
+    done = workflow.run("list")
+
+    assert done.returncode == 0, done.stderr
+    assert done.stderr == ""
+    # A session the tick has not looked at yet has no time.
+    assert done.stdout.splitlines() == [
+        "audit-8  busy  0 MB held  0 MB in swap",
+        "ticket-7  busy  0 MB held  0 MB in swap  screen changed Sep 21, 2026, 2:13pm (UTC)",
+    ]
+
+
+def test_the_screen_change_comes_before_the_limit_the_tick_reads_last(
+    workflow: Workflow,
+) -> None:
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    workflow.screen("● Working.\n  ⎿  You've hit your session limit · resets 4pm\n", "ticket-7")
+    _screen_seen(workflow, "ticket-7", 1_790_000_000)
+
+    done = workflow.run("list")
+
+    assert done.stdout.splitlines() == [
+        "ticket-7  limit  0 MB held  0 MB in swap  screen changed Sep 21, 2026, 2:13pm (UTC)"
+        "  session limit  resets 4pm"
+    ]
 
 
 @pytest.mark.parametrize(("processors", "waits"), [(4, True), (8, False)])
