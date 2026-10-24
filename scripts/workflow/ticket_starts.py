@@ -68,6 +68,10 @@ MODEL_CALLS_PER_PICK = 3
 ASK_AGAIN_SECONDS = 30 * 60
 MODEL = "claude-haiku-5-5"
 MODEL_SECONDS = 90
+# A fetch of the tickets' heads, and any other git call; `decide` makes them under its lock,
+# which the tick's starts wait for. One fetch that stalls ends the fetches of that pick or call.
+FETCH_SECONDS = 15
+GIT_SECONDS = 60
 # The usage rule the orchestrator kept for its starts (AGENTS.md, the wake's check-in).
 USAGE_CEILING = 85
 USAGE_RESET_SECONDS = 3600
@@ -158,7 +162,10 @@ def heading_files(body: str) -> list[str]:
 
 def model_files(body: str, main: Path) -> list[str] | None:
     """Ask the model once; None when it gave no path."""
-    folders = git(main, "ls-tree", "-r", "-d", "--name-only", "HEAD")
+    try:
+        folders = git(main, "ls-tree", "-r", "-d", "--name-only", "HEAD")
+    except OSError:
+        return None
     question = (
         f"The directories of the repository:\n{folders}\n\n"
         f"The description of the change, between the lines of dashes:\n----------\n{body}\n"
@@ -196,13 +203,24 @@ def model_files(body: str, main: Path) -> list[str] | None:
     return list(dict.fromkeys(paths)) or None
 
 
-def git(main: Path, *arguments: str) -> str:
-    done = subprocess.run(
-        ["git", "-C", str(main), *arguments], capture_output=True, text=True, check=False
-    )
+def git(main: Path, *arguments: str, timeout: float = GIT_SECONDS) -> str:
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(main), *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise Stalled(f"git {arguments[0]} gave no answer in {timeout:.0f} s") from None
     if done.returncode != 0:
         raise OSError(f"git {arguments[0]} failed: {done.stderr.strip()}")
     return done.stdout.strip()
+
+
+class Stalled(OSError):
+    """A git call ran out of its time: the network, most likely, gave no answer."""
 
 
 @dataclass
@@ -213,6 +231,8 @@ class Files:
     model_calls: int = MODEL_CALLS_PER_PICK
     # The tickets the model was asked about in this pick, answered or not.
     asked: set[str] = field(default_factory=set)
+    # A fetch ran out of its time: no other is tried, and the heads not fetched stay unknown.
+    stalled: bool = False
 
     @property
     def notes(self) -> Path:
@@ -244,7 +264,7 @@ class Files:
             kept = self.kept(str(pull["number"]))
             if kept is None or kept[1][-1] != pull["headRefOid"]:
                 wanted.append(pull)
-        if not wanted:
+        if not wanted or self.stalled:
             return set()
         main = "+refs/heads/main:refs/workflow/files/main"
         specs = {
@@ -262,16 +282,34 @@ class Files:
                 "origin",
                 main,
                 *specs.values(),
+                timeout=FETCH_SECONDS,
             )
             return set(specs)
+        except Stalled as error:
+            self.stalled = True
+            print(f"cannot fetch the heads of tickets: {error}", file=sys.stderr)
+            return set()
         except OSError as error:
             print(f"cannot fetch the heads of tickets together: {error}", file=sys.stderr)
         # One branch gone, as after a rename, fails the whole fetch: the others are fetched alone.
         fetched = set()
         for number, spec in specs.items():
             try:
-                git(self.main, "fetch", "--quiet", "--no-write-fetch-head", "origin", main, spec)
+                git(
+                    self.main,
+                    "fetch",
+                    "--quiet",
+                    "--no-write-fetch-head",
+                    "origin",
+                    main,
+                    spec,
+                    timeout=FETCH_SECONDS,
+                )
                 fetched.add(number)
+            except Stalled as error:
+                self.stalled = True
+                print(f"cannot fetch the head of {number}: {error}", file=sys.stderr)
+                break
             except OSError as error:
                 print(f"cannot fetch the head of {number}: {error}", file=sys.stderr)
         return fetched
@@ -361,7 +399,11 @@ def labels_of(pull: dict[str, Any]) -> set[str]:
 
 def running_numbers() -> set[str]:
     done = subprocess.run(
-        ["bash", str(here / "session"), "list"], capture_output=True, text=True, check=False
+        ["bash", str(here / "session"), "list"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=GIT_SECONDS,
     )
     return set(re.findall(r"^(?:ticket|audit|review|codex)-([0-9]+)\s", done.stdout, re.M))
 
@@ -379,7 +421,11 @@ def train_numbers(notes: Path) -> set[str]:
 def machine_wait(notes: Path, moment: int) -> str | None:
     """Why the machine holds a start now, or None. Counts the minutes of room as it goes."""
     room = subprocess.run(
-        ["bash", str(here / "session"), "room"], capture_output=True, text=True, check=False
+        ["bash", str(here / "session"), "room"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=GIT_SECONDS,
     )
     record = notes / "room"
     try:
@@ -400,8 +446,17 @@ def machine_wait(notes: Path, moment: int) -> str | None:
         last = 0
     if moment - last < QUIET_SECONDS:
         return "a session started in the last 5 minutes"
+    return usage_wait(moment)
+
+
+def usage_wait(moment: int) -> str | None:
+    """Why the 5-hour usage window holds a start now, or None. `decide` asks it too."""
     usage = subprocess.run(
-        ["bash", str(here / "usage")], capture_output=True, text=True, check=False
+        ["bash", str(here / "usage")],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=GIT_SECONDS,
     )
     for line in usage.stdout.splitlines():
         words = line.split()
@@ -456,103 +511,171 @@ def add_label(number: str) -> bool:
     return done.returncode == 0
 
 
+def order(pull: dict[str, Any]) -> tuple[int, int]:
+    """Where a ticket stands among the waiting: by priority, then the older ticket."""
+    return (priority.rank(priority.of(pull.get("labels"))), pull["number"])
+
+
+@dataclass
+class Queue:
+    """The drafts that wait for their start and the tickets that run, as one pick sees them."""
+
+    main: Path
+    open_pulls: dict[str, dict[str, Any]]
+    held_all: bool
+    held: set[str]
+    after: dict[str, set[str]]
+    unclear: list[str]
+    busy: dict[str, dict[str, Any]]
+    candidates: list[dict[str, Any]]
+    files: Files = field(init=False)
+    fetched: set[str] = field(default_factory=set)
+    busy_files: dict[str, list[str] | None] = field(default_factory=dict)
+
+    @classmethod
+    def read(cls, main: Path, open_pulls: dict[str, dict[str, Any]]) -> Queue:
+        notes = main / CONFIG.state_folder
+        held_all, held, after, unclear = read_plan(notes / "start-plan")
+        sessions = running_numbers()
+        cloud = {path.name.removeprefix("cloud-") for path in notes.glob("cloud-[0-9]*")}
+        train = train_numbers(notes)
+        working = sessions | cloud | train
+        busy = {
+            number: pull
+            for number, pull in open_pulls.items()
+            if (LABEL in labels_of(pull) or number in working)
+            and not (
+                number in train
+                and not pull.get("isDraft")
+                and number not in sessions
+                and number not in cloud
+            )
+        }
+        candidates = sorted(
+            (
+                pull
+                for number, pull in open_pulls.items()
+                if pull.get("isDraft")
+                and number not in busy
+                and not has_line(pull.get("body") or "", CLOUD_MARK)
+                and not has_line(pull.get("body") or "", OWNER_MARK)
+            ),
+            key=order,
+        )
+        return cls(main, open_pulls, held_all, held, after, unclear, busy, candidates)
+
+    def __post_init__(self) -> None:
+        self.files = Files(self.main)
+
+    def look(self, *more: dict[str, Any]) -> None:
+        """Fetch the heads of the running tickets, the waiting ones and `more`, and find the
+        files of the running ones."""
+        self.fetched |= self.files.fetch(list(self.busy.values()) + self.candidates + list(more))
+        self.busy_files = {
+            number: self.files.of(pull, self.fetched) for number, pull in sorted(self.busy.items())
+        }
+
+    def files_of(self, pull: dict[str, Any]) -> list[str] | None:
+        if str(pull["number"]) not in self.fetched:
+            self.fetched |= self.files.fetch([pull])
+        return self.files.of(pull, self.fetched)
+
+    @property
+    def unknown(self) -> list[str]:
+        return sorted(
+            (number for number, found in self.busy_files.items() if found is None), key=int
+        )
+
+    def sharing(self, found: list[str]) -> list[tuple[str, str]]:
+        """Each running ticket that shares a path with `found`, with the first path shared."""
+        shared = []
+        for other, theirs in self.busy_files.items():
+            both = next(
+                (
+                    both
+                    for mine in found
+                    for their in theirs or []
+                    if (both := overlap(mine, their))
+                ),
+                None,
+            )
+            if both:
+                shared.append((other, both))
+        return shared
+
+    def reason(self, pull: dict[str, Any], found: list[str] | None) -> str | None:
+        """Why this draft does not start now, by the plan and the files; None when it may."""
+        number = str(pull["number"])
+        if number in self.held:
+            return f"hold {number} in start-plan"
+        if waits := sorted(self.after.get(number, set()) & set(self.open_pulls), key=int):
+            return f"{number} after {', '.join(waits)} in start-plan"
+        if pull.get("baseRefName") != "main":
+            base = pull.get("baseRefName")
+            branches = {other.get("headRefName"): n for n, other in self.open_pulls.items()}
+            return f"built on {branches.get(base, base)}, not on main"
+        if found is None:
+            return "its files are not known yet"
+        if unknown := self.unknown:
+            return f"the files of {', '.join(unknown)} are not known yet"
+        if shared := self.sharing(found):
+            other, both = shared[0]
+            return f"shares {both} with {other}"
+        return None
+
+
 def pick(main: Path, snapshot: Path) -> int:
+    import decisions
+
     notes = main / CONFIG.state_folder
     notes.mkdir(parents=True, exist_ok=True)
     moment = now()
     pulls: dict[str, dict[str, Any]] = json.loads(snapshot.read_text())
     open_pulls = {number: pull for number, pull in pulls.items() if pull.get("state") == "OPEN"}
-    held_all, held, after, unclear = read_plan(notes / "start-plan")
+    # A hold `decide` recorded ends when its ticket or the one it waits for closes, or once
+    # its ticket started. The tick holds the lock of `decide` while it picks.
+    decisions.repair(notes)
+    decisions.close_holds(notes, open_pulls, moment)
+    unfinished = decisions.unfinished(notes)
+    queue = Queue.read(main, open_pulls)
     # Measured every pick, so the minutes of room are counted even while nothing waits.
     machine = machine_wait(notes, moment)
 
-    if held_all:
+    if queue.held_all:
         tell(notes, {"all": "automatic starts are held: hold all in start-plan"}, None)
         return 0
-    if unclear:
+    if queue.unclear:
         # A rule mistyped may be a hold: nothing starts until it is written so it is understood.
-        line = f"automatic starts are held: start-plan line not understood: {unclear[0]}"
+        line = f"automatic starts are held: start-plan line not understood: {queue.unclear[0]}"
         tell(notes, {"all": line}, None)
         return 0
 
-    sessions = running_numbers()
-    cloud = {path.name.removeprefix("cloud-") for path in notes.glob("cloud-[0-9]*")}
-    train = train_numbers(notes)
-    working = sessions | cloud | train
-    busy = {
-        number: pull
-        for number, pull in open_pulls.items()
-        if (LABEL in labels_of(pull) or number in working)
-        and not (
-            number in train
-            and not pull.get("isDraft")
-            and number not in sessions
-            and number not in cloud
-        )
-    }
-    candidates = sorted(
-        (
-            pull
-            for number, pull in open_pulls.items()
-            if pull.get("isDraft")
-            and number not in busy
-            and not has_line(pull.get("body") or "", CLOUD_MARK)
-            and not has_line(pull.get("body") or "", OWNER_MARK)
-        ),
-        key=lambda pull: (priority.rank(priority.of(pull.get("labels"))), pull["number"]),
-    )
-
-    if not candidates:
+    if not queue.candidates:
         # Nothing waits: the files of running tickets matter only beside a draft's.
         tell(notes, {}, None)
         return 0
-    files = Files(main)
-    fetched = files.fetch(list(busy.values()) + candidates)
-    busy_files = {number: files.of(pull, fetched) for number, pull in sorted(busy.items())}
-    unknown = sorted((number for number, found in busy_files.items() if found is None), key=int)
-    branches = {pull.get("headRefName"): number for number, pull in open_pulls.items()}
+    queue.look()
 
     lines: dict[str, str] = {}
     chosen: dict[str, Any] | None = None
-    for pull in candidates:
+    for pull in queue.candidates:
         number = str(pull["number"])
-        found = files.of(pull, fetched)
-        reason = None
-        if number in held:
-            reason = f"hold {number} in start-plan"
-        elif waits := sorted(after.get(number, set()) & set(open_pulls), key=int):
-            reason = f"{number} after {', '.join(waits)} in start-plan"
-        elif pull.get("baseRefName") != "main":
-            base = pull.get("baseRefName")
-            reason = f"built on {branches.get(base, base)}, not on main"
-        elif found is None:
-            reason = "its files are not known yet"
-        elif unknown:
-            reason = f"the files of {', '.join(unknown)} are not known yet"
+        found = queue.files.of(pull, queue.fetched)
+        if number in unfinished:
+            # The orchestrator's decision on it is not finished: the next call of `decide` does.
+            reason = f"a decision on {number} is not finished"
         else:
-            for other, theirs in busy_files.items():
-                shared = next(
-                    (
-                        both
-                        for mine in found
-                        for their in theirs or []
-                        if (both := overlap(mine, their))
-                    ),
-                    None,
-                )
-                if shared:
-                    reason = f"shares {shared} with {other}"
-                    break
+            reason = queue.reason(pull, found)
         if reason is None:
             chosen = pull
             break
         if len(lines) < TOLD_WAITS:
             lines[number] = f"{number} waits: {reason}"
     # Files are found for the drafts after the chosen one too, once each, as the calls allow.
-    for pull in candidates:
-        if files.model_calls <= 0:
+    for pull in queue.candidates:
+        if queue.files.model_calls <= 0:
             break
-        files.of(pull, fetched)
+        queue.files.of(pull, queue.fetched)
 
     started = None
     if chosen is not None:

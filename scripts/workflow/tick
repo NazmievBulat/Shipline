@@ -153,7 +153,7 @@ trap 'rm -rf "$WORKFLOW_TRAIN_TICK"' EXIT
 # The lock is closed for everything the tick calls: a `tmux` server started here lives on
 # after the tick, and would hold the lock for as long as its session runs.
 session() {
-  bash "$here/session" "$@" 9>&-
+  bash "$here/session" "$@" 9>&- 8>&-
 }
 
 # An audit ends with "audit finished", a worker with "worker finished", a hunt with "hunt
@@ -1159,6 +1159,37 @@ codex_candidate() {
   [[ $program == codex || -e $notes/codex-built-$1 ]]
 }
 
+# The starts, the program each worker gets and its launch, and the next ticket's label, go under
+# the lock of `decide`: an orchestrator's decision and the tick's start never cross. Every
+# session the tick starts closes it, as it closes the tick's own.
+# Whether the starts and the pick go in this tick: the lock is held and what they read is fresh.
+starts_go=0
+exec 8>"$common/shipline-decide.lock"
+if flock --timeout 60 8; then
+  starts_go=1
+  # A decision made since the snapshot may have labelled a ticket or chosen its program.
+  records=$main/$SHIPLINE_STATE_FOLDER/decisions.jsonl
+  if [[ -e $records && $records -nt $snapshot ]]; then
+    if ! python3 "$here/tick_snapshot.py" create "$snapshot" 9>&- 8>&- || ! pulls=$(labelled_pulls); then
+      echo "cannot list the pull requests again after a decision; starts wait for the next tick" >&2
+      pulls=""
+      starts_go=0
+      failed=1
+    fi
+  fi
+  # A ticket whose decision is not finished waits for the next call of `decide` to finish it.
+  if ! unfinished=$(python3 -B "$here/decisions.py" unfinished 9>&- 8>&-); then
+    echo "cannot read the decisions; starts wait for the next tick" >&2
+    pulls=""
+    starts_go=0
+    failed=1
+  fi
+else
+  echo "a decision holds the lock of decide; starts wait for the next tick"
+  pulls=""
+  unfinished=""
+fi
+
 # A start that waits for memory (75) holds later local starts. Cloud starts use no
 # local worker memory, so they can still go ahead; nothing else is asked about.
 started=0
@@ -1166,6 +1197,7 @@ local_starts_held=0
 while read -r number draft base; do
   ((started != 75)) || local_starts_held=1
   [[ $number =~ ^[0-9]+$ ]] || continue
+  ! grep -qxF "$number" <<<"$unfinished" || continue
   if ((local_starts_held)); then
     [[ $draft == true ]] && cloud_candidate "$number" || continue
   fi
@@ -1247,8 +1279,11 @@ python3 -B "$here/reviewer_start.py" --reconcile "$main/$SHIPLINE_STATE_FOLDER" 
 
 # After this tick's own starts, which count as starts too: the next draft ticket gets the label
 # when one may start, and the next tick starts its worker.
-python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
-  failed=1
+if ((starts_go)); then
+  python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
+    failed=1
+fi
+exec 8>&-
 
 # Step 11, after the starts the tickets wait for, and not while one waits for memory.
 if ((local_starts_held == 0 && started != 75)); then

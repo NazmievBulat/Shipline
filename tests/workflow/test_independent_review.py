@@ -11,13 +11,13 @@ def _idle(workflow: Workflow, name: str) -> None:
     (workflow.notes(7) / f"{name}.idle").touch()
 
 
-def test_reviewer_is_fresh_opus_at_high_effort(workflow: Workflow) -> None:
+def test_reviewer_is_fresh_opus_at_the_effort_given(workflow: Workflow) -> None:
     workflow.add_pull_request(7)
     done = workflow.run("start", "review", "7", "low")
     assert done.returncode == 0, done.stderr
     command = (workflow.state / "args" / "review-7").read_text().splitlines()[-1]
     assert command == (
-        "claude --effort high --model opus --remote-control review-7 "
+        "claude --effort low --model opus --remote-control review-7 "
         f'"{instruction("Review pull request 7")}"'
     )
     assert "resume" not in command
