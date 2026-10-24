@@ -80,8 +80,10 @@ def mechanical_conflicts() -> ModuleType | None:
     return rules
 
 
-# How many of its last lines a failed push is refused with, when the repository words no refusal.
+# How many of its last lines a failed push is refused with when the repository words no refusal;
+# a push that outlasted its deadline keeps twice as many.
 REFUSAL_LINES = 10
+TIMEOUT_REFUSAL_LINES = 20
 
 CONFIG = workflow_config.current()
 REPOSITORY = CONFIG.repository
@@ -92,6 +94,14 @@ SCRATCH_PREFIX = "workflow/merge-batch-"
 E2E_PLAN = CONFIG.checks.e2e_plan
 CI_PLAN = CONFIG.checks.ci_plan
 CI_RESULT = CONFIG.checks.ci_result
+# The word or words the name of every check of the CI workflow begins with: those its planner
+# and its result begin with both, "CI" by default.
+CI_PREFIX = (
+    " ".join(os.path.commonprefix([CI_PLAN.replace(":", " ").split(), CI_RESULT.split()]))
+    or CI_RESULT
+)
+# How long after GitHub listed no CI run for a head whose CI jobs finished it is asked again.
+UNLISTED_RETRY_SECONDS = 30
 # Every check of the image workflow begins with this; its planner is IMAGES_PLAN.
 IMAGES = CONFIG.checks.images
 IMAGES_PLAN = CONFIG.checks.images_plan
@@ -147,10 +157,23 @@ MEMBER_MARKS = ("unavailable", "fixes", "refreshable")
 
 # Set only while computing train order, never while verifying a merge.
 _planning_reads: train_reads.Reads | None = None
+# Whether this process already paused for GitHub to list a CI run: it pauses once in all, so a
+# line whose runs GitHub lists for none of its members never holds the merge lock longer.
+_paused = False
 
 
 class Refused(Exception):
     """Missing evidence is a refusal, never permission to merge."""
+
+
+class TimedOut(Refused):
+    """A command outlasted its deadline and was stopped."""
+
+    def __init__(self, message: str, output: str, timeout: float) -> None:
+        super().__init__(message)
+        # What it printed before it was stopped, and the deadline it outlasted.
+        self.output = output
+        self.timeout = timeout
 
 
 class Waiting(Refused):
@@ -188,7 +211,7 @@ def command(
             errors=errors,
         )
     except CommandTimeout as error:
-        raise Refused(str(error)) from error
+        raise TimedOut(str(error), error.output, COMMAND_TIMEOUT) from error
     if done.returncode == 75 and os.environ.get("WORKFLOW_BACKGROUND_GITHUB") == "1":
         raise BudgetWaiting(done.stderr.strip())
     if check and done.returncode:
@@ -245,6 +268,8 @@ class Pushed:
     output: str
     # The hook's step that failed and its last lines, when the push failed.
     refusal: str
+    # Whether the push outlasted its deadline; `output` is what it printed before it was stopped.
+    timed_out: bool = False
 
 
 def push(*args: str, where: Path | None = None) -> Pushed:
@@ -260,20 +285,26 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         raise PackagesWaiting(failed)
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
     merged = ("env", "EIO_BACKEND=posix", "sh", "-c", 'exec "$@" 2>&1', "push", *git_args)
-    done = command(*merged, check=False)
-    if done.returncode and short_of_memory(done.stdout):
+    done, timeout = _push_once(merged)
+    if done.returncode and timeout is None and short_of_memory(done.stdout):
         command("sleep", str(PUSH_RETRY_SECONDS))
-        done = command(*merged, check=False)
+        done, timeout = _push_once(merged)
     output = done.stdout
     pushed = Pushed(
         done.returncode,
         output,
-        push_failure(output, checkout) if done.returncode else "",
+        push_failure(output, checkout, timeout) if done.returncode else "",
+        timeout is not None,
     )
     if advisory_service is None:
         return pushed
     folder = main_checkout() / CONFIG.state_folder
-    service = advisory_service.unreachable(output) if pushed.returncode else None
+    # A scan stopped at the deadline never concluded that a service was out.
+    service = (
+        advisory_service.unreachable(output)
+        if pushed.returncode and not pushed.timed_out
+        else None
+    )
     if service:
         folder.mkdir(parents=True, exist_ok=True)
         advisory_service.note_down(folder, service)
@@ -286,15 +317,28 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     return pushed
 
 
-def push_failure(output: str, checkout: Path) -> str:
-    """What a failed push says, led by the scan's memory error when it ran short.
+def _push_once(merged: tuple[str, ...]) -> tuple[subprocess.CompletedProcess[str], float | None]:
+    """The push, and the deadline it outlasted, if it did: then it failed with what it printed."""
+    try:
+        return command(*merged, check=False), None
+    except TimedOut as error:
+        # 124, as `timeout` reports a command it stopped.
+        return subprocess.CompletedProcess(merged, 124, error.output, ""), error.timeout
 
-    The first line is all the wake and a hand-back show, so a shortage is named there, before
-    the hook's step that failed and its last lines."""
+
+def push_failure(output: str, checkout: Path, timeout: float | None = None) -> str:
+    """What a failed push says, led by the deadline it outlasted, or by the scan's memory error
+    when it ran short.
+
+    The first line is all the wake and a hand-back show, so a timeout or a shortage is named
+    there, before the hook's step that failed, or was running, and its last lines."""
     if pushing_checkout:
         refusal = pushing_checkout.refusal(output, checkout)
     else:
-        refusal = "\n".join([line for line in output.splitlines() if line.strip()][-REFUSAL_LINES:])
+        lines = REFUSAL_LINES if timeout is None else TIMEOUT_REFUSAL_LINES
+        refusal = "\n".join([line for line in output.splitlines() if line.strip()][-lines:])
+    if timeout is not None:
+        return "\n".join(filter(None, [f"git push timed out after {timeout:g}s", refusal]))
     shortage = next(
         (line.strip() for line in output.splitlines() if short_of_memory(line)),
         None,
@@ -304,9 +348,10 @@ def push_failure(output: str, checkout: Path) -> str:
     return f"the security scan was short of locked memory twice, a minute apart: {shortage}\n{refusal}"
 
 
-def api(path: str, key: str | None = None, *, paginate: bool = True) -> Any:
+def api(path: str, key: str | None = None, *, paginate: bool = True, fresh: bool = False) -> Any:
+    """GitHub's answer for `path`; `fresh` asks again what a reconciliation already read."""
     if _planning_reads is not None:
-        return _planning_reads.api(path, lambda: _api(path, key, paginate=paginate))
+        return _planning_reads.api(path, lambda: _api(path, key, paginate=paginate), fresh=fresh)
     return _api(path, key, paginate=paginate)
 
 
@@ -346,11 +391,77 @@ def runs(
     # Main is judged by the runs of its pushes (and manual reruns). A scheduled run of an
     # unchanged head is kept apart: it may report a failure, never hold or close the gate.
     event = "&event=pull_request" if pull else ""
-    found = api(
+    path = (
         f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
-        f"?head_sha={head}{event}&per_page=100",
-        "workflow_runs",
+        f"?head_sha={head}{event}&per_page=100"
     )
+    listed = api(path, "workflow_runs")
+    found = _own_runs(listed, head, pull=pull, scheduled=scheduled)
+    if listed or workflow != "ci":
+        return found
+    try:
+        return _unlisted_runs(path, head, pull=pull, scheduled=scheduled)
+    except Waiting:
+        raise
+    except Refused, KeyError, TypeError, ValueError:
+        # Unread is not absent: the head has no CI result yet, and the line keeps its judgment.
+        return []
+
+
+def _unlisted_runs(path: str, head: str, *, pull: bool, scheduled: bool) -> list[dict[str, Any]]:
+    """The CI runs of `head` that GitHub did not list, when its check runs show CI jobs finished.
+
+    GitHub sometimes lists no CI run for such a head and lists it when asked again a little
+    later. The run is found by the check suite of its jobs; when that lists none either, GitHub
+    is asked again, after a pause the first time in a process. A run still not found is no CI
+    result yet, a wait: the line keeps what it judged of the head before."""
+    global _paused
+    suites = _ci_suites(head)
+    if not suites:
+        return []
+    ci_path = f".github/workflows/{WORKFLOW_FILES['ci']}"
+    found = _own_runs(
+        [
+            run
+            for suite in suites
+            for run in api(
+                f"{API}/actions/runs?check_suite_id={suite}&per_page=100", "workflow_runs"
+            )
+            if run.get("path", "").split("@")[0] == ci_path
+        ],
+        head,
+        pull=pull,
+        scheduled=scheduled,
+    )
+    if found:
+        return found
+    if not _paused:
+        _paused = True
+        command("sleep", str(UNLISTED_RETRY_SECONDS))
+    return _own_runs(api(path, "workflow_runs", fresh=True), head, pull=pull, scheduled=scheduled)
+
+
+def _ci_check(name: str) -> bool:
+    return re.match(rf"{re.escape(CI_PREFIX)}(?:$|[\s:(])", name) is not None
+
+
+def _ci_suites(head: str) -> list[int]:
+    """The check suites of the CI jobs that finished on `head`, as its check runs show them."""
+    return sorted(
+        {
+            check["check_suite"]["id"]
+            for check in api(f"{API}/commits/{head}/check-runs?per_page=100", "check_runs")
+            if _ci_check(check.get("name", ""))
+            and check.get("status") == "completed"
+            and check.get("check_suite")
+        }
+    )
+
+
+def _own_runs(
+    found: list[dict[str, Any]], head: str, *, pull: bool, scheduled: bool
+) -> list[dict[str, Any]]:
+    """The runs of `head` that judge it, newest first: its pull request's, or main's own."""
     return sorted(
         [
             run
@@ -432,6 +543,51 @@ def main_image_runs(head: str, recent: MainImages) -> list[dict[str, Any]]:
 
 def jobs(run: dict[str, Any]) -> list[dict[str, Any]]:
     return checks(api(f"{API}/actions/runs/{run['id']}/jobs?per_page=100", "jobs"))
+
+
+def carried(job: dict[str, Any]) -> bool:
+    """Whether GitHub carried this job into its attempt from an earlier one, without running it.
+
+    A re-run of only the failed jobs lists each job that passed before as a copy in the new
+    attempt: a new ID, the new attempt's `run_attempt`, no notes, and the `started_at` and
+    `completed_at` of the attempt it ran in, but the `created_at` of the re-run. A job that ran
+    in its attempt started after it was created.
+    """
+    started, created = _seconds(job.get("started_at")), _seconds(job.get("created_at"))
+    return started is not None and created is not None and started < created
+
+
+def job_notes(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """The notes of a job, from the attempt of its run where it ran.
+
+    A job carried into a re-run has no notes of its own. Its notes are those of the copy, in an
+    earlier attempt of the same run, with the same name, head and times, that passed and ran
+    there; a job carried by two re-runs has a carried copy in the attempt between. A job that
+    ran in its own attempt has only its own notes, however few.
+    """
+    notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+    attempt, run, head = job.get("run_attempt"), job.get("run_id"), job.get("head_sha")
+    if (
+        notes
+        or job.get("conclusion") != "success"
+        or not carried(job)
+        or not isinstance(attempt, int)
+        or run is None
+        or not head
+    ):
+        return notes
+    for earlier in range(attempt - 1, 0, -1):
+        for copy in api(f"{API}/actions/runs/{run}/attempts/{earlier}/jobs?per_page=100", "jobs"):
+            if (
+                copy.get("name") == job["name"]
+                and copy.get("head_sha") == head
+                and copy.get("conclusion") == "success"
+                and copy.get("started_at") == job.get("started_at")
+                and copy.get("completed_at") == job.get("completed_at")
+                and not carried(copy)
+            ):
+                return api(f"{API}/check-runs/{copy['id']}/annotations?per_page=100")
+    return []
 
 
 # A CI job that runs in parts is named with its part by GitHub, "CI: server tests (1 of 2)", and with
@@ -1087,7 +1243,7 @@ def strict_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     strict: list[dict[str, Any]] = []
     for job in parts:
         if job["name"] == "CI: dependencies" and job.get("conclusion") == "success":
-            notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+            notes = job_notes(job)
             if any(note.get("title") == "Advisory on main" for note in notes):
                 job = {**job, "conclusion": "passed over an advisory on main"}
         strict.append(job)
@@ -1214,7 +1370,7 @@ def main_images_needed(head: str, ci: list[dict[str, Any]]) -> bool:
         for job in jobs(push):
             if job["name"] != CI_PLAN:
                 continue
-            notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+            notes = job_notes(job)
             before = next(
                 (note["message"].strip() for note in notes if note.get("title") == "Push base"),
                 None,
@@ -1415,12 +1571,9 @@ def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> 
         job["name"] == "playwright" and job.get("conclusion") == "success" for job in parts
     ):
         return False
-    planner = next(job for job in parts if job["name"] == E2E_PLAN)
-    notes = {
-        (note.get("title"), note["message"].strip())
-        for note in api(f"{API}/check-runs/{planner['id']}/annotations?per_page=100")
-    }
-    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= notes
+    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= _planner_notes(
+        parts, E2E_PLAN
+    )
 
 
 def inherited_image_jobs(
@@ -1464,10 +1617,7 @@ def inherited_image_jobs(
 
 def _planner_notes(parts: list[dict[str, Any]], plan: str) -> set[tuple[Any, str]]:
     planner = next(job for job in parts if job["name"] == plan)
-    return {
-        (note.get("title"), note["message"].strip())
-        for note in api(f"{API}/check-runs/{planner['id']}/annotations?per_page=100")
-    }
+    return {(note.get("title"), note["message"].strip()) for note in job_notes(planner)}
 
 
 def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
@@ -1506,8 +1656,7 @@ def tested_merge(parts: list[dict[str, Any]], base: str, head: str) -> str | Non
     for job in parts:
         if job["name"] != CI_PLAN:
             continue
-        notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
-        for note in notes:
+        for note in job_notes(job):
             if note.get("title") != NOTES.merge_tested:
                 continue
             merge = note["message"].strip()
@@ -1893,7 +2042,7 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
             return False
         tree = api(f"{API}/git/commits/{merge}")["tree"]["sha"]
         plan = next(job for job in image_jobs if job["name"] == IMAGES_PLAN)
-        notes = api(f"{API}/check-runs/{plan['id']}/annotations?per_page=100")
+        notes = job_notes(plan)
         if not any(
             note.get("title") == NOTES.files_tested and note["message"].strip() == tree
             for note in notes
@@ -2188,7 +2337,9 @@ class Train:
         pulls: dict[str, Any] = {}
         suite_states: dict[str, str | None] = {}
         lost: dict[str, dict[str, Any]] = {}
-        self.refreshable = set()
+        # A blocked head's CI run that cannot be read, or that GitHub lists no more, is no new
+        # evidence: GitHub can lag on its check runs too, so its mark stays.
+        marked, self.refreshable = self.refreshable, set()
         # Use the same session state and owner-question notes as the tick. A background
         # job leaves its session running and must not lose its turn merely for waiting.
         sessions = {
@@ -2278,6 +2429,12 @@ class Train:
                     if state == "red":
                         self.blocked[number] = pull["headRefOid"]
                         self._failed_lost(number, pull, ci[:1], lost)
+                    elif (
+                        not ci
+                        and number in marked
+                        and self.blocked.get(number) == pull["headRefOid"]
+                    ):
+                        self.refreshable.add(number)
                     elif state == "green" and number in self.blocked:
                         # Its own green run cannot clear a failure its prefix run found. A
                         # new run or attempt of that prefix, or a fix, is needed first.
@@ -2309,7 +2466,10 @@ class Train:
                             # Still blocked, but its turn may refresh the stale green run.
                             self.refreshable.add(number)
                 except Refused, KeyError, TypeError, ValueError, IndexError:
-                    pass
+                    # An unread run changes nothing: a green re-run on this same head keeps
+                    # its mark, so its turn still refreshes it.
+                    if number in marked and self.blocked.get(number) == pull["headRefOid"]:
+                        self.refreshable.add(number)
             remaining.append(number)
         self.queue = remaining
         # A label changed while waiting moves its pull request at this turn.
@@ -3058,11 +3218,11 @@ def _push_scratch(
         pushed = push("origin", f"{record['head']}:refs/heads/{record['branch']}")
         if pushed.returncode:
             failure = pushed.refusal
-            output = pushed.output
+            # A push that keeps stalling ends the batch, whatever its scan printed first.
+            output = "" if pushed.timed_out else pushed.output
     except Waiting:
         raise
     except Refused as error:
-        # A push that outlasted its deadline failed like any other.
         failure = str(error)
     if failure is not None:
         reason = f"could not push {whose} scratch branch: " + failure
@@ -4159,7 +4319,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             image_plan = next(
                 job for job in image_jobs if job["name"] == IMAGES_PLAN
             )
-            image_notes = api(f"{API}/check-runs/{image_plan['id']}/annotations?per_page=100")
+            image_notes = job_notes(image_plan)
             if not any(
                 note.get("title") == NOTES.files_tested and note["message"].strip() == tree
                 for note in image_notes
