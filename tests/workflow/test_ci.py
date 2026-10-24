@@ -219,11 +219,11 @@ _EXAMPLES = [_ROOT / "examples" / name for name in ("ci.yml", "e2e.yml", "images
 def test_all_example_steps_run_shipline_scripts_from_the_clone(path: Path) -> None:
     for job in _jobs(path):
         for step in re.findall(r"^      - .*?(?=^      - |\Z)", _job(path, job), re.M | re.S):
-            if not re.search(r"^        run:", step, re.M):
+            if not re.search(r"^      (?:- |  )run:", step, re.M):
                 continue
             # Shell and embedded Python use the same clone, with their own quoting.
             remaining = step.replace(_PROOF[_EXAMPLE], "").replace(_PROOF_IN_PYTHON, "")
-            assert "scripts/workflow/" not in remaining, f"{path.name}: {job}: {step}"
+            assert "scripts/workflow" not in remaining, f"{path.name}: {job}: {step}"
 
 
 @pytest.mark.parametrize("path", _EXAMPLES, ids=lambda path: path.name)

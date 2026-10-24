@@ -31,6 +31,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+      # Shipline's own scripts, which the repository does not hold: its main as it is now.
+      - name: Shipline
+        run: git clone --quiet --depth 1 https://github.com/NazmievBulat/Shipline.git "$RUNNER_TEMP/shipline"
       - name: The existing browser selection
         id: selection
         run: |
@@ -40,27 +43,27 @@ jobs:
       - name: Defer the whole suite only for a pull request
         id: deferred
         if: steps.selection.outputs.needed == 'true'
-        run: python3 scripts/workflow/ci_proof.py prefix-only --needed browser_whole
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" prefix-only --needed browser_whole
       - name: The notes the gate reads
         env:
           DEFERRED: ${{ steps.deferred.outputs.prefix_only || '[]' }}
           NEEDED: ${{ steps.selection.outputs.needed }}
         run: |
           if [[ $NEEDED != true ]]; then
-            python3 scripts/workflow/ci_proof.py notes --none browser_suite
+            python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes --none browser_suite
           elif jq -e 'index("browser_whole") != null' <<< "$DEFERRED" >/dev/null; then
             ran=$(jq '.browser_files | length' "$RUNNER_TEMP/selection.json")
             total=$(jq '.browser_total' "$RUNNER_TEMP/selection.json")
-            python3 scripts/workflow/ci_proof.py notes --selected browser_suite "$ran" "$total" files
+            python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes --selected browser_suite "$ran" "$total" files
           else
-            python3 scripts/workflow/ci_proof.py notes --whole browser_suite
+            python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes --whole browser_suite
           fi
       - name: Browser tests main inherits on the identical tree
         id: inherited
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/workflow/ci_proof.py inherited e2e
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" inherited e2e
   browser:
     name: playwright
     needs: plan
