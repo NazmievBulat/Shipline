@@ -60,7 +60,7 @@ def _run(
         "BUILT": str(machine / "built"),
     }
     return subprocess.run(
-        ["bash", str(_RUNNER / script), *args],
+        ["sh", str(_RUNNER / script), *args],
         cwd=machine / "checkout",
         env=env,
         capture_output=True,
@@ -136,6 +136,21 @@ def test_the_hub_cache_command_runs_on_main_s_files_with_its_arguments(machine: 
         " example-app-hub-cache example-app-hub-cache 172.31.255.2:5000 main's",
         "watch example-app-hub-cache example-app-hub-cache 172.31.255.2:5000 main's",
     ]
+
+
+def test_the_watch_leaves_the_running_cache_s_files_alone(machine: Path) -> None:
+    """The cache runs for days from its folder; the watch every 10 minutes takes one of its own,
+    and a folder whose main has not moved is not taken again."""
+    _main(machine, {"hub_cache": "true"})
+    folders = machine / "home/.local/state/example-app-runner/main"
+    assert _run(machine, "hub-cache.sh").returncode == 0
+    (folders / "hub_cache/kept").touch()
+
+    assert _run(machine, "hub-cache.sh", "watch").returncode == 0
+    assert _run(machine, "hub-cache.sh").returncode == 0
+
+    assert (folders / "hub_cache/kept").exists()
+    assert (folders / "hub_cache-watch/shipline.json").exists()
 
 
 def test_without_a_hub_cache_command_there_is_no_cache(machine: Path) -> None:
