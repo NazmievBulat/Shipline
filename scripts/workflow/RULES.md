@@ -125,8 +125,9 @@ one waiting for the owner. So a pull request waiting for the owner does not hold
 failed checks joins at the back when the gate is called again; a green CI re-run on the same
 head and current main lifts a failed-check block and restores the pull request's earlier
 queue position, and a green re-run on an older main is refreshed in that place when its turn
-comes. A pull request that merged, closed, became a draft or left `main` as its base leaves
-the line. When the gate says the pull request waits behind another (or for main to change),
+comes. A re-run of only the failed jobs keeps the run's proof of the merge it tested, as a
+full re-run does. A pull request that merged, closed, became a draft or left `main` as its
+base leaves the line. When the gate says the pull request waits behind another (or for main to change),
 it has already run `scripts/workflow/notify waiting` itself: end the turn. The tick wakes
 that reviewer or audit when its pull request is first and all checks on its head have
 finished, once for each turn of the line, state of main and head. One whose checks failed
