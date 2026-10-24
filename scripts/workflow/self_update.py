@@ -4,8 +4,10 @@ when a new version crashes.
     self_update.py start <pid> [moved]       at the start of a tick: roll back, or update; exits
                                              10 when the checkout moved, so the tick runs again
                                              as the version now checked out, which moves nothing
-                                             more in that tick (`moved`); 11 when this checkout
-                                             is not one to keep current
+                                             more in that tick (`moved`), and also when the tick
+                                             still runs an older file of the tick; 11 when this
+                                             checkout is not one to keep current; 12 when it
+                                             crashed itself, which counts as the tick's crash
     self_update.py watch <pid>               passes the tick's standard error through, and notes
                                              a traceback or an error of the shell in it
     self_update.py end <pid> <exit> [skipped] [watched]
@@ -21,9 +23,13 @@ commit of its own, another branch) is left alone and named in the wake once.
 Only a crash counts against a version; a failure the tick or the gate handles and reports (a
 step that failed, GitHub out of reach, a refusal, a wait) is routine. A tick crashed when it
 exited other than 0 or 1 (an error of the shell, 127 or 2), when a traceback or an error of the
-shell showed in its standard error, or when it ended without its end; a tick stopped by a signal
-counts neither way. The merge gate run by the tick's merge driver crashed when it raised, timed
-out in one of its own commands, or exited other than the driver defines.
+shell in one of Shipline's own scripts showed in its standard error, when the self-update
+itself crashed, or when it ended without its end; a tick stopped by a signal counts neither way.
+The merge gate run by the tick's merge driver crashed when it raised, when one of its own local
+git commands timed out (a push, a fetch, a `gh` call and the repository's own checks wait on
+GitHub or on the repository, and are routine), or when it exited other than the driver defines.
+A crash is named by its kind alone (`KeyError`, `unbound variable`, `exit 2`): its message may
+quote anything, and the wake's line is read by a model.
 
 A version is good once it ran 5 ticks in a row without crashing, with no crash of the gate
 since its last good run; the last three good commits are kept in `.local/shipline/versions`,
@@ -48,9 +54,12 @@ import fcntl
 import json
 import os
 import re
+import signal
+import stat
 import subprocess
 import sys
 import time
+import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -62,9 +71,11 @@ FETCH_EVERY_SECONDS = 10 * 60
 GOOD_AFTER_TICKS = 5
 ROLL_BACK_AFTER = 3
 KEEP_GOOD = 3
-# The exits of `start` when the checkout moved, and when it is not one to keep current.
+# The exits of `start` when the checkout moved, when it is not one to keep current, and when it
+# crashed itself.
 MOVED = 10
 NOT_KEPT = 11
+CRASHED = 12
 CI_WORKFLOW = ".github/workflows/ci.yml"
 # Seconds a local git command, the fetch, and the read of CI may take.
 GIT_SECONDS = 60
@@ -93,11 +104,21 @@ GIT_PLACES = (
 )
 # The gate's exits under `--drive` that are answers: merged, wait for a new run, wait.
 GATE_ANSWERS = (0, 2, 3)
-# A line of standard error that tells a crash: an error of the shell, or a script not found.
-SHELL_ERROR = re.compile(
-    r".*: line [0-9]+: .*(unbound variable|syntax error.*|command not found|bad substitution)"
-    r"|.*can't open file .*|bash: .*: No such file or directory"
+# A line of standard error that tells a crash, when it names one of Shipline's own files: an
+# error of the shell, or a script not found. Each is named by the kind of error.
+SHELL_ERRORS = (
+    (re.compile(r".*: line [0-9]+: .*unbound variable"), "unbound variable"),
+    (re.compile(r".*: line [0-9]+: syntax error.*"), "syntax error"),
+    (re.compile(r".*: line [0-9]+: .*command not found"), "command not found"),
+    (re.compile(r".*: line [0-9]+: .*bad substitution"), "bad substitution"),
+    (re.compile(r".*can't open file .*|bash: .*: No such file or directory"), "script not found"),
 )
+# The exception a traceback ends with, its message left out.
+EXCEPTION = re.compile(r"([A-Za-z_][A-Za-z0-9_.]*)(:.*)?")
+# A command of the gate that timed out, as its refusal says.
+GATE_TIMEOUT = re.compile(r"merge refused: (\S+) (\S+).* timed out after [0-9.]+s")
+# The git commands of the gate that wait on GitHub, or on the repository's own push hook.
+GIT_WAITS = ("push", "fetch", "ls-remote")
 TRACEBACK = "Traceback (most recent call last):"
 SHA = re.compile(r"[0-9a-f]{40}")
 GITHUB = re.compile(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
@@ -194,6 +215,19 @@ def one_line(text: str) -> str:
     return text if len(text) <= REASON_CHARACTERS else text[: REASON_CHARACTERS - 3] + "..."
 
 
+def exception_kind(line: str) -> str:
+    """`KeyError` of `KeyError: 'head'`; a line that names no exception, as a whole."""
+    found = EXCEPTION.fullmatch(line.strip())
+    return found[1] if found else one_line(line)
+
+
+def shell_error(line: str) -> str | None:
+    """The kind of error of the shell a line tells, when it is one of Shipline's own files."""
+    if str(HOME) not in line:
+        return None
+    return next((kind for pattern, kind in SHELL_ERRORS if pattern.fullmatch(line)), None)
+
+
 def read_trial() -> dict[str, Any] | None:
     """The version on trial: its commit, the good commit to go back to, its ticks in a row
     without crashing, and its crashes in a row as a tick and as the gate."""
@@ -286,6 +320,17 @@ def run_note(pid: int, suffix: str = "") -> Path:
     return NOTES / "runs" / f"{pid}{suffix}"
 
 
+def tick_file_changed(pid: int) -> bool:
+    """Whether the tick runs an older file of the tick than the one checked out: one that
+    started while the checkout moved. Bash keeps the file of its script open as 255."""
+    try:
+        running = os.stat(f"/proc/{pid}/fd/255")
+        checked_out = (HOME / "scripts" / "workflow" / "tick").stat()
+    except OSError:
+        return False
+    return (running.st_dev, running.st_ino) != (checked_out.st_dev, checked_out.st_ino)
+
+
 def forget_run(pid: int) -> None:
     for suffix in ("", ".crash", ".drained"):
         run_note(pid, suffix).unlink(missing_ok=True)
@@ -366,13 +411,20 @@ def locks_held() -> bool:
         return False
     for path in paths:
         try:
-            with open(path) as lock:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    return True
+            # Neither a link nor anything but a file is followed: opening a pipe would wait.
+            lock = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         except OSError:
             continue
+        try:
+            if not stat.S_ISREG(os.fstat(lock).st_mode):
+                continue
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            continue
+        finally:
+            os.close(lock)
     return False
 
 
@@ -505,8 +557,13 @@ def start(pid: int, moved_already: bool) -> int:
         return NOT_KEPT
     moved = False
     with locked():
-        # Noted before anything is fetched: a move made meanwhile sees this tick.
+        # Noted before anything is fetched: a move made meanwhile sees this tick. What a watch
+        # left for an earlier tick of the same pid is not this tick's.
+        for suffix in (".crash", ".drained"):
+            run_note(pid, suffix).unlink(missing_ok=True)
         write(run_note(pid), f"{head()} {started_at(pid)}\n")
+        if not moved_already and tick_file_changed(pid):
+            return MOVED
         register_locks()
         reap(pid)
         # A tick that runs from the checkout would run the rest of its steps from another
@@ -534,6 +591,10 @@ def watch(pid: int) -> None:
     says everything before it was read."""
     end_line = f"shipline-tick-ended {pid}\n".encode()
     noted = run_note(pid).exists()
+    # A signal to the tick's whole group leaves the watch to read on: the tick's end still
+    # writes to it. It leaves when the last writer has.
+    for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(number, signal.SIG_IGN)
     crash: str | None = None
     in_traceback = False
 
@@ -558,6 +619,8 @@ def watch(pid: int) -> None:
                 passed(before + b"\n")
             if noted:
                 note(".drained", "")
+            # What a later writer prints is no longer this tick's.
+            noted = False
             continue
         passed(raw)
         if not noted or crash is not None:
@@ -566,9 +629,9 @@ def watch(pid: int) -> None:
         if line.startswith(TRACEBACK):
             in_traceback = True
         elif in_traceback and line and not line[0].isspace():
-            crash = line
-        elif SHELL_ERROR.fullmatch(line):
-            crash = line
+            crash = exception_kind(line)
+        else:
+            crash = shell_error(line)
         if crash is not None:
             note(".crash", one_line(crash) + "\n")
 
@@ -610,9 +673,12 @@ def gate_crash(code: int, stderr: str) -> str | None:
         (line for line in lines if line.startswith(("merge refused: ", "merge waiting: "))), None
     )
     if code == 1 and answer is not None:
-        return answer if re.search(r" timed out after [0-9.]+s$", answer) else None
+        timed_out = GATE_TIMEOUT.fullmatch(answer)
+        if timed_out and timed_out[1] == "git" and timed_out[2] not in GIT_WAITS:
+            return f"git {timed_out[2]} timed out"
+        return None
     if code == 1 and lines:
-        return lines[-1]
+        return exception_kind(lines[-1])
     return f"exit {code}"
 
 
@@ -668,6 +734,16 @@ def main() -> int:
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"shipline self-update: {error}", file=sys.stderr)
         return 1
+    except Exception as error:
+        # A crash of the self-update is the tick's crash: the tick it started counts it.
+        traceback.print_exc()
+        if arguments[0] in ("start", "end") and arguments[1:2] and arguments[1].isdigit():
+            try:
+                if run_note(int(arguments[1])).exists():
+                    write(run_note(int(arguments[1]), ".crash"), type(error).__name__ + "\n")
+            except OSError:
+                pass
+        return CRASHED
     print(
         "usage: self_update.py start <pid> [moved] | watch <pid> | "
         "end <pid> <exit> [skipped] [watched] | gate <exit> <stderr>",

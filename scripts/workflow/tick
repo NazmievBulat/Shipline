@@ -110,13 +110,16 @@ fi
 # Set when this tick only found the one before it still running: it counts neither way.
 tick_skipped=""
 tick_watched=""
-if ((kept == 0 || kept == 10)); then
+# 12: the self-update crashed itself, which this tick's end counts.
+if ((kept == 0 || kept == 10 || kept == 12)); then
   tick_watched=watched
   exec 8>&2 2> >(python3 -B "$here/self_update.py" watch "$$" 2>&8 >&8 8>&-)
 fi
 tick_ended() {
   if [[ -n $tick_watched ]]; then
-    # Everything printed before this line was read; what follows goes straight out.
+    # Everything printed before this line was read; what follows goes straight out. A watch
+    # that is gone must not end the tick before its end is counted.
+    trap '' PIPE
     printf 'shipline-tick-ended %s\n' "$$" >&2
     exec 2>&8 8>&-
   fi
@@ -486,7 +489,7 @@ if [[ $METRICS_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] &&
   if mkdir -p "$HOME/.local/state/workflow"; then
     env -u WORKFLOW_TRAIN_TICK -u WORKFLOW_SESSION_SNAPSHOT -u WORKFLOW_DEFER_START \
       WORKFLOW_NOW="$NOW" setsid bash "$here/workflow-metrics" --daily </dev/null \
-      >>"$HOME/.local/state/workflow/metrics.log" 2>&1 9>&- &
+      >>"$HOME/.local/state/workflow/metrics.log" 2>&1 8>&- 9>&- &
   else
     failed=1
   fi
