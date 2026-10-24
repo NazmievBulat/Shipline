@@ -38,7 +38,7 @@ def _comment(identity: int, text: str) -> dict[str, object]:
         "id": identity,
         "body": f"{_MARKER}\n{text}",
         "created_at": "2026-10-19T18:00:00Z",
-        "html_url": f"https://github.com/NazmievBulat/Shipline/pull/7#issuecomment-{identity}",
+        "html_url": f"https://github.com/example-org/example-app/pull/7#issuecomment-{identity}",
     }
 
 

@@ -1,3 +1,5 @@
+This file holds the rules for repositories that use Shipline; Shipline's own development follows `AGENTS.md` in the Shipline repository.
+
 # Workflow sessions
 
 A draft pull request labelled `workflow` gets a worker session, which builds it and marks it
