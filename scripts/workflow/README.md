@@ -170,7 +170,9 @@ To add a configuration key, add one `option(...)` field in its dataclass section
 `workflow_config.py`, sorted by key name. Its kind selects validation; its default, meaning
 and optional example generate the tables and example file. A new section uses `section()`.
 Run `python3 scripts/workflow/workflow_config.py docs --write` and commit the generated files;
-CI checks that they are current. Shell exports use the field's `shell=(position, name)` metadata;
+CI checks that they are current. Give keys whose omitted default is `None` a valid example.
+The `position` metadata preserves existing positional constructors; keep those positions.
+Shell exports use the field's `shell=(position, name)` metadata;
 keep existing positions, and give new exports an unused position to preserve the interface.
 Defaults in the table apply to omitted keys; `none` means no configured value.
 

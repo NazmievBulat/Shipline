@@ -2335,10 +2335,13 @@ def test_one_new_declaration_drives_defaults_validation_exports_and_docs(tmp_pat
 
 @pytest.mark.parametrize("damage", ["missing", "duplicate", "reversed"])
 def test_docs_refuses_broken_markers_before_writing_anything(tmp_path: Path, damage: str) -> None:
+    import shutil
+
     root = tmp_path
     scripts = root / "scripts/workflow"
     scripts.mkdir(parents=True)
     (root / "examples").mkdir()
+    shutil.copyfile(_WORKFLOW / "workflow_config.py", scripts / "workflow_config.py")
     original = (_WORKFLOW / "README.md").read_text()
     start, end = "<!-- shipline-commands:start -->", "<!-- shipline-commands:end -->"
     if damage == "missing":
@@ -2350,10 +2353,16 @@ def test_docs_refuses_broken_markers_before_writing_anything(tmp_path: Path, dam
             "temporary marker", end
         )
     (scripts / "README.md").write_text(changed)
-    with pytest.raises(workflow_config.ConfigError, match="expected one ordered pair"):
-        workflow_config.documentation(root)
+    example = root / "examples/shipline.json"
+    example.write_text("{}\n")
+    done = subprocess.run(
+        ["python3", str(scripts / "workflow_config.py"), "docs", "--write"],
+        env=_GIT_ENV, capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert done.returncode == 1
+    assert "expected one ordered pair" in done.stderr
     assert (scripts / "README.md").read_text() == changed
-    assert not (root / "examples/shipline.json").exists()
+    assert example.read_text() == "{}\n"
 
 
 def test_config_sections_keep_existing_positional_constructors() -> None:
