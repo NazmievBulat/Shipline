@@ -1467,14 +1467,28 @@ def _attempt_path(gate: Any, attempt: int) -> str:
 
 
 @pytest.mark.parametrize(
-    "case", ["carried", "failed copy", "still running", "unreadable", "ran again"]
+    "case",
+    [
+        "carried",
+        "failed copy",
+        "still running",
+        "unreadable",
+        "ran again",
+        "ran again, started the second it was created",
+        "ran again, its clock a second behind",
+    ],
 )
 def test_a_carried_job_reads_the_notes_of_the_attempt_it_ran_in(
     gate: Any, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
     # Attempt 2 re-ran the failed jobs and carried the planner, which ran in attempt 1.
-    if case == "ran again":
+    if case.startswith("ran again"):
         job = _attempt_job(531, 2)  # a full re-run ran it again: created before it started
+        if case.endswith("created"):
+            job["started_at"] = job["created_at"]
+        elif case.endswith("behind"):
+            # It looks carried, but no earlier copy ran at its times.
+            job["created_at"] = job["started_at"].replace(":02Z", ":03Z")
     else:
         job = _attempt_job(531, 2, None if case == "still running" else "success", ran=1)
     calls = _notes_api(
@@ -1495,7 +1509,7 @@ def test_a_carried_job_reads_the_notes_of_the_attempt_it_ran_in(
         return
     notes = gate.job_notes(job)
     assert notes == ([{"title": "Merge tested", "message": "first"}] if case == "carried" else [])
-    if case in ("still running", "ran again"):
+    if case == "still running" or case.startswith("ran again") and not case.endswith("behind"):
         assert calls == [_notes_path(gate, 531)]
 
 
