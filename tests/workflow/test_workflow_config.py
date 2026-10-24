@@ -2159,3 +2159,93 @@ def test_install_only_programs_cannot_escape_the_installation_folder(
     done = _read_installation(workflow)
     assert done.returncode == 1
     assert done.stderr.startswith(str(config)) and "commands.pre_train_checks" in done.stderr
+
+
+# Captured from the loader before declarations or documentation generation changed it.
+_CONFIG_FIXTURES = Path(__file__).with_name("fixtures") / "config"
+
+
+@pytest.mark.parametrize("name", ["empty", "example", "installed"])
+def test_config_values_and_both_shell_formats_match_recorded_fixtures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    import sys
+
+    repo = _repository(tmp_path)
+    folder = repo if name != "installed" else tmp_path / "installed"
+    folder.mkdir(exist_ok=True)
+    given = {} if name == "empty" else json.loads(
+        (_CONFIG_FIXTURES / f"{name}.input.json").read_text()
+    )
+    if name == "installed":
+        (folder / "tools").mkdir()
+        (folder / "tools/conflicts.py").write_text(
+            "def resolve(*args): pass\ndef renumber(*args): pass\ndef taken(*args): pass\n"
+        )
+    path = folder / "shipline.json"
+    path.write_text(json.dumps(given))
+    monkeypatch.setenv("SHIPLINE_CONFIG", str(path))
+    monkeypatch.setenv("SHIPLINE_REPO", str(repo))
+    workflow_config.current.cache_clear()
+    try:
+        config = workflow_config.current()
+        expected = json.loads((_CONFIG_FIXTURES / f"{name}.json").read_text())
+        assert _as_json(config) == expected["values"]
+        for mode in ("shell", "sh"):
+            text = workflow_config.shell(config, posix=mode == "sh")
+            for actual, marker in (
+                (str(repo), "<checkout>"), (str(folder), "<install>"),
+                (str(_WORKFLOW), "<workflow>"), (sys.executable, "<python>"),
+            ):
+                text = text.replace(actual, marker)
+            assert text == expected[mode]
+    finally:
+        workflow_config.current.cache_clear()
+
+
+def test_config_documentation_is_current() -> None:
+    done = subprocess.run(
+        ["python3", str(_WORKFLOW / "workflow_config.py"), "docs"],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr + (
+        "\nRun python3 scripts/workflow/workflow_config.py docs --write"
+    )
+
+
+def test_docs_write_repairs_drift_without_reading_a_repository_config(tmp_path: Path) -> None:
+    import shutil
+
+    root = tmp_path / "source"
+    scripts = root / "scripts/workflow"
+    scripts.mkdir(parents=True)
+    (root / "examples").mkdir()
+    for source, target in (
+        (_WORKFLOW / "workflow_config.py", scripts / "workflow_config.py"),
+        (_WORKFLOW / "README.md", scripts / "README.md"),
+        (_WORKFLOW.parents[1] / "examples/shipline.json", root / "examples/shipline.json"),
+    ):
+        shutil.copyfile(source, target)
+    example = root / "examples/shipline.json"
+    example.write_text("{}\n")
+    readme = scripts / "README.md"
+    readme.write_text(readme.read_text().replace("| `state_folder`", "| `stale_folder`"))
+    env = {**os.environ, "SHIPLINE_CONFIG": str(root / "missing.json")}
+
+    def docs(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["python3", str(scripts / "workflow_config.py"), "docs", *args],
+            cwd=tmp_path, env=env, capture_output=True, text=True, check=False, timeout=30,
+        )
+
+    refused = docs()
+    assert refused.returncode == 1
+    assert "python3 scripts/workflow/workflow_config.py docs --write" in refused.stdout
+    assert "examples/shipline.json" in refused.stdout
+    assert "scripts/workflow/README.md" in refused.stdout
+    written = docs("--write")
+    assert written.returncode == 0, written.stdout + written.stderr
+    assert docs().returncode == 0
+    before = example.read_bytes(), readme.read_bytes()
+    assert docs("--write").returncode == 0
+    assert (example.read_bytes(), readme.read_bytes()) == before
