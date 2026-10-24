@@ -2,7 +2,8 @@
 # Install the same call limiter for interactive sessions and installed host services.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-installed=$HOME/.local/share/example-app-github
+# One for the machine, whatever repositories it runs runners for: its budget is the machine's.
+installed=$HOME/.local/share/shipline-github
 link=$HOME/.local/bin/gh
 if { [ -e "$link" ] || [ -L "$link" ]; } &&
    [ "$(readlink -f "$link")" != "$installed/github-gh.sh" ]; then

@@ -12,7 +12,7 @@ set -u
 # The folder a job works in, and what it held when the image was built (vm.Dockerfile, list-work):
 # the image ships uv there, so a clean start is that folder as listed, not an empty one.
 work=/home/runner/_work
-shipped=/usr/local/share/example-app-runner/work-as-shipped
+shipped=/usr/local/share/shipline-runner/work-as-shipped
 
 failed=0
 good() { echo "ok      $*"; }

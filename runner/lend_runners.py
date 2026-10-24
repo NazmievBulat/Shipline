@@ -1,11 +1,11 @@
 """Lend one of main's idle runners to pull request jobs, and the merge train's first member first.
 
-Runs on the home machine as `example-app-runner-lend.service`, as the runner programs' own GitHub
-identity (github_identity.py), or the owner's `gh` login without one, as the spare supervisor
-does. Main's runners register with `example-app-home-main` alone. While no job of a push to main
-waits for a runner, this gives one idle main runner the pull request
-labels too: `example-app-home-first`, which the jobs of the train's first member ask for, and
-`example-app-home`, which every other pull request job asks for. While a job of the first member
+Runs on the machine with main's runners as `<prefix>-runner-lend.service`, as the runner
+programs' own GitHub identity (github_identity.py), or the owner's `gh` login without one, as the
+spare supervisor does. Main's runners register with `<label>-main` alone. While no job of a push
+to main waits for a runner, this gives one idle main runner the pull request
+labels too: `<label>-first`, which the jobs of the train's first member ask for, and
+`<label>`, which every other pull request job asks for. While a job of the first member
 waits, the lent runner keeps only the first label, so it takes that job before older ones. When
 a job of main waits, an idle lent runner loses both. A busy runner is never relabelled: its
 labels go with its registration when the job ends.
@@ -14,7 +14,7 @@ The merge gate writes the train's first member to `~/.local/state/workflow/train
 (scripts/workflow/merge_gate.py). This copies it, with the time, into the folder the planner's
 container reads (`home/first.json`), so the planner sends that member's runs to the first label
 only while this service runs to label runners for it. A run of the first member planned before it
-became first still asks for `example-app-home` and waits behind older runs: it is cancelled and
+became first still asks for `<label>` and waits behind older runs: it is cancelled and
 run again once, so that its planner sends it to the first label.
 """
 
@@ -398,7 +398,7 @@ def round_once(
     most: int,
     first: First,
     published: Path,
-    own: str = "home-main",
+    own: str,
     listing: Path | None = None,
 ) -> None:
     record = first.record()

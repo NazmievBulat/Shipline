@@ -20,10 +20,15 @@ BLACKSMITH_LIMIT = 3000
 BLACKSMITH_RESERVE = 140
 _RESERVE = {"blacksmith": BLACKSMITH_RESERVE, "github": 90}
 _LEGACY_RESERVE = {"blacksmith": 115, "github": 70}
-_LABELS = {
-    "blacksmith": [("blacksmith-2vcpu-ubuntu-2404", "blacksmith-4vcpu-ubuntu-2404")],
-    "github": [("ubuntu-latest", "ubuntu-latest"), ("ubuntu-latest", "example-app-home")],
-}
+
+
+def _labels(label: str) -> dict[str, list[tuple[str, str]]]:
+    """The (small, large) runner labels the planner may record a run of each destination with;
+    the pool's own label is one of them."""
+    return {
+        "blacksmith": [("blacksmith-2vcpu-ubuntu-2404", "blacksmith-4vcpu-ubuntu-2404")],
+        "github": [("ubuntu-latest", "ubuntu-latest"), ("ubuntu-latest", label)],
+    }
 
 
 def _blacksmith_on(root: Path, repository: str, now: datetime) -> bool:
@@ -72,7 +77,7 @@ def _blacksmith_on(root: Path, repository: str, now: datetime) -> bool:
     return on
 
 
-def _used(root: Path, now: datetime) -> int:
+def _used(root: Path, now: datetime, label: str) -> int:
     month = now.strftime("%Y-%m")
     folder = root / "ledger"
     paths = sorted(folder.glob("*.json"))
@@ -97,7 +102,7 @@ def _used(root: Path, now: datetime) -> int:
                 or type(row["attempt"]) is not int
                 or row["attempt"] < 1
                 or key != f"{row['run_id']}:{row['attempt']}"
-                or (row["small"], row["large"]) not in _LABELS[target]
+                or (row["small"], row["large"]) not in _labels(label)[target]
                 or reserved not in (_RESERVE[target], _LEGACY_RESERVE[target])
                 or (cost is not None and (type(cost) is not int or cost < 0))
             ):
@@ -112,6 +117,7 @@ def slots(
     maximum: int,
     reduced: int,
     repository: str,
+    label: str,
     *,
     root: Path | None = None,
     now: datetime | None = None,
@@ -122,7 +128,7 @@ def slots(
         if (
             reduced < maximum
             and _blacksmith_on(root, repository, now)
-            and _used(root, now) + BLACKSMITH_RESERVE < BLACKSMITH_LIMIT
+            and _used(root, now, label) + BLACKSMITH_RESERVE < BLACKSMITH_LIMIT
         ):
             return reduced
     except Exception as error:
@@ -131,4 +137,4 @@ def slots(
 
 
 if __name__ == "__main__":
-    print(slots(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]))
+    print(slots(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]))
