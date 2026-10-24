@@ -172,6 +172,7 @@ def _run(
     slot_fd: int | None = None,
     environment: dict[str, str] | None = None,
     github_slot_fd: int | None = None,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     # Hooks inherit the new group. Killing just git/gh leaves them able to mutate the
     # repository after the caller releases its merge lock. Never inherit that lock fd.
@@ -180,6 +181,8 @@ def _run(
         with _defer_interrupts():
             process = subprocess.Popen(
                 args,
+                # Without input the command reads what the caller's standard input holds.
+                stdin=None if input is None else subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -191,7 +194,7 @@ def _run(
                 if slot_fd is None
                 else {**(environment or os.environ), SLOT_FD_ENV: str(slot_fd)},
             )
-        stdout, stderr = process.communicate(timeout=timeout)
+        stdout, stderr = process.communicate(input, timeout=timeout)
     except subprocess.TimeoutExpired:
         # Kill the entire group even when the leader has already exited and only a
         # child holds the output pipe. SIGKILL also stops hooks that ignore SIGTERM.
@@ -218,6 +221,7 @@ def run(
     timeout: float | None = COMMAND_TIMEOUT,
     unwind_on_interrupt: bool = False,
     errors: str = "strict",
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if args and args[0] == "gh":
         from github_budget import Limited, call, wait
@@ -237,6 +241,7 @@ def run(
                         errors=errors,
                         environment=environment,
                         github_slot_fd=fd,
+                        input=input,
                     ),
                 )
             except Limited:
@@ -256,8 +261,15 @@ def run(
                 unwind_on_interrupt=unwind_on_interrupt,
                 errors=errors,
                 slot_fd=fd,
+                input=input,
             )
-    return _run(*args, timeout=timeout, unwind_on_interrupt=unwind_on_interrupt, errors=errors)
+    return _run(
+        *args,
+        timeout=timeout,
+        unwind_on_interrupt=unwind_on_interrupt,
+        errors=errors,
+        input=input,
+    )
 
 
 def transient(error: str) -> bool:

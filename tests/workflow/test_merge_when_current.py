@@ -3497,6 +3497,9 @@ def _train(github: GitHub) -> dict[str, Any]:
 two_stale_pulls = _two_stale_pulls
 line_up = _line
 train_status = _train
+blocked_first = _blocked_first
+refreshed_first = _refreshed_first
+waiting_reviewers = _waiting_reviewers
 
 
 def test_an_audit_with_a_new_fix_still_gets_its_checks_finished_wake(github: GitHub) -> None:
@@ -7484,9 +7487,7 @@ def _held(workflow: Workflow) -> list[float]:
 
 def _after_the_checks(workflow: Workflow, script: str) -> None:
     """Run `script` as the pre-train checks: after the handoff's own checks, before the lock."""
-    checks = workflow.script.with_name("pre-train-checks")
-    checks.write_text("#!/bin/bash\n" + script + "\nexit 0\n")
-    checks.chmod(0o755)
+    workflow.fake("pre-train-checks", "#!/bin/bash\n" + script + "\nexit 0\n")
 
 
 def _waiting(workflow: Workflow) -> list[str]:
@@ -7658,8 +7659,7 @@ def test_each_handoff_refusal_still_fires(github: GitHub, case: str, refusal: st
     elif case == "branch":
         workflow.git("checkout", "--detach", cwd=worktree)
     elif case == "pre-train checks":
-        checks = workflow.script.with_name("pre-train-checks")
-        checks.write_text("#!/bin/bash\necho 'inventory is stale' >&2\nexit 1\n")
+        workflow.fake("pre-train-checks", "#!/bin/bash\necho 'inventory is stale' >&2\nexit 1\n")
         # An earlier handoff of it waits in the line: it leaves the line, and its note goes.
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7"]}))
