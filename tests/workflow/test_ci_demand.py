@@ -185,7 +185,8 @@ def test_a_pull_request_counted_twice_pushes_once(demand: Demand) -> None:
 
 
 def test_the_merge_line_counts_the_prefixes_still_to_build(demand: Demand) -> None:
-    # A window of 3 with one prefix running: the next two eligible members, in the line's order.
+    # A window of 3 with one prefix running: the next two eligible members after it, in the
+    # line's order.
     for number in (11, 12, 13, 14, 15, 16):
         demand.pull(number, draft=False, checks=[{"name": "CI result"}], runs=[_ci(number * 10)])
     demand.train(
@@ -205,7 +206,8 @@ def test_the_merge_line_counts_the_prefixes_still_to_build(demand: Demand) -> No
     forecast = demand.write()
 
     assert forecast is not None
-    assert forecast["pulls"]["prefixes"] == [16, 13]
+    # The line extends after its last running prefix (11), never ahead of it: 16 waits.
+    assert forecast["pulls"]["prefixes"] == [13, 15]
     assert forecast["ordinary"] == 6
 
 
@@ -445,3 +447,13 @@ def test_a_spare_or_main_runners_job_is_no_slots(demand: Demand) -> None:
 
     assert forecast is not None
     assert (forecast["ordinary"], forecast["docker"]) == (1, 1)
+
+
+def test_a_paused_budget_does_not_fail_the_tick(workflow: Workflow) -> None:
+    workflow.add_pull_request(7, draft=False, labels=())
+    forecast = Path(workflow.repo / "scripts/workflow/ci_demand.py")
+    forecast.write_text("import sys\nsys.exit(75)\n")
+
+    done = workflow.run_script("tick", env=AT)
+
+    assert done.returncode == 0, done.stdout + done.stderr

@@ -230,7 +230,18 @@ def prefixes_to_build(notes: Path) -> list[int]:
     ):
         return []
     held = away | blocked | set(train.get("pending", []))
-    eligible = [number for number in line if number not in members and number not in held]
+    # The line extends after its last running prefix, or from its front when none runs.
+    running = [
+        str(member.get("number"))
+        for member in (train.get("prefixes") or {}).get("members") or []
+        if isinstance(member, dict)
+    ]
+    start = (
+        line.index(running[-1]) + 1 if running and running[-1] in line else line.index(front)
+    )
+    eligible = [
+        number for number in line[start:] if number not in members and number not in held
+    ]
     return [int(number) for number in eligible[: max(window - len(members), 0)]]
 
 

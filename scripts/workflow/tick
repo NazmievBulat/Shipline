@@ -962,7 +962,9 @@ fi
 
 # Step 12, after this tick's starts: the CI demand on its way, for the runner balancer.
 if running=$(session list); then
-  python3 -B "$here/ci_demand.py" write "$main" "$snapshot" <<<"$running" 9>&- || failed=1
+  # 75: the GitHub budget is paused; the forecast is written again at a later tick.
+  python3 -B "$here/ci_demand.py" write "$main" "$snapshot" <<<"$running" 9>&- ||
+    (($? == 75)) || failed=1
 else
   failed=1
 fi
