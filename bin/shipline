@@ -14,12 +14,15 @@ set -euo pipefail
 # Every command a rule, a hook or the timer names. The others in `scripts/workflow` are the
 # scripts' own parts.
 COMMANDS=(
+  flow-page
+  install-flow-page-timer
   install-hooks
   install-timer
   main-status
   merge-train-metrics
   merge-when-current
   notify
+  review-effort
   review-panel
   session
   test-run

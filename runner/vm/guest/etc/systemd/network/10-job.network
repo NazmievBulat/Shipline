@@ -1,0 +1,6 @@
+# The one network card of the virtual machine. QEMU answers the request for an address itself.
+[Match]
+Name=en*
+
+[Network]
+DHCP=ipv4

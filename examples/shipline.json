@@ -49,12 +49,18 @@
   "runner": {
     "labels": [
       "example-app-home",
+      "example-app-home-standby",
+      "example-app-home-first",
       "example-app-home-main",
       "example-app-home-docker",
-      "example-app-planner"
+      "example-app-home-planner"
     ],
-    "identity_folder": "~/.config/example-app-runner",
-    "prefix": "example-app-runner"
+    "identity_folder": "~/.config/shipline-runner",
+    "prefix": "example-app",
+    "label": "example-app-home",
+    "planner_label": "example-app-home-planner",
+    "image_build": "tools/shipline/build-runner-images",
+    "hub_cache": "tools/shipline/hub-cache"
   },
   "parity": {
     "workflow_tests": "tools/shipline/tests",
@@ -71,5 +77,14 @@
       "billing": ["/invoices", "/settings/billing"]
     },
     "plans": "docs/hunt-plans.md"
-  }
+  },
+  "review": {
+    "high_effort_paths": [
+      "^db/migrations/", "^db/schema\\.sql$", "^app/models/",
+      "^prompts/", "(^|/)AGENTS\\.md$", "\\.prompt\\.md$",
+      "^app/jobs/", "^app/queues/", "(^|/)locks?\\.py$",
+      "^app/auth/", "^app/permissions/", "^config/secrets"
+    ]
+  },
+  "answer_for_owner_after_minutes": 15
 }
