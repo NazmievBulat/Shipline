@@ -882,8 +882,8 @@ def test_without_test_selections_the_panel_says_the_whole_suites_run(workflow: W
         "reasons": ["no server test selection is configured"],
     }
     assert (root / "browser-tests.txt").read_text() == ""
-    assert "no browser test selection is configured, so CI runs the whole browser suite" in (
-        done.stdout
+    assert (root / "task.md").read_text().endswith(
+        "\nNo browser test selection is configured: CI runs the whole browser suite.\n"
     )
 
 

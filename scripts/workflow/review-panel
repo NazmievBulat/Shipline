@@ -39,7 +39,8 @@ run_one() {
 
 # The tests a conflict's resolution reaches from `base`, by the repository's selection of one
 # kind (`server` or `browser`, its words after the base), given the conflicting files. Without a
-# server selection the whole server suite is reached; without a browser one no spec is selected.
+# server selection the whole server suite is reached; without a browser one no spec is selected,
+# and the task says CI runs the whole browser suite.
 select_tests() {
   local kind=$1 base=$2
   shift 2
@@ -47,6 +48,8 @@ select_tests() {
     "$@" "$base" --files-from .review/conflict-files.txt
   elif [[ $kind == server ]]; then
     jq -n '{whole: true, tests: [], total: 0, reasons: ["no server test selection is configured"]}'
+  else
+    printf '\nNo browser test selection is configured: CI runs the whole browser suite.\n' >>.review/task.md
   fi
 }
 
@@ -107,8 +110,6 @@ if [[ $full_review == false && -f $main/$SHIPLINE_STATE_FOLDER/review-$number.co
       exit 1
     fi
     cp "$inputs/.review/"{diff.patch,task.md,weaker-tests.md,conflict-files.txt,server-tests.json,browser-tests.txt} "$root/"
-    ((${#SHIPLINE_COMMAND_BROWSER_TESTS_FOR_CHANGES[@]} > 0)) ||
-      echo "no browser test selection is configured, so CI runs the whole browser suite"
     scope_key=$(sha256sum "$root/task.md" "$root/diff.patch" | sha256sum | cut -d' ' -f1)
   elif ((scope_result == 2)); then
     cp "$inputs/.review/task.md" "$root/task.md"

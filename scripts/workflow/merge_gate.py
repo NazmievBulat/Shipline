@@ -39,10 +39,10 @@ from workflow_commands import (
 )
 
 # The files a repository keeps for the gate are in its own `scripts/workflow`, in its main
-# checkout: the repository Shipline works on, not the checkout these scripts are in. Searched after
-# the scripts' own folder, so none of them stands in for one of the scripts.
+# checkout: the repository Shipline works on, not the checkout these scripts are in. Searched last,
+# so none of them stands in for one of the scripts or for a module of Python's own.
 REPOSITORY_FILES = workflow_config.current().main / "scripts" / "workflow"
-sys.path.insert(1, str(REPOSITORY_FILES))
+sys.path.append(str(REPOSITORY_FILES))
 
 # A repository may hold one helper there, and the gate uses it when it does: `run_proof` reads
 # and writes the `Workflow-Proof` line with which main skips a job its squash proved. Without it
@@ -3976,7 +3976,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             reason = f"behind {train.first}" if train.first else "for main to change"
             print(
                 f"merge train: pull request {number} waits {reason}; "
-                "run scripts/workflow/notify waiting and end the turn; the tick wakes you",
+                "run shipline notify waiting and end the turn; the tick wakes you",
                 flush=True,
             )
             command("bash", str(HERE / "notify"), "waiting")

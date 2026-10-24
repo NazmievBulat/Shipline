@@ -28,6 +28,7 @@ COMMANDS=(
   usage
   wake
   weaker-tests
+  workflow-metrics
 )
 
 # The repository's own commands its `shipline.json` names under `commands` (`hunt-app` for

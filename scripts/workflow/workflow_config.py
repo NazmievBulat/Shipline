@@ -1,8 +1,8 @@
 """What differs between the repositories that use Shipline, read from one file.
 
 A repository keeps `shipline.json` at the root of its main checkout: the main checkout of the
-repository being worked on (`SHIPLINE_REPO`, else the repository of the current directory, never
-the checkout these scripts are in), found from the git common directory, so a worktree reads the
+repository being worked on (`SHIPLINE_REPO`, else the repository of the current directory; never
+found from where these scripts are), found from the git common directory, so a worktree reads the
 same file as the main checkout. A key the file leaves out keeps its default, key by key; a key the
 file names that Shipline does not know, or a value of the wrong kind, is refused, so a typing
 error never passes as a default.
@@ -218,8 +218,8 @@ def main_checkout(start: Path) -> Path:
 
 def repository_checkout() -> Path:
     """The main checkout of the repository Shipline works on: the one `SHIPLINE_REPO` names
-    (`shipline --repo` sets it), else the one the current directory is in. Never the checkout
-    these scripts are in, which is Shipline's own."""
+    (`shipline --repo` sets it), else the one the current directory is in. Never found from
+    where these scripts are: they are in Shipline's own checkout."""
     named = os.environ.get("SHIPLINE_REPO")
     if named:
         try:
