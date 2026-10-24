@@ -717,3 +717,22 @@ def test_a_refused_move_with_a_new_identity_leaves_the_counts_units_and_installe
     assert "Install the receiving machine first" in done.stderr
     assert pool_machine.installation(identity=False) == before
     assert pool_machine.calls("systemctl") == []
+    assert (pool_machine.identity / "token").read_text() == "stand-in\n"
+
+
+def test_an_identity_github_refuses_stops_the_install_with_nothing_changed(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.installed_as(slots=4)
+    pool_machine.refuse_new_identities()
+    pool_machine.settle(slots=4)
+    token = pool_machine.root / "token"
+    token.write_text("stand-in\n")
+    before = pool_machine.installation()
+
+    done = pool_machine.install("--github-token", str(token))
+
+    assert done.returncode != 0
+    assert "Resource not accessible" in done.stderr
+    assert pool_machine.installation() == before
+    assert pool_machine.calls("systemctl") == []

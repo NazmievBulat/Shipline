@@ -66,7 +66,7 @@ _STAND_INS = {
 # GitHub's runner list, runner labels and registrations, kept in runners.json: missing, GitHub
 # cannot be read.
 _GH = """#!/usr/bin/env python3
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 
 state = "@STATE@"
 with open(f"{state}/calls.log", "a") as log:
@@ -95,8 +95,12 @@ try:
 except OSError:
     sys.exit(1)
 path = (path or "").split("?", 1)[0]
-# The rights github_identity.py checks a new identity by, which this GitHub grants.
+# The rights github_identity.py checks a new identity by, which this GitHub grants unless told
+# to refuse one.
 if re.search(r"/(actions/runs|actions/variables|pulls)$", path) and method == "GET":
+    if os.path.exists(f"{state}/refuse-identity"):
+        sys.stderr.write("HTTP 403: Resource not accessible by personal access token\\n")
+        sys.exit(1)
     print("{}")
     sys.exit(0)
 if path.endswith("/actions/runners/registration-token") and method == "POST":
@@ -230,6 +234,10 @@ class Machine:
     def usage(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         """usage.py of the installed copy, as runner/README.md says to run it."""
         return self._run("python3", str(self.installed / "usage.py"), *arguments)
+
+    def refuse_new_identities(self) -> None:
+        """GitHub refuses a right github_identity.py checks a new identity by."""
+        (self.state / "refuse-identity").touch()
 
     def lose_github(self) -> None:
         """GitHub's runner list cannot be read."""
