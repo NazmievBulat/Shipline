@@ -616,17 +616,25 @@ def _attach(name: str, address: str, text: str) -> str:
             _end_group(group)
 
 
-def _end_group(group: int) -> None:
-    for _ in range(10):
+def _gone(group: int, seconds: float) -> bool:
+    for _ in range(int(seconds * 10)):
         try:
             os.killpg(group, 0)
         except (ProcessLookupError, PermissionError):
-            return
+            return True
         time.sleep(0.1)
+    return False
+
+
+def _end_group(group: int) -> None:
+    if _gone(group, 1):
+        return
     try:
         os.killpg(group, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
-        pass
+        return
+    # Until its parent's parent reaps it, a killed client still answers as a process.
+    _gone(group, 3)
 
 
 def _wake(notes: Path, snapshot: Path) -> int:
