@@ -132,6 +132,9 @@ _TICK_LINES = [
     re.compile(rf"^stuck\? (?P<who>{_NAME}) \((?:\d+ min, running: |nudge not taken).*$"),
     re.compile(rf"^idle, no rule: (?P<who>{_NAME}) \(\d+ min, last line: .*\)$"),
     re.compile(r"^(?P<who>worker-program-\d+) names no worker program .*$"),
+    re.compile(rf"^answered for the owner: (?P<who>{_NAME}), .*$"),
+    re.compile(rf"^(?P<who>{_NAME}) asks the owner without (?:a reply word|the Owner only line); "),
+    re.compile(rf"^(?P<who>{_NAME}) answer for the owner failed: .*$"),
     re.compile(
         rf"^(?P<who>{_NAME}) (?:still|loop|stuck) nudge "
         r"(?:failed|failed again|sent again|not taken).*$"

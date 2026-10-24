@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from workflow_harness import Workflow
+from workflow_harness import Workflow, install_shipline
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "flow_page"
 # 24 October 2026, 07:50 UTC.
@@ -825,13 +825,14 @@ def _units(workflow: Workflow) -> Path:
 def test_the_timer_runs_the_page_every_10_minutes_and_serves_nothing_without_settings(
     workflow: Workflow,
 ) -> None:
+    home = install_shipline(workflow)
     done = workflow.run_script("install-flow-page-timer")
 
     assert done.returncode == 0, done.stderr
     service = (_units(workflow) / "flow-page.service").read_text().splitlines()
     assert "Type=oneshot" in service
     assert f"WorkingDirectory={workflow.repo}" in service
-    assert f'ExecStart="{workflow.repo}/scripts/workflow/flow-page"' in service
+    assert f'ExecStart="{home}/bin/shipline" --repo "{workflow.repo}" flow-page' in service
     assert f'Environment="PATH={workflow.env["PATH"]}"' in service
     timer = (_units(workflow) / "flow-page.timer").read_text().splitlines()
     assert "OnCalendar=*:0/10" in timer
@@ -844,13 +845,14 @@ def test_the_timer_runs_the_page_every_10_minutes_and_serves_nothing_without_set
 
 
 def test_with_settings_a_service_serves_the_page_on_their_port(workflow: Workflow) -> None:
+    home = install_shipline(workflow)
     _settings(workflow, "flow_page_address=192.0.2.10\nflow_page_port=8800\n")
 
     done = workflow.run_script("install-flow-page-timer")
 
     assert done.returncode == 0, done.stderr
     serve = (_units(workflow) / "flow-page-serve.service").read_text().splitlines()
-    assert f'ExecStart="{workflow.repo}/scripts/workflow/flow-page" --serve 8800' in serve
+    assert f'ExecStart="{home}/bin/shipline" --repo "{workflow.repo}" flow-page --serve 8800' in serve
     assert "Restart=always" in serve and "RestartSec=30" in serve
     assert "WantedBy=default.target" in serve
     assert workflow.calls("systemctl") == [
@@ -862,6 +864,7 @@ def test_with_settings_a_service_serves_the_page_on_their_port(workflow: Workflo
 
 
 def test_settings_taken_away_stop_and_remove_the_server(workflow: Workflow) -> None:
+    install_shipline(workflow)
     _settings(workflow, "flow_page_port=8800\n")
     workflow.run_script("install-flow-page-timer")
     settings = workflow.repo / ".github" / "runner" / "settings.sh"

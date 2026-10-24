@@ -1012,6 +1012,51 @@ def test_a_check_in_brought_about_by_a_wait_loop_that_came_due_is_timing(tmp_pat
     )
 
 
+def test_an_answer_for_the_owner_due_between_the_ticks_is_noted_and_typed_by_the_real_one(
+    workflow: Workflow,
+) -> None:
+    from test_tick import _ASKED_AT, _answered, _asks_the_owner, _replies
+
+    _asks_the_owner(workflow)
+    _settled(workflow)
+
+    # 14 min 40 s after the question when the shadow tick reads the clock, 15 min 40 s after it
+    # when the real one does.
+    _ticks(workflow, _ASKED_AT + 880, late=60)
+
+    log = _shadow_log(workflow).read_text()
+    assert f'{_ASKED_AT + 880} due within 20 s: answered for the owner: ticket-7, "1"\n' in log
+    assert _replies(workflow) == ["1"]
+    assert _answered(workflow) == [{"name": "ticket-7", "reply": "1", "at": _ASKED_AT + 940}]
+    compared = _compare("--shadow", str(_shadow_log(workflow)), "--wake", str(workflow.wake_log))
+    assert compared.returncode == 0, compared.stdout
+
+
+def test_an_answer_for_the_owner_is_logged_by_the_shadow_and_typed_by_no_one_else(
+    workflow: Workflow,
+) -> None:
+    from test_tick import _ASKED_AT, _answered, _asks_the_owner, _replies
+
+    _asks_the_owner(workflow)
+    _settled(workflow)
+    _strict(workflow)
+    notes = _digest(workflow.notes(7), workflow.repo / ".local" / "workflow")
+
+    done = workflow.run_script(
+        "tick", "--shadow", env={"TZ": "UTC", "WORKFLOW_NOW": str(_ASKED_AT + 960)}
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert not (workflow.state / "refused.log").exists(), (
+        workflow.state / "refused.log"
+    ).read_text()
+    assert f'{_ASKED_AT + 960} answered for the owner: ticket-7, "1"\n' in (
+        _shadow_log(workflow).read_text()
+    )
+    assert _replies(workflow) == [] and _answered(workflow) == []
+    assert _digest(workflow.notes(7), workflow.repo / ".local" / "workflow") == notes
+
+
 def test_the_readme_runs_the_shadow_tick_on_a_timer_of_its_own_and_bounds_it() -> None:
     readme = (_ROOT / "scripts" / "workflow" / "README.md").read_text()
 
