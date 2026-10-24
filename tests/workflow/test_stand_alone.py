@@ -36,24 +36,29 @@ def _gate(workflow: Workflow, code: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _failing_hook(workflow: Workflow, lines: list[str]) -> None:
-    """A pre-push hook that prints `lines` and refuses. It lives in `workflow.bin`: CI runs
-    pytest in /dev/shm, where git finds a hook it cannot run and skips it."""
+def _failing_hook(workflow: Workflow, lines: list[str], *, stall: bool = False) -> None:
+    """A pre-push hook that prints `lines` and refuses, or with `stall` sleeps past any deadline.
+    It lives in `workflow.bin`: CI runs pytest in /dev/shm, where git finds a hook it cannot run
+    and skips it."""
     hooks = workflow.bin / "hooks"
     hooks.mkdir(exist_ok=True)
     hook = hooks / "pre-push"
     printed = "".join(f"echo {json.dumps(line)}\n" for line in lines)
-    hook.write_text(f'#!/bin/bash\necho pre-push >> "{workflow.state}/calls.log"\n{printed}exit 1\n')
+    end = "exec /bin/sleep 30" if stall else "exit 1"
+    hook.write_text(f'#!/bin/bash\necho pre-push >> "{workflow.state}/calls.log"\n{printed}{end}\n')
     hook.chmod(0o755)
     workflow.git("config", "core.hooksPath", str(hooks))
 
 
-def _push(workflow: Workflow) -> subprocess.CompletedProcess[str]:
-    """The gate pushes a new branch; it prints what came back, or the wait it raised."""
+def _push(workflow: Workflow, deadline: int | None = None) -> subprocess.CompletedProcess[str]:
+    """The gate pushes a new branch; it prints what came back, or the wait it raised. A
+    `deadline` is the gate's own for this test, shorter than its commands'."""
     workflow.git("commit", "--quiet", "--allow-empty", "-m", "feat: pushed by the gate")
     return _gate(
         workflow,
-        """
+        (f"g.COMMAND_TIMEOUT = {deadline}\n" if deadline else "")
+        + textwrap.dedent(
+            """
         import json
         try:
             pushed = g.push("origin", "HEAD:refs/heads/ticket/pushed")
@@ -61,7 +66,8 @@ def _push(workflow: Workflow) -> subprocess.CompletedProcess[str]:
             print(json.dumps({"waiting": type(error).__name__, "reason": str(error)}))
         else:
             print(json.dumps({"returncode": pushed.returncode, "refusal": pushed.refusal}))
-        """,
+        """
+        ),
     )
 
 
@@ -97,6 +103,8 @@ def _helpers_beside_the_scripts(workflow: Workflow) -> None:
                     log.write("install " + str(checkout) + "\\n")
                 return ""
             def refusal(output, checkout):
+                with open({str(calls)!r}, "a") as log:
+                    log.write("refusal " + output.replace("\\n", " | ") + "\\n")
                 return "the hook's step failed"
             """
         )
@@ -139,6 +147,22 @@ def test_a_failed_push_is_refused_with_its_last_lines(workflow: Workflow) -> Non
     assert len(refused) == 10, refused
     assert _UNREACHED in refused and "step 1" not in refused
     assert "failed to push" in refused[-1]
+
+
+def test_a_push_that_times_out_is_refused_with_its_last_twenty_lines(workflow: Workflow) -> None:
+    lines = [f"step {number}" for number in range(1, 26)] + [_UNREACHED]
+    _failing_hook(workflow, lines, stall=True)
+
+    done = _push(workflow, deadline=5)
+
+    assert done.returncode == 0, done.stderr
+    pushed = json.loads(done.stdout)
+    assert pushed["returncode"] != 0
+    # The deadline on the first line, then the hook's last twenty, which git never followed.
+    assert pushed["refusal"].splitlines() == [
+        "git push timed out after 5s",
+        *lines[-20:],
+    ], pushed["refusal"]
 
 
 def test_a_failed_push_is_never_read_as_an_outage_of_an_advisory_service(
@@ -266,6 +290,23 @@ def test_a_repository_s_refusal_of_a_failed_push_is_used_when_it_holds_it(
     done = _push(workflow)
 
     assert json.loads(done.stdout)["refusal"] == "the hook's step failed", done.stderr
+
+
+def test_a_repository_s_refusal_of_a_timed_out_push_follows_the_deadline(
+    workflow: Workflow,
+) -> None:
+    _helpers_beside_the_scripts(workflow)
+    _failing_hook(workflow, ["$ sh scripts/slow-check.sh", _UNREACHED], stall=True)
+
+    done = _push(workflow, deadline=5)
+
+    # The output read before the stop is worded by the repository; no outage is noted.
+    pushed = json.loads(done.stdout)
+    assert pushed["refusal"] == "git push timed out after 5s\nthe hook's step failed", done.stderr
+    assert workflow.calls("refusal ") == [
+        f"refusal $ sh scripts/slow-check.sh | {_UNREACHED} | "
+    ]
+    assert not (workflow.repo / ".local/workflow/advisory-service-down").exists()
 
 
 def test_a_repository_s_proof_is_read_and_written_when_it_holds_it(workflow: Workflow) -> None:

@@ -11,8 +11,8 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix; no test command, which a repository names for its CI's test job
-(`ci_proof.py test`).
+runner prefix; no hunt areas, so one hunt runs at a time, and no hunt plans file; no test
+command, which a repository names for its CI's test job (`ci_proof.py test`).
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -87,6 +87,13 @@ DEFAULTS: dict[str, Any] = {
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
     },
+    "hunts": {
+        # Each area of the application a hunt may keep to: its name and the screens (paths) it
+        # covers. With none, a hunt hunts every screen and runs alone (`session start hunt`).
+        "areas": {},
+        # The repository's file of hunt plans, which a hunt with a plan is told of.
+        "plans": None,
+    },
     "commands": {
         # The command line that runs the repository's tests, from the root of its checkout.
         "test": None,
@@ -95,6 +102,12 @@ DEFAULTS: dict[str, Any] = {
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
+# An area is the last word of `session start hunt`, and the area and its screens go into the
+# sentence a hunt is started with, inside double quotes in a shell command: no quotation mark,
+# dollar, backtick, backslash or space. The screens are joined with commas there.
+_AREA = re.compile(r"[a-z0-9][a-z0-9-]*")
+_SCREEN = re.compile(r"/[A-Za-z0-9/._~:@%+*\[\]{}-]*")
+_PLANS = re.compile(r"[A-Za-z0-9/._-]+")
 
 
 class ConfigError(Exception):
@@ -151,6 +164,13 @@ class Runner:
 
 
 @dataclass(frozen=True)
+class Hunts:
+    # In the order the file names them.
+    areas: dict[str, tuple[str, ...]]
+    plans: str | None = None
+
+
+@dataclass(frozen=True)
 class Commands:
     # None when the file names none.
     test: str | None
@@ -167,6 +187,7 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    hunts: Hunts
     commands: Commands
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
@@ -218,6 +239,8 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
         name = where + key
         if key not in given:
             merged[key] = default
+        elif name == "hunts.areas":
+            merged[key] = _areas(given[key])
         elif isinstance(default, dict):
             merged[key] = _merged(default, given[key], name + ".")
         elif isinstance(default, list):
@@ -235,10 +258,44 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
     return merged
 
 
+def _areas(given: Any) -> dict[str, tuple[str, ...]]:
+    if not isinstance(given, dict):
+        raise ConfigError(f"{FILE}: hunts.areas must be an object of area names to screens")
+    areas: dict[str, tuple[str, ...]] = {}
+    for area, screens in given.items():
+        if not _AREA.fullmatch(area):
+            raise ConfigError(
+                f"{FILE}: hunts.areas: {json.dumps(area)} is not an area name: small letters, "
+                "digits and dashes"
+            )
+        if (
+            not isinstance(screens, list)
+            or not screens
+            or not all(isinstance(screen, str) and _SCREEN.fullmatch(screen) for screen in screens)
+        ):
+            raise ConfigError(
+                f"{FILE}: hunts.areas.{area} must be a list of screens, each a path that starts "
+                "with / and has no space, comma, quotation mark, dollar, backtick or backslash"
+            )
+        areas[area] = tuple(screens)
+    return areas
+
+
 def _relative(value: str, name: str) -> str:
     path = PurePosixPath(value)
     if path.is_absolute() or ".." in path.parts or str(path) == ".":
         raise ConfigError(f"{FILE}: {name} must be a path inside the checkout, not {value}")
+    return value
+
+
+def _plans(value: str | None) -> str | None:
+    if value is not None and not (
+        _PLANS.fullmatch(value) and _relative(value, "hunts.plans") == value
+    ):
+        raise ConfigError(
+            f"{FILE}: hunts.plans must be a path inside the checkout of letters, digits, dots, "
+            f"dashes and underscores, not {value}"
+        )
     return value
 
 
@@ -330,6 +387,7 @@ def load(start: Path = HERE) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
+        hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
         commands=Commands(**values["commands"]),
         given=given,
         main=main,
@@ -361,6 +419,10 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
         },
+        "hunts": {
+            "areas": {area: list(screens) for area, screens in config.hunts.areas.items()},
+            "plans": config.hunts.plans,
+        },
         "commands": vars(config.commands).copy(),
     }
 
@@ -383,11 +445,17 @@ def shell(config: Config) -> str:
         "LABEL_AUDITED": config.labels.audited,
         **{f"PRIORITY_{key.upper()}": value for key, value in config.labels.priority.items()},
         "IDENTITY_FOLDER": config.runner.identity_folder,
+        "HUNT_PLANS": config.hunts.plans or "",
         "CONFIG": json.dumps(config.given, separators=(",", ":")),
     }
     lines = [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]
     labels = " ".join(shlex.quote(label) for label in config.runner.labels)
     lines.append(f"SHIPLINE_RUNNER_LABELS=({labels})")
+    # The hunt areas, and at the same place in the other array the screens of each, joined.
+    areas = config.hunts.areas
+    lines.append(f"SHIPLINE_HUNT_AREAS=({' '.join(shlex.quote(area) for area in areas)})")
+    screens = " ".join(shlex.quote(", ".join(paths)) for paths in areas.values())
+    lines.append(f"SHIPLINE_HUNT_SCREENS=({screens})")
     return "\n".join(lines) + "\n"
 
 
