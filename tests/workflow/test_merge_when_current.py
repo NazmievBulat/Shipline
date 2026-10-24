@@ -4,6 +4,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import select
 import signal
 import subprocess
@@ -19,6 +20,7 @@ from stand_in_server import StandInServer
 from workflow_harness import Workflow
 
 _GH = r"""import builtins
+import fcntl
 import json
 import subprocess
 import sys
@@ -42,6 +44,23 @@ def answer(args, cwd, env, out, err):
     with (state / "calls.log").open("a") as log:
         log.write("gh " + " ".join(args) + "\n")
     data = json.loads((state / "github.json").read_text())
+    probe = Path(data.get("lock_probe") or "/nonexistent/merge.lock")
+    if probe.parent.is_dir():
+        # A call made while a gate holds the merge lock is written down as well.
+        with probe.open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                with (state / "locked-calls.log").open("a") as log:
+                    log.write("gh " + " ".join(args) + "\n")
+    pause = state / "pause-call"
+    if pause.exists() and pause.read_text().strip() in " ".join(args):
+        # The call waits until the test lets it go on.
+        pause.unlink()
+        with (state / "call-entered").open("w") as pipe:
+            pipe.write("entered\n")
+        with (state / "call-continue").open() as pipe:
+            pipe.read(1)
     if args[:2] == ["pr", "view"] and "-R" in args and args[2] in data["pulls"]:
         if data["pulls"][args[2]].get("fail_view"):
             sys.exit("GitHub unavailable")
@@ -57,6 +76,11 @@ def answer(args, cwd, env, out, err):
         for check in data["pulls"][args[2]]["statusCheckRollup"]:
             check.setdefault("__typename", "StatusContext" if "state" in check else "CheckRun")
         print(json.dumps(data["pulls"][args[2]]))
+        changed = data.get("after_view", {}).pop(args[2], None)
+        if changed:
+            # The pull request changes on GitHub right after this read.
+            data["pulls"][args[2]].update(changed)
+            (state / "github.json").write_text(json.dumps(data))
     elif (args[:2] == ["pr", "list"]
           and "--state" in args and "--jq" not in args and "--base" not in args):
         # Both bulk and individual reads describe the same GitHub state. Keep ordinary
@@ -215,6 +239,10 @@ class GitHub:
     after_merge: dict[str, dict[str, dict[str, Any]]] = field(
         default_factory=dict[str, dict[str, dict[str, Any]]]
     )
+    # What GitHub shows of a pull request right after the gate's next read of it.
+    after_view: dict[str, dict[str, Any]] = field(default_factory=dict[str, dict[str, Any]])
+    # The merge lock whose holder's calls the stand-in writes down (locked_calls).
+    lock_probe: str | None = None
 
     def save(self) -> None:
         (self.workflow.state / "github.json").write_text(
@@ -230,6 +258,8 @@ class GitHub:
                     "refusal_moves_main": self.refusal_moves_main,
                     "after_main": self.after_main,
                     "after_merge": self.after_merge,
+                    "after_view": self.after_view,
+                    "lock_probe": self.lock_probe,
                 }
             )
         )
@@ -6035,3 +6065,224 @@ def test_gate_refuses_reused_image_evidence_it_cannot_verify(github: GitHub, bro
     done = github.run()
     assert done.returncode == 1, done.stdout + done.stderr
     assert not (github.workflow.state / "merged").exists()
+
+
+# A reviewer's handoff checks its own pull request, then holds the merge lock only to join the
+# line and save its note: the members already in the line are the tick's to read.
+
+
+def _handing_off(github: GitHub) -> Path:
+    """Pull request 7's reviewer in its worktree, with a passed round published on its head."""
+    workflow = github.workflow
+    workflow.git("checkout", "main")
+    workflow.git("worktree", "add", str(workflow.worktree(7)), "ticket/seven")
+    github.api[f"{_REPO}/pulls/7/reviews"] = [
+        {
+            "body": "<!-- workflow-review round=1 result=passed -->\nReviewed.",
+            "commit_id": github.head,
+        }
+    ]
+    github.lock_probe = str(workflow.repo / ".local/workflow/merge.lock")
+    github.save()
+    return workflow.worktree(7)
+
+
+def _hand_off(github: GitHub) -> subprocess.CompletedProcess[str]:
+    github.save()
+    return github.workflow.run_script(
+        "merge-when-current", "--handoff", "7", cwd=github.workflow.worktree(7)
+    )
+
+
+def _locked_calls(workflow: Workflow) -> list[str]:
+    log = workflow.state / "locked-calls.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _waiting(workflow: Workflow) -> list[str]:
+    path = workflow.repo / ".local/workflow/merge-train.json"
+    return json.loads(path.read_text())["waiting"] if path.exists() else []
+
+
+def test_a_handoff_into_a_long_line_reads_no_other_member_under_the_merge_lock(
+    github: GitHub,
+) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    line = [str(number) for number in range(8, 58)]
+    for number in line:
+        github.pulls[number] = {
+            **deepcopy(github.pulls["7"]),
+            "headRefOid": f"{int(number):040x}",
+            "headRefName": f"ticket/{number}",
+        }
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": line}))
+
+    done = _hand_off(github)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (folder / "merge-wanted-7").exists()
+    assert _waiting(workflow) == [*line, "7"]
+    # Under the lock, one read of its own pull request; the line's members are not read at all.
+    locked = _locked_calls(workflow)
+    assert len(locked) == 1 and locked[0].startswith("gh pr view 7 "), locked
+    others = [github.pulls[number]["headRefOid"] for number in line]
+    assert not [
+        call
+        for call in workflow.calls("gh")
+        if call.startswith(tuple(f"gh pr view {number} " for number in line))
+        or any(head in call for head in others)
+    ]
+    assert re.search(
+        r"^[0-9]+ handoff 7 held the merge lock for [0-9]+\.[0-9] s$",
+        workflow.wake_log.read_text(),
+        re.MULTILINE,
+    )
+
+
+def test_another_gate_call_gets_the_merge_lock_while_a_handoff_reads_github(
+    github: GitHub,
+) -> None:
+    workflow = github.workflow
+    worktree = _handing_off(github)
+    entered = workflow.state / "call-entered"
+    release = workflow.state / "call-continue"
+    os.mkfifo(entered)
+    os.mkfifo(release)
+    # GitHub is slow to answer the handoff's read of its reviews.
+    (workflow.state / "pause-call").write_text("pulls/7/reviews")
+    entered_fd = os.open(entered, os.O_RDWR | os.O_NONBLOCK)
+    release_fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
+    handoff = subprocess.Popen(
+        ["bash", str(workflow.script.with_name("merge-when-current")), "--handoff", "7"],
+        cwd=worktree,
+        env=workflow.env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert select.select([entered_fd], [], [], 15)[0], "the handoff never read its reviews"
+        assert os.read(entered_fd, 100) == b"entered\n"
+        # Another gate call waiting for the lock gets it while the handoff waits on GitHub.
+        got = None
+        started = time.monotonic()
+        with (workflow.repo / ".local/workflow/merge.lock").open("w") as lock:
+            while got is None and time.monotonic() - started < 5:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    got = time.monotonic() - started
+                except BlockingIOError:
+                    time.sleep(0.05)
+        os.write(release_fd, b"x")
+        out, err = handoff.communicate(timeout=60)
+    finally:
+        if handoff.poll() is None:
+            handoff.kill()
+            handoff.communicate()
+        os.close(entered_fd)
+        os.close(release_fd)
+    assert got is not None, "the handoff held the merge lock while it read GitHub"
+    assert handoff.returncode == 0, out + err
+    assert (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+
+
+@pytest.mark.parametrize(
+    ("change", "refusal"),
+    [
+        ({"headRefOid": "f" * 40}, "the pull request head changed during the handoff"),
+        ({"headRefName": "ticket/other"}, "the pull request head changed during the handoff"),
+        ({"isDraft": True}, "only a ready, non-conflicting pull request can be handed off"),
+        ({"mergeable": "CONFLICTING"}, "only a ready, non-conflicting pull request"),
+        (
+            {
+                "statusCheckRollup": [
+                    {"name": "CI result", "status": "COMPLETED", "conclusion": "FAILURE"}
+                ]
+            },
+            "only a ready, non-conflicting pull request",
+        ),
+    ],
+)
+def test_a_pull_request_that_changed_before_the_lock_was_taken_is_refused(
+    github: GitHub, change: dict[str, Any], refusal: str
+) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    github.after_view = {"7": change}
+
+    done = _hand_off(github)
+
+    assert done.returncode == 1 and refusal in done.stderr, done.stdout + done.stderr
+    assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+    assert "7" not in _waiting(workflow)
+    # The refusal comes from the one read under the lock.
+    assert [call.split()[:4] for call in _locked_calls(workflow)] == [["gh", "pr", "view", "7"]]
+
+
+def _red_ci(github: GitHub) -> None:
+    """Its CI run failed, though GitHub still shows its checks green."""
+    github.api[
+        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={github.head}&event=pull_request&per_page=100"
+    ]["workflow_runs"][0]["conclusion"] = "failure"
+    github.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"]["jobs"][1]["conclusion"] = "failure"
+
+
+@pytest.mark.parametrize(
+    ("case", "refusal"),
+    [
+        ("draft", "only a ready, non-conflicting pull request can be handed off"),
+        ("conflicting", "only a ready, non-conflicting pull request can be handed off"),
+        ("failed", "only a ready, non-conflicting pull request can be handed off"),
+        ("unreviewed", "the latest independent round must have passed on the current head"),
+        ("sent back", "the latest independent round must have passed on the current head"),
+        ("unclean", "handoff requires the clean published pull request worktree"),
+        ("branch", "handoff requires the pull request branch"),
+        ("pre-train checks", "pre-train checks failed"),
+        ("blocked", "this pull request failed checks; fix it before rejoining the merge train"),
+    ],
+)
+def test_each_handoff_refusal_still_fires(github: GitHub, case: str, refusal: str) -> None:
+    workflow = github.workflow
+    worktree = _handing_off(github)
+    folder = workflow.repo / ".local/workflow"
+    pull = github.pulls["7"]
+    if case == "draft":
+        pull["isDraft"] = True
+    elif case == "conflicting":
+        pull["mergeable"] = "CONFLICTING"
+    elif case == "failed":
+        pull["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    elif case == "unreviewed":
+        github.api[f"{_REPO}/pulls/7/reviews"] = []
+    elif case == "sent back":
+        github.api[f"{_REPO}/pulls/7/reviews"][0]["body"] = (
+            "<!-- workflow-review round=1 result=sent-back -->\nNot yet."
+        )
+    elif case == "unclean":
+        (worktree / "uncommitted.txt").write_text("not published\n")
+    elif case == "branch":
+        workflow.git("checkout", "--detach", cwd=worktree)
+    elif case == "pre-train checks":
+        checks = workflow.script.with_name("pre-train-checks")
+        checks.write_text("#!/bin/bash\necho 'inventory is stale' >&2\nexit 1\n")
+    else:
+        # It failed in the line before, on this same head, and its run is still red.
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "merge-train.json").write_text(
+            json.dumps({"waiting": ["7"], "blocked": {"7": github.head}})
+        )
+        _red_ci(github)
+
+    done = _hand_off(github)
+
+    assert done.returncode == 1 and refusal in done.stderr, done.stdout + done.stderr
+    assert not (folder / "merge-wanted-7").exists()
+    if case == "blocked":
+        # It keeps its place, passed over until a green re-run, as before.
+        train = json.loads((folder / "merge-train.json").read_text())
+        assert train["waiting"] == ["7"] and train["blocked"] == {"7": github.head}
+    else:
+        assert "7" not in _waiting(workflow)
