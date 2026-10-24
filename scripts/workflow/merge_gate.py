@@ -273,7 +273,8 @@ def runs(
     # unchanged head is kept apart: it may report a failure, never hold or close the gate.
     event = "&event=pull_request" if pull else ""
     found = api(
-        f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs?head_sha={head}{event}&per_page=100",
+        f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
+        f"?head_sha={head}{event}&per_page=100",
         "workflow_runs",
     )
     return sorted(

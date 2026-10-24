@@ -237,9 +237,7 @@ def load(start: Path = HERE) -> Config:
     except ValueError as error:
         raise ConfigError(f"{FILE} is not JSON: {error}") from error
     values = _merged(DEFAULTS, given, "")
-    repository = (
-        values["repository"] or _from_runner_settings(main) or _from_origin(main)
-    )
+    repository = values["repository"] or _from_runner_settings(main) or _from_origin(main)
     if not repository:
         raise ConfigError(
             f"{FILE} names no repository, and neither {RUNNER_SETTINGS} nor the origin remote does"

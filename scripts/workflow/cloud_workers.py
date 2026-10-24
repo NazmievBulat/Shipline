@@ -141,7 +141,9 @@ def _recover(path: Path) -> None:
                         if record.get("status") == "retryable"
                         else "no View address; reservation kept, retrying address recovery only"
                     ),
-                    "url": f"https://github.com/{workflow_config.current().repository}/pull/{number}",
+                    "url": (
+                        f"https://github.com/{workflow_config.current().repository}/pull/{number}"
+                    ),
                 },
             )
             record["launch_noted"] = True

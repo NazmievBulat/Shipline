@@ -1,6 +1,7 @@
 """One file, `shipline.json` at the root of the main checkout, names what differs between the
 repositories that use Shipline; `workflow_config.py` reads it, key by key over its defaults."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -294,7 +295,13 @@ def test_bash_without_a_file_reads_the_defaults(tmp_path: Path) -> None:
         '"${#SHIPLINE_RUNNER_LABELS[@]}" "$SHIPLINE_CONFIG"',
     )
 
-    assert printed.splitlines() == ["example-owner/example-app", ".local/workflow", "CI result", "0", "{}"]
+    assert printed.splitlines() == [
+        "example-owner/example-app",
+        ".local/workflow",
+        "CI result",
+        "0",
+        "{}",
+    ]
 
 
 def _jq(config: str | None, labels: list[str], program: str = "priority_name") -> str:
@@ -479,3 +486,234 @@ def test_another_repository_state_folder_and_check_names_reach_the_gate_the_tick
     assert not [call for call in workflow.calls("gh") if "NazmievBulat" in call]
     for checkout in (workflow.repo, workflow.worktree(7), workflow.worktree(8)):
         assert not (checkout / ".local" / "workflow").exists(), checkout
+
+
+def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> dict[str, str]:
+    """The worker's sentence, the cloud worker's, the wake's message and the review prompt, as
+    the scripts write them in a repository without `shipline.json`."""
+    (workflow.repo / "AGENTS.md").write_text("Rules from main\n")
+    workflow.git("add", "AGENTS.md")
+    workflow.git("commit", "--quiet", "-m", "docs: main rules")
+    workflow.git("push", "--quiet", "origin", "main")
+    texts: dict[str, str] = {}
+
+    workflow.add_pull_request(7)
+    assert workflow.run_script("tick").returncode == 0
+    texts["worker"] = (workflow.state / "args" / "ticket-7").read_text().splitlines()[-1]
+
+    workflow.add_pull_request(8)
+    done = workflow.run("start", "worker", "8", "cloud")
+    assert done.returncode == 0, done.stderr
+    texts["cloud"] = (workflow.state / "cloud-args").read_bytes().decode().split("\0")[-2]
+
+    workflow.add_worktree(9, draft=False)
+    workflow.fake("bwrap", '#!/bin/bash\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n')
+    workflow.fake("codex", '#!/bin/bash\nprintf "%s" "${@: -1}" > "@STATE@/review-prompt"\n')
+    done = workflow.run_script("review-panel", "9", "codex")
+    assert done.returncode == 0, done.stderr
+    texts["review"] = (workflow.state / "review-prompt").read_text()
+
+    workflow.add_pull_request(12, draft=False, labels=("workflow", high))
+    workflow.add_pull_request(13, labels=())
+    workflow.orchestrator("idle")
+    # What the tick's own wake looked at and told is forgotten: this wake tells it all again.
+    for told in (workflow.root / "home/.local/state/workflow").glob("wake.*"):
+        told.unlink()
+    moment = "1791946800"  # 2026-10-13, 23:00 in New York: the night's check-in.
+    done = workflow.run_script("wake", env={"WORKFLOW_NOW": moment, "TZ": "America/New_York"})
+    assert done.returncode == 0, done.stderr
+    texts["wake"] = workflow.sent()[-1].replace(str(workflow.root), "<root>")
+    return texts
+
+
+# The SHA-256 of each text as the scripts wrote it before they read `shipline.json`.
+_TEXTS_BEFORE = {
+    "worker": "a1ada6cfb39264bb4b6501807f3feb74fbf51c2ea3c32c5b5b56f77a23838b36",
+    "cloud": "9603fac3798a46497342dda2b64491c2523c1e771d7620bb78e15b034c9d7bef",
+    "review": "ea932fce613e8e9c075daa884a2adee29b64ee5610f1fcd922f27aa6cd39c49a",
+    "wake": "af21558438c99d72e165c8fb8ab4febdd80204e43f532a399697b4131441d080",
+}
+
+
+def test_with_the_defaults_the_texts_sent_to_models_are_as_before(workflow: Workflow) -> None:
+    texts = _texts_sent_to_models(workflow)
+
+    assert "Run the repository's setup command, scripts/setup-worktree, when" in texts["cloud"]
+    assert texts["review"].startswith(
+        "You are an independent reviewer of pull request 9 in NazmievBulat/Shipline."
+    )
+    assert "ready high 12" in texts["wake"]
+    hashes = {name: hashlib.sha256(text.encode()).hexdigest() for name, text in texts.items()}
+    assert hashes == _TEXTS_BEFORE
+
+
+def test_the_texts_sent_to_models_take_the_named_values(workflow: Workflow) -> None:
+    _commit_on_main(
+        workflow,
+        {
+            "shipline.json": json.dumps(
+                {
+                    "repository": "example-owner/example-app",
+                    "worktree_setup": "tools/prepare-worktree",
+                    "labels": {"workflow": "workflow", "priority": {"high": "urgent"}},
+                }
+            )
+        },
+    )
+
+    texts = _texts_sent_to_models(workflow, high="urgent")
+
+    assert "Run the repository's setup command, tools/prepare-worktree, when" in texts["cloud"]
+    assert texts["review"].startswith(
+        "You are an independent reviewer of pull request 9 in example-owner/example-app."
+    )
+    assert "ready high 12" in texts["wake"]
+
+
+_NAMED = {
+    "state_folder": ".shipline/state",
+    "labels": {"workflow": "shipline", "priority": {"high": "urgent"}},
+}
+
+
+def test_python_bash_node_and_jq_read_the_same_values(workflow: Workflow) -> None:
+    _commit_on_main(workflow, {"shipline.json": json.dumps(_NAMED)})
+    scripts = workflow.repo / "scripts/workflow"
+    python = subprocess.run(
+        [
+            "python3",
+            "-c",
+            "import workflow_config, priority; config = workflow_config.current(); "
+            "print(config.state_folder, config.labels.workflow, "
+            "priority.of([{'name': 'urgent'}]), priority.of([{'name': 'priority: high'}]))",
+        ],
+        cwd=scripts,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    bash = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'eval "$(python3 workflow_config.py shell)"; export SHIPLINE_CONFIG; '
+            'echo "$SHIPLINE_STATE_FOLDER" "$SHIPLINE_LABEL_WORKFLOW"; '
+            "for name in urgent 'priority: high'; do "
+            '  jq -nr -L . --arg name "$name" '
+            "    'include \"priority\"; {labels: [{name: $name}]} | priority_name'; "
+            "done; jq -nr -L . 'include \"priority\"; workflow_label'",
+        ],
+        cwd=scripts,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+
+    assert python == [".shipline/state", "shipline", "high", "medium"]
+    assert bash == [".shipline/state", "shipline", "high", "medium", "shipline"]
+
+    # Node: the bridge reads the turn Bash's `notify` wrote, both in the named state folder.
+    workflow.add_worktree(7)
+    notes = workflow.worktree(7) / ".shipline/state"
+    notes.mkdir(parents=True)
+    (notes / "ticket-7.codex").touch()
+    workflow.running("ticket-7")
+    workflow.running("codex-7")
+    payload = {"type": "agent-turn-complete", "last-assistant-message": "Type 1.", "turn-id": "1"}
+    done = workflow.run_script(
+        "notify",
+        "codex",
+        json.dumps(payload),
+        env={"WORKFLOW_SESSION": "ticket-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    assert done.returncode == 0, done.stderr
+    assert (notes / "ticket-7.codex-turn.json").exists()
+    bridge = subprocess.Popen(
+        ["node", str(scripts / "codex-bridge.mjs"), str(workflow.worktree(7)), "ticket-7"],
+        env=workflow.env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "await_turn"}}  # fmt: skip
+        answer, _ = bridge.communicate(json.dumps(request) + "\n", timeout=10)
+    finally:
+        bridge.kill()
+    assert json.loads(answer.splitlines()[0])["result"]["content"][0]["text"] == "Type 1."
+    assert not (workflow.worktree(7) / ".local").exists()
+
+
+def test_the_named_labels_are_what_the_tick_starts_by_and_install_timer_creates(
+    workflow: Workflow,
+) -> None:
+    _commit_on_main(
+        workflow,
+        {"shipline.json": json.dumps({"labels": {"workflow": "shipline", "audited": "checked"}})},
+    )
+    workflow.add_pull_request(7, labels=("shipline",))
+    workflow.add_pull_request(8, labels=("workflow",))
+
+    done = workflow.run_script("tick")
+
+    assert workflow.is_running("ticket-7"), done.stderr
+    assert not workflow.is_running("ticket-8")
+
+    done = workflow.run_script("install-timer")
+
+    assert done.returncode == 0, done.stderr
+    assert (workflow.state / "labels").read_text().split() == ["shipline", "checked"]
+
+
+def test_the_identity_folder_and_repository_of_the_runners_come_from_the_file(
+    workflow: Workflow,
+) -> None:
+    scripts = workflow.repo / "scripts/workflow"
+
+    def folder() -> str:
+        return subprocess.run(
+            ["python3", "-c", "import github_identity; print(github_identity.folder())"],
+            cwd=scripts,
+            env=workflow.env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    def install(*repository: str) -> str:
+        token = workflow.root / "token"
+        token.write_text("github_pat_EXAMPLE\n")
+        subprocess.run(
+            ["python3", "github_identity.py", "install", *repository, "--token", str(token)],
+            cwd=scripts,
+            env=workflow.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        # The stand-in cannot answer the first check of the new identity; it names the repository.
+        return workflow.calls("gh api repos/")[-1]
+
+    assert folder() == str(workflow.root / "home/.config/shipline-runner")
+    assert install().startswith("gh api repos/NazmievBulat/Shipline/")
+
+    _commit_on_main(
+        workflow,
+        {
+            "shipline.json": json.dumps(
+                {
+                    "repository": "example-owner/example-app",
+                    "runner": {"identity_folder": "~/.config/example-app-runner"},
+                }
+            )
+        },
+    )
+
+    assert folder() == str(workflow.root / "home/.config/example-app-runner")
+    assert install().startswith("gh api repos/example-owner/example-app/")
+    flagged = install("--repository", "flag-owner/flag-app")
+    assert flagged.startswith("gh api repos/flag-owner/flag-app/")

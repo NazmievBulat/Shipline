@@ -88,7 +88,8 @@ def _hand_back_pull(folder: Path, path: Path, running: set[str]) -> dict[str, An
         # Drafts already have their worker path; closed pulls need no reviewer.
         path.unlink()
         return None
-    if not any(label.get("name") == gate.CONFIG.labels.workflow for label in pull.get("labels", [])):
+    labelled = gate.CONFIG.labels.workflow
+    if not any(label.get("name") == labelled for label in pull.get("labels", [])):
         # Unlabelled children belong to the orchestrator's audit path. The wake
         # reports their hand-back; the tick never invents an audit or review for them.
         return None

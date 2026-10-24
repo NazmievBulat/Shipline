@@ -209,7 +209,7 @@ fi
 # The open pull requests that carry the label, as the JSON GitHub answers with. The script's
 # own filter turns it into lines, as the real `gh` would.
 fields=number,isDraft,baseRefName
-asked="pr list --label workflow --state open --limit 1000 --json $fields --jq ${12}"
+asked="pr list --label $4 --state open --limit 1000 --json $fields --jq ${12}"
 if [ "$*" = "$asked" ] && [ ! -e "@STATE@/fail-gh-list" ]; then
   for listed in "@STATE@"/listing/*; do
     [ -f "$listed" ] || continue
@@ -219,7 +219,7 @@ if [ "$*" = "$asked" ] && [ ! -e "@STATE@/fail-gh-list" ]; then
     base=main
     [ ! -f "@STATE@/base-branch-$number" ] || base=$(cat "@STATE@/base-branch-$number")
     case " $labels " in
-      *" workflow "*) [ "$state" != OPEN ] || echo "$number $draft $base" ;;
+      *" $4 "*) [ "$state" != OPEN ] || echo "$number $draft $base" ;;
     esac
   done | jq --raw-input 'split(" ") | {number: (.[0] | tonumber), isDraft: (.[1] == "true"),
     baseRefName: .[2]}' |
