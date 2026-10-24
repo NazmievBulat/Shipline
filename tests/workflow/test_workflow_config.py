@@ -69,6 +69,7 @@ _DEFAULTS = {
         "image_build": None,
         "hub_cache": None,
     },
+    "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
     "machines": [],
     # The branches the merge gate tests its prefixes on are named by this, then a random name.
     "merge": {"scratch_prefix": "workflow/merge-batch-"},
@@ -383,6 +384,16 @@ def test_bash_reads_the_runner_label_and_the_built_labels(tmp_path: Path) -> Non
         "tools/hub 'cache'",
         *_LABELS,
     ]
+def test_the_test_folders_tools_parity_compares_are_read(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"parity": {"workflow_tests": "app/tests/flow"}})
+
+    parity = workflow_config.load(repo).parity
+    assert (parity.workflow_tests, parity.runner_tests) == ("app/tests/flow", "tests/runner")
+    assert parity.known is None
+
+    _write(repo, {"parity": {"known": "tools/shipline/parity-known.txt"}})
+    assert workflow_config.load(repo).parity.known == "tools/shipline/parity-known.txt"
 
 
 def test_the_machines_are_read_with_their_addresses_and_one_without_is_this_machine(
@@ -596,6 +607,9 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"runner": {"labels": "home"}}', "runner.labels"),
         ('{"state_folder": "/var/workflow"}', "state_folder"),
         ('{"state_folder": "../workflow"}', "state_folder"),
+        ('{"parity": {"workflow_tests": "/srv/tests"}}', "parity.workflow_tests"),
+        ('{"parity": {"runner_tests": "../tests"}}', "parity.runner_tests"),
+        ('{"parity": {"known": "/srv/known.txt"}}', "parity.known"),
         ('{"repositry": "example-owner/example-app"}', "repositry"),
         ('{"checks": {"ci_results": "CI result"}}', "checks.ci_results"),
         ('{"hunts": {"areas": [{"name": "phone"}]}}', "hunts.areas"),

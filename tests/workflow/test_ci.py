@@ -40,7 +40,7 @@ def _shards() -> dict[int, list[str]]:
             shard = int(found[1])
             shards[shard] = []
         elif shard is not None and (
-            found := re.fullmatch(r"\s+(tests/(?:workflow|runner)/\S+\.py)", line)
+            found := re.fullmatch(r"\s+(tests/(?:workflow|runner|tools)/\S+\.py)", line)
         ):
             shards[shard].append(found[1])
     return shards
@@ -52,11 +52,11 @@ def test_ci_runs_four_shards() -> None:
 
 
 def _test_files(root: Path) -> list[str]:
-    """The files pytest collects tests from under `tests/workflow` and `tests/runner`: its
-    default `python_files`, in every folder below them too."""
+    """The files pytest collects tests from under `tests/workflow`, `tests/runner` and
+    `tests/tools`: its default `python_files`, in every folder below them too."""
     found = {
         path
-        for folder in (root / "tests/workflow", root / "tests/runner")
+        for folder in (root / "tests/workflow", root / "tests/runner", root / "tests/tools")
         for pattern in ("test_*.py", "*_test.py")
         for path in folder.rglob(pattern)
     }
@@ -94,7 +94,9 @@ def test_a_test_file_of_the_runner_pool_is_counted(tmp_path: Path) -> None:
 def test_pytest_collects_the_runner_pool_s_tests() -> None:
     text = (_ROOT / "pyproject.toml").read_text()
 
-    assert re.search(r'^testpaths = \["tests/workflow", "tests/runner"\]$', text, re.M)
+    assert re.search(
+        r'^testpaths = \["tests/workflow", "tests/runner", "tests/tools"\]$', text, re.M
+    )
 
 
 def test_ci_runs_only_on_github_s_own_runners() -> None:
