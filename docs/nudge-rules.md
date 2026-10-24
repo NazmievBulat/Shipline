@@ -36,7 +36,7 @@ key that sends it follows only when the box holds exactly that text. Each one is
 Each of these two is tried once per stretch or loop, even when typing fails: Escape may already
 have been pressed.
 
-Codex bridges, hunts and audits get none of the last four.
+Codex bridges, hunts, audits and analysts get none of the last four.
 
 ## Named in the wake, not typed
 
