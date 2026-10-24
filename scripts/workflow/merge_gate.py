@@ -2008,6 +2008,7 @@ def _commit_and_push(
 ) -> None:
     head = pull["headRefOid"]
     git("commit", "--allow-empty", "-m", message)
+    clear_generated(Path.cwd())
     try:
         pushed = push("origin", f"HEAD:{pull['headRefName']}")
     except PushWaiting:
@@ -2028,6 +2029,16 @@ def _commit_and_push(
         note.save(train.path.parent, number)
         train.approved[number] = note.head
         train.save()
+
+
+def clear_generated(worktree: Path) -> None:
+    if not CONFIG.refresh.clear_generated:
+        return
+    try:
+        root = Path(git("-C", str(worktree), "rev-parse", "--show-toplevel"))
+        CONFIG.refresh.clear(root)
+    except (workflow_config.ConfigError, OSError) as error:
+        raise Refused(str(error)) from error
 
 
 def _seconds(stamp: Any) -> float | None:
@@ -4243,15 +4254,21 @@ def _prefix_summary(scratch: dict[str, Any] | None) -> str:
 
 
 def train_status(folder: Path) -> int:
-    folder.mkdir(parents=True, exist_ok=True)
-    with (folder / "merge.lock").open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            locked = True
-        except BlockingIOError:
-            # A gate holds the lock, for a refresh through its push hooks. The tick reads the
-            # last saved line, written whole, and a later tick reconciles it.
-            locked = False
+    # A shadow run (`tick --shadow`) only reads: the line as last saved, never the lock, which
+    # the installation's own gate may want, nor a reconcile, which pushes and saves.
+    shadow = bool(os.environ.get("SHIPLINE_SHADOW"))
+    if not shadow:
+        folder.mkdir(parents=True, exist_ok=True)
+    with nullcontext() if shadow else (folder / "merge.lock").open("w") as lock:
+        locked = False
+        if lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except BlockingIOError:
+                # A gate holds the lock, for a refresh through its push hooks. The tick reads the
+                # last saved line, written whole, and a later tick reconciles it.
+                pass
         train = Train(folder)
         if locked:
             train.reconcile()
@@ -4717,6 +4734,12 @@ def main() -> int:
     ):
         print(
             "usage: merge-when-current N | --handoff N | --drive N | --main-status | --train-status",
+            file=sys.stderr,
+        )
+        return 1
+    if os.environ.get("SHIPLINE_SHADOW") and sys.argv[1:] != ["--train-status"]:
+        print(
+            "merge refused: a shadow run only reads the merge line (--train-status)",
             file=sys.stderr,
         )
         return 1

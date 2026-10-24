@@ -161,9 +161,10 @@ wakes the first member's reviewer or audit for a lost check, once for each turn 
 state of main and head, or drives its handoff, and the wake tells the orchestrator
 `lost check: <check> of run <id> on pull request N` at any hour, once per head.
 
-A stale run is refreshed by merging current main into the clean pull request worktree and
-pushing, then the gate exits without merging the pull request. Wait for that new CI run and
-call the gate again. Re-running an old workflow reuses the original merge commit and cannot
+A stale run is refreshed by merging current main into the clean pull request worktree,
+clearing the ignored, untracked generated output listed in `refresh.clear_generated` in that
+worktree before pushing, then the gate exits without merging the pull request. Wait for that
+new CI run and call the gate again. Re-running an old workflow reuses the original merge commit and cannot
 prove freshness. A run from before CI recorded its tested merge needs a fresh run too; if main
 is already in the branch, the gate pushes an empty commit. A conflict is left for the session
 to resolve, with `merge main: conflict in <files>` as the merge message. Never resolve a
@@ -338,6 +339,31 @@ removes the record only once the pull request is ready, letting the normal indep
 start. Reports and failed deliveries are remembered locally. The workflow does not read cloud
 transcripts or stop cloud sessions; the owner answers in the cloud session or on the pull
 request.
+
+A cloud worker's push also runs the tests CI will run for its change: its machine is its own,
+so the slower suites cost no local machine anything. It exports `SHIPLINE_CLOUD_WORKER=1` in
+every shell before pushing, runs each push in the background and waits for it, and the
+repository's pre-push hook ends with
+`shipline ci-tests-for-changes --run --extra-only`, which runs nothing unless that is set. A
+local worker, a reviewer, the gate and the tick push as before, and nothing that runs today
+is skipped for anyone. The suites are the `cloud_pre_push.suites` of `shipline.json`, each
+chosen by its selection command as CI chooses it, against where the branch left main, with
+the working changes and without the local cap of three browser specs.
+`shipline ci-tests-for-changes` alone prints that choice and why, the same for anyone;
+`--run` runs the repository's push checks (`commands.push_checks`) first. The suites test
+what CI tests: when main has moved on since the branch left it, they run in a temporary
+worktree of the branch merged with the fetched main, set up by the repository's setup command
+and removed afterwards; a branch that conflicts with main is refused and told to merge it.
+When the worker runs as root, it exports `SHIPLINE_CLOUD_TEST_USER`, gives that unprivileged
+account the checkout (`chown -R`) and marks it safe for git (`safe.directory`), as root and as
+the account; every suite and browser probe runs as the account. As root without it, or with
+an account that cannot write the checkout or that git does not trust there, the push is
+refused before any test runs, naming the remedy. Each suite reports its time and has 25
+minutes; a failed or timed-out suite refuses the push. When no browser can start, the browser
+suite is left to CI with the probe's error. Only after the server suite timed out does the
+worker export `SHIPLINE_CLOUD_SERVER_PART="1 of 4"` (or another part), which runs that part
+of the selected server tests as CI parts it and leaves the rest to CI; a failing part still
+refuses. It unsets it once it is not needed.
 
 A cloud session that ends its turn stays stopped until something types into it. The tick keeps,
 in each record, when it first saw the draft's head and the time of the last report. A worker

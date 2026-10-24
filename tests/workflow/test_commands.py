@@ -47,6 +47,7 @@ _COMMANDS = (
     "hunt_cursor",
     "advisory_watch",
     "push_checkout",
+    "push_checks",
 )
 
 
@@ -415,6 +416,102 @@ def _main_moved(github: GitHub) -> None:
     workflow.git("checkout", "ticket/seven")
     github.main()
     github.ci(github.base, github.head, tested_base=old)
+
+
+@pytest.mark.parametrize("subdirectory", [False, True])
+@pytest.mark.parametrize(
+    "paths", [None, [], ["generated/types"], ["generated/ty*"], ["generated/**/st*"],
+              ["**/types"]]
+)
+def test_refresh_clears_only_configured_ignored_output_before_the_push(
+    github: GitHub, paths: list[str] | None, subdirectory: bool
+) -> None:
+    workflow = github.workflow
+    _main_moved(github)
+    config = workflow.repo / "shipline.json"
+    workflow.git("update-index", "--skip-worktree", "shipline.json")
+    given = json.loads(config.read_text())
+    if paths is not None:
+        given["refresh"] = {"clear_generated": paths}
+    config.write_text(json.dumps(given))
+    exclude = Path(workflow.git("rev-parse", "--path-format=absolute", "--git-path", "info/exclude"))
+    exclude.write_text(exclude.read_text() + "\ngenerated/\n")
+    generated = workflow.repo / "generated"
+    generated.mkdir()
+    (generated / "types").mkdir()
+    (generated / "types/stale").write_text("obsolete route\n")
+    (generated / "cache").write_text("keep\n")
+    other = workflow.worktree(99)
+    workflow.git("worktree", "add", "--detach", str(other), "main")
+    (other / "generated/types").mkdir(parents=True)
+    (other / "generated/types/stale").write_text("another worktree\n")
+    hooks = workflow.bin / "generated-hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-push"
+    hook.write_text("#!/bin/bash\nif [[ -e generated/types/stale ]]; then echo 'stale generated output' >&2; exit 1; fi\n")
+    hook.chmod(0o755)
+    workflow.git("config", "core.hooksPath", str(hooks))
+
+    cwd = workflow.repo
+    if subdirectory:
+        cwd = workflow.repo / "nested"
+        cwd.mkdir()
+    github.save()
+    done = workflow.run_script("merge-when-current", "7", cwd=cwd)
+
+    assert done.returncode == (2 if paths else 1), done.stdout + done.stderr
+    assert (generated / "types/stale").exists() == (not bool(paths))
+    assert (generated / "cache").read_text() == "keep\n"
+    assert (other / "generated/types/stale").read_text() == "another worktree\n"
+    assert (workflow.repo / "shared.txt").read_text() == "original\n"
+    if paths:
+        assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == workflow.git("rev-parse", "HEAD")
+    else:
+        assert "stale generated output" in done.stderr
+
+
+@pytest.mark.parametrize("kind", ["tracked", "not ignored", "outside", "symlink"])
+def test_refresh_refuses_unsafe_config_without_deleting_anything(
+    github: GitHub, kind: str
+) -> None:
+    workflow = github.workflow
+    _main_moved(github)
+    config = workflow.repo / "shipline.json"
+    workflow.git("update-index", "--skip-worktree", "shipline.json")
+    given = json.loads(config.read_text())
+    exclude = Path(workflow.git("rev-parse", "--path-format=absolute", "--git-path", "info/exclude"))
+    exclude.write_text(exclude.read_text() + "\ngenerated/\n")
+    generated = workflow.repo / "generated"
+    generated.mkdir()
+    (generated / "keep").write_text("keep\n")
+    named = "generated/keep"
+    if kind == "tracked":
+        workflow.git("add", "-f", named)
+    elif kind == "not ignored":
+        named = "shared.txt"
+    elif kind == "outside":
+        named = "../outside"
+        (workflow.root / "outside").write_text("keep\n")
+    else:
+        outside = workflow.root / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("keep\n")
+        (generated / "link").symlink_to(outside, target_is_directory=True)
+        named = "generated/link/keep"
+    given["refresh"] = {"clear_generated": [named]}
+    config.write_text(json.dumps(given))
+
+    done = github.run()
+
+    assert done.returncode != 0
+    assert "refresh.clear_generated" in done.stderr
+    assert (generated / "keep").read_text() == "keep\n"
+    assert (workflow.repo / "shared.txt").read_text() == "original\n"
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == github.head
+    if kind == "outside":
+        assert (workflow.root / "outside").read_text() == "keep\n"
+    elif kind == "symlink":
+        assert (workflow.root / "outside/keep").read_text() == "keep\n"
 
 
 def test_a_clean_refresh_asks_the_conflict_command_to_renumber(github: GitHub) -> None:
