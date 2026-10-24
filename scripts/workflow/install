@@ -8,9 +8,10 @@
 # git, jq, gh signed in, Python 3.14, Node 22 and Claude Code (Codex only for Codex workers). It
 # says each thing that is missing, and then changes nothing; so it does when the repository, its
 # shipline.json or its labels on GitHub cannot be read, or when labels are missing that the
-# signed-in gh account may not create. Otherwise it creates the missing labels the workflow reads
-# (`labels` in shipline.json), writes the timer that runs the tick (`install-timer`) and the
-# hooks of the sessions (`install-hooks`). Run again, it adds only what is missing.
+# signed-in gh account may not create, or when the owner's Claude settings are no JSON object.
+# Otherwise it creates the missing labels the workflow reads (`labels` in shipline.json), adds the
+# hooks of the sessions (`install-hooks`) and, last, writes and starts the timer that runs the
+# tick (`install-timer`). Run again, it adds only what is missing.
 set -euo pipefail
 
 # The oldest Python and Node the scripts run on.
@@ -63,6 +64,10 @@ elif ! at_least "$found" "$NODE"; then
 fi
 command -v claude >/dev/null || missing+=("missing: claude (Claude Code)")
 ((${#missing[@]} == 0)) || refuse "${missing[@]}"
+# The settings the hooks are added to, read as `install-hooks` reads them.
+settings=$HOME/.claude/settings.json
+[[ ! -e $settings ]] || jq -e 'type == "object"' "$settings" >/dev/null 2>&1 ||
+  refuse "$settings is not a JSON object, where the hooks go"
 command -v codex >/dev/null || echo "codex not found: only Codex workers need it"
 
 # The repository: its main checkout, its shipline.json and its name on GitHub.
@@ -90,7 +95,7 @@ if ((${#absent[@]} > 0)); then
   answer=$(timeout "$GITHUB_SECONDS" gh api "repos/$SHIPLINE_REPOSITORY") ||
     refuse "cannot read $SHIPLINE_REPOSITORY with gh"
   if [[ $(jq -r '.permissions.push // false' <<<"$answer") != true ]]; then
-    who="someone who may can create them with:"
+    who="someone allowed to push to it can create them with:"
     lines=("missing: labels on $SHIPLINE_REPOSITORY that this gh account may not create; $who")
     for label in "${absent[@]}"; do
       lines+=("  gh label create $(printf '%q' "$label") --repo $SHIPLINE_REPOSITORY")
@@ -98,9 +103,6 @@ if ((${#absent[@]} > 0)); then
     refuse "${lines[@]}"
   fi
 fi
-
-# The timer, and the two labels it creates itself.
-bash "$here/install-timer"
 
 # The priority labels, described as the priority rule in RULES.md describes them.
 create_priority() {
@@ -116,4 +118,7 @@ create_priority "$SHIPLINE_PRIORITY_MEDIUM" FBCA04 "Anything else"
 create_priority "$SHIPLINE_PRIORITY_LOW" CCCCCC "Only when the owner says so"
 
 bash "$here/install-hooks"
+# The timer, and the two labels it creates itself, last: a step that fails before it leaves no
+# tick starting sessions without their hooks.
+bash "$here/install-timer"
 echo "Shipline is installed for $SHIPLINE_REPOSITORY: the tick runs every 3 minutes"

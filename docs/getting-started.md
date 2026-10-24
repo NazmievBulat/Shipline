@@ -10,16 +10,17 @@ runs every command shown here (`tests/workflow/test_getting_started.py`).
 
 ## What Shipline needs
 
-- Linux with systemd user units: `systemctl --user` must reach your service manager.
+- Linux with systemd user units.
 - `tmux`, `git` and `jq`.
-- `gh`, signed in (`gh auth login`) as an account that may push to the repository.
+- `gh`, signed in to GitHub.
 - Python 3.14, as `python3`.
 - Node 22, as `node`.
-- Claude Code, as `claude`, signed in.
+- Claude Code, as `claude`.
 - Codex, as `codex`, only if you want Codex workers. It is optional.
 
 `shipline install` checks each of these. It says exactly what is missing, and then it changes
-nothing.
+nothing. When labels are missing on GitHub, the `gh` account must be allowed to push to the
+repository, so that it may create them. Sign in to Claude Code before the first session starts.
 
 ## Get Shipline
 
@@ -68,9 +69,9 @@ reads to know what CI tested. The sessions read their rules from `AGENTS.md` on 
 ```
 
 This creates the labels `workflow`, `audited` and the four priority labels on GitHub, when
-they are missing. It writes a systemd user timer, `workflow-tick`, that runs the tick on your
-repository every 3 minutes, and starts it. It adds the hooks the sessions report through to
-`~/.claude/settings.json`. It links `~/.local/bin/shipline` to Shipline's launcher; keep
+they are missing. It adds the hooks the sessions report through to `~/.claude/settings.json`.
+Last, it writes a systemd user timer, `workflow-tick`, that runs the tick on your repository
+every 3 minutes, and starts it. It links `~/.local/bin/shipline` to Shipline's launcher; keep
 `~/.local/bin` on your `PATH`.
 
 Check that the timer runs:

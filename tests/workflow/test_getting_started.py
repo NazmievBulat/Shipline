@@ -32,9 +32,9 @@ atexit.register(shutil.rmtree, _HIDDEN, ignore_errors=True)
 
 
 @cache
-def _path_without(name: str) -> str:
-    """A folder that holds every program on the test's `PATH` but `name`, as links."""
-    folder = _HIDDEN / name
+def _path_without(*names: str) -> str:
+    """A folder that holds every program on the test's `PATH` but `names`, as links."""
+    folder = _HIDDEN / "-".join(names)
     folder.mkdir()
     for directory in os.environ["PATH"].split(os.pathsep):
         try:
@@ -43,7 +43,7 @@ def _path_without(name: str) -> str:
             continue
         for entry in entries:
             link = folder / entry.name
-            if entry.name == name or link.is_symlink():
+            if entry.name in names or link.is_symlink():
                 continue
             if entry.is_file() and os.access(entry.path, os.X_OK):
                 link.symlink_to(entry.path)
@@ -62,10 +62,11 @@ def workflow(workflow: Workflow) -> Workflow:
     return workflow
 
 
-def _hide(workflow: Workflow, name: str) -> None:
-    """`name` is on neither the stand-ins' folder nor the machine's `PATH`."""
-    (workflow.bin / name).unlink(missing_ok=True)
-    workflow.env["PATH"] = f"{workflow.bin}:{_path_without(name)}"
+def _hide(workflow: Workflow, *names: str) -> None:
+    """`names` are on neither the stand-ins' folder nor the machine's `PATH`."""
+    for name in names:
+        (workflow.bin / name).unlink(missing_ok=True)
+    workflow.env["PATH"] = f"{workflow.bin}:{_path_without(*names)}"
 
 
 def _changed_nothing(workflow: Workflow, labels: str) -> None:
@@ -94,7 +95,12 @@ def test_install_writes_the_timer_and_the_hooks_and_creates_the_labels(
     done = workflow.shipline("install", path, cwd=cwd)
 
     assert done.returncode == 0, done.stderr
-    assert (workflow.state / "labels").read_text().splitlines() == ["bug", *_LABELS]
+    assert (workflow.state / "labels").read_text().splitlines() == [
+        "bug",
+        "workflow",
+        *_PRIORITIES,
+        "audited",
+    ]
     assert workflow.calls("gh label create priority") == [
         "gh label create priority: blocker --color B60205 --description Stops every merge or push"
         " now: a red main, a push refused for everyone, a deadlocked train",
@@ -180,8 +186,7 @@ def test_install_says_exactly_what_is_missing_and_changes_nothing(
 
 
 def test_install_names_every_requirement_that_is_missing_at_once(workflow: Workflow) -> None:
-    _hide(workflow, "tmux")
-    workflow.env["PATH"] = workflow.env["PATH"].replace(_path_without("tmux"), _path_without("jq"))
+    _hide(workflow, "tmux", "jq")
     (workflow.state / "signed-out").touch()
     (workflow.state / "labels").write_text("")
 
@@ -189,11 +194,42 @@ def test_install_names_every_requirement_that_is_missing_at_once(workflow: Workf
 
     assert done.returncode == 1
     assert done.stderr.splitlines() == [
+        "missing: tmux",
         "missing: jq",
         "missing: gh signed in (run: gh auth login)",
         "nothing was installed",
     ]
     _changed_nothing(workflow, "")
+
+
+def test_settings_that_are_no_json_object_install_nothing(workflow: Workflow) -> None:
+    settings = Path(workflow.env["HOME"]) / ".claude" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text("[]\n")
+    (workflow.state / "labels").write_text("")
+
+    done = workflow.shipline("install", str(workflow.repo))
+
+    assert done.returncode == 1
+    assert done.stderr.splitlines() == [
+        f"{settings} is not a JSON object, where the hooks go",
+        "nothing was installed",
+    ]
+    assert settings.read_text() == "[]\n"
+    shutil.rmtree(settings.parent)
+    _changed_nothing(workflow, "")
+
+
+def test_the_timer_starts_last(workflow: Workflow) -> None:
+    """A step that fails leaves no tick running for sessions without their hooks or labels."""
+    (workflow.state / "labels").write_text("workflow\naudited\n")
+    (workflow.state / "fail-gh-label-create").touch()
+
+    done = workflow.shipline("install", str(workflow.repo))
+
+    assert done.returncode != 0
+    assert workflow.calls("systemctl") == ["systemctl --user show-environment"]
+    assert not (Path(workflow.env["HOME"]) / ".config").exists()
 
 
 def test_codex_is_not_needed(workflow: Workflow) -> None:
@@ -216,7 +252,7 @@ def test_labels_the_account_may_not_create_are_named_with_their_command(
     assert done.returncode == 1
     assert done.stderr.splitlines() == [
         f"missing: labels on {_REPOSITORY} that this gh account may not create;"
-        " someone who may can create them with:",
+        " someone allowed to push to it can create them with:",
         f"  gh label create audited --repo {_REPOSITORY}",
         f"  gh label create priority:\\ blocker --repo {_REPOSITORY}",
         f"  gh label create priority:\\ medium --repo {_REPOSITORY}",
@@ -322,6 +358,8 @@ def _guide() -> dict[str, list[tuple[str, str]]]:
             heading = found[1]
         else:
             sections.setdefault(heading, []).append((found[2], found[3]))
+    # Every block is one of these: none is left out unread.
+    assert text.count("```") == 2 * sum(len(blocks) for blocks in sections.values())
     return sections
 
 
@@ -548,7 +586,7 @@ def test_a_newcomer_installs_shipline_and_merges_a_first_pull_request_through_it
     github.save()
     (workflow.state / "labels").write_text("")
     _follow(workflow, "Install it for your repository", ran)
-    assert (workflow.state / "labels").read_text().splitlines() == _LABELS
+    assert sorted((workflow.state / "labels").read_text().splitlines()) == sorted(_LABELS)
 
     _follow(workflow, "Open a first ticket", ran)
     created = (workflow.state / "created").read_text().splitlines()
