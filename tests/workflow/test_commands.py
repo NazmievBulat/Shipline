@@ -309,8 +309,7 @@ def _changes(workflow: Workflow, *paths: str) -> None:
     for path in paths:
         (workflow.repo / path).parent.mkdir(parents=True, exist_ok=True)
         (workflow.repo / path).write_text("changed\n")
-    if paths:
-        workflow.git("add", "--", *paths)
+    workflow.git("add", "-A")
     workflow.git("commit", "--quiet", "--allow-empty", "-m", "feat: a change")
 
 
@@ -1312,6 +1311,9 @@ def test_function_browser_plan_reads_byte_paths(workflow: Workflow, path: str, n
             assert all(isinstance(path, bytes) for path in changed)
             return not all(path.endswith(b".md") for path in changed)
     ''')
+    # Put the planner in the baseline, so its own source is not part of the measured change.
+    workflow.git("add", module)
+    workflow.git("commit", "--quiet", "-m", "chore: prepare browser planner")
     _configure(workflow, browser_plan={
         "run": module, "form": "functions", "functions": {"browser_plan": "browser_needed"},
     })
