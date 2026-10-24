@@ -20,8 +20,9 @@ A pick takes the drafts without the label `workflow`, leaving out a cloud worker
 `Start: owner only`), and orders them by priority, then the older ticket. The first that may
 start is the one whose files overlap no running ticket's (an open pull request labelled
 `workflow`, one with a session or a cloud record, one in the merge train), except a ready
-train member with no session or cloud record, and that no line of
-`.local/workflow/start-plan` holds back:
+train member with no session or cloud record, that shares no hot path of `shipline.json` with
+a running ticket or any train member, and that no line of `.local/workflow/start-plan` holds
+back:
 
     609 after 605     609 waits while 605 is open
     hold 590          590 does not start
@@ -39,6 +40,7 @@ wording, so a load that comes and goes is not told at every tick; the tick print
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import os
@@ -82,6 +84,8 @@ TOLD_WAITS = 8
 CONFIG = workflow_config.current()
 LABEL = CONFIG.labels.workflow
 CLOUD_MARK = "Worker: cloud"
+# Where a pick fetches main, beside the heads of the tickets.
+MAIN_REF = "refs/workflow/files/main"
 OWNER_MARK = "Start: owner only"
 # Any file name of the repository, route folders like `[runId]` and `(group)` among them.
 PATH = re.compile(r"[^\s`'\"<>|*?:/-][^\s`'\"<>|*?:]*")
@@ -213,6 +217,8 @@ class Files:
     model_calls: int = MODEL_CALLS_PER_PICK
     # The tickets the model was asked about in this pick, answered or not.
     asked: set[str] = field(default_factory=set)
+    # The files of main, sorted, once read.
+    files_of_main: list[str] | None = None
 
     @property
     def notes(self) -> Path:
@@ -246,7 +252,7 @@ class Files:
                 wanted.append(pull)
         if not wanted:
             return set()
-        main = "+refs/heads/main:refs/workflow/files/main"
+        main = f"+refs/heads/main:{MAIN_REF}"
         specs = {
             str(
                 pull["number"]
@@ -279,7 +285,7 @@ class Files:
     def diff(self, number: str) -> list[str]:
         """The files the diff names, as git names them: every one is a file of the repository."""
         ref = f"refs/workflow/files/{number}"
-        base = git(self.main, "merge-base", "refs/workflow/files/main", ref)
+        base = git(self.main, "merge-base", MAIN_REF, ref)
         listed = git(self.main, "diff", "--name-only", "--no-renames", "-z", base, ref)
         return [path for path in listed.split("\0") if path and "\n" not in path]
 
@@ -322,6 +328,26 @@ class Files:
             return self.keep(number, paths, "description", digest(body), seen)
         failed.write_text(f"{digest(body)} {now()}\n")
         return None
+
+    def hot(self, paths: list[str]) -> set[str]:
+        """The hot paths these paths match: a folder's by the files of main inside it."""
+        if not CONFIG.hot_paths:
+            return set()
+        if self.files_of_main is None:
+            try:
+                listed = git(self.main, "ls-tree", "-r", "-z", "--name-only", MAIN_REF)
+            except OSError:
+                listed = git(self.main, "ls-tree", "-r", "-z", "--name-only", "HEAD")
+            self.files_of_main = sorted(filter(None, listed.split("\0")))
+        found: set[str] = set()
+        for path in paths:
+            inside = self.files_of_main
+            if path != ".":
+                start = bisect.bisect_left(inside, path + "/")
+                inside = inside[start : bisect.bisect_left(inside, path + "0", start)]
+            for file in (path, *inside):
+                found.update(CONFIG.hot_paths_of(file))
+        return found
 
     def asked_lately(self, number: str, body: str) -> bool:
         """Whether the model gave no path for this description in the last half hour."""
@@ -506,10 +532,23 @@ def pick(main: Path, snapshot: Path) -> int:
         # Nothing waits: the files of running tickets matter only beside a draft's.
         tell(notes, {}, None)
         return 0
+    # A train member that is not running still holds its hot paths: its squash is to come.
+    waiting = {
+        number: pull
+        for number, pull in open_pulls.items()
+        if CONFIG.hot_paths and number in train and number not in busy
+    }
     files = Files(main)
-    fetched = files.fetch(list(busy.values()) + candidates)
+    fetched = files.fetch(list(busy.values()) + list(waiting.values()) + candidates)
     busy_files = {number: files.of(pull, fetched) for number, pull in sorted(busy.items())}
     unknown = sorted((number for number, found in busy_files.items() if found is None), key=int)
+    waiting_files = {number: files.of(pull, fetched) for number, pull in waiting.items()}
+    unseen = sorted((number for number, found in waiting_files.items() if found is None), key=int)
+    holding = {
+        number: files.hot(found)
+        for number, found in {**busy_files, **waiting_files}.items()
+        if found is not None
+    }
     branches = {pull.get("headRefName"): number for number, pull in open_pulls.items()}
 
     lines: dict[str, str] = {}
@@ -529,6 +568,20 @@ def pick(main: Path, snapshot: Path) -> int:
             reason = "its files are not known yet"
         elif unknown:
             reason = f"the files of {', '.join(unknown)} are not known yet"
+        elif (mine := files.hot(found)) and unseen:
+            reason = f"the files of {', '.join(unseen)} are not known yet"
+        elif mine and (
+            shared := next(
+                (
+                    (hot, other)
+                    for other in sorted(holding, key=int)
+                    for hot in CONFIG.hot_paths
+                    if hot in mine and hot in holding[other]
+                ),
+                None,
+            )
+        ):
+            reason = f"hot path {shared[0]} with {shared[1]}"
         else:
             for other, theirs in busy_files.items():
                 shared = next(
