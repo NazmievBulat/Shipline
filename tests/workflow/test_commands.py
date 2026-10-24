@@ -415,6 +415,49 @@ def _main_moved(github: GitHub) -> None:
     github.ci(github.base, github.head, tested_base=old)
 
 
+@pytest.mark.parametrize("paths", [None, [], ["generated/types"], ["generated/ty*"]])
+def test_refresh_clears_only_configured_ignored_output_before_the_push(
+    github: GitHub, paths: list[str] | None
+) -> None:
+    workflow = github.workflow
+    _main_moved(github)
+    config = workflow.repo / "shipline.json"
+    workflow.git("update-index", "--skip-worktree", "shipline.json")
+    given = json.loads(config.read_text())
+    if paths is not None:
+        given["refresh"] = {"clear_generated": paths}
+    config.write_text(json.dumps(given))
+    exclude = Path(workflow.git("rev-parse", "--path-format=absolute", "--git-path", "info/exclude"))
+    exclude.write_text(exclude.read_text() + "\ngenerated/\n")
+    generated = workflow.repo / "generated"
+    generated.mkdir()
+    (generated / "types").mkdir()
+    (generated / "types/stale").write_text("obsolete route\n")
+    (generated / "cache").write_text("keep\n")
+    other = workflow.worktree(99)
+    workflow.git("worktree", "add", "--detach", str(other), "main")
+    (other / "generated/types").mkdir(parents=True)
+    (other / "generated/types/stale").write_text("another worktree\n")
+    hooks = workflow.bin / "generated-hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-push"
+    hook.write_text("#!/bin/bash\nif [[ -e generated/types/stale ]]; then echo 'stale generated output' >&2; exit 1; fi\n")
+    hook.chmod(0o755)
+    workflow.git("config", "core.hooksPath", str(hooks))
+
+    done = github.run()
+
+    assert done.returncode == (2 if paths else 1), done.stdout + done.stderr
+    assert (generated / "types/stale").exists() == (not bool(paths))
+    assert (generated / "cache").read_text() == "keep\n"
+    assert (other / "generated/types/stale").read_text() == "another worktree\n"
+    assert (workflow.repo / "shared.txt").read_text() == "original\n"
+    if paths:
+        assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == workflow.git("rev-parse", "HEAD")
+    else:
+        assert "stale generated output" in done.stderr
+
+
 def test_a_clean_refresh_asks_the_conflict_command_to_renumber(github: GitHub) -> None:
     workflow = github.workflow
     _stand_in(workflow, "example-conflicts", "db/0002_seven.py db/0003_seven.py\n")

@@ -36,6 +36,7 @@ _DEFAULTS = {
     "repository": "example-owner/example-app",
     "state_folder": ".local/workflow",
     "worktree_setup": "scripts/setup-worktree",
+    "refresh": {"clear_generated": []},
     "checks": {
         "ci_result": "CI result",
         "ci_plan": "CI: what to run",
@@ -116,6 +117,56 @@ def test_without_a_file_every_value_is_its_default(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
 
     assert _as_json(workflow_config.load(repo)) == _DEFAULTS
+
+
+def test_refresh_reads_ignored_paths_and_globs_even_before_output_exists(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("generated/\n")
+    paths = ["generated/types", "generated/cache/*"]
+    _write(repo, {"refresh": {"clear_generated": paths}})
+
+    config = workflow_config.load(repo)
+
+    assert config.refresh.clear_generated == tuple(paths)
+    assert _as_json(config)["refresh"] == {"clear_generated": paths}
+
+
+@pytest.mark.parametrize("value", [None, "generated/types", [1], [""], ["../generated"],
+                                   ["/generated"], ["."], [".git/objects"], ["generated/../other"]])
+def test_refresh_refuses_unsafe_configuration(tmp_path: Path, value: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"refresh": {"clear_generated": value}})
+
+    with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
+        workflow_config.load(repo)
+
+
+@pytest.mark.parametrize("kind", ["tracked", "not ignored", "tracked descendant", "symlink"])
+def test_refresh_refuses_unsafe_targets_when_config_is_read(tmp_path: Path, kind: str) -> None:
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("generated/\n")
+    target = repo / "generated"
+    target.mkdir()
+    if kind == "symlink":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("keep\n")
+        (target / "link").symlink_to(outside, target_is_directory=True)
+        named = "generated/link/types"
+    else:
+        (target / "types").write_text("keep\n")
+        if kind.startswith("tracked"):
+            _git(repo, "add", "-f", "generated/types")
+            _git(repo, "commit", "-m", "chore: tracked output")
+        if kind == "not ignored":
+            (repo / ".gitignore").write_text("")
+        named = "generated" if kind == "tracked descendant" else "generated/types"
+    _write(repo, {"refresh": {"clear_generated": [named]}})
+
+    with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
+        workflow_config.load(repo)
+
+    assert (target / ("link/keep" if kind == "symlink" else "types")).read_text() == "keep\n"
 
 
 @pytest.mark.parametrize(
