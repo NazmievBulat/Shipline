@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from workflow_harness import SESSION_LINK, Workflow, install_shipline, instruction, scope_words
+from workflow_harness import SESSION_LINK, Workflow, in_scope, install_shipline, instruction
 
 
 def _codex(workflow: Workflow, draft: bool = True) -> None:
@@ -1525,8 +1525,7 @@ def test_codex_and_its_bridge_each_run_in_a_scope_with_the_memory_limits(
     assert done.returncode == 0, done.stderr
     for name in ("codex-7", "ticket-7"):
         arguments = (workflow.state / "args" / name).read_text().splitlines()
-        start = arguments.index("systemd-run")
-        assert arguments[start:-1] == scope_words(name, arguments[start + 5])
+        assert in_scope(arguments, name)[-1].startswith(("codex ", "claude "))
 
 
 def test_list_shows_the_limit_of_codex_and_its_bridge_once(workflow: Workflow) -> None:
