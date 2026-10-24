@@ -12,8 +12,8 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner prefix and no
-image build command, and the runner label `<prefix>-home`, whose labels are the runner labels;
-none without a prefix; no hunt areas, so one hunt runs at a
+image build or hub cache command, and the runner label `<prefix>-home` and planner label
+`<label>-planner`, whose labels are the runner labels; none without a prefix; no hunt areas, so one hunt runs at a
 time, and no hunt plans file; no test command, which a repository names for its CI's test job
 (`ci_proof.py test`).
 
@@ -89,9 +89,15 @@ DEFAULTS: dict[str, Any] = {
         "prefix": None,
         # The base label every machine's runners carry; `<prefix>-home` by default.
         "label": None,
+        # The label the CI planner's runner carries; `<label>-planner` by default.
+        "planner_label": None,
         # The command line, run from the main checkout, that builds the runner images; without
-        # it, the pool builds its own Dockerfile.
+        # it, the pool has no images to run.
         "image_build": None,
+        # The command line, run from the main checkout, that runs the Docker Hub cache of the
+        # Docker-capable runners' virtual machines (`hub-cache.sh`); without it, they pull from
+        # Docker Hub directly.
+        "hub_cache": None,
     },
     "hunts": {
         # Each area of the application a hunt may keep to: its name and the screens (paths) it
@@ -162,7 +168,9 @@ class Runner:
     identity_folder: str
     prefix: str | None = None
     label: str | None = None
+    planner_label: str | None = None
     image_build: str | None = None
+    hub_cache: str | None = None
 
     @property
     def identity_path(self) -> Path:
@@ -363,11 +371,19 @@ def _from_runner_settings(main: Path) -> str | None:
     return done.stdout
 
 
-def runner_labels(label: str) -> tuple[str, ...]:
+def runner_labels(label: str, planner_label: str | None = None) -> tuple[str, ...]:
     """The labels every machine's runners carry, so GitHub gives a job to whichever machine has
     one free: the base label, a spare's before it takes a slot, the merge train's first
-    member's, main's runners' and the Docker runners'."""
-    return (label, f"{label}-standby", f"{label}-first", f"{label}-main", f"{label}-docker")
+    member's, main's runners', the Docker runners' and the planner's, `<label>-planner` unless
+    the file names another."""
+    return (
+        label,
+        f"{label}-standby",
+        f"{label}-first",
+        f"{label}-main",
+        f"{label}-docker",
+        planner_label or f"{label}-planner",
+    )
 
 
 def _from_origin(main: Path) -> str | None:
@@ -418,14 +434,16 @@ def load(start: Path | None = None) -> Config:
             f"starting with a letter and ending with a letter or digit, not {prefix}"
         )
     label = values["runner"]["label"] or (prefix and f"{prefix}-home")
-    if label is not None and not _LABEL.fullmatch(label):
-        raise ConfigError(
-            f"{FILE}: runner.label must be lowercase letters, digits and hyphens, starting and "
-            f"ending with a letter or digit, not {label}"
-        )
+    planner_label = values["runner"]["planner_label"] or (label and f"{label}-planner")
+    for key, value in (("label", label), ("planner_label", planner_label)):
+        if value is not None and not _LABEL.fullmatch(value):
+            raise ConfigError(
+                f"{FILE}: runner.{key} must be lowercase letters, digits and hyphens, starting "
+                f"and ending with a letter or digit, not {value}"
+            )
     labels = tuple(values["runner"]["labels"])
     if "labels" not in given.get("runner", {}) and label is not None:
-        labels = runner_labels(label)
+        labels = runner_labels(label, planner_label)
     return Config(
         found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),
@@ -439,7 +457,9 @@ def load(start: Path | None = None) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
             label=label,
+            planner_label=planner_label,
             image_build=values["runner"]["image_build"],
+            hub_cache=values["runner"]["hub_cache"],
         ),
         hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
         commands=Commands(**values["commands"]),
@@ -473,7 +493,9 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
             "label": config.runner.label,
+            "planner_label": config.runner.planner_label,
             "image_build": config.runner.image_build,
+            "hub_cache": config.runner.hub_cache,
         },
         "hunts": {
             "areas": {area: list(screens) for area, screens in config.hunts.areas.items()},
@@ -504,7 +526,9 @@ def shell(config: Config) -> str:
         # Empty when the file names none.
         "RUNNER_PREFIX": config.runner.prefix or "",
         "RUNNER_LABEL": config.runner.label or "",
+        "RUNNER_PLANNER_LABEL": config.runner.planner_label or "",
         "RUNNER_IMAGE_BUILD": config.runner.image_build or "",
+        "RUNNER_HUB_CACHE": config.runner.hub_cache or "",
         "HUNT_PLANS": config.hunts.plans or "",
         "CONFIG": json.dumps(config.given, separators=(",", ":")),
     }

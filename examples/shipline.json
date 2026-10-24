@@ -36,12 +36,15 @@
       "example-app-home-standby",
       "example-app-home-first",
       "example-app-home-main",
-      "example-app-home-docker"
+      "example-app-home-docker",
+      "example-app-home-planner"
     ],
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app",
     "label": "example-app-home",
-    "image_build": "tools/shipline/build-runner-images"
+    "planner_label": "example-app-home-planner",
+    "image_build": "tools/shipline/build-runner-images",
+    "hub_cache": "tools/shipline/hub-cache"
   },
   "hunts": {
     "areas": {

@@ -65,7 +65,9 @@ _DEFAULTS = {
         "identity_folder": "~/.config/shipline-runner",
         "prefix": None,
         "label": None,
+        "planner_label": None,
         "image_build": None,
+        "hub_cache": None,
     },
     "hunts": {"areas": {}, "plans": None},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
@@ -218,6 +220,7 @@ _LABELS = (
     "example-app-home-first",
     "example-app-home-main",
     "example-app-home-docker",
+    "example-app-home-planner",
 )
 
 
@@ -242,7 +245,26 @@ def test_a_named_runner_label_builds_the_labels(tmp_path: Path) -> None:
         "example-pool-first",
         "example-pool-main",
         "example-pool-docker",
+        "example-pool-planner",
     )
+
+
+def test_a_named_planner_label_is_the_planner_s_label(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app", "planner_label": "example-planner"}})
+
+    runner = workflow_config.load(repo).runner
+    assert runner.planner_label == "example-planner"
+    assert runner.labels == (*_LABELS[:-1], "example-planner")
+
+
+def test_the_hub_cache_command_is_read_and_absent_by_default(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app"}})
+    assert workflow_config.load(repo).runner.hub_cache is None
+
+    _write(repo, {"runner": {"hub_cache": "tools/shipline/hub-cache"}})
+    assert workflow_config.load(repo).runner.hub_cache == "tools/shipline/hub-cache"
 
 
 def test_named_runner_labels_win_over_the_built_ones(tmp_path: Path) -> None:
@@ -259,15 +281,19 @@ def test_without_a_prefix_or_a_label_there_are_no_labels(tmp_path: Path) -> None
 
     runner = workflow_config.load(repo).runner
     assert runner.label is None
+    assert runner.planner_label is None
     assert runner.labels == ()
 
 
+@pytest.mark.parametrize("key", ["label", "planner_label"])
 @pytest.mark.parametrize("label", ["Example-home", "example home", "-home", "home-", "a/b"])
-def test_a_runner_label_that_is_not_a_plain_name_is_refused(tmp_path: Path, label: str) -> None:
+def test_a_runner_label_that_is_not_a_plain_name_is_refused(
+    tmp_path: Path, key: str, label: str
+) -> None:
     repo = _repository(tmp_path)
-    _write(repo, {"runner": {"prefix": "example-app", "label": label}})
+    _write(repo, {"runner": {"prefix": "example-app", key: label}})
 
-    with pytest.raises(workflow_config.ConfigError, match="runner.label must be"):
+    with pytest.raises(workflow_config.ConfigError, match=f"runner.{key} must be"):
         workflow_config.load(repo)
 
 
@@ -275,11 +301,20 @@ def test_bash_reads_the_runner_label_and_the_built_labels(tmp_path: Path) -> Non
     repo = _repository(tmp_path)
     _write(repo, {"runner": {"prefix": "example-app"}})
 
+    _write(repo, {"runner": {"prefix": "example-app", "hub_cache": "tools/hub 'cache'"}})
+
     printed = _shell(
-        repo, 'printf "%s\\n" "$SHIPLINE_RUNNER_LABEL" "${SHIPLINE_RUNNER_LABELS[@]}"'
+        repo,
+        'printf "%s\\n" "$SHIPLINE_RUNNER_LABEL" "$SHIPLINE_RUNNER_PLANNER_LABEL" '
+        '"$SHIPLINE_RUNNER_HUB_CACHE" "${SHIPLINE_RUNNER_LABELS[@]}"',
     )
 
-    assert printed.splitlines() == ["example-app-home", *_LABELS]
+    assert printed.splitlines() == [
+        "example-app-home",
+        "example-app-home-planner",
+        "tools/hub 'cache'",
+        *_LABELS,
+    ]
 
 
 def test_the_repository_named_in_the_file_wins_over_the_runner_settings_and_origin(

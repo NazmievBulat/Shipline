@@ -76,10 +76,12 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `workflows.ci`, `workflows.e2e`, `workflows.images` | the workflow files under `.github/workflows/` | `ci.yml`, `e2e.yml`, `images.yml` |
 | `labels.workflow`, `labels.audited` | the label that starts a ticket, and an audit's | `workflow`, `audited` |
 | `labels.priority.blocker` … `.low` | the four priority labels | `priority: blocker` … `priority: low` |
-| `runner.labels` | the runner labels the merge gate may re-run failed jobs on | the ones built from `runner.label`: `<label>`, `<label>-standby`, `<label>-first`, `<label>-main`, `<label>-docker`; without a label, none: the gate re-runs nothing |
+| `runner.labels` | the runner labels the merge gate may re-run failed jobs on | the ones built from `runner.label`: `<label>`, `<label>-standby`, `<label>-first`, `<label>-main`, `<label>-docker`, and `runner.planner_label`; without a label, none: the gate re-runs nothing |
 | `runner.label` | the base label every machine's runners carry, so GitHub gives a job to whichever machine has one free (`runner/README.md`) | `<prefix>-home`; none without a prefix |
+| `runner.planner_label` | the label the CI planner's runner carries | `<label>-planner` |
 | `runner.prefix` | the one word the runner pool (`runner/`) names everything by: its images, network, services and containers, `<prefix>-runner…`, and its labels; `workflow-metrics` reads the CPU of the `<prefix>-runner…` services and containers | none: no runner figures |
-| `runner.image_build` | the command line, run from the main checkout, that builds the runner images | none: the pool builds its own Dockerfile |
+| `runner.image_build` | the command line, run on main's files, that builds the runner images `<prefix>-runner` and `<prefix>-runner-docker` | none: the runner pool cannot be installed |
+| `runner.hub_cache` | the command line, run on main's files, that runs the Docker Hub cache of the Docker-capable runners | none: no cache, and their virtual machines pull from Docker Hub |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
 | `hunts.areas` | the areas of the application two hunts may keep to at once: an object of each area's name (small letters, digits and dashes) to its screens, paths starting with `/` without a space, comma, quotation mark, dollar, backtick or backslash | none: one hunt runs at a time, on every screen |
 | `hunts.plans` | the repository's file of hunt plans, which the sentence of a hunt with a plan names | none: the sentence names no file |
