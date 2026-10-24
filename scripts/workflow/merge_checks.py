@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from merge_health import Health
+from merge_train import Train
 
 
 def _ci_check(name: str) -> bool:
