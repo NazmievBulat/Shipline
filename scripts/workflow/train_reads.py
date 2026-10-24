@@ -13,6 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import check_repair
 import workflow_config
 
 
@@ -85,6 +86,7 @@ class Reads:
         self.owners: dict[str, str] = {}
         self.tokens: dict[str, str] = {}
         self.steady: set[str] = set()
+        self.polling: set[str] = set()
         for member in planning_pulls(self.tick).values() if self.tick else []:
             self.register(member)
 
@@ -112,6 +114,15 @@ class Reads:
         else:
             self.steady.discard(head)
 
+    def _poll_retry(self, head: str) -> None:
+        self.polling.add(head)
+        # Jobs and annotations can have been cached before the retry was requested.
+        # Remove them too, so they cannot outlive the run metadata catching up.
+        self.previous = {
+            path: entry for path, entry in self.previous.items()
+            if entry.get("token") != self.tokens.get(head)
+        }
+
     def api(self, path: str, read: Callable[[], Any], *, fresh: bool = False) -> Any:
         """GitHub's answer for `path`, shared within the tick; `fresh` asks GitHub again, and
         the later reads of the tick share that answer."""
@@ -124,18 +135,37 @@ class Reads:
         owner = head_match[1] if head_match else self.owners.get(path)
         token = self.tokens.get(owner or "")
         key = digest([path, token])
+
+        def retrying(value: Any) -> bool:
+            # A terminal rollup can precede its successful retry's run metadata. Do not
+            # freeze the failed first attempt under that otherwise unchanged rollup.
+            return bool(head_match) and any(
+                check_repair.retry_requested(self.path.parent, found) for found in value
+            )
+
+        candidate = self.responses.get(key, self.previous.get(path, {}).get("value", []))
+        if owner and retrying(candidate):
+            self._poll_retry(owner)
+
         if fresh:
             value = read()
             self.responses[key] = value
         elif key in self.responses:
             value = self.responses[key]
-        elif owner in self.steady and self.previous.get(path, {}).get("token") == token:
+        elif (
+            owner in self.steady
+            and owner not in self.polling
+            and self.previous.get(path, {}).get("token") == token
+            and not retrying(self.previous[path]["value"])
+        ):
             value = self.previous[path]["value"]
             self.responses[key] = value
         else:
             value = read()
             self.responses[key] = value
         if owner and token:
+            if retrying(value):
+                self._poll_retry(owner)
             if head_match:
                 for run in value:
                     self.owners[f"{config.api}/actions/runs/{run['id']}/jobs?per_page=100"] = owner
@@ -156,6 +186,8 @@ class Reads:
             # into recognition, and a scratch rerun must never use the member's cache.
             if (
                 owner in self.steady
+                and owner not in self.polling
+                and not retrying(value)
                 and (value or f"/{config.workflows.images}/runs?" in path)
                 and (
                     not isinstance(value, list)

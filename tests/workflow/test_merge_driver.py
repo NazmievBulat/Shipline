@@ -2606,5 +2606,6 @@ def test_successful_retry_jobs_wait_for_the_run_metadata_before_handing_back(
     handed.save()
     done = workflow.run_script("tick")
     assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "merged").exists(), done.stdout + done.stderr + str(_train(workflow))
     assert (workflow.state / "merged").read_text() == "7"
     assert len(workflow.calls("gh run rerun")) == 1

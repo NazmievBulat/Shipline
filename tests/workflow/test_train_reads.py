@@ -42,6 +42,7 @@ def _load(name: str) -> ModuleType:
 @pytest.fixture
 def reads_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     # What train_reads reads this checkout's repository and workflow files with.
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts/workflow"))
     monkeypatch.setitem(sys.modules, "workflow_config", _load("workflow_config"))
     module = _load("train_reads")
     monkeypatch.setenv("WORKFLOW_TRAIN_TICK", str(tmp_path))
@@ -534,3 +535,50 @@ def test_an_owner_question_noted_during_the_scan_is_not_hidden_by_the_reconcile_
     reused = workflow.run_script("merge-when-current", "--train-status", env=env)
     assert reused.stdout == uncached.stdout
     assert workflow.calls("gh") == before
+
+
+
+def test_a_requested_retry_polls_until_attempt_metadata_catches_up_then_reuses_reads(
+    reads_module: ModuleType, tmp_path: Path
+) -> None:
+    _snapshot(tmp_path)
+    path = f"{_API}/actions/workflows/ci.yml/runs?head_sha=abc&event=pull_request&per_page=100"
+    jobs_path = f"{reads_module.workflow_config.current().api}/actions/runs/1/jobs?per_page=100"
+    calls = []
+    found = {"id": 1, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+    job = {"id": 2, "status": "completed", "conclusion": "failure"}
+
+    def fetch() -> list[dict[str, Any]]:
+        calls.append(path)
+        return [dict(found)]
+
+    def fetch_jobs() -> list[dict[str, Any]]:
+        calls.append(jobs_path)
+        return [dict(job)]
+
+    # Failed attempt-1 runs and jobs were cached beside an already successful rollup.
+    first = reads_module.Reads(tmp_path, "main")
+    assert first.api(path, fetch)[0]["conclusion"] == "failure"
+    assert first.api(jobs_path, fetch_jobs)[0]["conclusion"] == "failure"
+    first.finish()
+    (tmp_path / "api.json").unlink()
+    (tmp_path / "check-rerun-1.json").write_text(json.dumps({"state": "requested"}))
+    waiting = reads_module.Reads(tmp_path, "main")
+    assert waiting.api(path, fetch)[0]["run_attempt"] == 1
+    assert waiting.api(jobs_path, fetch_jobs)[0]["conclusion"] == "failure"
+    assert waiting.api(path, fetch)[0]["run_attempt"] == 1
+    assert waiting.api(jobs_path, fetch_jobs)[0]["conclusion"] == "failure"
+    assert calls.count(path) == calls.count(jobs_path) == 2  # one poll per tick
+    waiting.finish()
+    (tmp_path / "api.json").unlink()
+    found.update(run_attempt=2, conclusion="success")
+    job["conclusion"] = "success"
+    caught_up = reads_module.Reads(tmp_path, "main")
+    assert caught_up.api(path, fetch)[0]["conclusion"] == "success"
+    assert caught_up.api(jobs_path, fetch_jobs)[0]["conclusion"] == "success"
+    caught_up.finish()
+    (tmp_path / "api.json").unlink()
+    steady = reads_module.Reads(tmp_path, "main")
+    assert steady.api(path, fetch)[0]["run_attempt"] == 2
+    assert steady.api(jobs_path, fetch_jobs)[0]["conclusion"] == "success"
+    assert calls.count(path) == calls.count(jobs_path) == 3  # completed retry is steady again
