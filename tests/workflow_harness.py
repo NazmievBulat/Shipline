@@ -264,6 +264,19 @@ if [ "$1 $2" = "label create" ] && [ ! -e "@STATE@/fail-gh-label-create" ]; then
   echo "$3" >> "@STATE@/labels"
   exit 0
 fi
+# Signed in, unless the test signed it out.
+if [ "$*" = "auth status" ]; then
+  [ ! -e "@STATE@/signed-out" ] || { echo "You are not logged into any GitHub hosts." >&2; exit 1; }
+  echo "Logged in to github.com account tester"
+  exit 0
+fi
+# The repository, with what the signed-in account may do in it.
+if [ $# = 2 ] && [ "$1" = api ] && [[ $2 =~ ^repos/[^/]+/[^/]+$ ]]; then
+  push=true
+  [ ! -e "@STATE@/no-push" ] || push=false
+  echo "{\\"full_name\\": \\"${2#repos/}\\", \\"permissions\\": {\\"push\\": $push}}"
+  exit 0
+fi
 echo "gh: could not answer $*" >&2
 exit 1
 """

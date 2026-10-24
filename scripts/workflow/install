@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Sets Shipline up for one repository, from the Shipline checkout this script is in. Run once by
+# the owner, with the repository's checkout named:
+#
+#   shipline install <repo-path>
+#
+# First it checks that the machine has what Shipline needs: Linux with systemd user units, tmux,
+# git, jq, gh signed in, Python 3.14, Node 22 and Claude Code (Codex only for Codex workers). It
+# says each thing that is missing, and then changes nothing; so it does when the repository, its
+# shipline.json or its labels on GitHub cannot be read, or when labels are missing that the
+# signed-in gh account may not create. Otherwise it creates the missing labels the workflow reads
+# (`labels` in shipline.json), writes the timer that runs the tick (`install-timer`) and the
+# hooks of the sessions (`install-hooks`). Run again, it adds only what is missing.
+set -euo pipefail
+
+# The oldest Python and Node the scripts run on.
+PYTHON=3.14
+NODE=22
+# How long one call to GitHub may take.
+GITHUB_SECONDS=30
+
+[[ $# == 1 && -n $1 ]] || { echo "usage: shipline install <repo-path>" >&2; exit 2; }
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# Stops with what stands in the way, before anything was changed.
+refuse() {
+  printf '%s\n' "$@" "nothing was installed" >&2
+  exit 1
+}
+
+# Whether the version $1 is $2 or later.
+at_least() {
+  [[ $(printf '%s\n' "$2" "$1" | sort -V | head -n 1) == "$2" ]]
+}
+
+missing=()
+system=$(uname -s)
+[[ $system == Linux ]] || missing+=("missing: Linux (this is $system)")
+if ! command -v systemctl >/dev/null || ! systemctl --user show-environment >/dev/null 2>&1; then
+  missing+=("missing: systemd user units (systemctl --user cannot reach the user's service manager)")
+fi
+for program in tmux git jq; do
+  command -v "$program" >/dev/null || missing+=("missing: $program")
+done
+if ! command -v gh >/dev/null; then
+  missing+=("missing: gh")
+elif ! timeout "$GITHUB_SECONDS" gh auth status >/dev/null 2>&1; then
+  missing+=("missing: gh signed in (run: gh auth login)")
+fi
+found=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null) || found=""
+if [[ -z $found ]]; then
+  missing+=("missing: python3 $PYTHON or later")
+elif ! at_least "$found" "$PYTHON"; then
+  missing+=("missing: python3 $PYTHON or later (found $found)")
+fi
+found=$(node --version 2>/dev/null) || found=""
+found=${found#v}
+if [[ -z $found ]]; then
+  missing+=("missing: node $NODE or later")
+elif ! at_least "$found" "$NODE"; then
+  missing+=("missing: node $NODE or later (found $found)")
+fi
+command -v claude >/dev/null || missing+=("missing: claude (Claude Code)")
+((${#missing[@]} == 0)) || refuse "${missing[@]}"
+command -v codex >/dev/null || echo "codex not found: only Codex workers need it"
+
+# The repository: its main checkout, its shipline.json and its name on GitHub.
+repo=$(cd "$1" 2>/dev/null && pwd) || refuse "$1 is no folder"
+git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || refuse "$repo is in no git repository"
+export SHIPLINE_REPO=$repo
+# Asked again only to say why it cannot be read: on success nothing but the values is read.
+config=$(python3 "$here/workflow_config.py" shell 2>/dev/null) ||
+  refuse "$(python3 "$here/workflow_config.py" shell 2>&1 >/dev/null)"
+eval "$config"
+[[ -n $SHIPLINE_REPOSITORY ]] ||
+  refuse "cannot tell which repository on GitHub $repo is: name it as repository in shipline.json"
+# gh, install-timer and install-hooks work on the repository of the folder they run in.
+cd "$SHIPLINE_REPO"
+
+# The labels, most of all, need asking before anything is changed.
+labels=$(timeout "$GITHUB_SECONDS" gh label list --limit 1000 --json name --jq '.[].name') ||
+  refuse "cannot read the labels of $SHIPLINE_REPOSITORY with gh"
+absent=()
+for label in "$SHIPLINE_LABEL_WORKFLOW" "$SHIPLINE_LABEL_AUDITED" "$SHIPLINE_PRIORITY_BLOCKER" \
+  "$SHIPLINE_PRIORITY_HIGH" "$SHIPLINE_PRIORITY_MEDIUM" "$SHIPLINE_PRIORITY_LOW"; do
+  grep -qxF -- "$label" <<<"$labels" || absent+=("$label")
+done
+if ((${#absent[@]} > 0)); then
+  answer=$(timeout "$GITHUB_SECONDS" gh api "repos/$SHIPLINE_REPOSITORY") ||
+    refuse "cannot read $SHIPLINE_REPOSITORY with gh"
+  if [[ $(jq -r '.permissions.push // false' <<<"$answer") != true ]]; then
+    lines=("missing: labels on $SHIPLINE_REPOSITORY that this gh account may not create; someone who may can create them with:")
+    for label in "${absent[@]}"; do
+      lines+=("  gh label create $(printf '%q' "$label") --repo $SHIPLINE_REPOSITORY")
+    done
+    refuse "${lines[@]}"
+  fi
+fi
+
+# The timer, and the two labels it creates itself.
+bash "$here/install-timer"
+
+# The priority labels, described as the priority rule in RULES.md describes them.
+create_priority() {
+  local name=$1 color=$2 description=$3
+  grep -qxF -- "$name" <<<"$labels" ||
+    timeout "$GITHUB_SECONDS" gh label create "$name" --color "$color" --description "$description"
+}
+create_priority "$SHIPLINE_PRIORITY_BLOCKER" B60205 \
+  "Stops every merge or push now: a red main, a push refused for everyone, a deadlocked train"
+create_priority "$SHIPLINE_PRIORITY_HIGH" D93F0B \
+  "Removes a bottleneck: CI capacity, a flaky test, a stalled or slow workflow"
+create_priority "$SHIPLINE_PRIORITY_MEDIUM" FBCA04 "Anything else"
+create_priority "$SHIPLINE_PRIORITY_LOW" CCCCCC "Only when the owner says so"
+
+bash "$here/install-hooks"
+echo "Shipline is installed for $SHIPLINE_REPOSITORY: the tick runs every 3 minutes"
