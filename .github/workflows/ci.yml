@@ -93,6 +93,7 @@ jobs:
               tests/workflow/test_install_hooks.py
               tests/workflow/test_limit_in_own_words.py
               tests/workflow/test_merge_driver.py
+              tests/workflow/test_break_55.py
               tests/workflow/test_notify.py
               tests/workflow/test_priority.py
               tests/workflow/test_review_effort.py

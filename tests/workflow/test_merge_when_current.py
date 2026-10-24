@@ -4860,6 +4860,7 @@ def _batch_setup(
     count: int = 3,
     conflict: bool = False,
     images: bool = False,
+    images_member: int = 7,
     migration: bool = False,
     compatibility: str | None = None,
     selected: bool = False,
@@ -4873,7 +4874,7 @@ def _batch_setup(
         if number != 7:
             workflow.git("checkout", "-b", f"ticket/{number}", original)
         filename = "shared.txt" if conflict and number in (7, 9) else f"change-{number}.txt"
-        if images and number == 7:
+        if images and number == images_member:
             filename = "docker/change.txt"
             (workflow.repo / "docker").mkdir()
         if (migration and number in (8, 9)) or str(number) == compatibility:
@@ -4896,7 +4897,9 @@ def _batch_setup(
         github.ci(original, head, run_id=number * 1000)
     github.head = github.pulls["7"]["headRefOid"]
     if images:
+        github.head = github.pulls[str(images_member)]["headRefOid"]
         _images(github)
+        github.head = github.pulls["7"]["headRefOid"]
     workflow.git("checkout", "ticket/seven")
     # Each reviewer calls the actual gate. Pending main prevents a premature first merge.
     github.main()
@@ -5962,9 +5965,301 @@ def test_a_green_scratch_rerun_restores_the_isolated_members_earlier_place(
     # On the same main, the passed rerun is its prefix: it merges without another run.
     assert done.returncode == (2 if moved else 0), done.stdout + done.stderr
     assert _merges(github) == ([] if moved else ["7"])
-    # 7, 8 and 9; 8 and 9 again behind the new front after the failure; and, once 7 is back in
-    # front of them, 8 and 9 once more on top of it. A refresh dispatches nothing.
-    assert len(github.workflow.calls("gh workflow run ci.yml")) == (5 if moved else 7)
+    # 7, 8 and 9; then 8 and 9 without the failed member. Restoring 7 starts no replacement
+    # runs on the old main. If 7 merges, its new main is where 8 and 9 are tested next.
+    assert len(github.workflow.calls("gh workflow run ci.yml")) == 5
+    if not moved:
+        base = github.workflow.git("rev-parse", "origin/main")
+        done = _batch_call(github, "8")
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert len(github.workflow.calls("gh workflow run ci.yml")) == 7
+        assert _scratch(github, "8")["under"] == github.workflow.git(
+            "rev-parse", f"{base}^{{tree}}"
+        )
+
+
+def _restored_before_eight(
+    github: GitHub, *, passed: bool, reconciled: bool = False, count: int = 3, late: bool = False
+) -> dict[str, Any]:
+    """Restore 7 on unchanged main, with a proof shortfall and 8 already tested alone."""
+    _batch_setup(github, count=count, images=True, images_member=8)
+    if late:
+        # 9 has not joined the ready line. A one-slot window starts 8 alone after 7 fails.
+        github.pulls["9"]["isDraft"] = True
+        saved = _batch_state(github)
+        saved["window"] = 2
+        (github.workflow.repo / ".local/workflow/merge-train.json").write_text(json.dumps(saved))
+    assert _batch_call(github).returncode == 3
+    isolated = _prefixes(github)[0]
+    _finish_prefix(github, "7", conclusion="failure")
+    assert _batch_call(github).returncode == 1
+    kept = next(member for member in _prefixes(github) if member["number"] == "8")
+    _finish_prefix(github, "8", run_id=1100)
+    if not passed:
+        for workflow in kept["scratch"]["workflows"]:
+            key = (
+                f"{_REPO}/actions/workflows/{workflow}.yml/runs"
+                f"?head_sha={kept['scratch']['head']}&event=workflow_dispatch&per_page=100"
+            )
+            github.api[key]["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    # Exercise a state written before kept prefixes and their dependencies were recorded.
+    path = github.workflow.repo / ".local/workflow/merge-train.json"
+    saved = _batch_state(github)
+    saved.pop("restored", None)
+    for member in saved["prefixes"]["members"]:
+        member.pop("ahead", None)
+        member.pop("kept", None)
+    path.write_text(json.dumps(saved))
+    _finish_prefix(
+        github, "7", scratch=isolated["scratch"], tree=isolated["tree"], run_id=100
+    )
+    for workflow in isolated["scratch"]["workflows"]:
+        key = (
+            f"{_REPO}/actions/workflows/{workflow}.yml/runs"
+            f"?head_sha={isolated['scratch']['head']}&event=workflow_dispatch&per_page=100"
+        )
+        github.api[key]["workflow_runs"][0]["run_attempt"] = 2
+    github.api[f"{_REPO}/check-runs/101/annotations?per_page=100"][1]["message"] = SELECTED
+    if reconciled:
+        github.save()
+        assert _train(github)["first"] == "7"
+        saved = _batch_state(github)
+        saved.pop("restored", None)
+        for member in saved["prefixes"]["members"]:
+            member.pop("ahead", None)
+        path.write_text(json.dumps(saved))
+    return kept
+
+
+@pytest.mark.parametrize("passed", [False, True], ids=["running", "passed"])
+@pytest.mark.parametrize("reconciled", [False, True], ids=["failed-state", "proven-state"])
+def test_restoration_keeps_an_existing_prefix_across_retests_and_gate_calls(
+    github: GitHub, passed: bool, reconciled: bool
+) -> None:
+    kept = _restored_before_eight(github, passed=passed, reconciled=reconciled)
+    branch = kept["scratch"]["branch"]
+    done = _batch_call(github)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "did not prove its tested files" in done.stderr
+    assert _scratch(github, "8")["branch"] == branch
+    assert branch in _scratch_branches(github)
+
+    # The replacement prefix of 7 starts beside the kept work; a later tick cannot forget it.
+    for _ in range(3):
+        github.save()
+        status = _train(github)
+        prefixes = {entry["number"]: entry for entry in status["prefixes"]}
+        assert prefixes["8"]["kept"] is True
+        assert prefixes["8"]["branch"] == branch
+        assert prefixes["7"]["branch"] != branch
+        number = status["first"]
+        done = _batch_call(github, number)
+        if passed:
+            assert done.returncode == 0, done.stdout + done.stderr
+            break
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert _scratch(github, "8")["branch"] == branch
+        saved = _batch_state(github)
+        assert sum(
+            member["scratch"] is None or member["scratch"]["pushed"]
+            for member in saved["prefixes"]["members"]
+        ) <= saved["window"]
+    if not passed:
+        _finish_prefix(github, "8", run_id=1100)
+        github.save()
+        assert _train(github)["first"] == "8"
+        done = _batch_call(github, "8")
+        assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["8"]
+    receipt = _receipt(github)
+    assert receipt["tree"] == kept["tree"]
+    assert receipt["ci_run"] == 1100
+    assert receipt["images_run"] == 1110 and receipt["images_complete"] is True
+    # The kept branch was dispatched only once, and 7 now tests against the new main.
+    assert len([call for call in github.workflow.calls("gh workflow run") if branch in call]) == len(
+        kept["scratch"]["workflows"]
+    )
+    restored = next(member for member in _prefixes(github) if member["number"] == "7")
+    base = github.workflow.git("rev-parse", "origin/main")
+    assert restored["scratch"]["under"] == github.workflow.git("rev-parse", f"{base}^{{tree}}")
+    _finish_prefix(github, "7", run_id=2100)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["8", "7"]
+
+
+@pytest.mark.parametrize("reconciled", [False, True], ids=["failed-state", "proven-state"])
+def test_a_member_joining_during_a_restored_retest_waits_for_the_restored_front(
+    github: GitHub, reconciled: bool
+) -> None:
+    # Read the older state shape, both before and after its green rerun was recognized.
+    kept = _restored_before_eight(github, passed=False, reconciled=reconciled, late=True)
+    assert _batch_call(github).returncode == 1
+    saved = _batch_state(github)
+    saved["window"] = 2
+    (github.workflow.repo / ".local/workflow/merge-train.json").write_text(json.dumps(saved))
+    assert _batch_call(github).returncode == 3
+    restored = _scratch(github, "7")
+    assert restored and restored["pushed"]
+
+    # 9 joins while 8 is kept and 7's replacement is running. Only the existing 8 may go first.
+    github.pulls["9"]["isDraft"] = False
+    saved = _batch_state(github)
+    saved["window"] = 4
+    (github.workflow.repo / ".local/workflow/merge-train.json").write_text(json.dumps(saved))
+    done = _batch_call(github, "9")
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "9" in _batch_state(github)["waiting"]
+    for member in _prefixes(github):
+        if member["number"] == "9":
+            assert "7" in member["ahead"], member
+            assert not member.get("kept"), member
+    assert _scratch(github, "8")["branch"] == kept["scratch"]["branch"]
+
+    _finish_prefix(github, "8", run_id=1100)
+    done = _batch_call(github, "8")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["8"]
+    replacement = _scratch(github, "7")
+    assert replacement and replacement["pushed"]
+    assert replacement["branch"] != restored["branch"]
+    base = github.workflow.git("rev-parse", "origin/main")
+    assert replacement["under"] == github.workflow.git("rev-parse", f"{base}^{{tree}}")
+
+    for member in _prefixes(github):
+        if member["number"] == "9":
+            assert "7" in member["ahead"], member
+            _finish_prefix(github, "9", run_id=4100)
+    for _ in range(3):
+        for number in ("7", "9"):
+            done = _batch_call(github, number)
+            assert done.returncode == 3, done.stdout + done.stderr
+        assert _merges(github) == ["8"]
+        assert _scratch(github, "7")["branch"] == replacement["branch"]
+    _finish_prefix(github, "7", run_id=3100)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github)[:2] == ["8", "7"]
+
+
+@pytest.mark.parametrize("change", ["head", "main", "draft"])
+def test_a_kept_prefix_is_invalidated_when_its_inputs_change(github: GitHub, change: str) -> None:
+    kept = _restored_before_eight(github, passed=False)
+    assert _batch_call(github).returncode == 1
+    if change == "head":
+        github.pulls["8"]["headRefOid"] = github.pulls["9"]["headRefOid"]
+    elif change == "draft":
+        github.pulls["8"]["isDraft"] = True
+    else:
+        workflow = github.workflow
+        workflow.git("checkout", "main")
+        workflow.git("commit", "--allow-empty", "-m", "chore: main moved")
+        github.base = workflow.git("rev-parse", "HEAD")
+        workflow.git("push", "origin", "main")
+        workflow.git("checkout", "ticket/seven")
+        github.main()
+    done = _batch_call(github)
+    assert done.returncode in (1, 2, 3), done.stdout + done.stderr
+    assert kept["scratch"]["branch"] not in _scratch_branches(github)
+    assert _merges(github) == []
+
+
+def test_replacing_a_short_prefix_cancels_only_its_own_live_runs_once(github: GitHub) -> None:
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    scratch = _scratch(github)
+    _finish_batch(github)
+    github.api[f"{_REPO}/check-runs/101/annotations?per_page=100"][1]["message"] = SELECTED
+    _branch_runs(
+        github, scratch["branch"],
+        (901, "queued"), (902, "in_progress"), (903, "completed"),
+        (904, "in_progress", "main", "push"),
+        (905, "in_progress", "ticket/7", "push"),
+    )
+    done = _batch_call(github)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert list(_cancelled(github)) == ["901", "902"]
+    assert all(scratch["branch"] in branches for branches in _cancelled(github).values())
+    assert done.stdout.count("cancel requested for run 901") == 1
+    assert done.stdout.count("cancel requested for run 902") == 1
+    assert scratch["branch"] not in _scratch_branches(github)
+    done = _batch_call(github)
+    assert "cancel requested for run 901" not in done.stdout
+    assert len(github.workflow.calls("gh run cancel")) == 2
+
+
+def test_an_old_scratch_name_is_cancelled_but_other_branches_are_untouched(github: GitHub) -> None:
+    _batch_setup(github)
+    branch = "workflow/merge-batch-legacy"
+    other = "ticket/example-app"
+    for name in (branch, other):
+        github.workflow.git("push", "origin", f"{github.base}:refs/heads/{name}")
+        _branch_runs(github, name, (901 if name == branch else 902, "in_progress"))
+    _branch_runs(github, "main", (903, "in_progress"))
+    done = _batch_call(github)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert list(_cancelled(github)) == ["901"]
+    assert branch not in _scratch_branches(github)
+    assert github.workflow.git("ls-remote", "origin", f"refs/heads/{other}")
+
+
+def test_planning_a_restored_prefix_does_not_rerun_its_failed_jobs(github: GitHub) -> None:
+    _restored_before_eight(github, passed=False)
+    assert _batch_call(github).returncode == 1
+    # Room for the restored member's retest, while the kept prefix still runs.
+    github.pulls["9"]["state"] = "CLOSED"
+    assert _batch_call(github).returncode == 3
+    _finish_prefix(github, "7", run_id=200)
+    batch_dependencies_red(github, annotation=UNREACHABLE, run_id=200)
+    advisory_service_answers(github.workflow, answers=True)
+    before = github.workflow.calls("gh run rerun")
+    _train(github)
+    assert github.workflow.calls("gh run rerun") == before
+
+
+def test_a_new_priority_front_still_invalidates_the_kept_line(github: GitHub) -> None:
+    kept = _restored_before_eight(github, passed=False, count=4)
+    assert _batch_call(github).returncode == 1
+    github.pulls["10"]["labels"] = [{"name": "priority: blocker"}]
+    github.workflow.git("checkout", "ticket/10")
+    done = _batch_call(github, "10")
+    assert done.returncode in (2, 3), done.stdout + done.stderr
+    assert "waiting for the members ahead of the next prefix" not in done.stdout
+    assert kept["scratch"]["branch"] not in _scratch_branches(github)
+    assert _merges(github) == []
+
+
+@pytest.mark.parametrize("descendant_passed", [False, True], ids=["pending", "passed"])
+def test_a_failed_kept_root_frees_capacity_for_the_restored_prefix(
+    github: GitHub, descendant_passed: bool
+) -> None:
+    _restored_before_eight(github, passed=False)
+    assert _batch_call(github).returncode == 1
+    for _ in range(2):
+        assert _batch_call(github).returncode == 3
+        assert _scratch(github, "7")["pushed"] is False
+    _finish_prefix(github, "8", conclusion="failure", run_id=1100)
+    if descendant_passed:
+        _finish_prefix(github, "9", run_id=2100)
+    github.save()
+    # Status reads keep nominating the failed independent root, not its dependent result
+    # or the restored member whose scratch branch cannot start until a slot is released.
+    for _ in range(3):
+        assert _train(github)["first"] == "8"
+    done = _batch_call(github, "8")
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "prefix failed" in done.stderr
+    assert _batch_state(github)["blocked"]["8"] == github.pulls["8"]["headRefOid"]
+    restored = _scratch(github, "7")
+    assert restored["pushed"] is True
+    assert _numbers(github) == ["7"]
+    for _ in range(2):
+        assert _batch_call(github).returncode == 3
+        assert _scratch(github, "7")["branch"] == restored["branch"]
+    _finish_prefix(github, "7", run_id=3100)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7"]
 
 
 @pytest.mark.parametrize("number", ["7", "9"])
