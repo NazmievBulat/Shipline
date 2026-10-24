@@ -216,7 +216,7 @@ def test_the_gate_runs_the_commands_a_repository_names_from_that_repository(
     programs = {
         "pre-train-checks": f'echo repository-checks >> "{calls}"\nexit 1\n',
         "conflicts": 'echo migrations/0002_taken.py\n',
-        "browser-plan": "exit 0\n",
+        "browser-plan": "echo needed\n",
     }
     kept = workflow.repo / "tools" / "shipline"
     kept.mkdir(parents=True)

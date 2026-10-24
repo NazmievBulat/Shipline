@@ -33,7 +33,9 @@
 #                               memory and its memory limit. The state is `busy`, `idle` (it ended its turn) or
 #                               `limit` (the usage limit stopped it; the line then ends with
 #                               which limit and when it resets, as the screen says it, or
-#                               `usage limit` and the reset the stop hook noted, in UTC)
+#                               `usage limit` and the reset the stop hook noted, in UTC).
+#                               Before that, once the tick has read its screen, when the
+#                               screen last changed, in UTC: the time its 45-minute rule counts from
 #   session load                the 5-minute load average and the ceiling above which a start
 #                               waits, as it waits while memory is short
 #   session room                succeeds when a start would not wait for memory or the
@@ -51,6 +53,11 @@
 #                               whether that wait is over (the tick does this, to keep its cache)
 #   session finish-ready <ticket-N>
 #                               tell an idle worker whose pull request is ready to finish
+#   session nudge-busy <ticket-N|review-N> <still|loop> [again]
+#                               press Escape in a busy Claude session whose screen has not
+#                               changed for 45 minutes, or whose wait loop finds itself, and
+#                               tell it so (the tick does this, once); with `again`, only send
+#                               that message once more when its Enter was not taken
 #   session running <name>      what the session's Bash tool runs, as JSON, and whether it is
 #                               a wait loop that finds itself (`running_command.py`)
 #   session bridge <ticket-N>   start the bridge of a Codex worker again when it ended while
@@ -64,9 +71,9 @@
 #                               `hunts`, only those of hunts and analysts, which needs no
 #                               answer from GitHub
 #
-# `gh`, `tmux`, `systemd-run`, `claude`, `codex`, `git`, `sleep`, `flock` and `nproc` are
-# found on the PATH, and the system paths below can be pointed elsewhere, so a test can replace
-# all of them.
+# `gh`, `tmux`, `systemd-run`, `claude`, `codex`, `git`, `sleep`, `flock`, `nproc`, `numfmt` and
+# `getconf` are found on the PATH, and the system paths below can be pointed elsewhere, so a test
+# can replace all of them.
 set -euo pipefail
 # A background merge driver may start a session. Its budget policy must not become
 # part of that interactive session's environment.
@@ -86,6 +93,8 @@ PROTECTED_BYTES=$((4 * 1024 * 1024 * 1024))
 # squeezed one had in swap was 3.2 GB.
 SESSION_MEMORY_MAX=${WORKFLOW_SESSION_MEMORY_MAX:-8G}
 SESSION_SWAP_MAX=${WORKFLOW_SESSION_SWAP_MAX:-4G}
+# How long a start waits for the session's scope to say it holds those limits.
+LIMITS_WAIT_SECONDS=30
 LINK_WAIT_SECONDS=60
 # Without a size `tmux` makes a window of 80 by 24, too small for the screen Claude draws.
 SCREEN_COLUMNS=200
@@ -154,6 +163,7 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session batch-merged <review-N> <squash>
        session status-check <ticket-N|review-N>
        session finish-ready <ticket-N>
+       session nudge-busy <ticket-N|review-N> <still|loop> [again]
        session running <ticket-N|audit-N|review-N|hunt-name|analyst-name>
        session bridge <ticket-N>
        session cleanup [hunts]
@@ -261,7 +271,7 @@ list_worktrees() {
 # limit after which its instruction was sent again, the reset of the limit it said it stopped
 # on). None of it is true of the next session.
 forget_notes() {
-  rm -f "$1.url" "$1.idle" "$1.waiting" "$1.pushed" "$1.started" "$1.area" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.checks-wait" "$1.job-wait"
+  rm -f "$1.url" "$1.idle" "$1.waiting" "$1.pushed" "$1.started" "$1.area" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.checks-wait" "$1.job-wait" "$1.limits"
   if [[ ${2:-} != keep-codex ]]; then
     rm -f "$1.codex" "$1.asking" "$1.resent" "$1.codex-delivered" "$1.codex-answered" "$1.codex-followed-up" "$1.codex-quota-delivered" "$1.codex-approval-delivered" "$1.codex-recovery-error" "$1.owner-reply"
   fi
@@ -308,15 +318,29 @@ stop_session() {
 }
 
 # The control group of the session: the scope `launch` made for it, or the one `tmux` made for a
-# session started before sessions had their own. Refuses a group that is not the session's own,
-# because reclaiming or protecting it would act on everything else in that group.
+# session started before sessions had their own. That scope holds the pane's child, or the pane's
+# own process for a session started before the child made it. Refuses a group that is not the
+# session's own, because reclaiming or protecting it would act on everything else in that group:
+# so too `tmux`'s own scope of a pane `launch` started, which holds only the waiting process.
 group_of() {
-  local name=$1 pid path
+  local name=$1 pid path child scoped waits
   pid=$(tmux -L "$name" list-panes -t "=$name" -F '#{pane_pid}' 2>/dev/null | head -n 1) || true
   [[ $pid =~ ^[0-9]+$ ]] || return 1
-  path=$(sed -n 's/^0:://p' "$PROC_ROOT/$pid/cgroup" 2>/dev/null | head -n 1) || true
-  [[ $path == */tmux-spawn-*.scope || $path =~ /workflow-$name-[0-9]+\.scope$ ]] || return 1
+  path=$(cgroup_of "$pid")
+  [[ ! $path =~ /workflow-$name-[0-9]+\.scope$ ]] || { echo "$CGROUP_ROOT$path"; return 0; }
+  for child in $(cat "$PROC_ROOT/$pid/task/$pid/children" 2>/dev/null); do
+    scoped=$(cgroup_of "$child")
+    [[ ! $scoped =~ /workflow-$name-[0-9]+\.scope$ ]] || { echo "$CGROUP_ROOT$scoped"; return 0; }
+  done
+  waits=$(tr '\0' '\n' 2>/dev/null <"$PROC_ROOT/$pid/cmdline" | sed -n 3p) || true
+  [[ $path == */tmux-spawn-*.scope && $waits != "$PANE_WAITS" ]] || return 1
   echo "$CGROUP_ROOT$path"
+}
+
+# The control group a process is in, as the kernel names it, or nothing.
+cgroup_of() {
+  [[ $1 =~ ^[0-9]+$ ]] || return 0
+  sed -n 's/^0:://p' "$PROC_ROOT/$1/cgroup" 2>/dev/null | head -n 1 || true
 }
 
 require_group() {
@@ -512,6 +536,8 @@ EOF
 
 start_cloud_worker() {
   local number=$1 effort=$2 name="cloud-$1" prompt command launch_file status_file invoked_file waited=0
+  local limits_file=$main/$SHIPLINE_STATE_FOLDER/cloud-$1.limits missing memory_bytes swap_bytes
+  check_session_limits
   prompt=$(cloud_sentence_of "$number")
   launch_file=$main/$SHIPLINE_STATE_FOLDER/$name.launch
   status_file=$main/$SHIPLINE_STATE_FOLDER/$name.exit
@@ -533,6 +559,12 @@ start_cloud_worker() {
     return 1
   fi
   while [[ ! -f $status_file ]] && ((waited < LINK_WAIT_SECONDS)); do
+    # Its scope refused to run the launcher without the limits: nothing was invoked.
+    if missing=$(limits_missing "$limits_file"); then
+      python3 -B "$script_dir/cloud_workers.py" refused "$main" "$number"
+      refuse_limits "$name" "$missing"
+      return 1
+    fi
     sleep 1
     waited=$((waited + 1))
   done
@@ -672,6 +704,69 @@ snapshot_busy() {
   mv "$WORKFLOW_SESSION_SNAPSHOT.pending" "$WORKFLOW_SESSION_SNAPSHOT"
 }
 
+# A limit as systemd reads it (8G, 96M, 0), in bytes as the kernel holds it in `memory.max`: a
+# whole number of pages. Fails for anything else.
+limit_bytes() {
+  local bytes page
+  bytes=$(LC_ALL=C numfmt --from=iec -- "$1" 2>/dev/null) && [[ $bytes =~ ^[0-9]+$ ]] || return 1
+  page=$(getconf PAGESIZE 2>/dev/null) && [[ $page =~ ^[1-9][0-9]*$ ]] || page=4096
+  echo "$((bytes / page * page))"
+}
+
+# Sets memory_bytes and swap_bytes, the session's limits in bytes. A limit that is not a size
+# would leave every session unstarted, so it is refused before anything is prepared.
+check_session_limits() {
+  memory_bytes=$(limit_bytes "$SESSION_MEMORY_MAX") ||
+    die "WORKFLOW_SESSION_MEMORY_MAX is '$SESSION_MEMORY_MAX', not a size such as 8G"
+  swap_bytes=$(limit_bytes "$SESSION_SWAP_MAX") ||
+    die "WORKFLOW_SESSION_SWAP_MAX is '$SESSION_SWAP_MAX', not a size such as 8G"
+}
+
+# What the session's scope runs first, before its command: the command runs only when the scope's
+# group holds the session's limits, and the note says either way. Called with the note, the
+# control group folder, the two limits in bytes and the command.
+IN_SCOPE='group=$2$(sed -n "s/^0:://p" /proc/self/cgroup); { read -r memory <"$group/memory.max"; } 2>/dev/null || memory=missing; { read -r swap <"$group/memory.swap.max"; } 2>/dev/null || swap=missing; if [[ $memory == "$3" && $swap == "$4" ]]; then echo "in place" >"$1"; exec bash -c "$5"; fi; echo "memory.max $memory, memory.swap.max $swap" >"$1"; exit 1'
+
+# The pane's own process: it only runs the scope's `systemd-run` as its child and ends with it.
+PANE_WAITS='"$@"; exit'
+
+# What the scope noted that it holds instead of the limits, when it noted that (IN_SCOPE). Fails
+# while it has noted nothing, and when it holds them.
+limits_missing() {
+  local said=""
+  [[ -s $1 ]] && read -r said <"$1" || true
+  [[ -n $said && $said != "in place" ]] && echo "$said"
+}
+
+# The sentence a start refused for its limits ends with.
+refuse_limits() {
+  echo "$1 was not started: its scope does not hold its memory limits of" \
+    "$(size_of "$memory_bytes") and $(size_of "$swap_bytes") of swap ($2)" >&2
+}
+
+# Waits for the session's scope to note that it holds the limits (IN_SCOPE). A session whose
+# scope never started, or that does not hold them, is ended, as it would run with no limit.
+await_limits() {
+  local name=$1 note=$2 waited=0 said="" limits
+  while [[ ! -s $note ]] && is_running "$name" && ((waited < LIMITS_WAIT_SECONDS * 10)); do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  [[ ! -s $note ]] || read -r said <"$note" || true
+  [[ $said != "in place" ]] || return 0
+  limits="its memory limits of $(size_of "$memory_bytes") and $(size_of "$swap_bytes") of swap"
+  if [[ -n $said ]]; then
+    refuse_limits "$name" "$said"
+  elif is_running "$name"; then
+    echo "$name was not started: its scope with $limits did not start" \
+      "within $LIMITS_WAIT_SECONDS seconds" >&2
+  else
+    echo "$name was not started: its scope with $limits did not start" >&2
+  fi
+  end_server "$name" 2>/dev/null || true
+  return 1
+}
+
 # Starts the session: one `tmux` server of its name, running the command in the worktree. A
 # word after the command is one more variable for the session, as NAME=value.
 #
@@ -682,17 +777,27 @@ snapshot_busy() {
 # each run, which stays inside the limits, and ends it with all it holds when it stops the run.
 # `tmux` runs a command given as several words without a shell, so the session's own command
 # stays its last word.
+#
+# The scope is made by a child of the pane's own process, which only waits for it: a `tmux` built
+# with systemd support moves each new pane's own process, and only that one, into a scope of its
+# own, and that move raced a scope the pane's process made itself. The start goes on only once the
+# scope notes that it holds the limits.
 launch() {
   local name=$1 worktree=$2 command=$3 variable=${4:-} session_name=${5:-$1} keep=""
+  local note=$2/$SHIPLINE_STATE_FOLDER/$1.limits memory_bytes swap_bytes
+  check_session_limits
   local -a scope=(systemd-run --user --scope --quiet --collect --unit="workflow-$name-$$"
     -p MemoryMax="$SESSION_MEMORY_MAX" -p MemorySwapMax="$SESSION_SWAP_MAX" -p OOMPolicy=continue
-    -p Delegate=yes -- bash -c "$command")
+    -p Delegate=yes --
+    bash -c "$IN_SCOPE" bash "$note" "$CGROUP_ROOT" "$memory_bytes" "$swap_bytes" "$command")
   if [[ $name == cloud-* ]]; then
     # tmux can succeed before systemd refuses the scope. Record that definite refusal
     # outside the scope so the next tick can retry it without trusting a missing pane.
     scope=(bash -c 'invoked=$1; refused=$2; shift 2; "$@"; result=$?; if [[ ! -e $invoked ]]; then printf "%s\n" "$result" >"$refused"; fi; exit "$result"'
       bash "$worktree/$SHIPLINE_STATE_FOLDER/$name.invoked" "$worktree/$SHIPLINE_STATE_FOLDER/$name.not-invoked"
       "${scope[@]}")
+  else
+    scope=(bash -c "$PANE_WAITS" bash "${scope[@]}")
   fi
   mkdir -p "$worktree/$SHIPLINE_STATE_FOLDER"
   if [[ $name == ticket-* ]] && is_running "codex-${name#ticket-}"; then
@@ -721,6 +826,9 @@ launch() {
     tmux -L "$name" new-session -d -x "$SCREEN_COLUMNS" -y "$SCREEN_ROWS" -s "$name" -c "$worktree" \
     "${scope[@]}" \
     8>&- || return $?
+  # A cloud launch's pane ends as soon as it has launched; the record of its launch is read
+  # instead, and its scope's check still keeps the launcher from running without the limits.
+  [[ $name == cloud-* ]] || await_limits "$name" "$note" || return 1
   snapshot_busy "$name"
 }
 
@@ -856,7 +964,10 @@ cmd_start_hunt() {
       command="codex exec --sandbox workspace-write -c sandbox_workspace_write.network_access=true --add-dir $report \"$prompt\" 2>&1 | tee $report/codex.log"
       label=Codex
     fi
-    launch "$name" "$worktree" "$command" "WORKFLOW_HUNT_REPORT=$report"
+    if ! launch "$name" "$worktree" "$command" "WORKFLOW_HUNT_REPORT=$report"; then
+      rmdir "$report" 2>/dev/null || true
+      exit 1
+    fi
     note_area "$name" "$worktree" "$area"
     # A hunter that cannot run (not signed in, a wrong option) ends within a moment, and `tmux`
     # shows its session until then.
@@ -875,9 +986,12 @@ cmd_start_hunt() {
     protect_hunt "$name"
     echo "$name started: $label, no link; its screen: tmux -L $name attach"
   else
-    launch "$name" "$worktree" \
-      "claude --effort $HUNT_EFFORT --add-dir $report --remote-control $name \"$prompt\"" \
-      "WORKFLOW_HUNT_REPORT=$report"
+    if ! launch "$name" "$worktree" \
+        "claude --effort $HUNT_EFFORT --add-dir $report --remote-control $name \"$prompt\"" \
+        "WORKFLOW_HUNT_REPORT=$report"; then
+      rmdir "$report" 2>/dev/null || true
+      exit 1
+    fi
     note_area "$name" "$worktree" "$area"
     touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
     if ! wait_for_link "$name"; then
@@ -1064,6 +1178,12 @@ list_sessions() {
     if [[ -e $browser_lock ]] && ! flock -n -x "$browser_lock" true; then
       state=busy
     fi
+    # When the tick last saw the screen change (its `.screen-seen` note: the sum and the time).
+    local seen="" sum changed
+    if { read -r sum changed <"$main/$SHIPLINE_STATE_FOLDER/$name.screen-seen"; } 2>/dev/null &&
+        [[ $changed =~ ^[0-9]{1,12}$ ]]; then
+      seen="  screen changed $(LC_ALL=C TZ=UTC date -d "@$changed" '+%b %-d, %Y, %-I:%M%P') (UTC)"
+    fi
     stopped=""
     if stopped_on_limit "$name" without-box; then
       state=limit
@@ -1096,9 +1216,9 @@ list_sessions() {
       limits=" ($limits)"
     fi
     if [[ $known == true ]]; then
-      echo "$name  $state  $(megabytes "$total_held") held$limits  $(megabytes "$total_swapped") in swap$stopped"
+      echo "$name  $state  $(megabytes "$total_held") held$limits  $(megabytes "$total_swapped") in swap$seen$stopped"
     else
-      echo "$name  $state  memory unknown$stopped"
+      echo "$name  $state  memory unknown$seen$stopped"
     fi
   done < <(list_running)
   # Python takes tens of milliseconds to start, and the tick lists the sessions many times a run:
@@ -1302,6 +1422,91 @@ cmd_nudge_idle() {
   fi
   [[ -e $notes.idle ]] || die "$name is busy"
   send_prompt "$name" "Pull request ${name#ticket-} is ready, but you have not finished. Finish by the rules: when nothing is left to do, name each ticket pull request this session opened and say that it waits for the owner's start, then say \`worker finished\` on a line of its own."
+}
+
+# Whether a busy screen shows a message typed while Claude works: Claude draws it as a line of
+# its own, `❯ ` and the text (on a grey ground), under the spinner and above the box. A prompt
+# already sent has the same mark, so only such a line after the last line Claude draws itself
+# (its spinner, any of its frames, or the time a turn took) counts; without one, after the
+# last reply. The mark may be followed by a no-break space, as in the box.
+shows_queued_message() {
+  strip_ansi <<<"$1" | LC_ALL=C awk '
+    /^─/ { above = last; last = NR }
+    { line[NR] = $0 }
+    END {
+      top = above ? above : (last ? last : NR + 1)
+      for (i = 1; i < top; i++) {
+        if (line[i] ~ /^[[:space:]]*(·|✢|✳|✶|✻|✽)[[:space:]]/ ||
+            line[i] ~ /^[[:space:]]*\*[[:space:]]+[^[:space:]]+…/) { from = i; drawn = 1 }
+        else if (!drawn && line[i] ~ /^[[:space:]]*●/) from = i
+      }
+      for (i = from + 1; i < top; i++)
+        if (line[i] ~ /^❯([[:space:]]|\302\240)+[^[:space:]]/) exit 0
+      exit 1
+    }'
+}
+
+# The tick's two messages to a busy Claude worker or reviewer that does not move: its screen has
+# not changed for 45 minutes, or its wait loop finds its own command line. Escape interrupts
+# what it runs, and the message tells it why. A session that waits for the owner, ended its
+# turn, shows a permission dialog (Escape or Enter would answer it) or has text in its box
+# exits 3 with nothing pressed; so does one with a message queued under the spinner, which
+# Escape would put back unsent. When Escape still puts a message back into the box, nothing is
+# typed after it: exit 4, the session interrupted.
+#
+# With `again`, the call only sends this message once more, typed by an earlier call whose
+# Enter was not taken: it exits 3 unless the box holds exactly that, and never presses Escape.
+cmd_nudge_busy() {
+  local name=$1 kind=$2 again=${3:-} notes typed poll screen message
+  message="That loop finds its own command line and never ends. Check the process by its number."
+  [[ $kind != still ]] ||
+    message="The command has produced nothing for 45 minutes. Check whether it is still running and go on."
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  require_running "$name"
+  [[ ! -e $notes.codex ]] || die "$name is a Codex worker; its bridge relays"
+  ! stopped_on_limit "$name" || die "$name is stopped on the usage limit"
+  if [[ -e $notes.owner-blocked || -e $notes.interaction-blocked || -e $notes.asking ]]; then
+    echo "$name is waiting for the owner; nothing was pressed" >&2
+    exit 3
+  fi
+  if [[ -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]]; then
+    echo "$name is not busy; nothing was pressed" >&2
+    exit 3
+  fi
+  screen=$(tmux -L "$name" capture-pane -p -t "=$name:" 2>/dev/null) || die "cannot read the screen of $name"
+  if LC_ALL=C grep -qE '^[[:space:]│]*Do you want to [^?]*\?' <<<"$screen"; then
+    echo "$name shows a permission dialog; nothing was pressed" >&2
+    exit 3
+  fi
+  read_prompt_box
+  if [[ $again == again ]]; then
+    if [[ -n $typed && -r $notes.typed && $(cat "$notes.typed") == "$message" ]] &&
+        holds_own_text "$name"; then
+      send_prompt "$name" "$message"
+      return
+    fi
+    echo "$name does not hold the message in its box; nothing was pressed" >&2
+    exit 3
+  fi
+  if [[ -n $typed ]]; then
+    echo "$name has text in its box that was not sent; nothing was pressed" >&2
+    exit 3
+  fi
+  if shows_queued_message "$screen"; then
+    echo "$name has a message queued; nothing was pressed" >&2
+    exit 3
+  fi
+  tmux -L "$name" send-keys -t "=$name:" Escape 2>/dev/null || die "Escape could not be sent to $name"
+  # Claude draws the interrupt, and puts back into the box what was queued while it worked.
+  for ((poll=0; poll<10; poll++)); do
+    sleep 0.2
+    read_prompt_box
+    if [[ -n $typed ]]; then
+      echo "$name has text in its box after Escape; nothing was typed into it" >&2
+      exit 4
+    fi
+  done
+  send_prompt "$name" "$message"
 }
 
 # What the session's Bash tool runs, as JSON (`running_command.py`).
@@ -1594,6 +1799,7 @@ codex_limit() {
 case ${1:-} in
   start)
     check_load_per_processor
+    check_session_limits
     # Cloud may be named without an effort level.
     if [[ $# == 4 && $2 == worker && $4 == cloud ]]; then
       set -- "$1" "$2" "$3" "$WORKER_EFFORT" cloud
@@ -1672,6 +1878,12 @@ case ${1:-} in
     [[ $# -eq 2 && $2 =~ ^ticket-[0-9]+$ ]] || usage
     find_main_checkout
     cmd_nudge_idle "$2" finish
+    ;;
+  nudge-busy)
+    [[ ($# -eq 3 || ($# -eq 4 && $4 == again)) && $2 =~ ^(ticket|review)-[0-9]+$ &&
+       $3 =~ ^(still|loop)$ ]] || usage
+    find_main_checkout
+    cmd_nudge_busy "$2" "$3" "${4:-}"
     ;;
   running)
     [[ $# -eq 2 ]] && is_session_name "$2" || usage

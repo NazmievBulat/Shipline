@@ -21,12 +21,10 @@ it too. The repository is the main checkout
 `--repo` names, else `SHIPLINE_REPO`, else the one the current folder is in; outside any
 repository, with none named, a command stops and says how to name one. A command started
 outside the repository runs in its main checkout. Every session gets `SHIPLINE_REPO` and the
-checkout's `bin` in its environment. The files a repository keeps for the gate and the panel
-(`pre-train-checks`, `advisory_service.py`, `pushing_checkout.py`, `run_proof.py`,
-`mechanical_conflicts.py`, `server_tests_for_changes.py`, `browser_tests_for_changes.py`) are
-read from its own `scripts/workflow`, and its E2E planner from `scripts/e2e-plan.py`; a
-missing one means none: no check, no helper, no selected test (the panel then notes that CI
-runs the whole suite).
+checkout's `bin` in its environment. The gate reads a repository's `run_proof.py` from its own
+`scripts/workflow`; its other parts are the commands its `shipline.json` names (below,
+"The repository's commands"), read from its main checkout; a missing one means none: no
+check, no helper, no selected test (the panel then notes that CI runs the whole suite).
 
 # Workflow workers
 
@@ -89,6 +87,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `runner.labels` | the runner labels the merge gate may re-run failed jobs on | none: the gate re-runs nothing |
 | `runner.prefix` | the prefix the runner pool names its services and containers by; `workflow-metrics` reads their CPU | none: no runner figures |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
+| `machines` | the machines `flow-page` samples for load and memory: a `name` each and, for another machine, the `address` `ssh` reaches it at (a destination, never a word starting with `-`); one without an address is this machine | none: only this machine |
 | `hunts.areas` | the areas of the application two hunts may keep to at once: an object of each area's name (small letters, digits and dashes) to its screens, paths starting with `/` without a space, comma, quotation mark, dollar, backtick or backslash | none: one hunt runs at a time, on every screen |
 | `hunts.plans` | the repository's file of hunt plans, which the sentence of a hunt with a plan names | none: the sentence names no file |
 | `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
@@ -146,7 +145,7 @@ call. A session runs one as `shipline <command>`, the name with dashes
 | `server_tests_for_changes` | the same: `<base> [--files-from <file>]` | one JSON object, `{"whole": bool, "tests": [paths], "total": int, "reasons": [str]}` | the whole server suite: `{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}` |
 | `pre_train_checks` | the merge gate, before a pull request joins the merge train, in its worktree | exits non-zero when a check failed; what it prints is shown | every pull request is admitted |
 | `mechanical_conflicts` | the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch | `resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line (paths without spaces), or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took | every conflict is left to the session, nothing is renumbered and main took no number |
-| `browser_plan` | the merge gate: the changed paths on standard input, each ended by a NUL | exits 0 when the merge needs browser tests, 1 when not; anything else counts as needed | every merge that changes a file needs browser tests while the merged tree holds the E2E workflow (`workflows.e2e`), and none does without it |
+| `browser_plan` | the merge gate: the changed paths on standard input, each ended by a NUL | prints `needed` or `none` and exits 0; anything else, a crash or another exit included, counts as needed | every merge that changes a file needs browser tests while the merged tree holds the E2E workflow (`workflows.e2e`), and none does without it |
 | `hunt_app` | `session` when a hunt stops: `stop`, in the hunt's worktree; the hunter itself, by `shipline hunt-app` | | `session start hunt` refuses |
 | `hunt_browser` | the hunter, by `shipline hunt-browser`, which its sentence names | | the sentence names none |
 | `hunt_cursor` | `session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>` | what it prints is kept in the report folder's `cursor.log` | a Cursor hunt is refused |
@@ -160,5 +159,8 @@ answering, and `advisory-service.pending`, the line the wake tells once.
 
 A command reads nothing but what is given on its standard input. Files a repository kept beside
 the scripts before these commands existed, `scripts/workflow/pre-train-checks`,
-`advisory_service.py`, `pushing_checkout.py`, `mechanical_conflicts.py` and `scripts/e2e-plan.py`,
-are no longer read: each becomes a command named here, which answers in the form above.
+`advisory_service.py`, `pushing_checkout.py`, `mechanical_conflicts.py`,
+`server_tests_for_changes.py`, `browser_tests_for_changes.py` and `scripts/e2e-plan.py`, are no
+longer read: each becomes a command named here, which answers in the form above. Its program now
+lives in the main checkout whichever worktree runs it, so one that reads the change finds the
+checkout from the folder it runs in (`git rev-parse --show-toplevel`), not from its own path.

@@ -81,6 +81,14 @@ SCRATCH_PREFIX = "workflow/merge-batch-"
 E2E_PLAN = CONFIG.checks.e2e_plan
 CI_PLAN = CONFIG.checks.ci_plan
 CI_RESULT = CONFIG.checks.ci_result
+# The word or words the name of every check of the CI workflow begins with: those its planner
+# and its result begin with both, "CI" by default.
+CI_PREFIX = (
+    " ".join(os.path.commonprefix([CI_PLAN.replace(":", " ").split(), CI_RESULT.split()]))
+    or CI_RESULT
+)
+# How long after GitHub listed no CI run for a head whose CI jobs finished it is asked again.
+UNLISTED_RETRY_SECONDS = 30
 # Every check of the image workflow begins with this; its planner is IMAGES_PLAN.
 IMAGES = CONFIG.checks.images
 IMAGES_PLAN = CONFIG.checks.images_plan
@@ -136,6 +144,9 @@ MEMBER_MARKS = ("unavailable", "fixes", "refreshable")
 
 # Set only while computing train order, never while verifying a merge.
 _planning_reads: train_reads.Reads | None = None
+# Whether this process already paused for GitHub to list a CI run: it pauses once in all, so a
+# line whose runs GitHub lists for none of its members never holds the merge lock longer.
+_paused = False
 
 
 class Refused(Exception):
@@ -414,9 +425,10 @@ def push_failure(output: str, checkout: Path, timeout: float | None = None) -> s
     return f"the security scan was short of locked memory twice, a minute apart: {shortage}\n{refusal}"
 
 
-def api(path: str, key: str | None = None, *, paginate: bool = True) -> Any:
+def api(path: str, key: str | None = None, *, paginate: bool = True, fresh: bool = False) -> Any:
+    """GitHub's answer for `path`; `fresh` asks again what a reconciliation already read."""
     if _planning_reads is not None:
-        return _planning_reads.api(path, lambda: _api(path, key, paginate=paginate))
+        return _planning_reads.api(path, lambda: _api(path, key, paginate=paginate), fresh=fresh)
     return _api(path, key, paginate=paginate)
 
 
@@ -456,11 +468,77 @@ def runs(
     # Main is judged by the runs of its pushes (and manual reruns). A scheduled run of an
     # unchanged head is kept apart: it may report a failure, never hold or close the gate.
     event = "&event=pull_request" if pull else ""
-    found = api(
+    path = (
         f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
-        f"?head_sha={head}{event}&per_page=100",
-        "workflow_runs",
+        f"?head_sha={head}{event}&per_page=100"
     )
+    listed = api(path, "workflow_runs")
+    found = _own_runs(listed, head, pull=pull, scheduled=scheduled)
+    if listed or workflow != "ci":
+        return found
+    try:
+        return _unlisted_runs(path, head, pull=pull, scheduled=scheduled)
+    except Waiting:
+        raise
+    except Refused, KeyError, TypeError, ValueError:
+        # Unread is not absent: the head has no CI result yet, and the line keeps its judgment.
+        return []
+
+
+def _unlisted_runs(path: str, head: str, *, pull: bool, scheduled: bool) -> list[dict[str, Any]]:
+    """The CI runs of `head` that GitHub did not list, when its check runs show CI jobs finished.
+
+    GitHub sometimes lists no CI run for such a head and lists it when asked again a little
+    later. The run is found by the check suite of its jobs; when that lists none either, GitHub
+    is asked again, after a pause the first time in a process. A run still not found is no CI
+    result yet, a wait: the line keeps what it judged of the head before."""
+    global _paused
+    suites = _ci_suites(head)
+    if not suites:
+        return []
+    ci_path = f".github/workflows/{WORKFLOW_FILES['ci']}"
+    found = _own_runs(
+        [
+            run
+            for suite in suites
+            for run in api(
+                f"{API}/actions/runs?check_suite_id={suite}&per_page=100", "workflow_runs"
+            )
+            if run.get("path", "").split("@")[0] == ci_path
+        ],
+        head,
+        pull=pull,
+        scheduled=scheduled,
+    )
+    if found:
+        return found
+    if not _paused:
+        _paused = True
+        command("sleep", str(UNLISTED_RETRY_SECONDS))
+    return _own_runs(api(path, "workflow_runs", fresh=True), head, pull=pull, scheduled=scheduled)
+
+
+def _ci_check(name: str) -> bool:
+    return re.match(rf"{re.escape(CI_PREFIX)}(?:$|[\s:(])", name) is not None
+
+
+def _ci_suites(head: str) -> list[int]:
+    """The check suites of the CI jobs that finished on `head`, as its check runs show them."""
+    return sorted(
+        {
+            check["check_suite"]["id"]
+            for check in api(f"{API}/commits/{head}/check-runs?per_page=100", "check_runs")
+            if _ci_check(check.get("name", ""))
+            and check.get("status") == "completed"
+            and check.get("check_suite")
+        }
+    )
+
+
+def _own_runs(
+    found: list[dict[str, Any]], head: str, *, pull: bool, scheduled: bool
+) -> list[dict[str, Any]]:
+    """The runs of `head` that judge it, newest first: its pull request's, or main's own."""
     return sorted(
         [
             run
@@ -1533,9 +1611,10 @@ def browser_needed(base: str, merge: str) -> bool:
 
     The gate reads the exact difference from main, so a merge that changes nothing needs
     none; the planner runs on an empty diff only because it cannot tell one from a misread.
-    The plan reads the changed paths, each ended by a NUL, and exits 0 when browser tests are
-    needed and 1 when not; any other answer counts as needed. Without a plan every merge needs
-    them while the merged tree holds the E2E workflow, and none does without that file.
+    The plan reads the changed paths, each ended by a NUL, exits 0 and prints `needed` or
+    `none`. Only `none` with exit 0 means none: a plan that crashes, as a Python one does with
+    exit 1, never skips the browser tests. Without a plan every merge needs them while the
+    merged tree holds the E2E workflow, and none does without that file.
     """
     changed = command(
         "git", "diff", "--no-renames", "--name-only", "-z", base, merge, errors="surrogateescape"
@@ -1548,13 +1627,17 @@ def browser_needed(base: str, merge: str) -> bool:
     done = repository_command(
         "browser_plan", input="".join(f"{path}\0" for path in changed), errors="surrogateescape"
     )
-    if done is not None and done.returncode not in (0, 1):
+    assert done is not None
+    answer = "" if done.returncode else done.stdout.strip()
+    if answer == "none":
+        return False
+    if answer != "needed":
         print(
             f"the browser plan could not answer, so browser tests run: {said(done)}",
             file=sys.stderr,
             flush=True,
         )
-    return done is not None and done.returncode != 1
+    return True
 
 
 def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> bool:
@@ -1812,20 +1895,23 @@ def lost_check(
     pull: dict[str, Any],
     known: list[dict[str, Any]] | None = None,
     read: Callable[[str], dict[str, Any]] | None = None,
+    *,
+    failed: bool = False,
 ) -> dict[str, Any] | None:
     """A check the rollup lists as queued or running whose workflow run completed at least
     LOST_AFTER_SECONDS ago, when every check not passing is lost so: a check still running for
     real may yet fail, and is waited for first. Each read run costs a request from the shared
     budget, so a check that started less than that ago ends the search: its run cannot have
     completed so long ago. `read` reads a run by its id; the tick passes one that keeps each
-    answer for the rest of the tick.
+    answer for the rest of the tick. A failed pull request's completed checks have had their
+    say: then only the checks not completed must each be lost.
     """
     now = float(os.environ.get("WORKFLOW_NOW") or time.time())
     seen = {str(run["id"]): run for run in known or []}
     # Every check that cannot be lost is ruled out before any run is read.
     waiting = []
     for check in pull["statusCheckRollup"]:
-        if _passing_check(check):
+        if _passing_check(check) or (failed and _completed_check(check)):
             continue
         if check.get("__typename") == "StatusContext" or check.get("status") == "COMPLETED":
             return None
@@ -2337,7 +2423,9 @@ class Train:
         pulls: dict[str, Any] = {}
         suite_states: dict[str, str | None] = {}
         lost: dict[str, dict[str, Any]] = {}
-        self.refreshable = set()
+        # A blocked head's CI run that cannot be read, or that GitHub lists no more, is no new
+        # evidence: GitHub can lag on its check runs too, so its mark stays.
+        marked, self.refreshable = self.refreshable, set()
         # Use the same session state and owner-question notes as the tick. A background
         # job leaves its session running and must not lose its turn merely for waiting.
         sessions = {
@@ -2357,7 +2445,9 @@ class Train:
                 continue
             if number in self.blocked and self.blocked[number] != pull["headRefOid"]:
                 # A fix on a new head joins at the back when its reviewer calls the gate.
-                # Keep its audit eligible for a checks-finished wake until that claim.
+                # Keep its audit eligible for a checks-finished wake until that claim; a check
+                # GitHub lost beside its failure still ends that wait.
+                self._failed_lost(number, pull, None, lost, failed=failed_checks(pull))
                 continue
             if self.conflicts.get(number) != pull["headRefOid"]:
                 self.conflicts.pop(number, None)
@@ -2403,6 +2493,7 @@ class Train:
                 suite_states[number] = None
             if failed_checks(pull):
                 self.blocked[number] = pull["headRefOid"]
+                self._failed_lost(number, pull, None, lost)
             elif suite_states[number] == "red" and self.blocked.get(number) == pull["headRefOid"]:
                 # The gate blocked it when it told its session that a whole suite failed
                 # (_whole_suite_run). Until then it keeps its turn, so the finished run
@@ -2423,6 +2514,13 @@ class Train:
                             note_lost(self.path.parent, number, pull["headRefOid"], found)
                     if state == "red":
                         self.blocked[number] = pull["headRefOid"]
+                        self._failed_lost(number, pull, ci[:1], lost)
+                    elif (
+                        not ci
+                        and number in marked
+                        and self.blocked.get(number) == pull["headRefOid"]
+                    ):
+                        self.refreshable.add(number)
                     elif state == "green" and number in self.blocked:
                         # Its own green run cannot clear a failure its prefix run found. A
                         # new run or attempt of that prefix, or a fix, is needed first.
@@ -2454,7 +2552,10 @@ class Train:
                             # Still blocked, but its turn may refresh the stale green run.
                             self.refreshable.add(number)
                 except Refused, KeyError, TypeError, ValueError, IndexError:
-                    pass
+                    # An unread run changes nothing: a green re-run on this same head keeps
+                    # its mark, so its turn still refreshes it.
+                    if number in marked and self.blocked.get(number) == pull["headRefOid"]:
+                        self.refreshable.add(number)
             remaining.append(number)
         self.queue = remaining
         # A label changed while waiting moves its pull request at this turn.
@@ -2508,7 +2609,7 @@ class Train:
         self.lost = {
             number: found
             for number, found in {**self.lost, **lost}.items()
-            if number in remaining
+            if (number in remaining or number in self.blocked)
             and found["head"] == pulls[number]["headRefOid"]
             and (number in lost or number == acting)
         }
@@ -2520,6 +2621,27 @@ class Train:
         }
         self._pending_turns(pulls, suite_states)
         self.save()
+
+    def _failed_lost(
+        self,
+        number: str,
+        pull: dict[str, Any],
+        known: list[dict[str, Any]] | None,
+        lost: dict[str, dict[str, Any]],
+        *,
+        failed: bool = True,
+    ) -> None:
+        """A failed member's check GitHub lost never completes, so its reviewer's checks-finished
+        wake would never come: the tick gives it that wake, and the orchestrator is told. One
+        not known to have failed failed only when a lost check's run did not pass."""
+        try:
+            found = lost_check(pull, known, failed=True)
+        except Refused, KeyError, TypeError, ValueError, IndexError:
+            # Unreadable runs prove nothing lost; the next reconcile looks again.
+            return
+        if found and (failed or found["conclusion"] != "success"):
+            lost[number] = {"head": pull["headRefOid"], **found, "failed": True}
+            note_lost(self.path.parent, number, pull["headRefOid"], found)
 
     def _pending_turns(self, pulls: dict[str, Any], suite_states: dict[str, str | None]) -> None:
         # Pending entries keep their FIFO slots. Only a green run tested on current main
@@ -2757,6 +2879,12 @@ def _passing_check(check: dict[str, Any]) -> bool:
         "SKIPPED",
         "NEUTRAL",
     )
+
+
+def _completed_check(check: dict[str, Any]) -> bool:
+    if check.get("__typename") == "StatusContext":
+        return check.get("state") in ("SUCCESS", "FAILURE", "ERROR")
+    return check.get("status") == "COMPLETED"
 
 
 def _passing_rollup(pull: dict[str, Any]) -> bool:

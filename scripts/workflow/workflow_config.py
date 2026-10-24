@@ -12,8 +12,10 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix; no hunt areas, so one hunt runs at a time, and no hunt plans file; no test
-command, which a repository names for its CI's test job (`ci_proof.py test`).
+runner prefix; the workflow and runner tests `tools/parity` compares are in `tests/workflow` and
+`tests/runner`, and it knows of no differences; no machines named, so `flow-page` samples only
+the machine it runs on; no hunt areas, so one hunt runs at a time, and no hunt plans file; no
+test command, which a repository names for its CI's test job (`ci_proof.py test`).
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -99,6 +101,12 @@ DEFAULTS: dict[str, Any] = {
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
     },
+    # What `tools/parity` reads of a repository that keeps its own copy of the scripts: where its
+    # workflow and runner tests are, and the file that lists the differences it expects.
+    "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
+    # The machines `flow-page` samples, each a name and, for another machine, the address `ssh`
+    # reaches it at; one without an address is this machine. None named: only this machine.
+    "machines": [],
     "hunts": {
         # Each area of the application a hunt may keep to: its name and the screens (paths) it
         # covers. With none, a hunt hunts every screen and runs alone (`session start hunt`).
@@ -110,6 +118,8 @@ DEFAULTS: dict[str, Any] = {
     # Each is read by `_suites`, not key by key: the names are the repository's own.
     "cloud_pre_push": {"suites": {}},
 }
+# The keys of one machine.
+MACHINE_KEYS = ("name", "address")
 
 # A suite's keys, and its worker count when it names none: by its name, else one.
 SUITE_KEYS = ("select", "run", "workers", "part", "probe")
@@ -118,6 +128,9 @@ _SUITE_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
+# What `ssh` reads as a destination and nothing else: `user@host`, a name or an address, never a
+# word that starts with a dash, which it would read as one of its own options.
+_ADDRESS = re.compile(r"(?!-)[A-Za-z0-9_.@:\[\]-]+")
 # An area is the last word of `session start hunt`, and the area and its screens go into the
 # sentence a hunt is started with, inside double quotes in a shell command: no quotation mark,
 # dollar, backtick, backslash or space. The screens are joined with commas there.
@@ -175,6 +188,20 @@ class Runner:
     @property
     def identity_path(self) -> Path:
         return Path(self.identity_folder).expanduser()
+
+
+@dataclass(frozen=True)
+class Parity:
+    workflow_tests: str
+    runner_tests: str
+    known: str | None = None
+
+
+@dataclass(frozen=True)
+class Machine:
+    name: str
+    # None for this machine.
+    address: str | None = None
 
 
 @dataclass(frozen=True)
@@ -236,6 +263,8 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    parity: Parity
+    machines: tuple[Machine, ...]
     hunts: Hunts
     commands: Commands
     cloud_pre_push: CloudPrePush
@@ -334,6 +363,8 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
         name = where + key
         if key not in given:
             merged[key] = default
+        elif name == "machines":
+            merged[key] = _machines(given[key])
         elif name == "hunts.areas":
             merged[key] = _areas(given[key])
         elif name == "cloud_pre_push.suites":
@@ -353,6 +384,33 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
                 raise ConfigError(f"{FILE}: {name} must be a name, not {json.dumps(value)}")
             merged[key] = value
     return merged
+
+
+def _machines(given: Any) -> list[dict[str, str]]:
+    if not isinstance(given, list):
+        raise ConfigError(f"{FILE}: machines must be a list of machines")
+    machines = []
+    for machine in given:
+        if not isinstance(machine, dict):
+            raise ConfigError(f"{FILE}: machines must be a list of machines")
+        unknown = sorted(set(machine) - set(MACHINE_KEYS))
+        if unknown:
+            raise ConfigError(
+                f"{FILE}: unknown key {', '.join('machines.' + key for key in unknown)}"
+            )
+        name = machine.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(f"{FILE}: machines.name must be a name, not {json.dumps(name)}")
+        address = machine.get("address")
+        if "address" in machine and not (isinstance(address, str) and _ADDRESS.fullmatch(address)):
+            raise ConfigError(
+                f"{FILE}: machines.address must be what ssh reaches a machine at, "
+                f"not {json.dumps(address)}"
+            )
+        machines.append({key: machine[key] for key in MACHINE_KEYS if key in machine})
+    if len({machine["name"] for machine in machines}) != len(machines):
+        raise ConfigError(f"{FILE}: machines must name each machine once")
+    return machines
 
 
 def _areas(given: Any) -> dict[str, tuple[str, ...]]:
@@ -558,12 +616,29 @@ def load(start: Path | None = None) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
+        parity=parity_of(given),
+        machines=tuple(Machine(**machine) for machine in values["machines"]),
         hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
         commands=Commands(**values["commands"]),
         cloud_pre_push=CloudPrePush(tuple(values["cloud_pre_push"]["suites"])),
         given=given,
         main=main,
     )
+
+
+def parity_of(given: Any) -> Parity:
+    """The `parity` section of a file as read, checked as `load` checks it. `tools/parity` reads
+    only this of another repository's file, whose other keys its own scripts may read."""
+    if not isinstance(given, dict):
+        raise ConfigError(f"{FILE}: the file must be an object")
+    only = {"parity": given.get("parity", {})}
+    values = _merged({"parity": DEFAULTS["parity"]}, only, "")["parity"]
+    # As git names a path: `./tests//flow/` is `tests/flow`.
+    named = {
+        key: None if value is None else str(PurePosixPath(_relative(value, f"parity.{key}")))
+        for key, value in values.items()
+    }
+    return Parity(**named)
 
 
 @cache
@@ -591,6 +666,11 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
         },
+        "parity": vars(config.parity).copy(),
+        "machines": [
+            {"name": machine.name, **({"address": machine.address} if machine.address else {})}
+            for machine in config.machines
+        ],
         "hunts": {
             "areas": {area: list(screens) for area, screens in config.hunts.areas.items()},
             "plans": config.hunts.plans,
