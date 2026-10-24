@@ -41,6 +41,7 @@ _DEFAULTS = {
         "ci_plan": "CI: what to run",
         "e2e_plan": "E2E: what to run",
         "images": "Docker images",
+        "prefix_only": [],
     },
     "annotations": {
         "merge_tested": "Merge tested",
@@ -99,6 +100,27 @@ def test_without_a_file_every_value_is_its_default(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
 
     assert _as_json(workflow_config.load(repo)) == _DEFAULTS
+
+
+@pytest.mark.parametrize("groups", [[], ["images"], ["browser_whole"], ["server_whole"],
+                                     ["images", "browser_whole", "server_whole"]])
+def test_prefix_only_groups_are_read(tmp_path: Path, groups: list[str]) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {"prefix_only": groups}})
+    config = workflow_config.load(repo)
+    assert _as_json(config)["checks"]["prefix_only"] == groups
+    mapped = config.checks.groups()
+    assert mapped["images"].workflow == "images"
+    assert mapped["browser_whole"].jobs == ("playwright",)
+    assert mapped["server_whole"].jobs == ("CI: server tests",)
+
+
+@pytest.mark.parametrize("groups", [["unknown"], ["images", "images"], "images", None, [3]])
+def test_invalid_prefix_only_groups_are_refused(tmp_path: Path, groups: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {"prefix_only": groups}})
+    with pytest.raises(workflow_config.ConfigError, match="checks.prefix_only"):
+        workflow_config.load(repo)
 
 
 @pytest.mark.parametrize(

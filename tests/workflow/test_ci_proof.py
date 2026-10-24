@@ -78,6 +78,33 @@ def _tested_merge(workflow: Workflow) -> tuple[str, str, str]:
     return merge, workflow.git("rev-parse", "HEAD^{tree}"), head
 
 
+@pytest.mark.parametrize("group", ["images", "browser_whole", "server_whole"])
+@pytest.mark.parametrize("event", ["pull_request", "workflow_dispatch", "push"])
+@pytest.mark.parametrize("configured", [False, True])
+def test_prefix_only_output_defers_only_configured_needed_pr_groups(
+    workflow: Workflow, group: str, event: str, configured: bool,
+) -> None:
+    (workflow.repo / "shipline.json").write_text(json.dumps({
+        "checks": {"prefix_only": [group] if configured else []}
+    }))
+    output = workflow.root / "outputs"
+    done = _proof(workflow, "prefix-only", "--needed", group,
+                  env={"GITHUB_EVENT_NAME": event, "GITHUB_OUTPUT": str(output)})
+    assert done.returncode == 0, done.stderr
+    expected = [group] if configured and event == "pull_request" else []
+    assert json.loads(output.read_text().split("=", 1)[1]) == expected
+    assert annotations(done.stdout) == [{"title": "Prefix-only groups", "message": json.dumps(expected)}]
+
+
+def test_a_group_no_path_filter_needs_is_not_deferred(workflow: Workflow) -> None:
+    (workflow.repo / "shipline.json").write_text(json.dumps({
+        "checks": {"prefix_only": ["images", "browser_whole", "server_whole"]}
+    }))
+    done = _proof(workflow, "prefix-only", env={"GITHUB_EVENT_NAME": "pull_request"})
+    assert done.returncode == 0, done.stderr
+    assert annotations(done.stdout) == [{"title": "Prefix-only groups", "message": "[]"}]
+
+
 def test_a_whole_run_notes_its_tested_merge_its_files_and_whole_suites(
     workflow: Workflow,
 ) -> None:
