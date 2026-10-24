@@ -351,8 +351,11 @@ def _main_test(args: list[str]) -> int:
         return 1
     # The command line is the repository's own, as its file names it; the job's arguments
     # follow it as words of their own, so it must end where arguments may follow.
+    entry = config.commands.test
+    line = entry["run"] if isinstance(entry, dict) else entry
+    leading = entry.get("args", []) if isinstance(entry, dict) else []
     return subprocess.run(
-        ["bash", "-c", config.commands.test + ' "$@"', "test", *args],
+        ["bash", "-c", line + ' "$@"', "test", *leading, *args],
         cwd=_git("rev-parse", "--show-toplevel"),
         check=False,
     ).returncode
