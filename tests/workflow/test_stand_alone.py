@@ -263,6 +263,9 @@ def _reviews_asked(workflow: Workflow) -> list[str]:
     [
         "https://github.com/example-org/other-app.git",
         "https://github.com/example-org/other-app",
+        "https://github.com/example-org/other-app.git/",
+        # `git clone https://name@github.com/...` keeps the user name in the URL.
+        "https://example-user@github.com/example-org/other-app.git",
         "git@github.com:example-org/other-app.git",
         "ssh://git@github.com/example-org/other-app.git",
     ],
@@ -339,6 +342,15 @@ def test_the_codex_gh_takes_the_repository_from_origin_without_the_runner_settin
     assert own.returncode == 0, own.stderr
     assert own.stdout.strip() == "allowed " + " ".join(_own_body("example-org/other-app"))
     assert other.returncode == 1 and "Codex worker" in other.stderr
+
+
+def test_the_codex_gh_reads_a_user_name_in_origin(workflow: Workflow) -> None:
+    _settings(workflow).unlink()
+    _origin(workflow, "https://example-user@github.com/example-org/other-app.git")
+
+    own = _codex_gh(workflow, *_own_body("example-org/other-app"))
+
+    assert own.returncode == 0, own.stderr
 
 
 def test_the_codex_gh_takes_the_repository_from_the_runner_settings_when_they_are_there(
@@ -460,3 +472,30 @@ def test_a_repository_s_conflict_rules_are_used_when_it_holds_them(workflow: Wor
     done = _gate(workflow, 'print(g._taken_migrations("HEAD", "HEAD"))')
 
     assert done.stdout == "['migrations/0002_taken.py']\n", done.stderr
+
+
+def _an_app_change(workflow: Workflow) -> None:
+    (workflow.repo / "app.txt").write_text("changed\n")
+    workflow.git("add", "app.txt")
+    workflow.git("commit", "--quiet", "-m", "feat: an app change")
+
+
+def _browser_needed(workflow: Workflow) -> subprocess.CompletedProcess[str]:
+    return _gate(workflow, 'print("needed" if g.browser_needed("HEAD~1", "HEAD") else "none")')
+
+
+def test_without_an_e2e_planner_no_change_needs_browser_tests(workflow: Workflow) -> None:
+    (workflow.script.parents[1] / "e2e-plan.py").unlink()
+    _an_app_change(workflow)
+
+    done = _browser_needed(workflow)
+
+    assert done.stdout == "none\n", done.stderr
+
+
+def test_a_repository_s_e2e_planner_decides_when_it_holds_one(workflow: Workflow) -> None:
+    _an_app_change(workflow)
+
+    done = _browser_needed(workflow)
+
+    assert done.stdout == "needed\n", done.stderr

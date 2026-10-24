@@ -76,7 +76,7 @@ if [[ -f $settings ]]; then
   source "$settings"
 else
   repository=$(git -C "$here" config --get remote.origin.url | sed -nE 's#/$##; s#\.git$##;
-    s#^(https://|ssh://git@|git@)github\.com[:/]([^/]+/[^/]+)$#\2#p')
+    s#^(https://([^/@]+@)?|ssh://git@|git@)github\.com[:/]([^/]+/[^/]+)$#\3#p')
 fi
 if [[ -z ${repository:-} ]]; then
   echo "cannot tell which repository the workflow works on: $settings is missing and" \
