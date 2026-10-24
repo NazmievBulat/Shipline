@@ -453,6 +453,31 @@ done
 """
 
 
+# Placed first on the scripts' `PYTHONPATH` by `Workflow.refuse_write`. It finds the file each
+# `os.write` goes to through `/proc/self/fd` and raises for the files the test named. It hides
+# a `sitecustomize` the system Python may bring, which the scripts do not need.
+_REFUSING_WRITE = """import json
+import os
+
+with open(@REFUSED@) as refused_file:
+    _refused = json.load(refused_file)
+_write = os.write
+
+
+def _refusing_write(fd, data, /):
+    try:
+        target = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        target = None
+    if target in _refused:
+        raise OSError(_refused[target], os.strerror(_refused[target]))
+    return _write(fd, data)
+
+
+os.write = _refusing_write
+"""
+
+
 @dataclass
 class Push:
     """One call of the stand-in `curl`."""
@@ -808,6 +833,21 @@ class Workflow:
     def wake_log(self) -> Path:
         return self.root / "home" / ".local" / "state" / "workflow" / "wake.log"
 
+    def refuse_write(self, file: Path, error: int) -> None:
+        """Makes each `os.write` of the scripts' Python to `file` raise a real `OSError(error)`.
+
+        Writes to every other file go through.
+        """
+        hooks = self.root / "python-hooks"
+        hooks.mkdir(exist_ok=True)
+        listed = hooks / "refused.json"
+        refused = json.loads(listed.read_text()) if listed.exists() else {}
+        refused[str(file.resolve())] = error
+        listed.write_text(json.dumps(refused))
+        hook = _REFUSING_WRITE.replace("@REFUSED@", repr(str(listed)))
+        (hooks / "sitecustomize.py").write_text(hook)
+        self.env["PYTHONPATH"] = str(hooks)
+
     def fake(self, tool: str, text: str) -> None:
         path = self.bin / tool
         path.write_text(text.replace("@STATE@", str(self.state)).replace("@TOOL@", tool))
@@ -880,8 +920,9 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
     made.fake("claude", _FAKE_CLAUDE)
     made.fake("codex", _FAKE_INSTALLER)
     # The repository's commands the stand-in `shipline.json` names: the checks the merge gate
-    # runs before a pull request joins the train, and its browser plan.
-    for command in ("pre-train-checks", "browser-plan"):
+    # runs before a pull request joins the train, its browser plan, a hunt's application and its
+    # Cursor hunter.
+    for command in ("pre-train-checks", "browser-plan", "hunt-app", "hunt-cursor"):
         made.fake(command, (STAND_INS / command).read_text())
     made.fake(
         "df",
@@ -999,9 +1040,8 @@ def _template() -> Path:
     runner_settings = repo / ".github" / "runner" / "settings.sh"
     runner_settings.parent.mkdir(parents=True)
     shutil.copy2(STAND_INS / "settings.sh", runner_settings)
-    # The runners the merge gate may re-run failed jobs on, and the repository's own commands it
-    # calls (`pre_train_checks`, `browser_plan`, stand-ins on the `PATH`): every other value is
-    # its default.
+    # The runners the merge gate may re-run failed jobs on, and the repository's own commands
+    # Shipline calls (stand-ins on the `PATH`): every other value is its default.
     shutil.copy2(STAND_INS / "shipline.json", repo / "shipline.json")
     (repo / ".gitignore").write_text(".local/\n.claude/\n")
     git("add", "-A")

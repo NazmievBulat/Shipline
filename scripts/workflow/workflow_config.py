@@ -12,7 +12,8 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix.
+runner prefix; no hunt areas, so one hunt runs at a time, and no hunt plans file; no test
+command, which a repository names for its CI's test job (`ci_proof.py test`).
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -30,7 +31,7 @@ import re
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -46,8 +47,11 @@ DEFAULTS: dict[str, Any] = {
     "repository": None,
     "state_folder": ".local/workflow",
     "worktree_setup": "scripts/setup-worktree",
-    # The repository's own commands Shipline calls, each a command line; none by default.
     "commands": {
+        # The command line that runs the repository's tests, from the root of its checkout, by
+        # `bash -c` (`ci_proof.py test`).
+        "test": None,
+        # The repository's own commands Shipline calls, each split into words (`Config.command`).
         "browser_tests_for_changes": None,
         "server_tests_for_changes": None,
         "pre_train_checks": None,
@@ -95,6 +99,13 @@ DEFAULTS: dict[str, Any] = {
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
     },
+    "hunts": {
+        # Each area of the application a hunt may keep to: its name and the screens (paths) it
+        # covers. With none, a hunt hunts every screen and runs alone (`session start hunt`).
+        "areas": {},
+        # The repository's file of hunt plans, which a hunt with a plan is told of.
+        "plans": None,
+    },
     # The suites a cloud worker's push runs as CI will (`ci_tests_for_changes.py`), by name.
     # Each is read by `_suites`, not key by key: the names are the repository's own.
     "cloud_pre_push": {"suites": {}},
@@ -107,6 +118,12 @@ _SUITE_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
+# An area is the last word of `session start hunt`, and the area and its screens go into the
+# sentence a hunt is started with, inside double quotes in a shell command: no quotation mark,
+# dollar, backtick, backslash or space. The screens are joined with commas there.
+_AREA = re.compile(r"[a-z0-9][a-z0-9-]*")
+_SCREEN = re.compile(r"/[A-Za-z0-9/._~:@%+*\[\]{}-]*")
+_PLANS = re.compile(r"[A-Za-z0-9/._-]+")
 
 
 class ConfigError(Exception):
@@ -161,6 +178,30 @@ class Runner:
 
 
 @dataclass(frozen=True)
+class Hunts:
+    # In the order the file names them.
+    areas: dict[str, tuple[str, ...]]
+    plans: str | None = None
+
+
+@dataclass(frozen=True)
+class Commands:
+    # Each None when the file names none.
+    test: str | None
+    browser_tests_for_changes: str | None
+    server_tests_for_changes: str | None
+    pre_train_checks: str | None
+    mechanical_conflicts: str | None
+    browser_plan: str | None
+    hunt_app: str | None
+    hunt_browser: str | None
+    hunt_cursor: str | None
+    advisory_watch: str | None
+    push_checkout: str | None
+    push_checks: str | None
+
+
+@dataclass(frozen=True)
 class Suite:
     name: str
     # The command lines, as the file names them: `select` is given the base and the changed
@@ -180,6 +221,10 @@ class CloudPrePush:
     suites: tuple[Suite, ...] = ()
 
 
+# The commands run as words, not by a shell: every one but `test`.
+RUN_AS_WORDS = tuple(name for name in DEFAULTS["commands"] if name != "test")
+
+
 @dataclass(frozen=True)
 class Config:
     # None when nothing names it: an error only for a script that needs it.
@@ -191,19 +236,19 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    hunts: Hunts
+    commands: Commands
     cloud_pre_push: CloudPrePush
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
-    # Each named command line, as written; a command the repository has none of is left out.
-    commands: dict[str, str] = field(default_factory=dict)
 
     def command(self, name: str) -> list[str] | None:
         """The words a command is run with, or None when the repository has none. Its script is
         the main checkout's (`_script`); the other words are passed as written."""
-        if name not in DEFAULTS["commands"]:
+        if name not in RUN_AS_WORDS:
             raise KeyError(name)
-        line = self.commands.get(name)
+        line = getattr(self.commands, name)
         if line is None:
             return None
         words = _words(line, name)
@@ -289,6 +334,10 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
         name = where + key
         if key not in given:
             merged[key] = default
+        elif name == "hunts.areas":
+            merged[key] = _areas(given[key])
+        elif name == "cloud_pre_push.suites":
+            merged[key] = _suites(given[key])
         elif isinstance(default, dict):
             merged[key] = _merged(default, given[key], name + ".")
         elif isinstance(default, list):
@@ -304,6 +353,29 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
                 raise ConfigError(f"{FILE}: {name} must be a name, not {json.dumps(value)}")
             merged[key] = value
     return merged
+
+
+def _areas(given: Any) -> dict[str, tuple[str, ...]]:
+    if not isinstance(given, dict):
+        raise ConfigError(f"{FILE}: hunts.areas must be an object of area names to screens")
+    areas: dict[str, tuple[str, ...]] = {}
+    for area, screens in given.items():
+        if not _AREA.fullmatch(area):
+            raise ConfigError(
+                f"{FILE}: hunts.areas: {json.dumps(area)} is not an area name: small letters, "
+                "digits and dashes"
+            )
+        if (
+            not isinstance(screens, list)
+            or not screens
+            or not all(isinstance(screen, str) and _SCREEN.fullmatch(screen) for screen in screens)
+        ):
+            raise ConfigError(
+                f"{FILE}: hunts.areas.{area} must be a list of screens, each a path that starts "
+                "with / and has no space, comma, quotation mark, dollar, backtick or backslash"
+            )
+        areas[area] = tuple(screens)
+    return areas
 
 
 def _suites(given: Any) -> tuple[Suite, ...]:
@@ -382,6 +454,17 @@ def _script(words: list[str]) -> int | None:
     )
 
 
+def _plans(value: str | None) -> str | None:
+    if value is not None and not (
+        _PLANS.fullmatch(value) and _relative(value, "hunts.plans") == value
+    ):
+        raise ConfigError(
+            f"{FILE}: hunts.plans must be a path inside the checkout of letters, digits, dots, "
+            f"dashes and underscores, not {value}"
+        )
+    return value
+
+
 def _from_runner_settings(main: Path) -> str | None:
     """The `repository` Bash reads from the runner settings, as `tick` and the Codex worker's
     `gh` read it when they sourced the file: in a `bash` of its own, with only PATH and HOME,
@@ -448,13 +531,7 @@ def load(start: Path | None = None) -> Config:
         given = json.loads(text)
     except ValueError as error:
         raise ConfigError(f"{FILE} is not JSON: {error}") from error
-    # The suites are read on their own, since their names are not Shipline's.
-    plain, suites = given, {}
-    if isinstance(given, dict) and isinstance(given.get("cloud_pre_push"), dict):
-        pre_push = dict(given["cloud_pre_push"])
-        suites = pre_push.pop("suites", {})
-        plain = {**given, "cloud_pre_push": pre_push}
-    values = _merged(DEFAULTS, plain, "")
+    values = _merged(DEFAULTS, given, "")
     # Where the repository was read, so a refusal names that place.
     repository, source = values["repository"], FILE
     if not repository:
@@ -465,9 +542,9 @@ def load(start: Path | None = None) -> Config:
         raise ConfigError(f"{FILE}: labels.priority must name four different labels")
     if repository is not None and not _REPOSITORY.fullmatch(repository):
         raise ConfigError(f"{source}: repository must be owner/name, not {repository}")
-    commands = {name: line for name, line in values["commands"].items() if line is not None}
-    for name, line in commands.items():
-        _words(line, name)
+    for name in RUN_AS_WORDS:
+        if values["commands"][name] is not None:
+            _words(values["commands"][name], name)
     return Config(
         found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),
@@ -481,10 +558,11 @@ def load(start: Path | None = None) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
-        cloud_pre_push=CloudPrePush(_suites(suites)),
+        hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
+        commands=Commands(**values["commands"]),
+        cloud_pre_push=CloudPrePush(tuple(values["cloud_pre_push"]["suites"])),
         given=given,
         main=main,
-        commands=commands,
     )
 
 
@@ -513,7 +591,11 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
         },
-        "commands": {name: config.commands.get(name) for name in DEFAULTS["commands"]},
+        "hunts": {
+            "areas": {area: list(screens) for area, screens in config.hunts.areas.items()},
+            "plans": config.hunts.plans,
+        },
+        "commands": vars(config.commands).copy(),
         "cloud_pre_push": {
             "suites": {
                 suite.name: {
@@ -545,13 +627,19 @@ def shell(config: Config) -> str:
         "LABEL_AUDITED": config.labels.audited,
         **{f"PRIORITY_{key.upper()}": value for key, value in config.labels.priority.items()},
         "IDENTITY_FOLDER": config.runner.identity_folder,
+        "HUNT_PLANS": config.hunts.plans or "",
         "CONFIG": json.dumps(config.given, separators=(",", ":")),
     }
     lines = [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]
     labels = " ".join(shlex.quote(label) for label in config.runner.labels)
     lines.append(f"SHIPLINE_RUNNER_LABELS=({labels})")
+    # The hunt areas, and at the same place in the other array the screens of each, joined.
+    areas = config.hunts.areas
+    lines.append(f"SHIPLINE_HUNT_AREAS=({' '.join(shlex.quote(area) for area in areas)})")
+    screens = " ".join(shlex.quote(", ".join(paths)) for paths in areas.values())
+    lines.append(f"SHIPLINE_HUNT_SCREENS=({screens})")
     # Each command as an array of its words, empty when the repository has none.
-    for name in DEFAULTS["commands"]:
+    for name in RUN_AS_WORDS:
         words = " ".join(shlex.quote(word) for word in config.command(name) or [])
         lines.append(f"SHIPLINE_COMMAND_{name.upper()}=({words})")
     # The main checkout, exported: every program the script starts works on the same repository,

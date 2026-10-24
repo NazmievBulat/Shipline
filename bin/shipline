@@ -26,6 +26,7 @@ COMMANDS=(
   test-run
   tick
   ticket-files
+  uninstall
   usage
   wake
   weaker-tests

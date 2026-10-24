@@ -1,7 +1,9 @@
 {
   "commands": {
     "pre_train_checks": "pre-train-checks",
-    "browser_plan": "browser-plan"
+    "browser_plan": "browser-plan",
+    "hunt_app": "hunt-app",
+    "hunt_cursor": "hunt-cursor"
   },
   "runner": {
     "labels": ["example-app-home", "example-app-home-main", "example-app-home-docker", "home-planner"]

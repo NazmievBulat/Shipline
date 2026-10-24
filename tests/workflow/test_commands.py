@@ -103,7 +103,7 @@ def test_without_commands_none_is_named(tmp_path: Path) -> None:
     config = workflow_config.load(_repository(tmp_path))
 
     assert [config.command(name) for name in _COMMANDS] == [None] * len(_COMMANDS)
-    assert workflow_config.as_dict(config)["commands"] == dict.fromkeys(_COMMANDS)
+    assert workflow_config.as_dict(config)["commands"] == dict.fromkeys(("test", *_COMMANDS))
 
 
 def test_a_command_s_program_is_found_in_the_main_checkout_from_a_worktree(
@@ -523,24 +523,29 @@ def test_without_a_conflict_command_a_conflict_is_left_for_a_reviewer(handed: Gi
     assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
 
 
-def _failing_hook(workflow: Workflow, lines: list[str]) -> None:
-    """A pre-push hook that prints `lines` and refuses; it lives in `workflow.bin`, where it
-    may run."""
+def _failing_hook(workflow: Workflow, lines: list[str], *, stall: bool = False) -> None:
+    """A pre-push hook that prints `lines` and refuses, or with `stall` sleeps past any deadline;
+    it lives in `workflow.bin`, where it may run."""
     hooks = workflow.bin / "hooks"
     hooks.mkdir(exist_ok=True)
     hook = hooks / "pre-push"
     printed = "".join(f"echo {json.dumps(line)}\n" for line in lines)
-    hook.write_text(f"#!/bin/bash\n{printed}exit 1\n")
+    end = "exec /bin/sleep 30" if stall else "exit 1"
+    hook.write_text(f"#!/bin/bash\n{printed}{end}\n")
     hook.chmod(0o755)
     workflow.git("config", "core.hooksPath", str(hooks))
 
 
-def _push(workflow: Workflow, cwd: Path | None = None) -> dict[str, object]:
-    """The gate pushes a new branch from `cwd`; what came back, or the wait it raised."""
+def _push(
+    workflow: Workflow, cwd: Path | None = None, deadline: int | None = None
+) -> dict[str, object]:
+    """The gate pushes a new branch from `cwd`; what came back, or the wait it raised. A
+    `deadline` is the gate's own for this test, shorter than its commands'."""
     workflow.git("commit", "--quiet", "--allow-empty", "-m", "feat: pushed by the gate", cwd=cwd)
     done = _gate(
         workflow,
-        """
+        (f"\n        g.COMMAND_TIMEOUT = {deadline}" if deadline else "")
+        + """
         import json
         try:
             pushed = g.push("origin", "HEAD:refs/heads/ticket/pushed")
@@ -583,6 +588,21 @@ def test_the_push_checkout_installs_first_and_words_a_refusal(workflow: Workflow
     ]
     read = _read(workflow, "example-checkout")
     assert "secret found in config.py\nand more\n" in read and "failed to push" in read
+
+
+def test_the_push_checkout_words_a_timed_out_push_after_its_deadline(workflow: Workflow) -> None:
+    workflow.fake("example-checkout", _PUSH_CHECKOUT)
+    workflow.fake("example-advisory", _ADVISORY_WATCH)
+    _configure(workflow, push_checkout="example-checkout", advisory_watch="example-advisory")
+    _failing_hook(workflow, ["$ sh scripts/slow-check.sh", "secret check", _UNREACHED], stall=True)
+
+    pushed = _push(workflow, deadline=5)
+
+    # The output read before the stop is worded by the repository; no outage is read in it.
+    assert pushed["refusal"] == "git push timed out after 5s\nstep: secret check"
+    assert f"secret check\n{_UNREACHED}\n" in _read(workflow, "example-checkout")
+    assert workflow.calls("example-advisory") == []
+    assert not _outage(workflow)[0].exists()
 
 
 def test_a_failed_install_of_the_push_checkout_is_a_wait(workflow: Workflow) -> None:

@@ -3,6 +3,7 @@
   "state_folder": ".local/shipline",
   "worktree_setup": "tools/prepare-worktree",
   "commands": {
+    "test": "tools/run-tests",
     "browser_tests_for_changes": "tools/shipline/browser-tests-for-changes",
     "server_tests_for_changes": "tools/shipline/server-tests-for-changes",
     "pre_train_checks": "tools/shipline/pre-train-checks",
@@ -52,6 +53,13 @@
     ],
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app-runner"
+  },
+  "hunts": {
+    "areas": {
+      "phone": ["/calls", "/contacts"],
+      "billing": ["/invoices", "/settings/billing"]
+    },
+    "plans": "docs/hunt-plans.md"
   },
   "cloud_pre_push": {
     "suites": {

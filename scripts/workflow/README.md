@@ -12,7 +12,12 @@ inside Shipline. The first time, the launcher is run by its path:
 ```
 
 Each of the two writes the launcher of this checkout and the repository's main checkout, and
-points the link `~/.local/bin/shipline` at that launcher. The repository is the main checkout
+points the link `~/.local/bin/shipline` at that launcher. `shipline uninstall` takes it all off
+in one step: it puts back exactly the hooks and the timer the two replaced (kept in
+`~/.claude/settings.json.shipline-replaced` and as `workflow-tick.*.before-shipline`), or
+switches Shipline's timer off when there was none. A sentence that tells a session to run a
+command names the launcher by its absolute path, so a session started before the switch runs
+it too. The repository is the main checkout
 `--repo` names, else `SHIPLINE_REPO`, else the one the current folder is in; outside any
 repository, with none named, a command stops and says how to name one. A command started
 outside the repository runs in its main checkout. Every session gets `SHIPLINE_REPO` and the
@@ -37,6 +42,11 @@ Cloud uses the same screen exclusions as Codex: screen changes and unclear tasks
 with no diff stay with local Claude. Test IDs and data-only route lists retain the
 existing exceptions. A cloud-built ticket returns to the cloud for a fix round,
 even after the default changes, subject to the same screen exclusions.
+A ticket's own record, the single word `cloud`, `claude` or `codex` in
+`.local/workflow/worker-program-N`, overrides the default and these fix-round
+markers for that ticket, under the same screen exclusions; only a cloud
+reservation outranks it. A record holding anything else is read as no record,
+and the wake names it once.
 Independent reviewers always stay local.
 
 Cloud starts bypass the local memory and load checks. The tick waits when the
@@ -69,7 +79,6 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `repository` | `owner/name` on GitHub | `repository` as Bash reads it from `.github/runner/settings.sh` (sourced in a `bash` of its own, with only `PATH` and `HOME`, for at most 5 seconds), else the `origin` remote on GitHub; a script that needs it stops when neither names one |
 | `state_folder` | the folder of the workflow's notes, in the main checkout and in each worktree | `.local/workflow` |
 | `worktree_setup` | the command that prepares a new worktree, run only when present | `scripts/setup-worktree` |
-| `commands.*` | the repository's own commands Shipline calls (below) | none |
 | `checks.ci_result` | the check that sums up CI | `CI result` |
 | `checks.ci_plan`, `checks.e2e_plan` | the planner checks of CI and of the browser suite | `CI: what to run`, `E2E: what to run` |
 | `checks.images` | the prefix of every image check; its planner is `<prefix>: what to run` | `Docker images` |
@@ -80,6 +89,10 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `runner.labels` | the runner labels the merge gate may re-run failed jobs on | none: the gate re-runs nothing |
 | `runner.prefix` | the prefix the runner pool names its services and containers by; `workflow-metrics` reads their CPU | none: no runner figures |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
+| `hunts.areas` | the areas of the application two hunts may keep to at once: an object of each area's name (small letters, digits and dashes) to its screens, paths starting with `/` without a space, comma, quotation mark, dollar, backtick or backslash | none: one hunt runs at a time, on every screen |
+| `hunts.plans` | the repository's file of hunt plans, which the sentence of a hunt with a plan names | none: the sentence names no file |
+| `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
+| `commands.*`, the others | the repository's own commands Shipline calls, each split into words (below) | none |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the
@@ -115,8 +128,9 @@ machine, as is its GitHub budget, and is not part of the file.
 ## The repository's commands
 
 What only the repository knows (which tests a change reaches, how its application runs) it
-gives Shipline as commands, under `commands` in `shipline.json`. Each is a command line, split
-into words as the shell splits them, with nothing expanded. A first word with a `/` in it is a
+gives Shipline as commands, under `commands` in `shipline.json`. Each but `test` (run by `bash`
+from the root of the checkout, above) is a command line, split into words as the shell splits
+them, with nothing expanded. A first word with a `/` in it is a
 program in the repository's main checkout, whichever worktree runs it; a first word without
 one is found on the `PATH`, and then the first later word with a `/` in it that is no option
 is the script it runs, read from the main checkout too (`node tools/shipline/hunt-browser.mjs`):

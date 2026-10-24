@@ -9,13 +9,15 @@
 # it is. The settings as they were before the first run are kept beside the file. The hooks call
 # `notify` through the launcher of this Shipline checkout, on the repository's main checkout,
 # whichever worktree this was run from. The link `~/.local/bin/shipline` is pointed at that
-# launcher (`launcher-link`).
+# launcher (`launcher-link`). A hook written when the scripts were in the repository is replaced,
+# and kept exactly in `settings.json.shipline-replaced`: `shipline uninstall` puts it back.
 set -euo pipefail
 
 # Codex workers use a per-process callback, never an owner's global notify setting.
 [[ $# == 0 ]] || { echo "usage: install-hooks" >&2; exit 2; }
 settings=$HOME/.claude/settings.json
 backup=$settings.before-workflow-hooks
+record=$settings.shipline-replaced
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$here/launcher-link"
@@ -76,7 +78,24 @@ if [[ $(jq -S . <<<"$after") == "$(jq -S . <<<"$before")" ]]; then
   exit 0
 fi
 
+# The hooks of the shape written when the scripts were in the repository, which ours replace,
+# one an event, as they were. A later run adds what it replaces then.
+# shellcheck disable=SC2016  # the dollars belong to jq
+replaced=$(jq -c '
+  def held:
+    (.command // "") | test("^bash ([^;&|\\\\]|\\\\.)*/scripts/workflow/notify 2>/dev/null \\|\\| true$");
+  . as $settings
+  | reduce (["Stop", ""], ["UserPromptSubmit", ""], ["Notification", "permission_prompt"],
+      ["PreToolUse", "AskUserQuestion"]) as [$event, $matcher] ({};
+    ([$settings.hooks[$event][]? | select((.matcher // "") == $matcher) | .hooks[]? | select(held)]
+      | first) as $hook
+    | if $hook then .[$event] = {matcher: $matcher, hook: $hook} else . end)' <<<"$before")
+
 mkdir -p "$(dirname "$settings")"
+if [[ $replaced != "{}" ]]; then
+  [[ ! -e $record ]] || replaced=$(jq -c --argjson now "$replaced" '. + $now' "$record")
+  printf '%s\n' "$replaced" >"$record"
+fi
 # The first copy is the one from before any of this; a later run does not replace it.
 [[ ! -e $settings || -e $backup ]] || cp "$settings" "$backup"
 # Written through the file's own name, so a settings file that is a link stays one.

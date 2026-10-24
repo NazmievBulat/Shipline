@@ -3,6 +3,7 @@
 import fcntl
 import json
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -627,6 +628,73 @@ def test_held_local_starts_ask_github_nothing_more(workflow: Workflow, draft: bo
     workflow.run_script("tick", env=_ENV)
 
     assert len(workflow.calls("gh pr list --label workflow")) == 1
+
+
+def _program(workflow: Workflow, number: int, text: str) -> None:
+    """The orchestrator's record of one ticket's worker program."""
+    notes = workflow.repo / ".local/workflow"
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / f"worker-program-{number}").write_text(text)
+
+
+@pytest.mark.parametrize("default", ["claude", "codex"])
+def test_a_ticket_recorded_cloud_passes_a_start_held_for_memory(
+    workflow: Workflow, default: str
+) -> None:
+    workflow.add_pull_request(7)
+    workflow.add_pull_request(8)
+    (workflow.state / "body-7").write_text("Change the screen layout")
+    _program(workflow, 8, "cloud\n")
+    workflow.pressure_file.write_text("some avg10=99.00 avg60=99.00 avg300=99.00 total=0\n")
+
+    done = workflow.run_script("tick", env=_cloud_tick(workflow, WORKFLOW_WORKER_PROGRAM=default))
+
+    assert not workflow.is_running("ticket-7")
+    assert len(workflow.calls("tmux cloud-8 new-session")) == 1, done.stderr
+    assert not workflow.is_running("ticket-8")
+
+
+@pytest.mark.parametrize("recorded", ["claude", "codex"])
+def test_a_ticket_recorded_local_waits_behind_a_held_start_asking_github_nothing(
+    workflow: Workflow, recorded: str
+) -> None:
+    workflow.add_pull_request(7)
+    workflow.add_pull_request(8)
+    (workflow.state / "body-7").write_text("Change the screen layout")
+    _program(workflow, 8, recorded)
+    workflow.pressure_file.write_text("some avg10=99.00 avg60=99.00 avg300=99.00 total=0\n")
+
+    workflow.run_script("tick", env=_cloud_tick(workflow))
+
+    assert len(workflow.calls("gh pr list --label workflow")) == 1
+    assert not [call for call in workflow.calls("gh pr") if re.search(r"\b8\b", call)]
+    assert not workflow.calls("tmux cloud-8 new-session")
+    assert not workflow.is_running("ticket-8")
+    assert not workflow.is_running("codex-8")
+
+
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("recorded", ["claude", "codex"])
+def test_a_reservation_keeps_the_ticket_in_the_cloud_whatever_its_record(
+    workflow: Workflow, recorded: str, held: bool
+) -> None:
+    if held:
+        workflow.add_pull_request(6)
+        (workflow.state / "body-6").write_text("Change the screen layout")
+        workflow.pressure_file.write_text("some avg10=99.00 avg60=99.00 avg300=99.00 total=0\n")
+    workflow.add_pull_request(7)
+    record = _record(workflow)
+    value = json.loads(record.read_text())
+    value.update(url="", status="retryable")
+    record.write_text(json.dumps(value))
+    _program(workflow, 7, recorded)
+
+    done = workflow.run_script("tick", env=_cloud_tick(workflow, WORKFLOW_WORKER_PROGRAM="claude"))
+
+    assert len(workflow.calls("tmux cloud-7 new-session")) == 1, done.stderr
+    assert json.loads(record.read_text())["url"] == _URL
+    assert not workflow.is_running("ticket-7")
+    assert not workflow.is_running("codex-7")
 
 
 def test_retry_also_waits_for_usage_and_never_falls_back_locally(workflow: Workflow) -> None:
