@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Switches the flow page on. Run once by the machine's owner, from any checkout, and again after
-# the `PATH`, the place of the main checkout or the local settings change.
+# Switches the flow page on. Run once by the machine's owner, from any checkout of the
+# repository Shipline works on (or with it named, `--repo`), and again after the `PATH`, the
+# place of either checkout or the local settings change.
 #
-# Writes a systemd user service and timer, `flow-page`, that run `scripts/workflow/flow-page` of
-# the main checkout every 10 minutes. When the machine's local settings
+# Writes a systemd user service and timer, `flow-page`, that run this Shipline checkout's
+# launcher on the repository's main checkout every 10 minutes. When the machine's local settings
 # (`.github/runner/settings.sh`) name `flow_page_address` or `flow_page_port`, a user service
 # `flow-page-serve` serves the page's folder on that port, bound to that address only; where to
 # serve it is the machine owner's choice, never the repository's. Without them nothing is served,
@@ -18,7 +19,12 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+source "$here/launcher-link"
+find_launcher
+# The repository (`workflow_config.py`): SHIPLINE_REPO, else the one of the current folder.
+config=$(python3 "$here/workflow_config.py" shell)
+eval "$config"
+main=$SHIPLINE_REPO
 units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 # "<address> <port>", or nothing when the settings name nowhere; settings that cannot be used
 # stop it here, before anything is installed.
@@ -30,7 +36,8 @@ mkdir -p "$units"
 # and `ssh`. A `%` is doubled because systemd reads it as the start of a placeholder, and in the
 # command also a `$`, with quotation marks around a path that may hold a space.
 escaped=${main//%/%%}
-command="\"${escaped//\$/\$\$}/scripts/workflow/flow-page\""
+escaped_launcher=${launcher//%/%%}
+command="\"${escaped_launcher//\$/\$\$}\" --repo \"${escaped//\$/\$\$}\" flow-page"
 cat >"$units/flow-page.service" <<UNIT
 [Unit]
 Description=Flow page: where the workflow's time goes and which stage is the bottleneck now

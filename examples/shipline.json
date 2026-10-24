@@ -74,5 +74,6 @@
       "billing": ["/invoices", "/settings/billing"]
     },
     "plans": "docs/hunt-plans.md"
-  }
+  },
+  "answer_for_owner_after_minutes": 15
 }
