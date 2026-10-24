@@ -36,19 +36,43 @@ a letter or digit, because it names systemd units and a user. Every name comes f
 | the container network | `<prefix>-runner` |
 | the Docker Hub cache | `<prefix>-runner-hub-cache` |
 | the systemd units | `<prefix>-runner…` |
-| a machine's labels | `<prefix>-<machine>`, `<prefix>-<machine>-main`, `<prefix>-<machine>-docker` |
-| the planner's label | `<prefix>-planner` |
+| the base label | `runner.label`, `<prefix>-home` when it names none |
 
-`runner.labels` is built from the prefix and the machines (below): the labels the merge gate
-may re-run failed jobs on. A list named in `shipline.json` wins over the built one.
-`workflow-metrics` reads the CPU of the `<prefix>-runner…` services and containers.
+The prefix is the repository's word, not a runner's: `example-app`, not `example-app-runner`,
+which would name `example-app-runner-runner…`. `workflow-metrics` reads the CPU of the
+`<prefix>-runner…` services and containers.
 
-`runner.image_build` is the repository's own command line that builds the runner images, run
-from its main checkout with `RUNNER_PREFIX` set. Without it, `build-images.sh` builds the
-ordinary image from the Dockerfile in this folder, with `docker build --pull -t <prefix>-runner`,
-and then, only on a machine with `/dev/kvm`, the Docker-capable image from `vm/`. The install
-builds them, and `<prefix>-runner-image.timer` builds them again every week: GitHub refuses
-runners that fall far behind its own version.
+## The labels: the same on every machine
+
+Every machine's runners carry the same labels, so GitHub gives a job to whichever machine has
+one free. They come from the base label, `runner.label` (`render-units.sh --labels` prints
+them):
+
+| Label | Which runners carry it |
+| --- | --- |
+| `<label>` | every ordinary runner |
+| `<label>-standby` | a spare, before it takes a slot |
+| `<label>-first` | the runners lent to the merge train's first member |
+| `<label>-main` | main's runners, on the main machine only |
+| `<label>-docker` | the Docker-capable runners |
+
+`runner.labels`, the labels the merge gate may re-run failed jobs on, are these five; a list
+named in `shipline.json` wins over them. Machines differ only by their runners' names:
+`<machine>-1`, `<machine>-docker-1`, `<machine>-main` and `<machine>-planner`.
+
+## The images
+
+`build-images.sh` builds the runner images. The install runs it, and
+`<prefix>-runner-image.timer` runs it again every week: GitHub refuses runners that fall far
+behind its own version. It runs in the repository's main checkout and builds from `origin/main`
+as last fetched, taken into a folder of its own, so whatever branch the checkout holds, a fork's
+pull request among them, never runs with the runner user's Docker rights.
+
+`runner.image_build` is the repository's own command line that builds them, read from main's
+`shipline.json` at each build and run in that folder with `RUNNER_PREFIX` set. Without it, the
+pool builds the ordinary image from the Dockerfile in this folder, with
+`docker build --pull -t <prefix>-runner`, and then, only on a machine with `/dev/kvm`, the
+Docker-capable image from `vm/`.
 
 ## A machine's own settings: `~/.config/shipline/runner.sh`
 
@@ -56,18 +80,13 @@ Each machine keeps what is its own in `~/.config/shipline/runner.sh`, a Bash fil
 repository; `SHIPLINE_RUNNER_SETTINGS` names another file. It is never committed anywhere:
 
 ```bash
-# This machine's name, in its labels: lowercase letters, digits and hyphens.
+# This machine's name, in its runners' names: lowercase letters, digits and hyphens.
 machine=home
-# The other machines of the pool, whose runners the merge gate may also re-run jobs on.
-other_machines=(office)
-# How many runners this machine runs.
+# How many ordinary runners this machine runs.
 runner_count=2
 ```
 
-The scripts read it in a `bash` of its own, with only `PATH` and `HOME`, for at most 5 seconds;
-a file that fails, never ends or names something that is not a machine name is refused by its
-path. Without the file, the only label built is the planner's. How many runners a machine has
-is its own choice.
+How many runners a machine has is its own choice.
 
 ## The units
 
@@ -88,6 +107,5 @@ the prefix `example-app` against `tests/runner/expected/`.
 | `<prefix>-runner-network.service` | the container network `<prefix>-runner` |
 | `<prefix>-runner-hub-cache.service` | a pull-through cache of Docker Hub on that network |
 
-The image build runs from `/var/lib/<prefix>-runner/checkout`, a link to the repository's main
-checkout, with the values of `images.env` beside it (`RUNNER_PREFIX`, and
-`SHIPLINE_RUNNER_IMAGE_BUILD` when the repository names one); the install writes both.
+The image build runs in `/var/lib/<prefix>-runner/checkout`, a link to the repository's main
+checkout that the install writes; the runner user must be able to read it.
