@@ -12,6 +12,8 @@ from workflow.test_merge_when_current import (
     ADVISORY,
     MEMORY_SHORTAGES,
     GitHub,
+    _finish_prefix,
+    _restored_before_eight,
     hook_runs,
     short_of_memory,
 )
@@ -1033,9 +1035,10 @@ def test_a_real_stacked_conflict_is_preserved_and_gets_one_fresh_reviewer(handed
     assert _started(workflow) == ["review-8"]
 
 
-def _handed_batch(github: GitHub) -> None:
+def _handed_batch(github: GitHub, *, prepared: bool = False) -> None:
     workflow = github.workflow
-    github.prepare_batch()
+    if not prepared:
+        github.prepare_batch()
     workflow.git("checkout", "main")
     github.driver_mode = True
     for number, pull in github.pulls.items():
@@ -1101,6 +1104,33 @@ def test_a_batch_retest_keeps_the_handoffs(github: GitHub) -> None:
     new = github.batch_state()["prefixes"]["members"][0]
     assert new["scratch"]["branch"] != old["scratch"]["branch"]
     assert new["tree"] == old["tree"]
+    assert _started(workflow) == []
+
+
+def test_repeated_ticks_keep_running_work_beside_a_restored_handoff(github: GitHub) -> None:
+    kept = _restored_before_eight(github, passed=False)
+    _handed_batch(github, prepared=True)
+    workflow = github.workflow
+
+    def tick() -> None:
+        github.save()
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        saved = json.loads((workflow.state / "github.json").read_text())
+        github.api, github.pulls = saved["api"], saved["pulls"]
+
+    for _ in range(3):
+        tick()
+        members = github.batch_state()["prefixes"]["members"]
+        eight = next(member for member in members if member["number"] == "8")
+        assert eight["scratch"]["branch"] == kept["scratch"]["branch"]
+        assert eight["kept"] is True
+        assert _notes(workflow) == ["merge-wanted-7", "merge-wanted-8", "merge-wanted-9"]
+        assert not workflow.calls("gh pr merge")
+    _finish_prefix(github, "8", run_id=1100)
+    tick()
+    assert [call.split()[3] for call in workflow.calls("gh pr merge")] == ["8"]
+    assert _note(workflow, 7).exists() and not _note(workflow, 8).exists()
     assert _started(workflow) == []
 
 

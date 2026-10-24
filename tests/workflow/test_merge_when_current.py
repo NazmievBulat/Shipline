@@ -4296,6 +4296,7 @@ def _batch_setup(
     count: int = 3,
     conflict: bool = False,
     images: bool = False,
+    images_member: int = 7,
     migration: bool = False,
     compatibility: str | None = None,
     selected: bool = False,
@@ -4309,7 +4310,7 @@ def _batch_setup(
         if number != 7:
             workflow.git("checkout", "-b", f"ticket/{number}", original)
         filename = "shared.txt" if conflict and number in (7, 9) else f"change-{number}.txt"
-        if images and number == 7:
+        if images and number == images_member:
             filename = "docker/change.txt"
             (workflow.repo / "docker").mkdir()
         if (migration and number in (8, 9)) or str(number) == compatibility:
@@ -4332,7 +4333,9 @@ def _batch_setup(
         github.ci(original, head, run_id=number * 1000)
     github.head = github.pulls["7"]["headRefOid"]
     if images:
+        github.head = github.pulls[str(images_member)]["headRefOid"]
         _images(github)
+        github.head = github.pulls["7"]["headRefOid"]
     workflow.git("checkout", "ticket/seven")
     # Each reviewer calls the actual gate. Pending main prevents a premature first merge.
     github.main()
@@ -5403,16 +5406,24 @@ def test_a_green_scratch_rerun_restores_the_isolated_members_earlier_place(
     assert len(github.workflow.calls("gh workflow run ci.yml")) == (5 if moved else 7)
 
 
-def _restored_before_eight(github: GitHub, *, passed: bool) -> dict[str, Any]:
+def _restored_before_eight(
+    github: GitHub, *, passed: bool, reconciled: bool = False
+) -> dict[str, Any]:
     """Restore 7 on unchanged main, with a proof shortfall and 8 already tested alone."""
-    _batch_setup(github)
+    _batch_setup(github, images=True, images_member=8)
     assert _batch_call(github).returncode == 3
     isolated = _prefixes(github)[0]
     _finish_prefix(github, "7", conclusion="failure")
     assert _batch_call(github).returncode == 1
     kept = next(member for member in _prefixes(github) if member["number"] == "8")
-    if passed:
-        _finish_prefix(github, "8", run_id=1100)
+    _finish_prefix(github, "8", run_id=1100)
+    if not passed:
+        for workflow in kept["scratch"]["workflows"]:
+            key = (
+                f"{_REPO}/actions/workflows/{workflow}.yml/runs"
+                f"?head_sha={kept['scratch']['head']}&event=workflow_dispatch&per_page=100"
+            )
+            github.api[key]["workflow_runs"][0].update(status="in_progress", conclusion=None)
     # Exercise a state written before kept prefixes and their dependencies were recorded.
     path = github.workflow.repo / ".local/workflow/merge-train.json"
     saved = _batch_state(github)
@@ -5431,16 +5442,24 @@ def _restored_before_eight(github: GitHub, *, passed: bool) -> dict[str, Any]:
         )
         github.api[key]["workflow_runs"][0]["run_attempt"] = 2
     github.api[f"{_REPO}/check-runs/101/annotations?per_page=100"][1]["message"] = SELECTED
+    if reconciled:
+        github.save()
+        assert _train(github)["first"] == "7"
+        saved = _batch_state(github)
+        saved.pop("restored", None)
+        for member in saved["prefixes"]["members"]:
+            member.pop("ahead", None)
+        path.write_text(json.dumps(saved))
     return kept
 
 
 @pytest.mark.parametrize("passed", [False, True], ids=["running", "passed"])
+@pytest.mark.parametrize("reconciled", [False, True], ids=["failed-state", "proven-state"])
 def test_restoration_keeps_an_existing_prefix_across_retests_and_gate_calls(
-    github: GitHub, passed: bool
+    github: GitHub, passed: bool, reconciled: bool
 ) -> None:
-    kept = _restored_before_eight(github, passed=passed)
+    kept = _restored_before_eight(github, passed=passed, reconciled=reconciled)
     branch = kept["scratch"]["branch"]
-    dispatches = len(github.workflow.calls("gh workflow run"))
     done = _batch_call(github)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "did not prove its tested files" in done.stderr
@@ -5462,6 +5481,11 @@ def test_restoration_keeps_an_existing_prefix_across_retests_and_gate_calls(
             break
         assert done.returncode == 3, done.stdout + done.stderr
         assert _scratch(github, "8")["branch"] == branch
+        saved = _batch_state(github)
+        assert sum(
+            member["scratch"] is None or member["scratch"]["pushed"]
+            for member in saved["prefixes"]["members"]
+        ) <= saved["window"]
     if not passed:
         _finish_prefix(github, "8", run_id=1100)
         github.save()
@@ -5472,9 +5496,11 @@ def test_restoration_keeps_an_existing_prefix_across_retests_and_gate_calls(
     receipt = _receipt(github)
     assert receipt["tree"] == kept["tree"]
     assert receipt["ci_run"] == 1100
+    assert receipt["images_run"] == 1110 and receipt["images_complete"] is True
     # The kept branch was dispatched only once, and 7 now tests against the new main.
-    assert len([call for call in github.workflow.calls("gh workflow run") if branch in call]) == 2
-    assert len(github.workflow.calls("gh workflow run")) >= dispatches
+    assert len([call for call in github.workflow.calls("gh workflow run") if branch in call]) == len(
+        kept["scratch"]["workflows"]
+    )
     restored = next(member for member in _prefixes(github) if member["number"] == "7")
     base = github.workflow.git("rev-parse", "origin/main")
     assert restored["scratch"]["under"] == github.workflow.git("rev-parse", f"{base}^{{tree}}")
@@ -5528,6 +5554,21 @@ def test_replacing_a_short_prefix_cancels_only_its_own_live_runs_once(github: Gi
     done = _batch_call(github)
     assert "cancel requested for run 901" not in done.stdout
     assert len(github.workflow.calls("gh run cancel")) == 2
+
+
+def test_an_old_scratch_name_is_cancelled_but_other_branches_are_untouched(github: GitHub) -> None:
+    _batch_setup(github)
+    branch = "workflow/merge-batch-legacy"
+    other = "ticket/example-app"
+    for name in (branch, other):
+        github.workflow.git("push", "origin", f"{github.base}:refs/heads/{name}")
+        _branch_runs(github, name, (901 if name == branch else 902, "in_progress"))
+    _branch_runs(github, "main", (903, "in_progress"))
+    done = _batch_call(github)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert list(_cancelled(github)) == ["901"]
+    assert branch not in _scratch_branches(github)
+    assert github.workflow.git("ls-remote", "origin", f"refs/heads/{other}")
 
 
 @pytest.mark.parametrize("number", ["7", "9"])

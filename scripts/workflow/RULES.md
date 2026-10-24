@@ -92,7 +92,11 @@ and a gate call on its current head. A member whose prefix failed once every mem
 it merged is blocked as a failed check, and its own gate call reports it; the prefixes behind
 it hold its change, so they are built again from the new front without it, and their failure
 is not their members' own. A green rerun of that failed run, on the tree main has now,
-restores its place and is its next prefix. A member that conflicts with one ahead of it waits
+restores its place and is its next prefix; prefixes already built on the current main are
+kept while their members stay ready at the same heads, and the restored member tests on main
+alone beside them. A kept prefix may merge first once it passes while the restored member's
+prefix is pending; every squash must still match its prefix's tested tree. A member that
+conflicts with one ahead of it waits
 for its own turn. A main changed from outside the gate, a changed or unready member, or a
 line now served in another order drops the prefixes from the first one that no longer
 stands, and they are built again. A scratch run that passed without proving
