@@ -11,7 +11,7 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix.
+runner prefix; a quiet cloud worker is woken after 30 minutes.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -80,6 +80,8 @@ DEFAULTS: dict[str, Any] = {
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
     },
+    # Minutes without a push or a report after which the tick wakes a cloud worker; 0 never does.
+    "cloud_wake_after_minutes": 30,
 }
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
@@ -148,6 +150,7 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    cloud_wake_after_minutes: int
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -200,6 +203,11 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
             merged[key] = default
         elif isinstance(default, dict):
             merged[key] = _merged(default, given[key], name + ".")
+        elif isinstance(default, int):
+            value = given[key]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ConfigError(f"{FILE}: {name} must be a whole number, not {json.dumps(value)}")
+            merged[key] = value
         elif isinstance(default, list):
             value = given[key]
             if not isinstance(value, list) or not all(
@@ -310,6 +318,7 @@ def load(start: Path = HERE) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
+        cloud_wake_after_minutes=values["cloud_wake_after_minutes"],
         given=given,
         main=main,
     )
@@ -340,6 +349,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
         },
+        "cloud_wake_after_minutes": config.cloud_wake_after_minutes,
     }
 
 

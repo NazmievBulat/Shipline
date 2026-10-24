@@ -33,7 +33,10 @@
 #      is asked once per idle stretch whether the wait is over; a worker idle 15 minutes on a
 #      ready pull request without "worker finished" is told once to finish; a busy session
 #      whose screen has not changed for 45 minutes, and a wait loop that finds its own shell,
-#      are named in the wake once. A running command is never interrupted.
+#      are named in the wake once. A running command is never interrupted. A cloud worker whose
+#      draft had no push and no report for `cloud_wake_after_minutes`, with no open question,
+#      is woken once through `claude --cloud` and named in the wake if still quiet that long
+#      after; one whose question was answered is woken at once (`cloud_workers.py wake`).
 #   9. After the starts of step 6, the next draft without the label gets it when one may start
 #      (`ticket_starts.py`: by priority, then the older ticket, when its files overlap no running
 #      ticket's, nothing in `start-plan` holds it back, the machine has had room for 10
@@ -761,6 +764,10 @@ while read -r name state _; do
     failed=1
   fi
 done <<<"$running"
+
+# A cloud worker whose draft had no push and no report for `cloud_wake_after_minutes`, with no
+# open question, is woken once per quiet stretch, and one whose question was answered at once.
+python3 -B "$here/cloud_workers.py" wake "$main" "$snapshot" 9>&- || failed=1
 
 # Record reviewer-start notices before waking the orchestrator. Their reviewers start below.
 python3 -B "$here/merge_driver.py" --hand-backs 9>&- || failed=1

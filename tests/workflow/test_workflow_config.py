@@ -61,6 +61,7 @@ _DEFAULTS = {
         },
     },
     "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
+    "cloud_wake_after_minutes": 30,
 }
 
 
@@ -153,6 +154,14 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     assert keys(example) == keys(_DEFAULTS)
     assert example["repository"].endswith("/example-app")
     assert example["runner"]["labels"]
+
+
+@pytest.mark.parametrize("minutes", [0, 45])
+def test_the_cloud_wake_wait_is_a_whole_number_of_minutes(tmp_path: Path, minutes: int) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"cloud_wake_after_minutes": minutes})
+
+    assert workflow_config.load(repo).cloud_wake_after_minutes == minutes
 
 
 def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
@@ -330,6 +339,10 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"state_folder": "../workflow"}', "state_folder"),
         ('{"repositry": "example-owner/example-app"}', "repositry"),
         ('{"checks": {"ci_results": "CI result"}}', "checks.ci_results"),
+        ('{"cloud_wake_after_minutes": "30"}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": -1}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": 1.5}', "cloud_wake_after_minutes"),
+        ('{"cloud_wake_after_minutes": true}', "cloud_wake_after_minutes"),
     ],
 )
 def test_a_file_that_cannot_be_read_is_refused_by_name(
@@ -680,9 +693,10 @@ def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> d
 
 
 # The SHA-256 of each text as the scripts wrote it before they read `shipline.json`.
+# The cloud one has since gained its sentence on never ending a turn to wait for an answer.
 _TEXTS_BEFORE = {
     "worker": "a1ada6cfb39264bb4b6501807f3feb74fbf51c2ea3c32c5b5b56f77a23838b36",
-    "cloud": "9603fac3798a46497342dda2b64491c2523c1e771d7620bb78e15b034c9d7bef",
+    "cloud": "0db18f0ee8a33f4b5070fdd5345361848baf25923ad9721e6b68b020b71ec6a4",
     "review": "ea932fce613e8e9c075daa884a2adee29b64ee5610f1fcd922f27aa6cd39c49a",
     "wake": "af21558438c99d72e165c8fb8ab4febdd80204e43f532a399697b4131441d080",
 }
