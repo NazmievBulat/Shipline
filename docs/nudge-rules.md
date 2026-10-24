@@ -31,10 +31,12 @@ key that sends it follows only when the box holds exactly that text. Each one is
 | Waiting for its own job or turn | Claude workers and reviewers | idle 50 minutes after `notify waiting`, or a reviewer idle for its turn in the line; once per idle stretch | "Status check: if what you were waiting for is done, carry on; if not, run `scripts/workflow/notify waiting` and end your turn." | one with an asking note |
 | Ready but not finished | Claude workers | idle 15 minutes on a pull request ready as long, without `worker finished`; once per ready stretch | "Pull request N is ready, but you have not finished. Finish by the rules: ..." | a draft pull request |
 | Still screen | busy Claude workers and reviewers | the screen, without the box, the status line, the spinner and its clock, unchanged for 45 minutes since it last changed or the session turned busy; once per stretch and head | Escape, then "The command has produced nothing for 45 minutes. Check whether it is still running and go on." | a permission prompt; a session that ended its turn to wait (idle, job-wait or check-wait note); a message queued under the spinner (a `❯ ` line after the spinner, above the box); any text in the box; after Escape, a message it put back into the box (nothing is typed) |
-| Wait loop finds itself | busy Claude workers and reviewers | the `pgrep -f` or `ps \| grep` loop it started last matches its own shell, and the screen has stood still for 5 minutes; once per loop | Escape, then "That loop finds its own command line and never ends. Check the process by its number." | the same as a still screen; a loop while another command runs, or while the screen moves (it is named when the screen stands still or the turn ends) |
+| Wait loop finds itself | busy Claude workers and reviewers | the `pgrep -f` or `ps \| grep` loop it started last matches its own shell, and the screen has stood still for 5 minutes; once per loop | Escape, then "That loop finds its own command line and never ends. Check the process by its number." | the same as a still screen; a loop while another command runs, or while the screen moves (it is named when the screen stands still, the turn ends or 15 minutes have passed) |
 
 A nudge whose Enter was not taken is sent again at the next passes, without another Escape,
-for as long as the box holds exactly that message. Anything else in the box ends the retry.
+while the box holds exactly that message, three times at most. Anything else in the box ends
+the retry; after the third, the wake is told
+`stuck? <session> (nudge not taken; its text stays in the box)`.
 
 Codex bridges, hunts, audits and analysts get none of the last four.
 

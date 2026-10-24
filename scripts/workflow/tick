@@ -79,8 +79,12 @@ KEEP_ALIVE_AFTER_SECONDS=$((50 * 60))
 READY_UNFINISHED_SECONDS=$((15 * 60))
 # A busy session whose screen has not changed for this long is nudged and named in the wake, once.
 STUCK_AFTER_SECONDS=$((45 * 60))
-# A busy session's wait loop that finds itself is nudged once its screen has stood still this long.
+# A busy session's wait loop that finds itself is nudged once its screen has stood still this long;
+# while the screen moves, it is named without a nudge after the second.
 LOOP_STILL_SECONDS=$((5 * 60))
+LOOP_NAMED_AFTER_SECONDS=$((15 * 60))
+# How many more times a nudge whose Enter was not taken is sent again.
+NUDGE_RETRIES=3
 # An idle session that no rule covers is named in the wake after this long, once per head.
 IDLE_NO_RULE_SECONDS=$((50 * 60))
 # The line a session ends with, WORDS standing for its words. `notify` reads it the same way.
@@ -747,7 +751,7 @@ last_line() {
   top=$(LC_ALL=C awk '/^─/ { above = last; last = NR }
     END { print above ? above : (last ? last : NR + 1) }' <<<"$screen")
   LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" |
-    { LC_ALL=C grep -vE '^[[:space:]]*(·|✢|✳|✶|✻|✽)[[:space:]]' || true; } |
+    { LC_ALL=C grep -vE '^[[:space:]]*((·|✢|✳|✶|✻|✽)[[:space:]]|\*[[:space:]]+[^[:space:]]+…)' || true; } |
     LC_ALL=C sed -E 's/^[[:space:]]*((●|⎿)[[:space:]]*)*//; s/[[:space:]]+$//' |
     LC_ALL=C awk 'NF { line = $0 } END { print line }'
 }
@@ -756,8 +760,9 @@ last_line() {
 # outcome to what the wake line says of it: "; nudge sent", "; nudge failed", "; interrupted,
 # text left in its box" when Escape put a queued message back, or nothing when the session was
 # left alone. Escape is never pressed on a dialog, a question to the owner or text in the box.
-# A nudge that failed after Escape leaves a `.nudge-retry` note: the session it stopped gets
-# the same message at the next passes (`retry_nudge`), never a second Escape.
+# A nudge that failed leaves a `.nudge-retry` note: when the box still holds its message (its
+# Enter was not taken after Escape), the next passes send it again (`retry_nudge`), never with
+# a second Escape.
 nudge_busy() {
   local name=$1 kind=$2 delivery sent
   outcome=""
@@ -776,29 +781,41 @@ nudge_busy() {
     echo "$delivery" >&2
     wake_log "$name $3 nudge failed: $delivery"
     outcome="; nudge failed"
-    echo "$kind" >"$main/$SHIPLINE_STATE_FOLDER/$name.nudge-retry" || true
+    echo "$kind 0" >"$main/$SHIPLINE_STATE_FOLDER/$name.nudge-retry" || true
     failed=1
   fi
 }
 
-# Sends again a nudge whose Enter was not taken, while the box still holds exactly it. Anything
-# else in the box, or a session that went on, ends the retry.
+# Sends again a nudge whose Enter was not taken, while the box still holds exactly it, at most
+# NUDGE_RETRIES times; then the wake is told once that it stays in the box. Anything else in
+# the box, or a session that went on, ends the retry.
 retry_nudge() {
-  local name=$1 note=$main/$SHIPLINE_STATE_FOLDER/$1.nudge-retry kind delivery sent
-  { read -r kind <"$note"; } 2>/dev/null || return 0
-  if [[ ! $kind =~ ^(still|loop)$ ]] || ! holds_own_nudge "$name"; then
+  local name=$1 note=$main/$SHIPLINE_STATE_FOLDER/$1.nudge-retry kind tries delivery sent
+  { read -r kind tries <"$note"; } 2>/dev/null || return 0
+  if [[ ! $kind =~ ^(still|loop)$ || ! $tries =~ ^[0-9]+$ ]] || ! holds_own_nudge "$name"; then
     rm -f "$note"
     return 0
   fi
-  delivery=$(session nudge-busy "$name" "$kind" 2>&1)
+  if ((tries >= NUDGE_RETRIES)); then
+    if note_for_wake "$name-retry-$NOW" "stuck? $name (nudge not taken; its text stays in the box)"; then
+      rm -f "$note"
+      wake_log "$name $kind nudge not taken after $tries more tries" || failed=1
+    else
+      failed=1
+    fi
+    return 0
+  fi
+  delivery=$(session nudge-busy "$name" "$kind" again 2>&1)
   sent=$?
-  nudged+="$name "
   if ((sent == 0)); then
+    nudged+="$name "
     rm -f "$note"
     wake_log "$name $kind nudge sent again after its Enter was not taken" || failed=1
   elif ((sent == 3)); then
     rm -f "$note"
   else
+    nudged+="$name "
+    echo "$kind $((tries + 1))" >"$note" || failed=1
     echo "$delivery" >&2
     wake_log "$name $kind nudge failed again: $delivery"
     failed=1
@@ -910,13 +927,19 @@ while read -r name state _; do
         later=false
         # Only when the loop is the command it started last and its screen stands still: Escape
         # would stop other work, not a loop left in the background. While the screen moves, the
-        # loop is named when it stands still or the session ends its turn. One the tick may not
-        # type into is named at once.
+        # loop is named when it stands still, the session ends its turn, or after 15 minutes. One
+        # the tick may not type into is named at once.
+        first=$main/$SHIPLINE_STATE_FOLDER/$name.loop-seen
+        { read -r first_at first_loop <"$first"; } 2>/dev/null || first_loop=""
+        if [[ $first_loop != "$loop" || ! $first_at =~ ^[0-9]+$ ]]; then
+          first_at=$NOW
+          printf '%s %s\n' "$NOW" "$loop" >"$first" || failed=1
+        fi
         if [[ $busy == true && $(jq -r '.running // ""' <<<"$activity") == "$loop" &&
               $nudged != *" $name "* ]] && ! asks_permission "$name" && quiet "$name"; then
           if ((NOW - last_since >= LOOP_STILL_SECONDS)); then
             nudge_busy "$name" loop loop
-          else
+          elif ((NOW - first_at < LOOP_NAMED_AFTER_SECONDS)); then
             later=true
           fi
         fi

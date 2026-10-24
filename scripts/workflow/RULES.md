@@ -655,10 +655,11 @@ two cases, a still screen and a wait loop that finds itself (below); the full ta
   stuck. Should Escape still put a message back into the box, nothing is typed after it, and
   the line ends `; interrupted, text left in its box`. A wait loop is nudged only when it is
   the command started last and the screen has stood still for 5 minutes; while the screen
-  moves, it is named when it stands still or the turn ends. A session stopped on the usage
-  limit, a hunt, an audit, an analyst and a Codex bridge are left alone. A nudge whose Enter
-  was not taken ends its line with `; nudge failed`, and is sent again at the next passes,
-  without another Escape, for as long as the box holds exactly it.
+  moves, it is named when it stands still, the turn ends or 15 minutes have passed. A session
+  stopped on the usage limit, a hunt, an audit, an analyst and a Codex bridge are left alone.
+  A nudge whose Enter was not taken ends its line with `; nudge failed`, and is sent again at
+  the next passes, without another Escape, while the box holds exactly it, three times at
+  most; then the wake is told `stuck? ticket-N (nudge not taken; its text stays in the box)`.
 - An idle session that none of these rules covers for 50 minutes is named in the wake once per
   head, as `idle, no rule: ticket-N (<min> min, last line: <line>)`. The tick types nothing it
   has no rule for; the orchestrator decides.

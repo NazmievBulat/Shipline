@@ -505,12 +505,16 @@ def test_text_that_escape_puts_back_in_the_box_is_not_sent(workflow: Workflow) -
     ]
 
 
-@pytest.mark.parametrize("queued", [True, False])
+@pytest.mark.parametrize("queued", ["queued", "no-break space", "plain spinner frame", "none"])
 def test_escape_is_never_pressed_on_a_message_queued_under_the_spinner(
-    workflow: Workflow, queued: bool
+    workflow: Workflow, queued: str
 ) -> None:
     screen = _captured("busy-queued")
-    if not queued:
+    if queued == "no-break space":
+        screen = screen.replace("❯ what is", "❯\u00a0what is")
+    elif queued == "plain spinner frame":
+        screen = screen.replace("✶ Pondering", "* Pondering")
+    elif queued == "none":
         # Only the prompt already sent, in the history above the reply, has the mark.
         screen = screen.replace("\x1b[48;5;237m❯ what is going on here?\x1b[0m\n", "")
     _session(workflow)
@@ -520,7 +524,7 @@ def test_escape_is_never_pressed_on_a_message_queued_under_the_spinner(
 
     _tick(workflow, _NOW + 2700)
 
-    if queued:
+    if queued != "none":
         assert _keys(workflow, "ticket-7") == []
         assert _pending(workflow) == ["stuck? ticket-7 (45 min, running: pytest tests)"]
     else:
@@ -545,6 +549,42 @@ def test_a_nudge_whose_enter_was_not_taken_is_sent_again_without_escape(
     assert "ticket-7 still nudge sent again after its Enter was not taken" in (
         workflow.wake_log.read_text()
     )
+
+
+def test_a_nudge_is_sent_again_under_a_history_prompt_of_an_earlier_turn(
+    workflow: Workflow,
+) -> None:
+    _still(workflow)
+    # Interrupted: no spinner now, an earlier turn's time and the prompt sent after it above.
+    (workflow.state / "screen-after-escape-ticket-7").write_text(
+        "● Done with the first part.\n\n✻ Worked for 3m 2s\n\n❯ run the tests and fix what fails\n\n"
+        + _captured("interrupted")
+    )
+    (workflow.state / "swallow-enter-ticket-7").write_text("2")
+    workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 2700)})
+
+    _tick(workflow, _NOW + 2880)
+
+    assert (workflow.state / "input-ticket-7").read_text() == ""
+    assert _keys(workflow, "ticket-7").count("Escape") == 1
+
+
+def test_a_nudge_that_is_never_taken_is_tried_three_more_times_then_named(
+    workflow: Workflow,
+) -> None:
+    _still(workflow)
+    (workflow.state / "screen-after-escape-ticket-7").write_text(_captured("interrupted"))
+    (workflow.state / "swallow-enter-ticket-7").write_text("100")
+    codes = [
+        workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 2700 + 180 * n)}).returncode
+        for n in range(7)
+    ]
+
+    # The first try and three more fail; then the wake is told and the tick is quiet again.
+    assert codes == [1, 1, 1, 1, 0, 0, 0]
+    assert _keys(workflow, "ticket-7").count("Escape") == 1
+    assert _keys(workflow, "ticket-7").count("Enter") == 8
+    assert "stuck? ticket-7 (nudge not taken; its text stays in the box)" in _pending(workflow)
 
 
 def test_a_message_of_the_tick_left_in_the_box_is_not_sent_for_a_nudge(
@@ -702,6 +742,23 @@ def test_a_wait_loop_on_a_screen_that_moves_is_named_when_the_turn_ends(
     _written(notes.with_name("ticket-7.idle"), _NOW + 400)
 
     _tick(workflow, _NOW + 540)
+
+    assert _keys(workflow, "ticket-7") == []
+    assert _pending(workflow) == [
+        'wait loop finds itself? ticket-7 (running: while pgrep -f "codex exec" >/dev/null; '
+        "do sleep 30; done)"
+    ]
+
+
+def test_a_wait_loop_on_a_screen_that_keeps_moving_is_named_after_15_minutes(
+    workflow: Workflow,
+) -> None:
+    _session(workflow)
+    _runs(workflow, "ticket-7", 'while pgrep -f "codex exec" >/dev/null; do sleep 30; done')
+    for n in range(7):
+        workflow.screen(f"● Bash(while pgrep …)\n  ⎿  +{n} lines\n" + _BOX, "ticket-7")
+        _tick(workflow, _NOW + 180 * n)
+        assert _pending(workflow) == [] or n * 180 >= 900
 
     assert _keys(workflow, "ticket-7") == []
     assert _pending(workflow) == [
