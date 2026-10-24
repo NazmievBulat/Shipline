@@ -881,11 +881,14 @@ if running=$(session list); then
 else
   failed=1
 fi
-# The last change of this machine's runner balancer, once, for the wake's next check-in.
+# The last change of this machine's runner balancer, once, for the wake's next check-in. One
+# older than a day (a first tick after an install, say) is no news.
 balance_log=$HOME/.local/state/workflow/runner-balance.log
 balance_told=$main/$SHIPLINE_STATE_FOLDER/runner-balance.told
 if [[ -s $balance_log ]] && balance_line=$(tail -n 1 "$balance_log") &&
-    [[ -n $balance_line && $balance_line != "$(cat "$balance_told" 2>/dev/null)" ]]; then
+    [[ -n $balance_line && $balance_line != "$(cat "$balance_told" 2>/dev/null)" ]] &&
+    balance_at=$(date -u -d "${balance_line%% *}" +%s 2>/dev/null) &&
+    ((NOW - balance_at < 86400)); then
   balance_pending=$main/$SHIPLINE_STATE_FOLDER/runner-balance.pending
   if mkdir -p "$balance_pending" &&
       jq -n --arg line "$balance_line" '{line: $line}' >"$balance_pending/.balance.json" &&

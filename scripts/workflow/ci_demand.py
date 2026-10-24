@@ -6,13 +6,16 @@ The pushes coming within half an hour are those of:
 
 - the working cloud workers: `cloud-N` records whose status is `working`;
 - the busy local workers and reviewers: `ticket-N` and `review-N` that `session list` shows busy;
-- the ready pull requests whose checks have not started: no check at all on their head;
+- the ready pull requests labelled for the workflow whose checks have not started: no check
+  at all on their head;
 - the merge line's prefixes still to be built: the window minus the running prefixes, taken
-  from the next eligible members in the order the line serves them.
+  from the next eligible members in the order the line serves them, where the gate would
+  start or extend its line.
 
 A pull request counted by more than one of the first three pushes once. Each push starts the
 jobs its pull request's last runs started: for each of the CI, E2E and image workflows, the
-newest run of its branch that ran a job, its jobs counted by the runner label they asked for
+newest run of its branch that ran a job, the jobs of its first attempt (the one a push starts)
+counted by the runner label they asked for
 (the labels of `runner.labels` in `shipline.json`: one ending `-docker` is a Docker runner's,
 one ending `-main` or `-planner` is neither, any other an ordinary slot's). A skipped job
 counts for nothing, so Docker jobs count only when the pull request changes the images. A pull
@@ -92,15 +95,19 @@ class Runs:
         self.used: dict[str, list[Any]] = {}
 
     def _counts(self, run: dict[str, Any]) -> tuple[int, int, bool]:
-        """Ordinary and Docker jobs the run started, and whether it ran any job at all."""
-        key = f"{run['id']}-{run['run_attempt']}"
-        if key in self.kept:
-            ordinary, docker, ran = self.kept[key]
+        """Ordinary and Docker jobs the run's push started, its first attempt (a re-run's attempt
+        holds only the jobs run again), and whether it ran any job at all."""
+        key = str(int(run["id"]))
+        kept = self.kept.get(key)
+        if (
+            isinstance(kept, list)
+            and len(kept) == 3
+            and all(isinstance(number, int) and number >= 0 for number in kept[:2])
+            and isinstance(kept[2], bool)
+        ):
+            ordinary, docker, ran = kept
         else:
-            jobs = _api(
-                f"{CONFIG.api}/actions/runs/{run['id']}/attempts/{run['run_attempt']}"
-                "/jobs?per_page=100"
-            )["jobs"]
+            jobs = _api(f"{CONFIG.api}/actions/runs/{key}/attempts/1/jobs?per_page=100")["jobs"]
             started = [job for job in jobs if job.get("conclusion") != "skipped"]
             kinds = [
                 next((found for label in job.get("labels") or [] if (found := kind(label))), None)
@@ -166,17 +173,24 @@ def busy(sessions: str) -> list[int]:
 
 
 def unchecked_ready(pulls: dict[str, dict[str, Any]]) -> list[int]:
+    """The workflow's ready tickets with no check on their head yet."""
     return sorted(
         int(number)
         for number, pull in pulls.items()
         if pull.get("state") == "OPEN"
         and pull.get("isDraft") is False
         and not pull.get("statusCheckRollup")
+        and any(
+            isinstance(label, dict) and label.get("name") == CONFIG.labels.workflow
+            for label in pull.get("labels") or []
+        )
     )
 
 
 def prefixes_to_build(notes: Path) -> list[int]:
-    """The members whose prefixes the line builds next: the window minus the running ones."""
+    """The members whose prefixes the line builds next: the window minus the running ones, as
+    the gate extends its line (`_extend_line` of `merge_gate.py`): nothing behind a blocked
+    front, and a new line only with two waiting or a front whose failed prefix passed again."""
     train = _read(notes / "merge-train.json")
     if not train:
         return []
@@ -186,12 +200,8 @@ def prefixes_to_build(notes: Path) -> list[int]:
         if isinstance(member, dict)
     }
     window = min(max(int(train.get("window", WINDOW_CEILING)), 1), WINDOW_CEILING)
-    held = {
-        *train.get("suspended", {}),
-        *train.get("conflicts", {}),
-        *train.get("unavailable", []),
-        *(set(train.get("blocked", {})) - set(train.get("refreshable", []))),
-    }
+    blocked = set(train.get("blocked", {}))
+    away = {*train.get("suspended", {}), *train.get("conflicts", {}), *train.get("unavailable", [])}
     queue = [str(number) for number in train.get("waiting", [])]
     fixes = set(train.get("fixes", []))
     priorities = train.get("priorities", {})
@@ -203,6 +213,22 @@ def prefixes_to_build(notes: Path) -> list[int]:
             else (1, priority.rank(priorities.get(number, priority.UNLABELLED)))
         ),
     )
+    refreshable = set(train.get("refreshable", []))
+    front = next(
+        (
+            number
+            for number in line
+            if number not in away and (number not in blocked or number in refreshable)
+        ),
+        None,
+    )
+    if (
+        front is None
+        or front in blocked
+        or (not members and len(queue) < 2 and front not in train.get("proven", {}))
+    ):
+        return []
+    held = away | blocked | set(train.get("pending", []))
     eligible = [number for number in line if number not in members and number not in held]
     return [int(number) for number in eligible[: max(window - len(members), 0)]]
 

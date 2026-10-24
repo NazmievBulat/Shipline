@@ -79,6 +79,7 @@ class Demand:
         draft: bool = True,
         checks: list | None = None,
         runs: list[tuple[dict, list[dict]]] = (),
+        labels: tuple[str, ...] = ("workflow",),
     ) -> None:
         branch = f"ticket/change-{number}"
         self.pulls[str(number)] = {
@@ -87,10 +88,14 @@ class Demand:
             "isDraft": draft,
             "headRefName": branch,
             "statusCheckRollup": checks or [],
+            "labels": [{"name": label} for label in labels],
         }
         self.runs[branch] = [run for run, _ in runs]
         for run, jobs in runs:
-            self.jobs[f"{run['id']}-{run['run_attempt']}"] = jobs
+            # A push starts the first attempt: the jobs of later ones are not read.
+            self.jobs[f"{run['id']}-1"] = jobs
+            for attempt in range(2, run["run_attempt"] + 1):
+                self.jobs[f"{run['id']}-{attempt}"] = [_job(ORDINARY, "skipped")]
 
     def cloud(self, number: int, status: str) -> None:
         (self.notes / f"cloud-{number}").write_text(json.dumps({"status": status}))
@@ -157,6 +162,8 @@ def test_only_working_cloud_workers_busy_sessions_and_unchecked_ready_pulls_coun
     demand.pull(11, runs=[_ci(110)])
     demand.pull(12, draft=False, checks=[{"name": "CI: what to run"}], runs=[_ci(120)])
     demand.pull(13, runs=[_ci(130)])
+    # Ready and unchecked, but no ticket of the workflow: no push of it is on its way.
+    demand.pull(14, draft=False, runs=[_ci(140)], labels=())
     sessions = "ticket-11 idle 100 8G\nreview-13 limit 0 8G  session limit  resets 4pm\n"
 
     forecast = demand.write(sessions + "hunt-x busy 0 8G\naudit-11 busy 0 8G\n")
@@ -202,6 +209,31 @@ def test_the_merge_line_counts_the_prefixes_still_to_build(demand: Demand) -> No
     assert forecast["ordinary"] == 6
 
 
+@pytest.mark.parametrize(
+    ("train", "expected"),
+    [
+        # A line starts only with two waiting, or a front whose failed prefix passed again.
+        ({"waiting": ["11"]}, []),
+        ({"waiting": ["11"], "proven": {"11": {"branch": "b"}}}, [11]),
+        ({"waiting": ["11", "12"]}, [11, 12]),
+        # A blocked front starts nothing; a pending member is passed over.
+        ({"waiting": ["11", "12"], "blocked": {"11": "red"}, "refreshable": ["11"]}, []),
+        ({"waiting": ["11", "12", "13"], "pending": ["12"]}, [11, 13]),
+    ],
+)
+def test_the_line_starts_where_the_gate_starts_it(
+    demand: Demand, train: dict[str, Any], expected: list[int]
+) -> None:
+    for number in (11, 12, 13):
+        demand.pull(number, draft=False, checks=[{"name": "CI result"}], runs=[_ci(number * 10)])
+    demand.train({"window": 4, **train})
+
+    forecast = demand.write()
+
+    assert forecast is not None
+    assert forecast["pulls"]["prefixes"] == expected
+
+
 def test_a_full_window_builds_no_prefix(demand: Demand) -> None:
     demand.pull(11, draft=False, checks=[{"name": "CI result"}], runs=[_ci(110)])
     demand.pull(12, draft=False, checks=[{"name": "CI result"}], runs=[_ci(120)])
@@ -228,6 +260,32 @@ def test_each_workflow_counts_its_newest_run_that_ran_a_job(demand: Demand) -> N
 
     assert forecast is not None
     assert (forecast["ordinary"], forecast["docker"]) == (2, 2)
+
+
+def test_a_re_run_counts_the_jobs_its_push_started(demand: Demand) -> None:
+    # The newest CI run had its failed job run again: one push still starts all four jobs.
+    demand.cloud(7, "working")
+    demand.pull(7, runs=[(_run(71, "ci.yml", attempt=2), [_job(ORDINARY)] * 4)])
+
+    forecast = demand.write()
+
+    assert forecast is not None
+    assert forecast["ordinary"] == 4
+    assert any("/runs/71/attempts/1/jobs" in call for call in demand.workflow.calls("gh api"))
+
+
+def test_a_kept_count_that_is_not_one_is_read_again(demand: Demand) -> None:
+    demand.cloud(7, "working")
+    demand.pull(7, runs=[_ci(71, 2)])
+    kept = demand.forecast.with_name("ci-demand-runs.json")
+    kept.parent.mkdir(parents=True)
+    kept.write_text(json.dumps({"71": "broken", "72-1": [1, 2, True]}))
+
+    forecast = demand.write()
+
+    assert forecast is not None
+    assert forecast["ordinary"] == 2
+    assert json.loads(kept.read_text()) == {"71": [2, 0, True]}
 
 
 def test_a_pull_request_without_runs_counts_as_the_others_on_average(demand: Demand) -> None:
@@ -288,15 +346,15 @@ def test_the_forecast_is_written_whole_for_its_owner_alone(demand: Demand) -> No
 
 
 def test_the_tick_writes_the_forecast_each_turn(workflow: Workflow) -> None:
-    # Ready and without the label: no reviewer starts for it, and its checks have not started.
-    workflow.add_pull_request(7, draft=False, labels=())
+    # Ready, its checks not started: the tick starts its reviewer, which is busy.
+    workflow.add_pull_request(7, draft=False)
 
     done = workflow.run_script("tick", env=AT)
 
     assert done.returncode == 0, done.stdout + done.stderr
     forecast = json.loads((workflow.root / "home/.local/state/workflow/ci-demand.json").read_text())
     assert forecast["at"] == NOW
-    assert forecast["pulls"]["ready"] == [7]
+    assert 7 in forecast["pulls"]["ready"] + forecast["pulls"]["busy"]
     assert "about 0 ordinary and 0 Docker jobs within 30 minutes" in done.stdout
 
 
@@ -322,6 +380,7 @@ def test_the_tick_notes_the_balancers_last_change_once(workflow: Workflow) -> No
     log = workflow.root / BALANCE_LOG
     log.parent.mkdir(parents=True)
     log.write_text("2026-10-24T07:30:00Z an older change\n" + BALANCED + "\n")
+    told = workflow.repo / ".local/workflow/runner-balance.told"
     pending = workflow.repo / ".local/workflow/runner-balance.pending"
 
     assert workflow.run_script("tick", env=AT).returncode == 0
@@ -331,6 +390,17 @@ def test_the_tick_notes_the_balancers_last_change_once(workflow: Workflow) -> No
     assert workflow.run_script("tick", env=AT).returncode == 0
 
     assert not list(pending.iterdir())
+    assert told.read_text() == BALANCED + "\n"
+
+
+def test_a_balance_change_older_than_a_day_is_not_announced(workflow: Workflow) -> None:
+    log = workflow.root / BALANCE_LOG
+    log.parent.mkdir(parents=True)
+    log.write_text("2026-10-22T07:30:00Z added an ordinary slot (3 to 4); queued ordinary 1\n")
+
+    assert workflow.run_script("tick", env=AT).returncode == 0
+
+    assert not (workflow.repo / ".local/workflow/runner-balance.pending").exists()
 
 
 def test_the_wake_names_the_last_balance_change_once_as_a_change(workflow: Workflow) -> None:
