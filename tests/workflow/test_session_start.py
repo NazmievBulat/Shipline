@@ -202,7 +202,6 @@ def test_the_session_sees_only_the_listed_variables(workflow: Workflow) -> None:
     assert seen["PATH"] == f"{gh_bin}:{workflow.env['PATH']}"
 
 
-
 @pytest.mark.parametrize("named", ["SHIPLINE_CONFIG", "XDG_CONFIG_HOME", "both"])
 @pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
 def test_a_session_keeps_a_named_config(

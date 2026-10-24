@@ -55,18 +55,24 @@ if [ -n "$github_token" ] && [ -n "$github_app_id" ]; then
   exit 1
 fi
 
-# The repository's own values, from its shipline.json (workflow_config.py), each quoted for sh.
+# The repository's own values, from the selected config, each quoted for sh.
 config=$(python3 "$here/../scripts/workflow/workflow_config.py" sh) || exit 1
 eval "$config"
-# The pool runs main's commands (main-command.sh), so it is named by main's file too.
-if ! git -C "$SHIPLINE_REPO" show refs/remotes/origin/main:shipline.json 2>/dev/null |
-  cmp -s - "$SHIPLINE_REPO/shipline.json"; then
-  echo "$SHIPLINE_REPO/shipline.json is not the one of origin/main: run this from main, as last fetched." >&2
-  exit 1
+config_file=${SHIPLINE_CONFIG:-$SHIPLINE_REPO/shipline.json}
+# A checkout config names a pool that runs main's commands, so it must be main's file too.
+# An external installation config has no counterpart on origin/main.
+if [ "$SHIPLINE_CONFIG" = "$SHIPLINE_REPO/shipline.json" ]; then
+  if ! git -C "$SHIPLINE_REPO" show refs/remotes/origin/main:shipline.json 2>/dev/null |
+    cmp -s - "$SHIPLINE_CONFIG"; then
+    echo "$SHIPLINE_CONFIG is not the one of origin/main: run this from main, as last fetched." >&2
+    exit 1
+  fi
+elif [ -n "$SHIPLINE_CONFIG" ]; then
+  printf 'Read runner configuration from %s.\n' "$SHIPLINE_CONFIG"
 fi
 if [ -z "$SHIPLINE_REPOSITORY" ] || [ -z "$SHIPLINE_RUNNER_PREFIX" ] ||
   [ -z "$SHIPLINE_RUNNER_IMAGE_BUILD" ]; then
-  echo "$SHIPLINE_REPO/shipline.json must name the repository, runner.prefix and runner.image_build (runner/README.md)." >&2
+  echo "$config_file must name the repository, runner.prefix and runner.image_build (runner/README.md)." >&2
   exit 1
 fi
 

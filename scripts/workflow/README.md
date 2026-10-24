@@ -83,6 +83,13 @@ Shipline reads one JSON file, using the first available source in this order:
 Only that file is read; files are never merged. Without any file the defaults apply. An invalid
 installation file is refused with its own path, without falling through to the checkout file.
 Worktrees use their main checkout's identity and config, never a worktree's config copy.
+
+The tick's explicit `SHIPLINE_CONFIG` and `XDG_CONFIG_HOME` settings reach every session it
+starts, with relative paths made absolute before changing folders. A session's own `shipline`
+calls therefore select the same file. `runner/install.sh` uses this same lookup and reports the
+selected external config path. It checks the config against `origin/main` only when reading the
+main checkout's `shipline.json`; an external config has no file there to compare with.
+
 `examples/shipline.json` names every key for `example-app` with a server suite, a browser suite
 and an image check. A repository needs no config or adapter scripts of its own.
 
