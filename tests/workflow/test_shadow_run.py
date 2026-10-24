@@ -1103,6 +1103,28 @@ def test_a_shadow_tick_runs_while_the_real_tick_holds_its_lock(workflow: Workflo
     assert "ticket-7 started" in _decisions(_shadow_log(workflow))
 
 
+def test_a_shadow_tick_takes_no_lock_of_decide(workflow: Workflow) -> None:
+    workflow.add_pull_request(7)
+    lock = workflow.repo / ".git" / "shipline-decide.lock"
+
+    alone = workflow.run_script("tick", "--shadow", env=_CLOCK)
+
+    assert alone.returncode == 0, alone.stderr
+    assert not lock.exists()
+    _shadow_log(workflow).unlink()
+    # An orchestrator's decision holds it: the shadow tick waits for nothing, and is not cut short.
+    with lock.open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        done = workflow.run_script(
+            "tick", "--shadow", env={**_CLOCK, "WORKFLOW_SHADOW_SECONDS": "20"}
+        )
+
+    assert done.returncode == 0, done.stderr
+    assert "ticket-7 started" in _decisions(_shadow_log(workflow))
+    assert "cut short" not in _shadow_log(workflow).read_text()
+
+
 def test_a_second_shadow_tick_exits_while_the_first_runs(workflow: Workflow) -> None:
     workflow.add_pull_request(7)
     with (workflow.repo / ".git" / "shipline-shadow.lock").open("w") as held:
