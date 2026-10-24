@@ -836,14 +836,19 @@ def unreached_service(parts: list[dict[str, Any]]) -> str | None:
 
 def _outage_in(notes: list[dict[str, Any]]) -> str | None:
     """The advisory service the audit's annotations name as unreachable, by the repository's
-    `advisory_watch`. The advisories notice is left out: published advisories' own words neither
-    fake an outage nor hide one."""
-    text = "".join(
+    `advisory_watch`."""
+    text = _outage_text(notes)
+    return unreachable_service(text) if text.strip() else None
+
+
+def _outage_text(notes: list[dict[str, Any]]) -> str:
+    """What the repository's `advisory_watch` reads of the audit's annotations. The advisories
+    notice is left out: published advisories' own words neither fake an outage nor hide one."""
+    return "".join(
         f"{note.get('message') or ''}\n"
         for note in notes
         if ADVISORIES_ONLY is None or note.get("title") != ADVISORIES_ONLY
     )
-    return unreachable_service(text) if text.strip() else None
 
 
 # What of an advisory's line may reach main's line, and so the orchestrator's message: words and
@@ -854,9 +859,10 @@ PLAIN_LENGTH = 80
 ADVISORIES_NAMED = 5
 
 
-def audit_notice(parts: list[dict[str, Any]]) -> tuple[list[str], bool]:
-    """The advisories the audit's notice names on a failed run of main, or none, and whether an
-    advisory service that did not answer left a lock file unaudited beside them.
+def audit_notice(parts: list[dict[str, Any]]) -> tuple[list[str], bool, str | None]:
+    """The advisories the audit's notice names on a failed run of main, or none; whether a lock
+    file was left unaudited beside them; and the advisory service that did not answer, when the
+    repository's `advisory_watch` names one.
 
     The dependency audit is the only failed job besides "CI result", which follows it, and its
     notice lists the advisories: the audit writes it only when it audited everything, every tool
@@ -864,15 +870,30 @@ def audit_notice(parts: list[dict[str, Any]]) -> tuple[list[str], bool]:
     not audit or a tool that failed, the failure is main's as any other; so it is with an
     outage beside the notice, which is not advisories alone."""
     if ADVISORIES_ONLY is None:
-        return [], False
+        return [], False, None
     failed = _failed_jobs(parts)
     if {job["name"] for job in failed} - {CI_RESULT} != {DEPENDENCIES}:
-        return [], False
+        return [], False, None
     job = next(job for job in failed if job["name"] == DEPENDENCIES)
     notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
     advisories = _advisory_lines(notes)
     # Asked only beside a notice: a run without one is red whatever else it says.
-    return advisories, bool(advisories) and _outage_in(notes) is not None
+    text = _outage_text(notes)
+    if not advisories or not text.strip():
+        return advisories, False, None
+    done = repository_command("advisory_watch", "unreachable", input=text)
+    if done is None:
+        return advisories, False, None
+    if done.returncode:
+        # A watch that could not read the annotations proves no lock file was audited whole.
+        print(
+            f"the repository's advisory_watch could not read main's audit: {said(done)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return advisories, True, None
+    service = next(iter(nonblank_lines(done.stdout)), "").strip() or None
+    return advisories, service is not None, service
 
 
 def _advisory_lines(notes: list[dict[str, Any]]) -> list[str]:
@@ -1150,15 +1171,15 @@ def push_health(
         assessments.append((*verdict(ci[0], parts), ci[0]))
         if assessments[-1][0] == "red":
             try:
-                advisories, unaudited = audit_notice(parts)
+                advisories, unaudited, service = audit_notice(parts)
             except Waiting:
                 # GitHub could not be read: main is unknown until it can be.
                 raise
             except Refused:
                 # An unread notice is no advisory: main stays red.
-                advisories, unaudited = [], False
+                advisories, unaudited, service = [], False, None
             try:
-                service = None if advisories and not unaudited else unreached_service(parts)
+                service = service if advisories else unreached_service(parts)
             except Waiting:
                 # Diagnostic only: main stays red as it is, and is not re-run for the service.
                 service = None

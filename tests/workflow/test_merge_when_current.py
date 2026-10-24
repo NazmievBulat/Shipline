@@ -2122,6 +2122,30 @@ def test_an_outage_beside_mains_advisories_is_red_and_says_what_was_found(
     assert "nothing was found wrong" not in line
 
 
+def test_an_advisory_watch_that_fails_beside_mains_advisories_keeps_main_red(
+    github: GitHub,
+) -> None:
+    """A watch that could not read the audit's annotations proves no lock file was audited whole:
+    main is not advisory, and merging stops."""
+    _advisory_config(github)
+    _advisory_watch(github)
+    github.workflow.fake("example-advisory", "#!/bin/bash\necho 'cannot read' >&2\nexit 1\n")
+    outage = {
+        "title": "Advisory service unreachable",
+        "annotation_level": "failure",
+        "message": "Refused because PyPI's advisory service could not be reached.",
+    }
+    _main_audit_failed(github, outage, _advisories_notice(_ADVISORY_LINES[:1]))
+    _pull_passed_over_mains_advisory(github)
+
+    line = github.workflow.run_script("main-status").stdout
+    done = github.run()
+
+    assert line.startswith("main: red"), line
+    assert done.returncode == 1
+    assert not (github.workflow.state / "merged").exists()
+
+
 def test_an_advisory_whose_own_words_name_an_outage_is_still_advisories_alone(
     github: GitHub,
 ) -> None:
