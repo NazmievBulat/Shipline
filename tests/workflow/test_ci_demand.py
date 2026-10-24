@@ -139,7 +139,7 @@ def test_every_push_on_its_way_counts_its_last_runs_jobs(demand: Demand) -> None
     demand.pull(9, draft=False, checks=[{"name": "CI result"}], runs=[_ci(91, 1)])
     images = (_run(102, "images.yml"), [_job(DOCKER), _job(DOCKER), _job(DOCKER, "skipped")])
     demand.pull(10, draft=False, runs=[_ci(101, 4), images])
-    sessions = "ticket-8 busy 100 8G\nreview-9 busy 50 8G\n"
+    sessions = "ticket-8  busy  100 MB held  0 MB in swap\nreview-9  busy  memory unknown\n"
 
     forecast = demand.write(sessions)
 
@@ -164,9 +164,9 @@ def test_only_working_cloud_workers_busy_sessions_and_unchecked_ready_pulls_coun
     demand.pull(13, runs=[_ci(130)])
     # Ready and unchecked, but no ticket of the workflow: no push of it is on its way.
     demand.pull(14, draft=False, runs=[_ci(140)], labels=())
-    sessions = "ticket-11 idle 100 8G\nreview-13 limit 0 8G  session limit  resets 4pm\n"
+    sessions = "ticket-11  idle  100 MB held\nreview-13  limit  0 MB held  session limit  resets 4pm\n"
 
-    forecast = demand.write(sessions + "hunt-x busy 0 8G\naudit-11 busy 0 8G\n")
+    forecast = demand.write(sessions + "hunt-x  busy  0 MB held\naudit-11  busy  0 MB held\n")
 
     assert forecast is not None
     assert (forecast["ordinary"], forecast["docker"]) == (0, 0)
@@ -177,7 +177,7 @@ def test_a_pull_request_counted_twice_pushes_once(demand: Demand) -> None:
     demand.cloud(7, "working")
     demand.pull(7, draft=False, runs=[_ci(71, 2)])
 
-    forecast = demand.write("ticket-7 busy 0 8G\nreview-7 busy 0 8G\n")
+    forecast = demand.write("ticket-7  busy  0 MB held\nreview-7  busy  0 MB held\n")
 
     assert forecast is not None
     assert forecast["ordinary"] == 2
@@ -343,6 +343,18 @@ def test_the_forecast_is_written_whole_for_its_owner_alone(demand: Demand) -> No
     mode = stat.S_IMODE(demand.forecast.stat().st_mode)
     assert mode == 0o600
     assert [path.name for path in demand.forecast.parent.iterdir() if path.name.startswith(".")] == []
+
+
+def test_the_tick_counts_a_session_busy_before_it(workflow: Workflow) -> None:
+    workflow.add_worktree(8)
+    workflow.running("ticket-8", held=100 * 1024 * 1024)
+    workflow.screen("Working\n  ✻ Thinking…\n", "ticket-8")
+
+    done = workflow.run_script("tick", env=AT)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    forecast = json.loads((workflow.root / "home/.local/state/workflow/ci-demand.json").read_text())
+    assert forecast["pulls"]["busy"] == [8]
 
 
 def test_the_tick_writes_the_forecast_each_turn(workflow: Workflow) -> None:

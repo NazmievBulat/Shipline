@@ -59,7 +59,8 @@ RUNS_LOOKED_AT = 3
 STATE = Path.home() / ".local/state/workflow"
 FORECAST = STATE / "ci-demand.json"
 RUN_COUNTS = STATE / "ci-demand-runs.json"
-BUSY = re.compile(r"(?:ticket|review)-([0-9]+) busy\b")
+# A `session list` line: the name, two spaces, the state.
+BUSY = re.compile(r"(?:ticket|review)-([0-9]+)\s+busy\b")
 
 CONFIG = workflow_config.current()
 
