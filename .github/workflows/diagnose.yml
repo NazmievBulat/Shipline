@@ -23,19 +23,16 @@ jobs:
           set +e
           mkdir -p "$RUNNER_TEMP/look"
           cat > "$RUNNER_TEMP/look/test_look.py" <<'PY'
-          import os, shlex, subprocess, sys, time
+          import subprocess, sys
           def test_look():
-              command = "while ps aux | grep -q 'codex exec'; do sleep 0.2; done"
-              shell = ["/bin/bash", "-c", f": codex exec && eval {shlex.quote(command)} < /dev/null"]
-              started = subprocess.Popen(shell)
-              time.sleep(1.5)
-              print("loop still running:", started.poll() is None, file=sys.__stderr__)
-              for name in ("COLUMNS", "LINES", "TERM", "PATH"):
-                  print(name, os.environ.get(name), file=sys.__stderr__)
-              print("ps:", subprocess.run(["sh", "-c", "command -v ps; ls -l /proc/self/fd/0 /proc/self/fd/1 /proc/self/fd/2"], capture_output=True, text=True).stdout, file=sys.__stderr__)
-              listed = subprocess.run(["bash", "-c", "ps aux | grep 'codex exec'"], capture_output=True, text=True)
-              print("ps aux | grep:", repr(listed.stdout), repr(listed.stderr), listed.returncode, file=sys.__stderr__)
-              started.kill()
+              script = (
+                  "ps aux > /tmp/ps-out 2> /tmp/ps-err; echo \"rc $?\"; wc -lc < /tmp/ps-out; head -3 /tmp/ps-out; "
+                  "cat /tmp/ps-err; ps -eo pid,args | wc -l; ls /proc | head -5; ls /proc | wc -l; "
+                  "grep -E 'Seccomp|NoNewPrivs|CapEff' /proc/self/status; cat /proc/self/mountinfo | grep ' /proc '"
+              )
+              for name, stdin in (("pipe", None), ("devnull", subprocess.DEVNULL)):
+                  done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, stdin=stdin)
+                  print(name, repr(done.stdout), repr(done.stderr), file=sys.__stderr__)
           PY
           python -m pytest -p no:cacheprovider -p no:xdist -c /dev/null -q -s "$RUNNER_TEMP/look/test_look.py"
-          python -m pytest -p no:cacheprovider -p no:xdist -q -rA "tests/workflow/test_running_command.py::test_a_real_wait_loop_finds_its_own_shell_and_is_named" 2>&1 | tail -15
+          python3 -c 'import subprocess; print("outside", subprocess.run(["bash", "-c", "ps aux | wc -lc"], capture_output=True, text=True).stdout)'
