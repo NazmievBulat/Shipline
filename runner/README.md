@@ -162,22 +162,34 @@ are written from the measured reports, never from guesses.
 
 1. Both machines run this version for seven whole days; `<prefix>-runner-usage.timer` writes one
    line a minute of what each has free.
-2. On the receiving machine, run `python3 ~/.local/share/<prefix>-runner/usage.py report --days 7`.
-   It prints each day's busiest hour. Only when it ends with `Room every day: yes` (exit 0) do the
-   slots move. When it says there is no room, nothing moves, and the report goes to the owner.
+2. On the receiving machine, run
+   `python3 ~/.local/share/<prefix>-runner/usage.py report --days 7 --job-memory <cap>`, with
+   the cap of one of its ordinary jobs (its `job_memory`, else `memory` of `settings.sh`, `10g`).
+   It prints each day's busiest hour, then `Room for <n> more PR jobs`: none unless every day had
+   room, else the least memory available at a busiest hour, less the 8 GiB margin, in jobs of
+   that cap. Only when it ends with `Room every day: yes` (exit 0) do slots move, and never more
+   than that `<n>`; main's runners and the planner never move. When it says there is no room,
+   nothing moves, and the report goes to the owner.
 3. The move is a change of each machine's own settings (`~/.config/shipline/runner.sh`) and an
-   install, by the machine's owner and on the owner's word: `ordinary_jobs` lowered on the giving
-   machine and raised by as many on the receiving one, which may also name `job_memory`, its own
-   cap of one ordinary job (`6g`; without it, `memory` of `settings.sh` holds). Then `install.sh`
-   on each. Nothing names where the jobs go: every machine's runners carry the same labels, so
-   GitHub gives a job to whichever runner is free.
+   install of each, by the machine's owner and on the owner's word, the receiving machine first:
+   - The receiving machine raises its `ordinary_jobs` by the slots that move, and may name its
+     own `job_memory` (`6g`). `install.sh` refuses to raise it by more than the room its last
+     week measured (`usage.py room`).
+   - Once its runners are online with the base label, the giving machine lowers its
+     `ordinary_jobs` by as many and installs. `install.sh` refuses to lower it while GitHub
+     lists no online ordinary runner of another machine with the base label, or cannot be read:
+     with the receiving machine down, unreachable or not installed, both counts stay as they are.
+   - Moving slots back is the same, the other way round.
+
+   Nothing names where the jobs go: every machine's runners carry the same labels, so GitHub
+   gives a job to whichever runner is free.
 4. A machine may keep no PR slot of its own (`ordinary_jobs=0`) while the pool has another
    machine; the only machine of a pool keeps at least one, and so does at least one machine of
-   every pool: two machines with none would each take a slot and give it back as the other did. PR jobs still run when no other machine
-   has an online ordinary runner: the giving machine's spare then takes one slot, and gives it
-   back once another machine's ordinary runner is online again (`keep-spare.sh`,
-   `ordinary_slots.py`). Main's runner lent to PR jobs does not count, as it is busy exactly when
-   main has work.
+   every pool: two machines with none would each take a slot and give it back as the other did.
+   PR jobs still run when no other machine has an online ordinary runner: the giving machine's
+   spare then takes one slot, and gives it back once another machine's ordinary runner is online
+   again (`keep-spare.sh`, `ordinary_slots.py`). Main's runner lent to PR jobs does not count, as
+   it is busy exactly when main has work.
 5. The pull request that records the move states, measured before and after it: the queue wait of
    PR jobs (each job's `started_at` minus `created_at`: median, 90th percentile and longest), and
    each machine's CPU pressure at its busiest hour.

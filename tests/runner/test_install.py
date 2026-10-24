@@ -10,11 +10,17 @@ from pathlib import Path
 
 import pytest
 from slot_stand_ins import (
+    FIRST,
+    LABEL,
+    MACHINE,
+    OTHER,
     SHARED_JOB_MEMORY,
     SPARE_UNIT,
+    STANDBY,
     Machine,
     make_machine,
     ordinary_unit,
+    runner_name,
 )
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -286,9 +292,10 @@ def test_no_value_of_the_file_runs_as_code(machine: Path) -> None:
 
     assert done.returncode == 0, done.stderr
     assert not (machine / "checkout/injected").exists()
-    assert "repository='example-owner/example-app'" in (
-        _installed(machine) / "pool-settings.sh"
-    ).read_text()
+    assert (
+        "repository='example-owner/example-app'"
+        in (_installed(machine) / "pool-settings.sh").read_text()
+    )
 
 
 def test_a_checkout_whose_file_is_not_main_s_is_refused(machine: Path) -> None:
@@ -469,3 +476,168 @@ def test_mains_job_containers_keep_the_shared_value_beside_the_machines_own(
     pool_machine.installed_as(slots=3, job_memory="6g")
 
     assert _memory_of_the_job_container(pool_machine, "main") == SHARED_JOB_MEMORY
+
+
+# A move is both machines agreeing: the receiving machine installs first, then the giving one.
+
+
+def _holding(machine: str, number: int, status: str = "online") -> tuple[str, str, list[str]]:
+    """A machine's ordinary runner holding a PR slot."""
+    return (runner_name(machine, number=number), status, [STANDBY, LABEL, FIRST])
+
+
+def _installed_with_four(pool_machine: Machine, *others: tuple[str, str, list[str]]) -> None:
+    pool_machine.installed_as(slots=4)
+    pool_machine.runners(*[_holding(MACHINE, n) for n in range(1, 6)], *others)
+
+
+def test_lowering_the_slots_while_the_other_machine_is_off_is_refused(
+    pool_machine: Machine,
+) -> None:
+    _installed_with_four(pool_machine, _holding(OTHER, 1, "offline"), _holding(OTHER, 2, "offline"))
+    pool_machine.settle(slots=2)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "Install the receiving machine first" in done.stderr
+    assert pool_machine.calls("systemctl") == []
+    assert "ordinary_jobs=4" in pool_machine.pool_settings.read_text().splitlines()
+
+
+def test_lowering_the_slots_installs_once_the_other_machine_holds_them(
+    pool_machine: Machine,
+) -> None:
+    _installed_with_four(pool_machine, _holding(OTHER, 1), _holding(OTHER, 2))
+    pool_machine.settle(slots=2)
+
+    done = pool_machine.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "ordinary_jobs=2" in pool_machine.pool_settings.read_text().splitlines()
+
+
+def test_main_docker_and_standby_runners_of_the_other_machine_hold_no_slot_given_up(
+    pool_machine: Machine,
+) -> None:
+    _installed_with_four(
+        pool_machine,
+        (runner_name(OTHER, "main"), "online", [f"{LABEL}-main", LABEL, FIRST]),
+        (runner_name(OTHER, "docker"), "online", [f"{LABEL}-docker"]),
+        (runner_name(OTHER, number=1), "online", [STANDBY]),
+    )
+    pool_machine.settle(slots=3)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert pool_machine.calls("systemctl") == []
+
+
+def test_lowering_the_slots_with_github_s_runners_unreadable_is_refused(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.installed_as(slots=4)
+    pool_machine.lose_github()
+    pool_machine.settle(slots=2)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "Could not read GitHub's runners" in done.stderr
+    assert pool_machine.calls("systemctl") == []
+
+
+def test_taking_more_slots_without_a_measured_week_is_refused(pool_machine: Machine) -> None:
+    """The receiving side of a move: no week of use, no room measured for more PR jobs."""
+    pool_machine.installed_as(slots=2)
+    pool_machine.settle(slots=3)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "measured room for 0 more" in done.stderr
+    assert pool_machine.calls("systemctl") == []
+    assert "ordinary_jobs=2" in pool_machine.pool_settings.read_text().splitlines()
+
+
+def test_taking_as_many_more_slots_as_the_week_measured_room_for_installs(
+    pool_machine: Machine,
+) -> None:
+    # 30 GiB available at the busiest hour, less the 8 GiB margin: two more jobs of 10g.
+    pool_machine.installed_as(slots=2)
+    pool_machine.measure(available_gib=30)
+    pool_machine.settle(slots=4)
+
+    done = pool_machine.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "ordinary_jobs=4" in pool_machine.pool_settings.read_text().splitlines()
+
+
+def test_taking_more_slots_than_the_week_measured_room_for_is_refused(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.installed_as(slots=2)
+    pool_machine.measure(available_gib=30)
+    pool_machine.settle(slots=5)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "would take 3 more PR slots" in done.stderr
+    assert "measured room for 2 more of 10g each" in done.stderr
+    assert pool_machine.calls("systemctl") == []
+
+
+def test_the_room_is_counted_in_jobs_of_the_machines_own_cap(pool_machine: Machine) -> None:
+    # 30 GiB less 8 is three jobs of 6g, where it is two of the shared 10g.
+    pool_machine.installed_as(slots=2, job_memory="6g")
+    pool_machine.measure(available_gib=30)
+    pool_machine.settle(slots=5, job_memory="6g")
+
+    done = pool_machine.install()
+
+    assert done.returncode == 0, done.stderr
+
+
+def test_a_week_with_cpu_pressure_at_its_busiest_hours_has_room_for_no_more_slots(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.installed_as(slots=2)
+    pool_machine.measure(available_gib=60, pressure=40)
+    pool_machine.settle(slots=3)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "measured room for 0 more" in done.stderr
+
+
+def test_the_report_says_how_many_more_pr_jobs_the_room_holds(pool_machine: Machine) -> None:
+    pool_machine.installed_as(slots=2)
+    pool_machine.measure(available_gib=30)
+
+    done = pool_machine.usage("report", "--days", "7")
+
+    assert done.returncode == 0, done.stdout
+    lines = done.stdout.strip().splitlines()
+    assert lines[-2].startswith("Room for 2 more PR jobs of 10g each")
+    assert lines[-1].startswith("Room every day: yes")
+    assert pool_machine.usage("room", "--job-memory", "6g").stdout.strip() == "3"
+
+
+def test_without_a_record_the_machine_holds_its_runners_with_the_label(
+    pool_machine: Machine,
+) -> None:
+    """A machine installed before installs were recorded still holds the slots GitHub lists."""
+    pool_machine.runners(
+        *[_holding(MACHINE, n) for n in range(1, 4)], _holding(OTHER, 1, "offline")
+    )
+    pool_machine.settle(slots=0)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "would give up 3 PR slots" in done.stderr
+    assert pool_machine.calls("systemctl") == []

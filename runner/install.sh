@@ -103,11 +103,17 @@ if [ -z "$roles" ]; then
   exit 1
 fi
 recorded=
+recorded_jobs=
 if [ -f "$installed/pool-settings.sh" ]; then
   recorded=$(
     machine=
     . "$installed/pool-settings.sh"
     printf '%s' "$machine"
+  )
+  recorded_jobs=$(
+    ordinary_jobs=
+    . "$installed/pool-settings.sh"
+    printf '%s' "$ordinary_jobs"
   )
 fi
 # Two machines with the same name would take each other's runner registrations (`--replace`) and
@@ -211,6 +217,48 @@ gh() {
   python3 "$tools/github_budget.py" wait --identity runner runner-install &&
     python3 "$tools/github_budget.py" call --identity runner runner-install "$@"
 }
+
+# A move of PR slots is both machines agreeing (README.md, "Moving a machine's PR slots"): the
+# receiving machine installs first, and only then this one gives its slots up. So before anything
+# is stopped, a machine of a pool that would keep fewer PR slots than it holds needs GitHub to
+# list an online ordinary runner of another machine (`<machine>-<n>`, with the workflow label):
+# with none, the other machine is down, unreachable or not installed, and both counts stay. What
+# it holds is what its last install recorded, or else its own runners with the workflow label; a
+# first install holds none. A list it cannot read stops it too.
+if [ -n "$other_machines" ]; then
+  if ! listed=$(gh api --paginate "repos/$repository/actions/runners?per_page=100" --jq \
+    '.runners[] | [.name, .status, ([.labels[].name] | join(","))] | @tsv'); then
+    echo "Could not read GitHub's runners, so $machine cannot tell whether the other machines took its PR jobs: nothing was changed." >&2
+    exit 1
+  fi
+  others_ordinary="^($(printf '%s\n' $other_machines | paste -sd '|'))-[1-9][0-9]*\$"
+  held=$recorded_jobs
+  if [ -z "$held" ]; then
+    held=$(printf '%s\n' "$listed" | awk -F '\t' -v own="$own_runner" -v label="$label" '
+      $1 ~ own && index("," $3 ",", "," label ",") {n++} END {print n+0}')
+  fi
+  if [ "$runners" -lt "$held" ]; then
+    taken=$(printf '%s\n' "$listed" | awk -F '\t' -v others="$others_ordinary" -v label="$label" '
+      $1 ~ others && $2 == "online" && index("," $3 ",", "," label ",") {n++} END {print n+0}')
+    if [ "$taken" -lt 1 ]; then
+      echo "$machine would give up $((held - runners)) PR slots ($held to $runners), but GitHub lists no online ordinary runner of $other_machines with $label. Install the receiving machine first and wait for its runners (README.md, \"Moving a machine's PR slots\"): nothing was changed." >&2
+      exit 1
+    fi
+  fi
+  # The receiving side of a move: a machine on record takes no more PR slots than its last week
+  # of use measured room for, in jobs of its own cap (usage.py room).
+  if [ -n "$recorded_jobs" ] && [ "$runners" -gt "$recorded_jobs" ]; then
+    cap=${job_memory:-$memory}
+    if ! room=$(python3 "$here/usage.py" room --days 7 --job-memory "$cap"); then
+      echo "Could not read this machine's usage, so $machine cannot tell whether it has room for more PR slots: nothing was changed." >&2
+      exit 1
+    fi
+    if [ $((runners - recorded_jobs)) -gt "$room" ]; then
+      echo "$machine would take $((runners - recorded_jobs)) more PR slots ($recorded_jobs to $runners), but its last 7 days measured room for $room more of $cap each (usage.py report --days 7): nothing was changed." >&2
+      exit 1
+    fi
+  fi
+fi
 
 mkdir -p "$installed" "$units"
 prefix=$prefix sh "$here/install-github-budget.sh"

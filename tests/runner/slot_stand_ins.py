@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 RUNNER = Path(__file__).resolve().parents[2] / "runner"
@@ -62,7 +63,8 @@ _STAND_INS = {
     "loginctl": _LOGGING + "echo yes\n",
     "sleep": _LOGGING + f"exit {ROUND}\n",
 }
-# GitHub's runner list and runner labels, kept in runners.json: missing, GitHub cannot be read.
+# GitHub's runner list, runner labels and registrations, kept in runners.json: missing, GitHub
+# cannot be read.
 _GH = """#!/usr/bin/env python3
 import json, re, subprocess, sys
 
@@ -93,20 +95,28 @@ try:
 except OSError:
     sys.exit(1)
 path = (path or "").split("?", 1)[0]
-found = re.search(r"/actions/runners(?:/([0-9]+)/labels(?:/([^/]+))?)?$", path)
+found = re.search(r"/actions/runners(?:/([0-9]+)(/labels(?:/([^/]+))?)?)?$", path)
 if not found:
     sys.exit(1)
 if found[1] is None:
     if method != "GET":
         sys.exit(1)
     answer = runners
+elif found[2] is None:
+    # A registration removed, as install.sh removes those of retired runners.
+    if method != "DELETE":
+        sys.exit(1)
+    runners["runners"] = [r for r in runners["runners"] if r["id"] != int(found[1])]
+    with open(f"{state}/runners.json", "w") as kept:
+        json.dump(runners, kept)
+    sys.exit(0)
 else:
     (runner,) = [r for r in runners["runners"] if r["id"] == int(found[1])]
     names = [label["name"] for label in runner["labels"]]
     if method == "POST":
         names += [label for label in labels if label not in names]
     elif method == "DELETE":
-        names = [name for name in names if name != found[2]]
+        names = [name for name in names if name != found[3]]
     else:
         sys.exit(1)
     runner["labels"] = [{"name": name} for name in names]
@@ -189,6 +199,24 @@ class Machine:
         listed = json.loads((self.state / "runners.json").read_text())["runners"]
         (runner,) = [runner for runner in listed if runner["name"] == name]
         return [label["name"] for label in runner["labels"]]
+
+    def measure(self, available_gib: float, pressure: float = 5.0, days: int = 7) -> None:
+        """A usage log of the last `days` whole days (UTC), a line every hour, as the usage timer
+        writes it: this much memory available and this CPU pressure throughout."""
+        folder = self.root / "home" / ".local" / "state" / "ci-runner"
+        folder.mkdir(parents=True, exist_ok=True)
+        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        lines = [
+            f"{(today - timedelta(hours=hour)).strftime('%Y-%m-%dT%H:%M:%SZ')}"
+            f" free_mb=1024 available_mb={int(available_gib * 1024)} swap_in_mb_s=0.0"
+            f" swap_out_mb_s=0.0 cpu_pressure_60s={pressure} load_1m=1.0 busy=none"
+            for hour in range(days * 24, 0, -1)
+        ]
+        (folder / "usage.log").write_text("".join(f"{line}\n" for line in lines))
+
+    def usage(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        """usage.py of the installed copy, as runner/README.md says to run it."""
+        return self._run("python3", str(self.installed / "usage.py"), *arguments)
 
     def lose_github(self) -> None:
         """GitHub's runner list cannot be read."""
