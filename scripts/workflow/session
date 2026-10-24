@@ -17,7 +17,9 @@
 #                               effort: low, medium, high, xhigh or max; when left out,
 #                               medium for a worker, high for an audit; reviewers always use high
 #                               model: opus, sonnet, codex or cloud for workers; the owner's Claude
-#                               default when omitted. Audits and reviewers always use opus.
+#                               default when omitted. Audits and reviewers always use opus, but
+#                               for the reviewer of a small conflict `conflict_review` of
+#                               shipline.json names (`conflict_review.py reviewer`).
 #   session start hunt <name> [plan|explore] [claude|codex|cursor]
 #                               name: small letters, digits and dashes; it names the report.
 #                               When left out, a hunt with a plan, by Claude Code. One hunt
@@ -543,7 +545,15 @@ cmd_start() {
   fi
   # Audits and independent reviewers never run on a smaller model, whatever the owner's default becomes.
   [[ $kind == worker ]] || model=opus
-  [[ $kind != review ]] || effort=high
+  if [[ $kind == review ]]; then
+    # High on Opus, unless shipline.json names the reviewer of a small conflict and this is one.
+    local choice
+    choice=$(python3 -B "$script_dir/conflict_review.py" reviewer \
+      "$main/$SHIPLINE_STATE_FOLDER" "$number") || choice="high opus"
+    read -r effort model <<<"$choice"
+    [[ $effort =~ ^(low|medium|high|xhigh|max)$ && $model =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+      { effort=high; model=opus; }
+  fi
 
   cmd_cleanup
 

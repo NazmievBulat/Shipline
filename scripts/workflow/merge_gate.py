@@ -3887,6 +3887,15 @@ def _failing(pull: dict[str, Any]) -> set[str]:
     return {check.get("name", check.get("context", "unknown")) for check in _failed_rollup(pull)}
 
 
+def _usual_reviewer(folder: Path, number: str, head: str, why: str) -> NoReturn:
+    """Leave the round to the usual reviewer: the tick stops this one and starts that one."""
+    (folder / f"review-{number}.usual-reviewer").write_text(head + "\n")
+    raise Refused(
+        f"this round needs the usual reviewer: {why}; end with review finished, and the tick "
+        "starts the usual reviewer"
+    )
+
+
 def handoff(number: str, folder: Path) -> int:
     """A published passed round is required before the reviewer can leave.
 
@@ -3920,7 +3929,7 @@ def handoff(number: str, folder: Path) -> int:
     latest = max(enumerate(rounds), key=lambda r: (r[1][0], r[0]))[1] if rounds else None
     if latest is None or latest[1:] != ("passed", head):
         raise Refused("the latest independent round must have passed on the current head")
-    from conflict_review import Scope, passed
+    from conflict_review import Scope, named_reviewer, passed
 
     current = next(
         review
@@ -3937,6 +3946,13 @@ def handoff(number: str, folder: Path) -> int:
     )
     if "<!-- workflow-conflict" in current["body"] and conflict is None:
         raise Refused("conflict round needs full review: invalid conflict marker")
+    # The cheaper reviewer `conflict_review` names was started for a small conflict: anything
+    # beyond resolving it within its lines is the usual reviewer's.
+    named = CONFIG.conflict_review if named_reviewer(folder, number) else None
+    if named is not None and conflict is None:
+        _usual_reviewer(
+            folder, number, head, "the reviewer of a small conflict passes no full review"
+        )
     if conflict:
         try:
             scope = Scope.read(folder, number)
@@ -3946,6 +3962,23 @@ def handoff(number: str, folder: Path) -> int:
                 or passed(reviews, scope.head) is None
             ):
                 raise ValueError("conflict round lacks its scope or earlier passed round")
+            if named is not None:
+                try:
+                    lines, outside = scope.size(Path.cwd())
+                except (ValueError, subprocess.SubprocessError) as error:
+                    _usual_reviewer(folder, number, head, str(error))
+                if outside:
+                    _usual_reviewer(
+                        folder, number, head, f"the resolution changes {', '.join(outside)} too"
+                    )
+                if lines > named.max_changed_lines:
+                    _usual_reviewer(
+                        folder,
+                        number,
+                        head,
+                        f"the resolution writes {lines} lines in {', '.join(scope.files)}, more "
+                        f"than the {named.max_changed_lines} of conflict_review.max_changed_lines",
+                    )
             scope.validate(Path.cwd(), head)
         except (ValueError, OSError, TypeError) as error:
             raise Refused(f"conflict round needs full review: {error}") from error

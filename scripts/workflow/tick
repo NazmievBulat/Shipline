@@ -41,8 +41,9 @@
 #      are named in the wake once. A running command is never interrupted.
 #   9. After the starts of step 6, the next draft without the label gets it when one may start
 #      (`ticket_starts.py`: by priority, then the older ticket, when its files overlap no running
-#      ticket's, nothing in `start-plan` holds it back, the machine has had room for 10
-#      minutes and nothing started for 5), at most one a tick. The next tick starts its worker.
+#      ticket's, it shares no hot path with a running ticket or a merge train member, nothing
+#      in `start-plan` holds it back, the machine has had room for 10 minutes and nothing
+#      started for 5), at most one a tick. The next tick starts its worker.
 #  10. `workflow-metrics`: every tick takes one sample of the machine and the sessions, from
 #      local reads only. Once a day from 07:50 UTC, once GitHub may be asked, it starts the daily
 #      run, detached: the report goes to .local/analyses/metrics-<date>.md and its findings to
@@ -208,11 +209,11 @@ list_pull_requests() {
 # said "review finished" while its pull request is still open, ready and based on main, with
 # neither a merge note nor a hand-back, broke that rule: the wake tells the orchestrator, once
 # for each session and head. GitHub is asked again, as the reviewer may have merged since the
-# snapshot.
+# snapshot. A cheaper conflict reviewer the gate sent to the usual one finished as it was told.
 note_rule_break() {
   local number=$1 folder=$main/$SHIPLINE_STATE_FOLDER state head event
   [[ ! -e $folder/merge-wanted-$number && ! -e $folder/merge-review-$number &&
-     ! -e $folder/batch-merged-$number ]] || return 0
+     ! -e $folder/batch-merged-$number && ! -e $folder/review-$number.usual-reviewer ]] || return 0
   read -r state _ head < <(gh pr view "$number" --json state,headRefName,headRefOid \
     --jq '"\(.state) \(.headRefName) \(.headRefOid)"' 9>&-) || return 1
   [[ $state == OPEN && $head =~ ^[0-9a-f]{40}$ ]] || return 0
