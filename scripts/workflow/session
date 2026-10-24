@@ -231,9 +231,18 @@ find_main_checkout() {
   fi
   # The repository, its state folder and set-up command (`workflow_config.py`), read once a
   # call: one Python start, which `list` below otherwise avoids.
-  local config
+  # Remember explicit lookup settings before the loader sets SHIPLINE_CONFIG to the
+  # selected path. A discovered checkout file must not become an installation config.
+  local config named_config=${SHIPLINE_CONFIG:-} config_home=${XDG_CONFIG_HOME:-}
+  # A leading `~` is the loader's to expand.
+  if [[ -n $config_home && $config_home != [/~]* ]]; then
+    config_home=$PWD/$config_home
+  fi
   config=$(python3 "$here/workflow_config.py" shell) || exit 1
   eval "$config"
+  session_config=()
+  [[ -z $named_config ]] || session_config+=("SHIPLINE_CONFIG=$SHIPLINE_CONFIG")
+  [[ -z $config_home ]] || session_config+=("XDG_CONFIG_HOME=$config_home")
   main=$SHIPLINE_REPO
   cd "$main"
 }
@@ -862,6 +871,7 @@ launch() {
     SHELL="${SHELL:-/bin/bash}" \
     PATH="$shipline_bin$script_dir/gh-bin:$PATH" \
     SHIPLINE_REPO="$main" \
+    "${session_config[@]}" \
     LANG="${LANG:-C.UTF-8}" \
     TERM="${TERM:-xterm-256color}" \
     XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \

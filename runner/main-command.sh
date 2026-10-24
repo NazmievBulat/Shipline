@@ -2,6 +2,8 @@
 # Runs one of the repository's own commands, `runner.<key>` of its shipline.json, on main's files
 # as last fetched (`origin/main` of its main checkout), taken into a folder of their own: a branch
 # the checkout holds, a fork's pull request among them, never runs here with Docker's rights.
+# When install.sh read an external config, pool-settings.sh records it as installation_config:
+# the command comes from that file, while its working files still come only from origin/main.
 #
 #   on_main <key> [arguments]
 #
@@ -47,11 +49,13 @@ on_main() {
       printf '%s\n' "$commit" >"$files.commit"
     fi
     command=
-    if [ -f "$files/shipline.json" ]; then
-      command=$(jq -r --arg key "$key" '.runner[$key] // empty' "$files/shipline.json")
+    config_file=${installation_config:-$files/shipline.json}
+    config_source=${installation_config:-"main's shipline.json"}
+    if [ -f "$config_file" ]; then
+      command=$(jq -r --arg key "$key" '.runner[$key] // empty' "$config_file")
     fi
     if [ -z "$command" ]; then
-      echo "main's shipline.json names no runner.$key (runner/README.md)" >&2
+      echo "$config_source names no runner.$key (runner/README.md)" >&2
       exit 1
     fi
     cd "$files"
