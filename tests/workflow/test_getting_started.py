@@ -273,6 +273,59 @@ def test_labels_that_are_all_there_need_no_right_to_create_them(workflow: Workfl
     assert not [call for call in workflow.calls("gh") if call.startswith("gh api repos/")]
 
 
+def test_labels_there_in_another_case_are_kept_and_named_for_the_config(
+    workflow: Workflow,
+) -> None:
+    """GitHub holds one label per name in any case; the tick and the gate read the names
+    shipline.json gives exactly, so a label GitHub spells otherwise is named for the file."""
+    (workflow.state / "labels").write_text("Workflow\nPriority: High\nbug\n")
+
+    done = workflow.shipline("install", str(workflow.repo))
+
+    assert done.returncode == 0, done.stderr
+    assert [call.split(" --color")[0] for call in workflow.calls("gh label create")] == [
+        "gh label create priority: blocker",
+        "gh label create priority: medium",
+        "gh label create priority: low",
+        "gh label create audited",
+    ]
+    assert done.stdout.splitlines()[:2] == [
+        'note: GitHub spells the label "workflow" as "Workflow"; the tick and the gate read'
+        ' labels by their exact names, so set labels.workflow to "Workflow" in shipline.json',
+        'note: GitHub spells the label "priority: high" as "Priority: High"; the tick and the'
+        ' gate read labels by their exact names, so set labels.priority.high to'
+        ' "Priority: High" in shipline.json',
+    ]
+
+
+def test_a_refusal_names_only_labels_missing_in_any_case(workflow: Workflow) -> None:
+    (workflow.state / "labels").write_text("WORKFLOW\npriority: High\nAudited\n")
+    (workflow.state / "no-push").touch()
+
+    done = workflow.shipline("install", str(workflow.repo))
+
+    assert done.returncode == 1
+    named = [re.search(r"gh label create (.+) --repo", line) for line in done.stderr.splitlines()]
+    assert [found[1] for found in named if found] == [
+        "priority:\\ blocker",
+        "priority:\\ medium",
+        "priority:\\ low",
+    ]
+
+
+def test_every_call_to_github_gives_up_after_30_seconds(workflow: Workflow) -> None:
+    """The timer step's own calls too: a stalled connection never hangs the install."""
+    workflow.trace_timeouts()
+    (workflow.state / "labels").write_text("")
+
+    done = workflow.shipline("install", str(workflow.repo))
+
+    assert done.returncode == 0, done.stderr
+    called = workflow.calls("gh ")
+    assert called and any(call.startswith("gh label list") for call in called[1:])
+    assert workflow.calls("timeout ") == ["timeout 30"] * len(called)
+
+
 def test_labels_that_cannot_be_read_install_nothing(workflow: Workflow) -> None:
     (workflow.state / "fail-gh-labels").touch()
     (workflow.state / "labels").write_text("")

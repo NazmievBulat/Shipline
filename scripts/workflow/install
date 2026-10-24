@@ -83,13 +83,24 @@ eval "$config"
 # gh, install-timer and install-hooks work on the repository of the folder they run in.
 cd "$SHIPLINE_REPO"
 
-# The labels, most of all, need asking before anything is changed.
+# The labels, most of all, need asking before anything is changed. GitHub holds one label per
+# name in any case, so one there in another case is there; but the tick and the gate read the
+# exact names shipline.json gives, so the owner is told to give GitHub's.
 labels=$(timeout "$GITHUB_SECONDS" gh label list --limit 1000 --json name --jq '.[].name') ||
   refuse "cannot read the labels of $SHIPLINE_REPOSITORY with gh"
+keys=(workflow audited priority.blocker priority.high priority.medium priority.low)
+names=("$SHIPLINE_LABEL_WORKFLOW" "$SHIPLINE_LABEL_AUDITED" "$SHIPLINE_PRIORITY_BLOCKER"
+  "$SHIPLINE_PRIORITY_HIGH" "$SHIPLINE_PRIORITY_MEDIUM" "$SHIPLINE_PRIORITY_LOW")
 absent=()
-for label in "$SHIPLINE_LABEL_WORKFLOW" "$SHIPLINE_LABEL_AUDITED" "$SHIPLINE_PRIORITY_BLOCKER" \
-  "$SHIPLINE_PRIORITY_HIGH" "$SHIPLINE_PRIORITY_MEDIUM" "$SHIPLINE_PRIORITY_LOW"; do
-  grep -qxF -- "$label" <<<"$labels" || absent+=("$label")
+for i in "${!names[@]}"; do
+  label=${names[i]}
+  there=$(grep -m 1 -ixF -- "$label" <<<"$labels") || there=""
+  if [[ -z $there ]]; then
+    absent+=("$label")
+  elif [[ $there != "$label" ]]; then
+    echo "note: GitHub spells the label \"$label\" as \"$there\"; the tick and the gate read" \
+      "labels by their exact names, so set labels.${keys[i]} to \"$there\" in shipline.json"
+  fi
 done
 if ((${#absent[@]} > 0)); then
   answer=$(timeout "$GITHUB_SECONDS" gh api "repos/$SHIPLINE_REPOSITORY") ||
@@ -107,7 +118,7 @@ fi
 # The priority labels, described as the priority rule in RULES.md describes them.
 create_priority() {
   local name=$1 color=$2 description=$3
-  grep -qxF -- "$name" <<<"$labels" ||
+  grep -qixF -- "$name" <<<"$labels" ||
     timeout "$GITHUB_SECONDS" gh label create "$name" --color "$color" --description "$description"
 }
 create_priority "$SHIPLINE_PRIORITY_BLOCKER" B60205 \

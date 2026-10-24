@@ -69,7 +69,8 @@ reads to know what CI tested. The sessions read their rules from `AGENTS.md` on 
 ```
 
 This creates the labels `workflow`, `audited` and the four priority labels on GitHub, when
-they are missing. It adds the hooks the sessions report through to `~/.claude/settings.json`.
+they are missing. A label already there in another case counts; then it says to spell it in
+`shipline.json` as GitHub does. It adds the hooks the sessions report through to `~/.claude/settings.json`.
 Last, it writes a systemd user timer, `workflow-tick`, that runs the tick on your repository
 every 3 minutes, and starts it. It links `~/.local/bin/shipline` to Shipline's launcher; keep
 `~/.local/bin` on your `PATH`.
