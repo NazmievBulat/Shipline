@@ -1,0 +1,114 @@
+[
+ {
+  "id": 201,
+  "name": "CI",
+  "path": ".github/workflows/ci.yml",
+  "event": "pull_request",
+  "head_branch": "ticket/example",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
+  "status": "completed",
+  "conclusion": "success",
+  "created_at": "2026-10-24T01:00:00Z",
+  "run_started_at": "2026-10-24T01:00:00Z",
+  "updated_at": "2026-10-24T01:12:00Z",
+  "run_attempt": 1
+ },
+ {
+  "id": 202,
+  "name": "CI",
+  "path": ".github/workflows/ci.yml",
+  "event": "pull_request",
+  "head_branch": "ticket/example",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
+  "status": "completed",
+  "conclusion": "failure",
+  "created_at": "2026-10-24T02:00:00Z",
+  "run_started_at": "2026-10-24T02:00:00Z",
+  "updated_at": "2026-10-24T02:20:00Z",
+  "run_attempt": 1
+ },
+ {
+  "id": 203,
+  "name": "CI",
+  "path": ".github/workflows/ci.yml",
+  "event": "pull_request",
+  "head_branch": "ticket/example",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
+  "status": "completed",
+  "conclusion": "cancelled",
+  "created_at": "2026-10-24T03:00:00Z",
+  "run_started_at": "2026-10-24T03:00:00Z",
+  "updated_at": "2026-10-24T03:04:00Z",
+  "run_attempt": 1
+ },
+ {
+  "id": 204,
+  "name": "E2E",
+  "path": ".github/workflows/e2e.yml",
+  "event": "pull_request",
+  "head_branch": "ticket/example",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
+  "status": "completed",
+  "conclusion": "success",
+  "created_at": "2026-10-24T04:00:00Z",
+  "run_started_at": "2026-10-24T04:00:00Z",
+  "updated_at": "2026-10-24T04:30:00Z",
+  "run_attempt": 1
+ },
+ {
+  "id": 205,
+  "name": "CI",
+  "path": ".github/workflows/ci.yml",
+  "event": "pull_request",
+  "head_branch": "ticket/example",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
+  "status": "in_progress",
+  "conclusion": null,
+  "created_at": "2026-10-24T07:40:00Z",
+  "run_started_at": "2026-10-24T07:40:00Z",
+  "updated_at": "2026-10-24T07:45:00Z",
+  "run_attempt": 1
+ },
+ {
+  "id": 206,
+  "name": "CI",
+  "path": ".github/workflows/ci.yml",
+  "event": "pull_request",
+  "head_branch": "ticket/example",
+  "head_repository": {
+   "full_name": "example-fork/example-app"
+  },
+  "status": "completed",
+  "conclusion": "success",
+  "created_at": "2026-10-24T05:00:00Z",
+  "run_started_at": "2026-10-24T05:00:00Z",
+  "updated_at": "2026-10-24T05:50:00Z",
+  "run_attempt": 1
+ },
+ {
+  "id": 207,
+  "name": "CI",
+  "path": ".github/workflows/ci.yml",
+  "event": "pull_request",
+  "head_branch": "ticket/example",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
+  "status": "completed",
+  "conclusion": "success",
+  "created_at": "2026-10-22T05:00:00Z",
+  "run_started_at": "2026-10-22T05:00:00Z",
+  "updated_at": "2026-10-22T05:50:00Z",
+  "run_attempt": 1
+ }
+]
