@@ -6453,7 +6453,7 @@ def test_a_stalled_head_check_lets_the_merge_lock_go_within_seconds(github: GitH
         "git",
         "#!/bin/bash\n"
         f'if [ -e "{workflow.state}/stall" ] && [ "$1" = ls-remote ] '
-        '&& [ "$3" = refs/heads/ticket/seven ]; then exec /usr/bin/sleep 600; fi\n'
+        '&& [[ " $* " == *" refs/heads/ticket/seven "* ]]; then exec /bin/sleep 600; fi\n'
         f'exec "{real}" "$@"\n',
     )
     _after_the_checks(workflow, f": > '{workflow.state}/stall'")
@@ -6464,8 +6464,9 @@ def test_a_stalled_head_check_lets_the_merge_lock_go_within_seconds(github: GitH
     assert "could not confirm the head; try again" in done.stderr
     assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
     assert "7" not in _waiting(workflow)
+    # It waited out the check's own time limit, and no more.
     held = _held(workflow)
-    assert len(held) == 1 and held[0] < 15, held
+    assert len(held) == 1 and 9 < held[0] < 15, held
 
 
 def _budget(workflow: Workflow) -> Path:
@@ -6485,10 +6486,13 @@ def test_a_budget_spent_after_the_checks_does_not_hold_the_merge_lock(github: Gi
         f"""echo '{{"core": {{"remaining": 0, "reset": '$(( $(date +%s) + 10 ))'}}}}' """
         f"""> '{budget}/budget.json'""",
     )
+    started = time.monotonic()
 
     done = _hand_off(github)
 
     assert done.returncode == 0, done.stdout + done.stderr
+    # It waited for the budget, before the lock.
+    assert "GitHub budget low" in done.stderr and time.monotonic() - started > 8
     held = _held(workflow)
     assert len(held) == 1 and held[0] < 5, held
 
@@ -6513,11 +6517,63 @@ def test_busy_gh_call_slots_do_not_hold_the_merge_lock(github: GitHub) -> None:
     _after_the_checks(
         workflow,
         f"python3 '{holder}' '{budget}' '{ready}' </dev/null >/dev/null 2>&1 &\n"
-        f"while [ ! -e '{ready}' ]; do /usr/bin/sleep 0.05; done",
+        f"while [ ! -e '{ready}' ]; do /bin/sleep 0.05; done",
     )
+    started = time.monotonic()
 
     done = _hand_off(github)
 
     assert done.returncode == 0, done.stdout + done.stderr
+    # It waited for a slot, before the lock.
+    assert time.monotonic() - started > 8
     held = _held(workflow)
     assert len(held) == 1 and held[0] < 5, held
+
+
+@pytest.mark.parametrize("meanwhile", ["nothing", "draft"])
+def test_a_read_made_old_by_a_long_wait_for_the_lock_is_made_again(
+    github: GitHub, meanwhile: str
+) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    holder = workflow.state / "lock-holder.py"
+    # Another gate holds the merge lock for 7 s, from just after the handoff's checks. Once the
+    # handoff has read its pull request before the lock, it may turn draft on GitHub.
+    holder.write_text(
+        "import fcntl, json, sys, time\n"
+        "from pathlib import Path\n"
+        "state, lock, draft = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3] == 'draft'\n"
+        "held = lock.open('w')\n"
+        "fcntl.flock(held, fcntl.LOCK_EX)\n"
+        "(state / 'lock-taken').touch()\n"
+        "started = time.monotonic()\n"
+        "while draft and (state / 'calls.log').read_text().count('gh pr view 7 ') < 2:\n"
+        "    time.sleep(0.05)\n"
+        "if draft:\n"
+        "    data = json.loads((state / 'github.json').read_text())\n"
+        "    data['pulls']['7']['isDraft'] = True\n"
+        "    (state / 'github.json').write_text(json.dumps(data))\n"
+        "time.sleep(max(0, 7 - (time.monotonic() - started)))\n"
+    )
+    lock = workflow.repo / ".local/workflow/merge.lock"
+    _after_the_checks(
+        workflow,
+        f"python3 '{holder}' '{workflow.state}' '{lock}' '{meanwhile}' "
+        "</dev/null >/dev/null 2>&1 &\n"
+        f"while [ ! -e '{workflow.state}/lock-taken' ]; do /bin/sleep 0.05; done",
+    )
+
+    done = _hand_off(github)
+
+    # Its pull request is read again once the lock is free, and judged by that read.
+    assert len(workflow.calls("gh pr view 7 ")) == 3
+    if meanwhile == "draft":
+        assert done.returncode == 1, done.stdout + done.stderr
+        assert "only a ready, non-conflicting pull request can be handed off" in done.stderr
+        assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+        assert "7" not in _waiting(workflow)
+    else:
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+        assert _waiting(workflow) == ["7"]
+    assert all(held < 5 for held in _held(workflow))
