@@ -36,6 +36,13 @@
     "prefix": "example-app",
     "image_build": "tools/shipline/build-runner-images"
   },
+  "hunts": {
+    "areas": {
+      "phone": ["/calls", "/contacts"],
+      "billing": ["/invoices", "/settings/billing"]
+    },
+    "plans": "docs/hunt-plans.md"
+  },
   "commands": {
     "test": "tools/run-tests"
   }

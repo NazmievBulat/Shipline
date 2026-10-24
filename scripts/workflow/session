@@ -18,10 +18,13 @@
 #                               medium for a worker, high for an audit; reviewers always use high
 #                               model: opus, sonnet, codex or cloud for workers; the owner's Claude
 #                               default when omitted. Audits and reviewers always use opus.
-#   session start hunt <name> [plan|explore] [claude|codex|cursor]
+#   session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>]
 #                               name: small letters, digits and dashes; it names the report.
-#                               When left out, a hunt with a plan, by Claude Code. One hunt
-#                               runs at a time.
+#                               When left out, a hunt with a plan, by Claude Code, on every
+#                               screen. The area, one of `hunts.areas` in shipline.json, comes
+#                               last, after the kind and the program. A hunt on every screen
+#                               runs alone; two hunts run at once only each in its own area, and
+#                               never three. With no areas configured, one hunt runs at a time.
 #   session start analyst <name> [1-7]
 #                               name: as a hunt's; it names the report. The number is the days
 #                               of logs it reads, 1 when left out. By Claude Opus at medium
@@ -100,8 +103,10 @@ HUNT_EFFORT=high
 # command, so it has no quotation mark, dollar, backtick or backslash.
 RULES_ON_MAIN="by the rules of AGENTS.md as it is on main, not the copy in this worktree; read them with: git fetch origin main && git show origin/main:AGENTS.md"
 
-# The end of the sentence a hunt is started with. Its worktree is the commit it hunts, so the
-# copy of AGENTS.md there is the right one. No quotation mark, dollar, backtick or backslash.
+# The end of the first sentence a hunt is started with. Its worktree is the commit it hunts, so
+# the copy of AGENTS.md there is the right one. What follows it (the plans file, the area and its
+# screens) is checked by `workflow_config.py`. No double quotation mark, dollar, backtick or
+# backslash.
 HUNT_RULES="by the section Hunt for bugs of AGENTS.md in this worktree"
 # What a hunt is a copy of. Another commit can be named to try a hunt before the scripts it
 # needs are on `main`.
@@ -134,7 +139,7 @@ CLAUDE_TMP_ROOT=${WORKFLOW_CLAUDE_TMP_ROOT:-/tmp/claude-$(id -u)}
 usage() {
   cat >&2 <<'EOF'
 usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus|sonnet|codex|cloud]
-       session start hunt <name> [plan|explore] [claude|codex|cursor]
+       session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>]
        session start analyst <name> [1-7]
        session list
        session load
@@ -241,11 +246,11 @@ list_worktrees() {
 }
 
 # What a session leaves in its worktree: its link, and the marks `notify` keeps (idle, waiting
-# for its own job, the last message the phone rang for, when a hunt started, the limit after
-# which its instruction was sent again, the reset of the limit it said it stopped on). None of
-# it is true of the next session.
+# for its own job, the last message the phone rang for, when a hunt started and its area, the
+# limit after which its instruction was sent again, the reset of the limit it said it stopped
+# on). None of it is true of the next session.
 forget_notes() {
-  rm -f "$1.url" "$1.idle" "$1.waiting" "$1.pushed" "$1.started" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.checks-wait" "$1.job-wait"
+  rm -f "$1.url" "$1.idle" "$1.waiting" "$1.pushed" "$1.started" "$1.area" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.checks-wait" "$1.job-wait"
   if [[ ${2:-} != keep-codex ]]; then
     rm -f "$1.codex" "$1.asking" "$1.resent" "$1.codex-delivered" "$1.codex-answered" "$1.codex-followed-up" "$1.codex-quota-delivered" "$1.codex-approval-delivered" "$1.codex-recovery-error" "$1.owner-reply"
   fi
@@ -587,7 +592,8 @@ cmd_start() {
     if [[ $kind =~ ^(review|audit)$ ]]; then
       touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
       rm -f "$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-"* \
-        "$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-"* "$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-"*
+        "$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-"* "$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-"* \
+        "$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-"*
     fi
     save_link "$name" "$worktree"
     if [[ $kind == review ]]; then
@@ -752,12 +758,55 @@ prepare_hunt_worktree() {
   ) >&2
 }
 
+# The screens of a configured area, joined with commas. Fails for any other word.
+screens_of() {
+  local i
+  for i in "${!SHIPLINE_HUNT_AREAS[@]}"; do
+    [[ ${SHIPLINE_HUNT_AREAS[i]} != "$1" ]] || { echo "${SHIPLINE_HUNT_SCREENS[i]}"; return 0; }
+  done
+  return 1
+}
+
+# Whether one more hunt, on the area given or on every screen when none is, may start beside
+# the hunts that run. Called under the start lock, so the areas of those hunts are all noted.
+check_room_for_hunt() {
+  local area=$1 other_area="" others
+  mapfile -t others < <(list_running | grep '^hunt-')
+  ((${#others[@]})) || return 0
+  # Without areas each hunt hunts every screen, and runs alone.
+  ((${#SHIPLINE_HUNT_AREAS[@]})) || die "${others[0]} is still running; one hunt runs at a time"
+  ((${#others[@]} < 2)) ||
+    die "${others[0]} and ${others[1]} are still running; two hunts run at most"
+  read -r other_area 2>/dev/null \
+    <"$(worktree_of "${others[0]}")/$SHIPLINE_STATE_FOLDER/${others[0]}.area" || true
+  [[ -n $other_area ]] ||
+    die "${others[0]} hunts every screen; a second hunt starts only beside one with an area"
+  [[ -n $area && $area != "$other_area" ]] ||
+    die "${others[0]} hunts area $other_area; a second hunt must name another area"
+}
+
 cmd_start_hunt() {
-  local hunt=$1 kind=$2 program=$3 name="hunt-$1" prompt worktree report other command label
+  local hunt=$1 kind=$2 program=$3 area=$4 name="hunt-$1" prompt worktree report command label
+  local screens
   case $kind in
     plan) prompt="Hunt for bugs with a plan, as $name, $HUNT_RULES" ;;
     explore) prompt="Hunt for bugs exploring, as $name, $HUNT_RULES" ;;
   esac
+  [[ $kind != plan || -z $SHIPLINE_HUNT_PLANS ]] ||
+    prompt+=". The plans are in $SHIPLINE_HUNT_PLANS."
+  if [[ -n $area ]]; then
+    if ! screens=$(screens_of "$area"); then
+      ((${#SHIPLINE_HUNT_AREAS[@]})) ||
+        die "$area is not a hunt area: shipline.json names none under hunts.areas"
+      die "$area is not a hunt area: shipline.json names ${SHIPLINE_HUNT_AREAS[*]}" \
+        "under hunts.areas"
+    fi
+    [[ $prompt == *. ]] || prompt+=.
+    prompt+=" Your area is $area: $screens."
+    prompt+=" Stay off the other areas' screens except to pass through them"
+    [[ $kind != plan ]] || prompt+=", and take only the plan's tasks marked $area"
+    prompt+=.
+  fi
 
   cmd_cleanup
 
@@ -768,9 +817,9 @@ cmd_start_hunt() {
   exec 8>"$main/$SHIPLINE_STATE_FOLDER/start-hunt.lock"
   flock --nonblock 8 || die "the start of another hunt is under way"
 
-  # A hunt runs a browser and a copy of the application beside its model.
-  other=$(list_running | grep -m 1 '^hunt-') || true
-  [[ -z $other ]] || die "$other is still running; one hunt runs at a time"
+  # A hunt runs a browser and a copy of the application beside its model, and two hunts over the
+  # same screens would report the same bugs twice.
+  check_room_for_hunt "$area"
   report=$(report_of "$name")
   [[ ! -e $report ]] || die "a hunt named $hunt has a report already, in $report"
 
@@ -792,6 +841,7 @@ cmd_start_hunt() {
       label=Codex
     fi
     launch "$name" "$worktree" "$command" "WORKFLOW_HUNT_REPORT=$report"
+    note_area "$name" "$worktree" "$area"
     # A hunter that cannot run (not signed in, a wrong option) ends within a moment, and `tmux`
     # shows its session until then.
     for _ in 1 2 3; do
@@ -812,6 +862,7 @@ cmd_start_hunt() {
     launch "$name" "$worktree" \
       "claude --effort $HUNT_EFFORT --add-dir $report --remote-control $name \"$prompt\"" \
       "WORKFLOW_HUNT_REPORT=$report"
+    note_area "$name" "$worktree" "$area"
     touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
     if ! wait_for_link "$name"; then
       stop_session "$name"
@@ -822,6 +873,12 @@ cmd_start_hunt() {
     protect_hunt "$name"
     echo "$name started: $link"
   fi
+}
+
+# The area a hunt keeps to, for the next start to read. Written after `launch`, which forgets
+# old notes, and under the start lock. A hunt on every screen has none.
+note_area() {
+  [[ -z $3 ]] || echo "$3" >"$2/$SHIPLINE_STATE_FOLDER/$1.area"
 }
 
 # A refusal for a reason that passes, before anything was made: exit 75, as a start deferred for
@@ -1526,11 +1583,13 @@ case ${1:-} in
       set -- "$1" "$2" "$3" "$WORKER_EFFORT" cloud
     fi
     if [[ ${2:-} == hunt ]]; then
-      [[ $# -ge 3 && $# -le 5 ]] && is_hunt_name "$3" || usage
+      [[ $# -ge 3 && $# -le 6 ]] && is_hunt_name "$3" || usage
       [[ $# -lt 4 || $4 =~ ^(plan|explore)$ ]] || usage
       [[ $# -lt 5 || $5 =~ ^(claude|codex|cursor)$ ]] || usage
+      # An area has the form of a name; whether it is one is read from shipline.json.
+      [[ $# -lt 6 ]] || is_hunt_name "$6" || usage
       find_main_checkout
-      cmd_start_hunt "$3" "${4:-plan}" "${5:-claude}"
+      cmd_start_hunt "$3" "${4:-plan}" "${5:-claude}" "${6:-}"
       exit 0
     fi
     if [[ ${2:-} == analyst ]]; then
