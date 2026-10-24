@@ -3,15 +3,21 @@ calls it as `shipline <command>` and keeps none of its scripts. Every script fin
 beside itself; the repository is the main checkout `--repo` or `SHIPLINE_REPO` names, else the
 one the current directory is in."""
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
 import pytest
-from test_merge_when_current import GitHub, github  # noqa: F401  (the gate's stand-in)
+from test_merge_when_current import (  # noqa: F401  (the gate's stand-in)
+    GitHub,
+    _two_stale_pulls,
+    github,
+)
 from workflow_harness import Workflow, install_shipline, instruction, session_arguments
 
 _SHIPLINE = Path(__file__).resolve().parents[2]
@@ -420,3 +426,85 @@ def test_the_link_is_pointed_at_this_checkout_and_a_file_of_the_owner_is_left_al
     assert done.returncode == 0, done.stderr
     assert link.read_text() == "#!/bin/sh\necho mine\n"
     assert f"{link} is not a link to Shipline; it was left as it is" in done.stderr
+
+
+# The SHA-256 of each sentence that names a command, as the scripts wrote it when the scripts
+# were in the repository and the sentence named the command by its path there.
+_SENTENCES_BEFORE = {
+    "status check": "3e8d5f12c6bdb570b59ceddfe8f2125e3fdade3efa60145fdfab708ddd9aa3e7",
+    "train wait": "f0a253050d62873459e22be5ac48a72322b68bf89e4b5a1d1463e5d0c480e8c9",
+}
+# What changed in them: the command's path became `shipline <command>`.
+_COMMAND_PATHS = {"shipline notify waiting": "scripts/workflow/notify waiting"}
+
+
+def _as_before(sentence: str) -> str:
+    for now, before in _COMMAND_PATHS.items():
+        sentence = sentence.replace(now, before)
+    return sentence
+
+
+def _status_check(workflow: Workflow) -> str:
+    """The sentence a session waiting for its own job is asked whether the wait is over with."""
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    box = "─" * 40 + "\n> \n" + "─" * 40 + "\n"
+    workflow.screen("● Waiting for the full Python run in the background.\n" + box, "ticket-7")
+    workflow.notes(7).mkdir(parents=True, exist_ok=True)
+    (workflow.notes(7) / "ticket-7.idle").write_text("\n")
+    done = workflow.shipline("session", "status-check", "ticket-7")
+    assert done.returncode == 0, done.stderr
+    prefix = "tmux ticket-7 send-keys -t =ticket-7: -l "
+    [typed] = [call.removeprefix(prefix) for call in workflow.calls(prefix)]
+    return typed
+
+
+def _train_wait(github: GitHub) -> str:  # noqa: F811
+    """The line the gate tells a pull request behind the train's first with."""
+    second = _two_stale_pulls(github)
+    assert github.run().returncode == 2
+    waiting = github.workflow.shipline("merge-when-current", "8", cwd=second)
+    assert waiting.returncode == 3, waiting.stdout + waiting.stderr
+    [line] = [line for line in waiting.stdout.splitlines() if "waits behind" in line]
+    return line
+
+
+def test_each_sentence_is_as_before_with_only_the_command_paths_changed(
+    github: GitHub,  # noqa: F811
+) -> None:
+    sentences = {"status check": _status_check(github.workflow), "train wait": _train_wait(github)}
+
+    for name, sentence in sentences.items():
+        assert "shipline notify waiting" in sentence, name
+        assert "scripts/workflow" not in sentence, name
+    assert {
+        name: hashlib.sha256(_as_before(sentence).encode()).hexdigest()
+        for name, sentence in sentences.items()
+    } == _SENTENCES_BEFORE
+
+
+def test_the_rules_name_each_command_as_shipline_command() -> None:
+    commands = _launched_commands()
+    for document in ("RULES.md", "weaker-tests.md"):
+        text = (_WORKFLOW / document).read_text()
+
+        # A command by its path; `scripts/workflow/ticket_starts.py` names a file, not `tick`.
+        by_path = [
+            name for name in commands if re.search(rf"scripts/workflow/{name}(?![\w.-])", text)
+        ]
+        assert by_path == [], document
+        assert "git-common-dir" not in text, document
+        assert set(re.findall(r"shipline ([a-z-]+)", text)) <= set(commands), document
+    rules = (_WORKFLOW / "RULES.md").read_text()
+    assert set(re.findall(r"`shipline ([a-z-]+)", rules)) == {
+        "install-hooks",
+        "install-timer",
+        "merge-when-current",
+        "notify",
+        "review-panel",
+        "session",
+        "tick",
+        "ticket-files",
+        "wake",
+        "weaker-tests",
+    }

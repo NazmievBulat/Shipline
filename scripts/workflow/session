@@ -1144,7 +1144,7 @@ cmd_nudge_idle() {
   if [[ $kind == status ]]; then
     [[ ! -e $notes.asking ]] || die "$name is waiting for the owner"
     [[ -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]] || die "$name is busy"
-    send_prompt "$name" "Status check: if what you were waiting for is done, carry on; if not, run \`scripts/workflow/notify waiting\` and end your turn."
+    send_prompt "$name" "Status check: if what you were waiting for is done, carry on; if not, run \`shipline notify waiting\` and end your turn."
     return
   fi
   [[ -e $notes.idle ]] || die "$name is busy"

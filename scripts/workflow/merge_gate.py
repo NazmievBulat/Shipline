@@ -3669,7 +3669,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             reason = f"behind {train.first}" if train.first else "for main to change"
             print(
                 f"merge train: pull request {number} waits {reason}; "
-                "run scripts/workflow/notify waiting and end the turn; the tick wakes you",
+                "run shipline notify waiting and end the turn; the tick wakes you",
                 flush=True,
             )
             command("bash", str(HERE / "notify"), "waiting")
