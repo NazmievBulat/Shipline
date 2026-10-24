@@ -37,8 +37,9 @@ Some differences follow from what a shadow tick does not run, and are explained 
 for a new turn of the merge line or a new state of main, which the real tick's own reconcile
 and report refresh make in the same tick (the shadow tick reads the line and the report as the
 tick before left them); and a check-in that tells the orchestrator of a hand-back, a cloud
-worker's report or an analyst's report the real tick noted in the same tick. The wake log is the machine's, one for
-every repository on it: compare a run on a machine that works on one repository only.
+worker's report or an analyst's report the real tick noted in the same tick. The wake log is
+the machine's, one for every repository on it: compare a run on a machine that works on one
+repository only.
 
 Each difference is printed with both versions, the decision of the same session or of the wake
 paired when both sides took one, `(nothing)` for the side that took none. The last line counts
