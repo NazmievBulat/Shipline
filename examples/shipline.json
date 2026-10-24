@@ -35,5 +35,8 @@
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app",
     "image_build": "tools/shipline/build-runner-images"
+  },
+  "commands": {
+    "test": "tools/run-tests"
   }
 }

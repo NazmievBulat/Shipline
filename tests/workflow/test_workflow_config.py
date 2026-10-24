@@ -66,6 +66,8 @@ _DEFAULTS = {
         "prefix": None,
         "image_build": None,
     },
+    # A repository names its own; CI's test job fails without one (ci_proof.py).
+    "commands": {"test": None},
 }
 
 
@@ -352,6 +354,8 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"repository": "../example-app"}', "repository"),
         ('{"checks": {"ci_result": ""}}', "checks.ci_result"),
         ('{"checks": "CI result"}', "checks"),
+        ('{"commands": {"test": ""}}', "commands.test"),
+        ('{"commands": {"test": ["pytest"]}}', "commands.test"),
         ('{"runner": {"labels": "home"}}', "runner.labels"),
         ('{"state_folder": "/var/workflow"}', "state_folder"),
         ('{"state_folder": "../workflow"}', "state_folder"),
