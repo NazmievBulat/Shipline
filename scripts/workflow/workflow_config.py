@@ -12,10 +12,10 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix; no machines named, so `flow-page` samples only the machine it runs on; the
-workflow and runner tests `tools/parity` compares are in `tests/workflow` and `tests/runner`,
-and it knows of no differences; no hunt areas, so one hunt runs at a time, and no hunt plans
-file; no test command, which a repository names for its CI's test job (`ci_proof.py test`).
+runner prefix; the workflow and runner tests `tools/parity` compares are in `tests/workflow` and
+`tests/runner`, and it knows of no differences; no machines named, so `flow-page` samples only
+the machine it runs on; no hunt areas, so one hunt runs at a time, and no hunt plans file; no
+test command, which a repository names for its CI's test job (`ci_proof.py test`).
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -83,12 +83,12 @@ DEFAULTS: dict[str, Any] = {
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
     },
-    # The machines `flow-page` samples, each a name and, for another machine, the address `ssh`
-    # reaches it at; one without an address is this machine. None named: only this machine.
-    "machines": [],
     # What `tools/parity` reads of a repository that keeps its own copy of the scripts: where its
     # workflow and runner tests are, and the file that lists the differences it expects.
     "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
+    # The machines `flow-page` samples, each a name and, for another machine, the address `ssh`
+    # reaches it at; one without an address is this machine. None named: only this machine.
+    "machines": [],
     "hunts": {
         # Each area of the application a hunt may keep to: its name and the screens (paths) it
         # covers. With none, a hunt hunts every screen and runs alone (`session start hunt`).
@@ -169,17 +169,17 @@ class Runner:
 
 
 @dataclass(frozen=True)
-class Machine:
-    name: str
-    # None for this machine.
-    address: str | None = None
-
-
-@dataclass(frozen=True)
 class Parity:
     workflow_tests: str
     runner_tests: str
     known: str | None = None
+
+
+@dataclass(frozen=True)
+class Machine:
+    name: str
+    # None for this machine.
+    address: str | None = None
 
 
 @dataclass(frozen=True)
@@ -206,8 +206,8 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
-    machines: tuple[Machine, ...]
     parity: Parity
+    machines: tuple[Machine, ...]
     hunts: Hunts
     commands: Commands
     # The file as it was read, without the defaults: `{}` when there is none.
@@ -461,8 +461,8 @@ def load(start: Path | None = None) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
-        machines=tuple(Machine(**machine) for machine in values["machines"]),
         parity=parity_of(given),
+        machines=tuple(Machine(**machine) for machine in values["machines"]),
         hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
         commands=Commands(**values["commands"]),
         given=given,
@@ -510,11 +510,11 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
         },
+        "parity": vars(config.parity).copy(),
         "machines": [
             {"name": machine.name, **({"address": machine.address} if machine.address else {})}
             for machine in config.machines
         ],
-        "parity": vars(config.parity).copy(),
         "hunts": {
             "areas": {area: list(screens) for area, screens in config.hunts.areas.items()},
             "plans": config.hunts.plans,
