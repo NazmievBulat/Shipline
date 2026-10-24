@@ -41,6 +41,8 @@ _DEFAULTS = {
         "ci_plan": "CI: what to run",
         "e2e_plan": "E2E: what to run",
         "images": "Docker images",
+        "dependency_audit": None,
+        "advisory_annotation": None,
     },
     "annotations": {
         "merge_tested": "Merge tested",
@@ -208,6 +210,22 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
 
     _write(repo, {"runner": {"prefix": ""}})
     with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be a name"):
+        workflow_config.load(repo)
+
+
+def test_the_dependency_audit_and_its_advisory_annotation_are_read(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {"dependency_audit": "Audit", "advisory_annotation": "Advisory"}})
+
+    checks = workflow_config.load(repo).checks
+    assert (checks.dependency_audit, checks.advisory_annotation) == ("Audit", "Advisory")
+
+    _write(repo, {"checks": {"dependency_audit": "Audit"}})
+    checks = workflow_config.load(repo).checks
+    assert (checks.dependency_audit, checks.advisory_annotation) == ("Audit", None)
+
+    _write(repo, {"checks": {"advisory_annotation": ""}})
+    with pytest.raises(workflow_config.ConfigError, match="checks.advisory_annotation must be"):
         workflow_config.load(repo)
 
 
@@ -1344,7 +1362,7 @@ def test_the_gate_reads_the_named_checks_titles_workflow_files_and_runner_labels
             "shipline.json": json.dumps(
                 {
                     "annotations": {key: named[key] for key in _DEFAULTS["annotations"]},
-                    "checks": {key: named[key] for key in _DEFAULTS["checks"]},
+                    "checks": {key: named[key] for key in _DEFAULTS["checks"] if key in named},
                     "workflows": {"images": "container.yml"},
                     "runner": {"labels": ["example-app-elsewhere"]},
                 }
