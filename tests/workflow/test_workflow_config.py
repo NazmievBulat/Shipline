@@ -89,6 +89,7 @@ _DEFAULTS = {
             "push_checkout",
         )
     },
+    "review": {"high_effort_paths": []},
     "answer_for_owner_after_minutes": 15,
     "cloud_wake_after_minutes": 30,
 }
@@ -197,6 +198,15 @@ def test_the_cloud_wake_wait_is_a_whole_number_of_minutes(tmp_path: Path, minute
     _write(repo, {"cloud_wake_after_minutes": minutes})
 
     assert workflow_config.load(repo).cloud_wake_after_minutes == minutes
+
+
+@pytest.mark.parametrize("paths", [["("], "^db/", [""], [3]])
+def test_review_paths_must_be_a_list_of_regular_expressions(tmp_path: Path, paths: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"review": {"high_effort_paths": paths}})
+
+    with pytest.raises(workflow_config.ConfigError, match="review.high_effort_paths"):
+        workflow_config.load(repo)
 
 
 def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:

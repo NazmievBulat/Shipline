@@ -18,7 +18,13 @@ runner tests `tools/parity` compares are in `tests/workflow` and `tests/runner`,
 no differences; no machines named, so `flow-page` samples only the machine it runs on; no hunt
 areas, so one hunt runs at a time, and no hunt plans file; no test command, which a repository
 names for its CI's test job (`ci_proof.py test`); a question to the owner marked `Owner only: no`
-gets its recommended reply after 15 minutes; a quiet cloud worker is woken after 30 minutes.
+gets its recommended reply after 15 minutes; a quiet cloud worker is woken after 30 minutes; no
+paths that call for a closer review.
+
+`review.high_effort_paths` are regular expressions, each searched for in every path a pull
+request changes: a match runs its independent reviewer at high effort, not medium
+(`review-effort`). A repository names there what it stores, what its models read, its
+background work, locks and queues, and its account boundaries and security.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -133,6 +139,7 @@ DEFAULTS: dict[str, Any] = {
         # The repository's file of hunt plans, which a hunt with a plan is told of.
         "plans": None,
     },
+    "review": {"high_effort_paths": []},
     # Minutes a question to the owner marked `Owner only: no` waits before the tick types its
     # recommended reply; 0 turns that off.
     "answer_for_owner_after_minutes": 15,
@@ -254,6 +261,11 @@ RUN_AS_WORDS = tuple(name for name in DEFAULTS["commands"] if name != "test")
 
 
 @dataclass(frozen=True)
+class Review:
+    high_effort_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Config:
     # None when nothing names it: an error only for a script that needs it.
     found_repository: str | None
@@ -268,6 +280,7 @@ class Config:
     machines: tuple[Machine, ...]
     hunts: Hunts
     commands: Commands
+    review: Review
     answer_for_owner_after_minutes: int
     cloud_wake_after_minutes: int
     # The file as it was read, without the defaults: `{}` when there is none.
@@ -480,6 +493,17 @@ def _plans(value: str | None) -> str | None:
     return value
 
 
+def _patterns(values: list[str], name: str) -> tuple[str, ...]:
+    for value in values:
+        try:
+            re.compile(value)
+        except re.error as error:
+            raise ConfigError(
+                f"{FILE}: {name} must be regular expressions, not {json.dumps(value)}: {error}"
+            ) from None
+    return tuple(values)
+
+
 def _from_runner_settings(main: Path) -> str | None:
     """The `repository` Bash reads from the runner settings, as `tick` and the Codex worker's
     `gh` read it when they sourced the file: in a `bash` of its own, with only PATH and HOME,
@@ -613,6 +637,11 @@ def load(start: Path | None = None) -> Config:
         machines=tuple(Machine(**machine) for machine in values["machines"]),
         hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
         commands=Commands(**values["commands"]),
+        review=Review(
+            high_effort_paths=_patterns(
+                values["review"]["high_effort_paths"], "review.high_effort_paths"
+            )
+        ),
         answer_for_owner_after_minutes=values["answer_for_owner_after_minutes"],
         cloud_wake_after_minutes=values["cloud_wake_after_minutes"],
         given=given,
@@ -674,6 +703,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "plans": config.hunts.plans,
         },
         "commands": vars(config.commands).copy(),
+        "review": {"high_effort_paths": list(config.review.high_effort_paths)},
         "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
         "cloud_wake_after_minutes": config.cloud_wake_after_minutes,
     }

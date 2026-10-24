@@ -278,7 +278,7 @@ route list. With an empty diff it judges the description conservatively; an uncl
 stays with Claude. A sent-back ticket with a `codex-built-N` marker gets Codex for its fix round regardless of the default program, using the same screen exclusions above, which still get Claude.
 A ticket whose description has the line `Worker: Codex (a bug fix with no new UI)` on its own
 is eligible for Codex whatever its diff or its words, its fix rounds included. Only the
-orchestrator writes that line.
+orchestrator writes that line, with `shipline decide program N codex`.
 
 Read the task, including any `Answers given for the owner`. Put unanswered product decisions
 under `Questions for the owner` in the description, recommendation first, and ask in the bridge
@@ -363,7 +363,12 @@ N" with these differences:
 
 ## "Review pull request N"
 
-A fresh context, always Claude Opus at high effort, started by `session start review N`.
+A fresh context, always Claude Opus, started by `session start review N`. It runs at medium
+effort, and at high when the change touches a path `review.high_effort_paths` of
+`shipline.json` names (stored data, text sent to a model, background work, locks and queues,
+account boundaries and security) or one of Shipline's own concurrent scripts, or when the
+description has the line `Review: high` on its own; `review-effort N` says which and why, and
+says high whenever it cannot tell.
 It knows only the description (the task), diff against the base, commits, code and rules
 from main. Do not read worker logs, transcripts, own reviews or ask the worker for a handover.
 Local `.local/workflow` session files are control notes, not review evidence. Panel reports
@@ -427,8 +432,9 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
    If that round still finds problems, stop and ask the owner in text instead of continuing
    to fix or send back silently. Keep the session open without either completion line.
    A restart does not reset the count: read the published reviews. After the owner authorizes another round, the
-   orchestrator writes its number to `.local/workflow/review-N.allow-round` in the main
-   checkout. This permits that exact round only. Record the authorization with its review.
+   orchestrator records it with `shipline decide allowance N --round R --owner "<his words>"`, which
+   writes its number to `.local/workflow/review-N.allow-round` in the main checkout. This
+   permits that exact round only. Record the authorization with its review.
 5. Ask product decisions in text, recommendation first, with the `Owner only:` line of
    "Asking the owner". A job longer than this pull request
    becomes a draft ticket as in audit step 5, without the label `workflow`. No question or
@@ -760,6 +766,26 @@ Each message and line is logged in `~/.local/state/workflow/wake.log`.
 
 The orchestrator session does what needs judgment:
 
+- Every decision of these kinds goes through `shipline decide`, never as chat alone: a start
+  (`shipline decide start N`), a hold of a ticket that shares files with a running one
+  (`shipline decide hold N --after M`, or `shipline decide start N --after M`), an answer to a
+  worker under the owner's standing delegation (`shipline decide answer N --area <area>
+  --question ... --reply ... --meaning ...`), the allowance of another review round after two
+  sent back (`shipline decide allowance N --round R`), a hand-back for judgment and a restart
+  of a session (`shipline decide hand-back N` or `shipline decide restart N`, with `--session`,
+  `--judgment` and `--message`), and the program of a ticket's next worker
+  (`shipline decide program N claude|codex|cloud`). The script checks each against these
+  rules, records it in `.local/workflow/decisions.jsonl` of the main checkout, a refusal too,
+  and does the act itself: the label, the `start-plan` line, the entry under `Answers given
+  for the owner`, `review-N.allow-round`, the `Worker:` line and `worker-program-N`. When the
+  decision is the owner's own word, it carries his exact words (`--owner "<his words>"`): an
+  answer in money, privacy, legal text or text sent to a model, an allowance, and a start of a
+  ticket marked `Start: owner only` need them. His word on a start also lifts the order and
+  overlap checks, never the 5-hour window. A message to a session that carries a decision
+  quotes the record's line that `shipline decide` printed. An interrupted decision is finished
+  by the next call of `shipline decide`; the tick starts nothing for a ticket whose decision is
+  unfinished.
+
 - Every ticket it opens gets a priority label (see the merge gate): `priority: blocker` for
   what stops every merge or push now, `priority: high` for a bottleneck, otherwise
   `priority: medium`, and `priority: low` only on the owner's word. What it starts by hand
@@ -776,8 +802,13 @@ The orchestrator session does what needs judgment:
   number: `session start <worker|audit|review> N <level>`. `low` for a mechanical change (a rename, a
   one-line fix); `medium` for work whose description is complete and testable; `high` for work
   that touches stored data, text sent to a model, concurrency, or a design the description
-  leaves open. Audits and independent reviewers run at `high`. Without a level a worker gets `medium` and an audit
-  `high`; the tick starts workers with no level.
+  leaves open. Audits run at `high`. Without a level a worker gets `medium`, an audit `high`
+  and an independent reviewer `medium`, or `high` for the paths `review.high_effort_paths`
+  names, for Shipline's own concurrent scripts and for a description with the line
+  `Review: high` (`review-effort N`); a level given by hand wins, and a conflict resolution's
+  reviewer runs at `high`. The tick starts workers and reviewers with no level. When it opens a
+  ticket whose review needs `high` that no path shows (text sent to a model, say), it writes
+  `Review: high` on a line of its own in the description.
 - It may choose the model as the word after the level: `opus` or `sonnet`. The default model is
   Opus. `sonnet` is used only when all of these hold: the change is mechanical; the description
   names exactly what changes; existing tests would catch a mistake; it does not touch stored
@@ -789,8 +820,8 @@ The orchestrator session does what needs judgment:
   independent reviewers always use Claude Opus.
 - A bug fix, screens included, may go to Codex. When the orchestrator opens or starts a ticket
   whose task fixes a bug and invents no new UI (no new control, layout or wording to choose),
-  it writes `Worker: Codex (a bug fix with no new UI)` on a line of its own in the
-  description. A ticket whose task needs clickable options never gets that line and goes to
+  it records `shipline decide program N codex`, which writes `Worker: Codex (a bug fix with no new UI)`
+  on a line of its own in the description. A ticket whose task needs clickable options never gets that line and goes to
   Claude. Without the line the tick routes as before.
 - It asks each audit session to tell it when it goes idle (`SendMessage` with
   `notify_when_idle`), so it reacts to a finished audit without polling.
@@ -857,12 +888,14 @@ The orchestrator session does what needs judgment:
 - `start-plan` holds what the files do not show, one rule a line: `609 after 605` (609 waits
   while 605 is open), `hold 590` (590 does not start), `hold all` (nothing starts by itself).
   The orchestrator writes those lines when the owner gives it a rule, and nothing else per
-  ticket. The orchestrator still names the waiting tickets to the owner when asked, from
-  `gh pr list --draft --json number,title,labels`, and still adds the label by hand when he
-  says to start one at once
-  (`gh api -X POST repos/NazmievBulat/Shipline/issues/<n>/labels -f "labels[]=workflow"`).
+  ticket; a hold of one ticket after another is `shipline decide hold`, which writes its own
+  line and removes it when the hold ends. The orchestrator still names the waiting tickets to the owner
+  when asked, from `gh pr list --draft --json number,title,labels`, and starts one at once
+  when he says so, with `shipline decide start N --owner "<his words>"`.
   The wake's check-in tells it what started and why the next one waits
-  (`608 waits: shares scripts/workflow/merge_gate.py with 563`), a line each, once per change.
+  (`608 waits: shares scripts/workflow/merge_gate.py with 563`), a line each, once per change,
+  and from the decision records each held ticket with its reason and age, and the answers
+  given and starts refused since the last check-in.
 - A session listed as `limit` is stopped on the usage limit. It is reported as that, never as
   working. The tick sends it its instruction again after the session or weekly reset, and
   the wake tells the orchestrator which sessions were resent. Four stay as they are
