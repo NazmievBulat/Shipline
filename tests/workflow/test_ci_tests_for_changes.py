@@ -544,6 +544,7 @@ def test_as_root_every_suite_and_the_probe_run_as_the_test_account(workflow: Wor
     top = str(workflow.repo)
     assert workflow.calls("runuser") == [
         f"runuser -u nobody -- test -w {top}",
+        f"runuser -u nobody -- test -w {top}/.git",
         f"runuser -u nobody -- git -C {top} rev-parse --show-toplevel",
         "runuser -u nobody -- suite-run server --workers 4 server/orders_test.py",
         "runuser -u nobody -- browser-starts",
@@ -861,6 +862,20 @@ def test_a_branch_that_conflicts_with_main_is_refused_and_told_to_merge_it(
     ), done.stdout
     assert _where(workflow) == []
     assert _worktrees(workflow) == [str(workflow.repo)]
+    _assert_untouched(workflow.repo, workflow)
+
+
+def _assert_untouched(checkout: Path, workflow: Workflow) -> None:
+    """The branch's checkout is as it was: no merge under way, nothing staged or changed."""
+    merging = subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        cwd=checkout,
+        env=workflow.env,
+        capture_output=True,
+        check=False,
+    )
+    assert merging.returncode != 0
+    assert workflow.git("status", "--porcelain", cwd=checkout) == ""
 
 
 @pytest.mark.parametrize("cannot", ["account-cannot-write", "account-untrusted"])
@@ -886,3 +901,88 @@ def test_as_root_a_checkout_the_account_cannot_use_is_refused_with_the_remedy(
     ), done.stdout
     assert workflow.calls("push-checks") == []
     assert _runs(workflow) == []
+
+
+def test_the_merged_tree_needs_no_name_for_git(workflow: Workflow) -> None:
+    _cloud_repository(workflow, _WHERE_SUITE)
+    _change(workflow, "server/orders.py")
+    _main_moves_on(workflow)
+    env = {key: value for key, value in workflow.env.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, **_CLOUD)
+    env["HOME"] = str(workflow.root / "no-identity")
+
+    done = subprocess.run(
+        ["bash", str(workflow.repo / "scripts/workflow/ci-tests-for-changes"), "--run",
+         "--extra-only"],
+        cwd=workflow.repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )  # fmt: skip
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _where(workflow)[0].endswith("billing=yes")
+
+
+def test_a_push_from_a_linked_worktree_leaves_that_worktree_as_it_was(workflow: Workflow) -> None:
+    _cloud_repository(workflow, _WHERE_SUITE)
+    _main_moves_on(workflow)
+    linked = workflow.root / "linked"
+    workflow.git("worktree", "add", "--quiet", "-b", "ticket/linked", str(linked), "ticket/change")
+    (linked / "server/orders.py").write_text("linked\n")
+    workflow.git("commit", "--quiet", "-am", "feat: a change", cwd=linked)
+    # Git's pre-push hook names the pushing worktree's own folder.
+    gitdir = workflow.git("rev-parse", "--absolute-git-dir", cwd=linked)
+
+    done = workflow.run_script(
+        "ci-tests-for-changes", "--run", "--extra-only", env={**_CLOUD, "GIT_DIR": gitdir},
+        cwd=linked,
+    )  # fmt: skip
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _where(workflow)[0].endswith("billing=yes")
+    _assert_untouched(linked, workflow)
+    assert sorted(_worktrees(workflow)) == sorted([str(workflow.repo), str(linked)])
+
+
+def test_as_root_the_merged_tree_is_made_and_removed_as_the_account(workflow: Workflow) -> None:
+    _cloud_repository(workflow, _WHERE_SUITE)
+    _change(workflow, "server/orders.py")
+    _main_moves_on(workflow)
+
+    # The stand-in runs every command as this user, whom git trusts in the account's folders as
+    # the remedy of a refusal says.
+    trusted = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory",
+               "GIT_CONFIG_VALUE_0": "*"}  # fmt: skip
+    done = _run(
+        workflow,
+        "--run",
+        "--extra-only",
+        env={**_CLOUD, **trusted, "WORKFLOW_EUID": "0", "SHIPLINE_CLOUD_TEST_USER": "nobody"},
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    calls = [call.split(" -- ", 1)[1] for call in workflow.calls("runuser")]
+    for step in ("merge-tree", "worktree add", "read-tree", "worktree remove"):
+        assert any(call.startswith("git") and step in call for call in calls), step
+    assert "./scripts/setup-worktree" in calls
+    assert _where(workflow)[0].endswith("billing=yes")
+    assert _worktrees(workflow) == [str(workflow.repo)]
+
+
+def test_a_failed_set_up_of_the_merged_tree_refuses_and_removes_it(workflow: Workflow) -> None:
+    _cloud_repository(workflow, _WHERE_SUITE)
+    _change(workflow, "server/orders.py")
+    _main_moves_on(workflow)
+    workflow.fake("worktree-setup", "#!/bin/bash\necho 'npm: no network'\nexit 1\n")
+
+    done = _run(workflow, "--run", "--extra-only", env=_CLOUD)
+
+    assert done.returncode == 1
+    assert done.stdout.endswith(
+        "the push is refused: the set-up of the merged tree, scripts/setup-worktree, failed\n"
+    )
+    assert _where(workflow) == []
+    assert _worktrees(workflow) == [str(workflow.repo)]

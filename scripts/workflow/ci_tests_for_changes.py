@@ -41,6 +41,8 @@ import os
 import pwd
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -215,8 +217,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _base(named: str | None) -> tuple[str, str, str]:
-    """Where the change starts, how to say it, and the main it is tested with."""
+def _base(named: str | None) -> tuple[str, str, str, str]:
+    """Where the change starts, how to say it, and the main it is tested with: the commit, read
+    once so a fetch by another push cannot move it, and its name."""
     if named is None:
         # Named in full: a single-branch clone's fetch would not update `origin/main`.
         _git(
@@ -227,8 +230,9 @@ def _base(named: str | None) -> tuple[str, str, str]:
             timeout=FETCH_SECONDS,
         )
         named = "origin/main"
-    base = _git("merge-base", named, "HEAD").strip()
-    return base, f"against {base[:12]}, where this branch left {named}", named
+    main = _git("rev-parse", "--verify", "--end-of-options", f"{named}^{{commit}}").strip()
+    base = _git("merge-base", main, "HEAD").strip()
+    return base, f"against {base[:12]}, where this branch left {named}", main, named
 
 
 def _account(run_tests: bool) -> str | None:
@@ -252,87 +256,123 @@ def _account(run_tests: bool) -> str | None:
 
 
 def _usable(account: str) -> None:
-    """Refuses before any test when the account cannot write the checkout, or git does not
-    trust it as the account: every suite would fail for that, not for the change."""
+    """Refuses before any test when the account cannot write the checkout and its git folder,
+    or git does not trust them as the account: every suite would fail for that, not for the
+    change."""
     top = Path.cwd()
-    checks = (["test", "-w", str(top)], ["git", "-C", str(top), "rev-parse", "--show-toplevel"])
+    common = Path(_git("rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    checks = (
+        ["test", "-w", str(top)],
+        ["test", "-w", str(common)],
+        ["git", "-C", str(top), "rev-parse", "--show-toplevel"],
+    )
     for check in checks:
         try:
             done = run(*_as_tester(check, account), timeout=FETCH_SECONDS, errors="replace")
-        except CommandTimeout, OSError:
+        except (CommandTimeout, OSError):
             done = None
         if done is None or done.returncode:
+            quoted = shlex.quote(str(top))
             raise Refused(
                 f"{account} cannot write {top}, or git does not trust it as {account}: give it "
-                f"the checkout with chown -R {account} {top} and mark it safe for git with "
-                f"git config --global --add safe.directory {top}, as root and as {account}"
+                f"the checkout with chown -R {account} {quoted} and mark it safe for git with "
+                f"git config --global --add safe.directory {quoted}, as root and as {account}"
             )
 
 
 def _as(account: str | None, *words: str) -> subprocess.CompletedProcess[str]:
-    """Runs a git step of the merged tree as the account the suites run as."""
+    """Runs a git step of the merged tree as the account the suites run as, with no hooks."""
+    git = ["git", "-c", "core.hooksPath=/dev/null", *words]
     try:
-        return run(*_as_tester(list(words), account), timeout=FETCH_SECONDS, errors="replace")
+        return run(*_as_tester(git, account), timeout=FETCH_SECONDS, errors="replace")
     except (CommandTimeout, OSError) as error:
-        raise Refused(f"{' '.join(words[:2])} failed: {error}") from None
+        raise Refused(f"git {words[0]} failed: {error}") from None
+
+
+def _holds(main: str) -> bool:
+    """Whether this branch holds main: then it is tested in place, else merged with it."""
+    try:
+        done = run(
+            "git", "merge-base", "--is-ancestor", main, "HEAD", timeout=FETCH_SECONDS,
+            errors="replace",
+        )  # fmt: skip
+    except (CommandTimeout, OSError) as error:
+        raise Refused(f"cannot tell whether this branch holds main: {error}") from None
+    if done.returncode not in (0, 1):
+        raise Refused(f"cannot tell whether this branch holds main: {done.stderr.strip()}")
+    return done.returncode == 0
 
 
 @contextmanager
-def _tree(main: str, account: str | None, setup: str) -> Iterator[str | None]:
+def _tree(main: str, named: str, account: str | None, setup: str) -> Iterator[str | None]:
     """Where the suites run, as CI tests: here when this branch holds `main`, else a worktree of
-    HEAD merged with it, set up as a session's worktree is and removed after, whatever happens.
-    Yields None for here, else how to say it."""
-    held = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", main, "HEAD"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        check=False,
-    )
-    if held.returncode == 0:
+    HEAD holding the tree of HEAD merged with it, set up as a session's worktree is and removed
+    after, whatever happens. The merge is made by `git merge-tree`, which needs no name and
+    leaves this checkout as it is. Yields None for here, else how to say it."""
+    if _holds(main):
         yield None
         return
     here = Path.cwd()
-    folder = Path(tempfile.mkdtemp(prefix="ci-tests-merged-"))
+    # In the git folder, which the account owns when the checkout is its own: a temporary
+    # folder of root's may be out of its reach.
+    common = Path(_git("rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    (common / "ci-tests").mkdir(exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix="merged-", dir=common / "ci-tests"))
     try:
-        if account:
+        if account and os.geteuid() == 0:
             entry = pwd.getpwnam(account)
-            os.chown(folder, entry.pw_uid, entry.pw_gid)
-        added = _as(account, "git", "worktree", "add", "--quiet", "--detach", str(folder), "HEAD")
+            for made in (common / "ci-tests", folder):
+                os.chown(made, entry.pw_uid, entry.pw_gid)
+        merged = _as(account, "-C", str(here), "merge-tree", "--write-tree", "--name-only",
+                     "--no-messages", "HEAD", main)  # fmt: skip
+        lines = merged.stdout.splitlines()
+        if merged.returncode == 1 and len(lines) > 1:
+            raise Refused(
+                f"this branch conflicts with {named} in {' '.join(lines[1:])}: "
+                "merge it into the branch, then push"
+            )
+        if merged.returncode or not lines:
+            raise Refused(f"cannot merge {named} in: {merged.stderr.strip()}")
+        added = _as(account, "-C", str(here), "worktree", "add", "--quiet", "--detach",
+                    str(folder), "HEAD")  # fmt: skip
         if added.returncode:
-            raise Refused(f"cannot make a worktree to merge {main} in: {added.stderr.strip()}")
-        # Not committed: a merge commit would need a name, and nothing keeps it.
-        merged = _as(account, "git", "-C", str(folder), "merge", "--quiet", "--no-commit",
-                     "--no-ff", main)  # fmt: skip
-        if merged.returncode:
-            conflicted = _as(account, "git", "-C", str(folder), "diff", "--name-only",
-                             "--diff-filter=U").stdout.split()  # fmt: skip
-            if conflicted:
-                raise Refused(
-                    f"this branch conflicts with {main} in {' '.join(conflicted)}: "
-                    "merge it into the branch, then push"
-                )
-            raise Refused(f"cannot merge {main} in: {merged.stderr.strip()}")
+            raise Refused(f"cannot make a worktree to test in: {added.stderr.strip()}")
+        filled = _as(account, "-C", str(folder), "read-tree", "-u", "--reset", lines[0])
+        if filled.returncode:
+            raise Refused(f"cannot fill the worktree to test in: {filled.stderr.strip()}")
         os.chdir(folder)
         if os.access(setup, os.X_OK) and Path(setup).is_file():
             code = run_shown(*_as_tester([f"./{setup}"], account), timeout=LIMIT_SECONDS, grace=0)
             if code != 0:
                 raise Refused(f"the set-up of the merged tree, {setup}, failed")
-        yield f"this branch merged with {main}"
+        yield f"this branch merged with {named}"
     finally:
-        os.chdir(here)
-        for words in (
-            _as_tester(["git", "worktree", "remove", "--force", str(folder)], account),
-            ["rm", "-rf", "--", str(folder)],
-            ["git", "worktree", "prune"],
-        ):
-            with suppress(subprocess.TimeoutExpired):
-                subprocess.run(
-                    words,
+        # A second stop while it cleans up must not leave the worktree behind.
+        stops = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT}
+        signal.pthread_sigmask(signal.SIG_BLOCK, stops)
+        try:
+            os.chdir(here)
+            removed = None
+            with suppress(subprocess.TimeoutExpired, OSError):
+                removed = subprocess.run(
+                    _as_tester(["git", "worktree", "remove", "--force", str(folder)], account),
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     timeout=FETCH_SECONDS,
                     check=False,
                 )
+            if removed is None or removed.returncode:
+                shutil.rmtree(folder, ignore_errors=True)
+                with suppress(subprocess.TimeoutExpired, OSError):
+                    subprocess.run(
+                        ["git", "worktree", "prune"],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        timeout=FETCH_SECONDS,
+                        check=False,
+                    )
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
 
 
 def main(argv: list[str]) -> int:
@@ -355,6 +395,12 @@ def main(argv: list[str]) -> int:
         parser.error(str(error))
     # A stopped push stops its suites with it.
     install_signal_handlers()
+    # Git names the pushing worktree's own folder to its hook (`GIT_DIR`): every git command
+    # here, and in the suites, would act on that folder wherever it runs. Configuration given
+    # by `git -c` is kept.
+    for name in _git("rev-parse", "--local-env-vars").split():
+        if not name.startswith("GIT_CONFIG"):
+            os.environ.pop(name, None)
     # Nothing it starts reads the push's input: git's list of refs in the hook, or a person's keys.
     os.dup2(os.open(os.devnull, os.O_RDONLY), sys.stdin.fileno())
     try:
@@ -376,7 +422,7 @@ def main(argv: list[str]) -> int:
             _say(f"push checks: {outcome} in {_duration(took)}")
             if outcome != "passed":
                 raise Refused("the push checks failed")
-        base, against, main = _base(arguments.base)
+        base, against, main, named = _base(arguments.base)
         changed = _git("diff", "--name-only", "--no-renames", "-z", base).split("\0")
         changed = [path for path in changed if path]
         _say(f"ci-tests-for-changes: {against}, {len(changed)} changed files")
@@ -390,7 +436,7 @@ def main(argv: list[str]) -> int:
             return 0
         if not any(selection.whole or selection.files for _, selection in selections):
             return 0
-        with _tree(main, account, config.worktree_setup) as merged:
+        with _tree(main, named, account, config.worktree_setup) as merged:
             refused = _suites(selections, config, part, account, merged, limit, grace)
         if refused:
             raise Refused(", ".join(refused))
