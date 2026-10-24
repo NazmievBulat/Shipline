@@ -435,3 +435,64 @@ def test_a_limit_that_is_not_a_size_is_refused_before_anything_starts(
     assert done.returncode == 1
     assert done.stderr.splitlines()[-1] == f"{variable} is '{value}', not a size such as 8G"
     assert workflow.calls("tmux ticket-7 new-session") == []
+
+
+def test_a_hunt_refused_for_its_limits_leaves_no_report_folder(workflow: Workflow) -> None:
+    """Else the next start of a hunt of that name finds a report already."""
+    (workflow.state / "limits-not-set-hunt-foo").write_text("memory.max max, memory.swap.max max\n")
+
+    done = workflow.run("start", "hunt", "foo")
+
+    assert done.returncode == 1
+    assert done.stderr.splitlines()[-1] == (
+        "hunt-foo was not started: its scope does not hold its memory limits of 8 GB and 4 GB of "
+        "swap (memory.max max, memory.swap.max max)"
+    )
+    assert not (workflow.repo / ".local" / "hunts" / "foo").exists()
+
+
+def test_a_cloud_launcher_refused_for_its_limits_says_so_without_waiting(
+    workflow: Workflow,
+) -> None:
+    workflow.add_pull_request(7)
+    # A scope with no memory controller to set the limits with.
+    workflow.fake(
+        "systemd-run", '#!/bin/bash\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n'
+    )
+
+    done = workflow.run("start", "worker", "7", "cloud")
+
+    assert done.returncode == 1
+    assert done.stderr.splitlines()[-1] == (
+        "cloud-7 was not started: its scope does not hold its memory limits of 8 GB and 4 GB of "
+        "swap (memory.max missing, memory.swap.max missing)"
+    )
+    assert workflow.calls("claude --effort") == []
+    assert workflow.calls("sleep") == []
+
+
+def _pane_of_launch(workflow: Workflow, name: str) -> None:
+    """The pane's own process is the one `launch` starts, which only waits for its child."""
+    pid = (workflow.state / "pid" / name).read_text().strip()
+    words = ["bash", "-c", '"$@"; exit', "bash", "systemd-run", "--user", "--scope"]
+    (workflow.root / "proc" / pid / "cmdline").write_bytes("\0".join(words).encode() + b"\0")
+
+
+@pytest.mark.parametrize("child", [False, True], ids=["no-child", "child-elsewhere"])
+def test_tmux_s_own_scope_is_not_the_group_of_a_pane_launch_started(
+    workflow: Workflow, child: bool
+) -> None:
+    """It holds only the waiting process: its child's scope, not found, is the session's group."""
+    if child:
+        workflow.running(
+            "ticket-7", scope="user.slice/session-2.scope", pane_scope=_spawned("ticket-7")
+        )
+    else:
+        workflow.running("ticket-7", scope=_spawned("ticket-7"))
+    _pane_of_launch(workflow, "ticket-7")
+
+    listed = workflow.run("list")
+    squeezed = workflow.run("squeeze", "ticket-7")
+
+    assert listed.stdout.splitlines() == ["ticket-7  busy  memory unknown"]
+    assert squeezed.stderr.splitlines() == ["ticket-7 has no control group of its own"]

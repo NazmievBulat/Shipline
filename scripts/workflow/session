@@ -291,19 +291,20 @@ stop_session() {
 # The control group of the session: the scope `launch` made for it, or the one `tmux` made for a
 # session started before sessions had their own. That scope holds the pane's child, or the pane's
 # own process for a session started before the child made it. Refuses a group that is not the
-# session's own, because reclaiming or protecting it would act on everything else in that group.
+# session's own, because reclaiming or protecting it would act on everything else in that group:
+# so too `tmux`'s own scope of a pane `launch` started, which holds only the waiting process.
 group_of() {
-  local name=$1 pid path child scoped
+  local name=$1 pid path child scoped waits
   pid=$(tmux -L "$name" list-panes -t "=$name" -F '#{pane_pid}' 2>/dev/null | head -n 1) || true
   [[ $pid =~ ^[0-9]+$ ]] || return 1
   path=$(cgroup_of "$pid")
-  if [[ ! $path =~ /workflow-$name-[0-9]+\.scope$ ]]; then
-    for child in $(cat "$PROC_ROOT/$pid/task/$pid/children" 2>/dev/null); do
-      scoped=$(cgroup_of "$child")
-      [[ ! $scoped =~ /workflow-$name-[0-9]+\.scope$ ]] || { path=$scoped; break; }
-    done
-  fi
-  [[ $path == */tmux-spawn-*.scope || $path =~ /workflow-$name-[0-9]+\.scope$ ]] || return 1
+  [[ ! $path =~ /workflow-$name-[0-9]+\.scope$ ]] || { echo "$CGROUP_ROOT$path"; return 0; }
+  for child in $(cat "$PROC_ROOT/$pid/task/$pid/children" 2>/dev/null); do
+    scoped=$(cgroup_of "$child")
+    [[ ! $scoped =~ /workflow-$name-[0-9]+\.scope$ ]] || { echo "$CGROUP_ROOT$scoped"; return 0; }
+  done
+  waits=$(tr '\0' '\n' 2>/dev/null <"$PROC_ROOT/$pid/cmdline" | sed -n 3p) || true
+  [[ $path == */tmux-spawn-*.scope && $waits != "$PANE_WAITS" ]] || return 1
   echo "$CGROUP_ROOT$path"
 }
 
@@ -508,6 +509,8 @@ EOF
 
 start_cloud_worker() {
   local number=$1 effort=$2 name="cloud-$1" prompt command launch_file status_file invoked_file waited=0
+  local limits_file=$main/$SHIPLINE_STATE_FOLDER/cloud-$1.limits missing memory_bytes swap_bytes
+  check_session_limits
   prompt=$(cloud_sentence_of "$number")
   launch_file=$main/$SHIPLINE_STATE_FOLDER/$name.launch
   status_file=$main/$SHIPLINE_STATE_FOLDER/$name.exit
@@ -529,6 +532,12 @@ start_cloud_worker() {
     return 1
   fi
   while [[ ! -f $status_file ]] && ((waited < LINK_WAIT_SECONDS)); do
+    # Its scope refused to run the launcher without the limits: nothing was invoked.
+    if missing=$(limits_missing "$limits_file"); then
+      python3 -B "$script_dir/cloud_workers.py" refused "$main" "$number"
+      refuse_limits "$name" "$missing"
+      return 1
+    fi
     sleep 1
     waited=$((waited + 1))
   done
@@ -690,6 +699,23 @@ check_session_limits() {
 # control group folder, the two limits in bytes and the command.
 IN_SCOPE='group=$2$(sed -n "s/^0:://p" /proc/self/cgroup); { read -r memory <"$group/memory.max"; } 2>/dev/null || memory=missing; { read -r swap <"$group/memory.swap.max"; } 2>/dev/null || swap=missing; if [[ $memory == "$3" && $swap == "$4" ]]; then echo "in place" >"$1"; exec bash -c "$5"; fi; echo "memory.max $memory, memory.swap.max $swap" >"$1"; exit 1'
 
+# The pane's own process: it only runs the scope's `systemd-run` as its child and ends with it.
+PANE_WAITS='"$@"; exit'
+
+# What the scope noted that it holds instead of the limits, when it noted that (IN_SCOPE). Fails
+# while it has noted nothing, and when it holds them.
+limits_missing() {
+  local said=""
+  [[ -s $1 ]] && read -r said <"$1" || true
+  [[ -n $said && $said != "in place" ]] && echo "$said"
+}
+
+# The sentence a start refused for its limits ends with.
+refuse_limits() {
+  echo "$1 was not started: its scope does not hold its memory limits of" \
+    "$(size_of "$memory_bytes") and $(size_of "$swap_bytes") of swap ($2)" >&2
+}
+
 # Waits for the session's scope to note that it holds the limits (IN_SCOPE). A session whose
 # scope never started, or that does not hold them, is ended, as it would run with no limit.
 await_limits() {
@@ -702,7 +728,7 @@ await_limits() {
   [[ $said != "in place" ]] || return 0
   limits="its memory limits of $(size_of "$memory_bytes") and $(size_of "$swap_bytes") of swap"
   if [[ -n $said ]]; then
-    echo "$name was not started: its scope does not hold $limits ($said)" >&2
+    refuse_limits "$name" "$said"
   elif is_running "$name"; then
     echo "$name was not started: its scope with $limits did not start" \
       "within $LIMITS_WAIT_SECONDS seconds" >&2
@@ -743,7 +769,7 @@ launch() {
       bash "$worktree/$SHIPLINE_STATE_FOLDER/$name.invoked" "$worktree/$SHIPLINE_STATE_FOLDER/$name.not-invoked"
       "${scope[@]}")
   else
-    scope=(bash -c '"$@"; exit' bash "${scope[@]}")
+    scope=(bash -c "$PANE_WAITS" bash "${scope[@]}")
   fi
   mkdir -p "$worktree/$SHIPLINE_STATE_FOLDER"
   if [[ $name == ticket-* ]] && is_running "codex-${name#ticket-}"; then
@@ -859,7 +885,10 @@ cmd_start_hunt() {
       command="codex exec --sandbox workspace-write -c sandbox_workspace_write.network_access=true --add-dir $report \"$prompt\" 2>&1 | tee $report/codex.log"
       label=Codex
     fi
-    launch "$name" "$worktree" "$command" "WORKFLOW_HUNT_REPORT=$report"
+    if ! launch "$name" "$worktree" "$command" "WORKFLOW_HUNT_REPORT=$report"; then
+      rmdir "$report" 2>/dev/null || true
+      exit 1
+    fi
     # A hunter that cannot run (not signed in, a wrong option) ends within a moment, and `tmux`
     # shows its session until then.
     for _ in 1 2 3; do
@@ -877,9 +906,12 @@ cmd_start_hunt() {
     protect_hunt "$name"
     echo "$name started: $label, no link; its screen: tmux -L $name attach"
   else
-    launch "$name" "$worktree" \
-      "claude --effort $HUNT_EFFORT --add-dir $report --remote-control $name \"$prompt\"" \
-      "WORKFLOW_HUNT_REPORT=$report"
+    if ! launch "$name" "$worktree" \
+        "claude --effort $HUNT_EFFORT --add-dir $report --remote-control $name \"$prompt\"" \
+        "WORKFLOW_HUNT_REPORT=$report"; then
+      rmdir "$report" 2>/dev/null || true
+      exit 1
+    fi
     touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
     if ! wait_for_link "$name"; then
       stop_session "$name"

@@ -89,8 +89,11 @@ def in_scope(arguments: list[str], name: str, memory: str = "8G", swap: str = "4
     words = scope_words(name, arguments[start + 5], memory, swap)
     assert arguments[start : start + len(words)] == words
     check = arguments[start + len(words) : start + len(words) + 6]
+    # The script `session` holds as IN_SCOPE: it reads the group the scope's process is in.
+    assert check[0].startswith('group=$2$(sed -n "s/^0:://p" /proc/self/cgroup); '), check
     assert check[1] == "bash"
     assert check[2].endswith(f"/{name}.limits"), check
+    assert check[3].endswith("/cgroup"), check
     assert check[4:] == [str(limit_bytes(memory)), str(limit_bytes(swap))]
     return arguments[: start - len(PANE_WORDS)] + arguments[start + len(words) + len(check) :]
 
