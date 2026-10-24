@@ -97,6 +97,7 @@ jobs:
               tests/workflow/test_self_update.py
               tests/workflow/test_session_memory.py
               tests/workflow/test_session_stop_and_cleanup.py
+              tests/workflow/test_shadow_run.py
               tests/workflow/test_ticket_starts.py
               tests/workflow/test_train_reads.py
               tests/workflow/test_usage.py
