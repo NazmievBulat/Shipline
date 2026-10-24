@@ -76,7 +76,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `workflows.ci`, `workflows.e2e`, `workflows.images` | the workflow files under `.github/workflows/` | `ci.yml`, `e2e.yml`, `images.yml` |
 | `labels.workflow`, `labels.audited` | the label that starts a ticket, and an audit's | `workflow`, `audited` |
 | `labels.priority.blocker` … `.low` | the four priority labels | `priority: blocker` … `priority: low` |
-| `runner.labels` | the runner labels the merge gate may re-run failed jobs on | none: the gate re-runs nothing |
+| `runner.labels` | the runner labels the merge gate may re-run failed jobs on | built from `runner.prefix` and the machines in `~/.config/shipline/runner.sh` (`runner/README.md`); without a prefix, none: the gate re-runs nothing |
 | `runner.prefix` | the one word the runner pool (`runner/`) names everything by: its images, network, services and containers, `<prefix>-runner…`, and its labels; `workflow-metrics` reads the CPU of the `<prefix>-runner…` services and containers | none: no runner figures |
 | `runner.image_build` | the command line, run from the main checkout, that builds the runner images | none: the pool builds its own Dockerfile |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
