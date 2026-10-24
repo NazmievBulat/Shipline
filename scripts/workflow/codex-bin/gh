@@ -4,11 +4,11 @@ set -euo pipefail
 
 # The repository and the priority labels, as the tick reads them (`workflow_config.py`).
 # Without them, nothing names this worker's pull request or its labels, and its body update and
-# its pull requests are refused.
+# its pull requests are refused. The caller's own values never stand in for them.
+SHIPLINE_REPOSITORY="" SHIPLINE_PRIORITY_MEDIUM="" SHIPLINE_PRIORITY_HIGH=""
 if config=$(python3 "$(dirname "${BASH_SOURCE[0]}")/../workflow_config.py" shell); then
   eval "$config"
 fi
-SHIPLINE_REPOSITORY=${SHIPLINE_REPOSITORY:-}
 
 refuse() {
   echo "Codex worker: gh permits reads, its own ready/body update, and draft tickets labelled with only a medium or high priority; this command is refused." >&2

@@ -168,6 +168,14 @@ def test_the_repository_named_in_the_file_wins_over_the_runner_settings_and_orig
     assert workflow_config.load(repo).repository == "named-owner/named-app"
 
 
+@pytest.mark.parametrize("repository", ["example-owner/.github", "example-owner/example.app"])
+def test_a_repository_name_with_a_dot_is_read(tmp_path: Path, repository: str) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"repository": repository})
+
+    assert workflow_config.load(repo).repository == repository
+
+
 @pytest.mark.parametrize("folder", ["state", ".local/workflow", "a/b/c"])
 def test_a_state_folder_of_any_depth_leads_back_to_its_checkout(
     tmp_path: Path, folder: str
@@ -201,6 +209,11 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ("[]", "an object"),
         ('{"repository": 7}', "repository"),
         ('{"repository": "no-slash"}', "repository"),
+        # `repos/../..` would leave the repository's own API.
+        ('{"repository": "../.."}', "repository"),
+        ('{"repository": "example-owner/.."}', "repository"),
+        ('{"repository": "./."}', "repository"),
+        ('{"repository": "../example-app"}', "repository"),
         ('{"checks": {"ci_result": ""}}', "checks.ci_result"),
         ('{"checks": "CI result"}', "checks"),
         ('{"runner": {"labels": "home"}}', "runner.labels"),
@@ -901,3 +914,47 @@ def test_without_a_repository_only_what_needs_one_stops(workflow: Workflow) -> N
     tick = workflow.run_script("tick")
     assert tick.returncode == 1
     assert "cannot tell which repository" in tick.stderr
+
+
+@pytest.mark.parametrize("file", ["valid", "refused"])
+def test_the_codex_gh_takes_no_value_from_its_callers_environment(
+    workflow: Workflow, file: str
+) -> None:
+    if file == "refused":
+        _commit_on_main(workflow, {"shipline.json": '{"repositry": "example-owner/example-app"}'})
+    body = workflow.root / "body.md"
+    body.write_text("rewritten\n")
+
+    def codex_gh(*args: str, **env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(workflow.repo / "scripts/workflow/codex-bin/gh"), *args],
+            cwd=workflow.repo,
+            env={
+                **workflow.env,
+                "WORKFLOW_SESSION": "ticket-7",
+                "WORKFLOW_GH": str(workflow.bin / "gh"),
+                **env,
+            },
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+    # `workflow` would start the ticket, and another repository's pull request 7 is not this
+    # worker's, whatever the caller's environment says.
+    label = codex_gh(
+        "pr", "create", "--draft", "--label", "workflow", "--title", "t", "--body", "b",
+        SHIPLINE_PRIORITY_MEDIUM="workflow",
+        SHIPLINE_PRIORITY_HIGH="workflow",
+    )
+    other = codex_gh(
+        "api", "-X", "PATCH", "repos/example-owner/other-app/pulls/7", "-F", f"body=@{body}",
+        SHIPLINE_REPOSITORY="example-owner/other-app",
+    )
+
+    for done in (label, other):
+        assert done.returncode == 1
+        assert "this command is refused" in done.stderr, done.stderr
+    assert not workflow.calls("gh pr create")
+    assert not workflow.calls("gh api")

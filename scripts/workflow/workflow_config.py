@@ -75,7 +75,8 @@ DEFAULTS: dict[str, Any] = {
     },
 }
 
-_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+# `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
+_REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
 
 
 class ConfigError(Exception):
