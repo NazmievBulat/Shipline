@@ -39,5 +39,15 @@
     "workflow_tests": "tools/shipline/tests",
     "runner_tests": "tools/runner/tests",
     "known": "tools/shipline/parity-known.txt"
+  },
+  "hunts": {
+    "areas": {
+      "phone": ["/calls", "/contacts"],
+      "billing": ["/invoices", "/settings/billing"]
+    },
+    "plans": "docs/hunt-plans.md"
+  },
+  "commands": {
+    "test": "tools/run-tests"
   }
 }
