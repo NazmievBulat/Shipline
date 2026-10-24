@@ -44,10 +44,13 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+      # Shipline's own scripts, which the repository does not hold: its main as it is now.
+      - name: Shipline
+        run: git clone --quiet --depth 1 https://github.com/NazmievBulat/Shipline.git "$RUNNER_TEMP/shipline"
       - name: The notes the merge gate reads
         # Every run runs the whole suite; a repository that runs a selection notes it with
         # `--selected server_tests N M files`, and one that needs none with `--none`.
-        run: python3 scripts/workflow/ci_proof.py notes --whole server_tests
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes --whole server_tests
       # A squash the gate made carries its proof: main skips a job that passed, whole, on the
       # identical tree, and names the run it inherited. Any other push runs everything.
       - name: The jobs main inherits from its squash's proof
@@ -55,7 +58,7 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/workflow/ci_proof.py inherited ci
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" inherited ci
 
   tests:
     # The gate's name for the job that runs every server test.
@@ -73,9 +76,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+      # Shipline's own scripts, which the repository does not hold: its main as it is now.
+      - name: Shipline
+        run: git clone --quiet --depth 1 https://github.com/NazmievBulat/Shipline.git "$RUNNER_TEMP/shipline"
       # Whatever the repository's tests need installed comes before this.
       - name: Tests
-        run: python3 scripts/workflow/ci_proof.py test
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" test
 
   result:
     # The check the gate judges a run by (`checks.ci_result`): it passes only when every job
