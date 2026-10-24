@@ -161,6 +161,7 @@ DEFAULTS: dict[str, Any] = {
         "plans": None,
     },
     "review": {"high_effort_paths": []},
+    "merge_train": {"queued_limit_minutes": 20},
     # Minutes a question to the owner marked `Owner only: no` waits before the tick types its
     # recommended reply; 0 turns that off.
     "answer_for_owner_after_minutes": 15,
@@ -537,6 +538,11 @@ class Review:
 
 
 @dataclass(frozen=True)
+class MergeTrain:
+    queued_limit_minutes: int
+
+
+@dataclass(frozen=True)
 class Config:
     # None when nothing names it: an error only for a script that needs it.
     found_repository: str | None
@@ -553,6 +559,7 @@ class Config:
     hunts: Hunts
     commands: Commands
     review: Review
+    merge_train: MergeTrain
     answer_for_owner_after_minutes: int
     cloud_wake_after_minutes: int
     cloud_pre_push: CloudPrePush
@@ -1073,6 +1080,7 @@ def _load(main: Path, start: Path | None, document: ConfigFile) -> Config:
                 values["review"]["high_effort_paths"], "review.high_effort_paths"
             )
         ),
+        merge_train=MergeTrain(**values["merge_train"]),
         answer_for_owner_after_minutes=values["answer_for_owner_after_minutes"],
         cloud_wake_after_minutes=values["cloud_wake_after_minutes"],
         cloud_pre_push=CloudPrePush(tuple(values["cloud_pre_push"]["suites"])),
@@ -1152,6 +1160,7 @@ def as_dict(config: Config) -> dict[str, Any]:
         },
         "commands": vars(config.commands).copy(),
         "review": {"high_effort_paths": list(config.review.high_effort_paths)},
+        "merge_train": vars(config.merge_train).copy(),
         "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
         "cloud_wake_after_minutes": config.cloud_wake_after_minutes,
         "cloud_pre_push": {
