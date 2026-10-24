@@ -81,6 +81,14 @@ def answer(args, cwd, env, out, err):
             # The pull request changes on GitHub right after this read.
             data["pulls"][args[2]].update(changed)
             (state / "github.json").write_text(json.dumps(data))
+        lines = data.get("line_after_view", {}).get(args[2])
+        if lines:
+            # The tick saves another line right after this read, or after a later one.
+            line = lines.pop(0)
+            if line is not None:
+                train = Path(data["lock_probe"]).with_name("merge-train.json")
+                train.write_text(json.dumps(line))
+            (state / "github.json").write_text(json.dumps(data))
     elif (args[:2] == ["pr", "list"]
           and "--state" in args and "--jq" not in args and "--base" not in args):
         # Both bulk and individual reads describe the same GitHub state. Keep ordinary
@@ -243,6 +251,10 @@ class GitHub:
     after_view: dict[str, dict[str, Any]] = field(default_factory=dict[str, dict[str, Any]])
     # The merge lock whose holder's calls the stand-in writes down (locked_calls).
     lock_probe: str | None = None
+    # The line saved beside that lock after each of the gate's reads of a pull request.
+    line_after_view: dict[str, list[dict[str, Any] | None]] = field(
+        default_factory=dict[str, list[dict[str, Any] | None]]
+    )
 
     def save(self) -> None:
         (self.workflow.state / "github.json").write_text(
@@ -260,6 +272,7 @@ class GitHub:
                     "after_merge": self.after_merge,
                     "after_view": self.after_view,
                     "lock_probe": self.lock_probe,
+                    "line_after_view": self.line_after_view,
                 }
             )
         )
@@ -6242,6 +6255,8 @@ def _red_ci(github: GitHub) -> None:
         ("branch", "handoff requires the pull request branch"),
         ("pre-train checks", "pre-train checks failed"),
         ("blocked", "this pull request failed checks; fix it before rejoining the merge train"),
+        ("whole suite", "a whole suite run on this pull request's tested merge failed"),
+        ("prefix", "the ci run of this pull request's prefix (workflow/merge-batch-b) failed"),
     ],
 )
 def test_each_handoff_refusal_still_fires(github: GitHub, case: str, refusal: str) -> None:
@@ -6268,21 +6283,146 @@ def test_each_handoff_refusal_still_fires(github: GitHub, case: str, refusal: st
     elif case == "pre-train checks":
         checks = workflow.script.with_name("pre-train-checks")
         checks.write_text("#!/bin/bash\necho 'inventory is stale' >&2\nexit 1\n")
-    else:
+        # An earlier handoff of it waits in the line: it leaves the line, and its note goes.
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7"]}))
+        (folder / "merge-wanted-7").write_text(
+            json.dumps({"head": github.head, "round": 1, "branch": "ticket/seven"})
+        )
+    elif case == "blocked":
         # It failed in the line before, on this same head, and its run is still red.
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "merge-train.json").write_text(
             json.dumps({"waiting": ["7"], "blocked": {"7": github.head}})
         )
         _red_ci(github)
+    elif case == "whole suite":
+        # The whole suite of its tested merge failed, on this same head.
+        suite = {
+            "member": github.head,
+            "head": "a" * 40,
+            "branch": "workflow/merge-batch-a",
+            "workflows": ["ci"],
+            "requested": ["ci"],
+        }
+        github.ci_dispatched("a" * 40, suite["branch"], run_id=40, conclusion="failure")
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "merge-train.json").write_text(
+            json.dumps(
+                {"waiting": ["7"], "blocked": {"7": github.head}, "suites": {"7": suite}}
+            )
+        )
+    else:
+        # Its prefix's CI run failed on this same head, and no re-run of it passed since.
+        batch = {"head": "b" * 40, "branch": "workflow/merge-batch-b", "workflows": ["ci"]}
+        github.ci_dispatched("b" * 40, batch["branch"], run_id=41, conclusion="failure")
+        failure = {"pull": "20:1", "batch": batch, "workflow": "ci", "run": "41:1"}
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "merge-train.json").write_text(
+            json.dumps(
+                {
+                    "waiting": ["7"],
+                    "blocked": {"7": github.head},
+                    "batch_failed": {"7": failure},
+                }
+            )
+        )
 
     done = _hand_off(github)
 
     assert done.returncode == 1 and refusal in done.stderr, done.stdout + done.stderr
     assert not (folder / "merge-wanted-7").exists()
-    if case == "blocked":
+    if case in ("blocked", "whole suite", "prefix"):
         # It keeps its place, passed over until a green re-run, as before.
         train = json.loads((folder / "merge-train.json").read_text())
         assert train["waiting"] == ["7"] and train["blocked"] == {"7": github.head}
     else:
         assert "7" not in _waiting(workflow)
+
+
+def test_a_handoff_whose_place_the_tick_changed_meanwhile_is_judged_again(
+    github: GitHub,
+) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    _red_ci(github)
+    # While the handoff judged its place, the tick blocked it for its red run.
+    github.line_after_view = {"7": [None, {"waiting": ["7"], "blocked": {"7": github.head}}]}
+
+    done = _hand_off(github)
+
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "this pull request failed checks" in done.stderr
+    assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+    train = json.loads((workflow.repo / ".local/workflow/merge-train.json").read_text())
+    assert train["waiting"] == ["7"] and train["blocked"] == {"7": github.head}
+    assert [call.split()[:4] for call in _locked_calls(workflow)] == [["gh", "pr", "view", "7"]] * 2
+
+
+def test_a_handoff_whose_place_keeps_changing_waits(github: GitHub) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    github.line_after_view = {
+        "7": [None, *({"waiting": [], "approved": {"7": f"{n:040x}"}} for n in range(3))]
+    }
+
+    done = _hand_off(github)
+
+    assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
+    assert "kept changing" in done.stderr
+    assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+    assert len(_locked_calls(workflow)) == 3
+
+
+def test_a_newly_joined_member_waits_for_the_tick_to_read_its_run(github: GitHub) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    github.pulls["8"] = {**deepcopy(github.pulls["7"]), "headRefOid": "8" * 40}
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    # 8 waits, green on current main; 7 joins with a higher priority.
+    (folder / "merge-train.json").write_text(
+        json.dumps({"waiting": ["8"], "passing": ["8"], "priorities": {"8": "low"}})
+    )
+    github.pulls["7"]["labels"] = [{"name": "priority: high"}]
+
+    done = _hand_off(github)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    train = json.loads((folder / "merge-train.json").read_text())
+    assert train["waiting"] == ["8", "7"] and train["pending"] == ["7"]
+    assert train["turn"] == 0
+
+
+def test_a_re_run_another_call_claimed_is_not_requested_again(github: GitHub) -> None:
+    workflow = github.workflow
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    marker = folder / "pull-rerun-20-1"
+    # Another call claimed this re-run a moment ago.
+    marker.write_text("automatic retry requested for failed jobs of run 20 of pull request 7\n")
+    before = marker.read_text()
+
+    done = subprocess.run(
+        [
+            "python3",
+            "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]); import merge_gate as g; "
+            "from pathlib import Path; "
+            "print(g._rerun({'id': 20}, Path(sys.argv[2]), Path(sys.argv[3]), 'now', "
+            "name='run 20 of pull request 7'))",
+            str(workflow.script.parent),
+            str(folder),
+            str(marker),
+        ],
+        cwd=workflow.repo,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "re-run of run 20 of pull request 7 is requested" in done.stdout
+    assert rerun_calls(workflow) == []
+    assert marker.read_text() == before
