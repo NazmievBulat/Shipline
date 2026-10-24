@@ -38,6 +38,10 @@
 #      (`ticket_starts.py`: by priority, then the older ticket, when its files overlap no running
 #      ticket's, nothing in `start-plan` holds it back, the machine has had room for 10
 #      minutes and nothing started for 5), at most one a tick. The next tick starts its worker.
+#  10. `workflow-metrics`: every tick takes one sample of the machine and the sessions, from
+#      local reads only. Once a day from 07:50 UTC, once GitHub may be asked, it starts the daily
+#      run, detached: the report goes to .local/analyses/metrics-<date>.md and its findings to
+#      the wake's next check-in.
 #
 # Steps 1 and 2 are the one place a session is closed, and only when its work no longer exists.
 # The starts come last because the steps before them may free memory they need.
@@ -65,6 +69,9 @@ READY_UNFINISHED_SECONDS=$((15 * 60))
 STUCK_AFTER_SECONDS=$((45 * 60))
 # The line a session ends with, WORDS standing for its words. `notify` reads it the same way.
 FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:]]*$'
+# The time of day, UTC, from which the daily metrics run starts; empty, it never does. A test
+# names another.
+METRICS_DAILY_AT=${WORKFLOW_METRICS_DAILY_AT-07:50}
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 gh() { python3 "$here/github_budget.py" call tick "$@"; }
@@ -327,7 +334,10 @@ if [[ -z $program && -r $main/$SHIPLINE_STATE_FOLDER/worker-program ]]; then
 fi
 program=${program:-claude}
 [[ $program =~ ^(claude|codex|cloud)$ ]] || { echo "invalid worker program: $program" >&2; exit 1; }
-running=$(session list) || failed=1
+listed=-
+running=$(session list) || { failed=1; listed=unread; }
+# From the sessions just listed: the sample asks GitHub nothing and lists nothing again.
+bash "$here/workflow-metrics" --sample --sessions "$listed" <<<"$running" 9>&- || failed=1
 
 # Before GitHub is asked anything: a hunt has no pull request, and its time runs out whether
 # or not GitHub answers.
@@ -346,6 +356,23 @@ fi
 # Poll every cloud record, including unlabelled tickets, before the ordinary ready path.
 python3 -B "$here/cloud_workers.py" poll "$main" 9>&- || failed=1
 budget_ready || paused
+
+# The daily metrics read a week of runs from GitHub, minutes on a first run: they run detached,
+# under a lock of their own, and the tick goes on. The run itself leaves when one is running
+# and waits half an hour after one that failed. It is given the tick's time, so it names the
+# day the tick looked for. One command alone goes to the background: a list would fork a shell
+# that keeps the tick's lock, and its output, for as long as the run.
+if [[ $METRICS_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] &&
+    ((10#$(date -u -d "@$NOW" +%H%M) >= 10#${BASH_REMATCH[1]}${BASH_REMATCH[2]})) &&
+    [[ ! -e $main/.local/analyses/metrics-$(date -u -d "@$NOW" +%F).md ]]; then
+  if mkdir -p "$HOME/.local/state/workflow"; then
+    env -u WORKFLOW_TRAIN_TICK -u WORKFLOW_SESSION_SNAPSHOT -u WORKFLOW_DEFER_START \
+      WORKFLOW_NOW="$NOW" setsid bash "$here/workflow-metrics" --daily </dev/null \
+      >>"$HOME/.local/state/workflow/metrics.log" 2>&1 9>&- &
+  else
+    failed=1
+  fi
+fi
 
 snapshot=$WORKFLOW_TRAIN_TICK/pulls.json
 # The labelled pull requests, as "<number> <draft> <base>". Starts go in the order the merge
