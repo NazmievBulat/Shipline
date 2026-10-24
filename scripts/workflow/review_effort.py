@@ -11,10 +11,12 @@ level every reviewer ran at before. Every `high` says why on standard error.
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 import workflow_config
 from workflow_commands import CommandTimeout, github_read
 
+HERE = Path(__file__).resolve().parent
 MARK = "Review: high"
 # Shipline's own scripts that hold locks, slots or queues, beside this file.
 OWN_SCRIPTS = re.compile(
@@ -133,7 +135,7 @@ def changed_paths(diff: str) -> list[str]:
 def _own_prefix() -> str:
     """Where Shipline's scripts are in the checkout, as the paths of a diff name them."""
     done = subprocess.run(
-        ["git", "-C", str(workflow_config.HERE), "rev-parse", "--show-prefix"],
+        ["git", "-C", str(HERE), "rev-parse", "--show-prefix"],
         capture_output=True,
         text=True,
         timeout=30,
