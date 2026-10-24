@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Refresh the main health report consumed by the tick and wake.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec python3 "$here/merge_gate.py" "${1:---main-status}"

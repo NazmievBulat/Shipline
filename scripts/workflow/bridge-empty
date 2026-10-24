@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Refuse an automatic wake when the owner has begun typing in the Claude bridge, or in the box
+# of a Claude worker or reviewer the tick would message.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/input-box"
+[[ ${1:-} =~ ^(ticket|review)-[0-9]+$ ]] || exit 2
+screen=$(tmux -L "$1" capture-pane -p -e -t "=$1:" 2>/dev/null) || exit 1
+top=$(strip_ansi <<<"$screen" | LC_ALL=C awk '
+  /^─/ { above = last; last = NR }
+  END { print above ? above : (last ? last : NR + 1) }
+')
+typed=$(LC_ALL=C sed -n "$((top + 1)),\$p" <<<"$screen" | LC_ALL=C sed -E $'/^(\\x1b\\[[0-?]*[ -/]*[@-~])*─/,$d' |
+  nonblank_input)
+[[ -z $typed ]]

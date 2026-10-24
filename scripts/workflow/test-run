@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# Runs a test command: `test-run <command> [arguments]`. The test scripts of package.json run
+# through it.
+#
+# Started by a session of the workflow (WORKFLOW_SESSION is set), the command is stopped once it
+# has run for the whole-run limit, and a run that ended because the time limit or the session's
+# memory limit stopped it says so on its last line, so the session looks for the loop or the leak
+# instead of running it again. Anywhere else, in CI or in the owner's own shell, it only runs the
+# command.
+#
+# The memory limit is the session's scope (`session start`): the kernel kills the largest process
+# there, which is the runaway, and counts the kill in the scope's `memory.events`.
+#
+# The command runs in a control group of its own inside that scope, `test-run-<number>`, so the
+# limit still holds it. A process that started a session of its own (Playwright's browsers, a
+# child started with `start_new_session=True`) leaves the command's process group, never its
+# control group: a stopped run is ended by `cgroup.kill` of that group, whatever it holds. Where
+# no group can be made, the script is the run's child subreaper and kills what it adopted.
+set -uo pipefail
+
+[[ -n ${WORKFLOW_SESSION:-} ]] || exec "$@"
+
+LIMIT_SECONDS=${WORKFLOW_TEST_RUN_SECONDS:-1800}
+# Time the command has after it was told to stop, before it is killed.
+GRACE_SECONDS=${WORKFLOW_TEST_RUN_GRACE_SECONDS:-30}
+CGROUP_ROOT=${WORKFLOW_CGROUP_ROOT:-/sys/fs/cgroup}
+here=$CGROUP_ROOT$(sed -n 's/^0:://p' /proc/self/cgroup)
+group=$here
+# A run started inside another run is in that run's group, which has no memory files: the limit
+# and its kills are those of the nearest group above that has them, the session's scope.
+while [[ ! -e $group/memory.events && $group =~ /test-run-[0-9]+$ ]]; do
+  group=${group%/*}
+done
+
+kills() {
+  awk '$1 == "oom_kill" { print $2; found = 1 } END { if (!found) print 0 }' \
+    "$group/memory.events" 2>/dev/null || echo 0
+}
+
+# The limit as `memory.max` holds it, in words.
+memory_limit() {
+  local bytes=""
+  read -r bytes <"$group/memory.max" 2>/dev/null || true
+  if [[ $bytes =~ ^[0-9]+$ ]] && ((bytes % 1073741824 == 0)); then
+    echo "of $((bytes / 1073741824)) GB"
+  elif [[ $bytes =~ ^[0-9]+$ ]]; then
+    echo "of $((bytes / 1048576)) MB"
+  fi
+}
+
+# The group of the run, inside the group this script runs in, so a run inside another run is
+# also inside its group. Groups of runs whose script has ended are removed when empty; a run that
+# ended by itself may have left a process there. Without a control group it can write (Codex's
+# sandbox, a container, a stand-in in a test) the run has no group, and this script adopts the
+# run's orphans instead (below).
+# Removes a group and the empty groups inside it, the deepest first: a run inside a run that was
+# killed before it could remove its own group leaves that group behind.
+remove_groups() {
+  find "$1" -depth -type d -exec rmdir {} + 2>/dev/null || true
+}
+
+own=""
+for left in "${here%/}"/test-run-*/; do
+  number=${left%/}
+  number=${number##*/test-run-}
+  if [[ $number =~ ^[0-9]+$ ]] && ! kill -0 "$number" 2>/dev/null; then
+    remove_groups "${left%/}"
+  fi
+done
+if [[ $(stat -f -c %T "$here" 2>/dev/null) == cgroup2fs ]] && mkdir "$here/test-run-$$" 2>/dev/null; then
+  own=$here/test-run-$$
+fi
+# Without a group of its own (Codex's sandbox mounts the control groups read-only) this script
+# adopts the orphans of the run instead: it becomes a child subreaper, which `exec` keeps, and
+# starts again as the same process. A process that started a session of its own stays its
+# descendant, and a stopped run ends all of them.
+reaper=${WORKFLOW_TEST_RUN_REAPER:-}
+unset WORKFLOW_TEST_RUN_REAPER
+if [[ -z $own && -z $reaper ]] && command -v python3 >/dev/null; then
+  # Python ignores SIGPIPE and SIGXFSZ, and `exec` would keep that: the run gets them back as
+  # this script got them.
+  restore=()
+  for signal in PIPE XFSZ; do
+    [[ -n $(trap -p "$signal") ]] || restore+=("SIG$signal")
+  done
+  exec python3 -c '
+import ctypes, os, signal, sys
+for name in sys.argv[1].split():
+    signal.signal(getattr(signal, name), signal.SIG_DFL)
+made = ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
+os.environ["WORKFLOW_TEST_RUN_REAPER"] = "yes" if made else "no"
+os.execvp("bash", ["bash", *sys.argv[2:]])
+' "${restore[*]}" "${BASH_SOURCE[0]}" "$@"
+fi
+
+before=$(kills)
+# Without `--foreground`, `timeout` stops the command's whole process group: the workers of
+# pytest, Vitest and Playwright and the browsers they started go with it. It runs in the
+# background, so a stop sent to this script can be passed on, with this script's input; `wait`
+# is kept quiet so the shell prints no line of its own ("Killed timeout ...") when it was killed.
+# The command moves itself into the run's group before it starts, so all it starts is there too.
+# A background job starts with SIGINT and SIGQUIT ignored, and Python then never raises
+# `KeyboardInterrupt`: the command gets them back as this script had them (still ignored when
+# its caller ignored them, which a shell cannot undo). GNU `timeout` handles both itself, so its
+# command never had them ignored; the `timeout` of uutils passes on what it was given.
+(
+  trap - INT QUIT
+  [[ -z $own ]] || echo "$BASHPID" >"$own/cgroup.procs" 2>/dev/null || true
+  exec timeout --kill-after="$GRACE_SECONDS" "$LIMIT_SECONDS" "$@"
+) <&0 &
+runner=$!
+stopped=false
+trap 'stopped=true; kill -TERM "$runner" 2>/dev/null' TERM INT HUP
+wait "$runner" 2>/dev/null
+status=$?
+# A stop sent to this script ends `wait` early; the command is then waited for to its end.
+while kill -0 "$runner" 2>/dev/null; do
+  wait "$runner" 2>/dev/null
+  status=$?
+done
+((SECONDS < LIMIT_SECONDS)) || ((status != 124 && status != 137)) || stopped=true
+# The kernel kills only the largest process at the memory limit: the rest of the run is told to
+# stop, as at the time limit.
+memory=false
+if ((status != 0)) && (($(kills) > before)); then
+  memory=true
+  stopped=true
+  kill -TERM -- "-$runner" 2>/dev/null || true
+fi
+# Whether the run's group still holds a process.
+populated() {
+  [[ -n $own ]] && grep -qx 'populated 1' "$own/cgroup.events" 2>/dev/null
+}
+
+# Kills what is left under this script, when it adopts orphans: each process killed leaves its
+# children to it, so it goes on until none is left. The list is read without starting a process,
+# which would be on it.
+kill_children() {
+  local children=() child state tasks
+  for ((waited = 0; waited < 100; waited++)); do
+    # The list ends without a new line, so `read` fails though it has read it.
+    children=()
+    read -r -a children <"/proc/$$/task/$$/children" 2>/dev/null || true
+    local alive=false
+    for child in "${children[@]}"; do
+      read -r state <"/proc/$child/stat" 2>/dev/null || continue
+      state=${state##*) }
+      # A process whose main thread has ended is shown as a zombie while its other threads run.
+      tasks=("/proc/$child/task/"*)
+      [[ ${state%% *} == Z && ${#tasks[@]} -le 1 ]] && continue
+      alive=true
+      kill -KILL "$child" 2>/dev/null || true
+    done
+    [[ $alive == true ]] || break
+    sleep 0.1
+  done
+}
+
+# `timeout` ends as soon as the command does, and a worker that ignored the stop would outlive
+# it: what is left of its process group is killed after the grace time, then all that is left in
+# the run's group, which the stop never reached.
+if [[ $stopped == true ]]; then
+  for ((waited = 0; waited < GRACE_SECONDS * 10; waited++)); do
+    kill -0 -- "-$runner" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -KILL -- "-$runner" 2>/dev/null || true
+  if [[ $reaper == yes ]]; then
+    kill_children
+  fi
+  if [[ -n $own ]]; then
+    echo 1 >"$own/cgroup.kill" 2>/dev/null || true
+    for ((waited = 0; waited < 100; waited++)); do
+      populated || break
+      sleep 0.1
+    done
+  fi
+fi
+[[ -z $own ]] || remove_groups "$own"
+if ((SECONDS >= LIMIT_SECONDS)) && ((status == 124 || status == 137)); then
+  echo "stopped: the test run ran longer than its limit of $LIMIT_SECONDS s. A test or a step" \
+    "that never ends is the likely cause, not the machine: find it before running again." >&2
+elif [[ $memory == true ]]; then
+  limit=$(memory_limit)
+  echo "stopped: the test run passed its memory limit${limit:+ $limit}. A loop or a leak is the" \
+    "likely cause, not the machine: find it before running again." >&2
+fi
+exit "$status"

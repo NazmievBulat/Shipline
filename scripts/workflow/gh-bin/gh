@@ -1,0 +1,5 @@
+#!/bin/sh
+# Every newly launched session shares the host's GitHub admission and secondary backoff.
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+exec python3 "$here/../github_budget.py" foreground "$@"

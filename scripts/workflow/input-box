@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Shared by session and bridge-empty: what the owner has typed into a Claude input box.
+# Claude Code draws the empty prompt as the mark and a no-break space (U+00A0).
+
+# Capture with -e so dim suggestions can be distinguished from the owner's text. Such a
+# capture also holds hyperlinks (OSC 8); both kinds are removed, leaving the plain capture.
+strip_ansi() {
+  LC_ALL=C sed -E $'s/\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)//g'
+}
+
+# Strip the prompt mark and blank input lines. Use complete UTF-8 byte sequences for
+# Unicode White_Space, so this works even with LC_ALL=C and never drops part of a letter.
+# Resend's first check, send_prompt's last check and the bridge's wake must agree on an
+# empty box.
+nonblank_input() {
+  # U+0085, U+00A0, U+1680, U+2000..200A, U+2028..2029, U+202F, U+205F, U+3000.
+  local spaces=$'[[:space:]]|\xc2\x85|\xc2\xa0|\xe1\x9a\x80|\xe2\x80[\x80-\x8a\xa8\xa9\xaf]|\xe2\x81\x9f|\xe3\x80\x80'
+  # SGR attributes persist across lines. Only reset (0) and normal intensity (22)
+  # end dim; changing colour alone does not. Skip extended colour parameters so
+  # the 2 in an RGB colour is not mistaken for dim.
+  LC_ALL=C awk '
+    {
+      rest = $0
+      while (match(rest, /\033(\[[0-?]*[ -\/]*[@-~]|\][^\007\033]*(\007|\033\\))/)) {
+        if (!dim) printf "%s", substr(rest, 1, RSTART - 1)
+        escape = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RSTART + RLENGTH)
+        if (escape ~ /^\033\[[0-9;]*m$/) {
+          count = split(substr(escape, 3, length(escape) - 3), codes, ";")
+          if (!count) dim = 0
+          for (i = 1; i <= count; i++) {
+            code = codes[i] + 0
+            if (code == 38 || code == 48 || code == 58) {
+              if (codes[i + 1] == 2) i += 4
+              else if (codes[i + 1] == 5) i += 2
+            } else if (code == 0 || code == 22) dim = 0
+            else if (code == 2) dim = 1
+          }
+        }
+      }
+      if (!dim) printf "%s", rest
+      printf "\n"
+    }
+  ' | LC_ALL=C sed -E "s/^(>|❯)//; /^($spaces)*$/d"
+}

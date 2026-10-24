@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# Rings the owner's phone when a workflow session is blocked on him, and only then.
+#
+# Called by four hooks in `~/.claude/settings.json` (`install-hooks` adds them), with the
+# hook's JSON on standard input:
+#
+#   Stop                the session ended its turn: it is marked idle, and the phone rings
+#                       unless it stopped because it finished or because the usage limit
+#                       was reached; then the reset is noted for the tick
+#   UserPromptSubmit    the session works again: the idle mark is removed
+#   Notification        the session waits for a permission: the phone rings
+#   PreToolUse          the session used the question tool: the phone rings. By the rules a
+#                       question is plain text at the end of a turn, which rings as a stop;
+#                       the owner's phone cannot answer the tool. The hook stays for a session
+#                       that used it anyway.
+#
+# and by a session itself, before it ends its turn only to wait for its own background job:
+#
+#   notify waiting      the next stop is neither idle nor blocked; a reviewer is marked as
+#                       waiting, so the tick can wake it when its checks finish, and every
+#                       session notes when it began to wait, so the tick can keep its cache
+#
+# It does nothing unless WORKFLOW_SESSION names a worker (`ticket-N`), an audit (`audit-N`) or
+# a hunt (`hunt-<name>`), so the orchestrator and sessions started by hand never ring. A hook must never block or fail
+# a session: this always exits 0, prints nothing, and gives GitHub and Pushover a few seconds
+# each.
+#
+# `gh`, `curl`, `jq`, `git` and `timeout` are found on the PATH, so a test can replace them, and
+# WORKFLOW_NOW can name the time.
+set -u
+
+# Seconds GitHub and Pushover each get to answer. Two of them must fit in the 10 seconds a
+# hook has.
+ANSWER_SECONDS=${WORKFLOW_NOTIFY_SECONDS:-4}
+BODY_CHARACTERS=300
+PUSHOVER=https://api.pushover.net/1/messages.json
+KEYS_FILE=$HOME/agents/.env
+MISSED_LOG=$HOME/.local/state/workflow/missed-pushes.log
+# The line a session ends with, WORDS standing for its words. `tick` reads it the same way.
+FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:]]*$'
+
+name=${WORKFLOW_SESSION:-}
+[[ $name =~ ^((ticket|audit|review|cloud)-[0-9]+|hunt-[a-z0-9][a-z0-9-]*)$ ]] || exit 0
+# Cloud reports are read only by the tick, not ordinary session hooks.
+[[ $name != cloud-* || ${1:-} == cloud ]] || exit 0
+number=${name#*-}
+
+event=""
+if [[ ${1:-} == codex ]]; then
+  # Codex passes one JSON argument, rather than Claude's stdin event.
+  event=$(jq -ce 'select(.type == "agent-turn-complete") |
+    {hook_event_name: "Stop", last_assistant_message: .["last-assistant-message"],
+     turn_id: .["turn-id"], thread_id: .["thread-id"]} |
+    select(.last_assistant_message | type == "string")' <<<"${2:-}" 2>/dev/null) || exit 0
+elif [[ ${1:-} != waiting ]]; then
+  event=$(cat)
+fi
+# A hook's output reaches the session, so nothing is printed from here on.
+exec >/dev/null 2>&1
+
+# The worktree of the pull request or of the hunt, whichever worktree this script was called
+# from.
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$here/limit-reset"
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+worktree=$main/.claude/worktrees/ticket-$number
+[[ $name != hunt-* ]] || worktree=$main/.claude/worktrees/$name
+[[ $name != cloud-* ]] || worktree=$main
+notes=$worktree/.local/workflow
+idle=$notes/$name.idle
+waiting=$notes/$name.waiting
+checks_wait=$notes/$name.checks-wait
+# Any session's wait for its own job, kept from that stop until its next prompt: the tick reads
+# how long it has waited from it, to keep its cached context alive.
+job_wait=$notes/$name.job-wait
+# When the usage limit the session stopped on resets, in seconds, when it said it stopped so.
+limit=$notes/$name.limit
+# The last message the phone rang for.
+pushed=$notes/$name.pushed
+# When the session asked the owner, and a sum of the words it asked with, for the check-in of
+# `wake`. It stays while the session waits for his answer.
+asking=$notes/$name.asking
+
+# Only the worker's per-process callback may publish turns. Global callbacks from a
+# review or hunt must not mark the enclosing Claude session idle or ring its phone.
+if [[ ${1:-} == codex ]]; then
+  [[ ${WORKFLOW_CODEX_BRIDGE:-} == 1 && -e $notes/$name.codex ]] || exit 0
+fi
+
+field() {
+  jq -r "$1 // empty" <<<"$event" 2>/dev/null
+}
+
+# The body of a push: the first characters of a text of the event, or nothing when it has none.
+beginning_of() {
+  field "($1 // \"\") | tostring | .[0:$BODY_CHARACTERS]"
+}
+
+# Writes a note of the session. A session whose worktree is gone has no notes.
+note() {
+  [[ -d $worktree ]] || return 1
+  mkdir -p "$notes" && printf '%s\n' "$2" >"$1"
+}
+
+# Reads one key from the owner's file. The file is read, never run.
+key() {
+  local value
+  value=$(sed -n "s/^\(export \)\{0,1\}$1=//p" "$KEYS_FILE" 2>/dev/null | tail -n 1)
+  value=${value#[\"\']}
+  value=${value%[\"\']}
+  [[ $value =~ ^[A-Za-z0-9]+$ ]] && echo "$value"
+}
+
+# Sends the push. The keys go to `curl` on its standard input and the rest in files, so none
+# of it shows in the list of running programs.
+send() {
+  local title=$1 message=$2 link=$3 token user parts sent=1
+  local -a with_link=()
+  token=$(key PUSHOVER_TOKEN) && user=$(key PUSHOVER_USER) || return 1
+  parts=$(mktemp -d) || return 1
+  printf '%s' "$title" >"$parts/title"
+  printf '%s' "$message" >"$parts/message"
+  if [[ -n $link ]]; then
+    printf '%s' "$link" >"$parts/url"
+    with_link=(--data-urlencode "url@$parts/url")
+  fi
+  timeout "$ANSWER_SECONDS" curl --silent --fail --max-time "$ANSWER_SECONDS" --config - \
+    --data-urlencode "title@$parts/title" \
+    --data-urlencode "message@$parts/message" \
+    "${with_link[@]}" \
+    "$PUSHOVER" <<EOF && sent=0
+data-urlencode = "token=$token"
+data-urlencode = "user=$user"
+EOF
+  rm -rf "$parts"
+  return "$sent"
+}
+
+# Rings the phone. A push that could not be sent is written down for the owner to find.
+ring() {
+  local message=$1 title="$name needs you" link=""
+  [[ -n $message ]] || message="The session stopped without a message."
+  [[ ! -r $notes/$name.url ]] || read -r link <"$notes/$name.url" || true
+  send "$title" "$message" "$link" && return 0
+  mkdir -p "$(dirname "$MISSED_LOG")"
+  echo "$(date '+%Y-%m-%d %H:%M:%S')  $title  ${message//$'\n'/ }  $link" >>"$MISSED_LOG"
+  return 1
+}
+
+# A session is blocked unless the last line of its last message says its words: "worker
+# finished", "audit finished" or "hunt finished". The line is read as `tick` reads it from the screen: the
+# words alone, in bold or not, with a full stop or not. In quotes the session is quoting the
+# rule, and with more text under them it went on, perhaps to ask something.
+said_finished() {
+  local last
+  last=$(LC_ALL=C grep -vE '^[[:space:]]*$' <<<"$2" | tail -n 1)
+  LC_ALL=C grep -qiE "${FINISHED_LINE/WORDS/$1}" <<<"$last"
+}
+
+# Only the last non-empty paragraph can ask the owner. Keep the reply-word patterns here,
+# so a draft worker's push and its `asking` note (read by `wake`) use the same test.
+asks_owner() {
+  local paragraph request_start='(^|[.!?:;,[:cntrl:]][[:space:]]*|[[:space:]]please[[:space:]]+)'
+  # The bridge may quote Codex's words or set them as a quote block, and reply words are
+  # often in bold: `Reply **1** or **2**.` "Type" and "write" also start progress notes
+  # ("Next: write `notify` tests"), so only quoted words after them ask.
+  local marks="([[:space:]*_>\"'-]|“|‘)*" word="[*_]*([\"'\`0-9]|“|‘)" quoted="[*_]*([\"']|“|‘)"
+  local question_end="\?([[:space:]*_\`\"']|”|’)*$"
+  paragraph=$(LC_ALL=C awk '
+    /^[[:space:]]*$/ { if (current != "") last = current; current = ""; next }
+    { current = current (current == "" ? "" : "\n") $0 }
+    END { print (current != "" ? current : last) }
+  ' <<<"$1")
+  # One record preserves line starts for requests and the paragraph end for question marks.
+  LC_ALL=C grep -zqiE "${request_start}${marks}(please[[:space:]]+)?(reply[[:space:]]+(with\>|$word)|choose[[:space:]]+$word|(type|write)[[:space:]]+$quoted)|$question_end" <<<"$paragraph"
+}
+
+# Draft workers stop for progress reports too, so they ring only when they ask. A ready
+# worker, or one GitHub does not answer for, is blocked until it says "worker finished": a
+# wrong ring is better than a missed one.
+worker_is_blocked() {
+  local draft
+  # A bridge can stop on a live Codex permission panel, before any turn completes.
+  # The relay already recognized it; permission prompts always ring. The bridge may put
+  # words of its own around the panel, so its heading is looked for.
+  local heading
+  if [[ -e $notes/$name.codex && -s $notes/$name.codex-approval-delivered ]]; then
+    heading=$(head -n 1 "$notes/$name.codex-approval-delivered")
+    [[ -z $heading || $1 != *"$heading"* ]] || return 0
+  fi
+  said_finished "worker finished" "$1" && return 1
+  draft=$(cd "$main" && timeout "$ANSWER_SECONDS" gh pr view "$number" --json isDraft --jq .isDraft)
+  [[ $draft != true ]] || asks_owner "$1"
+}
+
+audit_is_blocked() {
+  ! said_finished "audit finished" "$1"
+}
+
+# A completion line takes precedence over a wait left by an earlier gate call.
+# A send-back is complete only once GitHub confirms that the pull request is draft.
+session_finished() {
+  case $name in
+    ticket-*) said_finished "worker finished" "$1" ;;
+    review-*)
+      said_finished "review finished" "$1" && return 0
+      said_finished "review sent back" "$1" &&
+        [[ $(cd "$main" && timeout "$ANSWER_SECONDS" gh pr view "$number" --json isDraft --jq .isDraft) == true ]]
+      ;;
+    audit-*) said_finished "audit finished" "$1" ;;
+    hunt-*) said_finished "hunt finished" "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Whether the session stopped because the usage limit was reached, said in its own words: "Your
+# usage limit was reached, so I am stopping here." Claude's own line ("You've hit your session
+# limit") is read from the screen by `session`; an hour-only weekly or other limit is also
+# recorded here when the hook receives it. Otherwise this is the stop where the model wrote
+# a closing message instead, and the screen holds no such line. Only the first line counts,
+# and it must say three things: the usage limit (or the session, 5-hour or weekly limit), that
+# it was reached or hit, and that the session itself is stopping ("I am stopping", "stopping
+# here"). Further on, with another limit ("the attempt limit"), or with something else stopped
+# ("I stopped the test"), the session is only talking about a limit, perhaps to ask the owner.
+#
+# The figures of the usage then say which window stopped it, and when it resets: the weekly one
+# when it is full, else the fuller of the two at LIMIT_STOP_PERCENT or more. A session whose
+# windows are both under that was stopped by something else (Codex has a limit of its own).
+# When the figures cannot be read, the 5-hour window is taken, and it resets at the latest
+# 5 hours on. A reset that is not ahead (the figures are a few minutes old, or the window had not
+# reset yet when the session was sent its instruction) is taken as LIMIT_RETRY_SECONDS on, so that the
+# tick tries again instead of waiting for a reset that has passed.
+# Sets limit_at to the reset, a minute late: a session sent its instruction while the window
+# is still full stops again.
+LIMIT_NAMED='\<(usage|session|5-hour|weekly) limit\>'
+LIMIT_REACHED='\<(reached|hit)\>'
+SESSION_STOPS='\<(I( am|.m)? stopping|stopping here)\>'
+# The usage figures may have to be asked of Anthropic. They get this long, so that with GitHub
+# and Pushover after them the hook still ends within its 10 seconds.
+USAGE_SECONDS=1.5
+
+stopped_on_limit() {
+  local first window percent at now five=() seven=()
+  claude_line_reset "$1" "$notes/$name" && return 0
+  # A bridge relays Codex's words, and Codex's usage is never read from Claude's figures.
+  [[ ! -e $notes/$name.codex ]] || return 1
+  now=${WORKFLOW_NOW:-$(date +%s)}
+  first=$(LC_ALL=C grep -m 1 -vE '^[[:space:]]*$' <<<"$1")
+  LC_ALL=C grep -qiE "$LIMIT_NAMED" <<<"$first" &&
+    LC_ALL=C grep -qiE "$LIMIT_REACHED" <<<"$first" &&
+    LC_ALL=C grep -qiE "$SESSION_STOPS" <<<"$first" || return 1
+  five=(0 0)
+  seven=(0 0)
+  limit_at=""
+  while read -r window percent at; do
+    case $window in
+      five_hour) five=("$percent" "$at") ;;
+      seven_day) seven=("$percent" "$at") ;;
+    esac
+    limit_at=read
+  done < <(WORKFLOW_USAGE_SECONDS=1 timeout "$USAGE_SECONDS" bash "$here/usage" 2>/dev/null)
+  if [[ -z $limit_at ]]; then
+    limit_at=$((now + 5 * 3600))
+  elif ((seven[0] >= 100 || (seven[0] >= LIMIT_STOP_PERCENT && seven[0] > five[0]))); then
+    limit_at=${seven[1]}
+  elif ((five[0] >= LIMIT_STOP_PERCENT)); then
+    limit_at=${five[1]}
+  else
+    return 1
+  fi
+  ((limit_at > now)) || limit_at=$((now + LIMIT_RETRY_SECONDS))
+  limit_at=$(((limit_at + 60 + 59) / 60 * 60))
+}
+
+on_stop() {
+  local message limit_at asked="" sum
+  # Permission dialogs and the question tool continue this same turn when answered. A
+  # later Stop proves that interaction ended; a refused merge still becomes an owner
+  # block below when the last message asks for permission to retry it.
+  rm -f "$notes/$name.interaction-blocked"
+  # Whatever this stop is, an earlier question is answered or asked again below.
+  [[ ! -r $asking ]] || read -r asked <"$asking" || true
+  rm -f "$asking"
+  [[ ! -e $notes/$name.codex ]] || note "$notes/$name.bridge-stopped" ""
+  message=$(field .last_assistant_message)
+  # Stopped by the usage limit, the session is neither working nor waiting for the owner: the
+  # tick sends it its instruction again after the reset. A hunt is not woken. This holds after
+  # `notify waiting` too, so the tick never keeps such a session's cache alive.
+  if [[ $name != hunt-* && ${1:-} != codex ]] && stopped_on_limit "$message"; then
+    rm -f "$waiting" "$checks_wait" "$job_wait"
+    note "$idle" ""
+    note "$limit" "$limit_at"
+    return 0
+  fi
+  if [[ -e $waiting ]]; then
+    rm -f "$waiting"
+    if session_finished "$message"; then
+      rm -f "$checks_wait" "$job_wait"
+      note "$idle" ""
+      return 0
+    fi
+    # Not idle: the tick squeezes idle sessions, and the background job still runs.
+    [[ ! $name =~ ^(review|audit)- ]] || note "$checks_wait" ""
+    note "$job_wait" ""
+    return 0
+  fi
+  rm -f "$job_wait"
+  note "$idle" ""
+  if [[ -e $notes/$name.codex ]] && LC_ALL=C grep -qiE "^[[:space:]]*(You.{1,3}ve hit your usage limit|.*(usage|session|weekly) limit.*(reached|hit).*(I am stopping|stopping here))" <<<"${message%%$'\n'*}"; then
+    return 0
+  fi
+  case $name in
+    ticket-*) worker_is_blocked "$message" || return 0 ;;
+    review-*)
+      said_finished "review finished" "$message" && return 0
+      if said_finished "review sent back" "$message"; then
+        [[ $(cd "$main" && timeout "$ANSWER_SECONDS" gh pr view "$number" --json isDraft --jq .isDraft) != true ]] || return 0
+      fi
+      # Record the block even when Pushover fails. No automatic check nudge is an answer
+      # to a question, including permission to retry a refused merge.
+      note "$notes/$name.owner-blocked" ""
+      ;;
+    audit-*) audit_is_blocked "$message" || return 0 ;;
+    # A hunt asks the owner nothing. One that stops before its report is done could not go on.
+    hunt-*) ! said_finished "hunt finished" "$message" || return 0 ;;
+  esac
+  # The same words after a turn of the session's own (its job ended) are the same question,
+  # asked since the first time; other words are a new one. A Codex bridge counts too: its stop
+  # shows Codex's last message.
+  sum=$(cksum <<<"$message")
+  sum=${sum%% *}
+  if [[ -n $asked && ${asked#* } == "$sum" ]]; then
+    note "$asking" "$asked"
+  else
+    note "$asking" "${WORKFLOW_NOW:-$(date +%s)} $sum"
+  fi
+  # A session woken by its own job that stops again with the same words rings once.
+  [[ ! -e $pushed || $(<"$pushed") != "$message" ]] || return 0
+  if [[ ${1:-} == codex || -e $notes/$name.codex ]]; then
+    ring "$(field '.last_assistant_message | .[-900:]')" || return 0
+  else
+    ring "$(beginning_of .last_assistant_message)" || return 0
+  fi
+  note "$pushed" "$message"
+}
+
+on_prompt() {
+  rm -f "$idle" "$waiting" "$checks_wait" "$job_wait" "$limit" "$notes/$name.limit-line" "$notes/$name.bridge-stopped"
+  # After the owner answered, the same question is a new one. A turn the session started
+  # itself, when its background job ended, is not an answer: the event then says so, in any
+  # of these fields. Claude Code 2.1.303 supplies no provenance fields for a queued
+  # task notification: its entire prompt is notification blocks instead. Owner text between
+  # two blocks keeps the prompt his.
+  local own_turn='.user_initiated == false or .is_user_input == false or .system == true
+    or (.source // "user_input"
+    | IN("background_task_output", "auto_continue", "permission_request",
+         "quota_auto_resume", "model_switch"))
+    or ((.prompt // "")
+    | test("^\\s*(?:<task-notification>(?:(?!</task-notification>)[\\s\\S])*</task-notification>\\s*)+$"))'
+  if [[ $(jq -r "$own_turn" <<<"$event" 2>/dev/null) != true ]]; then
+    rm -f "$pushed" "$notes/$name.owner-blocked" "$notes/$name.interaction-blocked"
+    # The bridge types this itself to relay Codex's next turn: the owner answered nothing.
+    [[ $(field .prompt) == __WORKFLOW_CODEX_TURN__ ]] || rm -f "$asking"
+    if [[ -e $notes/$name.codex ]] && jq -e '(.source // "user_input") == "user_input"' <<<"$event" >/dev/null; then
+      # jq writes the submitted text exactly, including trailing newlines. An automatic
+      # wake authorizes no reply and leaves any pending owner's answer alone.
+      if jq -e '.prompt | type == "string" and . != "__WORKFLOW_CODEX_TURN__" and length > 0' <<<"$event" >/dev/null; then
+        # The old turn stopped being current when the owner followed up, even if the
+        # relay later consumes the reply but fails to send it to Codex.
+        if [[ -r $notes/$name.codex-turn.json ]]; then
+          cp "$notes/$name.codex-turn.json" "$notes/$name.codex-followed-up"
+        fi
+        local temporary
+        temporary=$(mktemp "$notes/$name.reply.XXXXXX") || return 0
+        jq -j '.prompt' <<<"$event" >"$temporary" && mv "$temporary" "$notes/$name.owner-reply"
+        rm -f "$temporary"
+      fi
+    fi
+  fi
+}
+
+on_notification() {
+  local kind
+  kind=$(field .notification_type)
+  [[ -z $kind || $kind == permission_prompt ]] || return 0
+  [[ $name != review-* ]] || note "$notes/$name.interaction-blocked" ""
+  ring "$(beginning_of .message)"
+}
+
+# A question asked with the question tool blocks inside the turn: no stop follows it. The
+# rules tell a session to ask in plain text; this rings for one that did not.
+on_tool() {
+  [[ $(field .tool_name) == AskUserQuestion ]] || return 0
+  [[ $name != review-* ]] || note "$notes/$name.interaction-blocked" ""
+  # The owner answers inside the tool, so no prompt follows: what is asked after it is new.
+  rm -f "$pushed"
+  ring "$(beginning_of '([.tool_input.questions[]?.question | strings] | join("\n"))')"
+}
+
+# The Haiku bridge receives the complete turn unchanged. Its ordinary Stop hook rings,
+# with its Remote Control URL, so there is one push rather than one from each model.
+if [[ ${1:-} == codex && ${WORKFLOW_CODEX_BRIDGE:-} == 1 ]]; then
+  [[ -d $worktree ]] || exit 0
+  mkdir -p "$notes"
+  temporary=$(mktemp "$notes/$name.turn.XXXXXX") || exit 0
+  jq '{"last-assistant-message": .last_assistant_message, "turn-id": .turn_id}' \
+    <<<"$event" >"$temporary" &&
+    mv "$temporary" "$notes/$name.codex-turn.json"
+  rm -f "$temporary"
+  if [[ -e $notes/$name.bridge-stopped ]] && bash "$here/bridge-empty" "$name"; then
+    tmux -L "$name" send-keys -t "=$name:" -l '__WORKFLOW_CODEX_TURN__' 2>/dev/null &&
+      tmux -L "$name" send-keys -t "=$name:" Enter 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+if [[ ${1:-} == cloud ]]; then
+  [[ $name == cloud-* && -f $notes/$name ]] || exit 0
+  comment_id=$(field .comment_id)
+  [[ $comment_id =~ ^[0-9]+$ ]] || exit 0
+  [[ ! -e $pushed || $(<"$pushed") != "$comment_id" ]] || exit 0
+  note "$notes/$name.url" "$(field .url)"
+  ring "$(beginning_of .last_assistant_message)" && note "$pushed" "$comment_id"
+  exit 0
+fi
+
+if [[ ${1:-} == waiting ]]; then
+  note "$waiting" ""
+  exit 0
+fi
+
+case $(field .hook_event_name) in
+  Stop) on_stop "${1:-}" ;;
+  UserPromptSubmit) on_prompt ;;
+  Notification) on_notification ;;
+  PreToolUse) on_tool ;;
+esac
+exit 0

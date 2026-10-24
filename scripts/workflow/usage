@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Prints how much of the owner's usage limits is used, one line for each window:
+#
+#   five_hour <per cent used> <reset, in seconds since 1970>
+#   seven_day <per cent used> <reset, in seconds since 1970>
+#
+# The figures are those the status line shows ("USE: 5H: 76% 1h9m"). They are read from the
+# file the status line keeps when it is at most 5 minutes old, and otherwise asked of
+# Anthropic with the token Claude Code signed in with, as the status line does. Nothing is
+# written. Fails, printing nothing, when neither answers.
+#
+# `curl`, `jq` and `date` are found on the PATH, and the paths below can be pointed elsewhere,
+# so a test can replace all of them.
+set -uo pipefail
+
+CACHE=${WORKFLOW_USAGE_CACHE:-$HOME/.claude/MEMORY/STATE/usage-cache.json}
+CREDENTIALS=${WORKFLOW_CREDENTIALS:-$HOME/.claude/.credentials.json}
+ADDRESS=${WORKFLOW_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}
+FRESH_SECONDS=300
+ANSWER_SECONDS=${WORKFLOW_USAGE_SECONDS:-4}
+NOW=${WORKFLOW_NOW:-$(date +%s)}
+
+# The two lines, from the JSON the status line keeps and Anthropic answers with. A window
+# whose reset cannot be read is left out; with neither, it fails.
+lines_of() {
+  local window percent at printed=1
+  for window in five_hour seven_day; do
+    read -r percent at < <(jq -r --arg window "$window" \
+      '.[$window] | select(type == "object") | "\(.utilization // "") \(.resets_at // "")"' \
+      <<<"$1" 2>/dev/null) || continue
+    [[ $percent =~ ^[0-9]+(\.[0-9]+)?$ && -n $at ]] || continue
+    at=$(date -d "$at" +%s 2>/dev/null) || continue
+    echo "$window ${percent%.*} $at"
+    printed=0
+  done
+  return "$printed"
+}
+
+from_cache() {
+  local changed
+  changed=$(date -r "$CACHE" +%s 2>/dev/null) || return 1
+  ((NOW - changed <= FRESH_SECONDS)) || return 1
+  lines_of "$(<"$CACHE")"
+}
+
+# The token goes to `curl` on its standard input, so it does not show in the list of running
+# programs.
+from_anthropic() {
+  local token answer
+  token=$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDENTIALS" 2>/dev/null)
+  [[ -n $token ]] || return 1
+  answer=$(curl --silent --fail --max-time "$ANSWER_SECONDS" --config - \
+    -H "Content-Type: application/json" -H "anthropic-beta: oauth-2025-04-20" \
+    "$ADDRESS" <<EOF
+header = "Authorization: Bearer $token"
+EOF
+  ) || return 1
+  lines_of "$answer"
+}
+
+from_cache || from_anthropic

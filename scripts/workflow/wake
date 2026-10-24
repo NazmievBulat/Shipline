@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+# Gives the orchestrator session a check-in from outside it. A schedule kept inside the
+# orchestrator stops with it when the usage limit stops it; this runs from the tick, which the
+# systemd timer runs every 3 minutes.
+#
+#   wake [<name> ...]   the names are the sessions the tick has just sent their instruction
+#                       again, after the reset of the limit that stopped them
+#
+# With names, the orchestrator is told at once. Without, the wake looks every 20 minutes, and
+# only at night (from 20:00 to 8:00 by the machine's clock), and tells the orchestrator only
+# when it is idle and something changed since the last check-in: a session started, ended or
+# changed its state, or a pull request opened, closed or was marked ready. A check-in that
+# says nothing new would cost the orchestrator a turn for nothing. One exception: when /tmp has
+# used more than 80% of its file slots, the orchestrator is told once, at any hour and busy or
+# not, tried again every 5 minutes until the message is sent.
+#
+# A check GitHub lost after its run finished (the merge gate notes it, once per head) is named on
+# a line of its own, `lost check: CI result of run 123 on pull request 494`, at any hour and busy
+# or not, tried again every 5 minutes until the message is sent. So is a reviewer that said
+# "review finished" without handing its merge to the tick (the tick notes it, once for each
+# session and head): `rule break: review-494 said review finished without a merge handoff`.
+#
+# A session the tick found stalled is named on a line of its own, once, at any hour and busy or
+# not, tried again every 5 minutes until the message is sent: one busy 45 minutes with a screen
+# that did not change, `stuck? ticket-426 (45 min, running: <first line of its command>)`, and
+# one whose wait loop finds its own shell, `wait loop finds itself? ticket-426 (running: ...)`.
+#
+# What the tick's automatic ticket start did, and why the next ticket waits, rides with the
+# next check-in, a line each, once per change (`ticket_starts.py` notes them): `started 611
+# (priority high)`, `608 waits: shares scripts/workflow/merge_gate.py with 563`. Such a line
+# counts as a change for a check-in, and does not by itself make the wake look in the day.
+#
+# A session that ended its turn with a question to the owner is named on a line of its own,
+# with how long it has waited: `asking the owner: review-156 (8 min)`. The stop hook (`notify`)
+# notes the question when the stop rings the phone, and drops it when he answers. A question
+# the orchestrator was not yet told of is told at the next look, at any hour and busy or not,
+# once, tried again every 5 minutes until the message is sent.
+#
+# Each pass reads `session list`, the open pull requests, the usage and the load, and writes what it saw
+# and did to ~/.local/state/workflow/wake.log. It starts no session, merges nothing, pushes
+# nothing and changes no file of the repository: what needs judgment is the orchestrator's.
+#
+# The orchestrator is named in .local/workflow/orchestrator in the main checkout. It is
+# reached by a message, as one session reaches another, which only a session can send: a short
+# `claude -p` on Claude Haiku 5.5, with no settings and the one tool, sends it.
+#
+# `gh`, `claude` and `date` are found on the PATH, so a test can replace them.
+set -uo pipefail
+
+# Pin the messenger model independently of Claude Code's haiku alias.
+CHAT_MODEL=claude-haiku-5-5
+LOOK_EVERY_SECONDS=$((20 * 60))
+NIGHT_FROM_HOUR=20
+NIGHT_UNTIL_HOUR=8
+# Seconds Claude gets to list its sessions, and to deliver the message.
+LIST_SECONDS=15
+SEND_SECONDS=90
+NOW=${WORKFLOW_NOW:-$(date +%s)}
+STATE=$HOME/.local/state/workflow
+LOG=$STATE/wake.log
+# When the wake last looked, and the state it last told the orchestrator.
+LOOKED=$STATE/wake.looked
+TOLD=$STATE/wake.told
+# The sessions woken after a reset that the orchestrator has not yet been told of: the message
+# could not be sent, or no orchestrator was open. They are told at the next look, at any hour,
+# tried again every RETRY_SECONDS.
+PENDING=$STATE/wake.pending
+RETRY_SECONDS=$((5 * 60))
+# The questions to the owner the orchestrator was told of, one "<session> <asked at>" a line.
+ASKED=$STATE/wake.asked
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+github_ready=1
+python3 "$here/github_budget.py" ready wake || github_ready=0
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)") || exit 1
+resent=("$@")
+mkdir -p "$STATE"
+main_report=$main/.local/workflow/main-status
+main_pending=$main/.local/workflow/main-status.pending
+# The first push the package audit refused because an advisory service could not be reached
+# (scripts/workflow/advisory_service.py), told once.
+service_pending=$main/.local/workflow/advisory-service.pending
+service_line=""
+[[ ! -s $service_pending ]] || service_line=$(<"$service_pending")
+handbacks=$main/.local/workflow/merge-handbacks.pending
+handback_files=()
+handback_lines=()
+lost=$main/.local/workflow/lost-checks.pending
+lost_files=()
+lost_lines=()
+breaks=$main/.local/workflow/rule-breaks.pending
+stuck=$main/.local/workflow/stuck.pending
+stuck_files=()
+stuck_lines=()
+cloud_files=()
+cloud_lines=()
+if [[ -d $main/.local/workflow/cloud-events.pending ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '"\(.name): \(.message) (\(.url))"' "$event"); then
+      cloud_files+=("$event")
+      cloud_lines+=("$line")
+    fi
+  done < <(find "$main/.local/workflow/cloud-events.pending" -type f -print0 | sort -z)
+fi
+starts=$main/.local/workflow/ticket-starts.pending
+start_files=()
+start_lines=()
+if [[ -d $starts ]]; then
+  while IFS= read -r -d '' event; do
+    if lines=$(jq -er '.lines | map(strings) | select(length > 0) | join("; ")' "$event"); then
+      start_files+=("$event")
+      start_lines+=("$lines")
+    fi
+  done < <(find "$starts" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+fi
+if [[ -d $handbacks ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '"pull request \(.number): \(.reason)"' "$event"); then
+      handback_files+=("$event")
+      handback_lines+=("$line")
+    fi
+  done < <(find "$handbacks" -type f -print0 | sort -z)
+fi
+
+if [[ -d $lost ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '"lost check: \(.check) of run \(.run) on pull request \(.number)"' "$event"); then
+      lost_files+=("$event")
+      lost_lines+=("$line")
+    fi
+  done < <(find "$lost" -type f -name '*.json' -print0 | sort -z)
+fi
+# Rule breaks travel with the lost checks: told at any hour, on a line of their own.
+if [[ -d $breaks ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '"rule break: \(.name) said review finished without a merge handoff"' "$event"); then
+      lost_files+=("$event")
+      lost_lines+=("$line")
+    fi
+  done < <(find "$breaks" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+fi
+
+if [[ -d $stuck ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '.line | strings' "$event"); then
+      stuck_files+=("$event")
+      stuck_lines+=("$line")
+    fi
+  done < <(find "$stuck" -type f -name '*.json' -print0 | sort -z)
+fi
+
+# Seconds since the last look, or a day when there was none.
+since_last_look() {
+  local looked=""
+  [[ ! -r $LOOKED ]] || read -r looked <"$LOOKED"
+  [[ $looked =~ ^[0-9]+$ ]] || looked=$((NOW - 86400))
+  echo $((NOW - looked))
+}
+
+# Report file slots as well as bytes: a tmpfs can be full while it still has free space.
+tmp_slots_line() {
+  local used total percent
+  if ! read -r used total percent < <(LC_ALL=C df -i /tmp 2>/dev/null | awk '
+    NR > 1 && $2 ~ /^[0-9]+$/ && $2 > 0 && $3 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+%$/ {
+      sub(/%$/, "", $5); print $3, $2, $5; exit
+    }'); then
+    echo "/tmp file slots: could not be read"
+    return
+  fi
+  printf '/tmp file slots: %s%% used (%s/%s)' "$percent" "$used" "$total"
+  ((10#$percent <= 80)) || printf '; WARNING above 80%%'
+  printf '\n'
+}
+
+tmp_slots=$(tmp_slots_line)
+tmp_warning=false
+[[ $tmp_slots != *WARNING* ]] || tmp_warning=true
+# A warning the orchestrator was not yet told of reaches it at any hour, busy or not, tried
+# again every RETRY_SECONDS. Once told, check-ins follow the usual rules until it clears.
+tmp_alert=false
+if [[ $tmp_warning == true ]] && ! [[ -r $TOLD && $(<"$TOLD") == *"tmp pressure: true" ]]; then
+  tmp_alert=true
+fi
+
+# The sessions that ended their turn asking the owner, as "<session> <asked at>", from the notes
+# of `notify`: a session idle, with a question it has not had an answer to. With `all`, also a
+# session working again on its own job, whose question is still open.
+asking_notes() {
+  local note name asked identity
+  shopt -s nullglob
+  {
+    for note in "$main"/.claude/worktrees/*/.local/workflow/*.asking; do
+      name=${note##*/}
+      name=${name%.asking}
+      [[ ${1:-} == all || -e ${note%.asking}.idle ]] || continue
+      asked=""
+      read -r asked _ <"$note" 2>/dev/null || true
+      [[ $asked =~ ^[0-9]+$ ]] && printf '%s %s\n' "$name" "$asked"
+    done
+    for note in "$main"/.local/workflow/cloud-*.asking; do
+      name=${note##*/}
+      name=${name%.asking}
+      [[ -f $main/.local/workflow/$name ]] || continue
+      read -r asked identity <"$note" 2>/dev/null || continue
+      # Include the comment id in the identity: two questions in the same second are distinct.
+      [[ $asked =~ ^[0-9]+$ && $identity =~ ^[0-9]+$ ]] &&
+        printf '%s %s %s\n' "$name" "$asked" "$identity"
+    done
+  } | sort
+}
+
+# The sessions that run, read only when a session asks: a note left by a session that no longer
+# runs asks nothing, and must not make the wake look at any hour. When the sessions could not be
+# read, every note is taken.
+sessions_read=false
+read_sessions() {
+  sessions=$(bash "$here/session" list 2>/dev/null 9>&-) || { sessions="" && unread=1; }
+  sessions_read=true
+}
+
+asking=$(asking_notes)
+untold=""
+if [[ -n $asking ]]; then
+  read_sessions
+  if [[ -z ${unread:-} ]]; then
+    asking=$(awk 'NR == FNR { running[$1] = 1; next } running[$1]' <(printf '%s\n' "$sessions") - <<<"$asking")
+  fi
+  untold=$(grep -vxF -f <(cat "$ASKED" 2>/dev/null; echo) <<<"$asking")
+fi
+
+if ((${#resent[@]} == 0)); then
+  if [[ -s $PENDING || -s $main_pending || -n $service_line || ${#handback_files[@]} -gt 0 || ${#cloud_files[@]} -gt 0 || ${#lost_files[@]} -gt 0 || ${#stuck_files[@]} -gt 0 || $tmp_alert == true || -n $untold ]]; then
+    (($(since_last_look) + 30 >= RETRY_SECONDS)) || exit 0
+  else
+    hour=$(date -d "@$NOW" +%-H)
+    ((hour >= NIGHT_FROM_HOUR || hour < NIGHT_UNTIL_HOUR)) || exit 0
+    (($(since_last_look) + 30 >= LOOK_EVERY_SECONDS)) || exit 0
+  fi
+fi
+echo "$NOW" >"$LOOKED"
+# The names not yet told go first, without the ones woken again since.
+if [[ -s $PENDING ]]; then
+  mapfile -t waiting < <(grep -vxF -f <(printf '%s\n' "${resent[@]}" "") "$PENDING")
+  resent=("${waiting[@]}" "${resent[@]}")
+fi
+# Written down before anything can fail; removed once the orchestrator was told.
+((${#resent[@]} == 0)) || printf '%s\n' "${resent[@]}" >"$PENDING"
+
+log() {
+  printf '%s\n' "$@" >>"$LOG"
+}
+
+# "2h17m" from seconds.
+duration() {
+  local seconds=$(($1 > 0 ? $1 : 0))
+  echo "$((seconds / 3600))h$((seconds % 3600 / 60))m"
+}
+
+usage_line() {
+  local window percent at five="" seven=""
+  while read -r window percent at; do
+    case $window in
+      five_hour) five="5-hour window $percent% used, resets in $(duration $((at - NOW)))" ;;
+      seven_day) seven="weekly $percent%" ;;
+    esac
+  done < <(bash "$here/usage" 2>/dev/null)
+  [[ -n $five$seven ]] || { echo "the usage could not be read" && return; }
+  echo "${five:-5-hour window unknown}${seven:+, $seven}"
+}
+
+starts_allowed() {
+  local window percent at
+  while read -r window percent at; do
+    [[ $window == five_hour ]] || continue
+    if ((percent > 85 && at - NOW > 3600)); then echo held; else echo allowed; fi
+    return
+  done < <(bash "$here/usage" 2>/dev/null)
+  echo unknown
+}
+
+# The open pull requests as "drafts 93, 94; ready high 97; ready medium 98", the drafts without
+# the label `workflow` (tickets that wait for their start by the tick) apart, and the ready ones
+# grouped by priority, most urgent first.
+pull_requests_line() {
+  ((github_ready)) || return 75
+  WORKFLOW_BACKGROUND_GITHUB=1 python3 "$here/workflow_commands.py" pr list --state open --limit 200 --json number,isDraft,labels,statusCheckRollup --jq "$(<"$here/priority.jq")"'
+    def numbers: sort_by(.number) | map(.number | tostring) | join(", ");
+    def labelled: .labels | map(.name) | index("workflow") != null;
+    def checks: [.statusCheckRollup[]? | (.conclusion // .state // "") | ascii_upcase]
+      | if any(IN("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED")) then "failing"
+        elif any(IN("", "PENDING", "EXPECTED", "IN_PROGRESS", "QUEUED")) then "pending"
+        else "passing" end;
+    def with_checks: sort_by(.number) | map("\(.number) (checks \(checks))") | join(", ");
+    [ "drafts " + (map(select(.isDraft and labelled)) | numbers),
+      "waiting tickets " + (map(select(.isDraft and (labelled | not))) | numbers),
+      (map(select(.isDraft | not)) | group_by(priority_rank) | .[]
+        | "ready \(.[0] | priority_name) " + with_checks) ]
+    | map(select(endswith(" ") | not))
+    | if length == 0 then "none" else join("; ") end' 9>&-
+}
+
+# Each running session as "ticket-94 limit", without its memory.
+sessions_line() {
+  [[ -z ${unread:-} ]] || { echo "could not be read" && return; }
+  [[ -n $1 ]] || { echo none && return; }
+  awk '{ printf "%s%s %s", (NR > 1 ? ", " : ""), $1, $2 }' <<<"$1"
+}
+
+# The registered orchestrator: its name and whether it is idle. Never pick another session.
+find_orchestrator() {
+  local registration=$main/.local/workflow/orchestrator name="" found
+  if [[ ! -r $registration ]]; then
+    log "  orchestrator registration could not be read: $registration; nobody was told"
+    return 1
+  fi
+  IFS= read -r name <"$registration" || true
+  if [[ -z $name ]]; then
+    log "  orchestrator registration is empty: $registration; nobody was told"
+    return 1
+  fi
+  found=$(timeout "$LIST_SECONDS" claude agents --json 2>/dev/null 9>&- | jq -r \
+    --arg main "$main" --arg name "$name" '
+    [.[] | select(.kind == "interactive" and .cwd == $main and .name == $name)][0]
+    | select(. != null) | "\(.status // "unknown")\t\(.name)"') || {
+      log "  orchestrator sessions could not be read; nobody was told"
+      return 1
+    }
+  if [[ -z $found ]]; then
+    log "  named orchestrator ($name) is not open in the main checkout; nobody was told"
+    return 1
+  fi
+  printf '%s\n' "$found"
+}
+
+# Sends the message and checks that the tool said it was delivered. What Claude answered is
+# kept in wake.send.log, for when it was not. Its standard input is closed: with none, Claude
+# waits 3 seconds for it and says so.
+send_to() {
+  local to=$1 message=$2 answer
+  answer=$(cd "$STATE" && timeout "$SEND_SECONDS" claude -p --model "$CHAT_MODEL" --setting-sources "" \
+    --tools SendMessage --output-format stream-json --verbose \
+    --system-prompt "You deliver one message between Claude sessions. Call SendMessage exactly once, with the recipient and the text given, the text unchanged. Then answer with one word: sent." \
+    "Recipient: $to
+Text, between the lines of dashes:
+----------
+$message
+----------" </dev/null 2>"$STATE/wake.send.err" 9>&-) || true
+  { printf '%s\n' "$answer" && cat "$STATE/wake.send.err"; } >"$STATE/wake.send.log" 2>/dev/null
+  rm -f "$STATE/wake.send.err"
+  jq -R 'fromjson? // empty' <<<"$answer" 2>/dev/null | jq -e -s '
+    ([.[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use" and .name == "SendMessage") | .id]) as $sent
+    | [.[] | select(.type == "user") | .message.content[]? | select(.type == "tool_result" and (.tool_use_id | IN($sent[])) and (.is_error | not))]
+    | length > 0' >/dev/null 2>&1
+}
+
+failed=0
+[[ $sessions_read == true ]] || read_sessions
+# "review-156 (8 min), review-208 (15 min)"
+asking_line=$(awk -v now="$NOW" 'NF >= 2 {
+  printf "%s%s (%d min)", (n++ ? ", " : ""), $1, (now - $2) / 60 }' <<<"$asking")
+pulls=$(pull_requests_line) || pulls="could not be read"
+[[ ! -r $main_report ]] || pulls+="; $(<"$main_report")"
+usage=$(usage_line)
+usage+="; $tmp_slots; $(bash "$here/session" load 2>/dev/null || echo "load could not be read")"
+# Whether the orchestrator may start sessions by its rule: not above 85% of the 5-hour window,
+# unless the window resets within the hour. When that changes, so does what it can do.
+gate=$(starts_allowed)
+seen="sessions: $(sessions_line "$sessions"); pull requests: $pulls; starts: $gate; tmp pressure: $tmp_warning"
+
+reason="every 20 minutes"
+((${#resent[@]} == 0)) || reason="after a reset"
+log "$(date -d "@$NOW" '+%Y-%m-%d %H:%M:%S')  $reason" \
+  "  usage: $usage" "  $seen"
+((${#resent[@]} == 0)) || log "  the tick sent its instruction again to: ${resent[*]}"
+[[ -z $asking_line ]] || log "  asking the owner: $asking_line"
+for line in "${lost_lines[@]}" "${stuck_lines[@]}"; do
+  log "  $line"
+done
+
+if ! orchestrator=$(find_orchestrator) || [[ -z $orchestrator ]]; then
+  exit "$failed"
+fi
+state=${orchestrator%%$'\t'*}
+name=${orchestrator#*$'\t'}
+
+if ((${#resent[@]} == 0 && ${#handback_files[@]} == 0 && ${#cloud_files[@]} == 0 && ${#lost_files[@]} == 0 &&
+  ${#stuck_files[@]} == 0)) &&
+  [[ ! -s $main_pending && -z $service_line && -z $untold ]]; then
+  if [[ $state != idle && $tmp_alert != true ]]; then
+    log "  $name is $state; not told"
+    exit "$failed"
+  fi
+  if [[ -r $TOLD && $(<"$TOLD") == "$seen" ]] && ((${#start_files[@]} == 0)); then
+    log "  nothing changed since the last check-in; $name not told"
+    exit "$failed"
+  fi
+fi
+
+# The sessions asking the owner stand on a line of their own, so the orchestrator sees them.
+between_lines=" "
+[[ -z $asking_line ]] || between_lines=$'\n'"asking the owner: $asking_line"$'\n'
+for line in "${lost_lines[@]}" "${stuck_lines[@]}"; do
+  [[ $between_lines == *$'\n' ]] || between_lines=$'\n'
+  between_lines+="$line"$'\n'
+done
+message="Wake check-in, $(date -d "@$NOW" '+%H:%M')${resent[*]:+, after a reset}. Usage: $usage.${resent[*]:+ Sent their instruction again: ${resent[*]}.} Sessions: $(sessions_line "$sessions"). Open pull requests: $pulls.${between_lines}Log: ~/.local/state/workflow/wake.log. Do what needs judgment by AGENTS.md, For the orchestrator session; start nothing above 85% of the 5-hour window unless it resets within the hour; never merge, never force-push, never edit code."
+if ((${#handback_lines[@]})); then
+  message+=" Merge hand-backs for judgment: ${handback_lines[*]}"
+fi
+if ((${#cloud_lines[@]})); then
+  message+=" Cloud worker reports: ${cloud_lines[*]}"
+fi
+if ((${#start_lines[@]})); then
+  joined=$(printf '%s; ' "${start_lines[@]}")
+  message+=" Ticket starts by the tick: ${joined%; }."
+fi
+if [[ -n $service_line ]]; then
+  message+=" Package audit: $service_line; pushes wait for it, nothing was found wrong."
+fi
+
+if send_to "$name" "$message"; then
+  echo "$seen" >"$TOLD"
+  # A question told before stays told while it is open, also while its session works again on
+  # its own job and so is not in this check-in.
+  { cat "$ASKED" 2>/dev/null; printf '%s\n' "$asking"; } | sort -u |
+    grep -xF -f <(asking_notes all; echo) >"$ASKED.new"
+  mv "$ASKED.new" "$ASKED"
+  rm -f "$PENDING"
+  for event in "${cloud_files[@]}" "${start_files[@]}"; do
+    rm -f -- "$event"
+  done
+  # Do not acknowledge a newer outage noted while the message was being sent.
+  if [[ -n $service_line && -r $service_pending && $(<"$service_pending") == "$service_line" ]]; then
+    rm -f "$service_pending"
+  fi
+  if ((${#lost_files[@]})); then
+    # The gate and the tick note a head once: one already sent is not noted again.
+    for event in "${lost_files[@]}"; do
+      sent=${event%/*}
+      sent=${sent%.pending}.sent
+      mkdir -p "$sent"
+      mv -- "$event" "$sent/${event##*/}"
+    done
+  fi
+  if ((${#stuck_files[@]})); then
+    mkdir -p "$main/.local/workflow/stuck.sent"
+    for event in "${stuck_files[@]}"; do
+      mv -- "$event" "$main/.local/workflow/stuck.sent/${event##*/}"
+    done
+  fi
+  if ((${#handback_files[@]})); then
+    mkdir -p "$main/.local/workflow/merge-handbacks.sent"
+    for event in "${handback_files[@]}"; do
+      mv -- "$event" "$main/.local/workflow/merge-handbacks.sent/${event##*/}"
+    done
+  fi
+  # Do not acknowledge a newer report published while the message was being sent.
+  if [[ -r $main_pending && $pulls == *"$(<"$main_pending")"* ]]; then
+    rm -f "$main_pending"
+  fi
+  log "  told $name: $message"
+  echo "the orchestrator ($name) was given a check-in"
+else
+  log "  the check-in could not be sent to $name"
+  echo "the check-in could not be sent to the orchestrator ($name)" >&2
+  failed=1
+fi
+exit "$failed"

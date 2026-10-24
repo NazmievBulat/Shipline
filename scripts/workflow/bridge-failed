@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# A parser failure can end Claude's turn without its Stop hook marking the bridge idle.
+# Only the last output above the input box counts; an older error is not a failed relay.
+bridge_parse_failed() {
+  local screen last top
+  screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null) || return 1
+  top=$(LC_ALL=C awk '/^─/ { above = last; last = NR } END { print above + 0 }' <<<"$screen")
+  if ((top > 0)); then
+    screen=$(LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen")
+  fi
+  last=$(LC_ALL=C awk '
+    /^─/ { next }
+    /^(>|❯)[[:space:]]*$/ { next }
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*(·|✢|✳|✶|✻|✽)/ && !/esc to interrupt/ { next }
+    { last = $0 }
+    END { print last }
+  ' <<<"$screen")
+  LC_ALL=C grep -qE "^[[:space:]]*(●|⎿)?[[:space:]]*(API Error: )?The model.s tool call could not be parsed \(retry also failed\)\.[[:space:]]*$" <<<"$last"
+}

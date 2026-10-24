@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Optional read-only reviewers. Reports are complete files, keyed by reviewed head.
+set -uo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+run_one() {
+  local main=$1 checkout=$2 report=$3 who=$4 prompt=$5 tool result runtime file cleanup
+  case $who in
+    cursor) tool=(agent -p "$prompt" --mode ask --trust --output-format text) ;;
+    codex) tool=(codex exec --sandbox read-only "$prompt") ;;
+  esac
+  runtime=$(mktemp -d "${TMPDIR:-/tmp}/workflow-review-$who.XXXXXX") || return 1
+  printf -v cleanup 'rm -rf -- %q' "$runtime"
+  trap "$cleanup" EXIT
+  # Give CLIs their own state and sign-in files, and no session history.
+  # The only writable host mount is this temporary home, removed when the process ends.
+  for file in .codex/auth.json .codex/config.toml .config/cursor/auth.json .cursor/cli-config.json; do
+    [[ -f $HOME/$file ]] || continue
+    mkdir -p "$runtime/${file%/*}"
+    cp -L "$HOME/$file" "$runtime/$file"
+  done
+  mkdir -p "$runtime/.cache" "$runtime/.codex" "$runtime/.config" "$runtime/.local/state" "$runtime/tmp"
+  # Git metadata and the writer's worktree remain read-only alongside the detached copy.
+  env -u WORKFLOW_SESSION -u WORKFLOW_CODEX_BRIDGE HOME="$runtime" CODEX_HOME="$runtime/.codex" \
+    XDG_CONFIG_HOME="$runtime/.config" XDG_CACHE_HOME="$runtime/.cache" \
+    XDG_STATE_HOME="$runtime/.local/state" XDG_DATA_HOME="$runtime/.local/share" TMPDIR="$runtime/tmp" timeout 1800 \
+    bwrap --ro-bind / / --dev /dev --proc /proc --bind "$runtime" "$runtime" \
+    --chdir "$checkout" -- \
+    "${tool[@]}" >"$report.pending" 2>&1
+  result=$?
+  if ((result != 0)); then
+    echo "skipped: $who exited unsuccessfully (installation, sign-in, quota or sandbox)" >>"$report.pending"
+  fi
+  cat "${report%/*}/task-history.md" 2>/dev/null >>"$report.pending"
+  echo "exit $result" >>"$report.pending"
+  mv "$report.pending" "$report"
+  git -C "$main" worktree remove --force "$checkout" >/dev/null 2>&1 || true
+}
+
+number=${1:-}
+[[ $number =~ ^[0-9]+$ ]] || { echo "usage: review-panel N [cursor|codex ...]" >&2; exit 2; }
+shift
+full_review=false
+if [[ ${1:-} == --full-review ]]; then
+  full_review=true
+  shift
+fi
+reviewers=("$@")
+((${#reviewers[@]})) || reviewers=(cursor codex)
+for who in "${reviewers[@]}"; do
+  [[ $who =~ ^(cursor|codex)$ ]] || exit 2
+done
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)") || exit 1
+cd "$main" || exit 1
+task=$(gh pr view "$number" --json title,body,baseRefName,headRefOid) || exit 1
+head=$(jq -er .headRefOid <<<"$task") || exit 1
+base=$(jq -er .baseRefName <<<"$task") || exit 1
+root=$main/.local/workflow/reviews/$number/$head
+[[ $full_review == false ]] || root=$root/full-review
+mkdir -p "$root" || exit 1
+exec 9>"$root/panel.lock"
+flock --nonblock 9 || { echo "panel $number already running: $root"; exit 0; }
+git fetch --quiet origin "$head" "$base" main || exit 1
+if ! bash "$here/weaker-tests" --base "origin/$base" --head "$head" >"$root/weaker-tests.md.pending"; then
+  rm -f "$root/weaker-tests.md.pending"
+  echo "could not generate weaker-tests report" >&2
+  exit 1
+fi
+mv "$root/weaker-tests.md.pending" "$root/weaker-tests.md"
+python3 "$here/task_history.py" "$number" "$root" <<<"$task" || exit 1
+prompt=$(sed "s/{N}/$number/g" "$here/review-prompt.txt")
+# Prepare evidence once, even when completed tool reports can be reused.
+git diff "origin/$base...$head" >"$root/diff.patch" || exit 1
+scope_key=full
+if [[ $full_review == false && -f $main/.local/workflow/review-$number.conflict.json ]]; then
+  raw_reviews=$(gh api --paginate "repos/NazmievBulat/Shipline/pulls/$number/reviews") || exit 1
+  reviews=$(jq -s 'add' <<<"$raw_reviews") || exit 1
+  inputs=$(mktemp -d "$root/inputs.XXXXXX") || exit 1
+  git worktree add --quiet --detach "$inputs" "$head" || exit 1
+  mkdir -p "$inputs/.review"
+  cp "$root/"{diff.patch,task.md,weaker-tests.md} "$inputs/.review/"
+  python3 -B "$here/conflict_review.py" panel "$main/.local/workflow" "$number" "$inputs" "$head" <<<"$reviews"
+  scope_result=$?
+  if ((scope_result == 0)); then
+    if ! (cd "$inputs" && python3 -B "$here/server_tests_for_changes.py" "$head^1" --files-from .review/conflict-files.txt > .review/server-tests.json &&
+        python3 -B "$here/browser_tests_for_changes.py" "$head^1" --files-from .review/conflict-files.txt > .review/browser-tests.txt); then
+      git worktree remove --force "$inputs" >/dev/null 2>&1
+      echo "could not select tests for the conflict resolution" >&2
+      exit 1
+    fi
+    cp "$inputs/.review/"{diff.patch,task.md,weaker-tests.md,conflict-files.txt,server-tests.json,browser-tests.txt} "$root/"
+    scope_key=$(sha256sum "$root/task.md" "$root/diff.patch" | sha256sum | cut -d' ' -f1)
+  elif ((scope_result == 2)); then
+    cp "$inputs/.review/task.md" "$root/task.md"
+    rm -f "$root/"{conflict-files.txt,server-tests.json,browser-tests.txt}
+  else
+    git worktree remove --force "$inputs" >/dev/null 2>&1
+    echo "could not prepare conflict review evidence" >&2
+    exit 1
+  fi
+  git worktree remove --force "$inputs" >/dev/null 2>&1 || exit 1
+fi
+pids=()
+for who in "${reviewers[@]}"; do
+  report=$root/$who.md
+  # The reviewer inherits this lock and its own processes keep it, even when a panel that
+  # started it was killed. A free lock beside a pending report means that review was abandoned.
+  exec 8>"$report.lock"
+  if ! flock --nonblock 8; then
+    echo "$who review of $head still running"
+    continue
+  fi
+  # A completed report for this exact head can be reused. Checked under the lock, since a
+  # surviving reviewer publishes its report before releasing it.
+  if [[ -f $report ]]; then
+    previous_scope=$(cat "$report.scope" 2>/dev/null || echo full)
+    [[ $previous_scope != "$scope_key" ]] || continue
+    rm -f "$report"
+  fi
+  echo "$scope_key" >"$report.scope"
+  rm -f "$report.pending"
+  installed=false
+  case $who in
+    cursor) command -v agent >/dev/null && installed=true ;;
+    codex) command -v codex >/dev/null && installed=true ;;
+  esac
+  if [[ $who == codex && -e $main/.local/workflow/codex-built-$number ]]; then
+    echo 'skipped: Codex built this pull request' >"$report"
+    continue
+  fi
+  if [[ $installed == false ]] || ! command -v bwrap >/dev/null; then
+    echo "skipped: $who or its read-only sandbox is not installed" >"$report"
+    continue
+  fi
+  checkout=$(mktemp -d "$root/$who.XXXXXX") || continue
+  if ! git worktree add --quiet --detach "$checkout" "$head"; then
+    echo "skipped: could not prepare $who checkout" >"$report"
+    rmdir "$checkout" 2>/dev/null || true
+    continue
+  fi
+  mkdir -p "$checkout/.review"
+  cp "$root/weaker-tests.md" "$checkout/.review/weaker-tests.md"
+  cp "$root"/task{,-as-opened,-changes,-history}.md "$checkout/.review/"
+  if ! git show origin/main:AGENTS.md >"$checkout/.review/workflow-rules.md"; then
+    git worktree remove --force "$checkout" >/dev/null 2>&1
+    echo "skipped: could not read workflow rules from main for $who" >"$report"
+    continue
+  fi
+  cp "$root/diff.patch" "$checkout/.review/diff.patch"
+  if [[ $scope_key != full ]]; then
+    cp "$root/"{conflict-files.txt,server-tests.json,browser-tests.txt} "$checkout/.review/"
+  fi
+  run_one "$main" "$checkout" "$report" "$who" "$prompt" 9>&- &
+  pids+=("$!")
+done
+exec 8>&-
+for pid in "${pids[@]}"; do wait "$pid" || true; done
+echo "panel $number reports: $root (read task-history.md, task-changes.md, weaker-tests.md and completed cursor.md and codex.md files only)"

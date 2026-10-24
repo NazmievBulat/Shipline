@@ -1,0 +1,834 @@
+#!/usr/bin/env bash
+# Does the part of the workflow that has one right answer. A systemd user timer runs it every
+# 3 minutes (see `install-timer`); there is no model in it, beyond the one that carries a
+# message of `wake` to the orchestrator.
+#
+#   1. An idle audit that said "audit finished" is stopped, and so is an idle worker that said
+#      "worker finished", unless its pull request is still a draft, and an idle hunt that said
+#      "hunt finished". A hunt that still runs 65 minutes after its start is stopped too. A
+#      Codex completion is read regardless of its bridge state; a bridge that ended or
+#      failed to parse a tool call gets its bridge again while Codex works. A reviewer that
+#      said "review finished" on an open, ready pull request based on main without handing
+#      its merge to the tick is noted as a rule break for the wake.
+#   2. `session cleanup`: the worktrees of merged pull requests and of ended hunts are removed.
+#   3. A session that is idle or stopped on the usage limit and holds more than 300 MB is
+#      squeezed.
+#   4. A worker, independent reviewer or audit that the usage limit stopped is sent its instruction again when
+#      the time the limit resets has passed, once for each reset.
+#   5. `wake`: the orchestrator session is told of the sessions step 4 woke, and looked in on
+#      every 20 minutes at night. This is the one step that may call a model, to deliver the
+#      message.
+#   6. A labelled draft with no session gets a worker; a ready pull request gets a fresh
+#      reviewer. A reviewer that restored draft and said "review sent back" hands back to a
+#      worker. A reviewed stack head waits for its base without repeated reviews. Starts go
+#      by priority (`priority.jq`), then the older ticket; one that waits for memory keeps
+#      the ones after it waiting too.
+#   7. A reviewer marked as waiting for checks is woken once per head when all checks finish,
+#      even before publishing its round. Without a wait note, an idle reviewer needs a round
+#      it published on the head or an earlier commit of it. Owner questions are left alone.
+#      A reviewer or audit whose pull request another member's gate call merged in a batch
+#      is told so once, to do its after-merge duties.
+#   8. Waits that ended or stalled, for Claude workers and reviewers (never Codex bridges, hunts
+#      or audits): a session idle 50 minutes waiting for its own job or its turn in the train
+#      is asked once per idle stretch whether the wait is over; a worker idle 15 minutes on a
+#      ready pull request without "worker finished" is told once to finish; a busy session
+#      whose screen has not changed for 45 minutes, and a wait loop that finds its own shell,
+#      are named in the wake once. A running command is never interrupted.
+#   9. After the starts of step 6, the next draft without the label gets it when one may start
+#      (`ticket_starts.py`: by priority, then the older ticket, when its files overlap no running
+#      ticket's, nothing in `start-plan` holds it back, the machine has had room for 10
+#      minutes and nothing started for 5), at most one a tick. The next tick starts its worker.
+#
+# Steps 1 and 2 are the one place a session is closed, and only when its work no longer exists.
+# The starts come last because the steps before them may free memory they need.
+# Audits are not started here: the orchestrator session starts one by hand, and only for a
+# pull request that was built before the workflow existed. Hunts are not started here either.
+set -uo pipefail
+
+# A session that holds more than this while idle is squeezed.
+SQUEEZE_ABOVE_MB=300
+# The usage limit counts over 5 hours, so the time on a limit line is at most this far ahead.
+LIMIT_WINDOW_SECONDS=$((5 * 3600))
+HALF_A_YEAR_SECONDS=$((182 * 86400))
+ZONES=${WORKFLOW_ZONES:-/usr/share/zoneinfo}
+# The time now, in seconds. A test names another.
+NOW=${WORKFLOW_NOW:-$(date +%s)}
+# A hunter hunts for 45 minutes and then writes its report. One that still runs after this
+# many is stuck, or a Codex hunter that never ended; nothing else would stop it.
+HUNT_STOPPED_AFTER_MINUTES=65
+# A session waiting for its own job or its turn loses its cached context an hour after its last
+# turn; one this long idle is asked whether the wait is over. One message per idle stretch.
+KEEP_ALIVE_AFTER_SECONDS=$((50 * 60))
+# A worker idle this long with its pull request ready, and no "worker finished", is told once.
+READY_UNFINISHED_SECONDS=$((15 * 60))
+# A busy session whose screen has not changed for this long is named in the wake, once.
+STUCK_AFTER_SECONDS=$((45 * 60))
+# The line a session ends with, WORDS standing for its words. `notify` reads it the same way.
+FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:]]*$'
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+gh() { python3 "$here/github_budget.py" call tick "$@"; }
+source "$here/bridge-failed"
+# Use the same repository as the runner registration and the worker gh shim.
+source "$here/../../.github/runner/settings.sh"
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)") || exit 1
+
+# A second tick exits while the first still runs.
+mkdir -p "$main/.local/workflow"
+exec 9>"$main/.local/workflow/tick.lock"
+if ! flock --nonblock 9; then
+  echo "the tick before this one is still running"
+  exit 0
+fi
+
+# A start the tick makes, directly or through the merge driver, does not wait for memory while
+# the tick holds its lock: it is left for the next tick, so later ticks still do their work.
+export WORKFLOW_DEFER_START=1
+export WORKFLOW_TRAIN_TICK
+WORKFLOW_TRAIN_TICK=$(mktemp -d)
+export WORKFLOW_SESSION_SNAPSHOT=$WORKFLOW_TRAIN_TICK/sessions
+python3 -c 'import json,sys,time; json.dump({"started": time.time()}, open(sys.argv[1], "w"))' "$WORKFLOW_TRAIN_TICK/context.json"
+trap 'rm -rf "$WORKFLOW_TRAIN_TICK"' EXIT
+
+# The lock is closed for everything the tick calls: a `tmux` server started here lives on
+# after the tick, and would hold the lock for as long as its session runs.
+session() {
+  bash "$here/session" "$@" 9>&-
+}
+
+# An audit ends with "audit finished", a worker with "worker finished", a hunt with "hunt
+# finished". The words count only
+# on a line of their own: after the bullet Claude draws, in bold or not, with a full stop or
+# not. With anything else on the line the session is talking about finishing or quoting the
+# rule, and after `>` it is quoting or it is what the owner typed.
+#
+# They count only as the end of the last reply. Between them and the box the owner types in
+# (it begins with a rule drawn from the left edge) there may be empty lines, an empty prompt,
+# and the lines Claude draws itself after a turn, which start with one of its own marks.
+# Anything else there is more of the reply, an instruction given after it, or a newer reply:
+# the session went on, perhaps to ask something.
+# What is under the box is not read: the list of agents there has bullets of its own.
+#
+# Read byte by byte, so that it is the same under any locale. The screen is read whole before
+# it is searched: `grep -q` leaves at the first match, and in a pipe that can end `tmux` with
+# an error, which `pipefail` would report as the words not being there.
+said_finished() {
+  local screen said after notes pattern=$FINISHED_LINE words="audit finished"
+  [[ $1 != review-* ]] || words="review finished"
+  [[ $1 != ticket-* ]] || words="worker finished"
+  [[ $1 != hunt-* ]] || words="hunt finished"
+  words=${2:-$words}
+  notes=$main/.claude/worktrees/$1/.local/workflow/$1
+  if [[ $1 == ticket-* && -e $notes.codex ]]; then
+    # An answered turn is no longer the current work, even before its successor ends.
+    [[ ! -e $notes.owner-reply ]] || return 1
+    if [[ -r $notes.codex-turn.json ]]; then
+      ! cmp -s "$notes.codex-turn.json" "$notes.codex-answered" || return 1
+      ! cmp -s "$notes.codex-turn.json" "$notes.codex-followed-up" || return 1
+      # A valid latest turn is authoritative, including one that did not finish.
+      if jq -e '.["last-assistant-message"] | type == "string"' \
+          "$notes.codex-turn.json" >/dev/null 2>&1; then
+        said=$(jq -r '.["last-assistant-message"] | split("\n") |
+          map(select(test("\\S"))) | last // ""' "$notes.codex-turn.json") || return 1
+        LC_ALL=C grep -qiE "${FINISHED_LINE/WORDS/$words}" <<<"$said"
+        return $?
+      fi
+    fi
+    # Older workers may have no recorded turn. Only bridges get this tolerance.
+    pattern="^[[:space:]]*(●|[*-])?[[:space:]]*(Codex says:[[:space:]]*)?(\"|“|')?[*_]*WORDS[.!]?[*_]*(\"|”|')?[[:space:]]*$"
+  fi
+  screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 1
+  said=$(LC_ALL=C grep -niE "${pattern/WORDS/$words}" <<<"$screen") || return 1
+  said=${said##*$'\n'}
+  after=$(LC_ALL=C sed -n "$((${said%%:*} + 1)),\$p" <<<"$screen" | LC_ALL=C sed '/^─/,$d')
+  ! LC_ALL=C grep -qvE '^([[:space:]]*((·|✢|✳|✶|✻|✽|⎿).*)?|(>|❯)[[:space:]]*)$' <<<"$after"
+}
+
+# Older hooks may have failed to deliver their phone push and left no block note. Read
+# only the latest reply above the input box. A question is a line ending in "?" or the words
+# to type back ('write "merge it"', "write 1 or 2"); a wait that only names the owner is not.
+asks_owner() {
+  local screen message top
+  screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 0
+  top=$(LC_ALL=C awk '/^─/ { above = last; last = NR } END { print above + 0 }' <<<"$screen")
+  ((top > 0)) || return 0
+  message=$(LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" | LC_ALL=C awk '
+    /^[[:space:]]*●/ { reply = "" }
+    { reply = reply $0 "\n" }
+    END { printf "%s", reply }
+  ')
+  # The words to type back may be in bold ("Reply **1**"); "reply with" and "choose" ask as in
+  # `notify`, which reads the same reply on a stop.
+  LC_ALL=C grep -qiE '\?([[:space:]"'"'"')*_`]|”|’)*$|(^|[^[:alpha:]])((write|type|reply|say|answer|choose)[[:space:]]+[*_]*("|“|‘|'"'"'|`|[0-9])|reply[[:space:]]+with([^[:alnum:]]|$))' <<<"$message"
+}
+
+# The open pull requests labelled `workflow`: number, true for a draft, and base branch.
+list_pull_requests() {
+  gh pr list --label workflow --state open --limit 1000 --json number,isDraft,baseRefName \
+    --jq '.[] | "\(.number) \(.isDraft) \(.baseRefName)"' 9>&-
+}
+
+# A reviewer hands every passed review to the tick (`merge-when-current --handoff N`). One that
+# said "review finished" while its pull request is still open, ready and based on main, with
+# neither a merge note nor a hand-back, broke that rule: the wake tells the orchestrator, once
+# for each session and head. GitHub is asked again, as the reviewer may have merged since the
+# snapshot.
+note_rule_break() {
+  local number=$1 folder=$main/.local/workflow state head event
+  [[ ! -e $folder/merge-wanted-$number && ! -e $folder/merge-review-$number &&
+     ! -e $folder/batch-merged-$number ]] || return 0
+  read -r state _ head < <(gh pr view "$number" --json state,headRefName,headRefOid \
+    --jq '"\(.state) \(.headRefName) \(.headRefOid)"' 9>&-) || return 1
+  [[ $state == OPEN && $head =~ ^[0-9a-f]{40}$ ]] || return 0
+  event=review-$number-$head.json
+  [[ ! -e $folder/rule-breaks.pending/$event && ! -e $folder/rule-breaks.sent/$event ]] ||
+    return 0
+  mkdir -p "$folder/rule-breaks.pending" &&
+    jq -n --arg name "review-$number" --arg number "$number" --arg head "$head" \
+      '{name: $name, number: $number, head: $head}' >"$folder/rule-breaks.pending/.$event.tmp" &&
+    mv -- "$folder/rule-breaks.pending/.$event.tmp" "$folder/rule-breaks.pending/$event"
+}
+
+# Read from the time written on the note `session start hunt` leaves.
+is_over_its_time() {
+  local started=$main/.claude/worktrees/$1/.local/workflow/$1.started
+  [[ -n $(find "$started" -mmin "+$HUNT_STOPPED_AFTER_MINUTES" 2>/dev/null) ]]
+}
+
+# Whether the time a limit line names has passed: "4:10pm", "4pm (America/New_York)" or, with
+# its day, "Oct 15, 1am (America/New_York)" and "Jan 2, 2027, 1am". The zone is the one on the
+# line, or the machine's when the line has none. Sets reset_at to that moment, in seconds.
+#
+# A time without a day is read only for the session limit, which counts over 5 hours: it is
+# still ahead only when that hour comes within the next 5 hours; further ahead than that, it
+# was earlier today or yesterday. Another limit (the weekly one, a model's) names only the
+# hour when it resets within a day. session supplies the dated reset from usage when its
+# clock agrees with that hour; an unresolved line still says nothing about the day.
+# A time that cannot be read has not passed: the session then waits for the orchestrator.
+reset_has_passed() {
+  local limit=$1 text=$2 zone="" clock='(1[0-2]|0?[1-9])(:[0-5][0-9])?[ap]m' day="" at
+  local -a in_zone=()
+  if [[ $text =~ ^(.*[^[:space:]])[[:space:]]*\(([A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*)\)$ ]]; then
+    text=${BASH_REMATCH[1]}
+    zone=${BASH_REMATCH[2]}
+    [[ -f $ZONES/$zone ]] || return 1
+    in_zone=(env "TZ=$zone")
+  fi
+  if [[ $text =~ ^([A-Z][a-z]{2})\ ([0-9]{1,2}),?(\ ([0-9]{4}),?)?\ ($clock)$ ]]; then
+    local year=${BASH_REMATCH[4]} hour=${BASH_REMATCH[5]}
+    day="${BASH_REMATCH[2]} ${BASH_REMATCH[1]}"
+    if [[ -n $year ]]; then
+      at=$("${in_zone[@]}" date -d "$day $year $hour" +%s 2>/dev/null) || return 1
+    else
+      # Without its year the day is of this year, or, read in December for January, of the
+      # next: a reset is never half a year back.
+      year=$("${in_zone[@]}" date -d "@$NOW" +%Y)
+      at=$("${in_zone[@]}" date -d "$day $year $hour" +%s 2>/dev/null) || return 1
+      ((NOW - at < HALF_A_YEAR_SECONDS)) ||
+        at=$("${in_zone[@]}" date -d "$day $((year + 1)) $hour" +%s 2>/dev/null) || return 1
+    fi
+  elif [[ $limit == "session limit" && $text =~ ^$clock$ ]]; then
+    local noon other
+    day=$("${in_zone[@]}" date -d "@$NOW" +%F)
+    at=$("${in_zone[@]}" date -d "$day $text" +%s 2>/dev/null) || return 1
+    # The hour meant is the one that comes within the next 5 hours, today or after midnight;
+    # when none does, the last one that passed. The day before and the day after are found
+    # from noon, and the hour is read on that day: a day the clocks change is not 24 hours.
+    noon=$("${in_zone[@]}" date -d "$day 12:00" +%s) || return 1
+    if ((at > NOW)); then
+      other=$("${in_zone[@]}" date -d "@$((noon - 86400))" +%F)
+      ((at - NOW <= LIMIT_WINDOW_SECONDS)) ||
+        at=$("${in_zone[@]}" date -d "$other $text" +%s 2>/dev/null) || return 1
+    else
+      other=$("${in_zone[@]}" date -d "@$((noon + 86400))" +%F)
+      other=$("${in_zone[@]}" date -d "$other $text" +%s 2>/dev/null) || return 1
+      ((other - NOW > LIMIT_WINDOW_SECONDS)) || at=$other
+    fi
+  else
+    return 1
+  fi
+  reset_at=$at
+  ((NOW >= at))
+}
+
+# The note of the reset after which a session was last sent its instruction. It holds the
+# moment and not the words of the line: the same hour on another day is another reset.
+resent_mark() {
+  echo "$main/.claude/worktrees/ticket-${1#*-}/.local/workflow/$1.resent"
+}
+
+failed=0
+woken=()
+wake_done=0
+local_done=0
+budget_ready() {
+  python3 "$here/github_budget.py" ready tick
+}
+# GitHub pauses do not hold back what needs no GitHub: squeezing and resending after a
+# usage reset, then local alerts and pending owner/cloud notifications in the wake.
+paused() {
+  ((local_done)) || local_duties
+  if ((wake_done == 0)); then
+    wake_done=1
+    bash "$here/wake" "${woken[@]}" 9>&- || true
+  fi
+  exit 0
+}
+local_duties() {
+  local_done=1
+  running=$(session list) || failed=1
+
+  while read -r name state held _; do
+    if [[ $state =~ ^(idle|limit)$ && $held =~ ^[0-9]+$ ]] && ((held > SQUEEZE_ABOVE_MB)); then
+      session squeeze "$name" || failed=1
+    fi
+  done <<<"$running"
+
+  # A session the usage limit stopped is neither working nor waiting for the owner, and nothing
+  # else wakes it. A hunt is left: its time ran on while it was stopped. The reset is written
+  # down after the instruction is sent, so a failed send is retried on the next tick.
+  while read -r name state rest; do
+    [[ $state == limit && $name =~ ^(ticket|audit|review)- && $rest == *"  resets "* ]] || continue
+    limit=${rest%%  resets *}
+    reset_has_passed "${limit##*  }" "${rest##*  resets }" || continue
+    mark=$(resent_mark "$name")
+    [[ ! -r $mark || $(<"$mark") != "$reset_at" ]] || continue
+    mkdir -p "${mark%/*}" || { failed=1; continue; }
+    if session resend "$name"; then
+      echo "$reset_at" >"$mark" || { failed=1; continue; }
+      woken+=("$name")
+    else
+      failed=1
+    fi
+  done <<<"$running"
+}
+
+# Set in the timer environment, or persistently in this file. Claude stays the default until
+# the owner has compared the three Codex trial tickets.
+program=${WORKFLOW_WORKER_PROGRAM:-}
+if [[ -z $program && -r $main/.local/workflow/worker-program ]]; then
+  read -r program <"$main/.local/workflow/worker-program"
+fi
+program=${program:-claude}
+[[ $program =~ ^(claude|codex|cloud)$ ]] || { echo "invalid worker program: $program" >&2; exit 1; }
+running=$(session list) || failed=1
+
+# Before GitHub is asked anything: a hunt has no pull request, and its time runs out whether
+# or not GitHub answers.
+while read -r name _; do
+  [[ $name == hunt-* ]] && is_over_its_time "$name" || continue
+  echo "$name is over its time"
+  session stop "$name" || failed=1
+done <<<"$running"
+
+# Local hunt deadlines still apply while GitHub is unavailable.
+if ! budget_ready; then
+  session cleanup hunts
+  paused
+fi
+
+# Poll every cloud record, including unlabelled tickets, before the ordinary ready path.
+python3 -B "$here/cloud_workers.py" poll "$main" 9>&- || failed=1
+budget_ready || paused
+
+snapshot=$WORKFLOW_TRAIN_TICK/pulls.json
+# The labelled pull requests, as "<number> <draft> <base>". Starts go in the order the merge
+# train serves: by priority, then the older ticket.
+labelled_pulls() {
+  jq -r -L "$here" 'include "priority";
+    [.[] | select(any(.labels[]; .name == "workflow"))] | sort_by(priority_rank, .number) |
+    .[] | "\(.number) \(.isDraft) \(.baseRefName)"' "$snapshot"
+}
+if ! python3 "$here/tick_snapshot.py" create "$snapshot" 9>&- || ! pulls=$(labelled_pulls); then
+  echo "cannot list the pull requests; the next tick tries again" >&2
+  # The application an ended hunt left running is stopped all the same.
+  session cleanup hunts
+  budget_ready || paused
+  exit 1
+fi
+
+while read -r name state _; do
+  # Codex's latest turn is authoritative even if its bridge never ran the Stop hook.
+  if [[ $name == ticket-* && -e $main/.claude/worktrees/$name/.local/workflow/$name.codex ]]; then
+    if ! grep -qE "^${name#ticket-} true " <<<"$pulls" && said_finished "$name"; then
+      session stop "$name" || failed=1
+      continue
+    fi
+    if bridge_parse_failed "$name"; then
+      session bridge "$name" || failed=1
+      continue
+    fi
+  fi
+  [[ $state == idle ]] || continue
+  # A Codex worker whose bridge ended is listed idle, and nobody would read its end or relay
+  # its question. Its bridge is started again; it shows Codex's last turn.
+  if [[ $name == ticket-* && -e $main/.claude/worktrees/$name/.local/workflow/$name.codex ]] &&
+      ! tmux -L "$name" has-session -t "=$name" 2>/dev/null 9>&- &&
+      { grep -qE "^${name#ticket-} true " <<<"$pulls" || ! said_finished "$name"; }; then
+    session bridge "$name" || failed=1
+    continue
+  fi
+  # A draft without a session gets a worker below, so the worker of a draft is never stopped
+  # here: the next tick would start it again.
+  [[ $name != ticket-* ]] || ! grep -qE "^${name#ticket-} true " <<<"$pulls" || continue
+  if [[ $name == review-* ]] && said_finished "$name" "review sent back"; then
+    if grep -qE "^${name#review-} true " <<<"$pulls"; then
+      session stop "$name" || failed=1
+    fi
+  elif said_finished "$name"; then
+    if [[ $name == review-* ]] && grep -qE "^${name#review-} false " <<<"$pulls" &&
+        ! grep -qxF "${name#review-} false main" <<<"$pulls"; then
+      # A reviewed stack member waits for its base; do not start it every three minutes.
+      head=$(git -C "$main/.claude/worktrees/ticket-${name#review-}" rev-parse HEAD 9>&-) ||
+        { failed=1; continue; }
+      echo "$head" >"$main/.local/workflow/$name.head" || { failed=1; continue; }
+    fi
+    if [[ $name == review-* ]] && grep -qxF "${name#review-} false main" <<<"$pulls"; then
+      # Unread, the break would be lost with the session: it waits for the next tick.
+      note_rule_break "${name#review-}" || { failed=1; continue; }
+    fi
+    session stop "$name" || failed=1
+  fi
+done <<<"$running"
+
+WORKFLOW_PR_SNAPSHOT=$snapshot session cleanup || failed=1
+
+local_duties
+
+# Refresh main before computing wake tokens: PR checks can finish while main is pending.
+# The tick alone requests one failed-job retry, after verifying home-runner evidence.
+WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/main-status" --tick-main-status 9>&- || failed=1
+budget_ready || paused
+
+# Passed reviews can leave a durable merge handoff instead of a model waiting in line.
+# The driver calls the same gate and returns every refusal needing judgment to review.
+WORKFLOW_BACKGROUND_GITHUB=1 python3 -B "$here/merge_driver.py" 9>&- || failed=1
+budget_ready || paused
+running=$(session list) || failed=1
+
+# A stopped watch needs no shell restarted. A check-wait note is enough, even before the
+# reviewer publishes its round. An idle reviewer without that note still needs its own round
+# after its session started, on the head or an ancestor. Unknown or empty checks are not
+# finished; failures are finished too.
+# The sessions given a message in this tick: step 8 gives them no second one.
+nudged=" "
+if train=$(WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/merge-when-current" --train-status 9>&-); then
+while read -r name state _; do
+  [[ $state != limit && $name =~ ^(review|audit)-([0-9]+)$ ]] || continue
+  number=${BASH_REMATCH[2]}
+  # Another member's gate call merged this one in a batch: it is no longer open or in the
+  # train, and its own session still owes the after-merge duties.
+  batch_merged=$main/.local/workflow/batch-merged-$number
+  if [[ -e $batch_merged ]]; then
+    :
+  elif [[ $name == review-* ]]; then
+    grep -qE "^$number false " <<<"$pulls" || continue
+  else
+    # Audits do not carry the workflow label. Only a known train entry may wake one.
+    jq -e --arg number "$number" '(.waiting + .blocked) | index($number) != null' \
+      <<<"$train" >/dev/null || continue
+  fi
+  worktree=$main/.claude/worktrees/ticket-$number
+  notes=$worktree/.local/workflow/$name
+  # `.pushed` also protects questions left by hooks from before owner-blocked existed.
+  [[ $name == audit-* || -e $notes.started ]] || continue
+  [[ -e $notes.checks-wait || ($name == review-* && $state == idle) ]] || continue
+  [[ ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked && ! -e $notes.pushed ]] || continue
+  said_finished "$name" && continue
+  said_finished "$name" "review sent back" && continue
+  asks_owner "$name" && continue
+  if [[ -e $batch_merged ]]; then
+    mark=$main/.local/workflow/$name.batch-merged-nudged
+    [[ ! -e $mark ]] || continue
+    # The squash commit, or the merged head when the gate could not read main after it.
+    squash=$(jq -er '(.squash // .head) | select(type == "string" and test("^[0-9a-f]{40}$"))' \
+      "$batch_merged") || { failed=1; continue; }
+    log=$HOME/.local/state/workflow/wake.log
+    if delivery=$(session batch-merged "$name" "$squash" 2>&1); then
+      nudged+="$name "
+      echo "$squash" >"$mark" || { failed=1; continue; }
+      mkdir -p "${log%/*}" &&
+        printf '%s %s merged in a batch as %s; session nudged\n' "$NOW" "$name" "$squash" >>"$log" ||
+        failed=1
+    else
+      echo "$delivery" >&2
+      failed=1
+    fi
+    continue
+  fi
+  if ! pull=$(python3 "$here/tick_snapshot.py" view "$snapshot" "$number" 9>&-); then
+    failed=1
+    continue
+  fi
+  if ! head=$(jq -er 'select(.state == "OPEN" and .isDraft == false) | .headRefOid |
+    select(type == "string" and test("^[0-9a-f]{40}$"))' <<<"$pull"); then
+    continue
+  fi
+  # A conflict can prevent CI from starting. Wake once per head, before the checks
+  # and train-turn gates, using the same owner/input protections as a checks wake.
+  if jq -e '.baseRefName == "main" and
+    (.mergeable == "CONFLICTING" or .mergeStateStatus == "DIRTY")' <<<"$pull" >/dev/null; then
+    mark=$main/.local/workflow/$name.conflict-nudged-$head
+    [[ ! -e $mark ]] || continue
+    if delivery=$(session conflict-found "$name" "$head" 2>&1); then
+      nudged+="$name "
+      echo "$head" >"$mark" || { failed=1; continue; }
+      log=$HOME/.local/state/workflow/wake.log
+      mkdir -p "${log%/*}" &&
+        printf '%s %s merge conflict on %s; reviewer nudged\n' "$NOW" "$name" "$head" >>"$log" || failed=1
+    else
+      echo "$delivery" >&2
+      failed=1
+    fi
+    continue
+  fi
+  mark=$main/.local/workflow/$name.checks-nudged-$head
+  if jq -e --arg number "$number" '.waiting | index($number) != null' <<<"$train" >/dev/null; then
+    [[ $(jq -r '.first' <<<"$train") == "$number" ]] || continue
+    # A turn can arrive after this head's checks already woke the reviewer. Persist a
+    # separate token so restarting the tick neither loses the turn nor repeats it.
+    turn=$(jq -r '.turn' <<<"$train")
+    health=$(sha256sum "$main/.local/workflow/main-status") || { failed=1; continue; }
+    mark=$main/.local/workflow/$name.train-nudged-$turn-${health%% *}-$head
+  fi
+  # A check GitHub lost after its run finished never completes: the gate runs CI again for it.
+  # In the line, the wake still comes again for a new turn or state of main.
+  lost=false
+  if jq -e --arg number "$number" --arg head "$head" '.lost[$number].head == $head' \
+    <<<"$train" >/dev/null; then
+    lost=true
+    if [[ $mark == */$name.train-nudged-* ]]; then
+      mark=$mark-lost
+    else
+      mark=$main/.local/workflow/$name.lost-nudged-$head
+    fi
+  fi
+  [[ ! -e $mark ]] || continue
+  # CI result is always scheduled, so a partial rollup before it exists is not done.
+  # Only skipped image planners means the draft run; ready must get its new run first.
+  # GitHub keeps skipped draft checks beside the ready run on the same head.
+  [[ $lost == true ]] || jq -e '.statusCheckRollup | type == "array" and
+    any(.[]; .name == "CI result") and
+    (all(.[]; .name != "Docker images: what to run") or
+      any(.[]; .name == "Docker images: what to run" and .conclusion != "SKIPPED")) and all(.[];
+    if .__typename == "CheckRun" then .status == "COMPLETED"
+    elif .__typename == "StatusContext" then (.state | IN("SUCCESS", "FAILURE", "ERROR"))
+    else false end)' <<<"$pull" >/dev/null || continue
+  if [[ ! -e $notes.checks-wait ]]; then
+    started=$(stat -c %Y "$notes.started" 9>&-) || continue
+    if ! reviews=$(gh api --paginate "repos/$repository/pulls/$number/reviews" 9>&-); then
+      failed=1
+      continue
+    fi
+    rounds=$(jq -sr --argjson started "$started" '.[][] |
+      select(((.body // "") | strings | startswith("<!-- workflow-review round=")) and
+        ((.submitted_at // "") | strings | (try fromdateiso8601 catch 0)) >= $started and
+        ((.commit_id // "") | strings | test("^[0-9a-f]{40}$"))) | .commit_id' <<<"$reviews") ||
+      continue
+    [[ -n $rounds ]] || continue
+    # A head pushed from elsewhere is fetched once; a branch rewritten past the round has no
+    # path back to it and is not woken.
+    git -C "$worktree" cat-file -e "$head^{commit}" 2>/dev/null 9>&- ||
+      git -C "$worktree" fetch --quiet origin 9>&- || { failed=1; continue; }
+    own=false
+    while read -r round; do
+      if git -C "$worktree" merge-base --is-ancestor "$round" "$head" 2>/dev/null 9>&-; then
+        own=true
+        break
+      fi
+    done <<<"$rounds"
+    [[ $own == true ]] || continue
+  fi
+  wake=checks-finished
+  [[ $lost == false ]] || wake=lost-check
+  if delivery=$(session "$wake" "$name" "$head" 2>&1); then
+    nudged+="$name "
+    echo "$head" >"$mark" || { failed=1; continue; }
+    log=$HOME/.local/state/workflow/wake.log
+    mkdir -p "${log%/*}" &&
+      printf '%s %s %s on %s; reviewer nudged\n' "$NOW" "$name" "${wake//-/ }" "$head" >>"$log" || failed=1
+  else
+    echo "$delivery" >&2
+    log=$HOME/.local/state/workflow/wake.log
+    mkdir -p "${log%/*}" &&
+      printf '%s %s wake failed: %s\n' "$NOW" "$name" "$delivery" >>"$log"
+    failed=1
+  fi
+done <<<"$running"
+else
+  echo "cannot read the merge train; reviewer nudges wait for the next tick" >&2
+  failed=1
+fi
+
+# Step 8.
+wake_log() {
+  local log=$HOME/.local/state/workflow/wake.log
+  mkdir -p "${log%/*}" && printf '%s %s\n' "$NOW" "$*" >>"$log"
+}
+
+# When a note was last written, in seconds.
+written_at() {
+  stat -c %Y "$1" 2>/dev/null 9>&-
+}
+
+# A sum of what the screen shows above the box. Left out is what changes while nothing happens:
+# the box and the status line under it, the spinner's line (its mark, word and clock), and any
+# elapsed time printed elsewhere ("Running… (3m 2s)").
+screen_sum() {
+  local screen top sum
+  screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 1
+  top=$(LC_ALL=C awk '/^─/ { above = last; last = NR }
+    END { print above ? above : (last ? last : NR + 1) }' <<<"$screen")
+  sum=$(LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" |
+    { LC_ALL=C grep -vE '^[[:space:]]*(·|✢|✳|✶|✻|✽|\*)[[:space:]]+[^[:space:]]+…' || true; } |
+    LC_ALL=C sed -E 's/[0-9]+(\.[0-9]+)?(ms|s|m|h)\b//g' | cksum) || return 1
+  echo "${sum%% *}"
+}
+
+# A line for the wake, kept until the orchestrator was told it. `key` names it once.
+note_for_wake() {
+  local key=$1 line=$2 folder=$main/.local/workflow/stuck.pending
+  mkdir -p "$folder" && jq -n --arg line "$line" '{line: $line}' >"$folder/$key.json"
+}
+
+# A session that would be told something: not given a message already in this tick, not
+# finished, asking the owner nothing on its screen, and nothing typed into its box but a message
+# of the tick's own that did not go (its `.typed` note): the session command sends that one,
+# only when the box still holds exactly it, and exits 3 when it holds anything else.
+quiet() {
+  [[ $nudged != *" $1 "* ]] && ! said_finished "$1" && ! said_finished "$1" "review sent back" &&
+    ! asks_owner "$1" && {
+      bash "$here/bridge-empty" "$1" 9>&- ||
+        [[ -e $main/.claude/worktrees/ticket-${1#*-}/.local/workflow/$1.typed ]]
+    }
+}
+
+# A permission dialog stays on the screen, unchanged, until the owner answers it. Its prompt
+# already rang the phone: the session is waiting for him, not stuck.
+asks_permission() {
+  local screen
+  screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 1
+  LC_ALL=C grep -qE '^[[:space:]│]*Do you want to [^?]*\?' <<<"$screen"
+}
+
+running=$(session list) || failed=1
+while read -r name state _; do
+  [[ $state != limit && $name =~ ^(ticket|review)-([0-9]+)$ ]] || continue
+  number=${BASH_REMATCH[2]}
+  notes=$main/.claude/worktrees/ticket-$number/.local/workflow/$name
+  [[ ! -e $notes.codex ]] || continue
+  [[ ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked ]] || continue
+
+  # Waiting for its own job, or a reviewer for its turn in the merge train. The stretch begins
+  # at the stop that started the wait, and a message the session answers begins another.
+  since=""
+  if [[ -e $notes.job-wait ]]; then
+    since=$(written_at "$notes.job-wait")
+  elif [[ -e $notes.checks-wait ]]; then
+    since=$(written_at "$notes.checks-wait")
+  elif [[ $name == review-* && -e $notes.idle && -n ${train:-} ]] &&
+      jq -e --arg number "$number" '.waiting | index($number) != null' <<<"$train" >/dev/null 2>&1; then
+    since=$(written_at "$notes.idle")
+  fi
+  mark=$main/.local/workflow/$name.kept-alive
+  if [[ $since =~ ^[0-9]+$ && ! -e $notes.asking ]] && ((NOW - since >= KEEP_ALIVE_AFTER_SECONDS)) &&
+      [[ ! -r $mark || $(<"$mark") != "$since" ]] && quiet "$name"; then
+    delivery=$(session status-check "$name" 2>&1)
+    sent=$?
+    if ((sent == 0)); then
+      echo "$since" >"$mark" || failed=1
+      wake_log "$name idle $(((NOW - since) / 60)) min waiting for its own job or turn; status check sent" ||
+        failed=1
+    elif ((sent != 3)); then
+      echo "$delivery" >&2
+      wake_log "$name status check failed: $delivery"
+      failed=1
+    fi
+  fi
+
+  # A worker whose pull request is ready, idle without "worker finished": the tick stopped it
+  # above if it had said so. Ready is counted from when the tick first saw it ready.
+  ready=$main/.local/workflow/$name.ready-seen
+  if [[ $name == ticket-* ]] && grep -qE "^$number false " <<<"$pulls"; then
+    [[ -r $ready ]] || echo "$NOW" >"$ready" || failed=1
+    ready_at=""
+    [[ ! -r $ready ]] || read -r ready_at <"$ready"
+    idle_at=""
+    [[ ! -e $notes.idle ]] || idle_at=$(written_at "$notes.idle")
+    mark=$main/.local/workflow/$name.ready-nudged
+    if [[ $ready_at =~ ^[0-9]+$ && $idle_at =~ ^[0-9]+$ ]] &&
+        ((NOW - (ready_at > idle_at ? ready_at : idle_at) >= READY_UNFINISHED_SECONDS)) &&
+        [[ ! -r $mark || $(<"$mark") != "$ready_at" ]] && quiet "$name"; then
+      delivery=$(session finish-ready "$name" 2>&1)
+      sent=$?
+      if ((sent == 0)); then
+        echo "$ready_at" >"$mark" || failed=1
+        wake_log "$name idle on ready pull request $number without worker finished; told to finish" ||
+          failed=1
+      elif ((sent != 3)); then
+        echo "$delivery" >&2
+        wake_log "$name finish message failed: $delivery"
+        failed=1
+      fi
+    fi
+  elif [[ $name == ticket-* ]]; then
+    rm -f "$ready"
+  fi
+
+  # What it runs: a wait loop that finds its own shell never ends, whatever its screen shows.
+  if activity=$(session running "$name" 2>/dev/null); then
+    loop=$(jq -r '.finds_itself // ""' <<<"$activity")
+    if [[ -n $loop ]]; then
+      mark=$main/.local/workflow/$name.loop-noted
+      if [[ ! -r $mark || $(<"$mark") != "$loop" ]]; then
+        if note_for_wake "$name-loop-$NOW" "wait loop finds itself? $name (running: $loop)"; then
+          printf '%s\n' "$loop" >"$mark" || failed=1
+          wake_log "$name runs a wait loop that finds its own shell: $loop" || failed=1
+        else
+          failed=1
+        fi
+      fi
+    fi
+  else
+    activity='{"running": ""}'
+  fi
+
+  # Busy, and not a session that ended its turn to wait for its own job.
+  seen=$main/.local/workflow/$name.screen-seen
+  if [[ $state != busy || -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]]; then
+    rm -f "$seen"
+    continue
+  fi
+  if asks_permission "$name"; then
+    rm -f "$seen"
+    continue
+  fi
+  sum=$(screen_sum "$name") || continue
+  read -r last_sum last_since <"$seen" 2>/dev/null || last_sum=""
+  if [[ $last_sum != "$sum" || ! $last_since =~ ^[0-9]+$ ]]; then
+    echo "$sum $NOW" >"$seen" || failed=1
+    continue
+  fi
+  ((NOW - last_since >= STUCK_AFTER_SECONDS)) || continue
+  mark=$main/.local/workflow/$name.stuck-noted
+  [[ ! -r $mark || $(<"$mark") != "$last_since" ]] || continue
+  what=$(jq -r '.running // ""' <<<"$activity")
+  line="stuck? $name ($(((NOW - last_since) / 60)) min, running: ${what:-no command})"
+  if note_for_wake "$name-stuck-$last_since" "$line"; then
+    echo "$last_since" >"$mark" || failed=1
+    wake_log "$line" || failed=1
+  else
+    failed=1
+  fi
+done <<<"$running"
+
+# Record reviewer-start notices before waking the orchestrator. Their reviewers start below.
+python3 -B "$here/merge_driver.py" --hand-backs 9>&- || failed=1
+running=$(session list) || failed=1
+
+# A draft goes to the cloud, if its screen check allows, by the cloud default (a Codex fix
+# round stays on Codex), or by a reservation or a cloud-built marker of its own.
+cloud_candidate() {
+  local notes=$main/.local/workflow
+  [[ ( $program == cloud && ! -e $notes/codex-built-$1 ) ||
+     -e $notes/cloud-built-$1 || -e $notes/cloud-$1 ]]
+}
+
+# A start that waits for memory (75) holds later local starts. Cloud starts use no
+# local worker memory, so they can still go ahead; nothing else is asked about.
+started=0
+local_starts_held=0
+while read -r number draft base; do
+  ((started != 75)) || local_starts_held=1
+  [[ $number =~ ^[0-9]+$ ]] || continue
+  if ((local_starts_held)); then
+    [[ $draft == true ]] && cloud_candidate "$number" || continue
+  fi
+  if [[ -e $main/.local/workflow/cloud-$number ]]; then
+    [[ $draft == true ]] && python3 -B "$here/cloud_workers.py" retryable "$main" "$number" || continue
+  fi
+  if [[ -e $main/.local/workflow/merge-review-$number ]]; then
+    ((local_starts_held == 0)) || continue
+    # A hand-back's fresh reviewer, at its pull request's place in the order.
+    python3 -B "$here/merge_driver.py" --start-hand-back "$number" 9>&-
+    started=$?
+    ((started == 0 || started == 75)) || failed=1
+    continue
+  fi
+  [[ ! -e $main/.local/workflow/merge-wanted-$number &&
+     ! -e $main/.local/workflow/merge-review-$number ]] || continue
+  grep -qE "^(ticket|audit|review)-$number " <<<"$running" && continue
+  # The start before this one may have taken minutes. Asked again, so that a pull request
+  # marked ready in that time gets no worker: its own worker finished it.
+  if ! now=$(list_pull_requests); then
+    echo "cannot list the pull requests; the next tick tries again" >&2
+    # The wake below still tells the orchestrator whom this tick resent.
+    failed=1
+    break
+  fi
+  grep -qxF "$number $draft $base" <<<"$now" || continue
+  if [[ -e $main/.local/workflow/cloud-$number ]]; then
+    [[ $draft == true ]] && python3 -B "$here/cloud_workers.py" retryable "$main" "$number" || continue
+  fi
+  if [[ $draft == true ]]; then
+    # A reservation or a cloud-built marker keeps fix rounds in the cloud even after
+    # the default changes. Both alternative programs share the conservative screen routing.
+    if cloud_candidate "$number" && node "$here/codex-eligible.mjs" "$number" 9>&-; then
+      python3 -B "$here/cloud_workers.py" allowed "$main" || continue
+      session start worker "$number" medium cloud
+    elif [[ ! -e $main/.local/workflow/cloud-$number &&
+          ( $program == codex || -e $main/.local/workflow/codex-built-$number ) ]] &&
+      node "$here/codex-eligible.mjs" "$number" 9>&-; then
+      ((local_starts_held == 0)) || continue
+      session start worker "$number" medium codex
+    else
+      [[ ! -e $main/.local/workflow/cloud-$number ]] || continue
+      ((local_starts_held == 0)) || continue
+      session start worker "$number"
+    fi
+    started=$?
+    ((started == 0)) || failed=1
+  elif [[ $draft == false ]]; then
+    ((local_starts_held == 0)) || continue
+    head=$(gh pr view "$number" --json state,headRefName,headRefOid \
+      --jq '"\(.state) \(.headRefName) \(.headRefOid)"' 9>&-) || { failed=1; continue; }
+    mark=$main/.local/workflow/review-$number.head
+    if [[ $base == main ]]; then
+      rm -f "$mark" || { failed=1; continue; }
+    else
+      [[ ! -r $mark || $(<"$mark") != "${head##* }" ]] || continue
+    fi
+    # Published independent rounds survive session restarts. Only the owner's allowance
+    # for the exact next round may exceed the two-round limit.
+    if ! reviews=$(gh api --paginate "repos/$repository/pulls/$number/reviews" 9>&-); then
+      echo "cannot read reviews for pull request $number; the next tick tries again" >&2
+      failed=1
+      continue
+    fi
+    if ! history=$(jq -scr '[.[][] | (.body // "") |
+      capture("^<!-- workflow-review round=(?<round>[0-9]+)( result=(?<result>sent-back|passed))? -->")? |
+      {round: (.round | tonumber), result: (.result // "sent-back")}] |
+      [(map(.round) | max // 0), (map(select(.result == "sent-back")) | length)] | @tsv' <<<"$reviews"); then
+      failed=1
+      continue
+    fi
+    read -r round sent_back <<<"$history"
+    branch=${head#* }
+    python3 -B "$here/reviewer_start.py" "$main/.local/workflow" "$number" "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&-
+    started=$?
+    ((started == 0 || started == 2)) || failed=1
+  fi
+done <<<"$pulls"
+
+python3 -B "$here/reviewer_start.py" --reconcile "$main/.local/workflow" 9>&- || failed=1
+
+# After this tick's own starts, which count as starts too: the next draft ticket gets the label
+# when one may start, and the next tick starts its worker.
+WORKFLOW_REPOSITORY=$repository python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
+  failed=1
+
+wake_done=1
+bash "$here/wake" "${woken[@]}" 9>&- || failed=1
+
+budget_ready || paused
+exit "$failed"

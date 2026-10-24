@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# The files or directories the change of ticket N will touch, one path per line, kept in
+# .local/workflow/files-N of the main checkout (ticket_starts.py says where they come from).
+#
+#   ticket-files N
+#
+# The tick finds them itself for every draft it may start and every ticket that runs; this
+# says what it found, and finds them now for a ticket it has not looked at yet.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+[[ $# -eq 1 && $1 =~ ^[0-9]+$ ]] || { echo "usage: ticket-files N" >&2; exit 2; }
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+exec python3 -B "$here/ticket_starts.py" files "$main" "$1"

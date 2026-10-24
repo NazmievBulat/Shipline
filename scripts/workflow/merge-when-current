@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# All sessions use this gate, from their PR worktree, instead of gh pr merge.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec python3 -B "$here/merge_gate.py" "$@"

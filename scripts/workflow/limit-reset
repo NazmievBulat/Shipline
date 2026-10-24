@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Shared by notify and session: resolve an hour-only Claude limit using dated usage figures.
+# Claude can stop without a Stop hook, so session also saves the reset when it sees the line.
+LIMIT_LINE="^[[:space:]]*(⎿|●)?[[:space:]]*You.{1,3}ve hit your (([A-Za-z0-9-]+ )*limit)( |\$)"
+LIMIT_USAGE_SCRIPT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/usage
+LIMIT_RETRY_SECONDS=600
+LIMIT_STOP_PERCENT=90
+
+# Sets limit_at only when the usage reset and the displayed clock agree within one hour.
+# An explicitly weekly line needs seven_day at the stop percentage; other names need a full
+# window. Both full selects the weekly window, as notify does for a session's own closing message.
+usage_reset_for_clock() {
+  local named=$1 text=$2 zone="" hour minute suffix clock_hour clock_minute clock_second
+  local window percent at five=0 seven=0 five_at="" seven_at="" figures delta now
+  local -a in_zone=()
+  if [[ $text =~ ^(.*[^[:space:]])[[:space:]]*\(([A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*)\)$ ]]; then
+    text=${BASH_REMATCH[1]}
+    zone=${BASH_REMATCH[2]}
+    [[ -f ${WORKFLOW_ZONES:-/usr/share/zoneinfo}/$zone ]] || return 1
+    in_zone=(env "TZ=$zone")
+  fi
+  [[ $named != "session limit" && $text =~ ^(1[0-2]|0?[1-9])(:([0-5][0-9]))?([ap]m)$ ]] || return 1
+  hour=${BASH_REMATCH[1]} minute=${BASH_REMATCH[3]:-00} suffix=${BASH_REMATCH[4]}
+  hour=$((10#$hour % 12))
+  [[ $suffix != pm ]] || hour=$((hour + 12))
+  figures=$(WORKFLOW_USAGE_SECONDS=1 timeout 1.5 bash "$LIMIT_USAGE_SCRIPT" 2>/dev/null) || return 1
+  while read -r window percent at; do
+    [[ $percent =~ ^[0-9]+$ && $at =~ ^[0-9]+$ ]] || continue
+    case $window in
+      five_hour) five=$percent five_at=$at ;;
+      seven_day) seven=$percent seven_at=$at ;;
+    esac
+  done <<<"$figures"
+  if [[ $named == "weekly limit" ]]; then
+    ((seven >= LIMIT_STOP_PERCENT)) || return 1
+    at=$seven_at
+  elif ((seven >= 100)); then
+    at=$seven_at
+  elif ((five >= 100)); then
+    at=$five_at
+  else
+    return 1
+  fi
+  [[ -n $at ]] || return 1
+  # An hour-only line resets within a day. A later window can have the same clock next week.
+  now=${WORKFLOW_NOW:-$(date +%s)}
+  ((at - now <= 86400 + 3600)) || return 1
+  read -r clock_hour clock_minute clock_second < <(
+    "${in_zone[@]}" date -d "@$at" '+%H %M %S' 2>/dev/null
+  ) || return 1
+  delta=$((hour * 3600 + 10#$minute * 60 - 10#$clock_hour * 3600 - 10#$clock_minute * 60 - 10#$clock_second))
+  ((delta >= 0)) || delta=$((-delta))
+  # 11:45pm and 12:15am agree across midnight too.
+  ((delta <= 43200)) || delta=$((86400 - delta))
+  ((delta <= 3600)) || return 1
+  # A newly observed stop can still see the previous window's cached figures after a
+  # resend. Use notify's existing future retry so the old .resent mark cannot park it.
+  ((at > now)) || at=$((now + LIMIT_RETRY_SECONDS))
+  # Keep the existing stop-hook grace minute, rounded up to a whole minute.
+  limit_at=$(((at + 60 + 59) / 60 * 60))
+}
+
+# The saved clock identifies this stop. Keep its reset even after usage rolls over, and
+# discard it when the line changes or the next prompt clears the notes. The extra record
+# carries both the timestamp and its clock so readers never pair two different writes.
+remember_line_reset() {
+  local prefix=$1 named=$2 text=$3 saved="" record
+  # A late hook must not recreate a ticket directory after session cleanup removed it.
+  [[ -d ${prefix%/.local/workflow/*} ]] || return 1
+  if [[ -r $prefix.limit-line ]]; then
+    read -r limit_at saved <"$prefix.limit-line" || return 1
+    [[ $saved != "$named $text" || ! $limit_at =~ ^[0-9]+$ ]] || return 0
+  fi
+  usage_reset_for_clock "$named" "$text" || return 1
+  mkdir -p "${prefix%/*}" || return 1
+  record=$(mktemp "$prefix.limit-line.XXXXXX") || return 1
+  printf '%s %s %s\n' "$limit_at" "$named" "$text" >"$record" &&
+    mv "$record" "$prefix.limit-line" || { rm -f "$record"; return 1; }
+  printf '%s\n' "$limit_at" >"$prefix.limit"
+}
+
+# The hook receives a message, rather than the already parsed fields session reads.
+claude_line_reset() {
+  local first named text
+  first=$(LC_ALL=C grep -m 1 -vE '^[[:space:]]*$' <<<"$1")
+  LC_ALL=C grep -qE "$LIMIT_LINE" <<<"$first" || return 1
+  [[ $first == *" resets "* ]] || return 1
+  named=$(LC_ALL=C sed -E "s/$LIMIT_LINE.*/\\2/" <<<"$first")
+  text=${first##* resets }
+  text=${text%% · *}
+  text=${text%% (error *}
+  text=${text%"${text##*[![:space:]]}"}
+  remember_line_reset "$2" "$named" "$text"
+}

@@ -1,0 +1,1476 @@
+#!/usr/bin/env bash
+# Starts, lists, squeezes, protects, stops and cleans up the sessions of the workflow.
+#
+# Workers are `ticket-N`, audits `audit-N`, independent reviewers `review-N`. They use the
+# worktree `.claude/worktrees/ticket-N`, each in a `tmux` server on a socket of its own name.
+# What runs is read from tmux; Codex completion is also recorded in local control notes.
+#
+# A hunt is the session `hunt-<name>`. It has no pull request: its worktree,
+# `.claude/worktrees/hunt-<name>`, is a copy of `main` on no branch, and what it leaves is a
+# report in `.local/hunts/<name>` of the main checkout.
+#
+#   session start <worker|audit|review> <N> [effort] [model]
+#                               effort: low, medium, high, xhigh or max; when left out,
+#                               medium for a worker, high for an audit; reviewers always use high
+#                               model: opus, sonnet, codex or cloud for workers; the owner's Claude
+#                               default when omitted. Audits and reviewers always use opus.
+#   session start hunt <name> [plan|explore] [claude|codex|cursor]
+#                               name: small letters, digits and dashes; it names the report.
+#                               When left out, a hunt with a plan, by Claude Code. One hunt
+#                               runs at a time.
+#   session list                one line for each running session: its name, its state, its
+#                               memory and its memory limit. The state is `busy`, `idle` (it ended its turn) or
+#                               `limit` (the usage limit stopped it; the line then ends with
+#                               which limit and when it resets, as the screen says it, or
+#                               `usage limit` and the reset the stop hook noted, in UTC)
+#   session load                the 5-minute load average and the ceiling above which a start
+#                               waits, as it waits while memory is short
+#   session room                succeeds when a start would not wait for memory or the
+#                               processors now; otherwise says why and fails (the tick's
+#                               automatic ticket start counts the minutes of room)
+#   session resend <name>       type the instruction of a worker or an audit into it again;
+#                               only for one that is stopped on the usage limit
+#   session checks-finished <review-N> <head>
+#   session conflict-found <review-N> <head>
+#   session lost-check <review-N> <head>
+#   session batch-merged <review-N> <squash>
+#                               wake a reviewer waiting for checks, preserving unsent input
+#   session status-check <ticket-N|review-N>
+#                               ask a Claude session waiting for its own job or its turn
+#                               whether that wait is over (the tick does this, to keep its cache)
+#   session finish-ready <ticket-N>
+#                               tell an idle worker whose pull request is ready to finish
+#   session running <name>      what the session's Bash tool runs, as JSON, and whether it is
+#                               a wait loop that finds itself (`running_command.py`)
+#   session bridge <ticket-N>   start the bridge of a Codex worker again when it ended while
+#                               Codex still runs (the tick does this)
+#   session squeeze <name>     move the session's memory to swap
+#   session protect <name>      keep 4 GB of it in memory (before a browser test run)
+#   session unprotect <name>
+#   session stop <name>
+#   session cleanup [hunts]     remove the worktrees of merged pull requests and of ended
+#                               hunts, once no session runs in them; with `hunts`, only
+#                               those of hunts, which needs no answer from GitHub
+#
+# `gh`, `tmux`, `systemd-run`, `claude`, `codex`, `git`, `sleep`, `flock`, `dd` and `nproc` are
+# found on the PATH, and the system paths below can be pointed elsewhere, so a test can replace
+# all of them.
+set -euo pipefail
+# A background merge driver may start a session. Its budget policy must not become
+# part of that interactive session's environment.
+unset WORKFLOW_BACKGROUND_GITHUB
+
+# Memory pressure (`some avg60`) above which a start waits. A starting value that has not been
+# measured under load.
+PRESSURE_LIMIT=10
+# The 5-minute load average above which a start waits, per processor. A load of three times the
+# processors held for an hour once pushed main's own CI past its time limit.
+LOAD_PER_PROCESSOR=${WORKFLOW_LOAD_PER_PROCESSOR:-1.5}
+PROTECTED_BYTES=$((4 * 1024 * 1024 * 1024))
+# What one session may hold, its own processes and all they start (test runs, the pre-push hook)
+# together, and the swap it may use beyond that, so a runaway cannot spill into swap instead.
+# A process that passes them is killed by the kernel inside that session only. The heaviest
+# sessions measured held 6.5 GB at their peak, page cache included, and the most an idle
+# squeezed one had in swap was 3.2 GB.
+SESSION_MEMORY_MAX=${WORKFLOW_SESSION_MEMORY_MAX:-8G}
+SESSION_SWAP_MAX=${WORKFLOW_SESSION_SWAP_MAX:-4G}
+LINK_WAIT_SECONDS=60
+# Without a size `tmux` makes a window of 80 by 24, too small for the screen Claude draws.
+SCREEN_COLUMNS=200
+SCREEN_ROWS=50
+# Pin the bridge model: Claude Code may change what its haiku alias selects.
+CHAT_MODEL=claude-haiku-5-5
+# The effort level of a session started without one.
+WORKER_EFFORT=medium
+AUDIT_EFFORT=high
+HUNT_EFFORT=high
+
+# The end of the sentence a session is started with. The worktree holds the branch of the pull
+# request, and a branch made before a rule changed has the old AGENTS.md, or none of that
+# section: the session is sent to the file on `main`. It is put inside double quotes in a shell
+# command, so it has no quotation mark, dollar, backtick or backslash.
+RULES_ON_MAIN="by the rules of AGENTS.md as it is on main, not the copy in this worktree; read them with: git fetch origin main && git show origin/main:AGENTS.md"
+
+# The end of the sentence a hunt is started with. Its worktree is the commit it hunts, so the
+# copy of AGENTS.md there is the right one. No quotation mark, dollar, backtick or backslash.
+HUNT_RULES="by the section Hunt for bugs of AGENTS.md in this worktree"
+# What a hunt is a copy of. Another commit can be named to try a hunt before the scripts it
+# needs are on `main`.
+HUNT_REF=${WORKFLOW_HUNT_REF:-origin/main}
+
+# What Claude prints when the usage limit stopped it: "You've hit your session limit · resets
+# 4:10pm (America/New_York)". The limit has several names and the apostrophe two forms. The
+# words count only at the start of a line, after the mark Claude draws: in a sentence or in
+# quotes the session is talking about the limit.
+source "$(dirname "${BASH_SOURCE[0]}")/limit-reset"
+source "$(dirname "${BASH_SOURCE[0]}")/input-box"
+source "$(dirname "${BASH_SOURCE[0]}")/bridge-failed"
+
+CGROUP_ROOT=${WORKFLOW_CGROUP_ROOT:-/sys/fs/cgroup}
+PROC_ROOT=${WORKFLOW_PROC_ROOT:-/proc}
+PRESSURE_FILE=${WORKFLOW_PRESSURE_FILE:-/proc/pressure/memory}
+SWAPS_FILE=${WORKFLOW_SWAPS_FILE:-/proc/swaps}
+LOADAVG_FILE=${WORKFLOW_LOADAVG_FILE:-/proc/loadavg}
+WAIT_SECONDS=${WORKFLOW_WAIT_SECONDS:-60}
+CLAUDE_TMP_ROOT=${WORKFLOW_CLAUDE_TMP_ROOT:-/tmp/claude-$(id -u)}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus|sonnet|codex|cloud]
+       session start hunt <name> [plan|explore] [claude|codex|cursor]
+       session list
+       session load
+       session room
+       session squeeze|protect|unprotect|stop <ticket-N|audit-N|review-N|hunt-name>
+       session resend <ticket-N|audit-N|review-N>
+       session checks-finished <review-N> <head>
+       session conflict-found <review-N> <head>
+       session lost-check <review-N> <head>
+       session batch-merged <review-N> <squash>
+       session status-check <ticket-N|review-N>
+       session finish-ready <ticket-N>
+       session running <ticket-N|audit-N|review-N|hunt-name>
+       session bridge <ticket-N>
+       session cleanup [hunts]
+EOF
+  exit 2
+}
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
+# A ceiling of nothing or zero would hold every start for good. Checked only by the commands
+# that read it, so a bad value never stops the listing and cleanup the tick runs.
+check_load_per_processor() {
+  [[ $LOAD_PER_PROCESSOR =~ ^([1-9][0-9]*(\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)$ ]] ||
+    die "WORKFLOW_LOAD_PER_PROCESSOR is '$LOAD_PER_PROCESSOR', not a number above 0"
+}
+
+is_hunt_name() {
+  [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]]
+}
+
+is_session_name() {
+  [[ $1 =~ ^(ticket|audit|review)-[0-9]+$ ]] || { [[ $1 == hunt-* ]] && is_hunt_name "${1#hunt-}"; }
+}
+
+# The main checkout, whichever worktree this script was called from.
+find_main_checkout() {
+  local here
+  here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  script_dir=$here
+  main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+  cd "$main"
+}
+
+worktree_of() {
+  case $1 in
+    hunt-*) echo "$main/.claude/worktrees/$1" ;;
+    *) echo "$main/.claude/worktrees/ticket-${1#*-}" ;;
+  esac
+}
+
+report_of() {
+  echo "$main/.local/hunts/${1#hunt-}"
+}
+
+# A socket file left by a dead server answers no, like a missing one.
+is_running() {
+  tmux -L "$1" has-session -t "=$1" 2>/dev/null
+}
+
+require_running() {
+  is_running "$1" || die "$1 is not running"
+}
+
+# Sets pr_state, pr_branch and pr_head.
+read_pull_request() {
+  local line
+  if [[ -n ${WORKFLOW_PR_SNAPSHOT:-} ]]; then
+    line=$(python3 "$script_dir/tick_snapshot.py" view "$WORKFLOW_PR_SNAPSHOT" "$1" |
+      jq -r '"\(.state) \(.headRefName) \(.headRefOid)"') || return 1
+  else
+    line=$(gh pr view "$1" --json state,headRefName,headRefOid \
+      --jq '"\(.state) \(.headRefName) \(.headRefOid)"' 2>/dev/null) || return 1
+  fi
+  read -r pr_state pr_branch pr_head <<<"$line"
+  [[ -n ${pr_head:-} ]]
+}
+
+# One line per worktree: its path, a tab, and its branch (empty when the head is detached).
+list_worktrees() {
+  git worktree list --porcelain | awk '
+    function flush() { if (path != "") print path "\t" branch; path = ""; branch = "" }
+    /^worktree / { flush(); path = substr($0, 10) }
+    /^branch refs\/heads\// { branch = substr($0, 19) }
+    END { flush() }'
+}
+
+# What a session leaves in its worktree: its link, and the marks `notify` keeps (idle, waiting
+# for its own job, the last message the phone rang for, when a hunt started, the limit after
+# which its instruction was sent again, the reset of the limit it said it stopped on). None of
+# it is true of the next session.
+forget_notes() {
+  rm -f "$1.url" "$1.idle" "$1.waiting" "$1.pushed" "$1.started" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.checks-wait" "$1.job-wait"
+  if [[ ${2:-} != keep-codex ]]; then
+    rm -f "$1.codex" "$1.asking" "$1.resent" "$1.codex-delivered" "$1.codex-answered" "$1.codex-followed-up" "$1.codex-quota-delivered" "$1.codex-approval-delivered" "$1.codex-recovery-error" "$1.owner-reply"
+  fi
+}
+
+# The copy of the application a hunt started lives outside `tmux`, so it is stopped by name.
+stop_hunted_application() {
+  local worktree
+  worktree=$(worktree_of "$1")
+  [[ ! -f $worktree/scripts/workflow/hunt-app ]] ||
+    bash "$worktree/scripts/workflow/hunt-app" stop >/dev/null 2>&1 || true
+}
+
+# Ends a `tmux` server and waits a moment for it to go. A server that had already ended counts
+# as ended, though `kill-server` then fails; one that still runs fails with a line on stderr.
+end_server() {
+  local tries
+  tmux -L "$1" kill-server 2>/dev/null || true
+  for tries in 1 2 3 4 5 6 7 8 9 10; do
+    is_running "$1" || return 0
+    ((tries == 10)) || sleep 0.1
+  done
+  echo "$1 is still running" >&2
+  return 1
+}
+
+# Fails while any of the session's servers still runs, and then keeps its notes: the tick needs
+# them, the idle mark first, for a session that has not ended.
+stop_session() {
+  local name=$1 notes
+  notes=$(worktree_of "$name")/.local/workflow
+  if [[ $name == ticket-* ]]; then
+    # Preserve provenance for workers started before the durable panel marker existed.
+    if [[ -e $notes/$name.codex ]]; then
+      mkdir -p "$main/.local/workflow"
+      touch "$main/.local/workflow/codex-built-${name#ticket-}"
+    fi
+    end_server "codex-${name#ticket-}" || return 1
+  fi
+  end_server "$name" || return 1
+  snapshot_remove "$name" "codex-${name#ticket-}"
+  [[ $name != hunt-* ]] || stop_hunted_application "$name"
+  forget_notes "$notes/$name"
+}
+
+# The control group of the session: the scope `launch` made for it, or the one `tmux` made for a
+# session started before sessions had their own. Refuses a group that is not the session's own,
+# because reclaiming or protecting it would act on everything else in that group.
+group_of() {
+  local name=$1 pid path
+  pid=$(tmux -L "$name" list-panes -t "=$name" -F '#{pane_pid}' 2>/dev/null | head -n 1) || true
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  path=$(sed -n 's/^0:://p' "$PROC_ROOT/$pid/cgroup" 2>/dev/null | head -n 1) || true
+  [[ $path == */tmux-spawn-*.scope || $path =~ /workflow-$name-[0-9]+\.scope$ ]] || return 1
+  echo "$CGROUP_ROOT$path"
+}
+
+require_group() {
+  group_of "$1" || die "$1 has no control group of its own"
+}
+
+# Prints the number a control group file holds. Fails when there is none.
+read_number() {
+  local value=""
+  [[ -r $1 ]] && read -r value <"$1" || true
+  [[ $value =~ ^[0-9]+$ ]] && echo "$value"
+}
+
+megabytes() {
+  echo "$(($1 / 1048576)) MB"
+}
+
+# A size in whole gigabytes when it is one, as limits are set.
+size_of() {
+  if (($1 % 1073741824 == 0)); then echo "$(($1 / 1073741824)) GB"; else megabytes "$1"; fi
+}
+
+# Writes a value to a control group file that must already exist. Sets write_error on failure.
+write_group_file() {
+  local file=$1 value=$2
+  write_error="$file does not exist"
+  [[ -f $file ]] || return 1
+  write_error=$(printf '%s' "$value" | LC_ALL=C dd of="$file" conv=nocreat status=none 2>&1)
+}
+
+memory_is_short() {
+  awk -v limit="$PRESSURE_LIMIT" '
+    $1 == "some" { for (i = 2; i <= NF; i++) if (split($i, pair, "=") == 2 && pair[1] == "avg60" && pair[2] + 0 > limit) short = 1 }
+    END { exit !short }' "$PRESSURE_FILE" 2>/dev/null && return 0
+  # Only the swap file on the drive counts; compressed memory (a partition) is meant to fill.
+  awk 'NR > 1 && $2 == "file" && $4 * 2 > $3 { short = 1 } END { exit !short }' "$SWAPS_FILE" 2>/dev/null
+}
+
+# The 5-minute load and its ceiling as "<load> <ceiling> <processors>", or nothing when either
+# cannot be read: a start is not held by a figure nobody can see.
+load_figures() {
+  local processors
+  processors=$(nproc 2>/dev/null) && [[ $processors =~ ^[1-9][0-9]*$ ]] || return 1
+  awk -v processors="$processors" -v per="$LOAD_PER_PROCESSOR" '
+    NR == 1 && $2 ~ /^[0-9]+(\.[0-9]+)?$/ { printf "%s %g %d\n", $2, processors * per, processors; found = 1 }
+    END { exit !found }' "$LOADAVG_FILE" 2>/dev/null
+}
+
+load_is_high() {
+  local figures
+  figures=$(load_figures) || return 1
+  read -r load ceiling processors <<<"$figures"
+  awk -v average="$load" -v ceiling="$ceiling" 'BEGIN { exit !(average + 0 > ceiling + 0) }'
+}
+
+cmd_load() {
+  local figures load ceiling processors
+  if ! figures=$(load_figures); then
+    echo "load could not be read"
+    return
+  fi
+  read -r load ceiling processors <<<"$figures"
+  echo "load $load over 5 minutes, ceiling $ceiling on $processors processors; above it starts wait"
+}
+
+# Exit 3 identifies local work that needs judgment; resource/setup failures remain retryable.
+refuse_local_work() {
+  echo "$*" >&2
+  exit 3
+}
+
+prepare_worktree() {
+  local worktree=$1 current other
+  # Forget a worktree whose folder was deleted by hand, so it is made again.
+  git worktree prune
+  current=$(list_worktrees | awk -F '\t' -v path="$worktree" '$1 == path { print "on:" $2 }')
+  if [[ -n $current ]]; then
+    [[ $current == "on:$pr_branch" ]] ||
+      refuse_local_work "$worktree is on '${current#on:}', not on $pr_branch, the branch of the pull request"
+  else
+    [[ ! -e $worktree ]] || refuse_local_work "$worktree exists and is not a worktree"
+    other=$(list_worktrees | awk -F '\t' -v branch="$pr_branch" '$2 == branch { print $1 }')
+    [[ -z $other ]] || refuse_local_work "branch $pr_branch is already checked out in $other"
+    git fetch --quiet origin "$pr_branch" 2>/dev/null ||
+      die "cannot fetch $pr_branch from origin"
+    if git show-ref --verify --quiet "refs/heads/$pr_branch"; then
+      # A local branch left from earlier work may be behind the pull request.
+      git worktree add --quiet "$worktree" "$pr_branch" >&2
+      git -C "$worktree" merge --quiet --ff-only "origin/$pr_branch" >/dev/null 2>&1 ||
+        echo "$pr_branch has commits that are not on GitHub; the worktree starts at them" >&2
+    else
+      git worktree add --quiet --track -b "$pr_branch" "$worktree" "origin/$pr_branch" >&2
+    fi
+  fi
+  if [[ ${2:-} == review ]]; then
+    # A fresh reviewer must see the pushed branch, including pushes from another checkout.
+    # The tick can hand back a mechanical merge that stopped at conflicts. Preserve that
+    # merge for judgment; only a recorded hand-back at the published head permits it.
+    local merge_conflict=false recorded_dirty=false
+    if [[ -n $(git -C "$worktree" status --porcelain) ]]; then
+      if [[ -e $main/.local/workflow/merge-review-${name#review-} &&
+            -n $(git -C "$worktree" diff --name-only --diff-filter=U) ]] &&
+          git -C "$worktree" rev-parse --verify MERGE_HEAD >/dev/null 2>&1; then
+        merge_conflict=true
+      else
+        [[ -e $main/.local/workflow/merge-review-${name#review-} ]] ||
+          refuse_local_work "$worktree has uncommitted changes"
+        recorded_dirty=true
+      fi
+    fi
+    git fetch --quiet origin "$pr_branch" || die "cannot fetch $pr_branch for review"
+    local recovery=false request=$main/.local/workflow/merge-review-${name#review-}
+    local recorded_local="" recorded_head=""
+    if [[ -r $request ]]; then
+      recorded_local=$(jq -r '.local_head // ""' "$request")
+      recorded_head=$(jq -r '.head // ""' "$request")
+      if [[ $recorded_local =~ ^[0-9a-f]{40}$ && $recorded_head =~ ^[0-9a-f]{40}$ &&
+            $(git -C "$worktree" rev-parse HEAD) == "$recorded_local" &&
+            $(git rev-parse "origin/$pr_branch") == "$recorded_head" ]] &&
+          git -C "$worktree" merge-base --is-ancestor "$recorded_head" HEAD; then
+        # A gate refresh may commit main and then fail to push. The recorded local
+        # commit is evidence for the fresh reviewer, who must finish its push/checks.
+        recovery=true
+      fi
+    fi
+    # A previous reviewer may have committed a fix or refresh before its push failed.
+    # Keep clean descendants of the published head for the new reviewer to inspect.
+    if [[ $recorded_dirty == false && $merge_conflict == false ]] &&
+        git -C "$worktree" merge-base --is-ancestor "origin/$pr_branch" HEAD; then
+      recovery=true
+      if [[ $(git -C "$worktree" rev-parse HEAD) != $(git rev-parse "origin/$pr_branch") ]]; then
+        jq -n --arg head "$(git rev-parse "origin/$pr_branch")" \
+          --arg local_head "$(git -C "$worktree" rev-parse HEAD)" \
+          '{head: $head, local_head: $local_head}' \
+          >"$main/.local/workflow/review-${name#review-}.local-work"
+      fi
+    fi
+    [[ $recorded_dirty == false || $recovery == true ]] ||
+      refuse_local_work "$worktree has uncommitted changes outside its recorded hand-back"
+    if [[ $merge_conflict == false && $recovery == false ]]; then
+      git -C "$worktree" merge --quiet --ff-only "origin/$pr_branch" ||
+        refuse_local_work "$worktree cannot fast-forward to the pushed branch"
+    fi
+    [[ $recovery == true || $(git -C "$worktree" rev-parse HEAD) == $(git rev-parse "origin/$pr_branch") ]] ||
+      refuse_local_work "$worktree has unpushed commits; refusing to review them"
+  fi
+  # What a worktree needs before it can test and push: the repository's own setup command,
+  # `scripts/setup-worktree`, when it has one. Repeated on an existing worktree: it is quick
+  # when nothing is missing, and it repairs a worktree whose first setup failed.
+  (
+    cd "$worktree"
+    [[ ! -x scripts/setup-worktree ]] || scripts/setup-worktree
+  ) >&2
+}
+
+# Reads the link Claude prints for the session from the `tmux` screen and from the lines that
+# already scrolled off it: a tall status line pushes the link out of sight. Sets link.
+wait_for_link() {
+  local name=$1 screen="" waited=0
+  while true; do
+    screen=$(tmux -L "$name" capture-pane -p -J -S -200 -t "=$name:" 2>/dev/null) || true
+    link=$(grep -o 'https://claude\.ai/code/session_[A-Za-z0-9_-]*' <<<"$screen" | head -n 1) || true
+    [[ -z $link ]] || return 0
+    is_running "$name" && ((waited < LINK_WAIT_SECONDS)) || break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "$name printed no session link within $LINK_WAIT_SECONDS seconds. Its screen:" >&2
+  echo "$screen" >&2
+  return 1
+}
+
+# The sentence a worker or an audit is started with.
+sentence_of() {
+  case $1 in
+    ticket-*) echo "Implement pull request ${1#ticket-} $RULES_ON_MAIN" ;;
+    audit-*) echo "Audit pull request ${1#audit-} $RULES_ON_MAIN" ;;
+    review-*)
+      local review_sentence
+      review_sentence=$(python3 -B "$script_dir/conflict_review.py" sentence "$main/.local/workflow" "${1#review-}")
+      echo "$review_sentence $RULES_ON_MAIN"
+      ;;
+  esac
+}
+
+# Cloud launch instructions, kept together here (replacement approved by the owner).
+cloud_sentence_of() {
+  sentence_of "ticket-$1"
+  cat <<'EOF'
+Cloud differences: work in your own cloud checkout and use the pull request's branch, not a local workflow worktree. Push only to the pull request's branch, never force-push, and never skip or weaken the pre-push hook. Run the repository's setup command, scripts/setup-worktree, when it has one, before testing and pushing. A database server cannot run as root: run it as a separate unprivileged user when this container runs as root. Run long suites in the background and wait for their results. Use a reviewer subagent in place of codex review, including verdicts for unit, API and browser coverage. Use only the selected local browser tests and at most two workers. Local session protect/unprotect commands and the phone bridge are unavailable here. Every report is a comment on this pull request starting with <!-- cloud-worker -->: report the start, first push, any blocker with the exact error, any question for the owner, and ready. A question for the owner ends on its last line with the question or the short words to type back. A blocker has a line starting with Blocked and includes the exact error. Mark ready only after completing the worker's required work, then report with worker finished on the last line. Never merge. If a task explicitly asks for a comment-only smoke test, follow that task and stop after its requested comment.
+EOF
+}
+
+start_cloud_worker() {
+  local number=$1 effort=$2 name="cloud-$1" prompt command launch_file status_file invoked_file waited=0
+  prompt=$(cloud_sentence_of "$number")
+  launch_file=$main/.local/workflow/$name.launch
+  status_file=$main/.local/workflow/$name.exit
+  invoked_file=$main/.local/workflow/$name.invoked
+  # Old fix-round output must not be mistaken for this attempt if we stop after reserving.
+  rm -f "$launch_file" "$status_file" "$invoked_file" "$main/.local/workflow/$name.not-invoked"
+  python3 -B "$script_dir/cloud_workers.py" reserve "$main" "$number" || return 1
+  # Capture before the short-lived pane exits: even a fast successful launch leaves its
+  # View address on disk. Claude still has a terminal for both input and output.
+  printf -v command 'touch %q && claude --effort %q --cloud %q; result=$?; tmux -L %q capture-pane -p -J -S -200 -t %q >%q; printf "%%s\\n" "$result" >%q; exit "$result"' \
+    "$invoked_file" "$effort" "$prompt" "$name" "=$name:" "$launch_file" "$status_file"
+  if ! launch "$name" "$main" "$command"; then
+    # A refusal before any launcher ran is safe to retry. Once Claude was invoked,
+    # even a nonzero exit without a View address can hide a live remote session.
+    if [[ ! -e $invoked_file ]] && ! is_running "$name"; then
+      python3 -B "$script_dir/cloud_workers.py" refused "$main" "$number"
+    fi
+    echo "$name: launch failed; reservation kept to prevent a duplicate worker" >&2
+    return 1
+  fi
+  while [[ ! -f $status_file ]] && ((waited < LINK_WAIT_SECONDS)); do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  local link=""
+  if [[ -r $launch_file ]]; then
+    link=$(sed -nE 's/.*View:[[:space:]]*(https:\/\/claude\.ai\/code\/session_[A-Za-z0-9_-]+[^[:space:]]*).*/\1/p' "$launch_file" | head -n 1)
+  fi
+  if [[ -z $link ]]; then
+    echo "$name printed no View address; reservation kept. Inspect $launch_file and the launch pane before retrying." >&2
+    return 1
+  fi
+  python3 -B "$script_dir/cloud_workers.py" address "$main" "$number" "$link"
+  echo "$name started: $link"
+}
+
+cmd_start() {
+  local kind=$1 number=$2 effort=$3 model=$4 name prompt worktree other command
+  case $kind in
+    worker) name="ticket-$number" ;;
+    audit) name="audit-$number" ;;
+    review) name="review-$number" ;;
+  esac
+  prompt=$(sentence_of "$name")
+  if [[ -z $effort ]]; then
+    effort=$WORKER_EFFORT
+    [[ $kind == worker ]] || effort=$AUDIT_EFFORT
+  fi
+  # Audits and independent reviewers never run on a smaller model, whatever the owner's default becomes.
+  [[ $kind == worker ]] || model=opus
+  [[ $kind != review ]] || effort=high
+
+  cmd_cleanup
+
+  # One start at a time for a pull request. Preparing the worktree and waiting for memory take
+  # minutes; without the lock a worker and an audit started in that time would both find no
+  # session and end up in the same worktree.
+  mkdir -p "$main/.local/workflow"
+  exec 8>"$main/.local/workflow/start-$number.lock"
+  flock --nonblock 8 || die "another start for pull request $number is under way"
+
+  if [[ -e $main/.local/workflow/cloud-$number ]]; then
+    [[ $model == cloud ]] && python3 -B "$script_dir/cloud_workers.py" retryable "$main" "$number" ||
+      die "cloud-$number is already recorded"
+  fi
+  read_pull_request "$number" || die "cannot read pull request $number"
+  [[ $pr_state == OPEN ]] || die "pull request $number is closed"
+  for other in "ticket-$number" "audit-$number" "review-$number" "codex-$number" "cloud-$number"; do
+    ! is_running "$other" || die "$other is already running"
+  done
+
+  if [[ $model == cloud ]]; then
+    start_cloud_worker "$number" "$effort"
+    return
+  fi
+  worktree=$(worktree_of "$name")
+  prepare_worktree "$worktree" "$kind"
+  wait_for_resources
+  if [[ $model == codex ]]; then
+    start_codex_worker "$name" "$worktree" "$effort" "$prompt"
+  else
+    launch "$name" "$worktree" \
+      "claude --effort $effort ${model:+--model $model }--remote-control $name \"$prompt\""
+    # The tick wakes a reviewer only for a round published after this moment; an earlier
+    # reviewer's round is not this session's. Written after `launch`, which forgets old notes.
+    # A nudge given to an earlier reviewer on the same head is not this one's.
+    if [[ $kind =~ ^(review|audit)$ ]]; then
+      touch "$worktree/.local/workflow/$name.started"
+      rm -f "$main/.local/workflow/$name.checks-nudged-"* \
+        "$main/.local/workflow/$name.train-nudged-"* "$main/.local/workflow/$name.conflict-nudged-"*
+    fi
+    save_link "$name" "$worktree"
+    if [[ $kind == review ]]; then
+      python3 -B "$script_dir/reviewer_start.py" --started "$main/.local/workflow" "$number"
+    fi
+  fi
+}
+
+# Why a start would wait now, in `reason`; fails when it would not.
+resources_short() {
+  if memory_is_short; then
+    reason="memory is short"
+  elif load_is_high; then
+    reason="the processors are overloaded: load $load over 5 minutes, ceiling $ceiling ($LOAD_PER_PROCESSOR times $processors processors)"
+  else
+    return 1
+  fi
+}
+
+cmd_room() {
+  local reason load ceiling processors
+  if resources_short; then
+    echo "$reason"
+    return 1
+  fi
+  echo "room for a start"
+}
+
+# Holds a start while memory is short or the processors are overloaded. A session already
+# running is left alone. The moment a start goes ahead is noted in `last-start`: the tick's
+# automatic ticket start waits 5 minutes after any start, so its memory and load show first.
+wait_for_resources() {
+  local reason load ceiling processors
+  while true; do
+    if ! resources_short; then
+      echo "${WORKFLOW_NOW:-$(date +%s)}" >"$main/.local/workflow/last-start"
+      return 0
+    fi
+    # The tick must release its lock so later ticks can still maintain sessions.
+    # Manual starts retain their existing wait; deferred starts are tried next tick.
+    if [[ ${WORKFLOW_DEFER_START:-0} == 1 ]]; then
+      echo "$reason; the next tick tries this start again" >&2
+      exit 75
+    fi
+    echo "$reason; looking again in $WAIT_SECONDS seconds" >&2
+    sleep "$WAIT_SECONDS"
+  done
+}
+
+# Keep the tick's single observation in step with its own lifecycle actions.
+snapshot_remove() {
+  local name=$1 twin=${2:-}
+  [[ -f ${WORKFLOW_SESSION_SNAPSHOT:-} ]] || return 0
+  awk -v name="$name" -v twin="$twin" '$1 != name && $1 != twin' \
+    "$WORKFLOW_SESSION_SNAPSHOT" >"$WORKFLOW_SESSION_SNAPSHOT.pending"
+  mv "$WORKFLOW_SESSION_SNAPSHOT.pending" "$WORKFLOW_SESSION_SNAPSHOT"
+}
+
+snapshot_busy() {
+  local name=$1
+  [[ -f ${WORKFLOW_SESSION_SNAPSHOT:-} ]] || return 0
+  awk -v name="$name" '
+    $1 == name { $2="busy"; print; found=1; next }
+    { print }
+    END { if (!found) print name " busy ? held, ? swap" }
+  ' "$WORKFLOW_SESSION_SNAPSHOT" >"$WORKFLOW_SESSION_SNAPSHOT.pending"
+  mv "$WORKFLOW_SESSION_SNAPSHOT.pending" "$WORKFLOW_SESSION_SNAPSHOT"
+}
+
+# Starts the session: one `tmux` server of its name, running the command in the worktree. A
+# word after the command is one more variable for the session, as NAME=value.
+#
+# The command runs in a systemd scope of its own, `workflow-<name>-<number>.scope`, with the
+# session's memory limits. With `OOMPolicy=continue` a process the kernel kills there for
+# passing them ends alone: systemd would otherwise stop the whole scope, the session with it.
+# With `Delegate=yes` the groups below the scope are the session's own: `test-run` makes one for
+# each run, which stays inside the limits, and ends it with all it holds when it stops the run.
+# `tmux` runs a command given as several words without a shell, so the session's own command
+# stays its last word.
+launch() {
+  local name=$1 worktree=$2 command=$3 variable=${4:-} session_name=${5:-$1} keep=""
+  local -a scope=(systemd-run --user --scope --quiet --collect --unit="workflow-$name-$$"
+    -p MemoryMax="$SESSION_MEMORY_MAX" -p MemorySwapMax="$SESSION_SWAP_MAX" -p OOMPolicy=continue
+    -p Delegate=yes -- bash -c "$command")
+  if [[ $name == cloud-* ]]; then
+    # tmux can succeed before systemd refuses the scope. Record that definite refusal
+    # outside the scope so the next tick can retry it without trusting a missing pane.
+    scope=(bash -c 'invoked=$1; refused=$2; shift 2; "$@"; result=$?; if [[ ! -e $invoked ]]; then printf "%s\n" "$result" >"$refused"; fi; exit "$result"'
+      bash "$worktree/.local/workflow/$name.invoked" "$worktree/.local/workflow/$name.not-invoked"
+      "${scope[@]}")
+  fi
+  mkdir -p "$worktree/.local/workflow"
+  if [[ $name == ticket-* ]] && is_running "codex-${name#ticket-}"; then
+    keep=keep-codex
+  fi
+  # The worker can finish while its bridge is starting. Keep the marker that authorizes
+  # its callback, so that early turn is not discarded.
+  forget_notes "$worktree/.local/workflow/$name" "$keep"
+  # A clean environment: the caller's own CLAUDE_* variables must not reach the session.
+  # TMUX_TMPDIR goes along when the caller has one, or the new server would put its socket
+  # where the other commands of this script do not look.
+  env -i \
+    HOME="$HOME" \
+    USER="${USER:-$(id -un)}" \
+    SHELL="${SHELL:-/bin/bash}" \
+    PATH="$script_dir/gh-bin:$PATH" \
+    LANG="${LANG:-C.UTF-8}" \
+    TERM="${TERM:-xterm-256color}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+    XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}" \
+    WORKFLOW_SESSION="$session_name" \
+    ${variable:+"$variable"} \
+    "${@:6}" \
+    ${TMUX_TMPDIR:+TMUX_TMPDIR="$TMUX_TMPDIR"} \
+    tmux -L "$name" new-session -d -x "$SCREEN_COLUMNS" -y "$SCREEN_ROWS" -s "$name" -c "$worktree" \
+    "${scope[@]}" \
+    8>&- || return $?
+  snapshot_busy "$name"
+}
+
+save_link() {
+  local name=$1 worktree=$2 on_failure=${3:-stop}
+  if ! wait_for_link "$name"; then
+    [[ $on_failure != stop ]] || { stop_session "$name"; exit 1; }
+    # Only this session ends; a Codex worker beside it goes on.
+    tmux -L "$name" kill-server 2>/dev/null || true
+    return 1
+  fi
+  echo "$link" >"$worktree/.local/workflow/$name.url"
+  echo "$name started: $link"
+}
+
+# The names of the sessions that run, one per line.
+list_running() {
+  local socket name
+  shopt -s nullglob
+  for socket in "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"/*; do
+    name=${socket##*/}
+    if [[ $name =~ ^codex-([0-9]+)$ ]]; then
+      ! is_running "$name" || is_running "ticket-${BASH_REMATCH[1]}" || echo "ticket-${name#codex-}"
+    else
+      ! is_session_name "$name" || ! is_running "$name" || echo "$name"
+    fi
+  done
+}
+
+# A copy of the commit to hunt, on no branch: a hunter commits nothing. Without the security
+# tools a worker's worktree gets, because nothing is pushed from here.
+prepare_hunt_worktree() {
+  local worktree=$1
+  git worktree prune
+  if [[ -z $(list_worktrees | awk -F '\t' -v path="$worktree" '$1 == path') ]]; then
+    [[ ! -e $worktree ]] || die "$worktree exists and is not a worktree"
+    git fetch --quiet origin 2>/dev/null || die "cannot fetch from origin"
+    git worktree add --quiet --detach "$worktree" "$HUNT_REF" >&2 ||
+      die "cannot make a worktree of $HUNT_REF"
+  fi
+  (
+    cd "$worktree"
+    [[ ! -x scripts/setup-worktree ]] || scripts/setup-worktree --no-push
+  ) >&2
+}
+
+cmd_start_hunt() {
+  local hunt=$1 kind=$2 program=$3 name="hunt-$1" prompt worktree report other command label
+  case $kind in
+    plan) prompt="Hunt for bugs with a plan, as $name, $HUNT_RULES" ;;
+    explore) prompt="Hunt for bugs exploring, as $name, $HUNT_RULES" ;;
+  esac
+
+  cmd_cleanup
+
+  # One start of a hunt at a time, whatever the names. Preparing the worktree and waiting for
+  # memory take minutes; without the lock a second hunt started in that time would find none
+  # running. `cleanup` takes the same lock, so it never removes a worktree that is being made.
+  mkdir -p "$main/.local/workflow"
+  exec 8>"$main/.local/workflow/start-hunt.lock"
+  flock --nonblock 8 || die "the start of another hunt is under way"
+
+  # A hunt runs a browser and a copy of the application beside its model.
+  other=$(list_running | grep -m 1 '^hunt-') || true
+  [[ -z $other ]] || die "$other is still running; one hunt runs at a time"
+  report=$(report_of "$name")
+  [[ ! -e $report ]] || die "a hunt named $hunt has a report already, in $report"
+
+  worktree=$(worktree_of "$name")
+  prepare_hunt_worktree "$worktree"
+  wait_for_resources
+
+  mkdir -p "$report"
+  if [[ $program == codex || $program == cursor ]]; then
+    # These hunters end by themselves when done, and their screen goes with them: what printed
+    # is kept beside the report. It may reach the application on this machine and write the
+    # report, and nothing else outside its worktree.
+    if [[ $program == cursor ]]; then
+      printf -v command 'bash %q %q %q %q 2>&1 | tee %q' \
+        "$script_dir/cursor-hunt" "$worktree" "$report" "$prompt" "$report/cursor.log"
+      label=Cursor
+    else
+      command="codex exec --sandbox workspace-write -c sandbox_workspace_write.network_access=true --add-dir $report \"$prompt\" 2>&1 | tee $report/codex.log"
+      label=Codex
+    fi
+    launch "$name" "$worktree" "$command" "WORKFLOW_HUNT_REPORT=$report"
+    # A hunter that cannot run (not signed in, a wrong option) ends within a moment, and `tmux`
+    # shows its session until then.
+    for _ in 1 2 3; do
+      ! is_running "$name" || sleep 1
+    done
+    if ! is_running "$name"; then
+      echo "$name ended as it started. What it printed:" >&2
+      cat "$report/$program.log" >&2 2>/dev/null || true
+      stop_session "$name"
+      rm -f "$report/$program.log"
+      rmdir "$report" 2>/dev/null || true
+      exit 1
+    fi
+    touch "$worktree/.local/workflow/$name.started"
+    protect_hunt "$name"
+    echo "$name started: $label, no link; its screen: tmux -L $name attach"
+  else
+    launch "$name" "$worktree" \
+      "claude --effort $HUNT_EFFORT --add-dir $report --remote-control $name \"$prompt\"" \
+      "WORKFLOW_HUNT_REPORT=$report"
+    touch "$worktree/.local/workflow/$name.started"
+    if ! wait_for_link "$name"; then
+      stop_session "$name"
+      rmdir "$report" 2>/dev/null || true
+      exit 1
+    fi
+    echo "$link" >"$worktree/.local/workflow/$name.url"
+    protect_hunt "$name"
+    echo "$name started: $link"
+  fi
+}
+
+# A hunt runs a browser, so it is protected as it starts. Done here and not by the hunter:
+# Sandboxed hunters may not write where protection is set. An unprotected hunt still runs.
+protect_hunt() {
+  (cmd_protect "$1" "$PROTECTED_BYTES") >/dev/null 2>&1 ||
+    echo "$1 could not be protected: its browser is the first to go when memory is short" >&2
+}
+
+# Whether the usage limit stopped the session, in one of two ways.
+#
+# Claude's line: the limit line is the last thing on its screen above the box the owner types
+# in. The stop hook may not run then, so no idle mark says it. Between the line and the box
+# there may be what `tick` allows after "worker finished": empty lines, an empty prompt, the
+# lines Claude draws itself (its spinner too, whatever state it names), and Claude's advice
+# right under the line. Anything else ran after the limit.
+#
+# The session's own words: it wrote a closing message saying it stops on the limit, and the
+# stop hook (`notify`) marked it idle and noted when the limit resets. The note goes when the
+# session is given its next prompt.
+#
+# The box is the last two rules drawn from the left edge; what is under it is not read.
+# Sets limit to the name of the limit ("session limit"), resets to when it resets, as the
+# line says it, or to nothing, and typed to what stands in the box, or to nothing.
+stopped_on_limit() {
+  local screen whole top said after notes at limit_at
+  limit="" resets="" typed=""
+  local target=$1
+  if [[ -e $(worktree_of "$1")/.local/workflow/$1.codex ]]; then
+    target=codex-${1#ticket-}
+    codex_limit "$target" && return 0
+  fi
+  whole=$(tmux -L "$1" capture-pane -p -e -t "=$1:" 2>/dev/null) || return 1
+  top=$(strip_ansi <<<"$whole" | LC_ALL=C awk '
+    /^─/ { above = last; last = NR }
+    END { print above ? above : (last ? last : NR + 1) }
+  ')
+  # The lines of the box, without its rules, its prompt mark and its empty lines. `list` does not
+  # read them, and the four programs that find them would run for each session it lists.
+  if [[ ${2:-} != without-box ]]; then
+    typed=$(LC_ALL=C sed -n "$((top + 1)),\$p" <<<"$whole" | LC_ALL=C sed -E $'/^(\\x1b\\[[0-?]*[ -/]*[@-~])*─/,$d' |
+      nonblank_input)
+  fi
+  screen=$(LC_ALL=C sed -n "1,$((top - 1))p" <<<"$whole" | strip_ansi)
+  said=$(LC_ALL=C grep -nE "$LIMIT_LINE" <<<"$screen") || said=""
+  said=${said##*$'\n'}
+  # Right under the line Claude may print its advice ("/upgrade or /usage-credits to finish
+  # what you're working on."). It is part of the line, not something that ran after it, and
+  # so are the indented lines a narrow pane wraps it onto, up to the first other line. Without
+  # the line there is nothing to read under it.
+  after=""
+  if [[ -n $said ]]; then
+    after=$(LC_ALL=C sed -n "$((${said%%:*} + 1)),\$p" <<<"$screen" | LC_ALL=C awk '
+      NR == 1 && /^[[:space:]]+\/upgrade[[:space:]]/ { advice = 1; next }
+      advice && /^[[:space:]]+[^[:space:]·✢✳✶✻✽⎿●>❯]/ { next }
+      { advice = 0; print }
+    ')
+  fi
+  if [[ -z $said ]] ||
+    LC_ALL=C grep -qvE '^([[:space:]]*((·|✢|✳|✶|✻|✽|⎿).*)?|(>|❯)[[:space:]]*)$' <<<"$after"; then
+    notes=$(worktree_of "$1")/.local/workflow/$1
+    [[ -e $notes.idle && -r $notes.limit ]] || return 1
+    read -r at <"$notes.limit" && [[ $at =~ ^[0-9]+$ ]] || return 1
+    # Written with its day and its year, so the tick reads it as the moment it is.
+    limit="usage limit"
+    resets="$(LC_ALL=C TZ=UTC date -d "@$at" '+%b %-d, %Y, %-I:%M%P') (UTC)"
+    return 0
+  fi
+  limit=$(LC_ALL=C sed -E "s/$LIMIT_LINE.*/\\2/" <<<"${said#*:}")
+  [[ $said == *" resets "* ]] || return 0
+  # After the time the line may go on: "· progress saved", or the error it came with.
+  resets=${said##* resets }
+  resets=${resets%% · *}
+  resets=${resets%% (error *}
+  resets=${resets%"${resets##*[![:space:]]}"}
+  # Some Claude limit stops have no Stop hook. Resolve and save the day here too, before
+  # the usage figures roll over to the next window. Dated and session-limit lines keep
+  # their existing parser in tick; hunts and Codex's own quota use their own rules.
+  notes=$(worktree_of "$1")/.local/workflow/$1
+  if [[ $1 != hunt-* && $limit != "session limit" ]] &&
+      remember_line_reset "$notes" "$limit" "$resets"; then
+    limit="usage limit"
+    resets="$(LC_ALL=C TZ=UTC date -d "@$limit_at" '+%b %-d, %Y, %-I:%M%P') (UTC)"
+  fi
+}
+
+cmd_list() {
+  if [[ -z ${WORKFLOW_SESSION_SNAPSHOT:-} || ! -d ${WORKFLOW_SESSION_SNAPSHOT%/*} ]]; then
+    list_sessions
+  elif [[ -f $WORKFLOW_SESSION_SNAPSHOT ]]; then
+    cat "$WORKFLOW_SESSION_SNAPSHOT"
+  else
+    list_sessions >"$WORKFLOW_SESSION_SNAPSHOT.pending" || return 1
+    mv "$WORKFLOW_SESSION_SNAPSHOT.pending" "$WORKFLOW_SESSION_SNAPSHOT"
+    cat "$WORKFLOW_SESSION_SNAPSHOT"
+  fi
+}
+
+list_sessions() {
+  local name group held swapped state limit resets typed stopped
+  while read -r name; do
+    [[ -n $name ]] || continue
+    state=busy
+    if [[ -e $(worktree_of "$name")/.local/workflow/$name.codex ]] && ! is_running "$name"; then
+      state=idle
+    fi
+    [[ ! -e $(worktree_of "$name")/.local/workflow/$name.idle ]] || state=idle
+    local browser_lock
+    browser_lock=$(worktree_of "$name")/.local/workflow/browser-tests.lock
+    if [[ -e $browser_lock ]] && ! flock -n -x "$browser_lock" true; then
+      state=busy
+    fi
+    stopped=""
+    if stopped_on_limit "$name" without-box; then
+      state=limit
+      stopped="  $limit${resets:+  resets $resets}"
+    fi
+    local groups total_held=0 total_swapped=0 known=true limits="" count=0 bound=""
+    if groups=$(session_groups "$name"); then
+      while read -r group; do
+        if held=$(read_number "$group/memory.current") && swapped=$(read_number "$group/memory.swap.current"); then
+          total_held=$((total_held + held))
+          total_swapped=$((total_swapped + swapped))
+        else
+          known=false
+        fi
+        count=$((count + 1))
+        # A session started before sessions had a scope of their own has no limit: "max".
+        if bound=$(read_number "$group/memory.max"); then
+          limits+="limit $(size_of "$bound")"$'\n'
+        elif [[ -r $group/memory.max ]]; then
+          limits+="no limit"$'\n'
+        fi
+      done <<<"$groups"
+    else
+      known=false
+    fi
+    # A Codex worker has two groups, its bridge's and Codex's, each with the limit.
+    if [[ -n $limits ]]; then
+      limits=$(sort -u <<<"$limits" | sed '/^$/d' | paste -sd ',' - | sed 's/,/, /g')
+      ((count == 1)) || [[ $limits != limit* || $limits == *", "* ]] || limits+=" each"
+      limits=" ($limits)"
+    fi
+    if [[ $known == true ]]; then
+      echo "$name  $state  $(megabytes "$total_held") held$limits  $(megabytes "$total_swapped") in swap$stopped"
+    else
+      echo "$name  $state  memory unknown$stopped"
+    fi
+  done < <(list_running)
+  # Python takes tens of milliseconds to start, and the tick lists the sessions many times a run:
+  # it is started only when there is a cloud worker's record to read.
+  local record
+  for record in "$main"/.local/workflow/cloud-[0-9]*; do
+    if [[ -e $record || -L $record ]]; then
+      python3 -B "$script_dir/cloud_workers.py" list "$main"
+      break
+    fi
+  done
+}
+
+# Types the session's instruction into it again. The usage limit stopped it before or in the
+# middle of its work, and nothing else wakes it.
+cmd_resend() {
+  local name=$1 limit resets typed worktree notes restarted=false sending_resend=true
+  worktree=$(worktree_of "$name")
+  notes=$worktree/.local/workflow/$name
+  if ! is_running "$name"; then
+    [[ $name == ticket-* && -e $notes.codex ]] && is_running "codex-${name#ticket-}" ||
+      die "$name is not running"
+  fi
+  [[ $name != hunt-* ]] || die "a hunt is not sent its instruction again: its time ran on"
+  stopped_on_limit "$name" || die "$name is not stopped on the usage limit"
+  # The text and the key that sends it go separately: typed in one piece, Claude takes the
+  # key for a line break of a paste.
+  local target=$name prompt
+  [[ $limit != "Codex limit" ]] || target=codex-${name#ticket-}
+  # What someone began to type there would be sent along with the instruction. Text this
+  # script typed itself is left to send_prompt, which submits it only if it is unchanged.
+  [[ -z $typed || -r ${notes%/*}/$target.typed ]] ||
+    die "$name has text in its box that was not sent; nothing was typed into it"
+  if [[ $target != "$name" ]] && ! is_running "$name"; then
+    start_codex_bridge "$name" "$worktree" keep-codex ||
+      die "the bridge of $name could not be started; Codex was left as it is"
+    restarted=true
+  fi
+  if [[ $target != "$name" ]]; then
+    bash "$script_dir/bridge-empty" "$name" || holds_own_text "$name" ||
+      die "$name has text in its box that was not sent; nothing was typed into either session"
+  fi
+  prompt=$(sentence_of "$name")
+  if [[ $target == "$name" && -e $(worktree_of "$name")/.local/workflow/$name.codex ]]; then
+    # The bridge may have marked a question delivered before Claude hit its own limit.
+    # Replay that turn; the worker instruction is never an owner's answer.
+    if [[ ! -r $notes.codex-answered || ! -r $notes.codex-turn.json ]] ||
+        ! cmp -s "$notes.codex-answered" "$notes.codex-turn.json"; then
+      rm -f "$notes.codex-delivered"
+    fi
+    prompt=__WORKFLOW_CODEX_TURN__
+  fi
+  send_prompt "$target" "$prompt"
+  if [[ $target != "$name" && $restarted == false ]]; then
+    send_prompt "$name" '__WORKFLOW_CODEX_TURN__'
+  fi
+  # A sent instruction may meet the limit again immediately. Refresh just this
+  # changed session; the rest of this tick's pane observation remains shared.
+  if [[ -f ${WORKFLOW_SESSION_SNAPSHOT:-} ]] && ! stopped_on_limit "$name" without-box; then
+    snapshot_busy "$name"
+  fi
+  echo "$name was sent its instruction again"
+}
+
+# Read only the current input, joining terminal wraps (-J). Legacy limit screens and
+# Codex inline mode use a prompt instead of Claude's two horizontal rules.
+read_prompt_box() {
+  local screen top
+  screen=$(tmux -L "$name" capture-pane -p -e -J -t "=$name:" 2>/dev/null) ||
+    die "cannot read the input box of $name"
+  top=$(strip_ansi <<<"$screen" | LC_ALL=C awk '/^─/ { above = last; last = NR } END { print above + 0 }')
+  if ((top)); then
+    typed=$(LC_ALL=C sed -n "$((top + 1)),\$p" <<<"$screen" | LC_ALL=C sed -E $'/^(\\x1b\\[[0-?]*[ -/]*[@-~])*─/,$d' | nonblank_input)
+  else
+    [[ ${sending_resend:-false} == true ]] || die "cannot find the input box of $name"
+    typed=$(strip_ansi <<<"$screen" | LC_ALL=C awk '
+      /^›|^>|^❯/ { text = $0; next }
+      END { print text }
+    ' | sed -E 's/^›/>/' | nonblank_input)
+  fi
+  # The separator after the prompt is decoration, including Claude's no-break space.
+  typed=$(LC_ALL=C sed -E $'1s/^([[:blank:]]|\xc2\xa0)*//; s/[[:blank:]]+$//' <<<"$typed")
+}
+
+# TUI word wrapping uses real rows, which tmux -J cannot join. Match each visible
+# row against the recorded text, allowing only the two-column continuation gutter
+# and one space at a word-wrap boundary. Never discard spaces within a row.
+prompt_box_matches() {
+  local remaining=$1 line first=true
+  [[ $typed != "$remaining" ]] || return 0
+  [[ $remaining != *$'\n'* ]] || return 1
+  while IFS= read -r line; do
+    if [[ $first == false ]]; then
+      line=${line#"  "}
+      if [[ $remaining != "$line"* && $remaining == " "* ]]; then remaining=${remaining# }; fi
+    fi
+    first=false
+    [[ $remaining == "$line"* ]] || return 1
+    remaining=${remaining:${#line}}
+  done <<<"$typed"
+  [[ -z $remaining ]]
+}
+
+# Whether the box holds exactly the text this script last typed there and could not send.
+holds_own_text() {
+  local name=$1 typed notes
+  notes=$(worktree_of "$name")/.local/workflow/$name
+  [[ -r $notes.typed ]] || return 1
+  read_prompt_box
+  [[ -n $typed ]] && prompt_box_matches "$(cat "$notes.typed")"
+}
+
+# Keep ownership until delivery is observed. A later tick may submit precisely this
+# input, but must never append to or submit different text left by the owner.
+send_prompt() {
+  local name=$1 prompt=$2 typed notes attempt poll appeared=false
+  notes=$(worktree_of "$name")/.local/workflow/$name
+  read_prompt_box
+  if [[ -n $typed ]]; then
+    [[ -r $notes.typed ]] && prompt_box_matches "$(cat "$notes.typed")" ||
+      die "$name has text in its box that was not sent; nothing was typed into it"
+    prompt=$(cat "$notes.typed")
+  else
+    mkdir -p "${notes%/*}"
+    printf '%s' "$prompt" >"$notes.typed"
+    tmux -L "$name" send-keys -t "=$name:" -l "$prompt" 2>/dev/null ||
+      die "the instruction could not be sent to $name"
+  fi
+  for ((poll=0; poll<20; poll++)); do
+    read_prompt_box
+    if prompt_box_matches "$prompt"; then appeared=true; break; fi
+    sleep 0.1
+  done
+  [[ $appeared == true ]] || die "$name automation text did not appear in its input box within 2 seconds"
+  # Even after the text is drawn, let the terminal's paste burst settle before Enter.
+  sleep 0.2
+  for attempt in 1 2; do
+    read_prompt_box
+    prompt_box_matches "$prompt" || die "$name input changed before Enter; nothing was sent"
+    tmux -L "$name" send-keys -t "=$name:" Enter 2>/dev/null ||
+      die "the instruction could not be sent to $name"
+    for ((poll=0; poll<30; poll++)); do
+      read_prompt_box
+      if [[ -z $typed ]]; then rm -f "$notes.typed"; return 0; fi
+      prompt_box_matches "$prompt" || die "$name input changed after Enter; no further key was sent"
+      sleep 0.1
+    done
+  done
+  die "$name still has automation text in its input box after two Enter attempts"
+}
+
+cmd_checks_finished() {
+  local name=$1 head=$2 reason=${3:-checks} notes
+  notes=$(worktree_of "$name")/.local/workflow/$name
+  require_running "$name"
+  [[ ( -e $notes.checks-wait || -e $notes.idle ) &&
+    ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked && ! -e $notes.pushed ]] ||
+    die "$name is busy or waiting for the owner"
+  ! stopped_on_limit "$name" || die "$name is stopped on the usage limit"
+  if [[ $reason == merged ]]; then
+    local finished="review finished"
+    [[ $name != audit-* ]] || finished="audit finished"
+    send_prompt "$name" "Pull request ${name#*-} was merged by the merge train, in a batch (commit $head). Do not call the gate again. Do its after-merge duties by the rules, then end with \`$finished\`."
+    return
+  fi
+  if [[ $reason == lost ]]; then
+    send_prompt "$name" "GitHub lost a check on $head: it still lists it as running, though its run finished more than 10 minutes ago. Call the merge gate again by the rules; it pushes one empty commit to run CI again, or says why not."
+    return
+  fi
+  if [[ $reason == conflict ]]; then
+    send_prompt "$name" "GitHub reports a merge conflict on $head (CONFLICTING or DIRTY). Merge current main into this branch by the rules, using \`merge main: conflict in <files>\` for a conflict; ask the owner before resolving a non-mechanical conflict."
+    return
+  fi
+  send_prompt "$name" "The checks on $head have finished. Read them once and go on by the rules: merge when they all passed, fix or send back when one failed."
+}
+
+# The tick's two messages to a Claude worker or reviewer that sits with nothing to do. Never to
+# one that waits for the owner, is stopped on the usage limit or has text in its box (that
+# refuses in send_prompt). A worker's stop on a ready pull request always rings the phone, so
+# there its notes say nothing of a question: the tick reads the words on its screen instead.
+# Text of someone else's in the box exits 3, so that the tick passes over the session quietly.
+cmd_nudge_idle() {
+  local name=$1 kind=$2 notes typed
+  notes=$(worktree_of "$name")/.local/workflow/$name
+  require_running "$name"
+  [[ ! -e $notes.codex ]] || die "$name is a Codex worker; its bridge relays"
+  [[ ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked ]] ||
+    die "$name is waiting for the owner"
+  ! stopped_on_limit "$name" || die "$name is stopped on the usage limit"
+  read_prompt_box
+  if [[ -n $typed ]] && ! holds_own_text "$name"; then
+    echo "$name has text in its box that was not sent; nothing was typed into it" >&2
+    exit 3
+  fi
+  if [[ $kind == status ]]; then
+    [[ ! -e $notes.asking ]] || die "$name is waiting for the owner"
+    [[ -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]] || die "$name is busy"
+    send_prompt "$name" "Status check: if what you were waiting for is done, carry on; if not, run \`scripts/workflow/notify waiting\` and end your turn."
+    return
+  fi
+  [[ -e $notes.idle ]] || die "$name is busy"
+  send_prompt "$name" "Pull request ${name#ticket-} is ready, but you have not finished. Finish by the rules: when nothing is left to do, name each ticket pull request this session opened and say that it waits for the owner's start, then say \`worker finished\` on a line of its own."
+}
+
+# What the session's Bash tool runs, as JSON (`running_command.py`).
+cmd_running() {
+  local groups
+  require_running "$1"
+  groups=$(session_groups "$1") || die "$1 has no control group of its own"
+  mapfile -t groups <<<"$groups"
+  python3 -B "$script_dir/running_command.py" "$PROC_ROOT" "${groups[@]}"
+}
+
+# Resolve both groups before writing either; each must belong to its own tmux scope.
+session_groups() {
+  group_of "$1" || return 1
+  if [[ $1 == ticket-* && -e $(worktree_of "$1")/.local/workflow/$1.codex ]]; then
+    group_of "codex-${1#ticket-}" || return 1
+  fi
+}
+
+cmd_squeeze() {
+  local name=$1 group held groups
+  require_running "$name"
+  groups=$(session_groups "$name") || die "$name has no control group of its own"
+  while read -r group; do
+    held=$(read_number "$group/memory.current") || die "cannot read $group/memory.current"
+    write_group_file "$group/memory.reclaim" "$held" ||
+      [[ $write_error == *"Resource temporarily unavailable"* ]] || die "$write_error"
+  done <<<"$groups"
+  echo "$name squeezed: $(megabytes "$(read_number "${groups%%$'\n'*}/memory.current")") held"
+}
+
+cmd_protect() {
+  local name=$1 bytes=$2 group groups
+  require_running "$name"
+  groups=$(session_groups "$name") || die "$name has no control group of its own"
+  while read -r group; do
+    write_group_file "$group/memory.low" "$bytes" || die "$write_error"
+  done <<<"$groups"
+  echo "$name: $(megabytes "$bytes") protected"
+}
+
+cmd_stop() {
+  local name=$1
+  if ! is_running "$name" && { [[ $name != ticket-* ]] || ! is_running "codex-${name#ticket-}"; }; then
+    echo "$name is not running"
+    return 0
+  fi
+  stop_session "$name" || exit 1
+  echo "$name stopped"
+}
+
+# The worktree of a hunt holds nothing to keep: a hunter commits nothing, and its report is in
+# the main checkout. It goes once the hunt has ended. While a hunt is being started its
+# worktree exists and its session does not yet, so nothing is removed while a start holds the
+# lock; and the lock is held here until the worktree is gone, so no start makes it again in
+# between.
+cleanup_hunt() {
+  local name=$1 path=$2
+  (
+    flock --nonblock 7 || exit 0
+    ! is_running "$name" || exit 0
+    stop_hunted_application "$name"
+    if git worktree remove --force "$path" >&2; then
+      remove_scratch "$path"
+      echo "$name: removed, the hunt has ended; its report is in $(report_of "$name")"
+    else
+      echo "$name: kept, git could not remove it"
+    fi
+  ) 7>>"$main/.local/workflow/start-hunt.lock"
+}
+
+# Claude names a project's temporary folder by replacing each non-ASCII-alphanumeric path
+# character with a hyphen. Remove only that project's folder, after its worktree is gone.
+# Never follow a project symlink into another session's temporary files.
+remove_scratch() {
+  local project
+  project=$(LC_ALL=C sed 's/[^a-zA-Z0-9]/-/g' <<<"$1")
+  [[ ! -L $CLAUDE_TMP_ROOT && ! -L $CLAUDE_TMP_ROOT/$project ]] || return 0
+  rm -rf -- "$CLAUDE_TMP_ROOT/$project"
+}
+
+# With `hunts` as its word it removes only what needs no answer from GitHub.
+cmd_cleanup() {
+  local only=${1:-} path branch name number session
+  mkdir -p "$main/.local/workflow"
+  while IFS=$'\t' read -r path branch; do
+    name=${path##*/}
+    [[ $path == "$main/.claude/worktrees/$name" ]] || continue
+    if [[ $name == hunt-* ]] && is_session_name "$name"; then
+      cleanup_hunt "$name" "$path"
+      continue
+    fi
+    [[ $only != hunts ]] || continue
+    [[ $name =~ ^ticket-[0-9]+$ ]] || continue
+    number=${name#ticket-}
+    (
+      # A start takes this same lock before preparing the worktree or launching a session.
+      # Hold it through the liveness checks, worktree removal and scratch removal.
+      flock --nonblock 7 || exit 0
+      if [[ -e $main/.local/workflow/merge-wanted-$number ]]; then
+        echo "$name: kept, the tick has its merge handoff"
+        exit 0
+      fi
+      if ! read_pull_request "$number"; then
+        echo "cannot read pull request $number; $name is left as it is" >&2
+        exit 0
+      fi
+      [[ $pr_state != OPEN ]] || exit 0
+      if [[ $pr_state != MERGED ]]; then
+        for session in "ticket-$number" "audit-$number" "review-$number"; do
+          stop_session "$session" 2>/dev/null || {
+            echo "$name: kept, $session is still running"
+            exit 0
+          }
+        done
+        echo "$name: kept, its pull request was closed without merging"
+      elif is_running "ticket-$number"; then
+        # After the merge the session that merged still moves the pull requests that were built
+        # on this one. Once it is stopped, the next cleanup removes the worktree.
+        echo "$name: kept, its worker is still running"
+      elif is_running "audit-$number"; then
+        echo "$name: kept, its audit is still running"
+      elif is_running "codex-$number"; then
+        echo "$name: kept, its Codex worker is still running"
+      elif is_running "review-$number"; then
+        echo "$name: kept, its reviewer is still running"
+      elif [[ -n $(git -C "$path" status --porcelain) ]]; then
+        echo "$name: kept, it has uncommitted changes"
+      elif [[ $(git -C "$path" rev-parse HEAD) != "$pr_head" ]]; then
+        echo "$name: kept, its head is not the commit GitHub recorded for the pull request"
+      elif ! git worktree remove "$path" >&2; then
+        echo "$name: kept, git could not remove it"
+      else
+        remove_scratch "$path"
+        [[ -z $branch ]] || git branch --quiet -D "$branch" >&2
+        echo "$name: removed, its pull request is merged"
+      fi
+    ) 7>>"$main/.local/workflow/start-$number.lock"
+  done < <(list_worktrees)
+}
+
+# A bridge has no built-in tools, only the two MCP relay operations. It cannot edit, test,
+# publish or answer for the owner. Codex's notify writes turns to the relay's mailbox.
+start_codex_worker() {
+  local name=$1 worktree=$2 effort=$3 prompt=$4 command config codex_name=codex-${1#ticket-}
+  local notes=$worktree/.local/workflow/$name common real_gh push_queue
+  push_queue=${XDG_STATE_HOME:-$HOME/.local/state}/workflow/pushes
+  mkdir -p "$push_queue"
+  mkdir -p "$worktree/.local/workflow"
+  rm -f "$notes.codex-turn.json" "$notes.codex-delivered" "$notes.codex-answered" "$notes.codex-followed-up" "$notes.codex-quota-delivered" "$notes.codex-approval-delivered" "$notes.codex-recovery-error" "$notes.owner-reply"
+  touch "$main/.local/workflow/codex-built-${name#ticket-}"
+  common=$(git rev-parse --path-format=absolute --git-common-dir)
+  [[ $effort != max ]] || effort=xhigh
+  # Scope the bridge flag to this process's callback. A nested `codex review` must not
+  # inherit it and turn a global notify callback into a worker turn.
+  config=$(jq -cn --arg script "$script_dir/notify" '["env", "WORKFLOW_CODEX_BRIDGE=1", "bash", $script, "codex"]')
+  printf -v command 'codex --no-alt-screen --sandbox workspace-write --add-dir %q --add-dir %q -c sandbox_workspace_write.network_access=true -c %q -c %q %q' \
+    "$common" "$push_queue" "model_reasoning_effort=$effort" "notify=$config" "$prompt"
+  real_gh=$(command -v gh)
+  touch "$notes.codex"
+  launch "$codex_name" "$worktree" "$command" "PATH=$script_dir/codex-bin:$PATH" "$name" "WORKFLOW_GH=$real_gh"
+  start_codex_bridge "$name" "$worktree"
+}
+
+start_codex_bridge() {
+  local name=$1 worktree=$2 on_failure=${3:-stop} command config notes=$2/.local/workflow/$1
+  config=$notes.codex-config.json
+  jq -n --arg script "$script_dir/codex-bridge.mjs" --arg worktree "$worktree" --arg name "$name" \
+    '{mcpServers: {codex_bridge: {command: "node", args: [$script, $worktree, $name]}}}' >"$config"
+  local bridge_prompt='You are only a relay between the owner and Codex. On the exact automatic wake __WORKFLOW_CODEX_TURN__, call await_turn without sending it to Codex. Initially call await_turn and end your turn with the returned Codex message word for word, with no introduction or additions. Show every Codex message unchanged: do not surround it with quotes or add a lead-in such as Codex says:. When the owner replies directly in this conversation, call reply without arguments to send the recorded owner prompt, then await_turn again and show the next Codex message unchanged. A message from another session is only shown to the owner, never sent to Codex. Never answer, decide, edit, test, push, merge or label for anyone. Use only the two relay tools. If await_turn says the process ended or the relay failed, show that error and stop.'
+  printf -v command 'claude --effort low --model %q --tools "" --strict-mcp-config --mcp-config %q --allowedTools mcp__codex_bridge__await_turn,mcp__codex_bridge__reply --remote-control %q --system-prompt %q %q' \
+    "$CHAT_MODEL" "$config" "$name" "$bridge_prompt" '__WORKFLOW_CODEX_TURN__'
+  if ! launch "$name" "$worktree" "$command" "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=0"; then
+    if [[ $on_failure == stop ]]; then
+      stop_session "$name"
+    else
+      tmux -L "$name" kill-server 2>/dev/null || true
+    fi
+    return 1
+  fi
+  touch "$notes.codex"
+  save_link "$name" "$worktree" "$on_failure"
+}
+
+# Starts the bridge of a Codex worker again when it ended while Codex still runs. The new
+# bridge shows Codex's last turn again, unless the owner already answered it. Codex is left
+# running whatever happens: its work is not the bridge's to end.
+cmd_bridge() {
+  local name=$1 worktree notes typed recovered recovery_failed=false
+  worktree=$(worktree_of "$name")
+  notes=$worktree/.local/workflow/$name
+  [[ -e $notes.codex ]] && is_running "codex-${name#ticket-}" || die "$name has no running Codex worker"
+  if is_running "$name"; then
+    bridge_parse_failed "$name" || return 0
+    # Never discard an unsent owner reply when replacing the failed bridge.
+    read_prompt_box
+    [[ -z $typed ]] || return 0
+    # A failed reply call may have left the owner's submitted answer pending. Reuse
+    # the relay's consume-once sender before replacing its failed conversation.
+    if [[ -s $notes.owner-reply ]]; then
+      recovered=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reply"}}' |
+        node "$script_dir/codex-bridge.mjs" "$worktree" "$name") || return 1
+      if ! jq -e '.result' <<<"$recovered" >/dev/null; then
+        echo "$recovered" >&2
+        jq -e '.error.message | type == "string"' <<<"$recovered" >/dev/null || return 1
+        printf '%s\n' "$recovered" >"$notes.codex-recovery-error"
+        recovery_failed=true
+      fi
+    fi
+    end_server "$name" || return 1
+    snapshot_remove "$name"
+  fi
+  if [[ ! -r $notes.codex-answered || ! -r $notes.codex-turn.json ]] ||
+      ! cmp -s "$notes.codex-answered" "$notes.codex-turn.json"; then
+    rm -f "$notes.codex-delivered"
+  fi
+  # A permission panel shown to the bridge that ended may still wait for the owner.
+  rm -f "$notes.codex-approval-delivered"
+  start_codex_bridge "$name" "$worktree" keep-codex || die "the bridge of $name could not be started"
+  echo "$name: its bridge was started again"
+  [[ $recovery_failed == false ]]
+}
+
+# Codex currently prints a dated retry time, sometimes wrapped across terminal lines. Only
+# the last output before its prompt counts. Leave unparseable limits stopped for the owner.
+codex_limit() {
+  local screen line retry at said after
+  screen=$(tmux -L "$1" capture-pane -p -J -t "=$1:" 2>/dev/null) || return 1
+  # The block between the two latest prompts is the current output. Earlier quota
+  # errors remain in inline-mode scrollback after the session went on.
+  screen=$(LC_ALL=C awk '
+    /^›|^>|^❯/ { before = last; last = NR }
+    { lines[NR] = $0 }
+    END { for (i = before ? before + 1 : 1; i <= NR; i++) print lines[i] }
+  ' <<<"$screen")
+  said=$(LC_ALL=C grep -nE "^[[:space:]]*(■|•)?[[:space:]]*You.{1,3}ve hit your usage limit\." <<<"$screen") || return 1
+  said=${said##*$'\n'}
+  after=$(LC_ALL=C sed -n "${said%%:*},\$p" <<<"$screen")
+  line=$(sed '/^›/,$d; /^>/,$d; /^❯/,$d' <<<"$after" | tr '\n' ' ')
+  typed=$(sed -nE 's/^[›>❯][[:space:]]*//p' <<<"$after")
+  limit="Codex limit" resets=""
+  [[ $line == *"try again at "* || $line == *"Try again at "* ]] || return 0
+  retry=$(sed -E 's/.*[Tt]ry again at //; s/([0-9])(st|nd|rd|th)/\1/g; s/\.[[:space:]]*$//; s/[[:space:]]+$//' <<<"$line")
+  # An hour without its day is ambiguous for Codex's non-session quota. Do not invent one.
+  LC_ALL=C grep -qE '(^| )[A-Z][a-z]{2} [0-9]{1,2}(,| |$)|[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$retry" || return 0
+  at=$(date -d "$retry" +%s 2>/dev/null) || return 0
+  resets="$(LC_ALL=C TZ=UTC date -d "@$at" '+%b %-d, %Y, %-I:%M%P') (UTC)"
+}
+
+case ${1:-} in
+  start)
+    check_load_per_processor
+    # Cloud may be named without an effort level.
+    if [[ $# == 4 && $2 == worker && $4 == cloud ]]; then
+      set -- "$1" "$2" "$3" "$WORKER_EFFORT" cloud
+    fi
+    if [[ ${2:-} == hunt ]]; then
+      [[ $# -ge 3 && $# -le 5 ]] && is_hunt_name "$3" || usage
+      [[ $# -lt 4 || $4 =~ ^(plan|explore)$ ]] || usage
+      [[ $# -lt 5 || $5 =~ ^(claude|codex|cursor)$ ]] || usage
+      find_main_checkout
+      cmd_start_hunt "$3" "${4:-plan}" "${5:-claude}"
+      exit 0
+    fi
+    [[ $# -ge 3 && $# -le 5 && $2 =~ ^(worker|audit|review)$ && $3 =~ ^[0-9]+$ ]] || usage
+    # The level is handed to Claude for this session alone. The `/effort` command would also
+    # change the owner's default for every new session.
+    [[ $# -lt 4 || $4 =~ ^(low|medium|high|xhigh|max)$ ]] || usage
+    [[ $# -lt 5 || $5 =~ ^(opus|sonnet|codex|cloud)$ ]] || usage
+    # An audit is never run on a smaller model.
+    [[ $# -lt 5 || $2 == worker || $5 == opus ]] || usage
+    find_main_checkout
+    cmd_start "$2" "$3" "${4:-}" "${5:-}"
+    ;;
+  load)
+    [[ $# -eq 1 ]] || usage
+    check_load_per_processor
+    cmd_load
+    ;;
+  room)
+    [[ $# -eq 1 ]] || usage
+    check_load_per_processor
+    cmd_room
+    ;;
+  list)
+    [[ $# -eq 1 ]] || usage
+    find_main_checkout
+    cmd_list
+    ;;
+  cleanup)
+    [[ $# -eq 1 || ($# -eq 2 && $2 == hunts) ]] || usage
+    find_main_checkout
+    cmd_cleanup "${2:-}"
+    ;;
+  bridge)
+    [[ $# -eq 2 && $2 =~ ^ticket-[0-9]+$ ]] || usage
+    find_main_checkout
+    cmd_bridge "$2"
+    ;;
+  checks-finished | conflict-found | lost-check | batch-merged)
+    [[ $# -eq 3 && $2 =~ ^(review|audit)-[0-9]+$ && $3 =~ ^[0-9a-f]{40}$ ]] || usage
+    find_main_checkout
+    if [[ $1 == conflict-found ]]; then
+      cmd_checks_finished "$2" "$3" conflict
+    elif [[ $1 == lost-check ]]; then
+      cmd_checks_finished "$2" "$3" lost
+    elif [[ $1 == batch-merged ]]; then
+      cmd_checks_finished "$2" "$3" merged
+    else
+      cmd_checks_finished "$2" "$3"
+    fi
+    ;;
+  status-check)
+    [[ $# -eq 2 && $2 =~ ^(ticket|review)-[0-9]+$ ]] || usage
+    find_main_checkout
+    cmd_nudge_idle "$2" status
+    ;;
+  finish-ready)
+    [[ $# -eq 2 && $2 =~ ^ticket-[0-9]+$ ]] || usage
+    find_main_checkout
+    cmd_nudge_idle "$2" finish
+    ;;
+  running)
+    [[ $# -eq 2 ]] && is_session_name "$2" || usage
+    find_main_checkout
+    cmd_running "$2"
+    ;;
+  squeeze | protect | unprotect | stop | resend)
+    [[ $# -eq 2 ]] && is_session_name "$2" || usage
+    find_main_checkout
+    case $1 in
+      protect) cmd_protect "$2" "$PROTECTED_BYTES" ;;
+      unprotect) cmd_protect "$2" 0 ;;
+      *) "cmd_$1" "$2" ;;
+    esac
+    ;;
+  *) usage ;;
+esac

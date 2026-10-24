@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Read-only comparison of equal windows before and after the merge train rolls out.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec python3 "$here/merge_train_metrics.py" "$@"
