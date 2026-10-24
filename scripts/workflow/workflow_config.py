@@ -89,6 +89,12 @@ DEFAULTS: dict[str, Any] = {
         "e2e_plan": "E2E: what to run",
         # The prefix of every check of the image workflow.
         "images": "Docker images",
+        # The job that audits the dependencies against published advisories (the gate reads
+        # "CI: dependencies" when none is named), and the title of the notice it writes on main
+        # when advisories alone failed it. Without the notice an advisory on main makes main red,
+        # as any other failure.
+        "dependency_audit": None,
+        "advisory_annotation": None,
     },
     # The titles of the annotations the CI planners write and the merge gate reads.
     "annotations": {
@@ -187,6 +193,8 @@ class Checks:
     ci_plan: str
     e2e_plan: str
     images: str
+    dependency_audit: str | None = None
+    advisory_annotation: str | None = None
 
     @property
     def images_plan(self) -> str:
