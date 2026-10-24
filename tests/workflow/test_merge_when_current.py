@@ -3041,6 +3041,9 @@ def _train(github: GitHub) -> dict[str, Any]:
 two_stale_pulls = _two_stale_pulls
 line_up = _line
 train_status = _train
+blocked_first = _blocked_first
+refreshed_first = _refreshed_first
+waiting_reviewers = _waiting_reviewers
 
 
 def test_an_audit_with_a_new_fix_still_gets_its_checks_finished_wake(github: GitHub) -> None:

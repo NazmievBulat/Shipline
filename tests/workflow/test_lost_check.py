@@ -8,9 +8,12 @@ from typing import Any
 import pytest
 from workflow.test_merge_when_current import (
     GitHub,
+    blocked_first,
     line_up,
+    refreshed_first,
     train_status,
     two_stale_pulls,
+    waiting_reviewers,
 )
 from workflow.test_merge_when_current import (
     github as github_fixture,
@@ -398,6 +401,10 @@ def test_a_failed_member_with_a_lost_check_wakes_its_reviewer_once(
     ] == [("7", head, "CI: server tests", 20)]
     assert "7" in train_status(github)["blocked"]
     assert _origin(github) == head
+    # The red run the line read for its verdict is not read again; a failed check alone is not
+    # a run read, so its lost check's run is.
+    reads = [call for call in workflow.calls("gh api") if call.endswith("/actions/runs/20")]
+    assert bool(reads) == (shown is _failed_beside_lost), reads
 
     # The woken reviewer's gate call refuses for the failed check, and pushes nothing.
     done = github.run()
@@ -439,10 +446,21 @@ def test_a_failed_member_with_a_check_still_running_wakes_nobody(github: GitHub)
 
 
 def test_a_failed_members_check_just_started_ends_the_search(github: GitHub) -> None:
-    """Its run cannot have completed ten minutes ago: it is not read."""
+    """Its run cannot have completed ten minutes ago: it is not read, and the lost check
+    beside it wakes nobody."""
     workflow = github.workflow
-    github.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
-    _lose(github, run_id=40, finished_ago=-240, name="E2E: browser tests (1 of 2)")
+    _failed_beside_lost(github)
+    github.pulls["7"]["statusCheckRollup"].append(
+        {
+            "__typename": "CheckRun",
+            "name": "E2E: browser tests (1 of 2)",
+            "status": "IN_PROGRESS",
+            "conclusion": None,
+            "startedAt": _stamp(60),
+            "detailsUrl": "https://github.com/example-org/example-app/actions/runs/40/job/41",
+        }
+    )
+    github.save()
     line_up(github, ["7"])
     _waiting_reviewer(github)
 
@@ -451,4 +469,75 @@ def test_a_failed_members_check_just_started_ends_the_search(github: GitHub) -> 
     assert done.returncode == 0, done.stdout + done.stderr
     assert workflow.calls("tmux review-7 send-keys") == []
     assert train_status(github)["lost"] == {}
+    assert _lost_notes(github) == []
     assert not [call for call in workflow.calls("gh api") if call.endswith("/actions/runs/40")]
+
+
+def _audit_of_a_new_head(github: GitHub) -> str:
+    """7 was blocked for a failed check; its audit waits for the checks of the fix it pushed."""
+    blocked_first(github)
+    workflow = github.workflow
+    waiting_reviewers(github)
+    workflow.list_pull_request(7, draft=False, labels=())
+    workflow.running("audit-7")
+    (workflow.state / "tmux/review-7").unlink()
+    workflow.screen("● Waiting for checks.\n" + "─" * 40 + "\n> \n" + "─" * 40 + "\n", "audit-7")
+    (workflow.notes(7) / "audit-7.checks-wait").touch()
+    workflow.git("commit", "--allow-empty", "-m", "fix: failed check")
+    refreshed_first(github)
+    workflow.set_pull_request(7, "OPEN", github.head)
+    return github.head
+
+
+def _shown_to_the_tick(github: GitHub) -> None:
+    github.save()
+    (github.workflow.state / "rollup-7.json").write_text(
+        json.dumps(github.pulls["7"]["statusCheckRollup"])
+    )
+
+
+@pytest.mark.parametrize("rollup_failed", [True, False], ids=["failed-check", "red-run"])
+def test_a_blocked_members_new_head_with_a_lost_check_wakes_its_audit_once(
+    github: GitHub, rollup_failed: bool
+) -> None:
+    workflow = github.workflow
+    head = _audit_of_a_new_head(github)
+    run = _ci_run(github, head)
+    run.update(conclusion="failure", updated_at=_stamp(3600))
+    github.api[f"{_REPO}/actions/runs/50"] = run
+    if rollup_failed:
+        github.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    else:
+        github.pulls["7"]["statusCheckRollup"] = []
+    _lose(github, run_id=50)
+    _shown_to_the_tick(github)
+    pushed = _origin(github)
+
+    first = workflow.run_script("tick")
+    second = workflow.run_script("tick")
+
+    assert first.returncode == second.returncode == 0, first.stdout + first.stderr
+    sent = workflow.calls("tmux audit-7 send-keys")
+    assert len(sent) == 2, sent
+    assert f"The checks on {head} have finished" in sent[0]
+    assert [(note["head"], note["run"]) for note in _lost_notes(github)] == [(head, 50)]
+    assert _origin(github) == pushed
+
+
+def test_a_blocked_members_new_head_green_beside_a_lost_check_is_not_woken_as_failed(
+    github: GitHub,
+) -> None:
+    """A green run's lost check is the gate's to run again, not a failure."""
+    workflow = github.workflow
+    head = _audit_of_a_new_head(github)
+    _ci_run(github, head)["updated_at"] = _stamp(3600)
+    github.api[f"{_REPO}/actions/runs/50"] = _ci_run(github, head)
+    github.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "SUCCESS"
+    _lose(github, run_id=50)
+    _shown_to_the_tick(github)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("tmux audit-7 send-keys") == []
+    assert train_status(github)["lost"] == {}

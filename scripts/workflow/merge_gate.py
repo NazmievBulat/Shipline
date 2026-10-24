@@ -2066,7 +2066,9 @@ class Train:
                 continue
             if number in self.blocked and self.blocked[number] != pull["headRefOid"]:
                 # A fix on a new head joins at the back when its reviewer calls the gate.
-                # Keep its audit eligible for a checks-finished wake until that claim.
+                # Keep its audit eligible for a checks-finished wake until that claim; a check
+                # GitHub lost beside its failure still ends that wait.
+                self._failed_lost(number, pull, None, lost, failed=failed_checks(pull))
                 continue
             if self.conflicts.get(number) != pull["headRefOid"]:
                 self.conflicts.pop(number, None)
@@ -2219,7 +2221,7 @@ class Train:
         self.lost = {
             number: found
             for number, found in {**self.lost, **lost}.items()
-            if number in remaining
+            if (number in remaining or number in self.blocked)
             and found["head"] == pulls[number]["headRefOid"]
             and (number in lost or number == acting)
         }
@@ -2238,15 +2240,18 @@ class Train:
         pull: dict[str, Any],
         known: list[dict[str, Any]] | None,
         lost: dict[str, dict[str, Any]],
+        *,
+        failed: bool = True,
     ) -> None:
         """A failed member's check GitHub lost never completes, so its reviewer's checks-finished
-        wake would never come: the tick gives it that wake, and the orchestrator is told."""
+        wake would never come: the tick gives it that wake, and the orchestrator is told. One
+        not known to have failed failed only when a lost check's run did not pass."""
         try:
             found = lost_check(pull, known, failed=True)
         except Refused, KeyError, TypeError, ValueError, IndexError:
             # Unreadable runs prove nothing lost; the next reconcile looks again.
             return
-        if found:
+        if found and (failed or found["conclusion"] != "success"):
             lost[number] = {"head": pull["headRefOid"], **found, "failed": True}
             note_lost(self.path.parent, number, pull["headRefOid"], found)
 
