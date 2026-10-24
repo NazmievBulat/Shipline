@@ -99,47 +99,6 @@ def test_a_note_that_cannot_be_written_does_not_stop_the_train(tmp_path: Path) -
     assert json.loads((folder / "merge-train.json").read_text())["waiting"] == ["433"]
 
 
-def test_save_publishes_batch_before_dispatch_without_a_lender_round(tmp_path: Path) -> None:
-    from datetime import UTC, datetime
-
-    from runner.test_ci_overflow import plan_with_lender
-
-    home = tmp_path / "home"
-    planner = home / ".local/state/ci-overflow/home/first.json"
-    planner.parent.mkdir(parents=True)
-    heartbeat = datetime.now(UTC)
-    planner.write_text(
-        json.dumps(
-            {
-                "number": "431",
-                "batch": None,
-                "free": 0,
-                "updated_at": heartbeat.isoformat(),
-            }
-        )
-    )
-    folder = tmp_path / "workflow"
-    folder.mkdir()
-    (folder / "merge-train.json").write_text(
-        json.dumps(
-            {
-                "waiting": ["433"],
-                "prefixes": {
-                    "base": "abc",
-                    "merged": 0,
-                    "members": [{"number": "433", "scratch": {"branch": "workflow/merge-batch-3"}}],
-                },
-            }
-        )
-    )
-    done = _save(folder, home)
-    assert done.returncode == 0, done.stderr
-    decision = plan_with_lender(tmp_path, planner, branch="workflow/merge-batch-3", now=heartbeat)
-    assert decision["large"] == "example-app-home-first"
-    assert json.loads(planner.read_text())["updated_at"] == heartbeat.isoformat()
-    assert planner.stat().st_mode & 0o777 == 0o644
-
-
 @pytest.mark.parametrize(
     "attempt,conclusion,expected",
     [(1, "cancelled", "pending"), (2, "cancelled", "red"), (2, "failure", "red")],

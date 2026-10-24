@@ -113,7 +113,7 @@ def start(
         )
         return 2
     _clear(folder, blocked)
-    worktree = folder.parent.parent / ".claude" / "worktrees" / f"ticket-{number}"
+    worktree = gate.CONFIG.checkout_of(folder) / ".claude" / "worktrees" / f"ticket-{number}"
     identity = _identity(worktree, head, branch_name)
     refused = folder / f"review-{number}.start-refused"
     if refused.exists() and json.loads(refused.read_text())["identity"] == identity:
