@@ -1,0 +1,729 @@
+"""`shipline tick --shadow` takes the tick's decisions against a repository and changes nothing:
+it writes each one to `.local/shipline/shadow.log`, in the words the real tick logs it in, and
+`tools/compare-shadow` lists every decision a shadow log and the real tick's logs differ on."""
+
+import fcntl
+import hashlib
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+from workflow_harness import Workflow, install_shipline
+
+_ROOT = Path(__file__).resolve().parents[2]
+_COMPARE = _ROOT / "tools" / "compare-shadow"
+_MB = 1024 * 1024
+# 2026-09-21 17:00:00 UTC, the clock of every tick here.
+_NOW = 1_790_010_000
+_CLOCK = {"WORKFLOW_NOW": str(_NOW), "TZ": "UTC"}
+# Reviewer 10's session started then; its own round was published after it.
+_STARTED = 1_790_000_000
+_BOX = "\n" + "─" * 40 + "\n> \n" + "─" * 40 + "\n"
+_FINISHED = "● The audit left nothing open.\n\n  Audit finished.\n\n> \n"
+_WAITING = "● The checks are still running; I am waiting for them." + _BOX
+_LIMIT = (
+    "> Implement pull request 12\n"
+    "  ⎿  You've hit your session limit · resets Sep 21, 2026, 4pm (UTC)\n" + _BOX
+)
+
+# The stand-ins of a shadow tick refuse what would change something. A refused call is written
+# down; the test then finds none.
+_READS_ONLY_GH = """#!/bin/bash
+reads='^(pr (list|view|diff|checks)|label list|run (list|view)|repo view) '
+if [[ ! "$1 $2 " =~ $reads ]]; then
+  method=GET
+  for word in "$@"; do
+    case $word in -X | --method) next=1; continue ;; esac
+    [[ -z ${next:-} ]] || { method=$word; next=""; }
+    case $word in -f | -F | --field | --raw-field | --input) method=POST ;; esac
+  done
+  if [[ $1 != api || $method != GET ]]; then
+    echo "gh $*" >> "@STATE@/refused.log"
+    exit 1
+  fi
+fi
+exec "@BIN@/gh.reads" "$@"
+"""
+_READS_ONLY_TMUX = """#!/bin/bash
+case $3 in
+  has-session | capture-pane | list-panes | display-message) exec "@BIN@/tmux.reads" "$@" ;;
+esac
+echo "tmux $*" >> "@STATE@/refused.log"
+exit 1
+"""
+_REFUSED = """#!/bin/bash
+echo "@TOOL@ $*" >> "@STATE@/refused.log"
+exit 1
+"""
+# `claude` may list the sessions; a message is sent by `claude -p`.
+_LISTING_CLAUDE = """#!/bin/bash
+[ "$*" = "agents --json" ] && exec "@BIN@/claude.reads" "$@"
+echo "claude $*" >> "@STATE@/refused.log"
+exit 1
+"""
+
+
+def _written(path: Path, at: float, text: str = "\n") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    os.utime(path, (at, at))
+
+
+def _scenario(workflow: Workflow) -> str:
+    """One tick's worth of decisions, each by its own pull request. Returns reviewer 10's head.
+
+    7, a labelled draft, gets a worker, and 8, ready, a reviewer. The audit of 9 said it
+    finished and is stopped, and its draft gets a worker in the same tick. A hunt is over its
+    time. Reviewer 10 waits for checks that finished. Worker 11 is idle and holds 400 MB. The
+    usage limit stopped worker 12 until an hour ago. Worker 13 has waited for its own job for
+    51 minutes. The orchestrator is open and idle.
+    """
+    workflow.add_pull_request(7)
+    workflow.add_pull_request(8, draft=False)
+
+    workflow.add_worktree(9)
+    workflow.running("audit-9")
+    _written(workflow.notes(9) / "audit-9.idle", _NOW)
+    workflow.screen(_FINISHED, "audit-9")
+
+    hunt = workflow.add_hunt("x")
+    workflow.running("hunt-x")
+    _written(hunt / ".local" / "workflow" / "hunt-x.started", time.time() - 2 * 3600)
+
+    workflow.add_worktree(10, draft=False)
+    workflow.running("review-10")
+    _written(workflow.notes(10) / "review-10.started", _STARTED)
+    _written(workflow.notes(10) / "review-10.checks-wait", _STARTED)
+    workflow.screen(_WAITING, "review-10")
+    head = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(10))
+    (workflow.state / "reviews-10.json").write_text(
+        json.dumps(
+            [
+                {
+                    "body": "<!-- workflow-review round=1 result=passed -->",
+                    "commit_id": head,
+                    "submitted_at": "2026-09-21T15:00:00Z",
+                }
+            ]
+        )
+    )
+    (workflow.state / "rollup-10.json").write_text(
+        json.dumps(
+            [
+                {"__typename": "CheckRun", "name": name, "status": "COMPLETED"}
+                | {"conclusion": "SUCCESS"}
+                for name in ("CI result", "Docker images: what to run", "E2E")
+            ]
+        )
+    )
+
+    workflow.add_worktree(11)
+    workflow.running("ticket-11", held=400 * _MB)
+    _written(workflow.notes(11) / "ticket-11.idle", _NOW)
+
+    workflow.add_worktree(12)
+    workflow.running("ticket-12")
+    workflow.screen(_LIMIT, "ticket-12")
+
+    workflow.add_worktree(13)
+    workflow.running("ticket-13")
+    workflow.screen("● Waiting for the full Python run in the background." + _BOX, "ticket-13")
+    _written(workflow.notes(13) / "ticket-13.job-wait", _NOW - 51 * 60)
+
+    workflow.orchestrator()
+    return head
+
+
+def _shadow_log(workflow: Workflow) -> Path:
+    return workflow.repo / ".local" / "shipline" / "shadow.log"
+
+
+def _decisions(log: Path) -> list[str]:
+    """The decisions of a shadow log, without their time: its tick lines, the run marks and the
+    train status left out."""
+    lines = []
+    for line in log.read_text().splitlines():
+        stamp, _, text = line.partition(" ")
+        if stamp.isdigit() and text != "shadow tick" and not text.startswith("train status: "):
+            lines.append(text)
+    return lines
+
+
+def _strict(workflow: Workflow) -> None:
+    """Stand-ins that answer reads as before and refuse everything else."""
+    for tool in ("gh", "tmux", "claude"):
+        os.replace(workflow.bin / tool, workflow.bin / f"{tool}.reads")
+    reads = {"gh": _READS_ONLY_GH, "tmux": _READS_ONLY_TMUX, "claude": _LISTING_CLAUDE}
+    for tool, text in reads.items():
+        workflow.fake(tool, text.replace("@BIN@", str(workflow.bin)))
+    for tool in ("curl", "systemd-run", "systemctl", "codex", "worktree-setup"):
+        workflow.fake(tool, _REFUSED)
+
+
+def _digest(*roots: Path, leave_out: tuple[Path, ...] = ()) -> dict[str, str]:
+    """Every file below the roots, and every folder, with what it holds."""
+    found: dict[str, str] = {}
+    for root in roots:
+        for path in sorted(root.rglob("*")):
+            if any(path == out or out in path.parents for out in leave_out):
+                continue
+            if path.is_symlink():
+                found[str(path)] = "link " + os.readlink(path)
+            elif path.is_file():
+                found[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+            elif path.is_dir():
+                found[str(path)] = "folder"
+    return found
+
+
+def _journal(*outputs: str, at: int = _NOW) -> str:
+    """What `journalctl -o short-unix` shows of a tick's output."""
+    lines = [line for output in outputs for line in output.splitlines() if line.strip()]
+    return "".join(f"{at}.250000 example-host workflow-tick[42]: {line}\n" for line in lines)
+
+
+def _compare(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["python3", str(_COMPARE), *args],
+        cwd=cwd,
+        env={**os.environ, "TZ": "UTC"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+# The shadow tick.
+
+
+def test_a_shadow_tick_changes_nothing(workflow: Workflow) -> None:
+    _scenario(workflow)
+    home = install_shipline(workflow)
+    _strict(workflow)
+    origin = workflow.git("ls-remote", "origin")
+    worktrees = workflow.git("worktree", "list", "--porcelain")
+    home_state = workflow.root / "home" / ".local" / "state" / "workflow"
+    # The shared GitHub budget counts the shadow's own reads, which are real calls to GitHub.
+    budget = home_state / "github-budget"
+    budget.mkdir(parents=True)
+    roots = (workflow.repo, workflow.cgroup_root, workflow.root / "home", workflow.root / "tmp")
+    leave_out = (workflow.repo / ".git", _shadow_log(workflow).parent, budget)
+    before = _digest(*roots, leave_out=leave_out)
+
+    done = workflow.shipline("tick", "--shadow", env=_CLOCK)
+
+    assert done.returncode == 0, done.stderr
+    assert not (workflow.state / "refused.log").exists(), (workflow.state / "refused.log").read_text()
+    assert _digest(*roots, leave_out=leave_out) == before
+    assert workflow.git("ls-remote", "origin") == origin
+    assert workflow.git("worktree", "list", "--porcelain") == worktrees
+    assert all(workflow.is_running(name) for name in ("audit-9", "hunt-x", "ticket-11"))
+    # What it would have done is in the shadow log, and nowhere else.
+    assert "review-10 checks finished on " in _shadow_log(workflow).read_text()
+    assert done.stdout == ""
+    assert home.is_dir()
+
+
+def test_a_shadow_tick_logs_the_decisions_the_real_tick_takes(workflow: Workflow) -> None:
+    head = _scenario(workflow)
+
+    shadow = workflow.run_script("tick", "--shadow", env=_CLOCK)
+    real = workflow.run_script("tick", env=_CLOCK)
+
+    assert shadow.returncode == 0, shadow.stderr
+    assert real.returncode == 0, real.stderr
+    decisions = _decisions(_shadow_log(workflow))
+    assert decisions == [
+        "hunt-x is over its time",
+        "hunt-x stopped",
+        "audit-9 stopped",
+        "ticket-11 squeezed",
+        "ticket-12 was sent its instruction again",
+        f"review-10 checks finished on {head}; reviewer nudged",
+        "ticket-13 idle 51 min waiting for its own job or turn; status check sent",
+        "ticket-7 started",
+        "review-8 started",
+        "ticket-9 started",
+    ]
+    log = _shadow_log(workflow).read_text()
+    assert "  the tick sent its instruction again to: ticket-12\n" in log
+    assert "  told Check-in: Wake check-in, 17:00, after a reset." in log
+    # The real tick did each of them.
+    assert workflow.is_running("ticket-7") and workflow.is_running("review-8")
+    assert not workflow.is_running("audit-9") and not workflow.is_running("hunt-x")
+    journal = workflow.root / "journal"
+    journal.write_text(_journal(real.stdout, real.stderr))
+
+    compared = _compare(
+        "--shadow",
+        str(_shadow_log(workflow)),
+        "--wake",
+        str(workflow.wake_log),
+        "--journal",
+        str(journal),
+    )
+
+    assert compared.returncode == 0, compared.stdout + compared.stderr
+    assert compared.stdout.splitlines()[-1] == (
+        "11 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 17:00:00: none differs"
+    )
+
+
+def test_a_start_that_would_wait_for_memory_is_logged_and_holds_the_later_ones(
+    workflow: Workflow,
+) -> None:
+    workflow.add_pull_request(7)
+    workflow.add_pull_request(8)
+    workflow.pressure_file.write_text(
+        "some avg10=60.00 avg60=60.00 avg300=60.00 total=22247292\n"
+        "full avg10=60.00 avg60=60.00 avg300=60.00 total=21634252\n"
+    )
+
+    shadow = workflow.run_script("tick", "--shadow", env=_CLOCK)
+    real = workflow.run_script("tick", env=_CLOCK)
+
+    # A start that waits fails the tick, which tries it again; so does the shadow tick.
+    assert shadow.returncode == real.returncode == 1, shadow.stderr
+    held = [line for line in real.stderr.splitlines() if "the next tick tries" in line]
+    assert held and _decisions(_shadow_log(workflow)) == held
+    assert not workflow.is_running("ticket-7") and not workflow.is_running("ticket-8")
+
+
+def test_each_shadow_tick_marks_its_run_and_the_train_status_when_it_changes(
+    workflow: Workflow,
+) -> None:
+    for at in (_NOW, _NOW + 180):
+        done = workflow.run_script("tick", "--shadow", env={**_CLOCK, "WORKFLOW_NOW": str(at)})
+        assert done.returncode == 0, done.stderr
+
+    lines = _shadow_log(workflow).read_text().splitlines()
+    assert lines[0] == f"{_NOW} shadow tick"
+    assert lines[1].startswith(f'{_NOW} train status: {{"first": null, "waiting": []')
+    assert lines[2:] == [f"{_NOW + 180} shadow tick"]
+
+
+def test_the_shadow_log_is_kept_from_other_users(workflow: Workflow) -> None:
+    done = workflow.run_script("tick", "--shadow", env=_CLOCK)
+
+    assert done.returncode == 0, done.stderr
+    assert _shadow_log(workflow).stat().st_mode & 0o077 == 0
+    assert _shadow_log(workflow).parent.stat().st_mode & 0o077 == 0
+
+
+def test_a_shadow_tick_runs_while_the_real_tick_holds_its_lock(workflow: Workflow) -> None:
+    workflow.add_pull_request(7)
+    with (workflow.repo / ".git" / "shipline-tick.lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        done = workflow.run_script("tick", "--shadow", env=_CLOCK)
+
+    assert done.returncode == 0, done.stderr
+    assert "ticket-7 started" in _decisions(_shadow_log(workflow))
+
+
+def test_a_second_shadow_tick_exits_while_the_first_runs(workflow: Workflow) -> None:
+    workflow.add_pull_request(7)
+    with (workflow.repo / ".git" / "shipline-shadow.lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        done = workflow.run_script("tick", "--shadow", env=_CLOCK)
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.splitlines() == ["the shadow tick before this one is still running"]
+    assert workflow.calls() == []
+    assert not _shadow_log(workflow).exists()
+
+
+def test_the_tick_takes_no_other_argument(workflow: Workflow) -> None:
+    done = workflow.run_script("tick", "--shadows")
+
+    assert done.returncode == 2
+    assert done.stderr == "usage: tick [--shadow]\n"
+    assert workflow.calls() == []
+
+
+def test_shipline_names_the_shadow_tick(workflow: Workflow) -> None:
+    install_shipline(workflow)
+
+    done = workflow.shipline("tick", "--shadows")
+
+    assert done.returncode == 2
+    assert done.stderr == "usage: tick [--shadow]\n"
+    assert "shipline tick --shadow" in (workflow.home / "bin" / "shipline").read_text()
+
+
+# What a shadow run refuses by itself, whoever calls it.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["stop", "ticket-7"],
+        ["start", "worker", "7"],
+        ["resend", "ticket-7"],
+        ["squeeze", "ticket-7"],
+        ["cleanup"],
+        ["checks-finished", "review-7", "0" * 40],
+    ],
+)
+def test_a_shadow_run_starts_stops_and_types_into_no_session(
+    workflow: Workflow, command: list[str]
+) -> None:
+    workflow.add_worktree(7)
+    workflow.running("ticket-7", held=400 * _MB)
+    log = _shadow_log(workflow)
+
+    done = workflow.run(*command, env={"SHIPLINE_SHADOW": str(log)})
+
+    assert done.returncode == 1
+    assert done.stderr == f"a shadow run does not run session {command[0]}\n"
+    assert workflow.is_running("ticket-7")
+    assert workflow.calls("tmux") == [] and workflow.calls("gh") == []
+
+
+def test_a_shadow_run_still_lists_the_sessions(workflow: Workflow) -> None:
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
+
+    done = workflow.run("list", env={"SHIPLINE_SHADOW": str(_shadow_log(workflow))})
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.startswith("ticket-7  busy")
+
+
+def test_a_shadow_run_reads_a_limit_s_day_as_the_real_tick_does_and_keeps_no_note(
+    workflow: Workflow,
+) -> None:
+    """An hour-only weekly limit gets its day from the usage figures; the real listing notes it."""
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    workflow.screen("  ⎿  You've hit your weekly limit · resets 3am (America/New_York)" + _BOX, "ticket-7")
+    workflow.usage(40, "2026-10-16T05:00:00+00:00", seven=100, seven_resets="2026-10-16T07:00:00+00:00")
+    clock = {"WORKFLOW_NOW": "1792119600", "TZ": "UTC"}
+    before = _digest(workflow.notes(7))
+
+    shadow = workflow.run("list", env={**clock, "SHIPLINE_SHADOW": str(_shadow_log(workflow))})
+
+    assert shadow.returncode == 0, shadow.stderr
+    assert _digest(workflow.notes(7)) == before
+    real = workflow.run("list", env=clock)
+    assert shadow.stdout == real.stdout
+    assert "usage limit  resets Oct 16, 2026, 7:01am (UTC)" in real.stdout
+    assert (workflow.notes(7) / "ticket-7.limit-line").exists()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["pr", "merge", "7", "--squash"],
+        ["pr", "ready", "7"],
+        ["api", "-X", "POST", "repos/example-org/example-app/issues/7/labels"],
+        ["api", "repos/example-org/example-app/issues/7/comments", "-f", "body=hello"],
+        ["api", "graphql", "-f", "query=mutation { closePullRequest }"],
+        ["label", "create", "workflow"],
+    ],
+)
+def test_a_shadow_run_sends_github_no_write(workflow: Workflow, arguments: list[str]) -> None:
+    called = subprocess.run(
+        ["python3", str(workflow.script.with_name("github_budget.py")), "call", "tick", *arguments],
+        cwd=workflow.repo,
+        env={**workflow.env, "SHIPLINE_SHADOW": str(_shadow_log(workflow))},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert called.returncode == 1
+    assert called.stderr == f"a shadow run sends GitHub no write: gh {' '.join(arguments)}\n"
+    assert workflow.calls("gh") == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["pr", "view", "7", "--json", "state,headRefName,headRefOid", "--jq", "."],
+        ["api", "--paginate", "repos/example-org/example-app/pulls/7/reviews"],
+    ],
+)
+def test_a_shadow_run_still_reads_github(workflow: Workflow, arguments: list[str]) -> None:
+    workflow.add_pull_request(7)
+
+    called = subprocess.run(
+        ["python3", str(workflow.script.with_name("github_budget.py")), "call", "tick", *arguments],
+        cwd=workflow.repo,
+        env={**workflow.env, "SHIPLINE_SHADOW": str(_shadow_log(workflow))},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert called.returncode == 0, called.stderr
+    assert workflow.calls("gh") == [f"gh {' '.join(arguments)}"]
+
+
+# The gate's read path.
+
+
+def _train(workflow: Workflow) -> Path:
+    folder = workflow.repo / ".local" / "workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    line = {
+        "waiting": ["8", "7"],
+        "blocked": {"8": "checks failed"},
+        "priorities": {"7": "high", "8": "medium"},
+        "turn": 4,
+    }
+    (folder / "merge-train.json").write_text(json.dumps(line))
+    return folder
+
+
+def test_a_shadow_run_reads_the_saved_merge_line_without_taking_the_lock(
+    workflow: Workflow,
+) -> None:
+    folder = _train(workflow)
+    saved = (folder / "merge-train.json").read_text()
+    with (folder / "merge.lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        done = workflow.run_script(
+            "merge-when-current",
+            "--train-status",
+            env={"SHIPLINE_SHADOW": str(_shadow_log(workflow))},
+        )
+
+    assert done.returncode == 0, done.stderr
+    status = json.loads(done.stdout)
+    assert (status["first"], status["waiting"], status["blocked"], status["turn"]) == (
+        "7",
+        ["7"],
+        ["8"],
+        4,
+    )
+    assert (folder / "merge-train.json").read_text() == saved
+    assert sorted(path.name for path in folder.iterdir()) == ["merge-train.json", "merge.lock"]
+    assert workflow.calls() == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [["7"], ["--handoff", "7"], ["--drive", "7"], ["--main-status"], ["--tick-main-status"]],
+)
+def test_a_shadow_run_merges_nothing_and_refreshes_no_report(
+    workflow: Workflow, arguments: list[str]
+) -> None:
+    folder = _train(workflow)
+    before = _digest(folder)
+
+    done = workflow.run_script(
+        "merge-when-current", *arguments, env={"SHIPLINE_SHADOW": str(_shadow_log(workflow))}
+    )
+
+    assert done.returncode == 1
+    assert done.stderr == (
+        "merge refused: a shadow run only reads the merge line (--train-status)\n"
+    )
+    assert _digest(folder) == before
+    assert workflow.calls() == []
+
+
+# Comparing a shadow log with the real tick's logs.
+
+
+def _logs(tmp_path: Path, shadow: str, wake: str = "", journal: str = "") -> list[str]:
+    paths = {"shadow": shadow, "wake": wake, "journal": journal}
+    arguments = []
+    for name, text in paths.items():
+        if name == "journal" and not text:
+            continue
+        (tmp_path / name).write_text(text)
+        arguments += [f"--{name}", str(tmp_path / name)]
+    return arguments
+
+
+def test_the_same_decisions_within_the_window_do_not_differ(tmp_path: Path) -> None:
+    shadow = (
+        f"{_NOW} shadow tick\n"
+        f"{_NOW} review-10 checks finished on {'a' * 40}; reviewer nudged\n"
+        f"{_NOW} ticket-7 started\n"
+        f"{_NOW + 180} shadow tick\n"
+    )
+    wake = f"{_NOW + 20} review-10 checks finished on {'a' * 40}; reviewer nudged\n"
+    journal = f"{_NOW + 95}.5 example-host bash[7]: ticket-7 started: https://example.com/s\n"
+
+    done = _compare(*_logs(tmp_path, shadow, wake, journal))
+
+    assert done.returncode == 0, done.stdout
+    assert done.stdout == (
+        "2 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 17:03:00: none differs\n"
+    )
+
+
+def test_a_decision_only_one_side_took_is_listed_with_the_other_side_empty(
+    tmp_path: Path,
+) -> None:
+    shadow = f"{_NOW} shadow tick\n{_NOW} audit-9 stopped\n"
+    journal = f"{_NOW + 3}.0 example-host bash[7]: ticket-7 started: https://example.com/s\n"
+
+    done = _compare(*_logs(tmp_path, shadow, "", journal))
+
+    assert done.returncode == 1
+    assert done.stdout == (
+        "2026-09-21 17:00:00 audit-9\n"
+        "  shadow: audit-9 stopped\n"
+        "  real:   (nothing)\n"
+        "2026-09-21 17:00:03 ticket-7\n"
+        "  shadow: (nothing)\n"
+        "  real:   ticket-7 started\n"
+        "2 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 17:00:00: 2 differ\n"
+    )
+
+
+def test_two_decisions_on_one_session_that_differ_show_both_versions(tmp_path: Path) -> None:
+    shadow = f"{_NOW} shadow tick\n{_NOW} review-10 stopped\n"
+    wake = f"{_NOW + 4} review-10 lost check on {'b' * 40}; reviewer nudged\n"
+
+    done = _compare(*_logs(tmp_path, shadow, wake, "\n"))
+
+    assert done.returncode == 1
+    assert done.stdout.splitlines()[:3] == [
+        "2026-09-21 17:00:00 review-10",
+        "  shadow: review-10 stopped",
+        f"  real:   review-10 lost check on {'b' * 40}; reviewer nudged",
+    ]
+
+
+def test_a_decision_outside_the_window_is_another_one(tmp_path: Path) -> None:
+    shadow = f"{_NOW} shadow tick\n{_NOW} ticket-13 finish message failed: no box\n"
+    wake = f"{_NOW + 400} ticket-13 finish message failed: no box\n"
+
+    narrow = _compare(*_logs(tmp_path, shadow, wake), "--until", str(_NOW + 600))
+    wide = _compare(*_logs(tmp_path, shadow, wake), "--window", "500")
+
+    assert narrow.returncode == 1
+    assert wide.returncode == 0, wide.stdout
+
+
+def test_figures_that_move_between_two_ticks_are_left_out(tmp_path: Path) -> None:
+    shadow = (
+        f"{_NOW} shadow tick\n"
+        f"{_NOW} ticket-13 idle 51 min waiting for its own job or turn; status check sent\n"
+        f"{_NOW} stuck? ticket-14 (45 min, running: pytest tests)\n"
+        f"{_NOW} ticket-11 squeezed\n"
+    )
+    wake = (
+        f"{_NOW + 60} ticket-13 idle 52 min waiting for its own job or turn; status check sent\n"
+        f"{_NOW + 60} stuck? ticket-14 (46 min, running: pytest tests)\n"
+    )
+    journal = f"{_NOW + 1}.0 example-host bash[7]: ticket-11 squeezed: 120 MB held\n"
+
+    done = _compare(*_logs(tmp_path, shadow, wake, journal))
+
+    assert done.returncode == 0, done.stdout
+
+
+def test_the_wake_s_check_ins_are_compared_by_whom_they_told_and_their_own_lines(
+    tmp_path: Path,
+) -> None:
+    def check_in(told: str, waited: int) -> str:
+        return (
+            "2026-09-21 17:00:00  after a reset\n"
+            "  usage: 5-hour window 12% used, resets in 2h0m; load 0.5\n"
+            "  sessions: ticket-12 busy; pull requests: none; starts: allowed; tmp pressure: false\n"
+            "  the tick sent its instruction again to: ticket-12\n"
+            f"  asking the owner: review-15 ({waited} min)\n"
+            f"  {told}\n"
+        )
+
+    shadow = f"{_NOW} shadow tick\n" + check_in("told Check-in: Wake check-in, 17:00.", 8)
+    wake = check_in("told Check-in: Wake check-in, 17:00, a longer message.", 9)
+    other = check_in("Check-in is busy; not told", 8)
+
+    same = _compare(*_logs(tmp_path, shadow, wake, "\n"))
+    differs = _compare(*_logs(tmp_path, shadow, other, "\n"))
+
+    assert same.returncode == 0, same.stdout
+    assert same.stdout.startswith("3 decisions compared")
+    assert differs.returncode == 1
+    assert differs.stdout.splitlines()[:3] == [
+        "2026-09-21 17:00:00 wake",
+        "  shadow: wake (after a reset): told Check-in",
+        "  real:   wake (after a reset): Check-in is busy; not told",
+    ]
+
+
+def test_what_only_the_real_installation_logs_is_not_compared(tmp_path: Path) -> None:
+    shadow = f"{_NOW} shadow tick\n{_NOW} train status: {{}}\n"
+    wake = (
+        f"{_NOW} ticket start: started 611 (priority high)\n"
+        f"{_NOW} handoff 7 held the merge lock for 0.4 s\n"
+        f"{_NOW} automatically re-ran failed jobs of CI\n"
+    )
+    journal = (
+        f"{_NOW}.1 example-host bash[7]: ticket-7: removed, its pull request is merged\n"
+        f"{_NOW}.1 example-host bash[7]: the orchestrator (Check-in) was given a check-in\n"
+    )
+
+    done = _compare(*_logs(tmp_path, shadow, wake, journal))
+
+    assert done.returncode == 0, done.stdout
+    assert done.stdout.startswith("0 decisions compared")
+
+
+def test_without_the_journal_the_session_commands_are_not_compared(tmp_path: Path) -> None:
+    shadow = f"{_NOW} shadow tick\n{_NOW} audit-9 stopped\n{_NOW} ticket-7 started\n"
+
+    done = _compare(*_logs(tmp_path, shadow))
+
+    assert done.returncode == 0, done.stdout
+    assert done.stdout == (
+        "the lines of the session commands (stopped, started, squeezed, sent again, bridged, "
+        "start held) are not compared: no --journal\n"
+        "0 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 17:00:00: none differs\n"
+    )
+
+
+def test_only_the_hours_of_the_shadow_run_are_compared(tmp_path: Path) -> None:
+    shadow = f"{_NOW} shadow tick\n{_NOW + 3600} shadow tick\n"
+    wake = (
+        f"{_NOW - 600} review-10 checks finished on {'a' * 40}; reviewer nudged\n"
+        f"{_NOW + 1800} review-11 checks finished on {'a' * 40}; reviewer nudged\n"
+        f"{_NOW + 9000} review-12 checks finished on {'a' * 40}; reviewer nudged\n"
+    )
+
+    whole = _compare(*_logs(tmp_path, shadow, wake, "\n"))
+    named = _compare(*_logs(tmp_path, shadow, wake, "\n"), "--from", "2026-09-21T17:40:00")
+
+    assert whole.returncode == 1
+    assert [line for line in whole.stdout.splitlines() if not line.startswith(" ")] == [
+        "2026-09-21 17:30:00 review-11",
+        "1 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 18:00:00: 1 differ",
+    ]
+    assert named.returncode == 0, named.stdout
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        (["--window", "soon"], "--window: soon is not a number of seconds"),
+        (["--from", "yesterday"], "--from: yesterday is not a time"),
+        (["--shadow", "/nonexistent/shadow.log"], "cannot read /nonexistent/shadow.log"),
+    ],
+)
+def test_a_wrong_argument_is_named(tmp_path: Path, arguments: list[str], error: str) -> None:
+    done = _compare(*_logs(tmp_path, f"{_NOW} shadow tick\n"), *arguments)
+
+    assert done.returncode == 2
+    assert done.stderr.splitlines()[-1].endswith(error)
+
+
+def test_a_shadow_log_without_a_run_names_no_hours(tmp_path: Path) -> None:
+    done = _compare(*_logs(tmp_path, ""))
+
+    assert done.returncode == 2
+    assert done.stderr == "the shadow log holds no shadow tick: name the hours with --from and --until\n"

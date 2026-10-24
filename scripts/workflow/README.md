@@ -83,3 +83,27 @@ How a script reads it:
 
 The machine-wide state, `~/.local/state/workflow`, is shared by every repository on one
 machine, as is its GitHub budget, and is not part of the file.
+
+# A shadow run
+
+Before a repository that runs the workflow from its own copy of the scripts moves onto
+`shipline <command>`, Shipline is run beside it in shadow: `shipline --repo <checkout> tick
+--shadow` takes the decisions of a tick on that repository and carries out none (`tick` says
+what it reads and what it leaves). It writes them to `.local/shipline/shadow.log` of the
+checkout, readable by its owner alone, and leaves every note of the installation as it was.
+
+Each shadow tick runs just before the installation's own tick, so both see the same state, for
+example as a step before the tick in its service, which the owner adds by a drop-in:
+
+    # ~/.config/systemd/user/workflow-tick.service.d/shadow.conf
+    [Service]
+    ExecStartPre=-<path of the Shipline checkout>/bin/shipline --repo <checkout> tick --shadow
+
+The `-` keeps a failed shadow tick from holding the real one back. After the run:
+
+    journalctl --user -u workflow-tick.service -o short-unix --since <start> >tick.journal
+    tools/compare-shadow --shadow <checkout>/.local/shipline/shadow.log \
+      --wake ~/.local/state/workflow/wake.log --journal tick.journal
+
+lists every decision the two took differently, with both versions, and exits 0 when none
+differs. What the shadow tick prints, which the journal holds too, is no decision it reads.

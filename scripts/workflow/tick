@@ -47,6 +47,21 @@
 # The starts come last because the steps before them may free memory they need.
 # Audits are not started here: the orchestrator session starts one by hand, and only for a
 # pull request that was built before the workflow existed. Hunts are not started here either.
+#
+# `tick --shadow` (`shipline tick --shadow`) takes the same decisions and carries out none:
+# no push, no label, no merge, no message, no session started, stopped or typed into, and no
+# note of the tick, the gate or the wake written. It runs beside an installation that still runs
+# its own copy of the scripts, just before that installation's own tick, and shows whether
+# Shipline decides as that copy does (`tools/compare-shadow`). Each decision is one line of
+# `.local/shipline/shadow.log` in the main checkout, in the words the real tick logs it in: the
+# wake log's for the nudges, the session command's for a stop, a squeeze, a resend, a bridge
+# and a start (without its link or figures), and the wake's check-in. It reads all the real tick
+# reads, the merge line as last saved (the gate's read path, without its lock), and notes the
+# train status whenever it changed. It does not run what only carries decisions out or keeps
+# records: the metrics, the cloud workers' poll, the worktree cleanup, main's report, the merge
+# driver and the automatic ticket start. A start is logged when `session start` would make it:
+# room for it, and for a reviewer the checks of `reviewer_start.py`. Its own lock keeps a second
+# shadow tick out, and never the real one.
 set -uo pipefail
 
 # A session that holds more than this while idle is squeezed.
@@ -73,7 +88,19 @@ FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:
 # names another.
 METRICS_DAILY_AT=${WORKFLOW_METRICS_DAILY_AT-07:50}
 
+shadow=0
+if (($#)); then
+  if [[ $# -ne 1 || $1 != --shadow ]]; then
+    echo "usage: tick [--shadow]" >&2
+    exit 2
+  fi
+  shadow=1
+fi
+
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Every program a shadow tick starts changes nothing while SHIPLINE_SHADOW names its log, set
+# once the tick holds its lock; a real tick gives them none.
+unset SHIPLINE_SHADOW SHIPLINE_SHADOW_NOTES
 gh() { python3 "$here/github_budget.py" call tick "$@"; }
 source "$here/bridge-failed"
 # The repository, its check names, labels and state folder (`workflow_config.py`), read once.
@@ -96,12 +123,23 @@ cd "$main" || exit 1
 
 # A second tick exits while the first still runs. The lock is in the git common directory, where
 # no change of shipline.json moves it: a tick that reads a new state folder still waits for one
-# that read the old.
-mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
-exec 9>"$common/shipline-tick.lock"
-if ! flock --nonblock 9; then
-  echo "the tick before this one is still running"
-  exit 0
+# that read the old. A shadow tick has a lock of its own.
+if ((shadow)); then
+  exec 9>"$common/shipline-shadow.lock"
+  if ! flock --nonblock 9; then
+    echo "the shadow tick before this one is still running"
+    exit 0
+  fi
+  # The log holds the names and the heads of the work: for its owner alone.
+  export SHIPLINE_SHADOW=$main/.local/shipline/shadow.log
+  (umask 077 && mkdir -p "${SHIPLINE_SHADOW%/*}" && : >>"$SHIPLINE_SHADOW") || exit 1
+else
+  mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
+  exec 9>"$common/shipline-tick.lock"
+  if ! flock --nonblock 9; then
+    echo "the tick before this one is still running"
+    exit 0
+  fi
 fi
 
 # A start the tick makes, directly or through the merge driver, does not wait for memory while
@@ -113,10 +151,105 @@ export WORKFLOW_SESSION_SNAPSHOT=$WORKFLOW_TRAIN_TICK/sessions
 python3 -c 'import json,sys,time; json.dump({"started": time.time()}, open(sys.argv[1], "w"))' "$WORKFLOW_TRAIN_TICK/context.json"
 trap 'rm -rf "$WORKFLOW_TRAIN_TICK"' EXIT
 
+# A decision of a shadow tick: a line of its log.
+shadow_note() {
+  printf '%s %s\n' "$NOW" "$*" >>"$SHIPLINE_SHADOW"
+}
+# What the tick says it does: on its output, and in a shadow tick in its log.
+say() {
+  if ((shadow)); then shadow_note "$*"; else echo "$*"; fi
+}
+# A note the tick reads again in a later tick. A shadow tick leaves the real tick's notes as
+# they are, and keeps none of its own.
+keep() {
+  ((shadow)) || echo "$2" >"$1"
+}
+# The tick's line of the wake log; a shadow tick's goes to its own log.
+wake_log() {
+  local log=$HOME/.local/state/workflow/wake.log
+  if ((shadow)); then
+    shadow_note "$*"
+    return
+  fi
+  mkdir -p "${log%/*}" && printf '%s %s\n' "$NOW" "$*" >>"$log"
+}
+if ((shadow)); then
+  # The notes the shadow tick takes for its own wake (`wake`), which reads them beside the real ones.
+  export SHIPLINE_SHADOW_NOTES=$WORKFLOW_TRAIN_TICK/shadow-notes
+  shadow_note "shadow tick"
+fi
+
+# The tick's list of sessions, kept in step with what a shadow tick would start and stop, as
+# the session command keeps it for the real tick.
+snapshot_drop() {
+  [[ -f $WORKFLOW_SESSION_SNAPSHOT ]] || return 0
+  awk -v name="$1" -v twin="$2" '$1 != name && $1 != twin' \
+    "$WORKFLOW_SESSION_SNAPSHOT" >"$WORKFLOW_SESSION_SNAPSHOT.pending" &&
+    mv "$WORKFLOW_SESSION_SNAPSHOT.pending" "$WORKFLOW_SESSION_SNAPSHOT"
+}
+snapshot_busy() {
+  [[ -f $WORKFLOW_SESSION_SNAPSHOT ]] || return 0
+  awk -v name="$1" '
+    $1 == name { $2="busy"; print; found=1; next }
+    { print }
+    END { if (!found) print name " busy ? held, ? swap" }
+  ' "$WORKFLOW_SESSION_SNAPSHOT" >"$WORKFLOW_SESSION_SNAPSHOT.pending" &&
+    mv "$WORKFLOW_SESSION_SNAPSHOT.pending" "$WORKFLOW_SESSION_SNAPSHOT"
+}
+
+# A start of a shadow tick, logged when `session start` would make it: with room for it, as
+# `session room` reads it, or 75 as when it waits. A cloud worker needs no room here.
+shadow_start() {
+  local kind=$1 number=$2 program=${3:-} name room
+  case $kind in
+    worker) name=ticket-$number ;;
+    review) name=review-$number ;;
+    *) name=$kind-$number ;;
+  esac
+  [[ $program != cloud ]] || name=cloud-$number
+  if [[ $program != cloud ]] && ! room=$(bash "$here/session" room 2>&1 9>&-); then
+    shadow_note "$room; the next tick tries this start again"
+    return 75
+  fi
+  shadow_note "$name started"
+  snapshot_busy "$name"
+}
+
+# A shadow tick reads the sessions and logs what it would make of them, in the words the
+# session command prints when it does it.
+shadow_session() {
+  case $1 in
+    list | running | load | room) bash "$here/session" "$@" 9>&- ;;
+    stop)
+      shadow_note "$2 stopped"
+      snapshot_drop "$2" "codex-${2#ticket-}"
+      ;;
+    squeeze) shadow_note "$2 squeezed" ;;
+    resend)
+      shadow_note "$2 was sent its instruction again"
+      snapshot_busy "$2"
+      ;;
+    bridge)
+      shadow_note "$2: its bridge was started again"
+      snapshot_busy "$2"
+      ;;
+    start) shadow_start "$2" "$3" "${5:-}" ;;
+    # The worktrees of finished work stay; their removal decides nothing the real tick logs.
+    cleanup) ;;
+    # The tick itself logs each message it would have typed, in the wake log's words.
+    checks-finished | conflict-found | lost-check | batch-merged | status-check | finish-ready) ;;
+    *) shadow_note "session $*" ;;
+  esac
+}
+
 # The lock is closed for everything the tick calls: a `tmux` server started here lives on
 # after the tick, and would hold the lock for as long as its session runs.
 session() {
-  bash "$here/session" "$@" 9>&-
+  if ((shadow)); then
+    shadow_session "$@"
+  else
+    bash "$here/session" "$@" 9>&-
+  fi
 }
 
 # An audit ends with "audit finished", a worker with "worker finished", a hunt with "hunt
@@ -197,7 +330,7 @@ list_pull_requests() {
 # for each session and head. GitHub is asked again, as the reviewer may have merged since the
 # snapshot.
 note_rule_break() {
-  local number=$1 folder=$main/$SHIPLINE_STATE_FOLDER state head event
+  local number=$1 folder=$main/$SHIPLINE_STATE_FOLDER state head event notes
   [[ ! -e $folder/merge-wanted-$number && ! -e $folder/merge-review-$number &&
      ! -e $folder/batch-merged-$number ]] || return 0
   read -r state _ head < <(gh pr view "$number" --json state,headRefName,headRefOid \
@@ -206,10 +339,12 @@ note_rule_break() {
   event=review-$number-$head.json
   [[ ! -e $folder/rule-breaks.pending/$event && ! -e $folder/rule-breaks.sent/$event ]] ||
     return 0
-  mkdir -p "$folder/rule-breaks.pending" &&
+  notes=$folder/rule-breaks.pending
+  ((shadow == 0)) || notes=$SHIPLINE_SHADOW_NOTES/rule-breaks.pending
+  mkdir -p "$notes" &&
     jq -n --arg name "review-$number" --arg number "$number" --arg head "$head" \
-      '{name: $name, number: $number, head: $head}' >"$folder/rule-breaks.pending/.$event.tmp" &&
-    mv -- "$folder/rule-breaks.pending/.$event.tmp" "$folder/rule-breaks.pending/$event"
+      '{name: $name, number: $number, head: $head}' >"$notes/.$event.tmp" &&
+    mv -- "$notes/.$event.tmp" "$notes/$event"
 }
 
 # Read from the time written on the note `session start hunt` leaves.
@@ -316,9 +451,9 @@ local_duties() {
     reset_has_passed "${limit##*  }" "${rest##*  resets }" || continue
     mark=$(resent_mark "$name")
     [[ ! -r $mark || $(<"$mark") != "$reset_at" ]] || continue
-    mkdir -p "${mark%/*}" || { failed=1; continue; }
+    ((shadow)) || mkdir -p "${mark%/*}" || { failed=1; continue; }
     if session resend "$name"; then
-      echo "$reset_at" >"$mark" || { failed=1; continue; }
+      keep "$mark" "$reset_at" || { failed=1; continue; }
       woken+=("$name")
     else
       failed=1
@@ -337,13 +472,14 @@ program=${program:-claude}
 listed=-
 running=$(session list) || { failed=1; listed=unread; }
 # From the sessions just listed: the sample asks GitHub nothing and lists nothing again.
-bash "$here/workflow-metrics" --sample --sessions "$listed" <<<"$running" 9>&- || failed=1
+((shadow)) ||
+  bash "$here/workflow-metrics" --sample --sessions "$listed" <<<"$running" 9>&- || failed=1
 
 # Before GitHub is asked anything: a hunt has no pull request, and its time runs out whether
 # or not GitHub answers.
 while read -r name _; do
   [[ $name == hunt-* ]] && is_over_its_time "$name" || continue
-  echo "$name is over its time"
+  say "$name is over its time"
   session stop "$name" || failed=1
 done <<<"$running"
 
@@ -354,7 +490,7 @@ if ! budget_ready; then
 fi
 
 # Poll every cloud record, including unlabelled tickets, before the ordinary ready path.
-python3 -B "$here/cloud_workers.py" poll "$main" 9>&- || failed=1
+((shadow)) || python3 -B "$here/cloud_workers.py" poll "$main" 9>&- || failed=1
 budget_ready || paused
 
 # The daily metrics read a week of runs from GitHub, minutes on a first run: they run detached,
@@ -362,7 +498,7 @@ budget_ready || paused
 # and waits half an hour after one that failed. It is given the tick's time, so it names the
 # day the tick looked for. One command alone goes to the background: a list would fork a shell
 # that keeps the tick's lock, and its output, for as long as the run.
-if [[ $METRICS_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] &&
+if ((shadow == 0)) && [[ $METRICS_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] &&
     ((10#$(date -u -d "@$NOW" +%H%M) >= 10#${BASH_REMATCH[1]}${BASH_REMATCH[2]})) &&
     [[ ! -e $main/.local/analyses/metrics-$(date -u -d "@$NOW" +%F).md ]]; then
   if mkdir -p "$HOME/.local/state/workflow"; then
@@ -424,7 +560,7 @@ while read -r name state _; do
       # A reviewed stack member waits for its base; do not start it every three minutes.
       head=$(git -C "$main/.claude/worktrees/ticket-${name#review-}" rev-parse HEAD 9>&-) ||
         { failed=1; continue; }
-      echo "$head" >"$main/$SHIPLINE_STATE_FOLDER/$name.head" || { failed=1; continue; }
+      keep "$main/$SHIPLINE_STATE_FOLDER/$name.head" "$head" || { failed=1; continue; }
     fi
     if [[ $name == review-* ]] && grep -qxF "${name#review-} false main" <<<"$pulls"; then
       # Unread, the break would be lost with the session: it waits for the next tick.
@@ -439,14 +575,19 @@ WORKFLOW_PR_SNAPSHOT=$snapshot session cleanup || failed=1
 local_duties
 
 # Refresh main before computing wake tokens: PR checks can finish while main is pending.
-# The tick alone requests one failed-job retry, after verifying home-runner evidence.
-WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/main-status" --tick-main-status 9>&- || failed=1
-budget_ready || paused
+# The tick alone requests one failed-job retry, after verifying home-runner evidence. A shadow
+# tick reads the report as the real tick left it.
+if ((shadow == 0)); then
+  WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/main-status" --tick-main-status 9>&- || failed=1
+  budget_ready || paused
+fi
 
 # Passed reviews can leave a durable merge handoff instead of a model waiting in line.
 # The driver calls the same gate and returns every refusal needing judgment to review.
-WORKFLOW_BACKGROUND_GITHUB=1 python3 -B "$here/merge_driver.py" 9>&- || failed=1
-budget_ready || paused
+if ((shadow == 0)); then
+  WORKFLOW_BACKGROUND_GITHUB=1 python3 -B "$here/merge_driver.py" 9>&- || failed=1
+  budget_ready || paused
+fi
 running=$(session list) || failed=1
 
 # A stopped watch needs no shell restarted. A check-wait note is enough, even before the
@@ -456,6 +597,11 @@ running=$(session list) || failed=1
 # The sessions given a message in this tick: step 8 gives them no second one.
 nudged=" "
 if train=$(WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/merge-when-current" --train-status 9>&-); then
+# A shadow tick notes the line it read whenever it changed: it explains a decision that differs.
+if ((shadow)) &&
+    [[ $(grep -E '^[0-9]+ train status: ' "$SHIPLINE_SHADOW" | tail -n 1 | cut -d ' ' -f 2-) != "train status: $train" ]]; then
+  shadow_note "train status: $train"
+fi
 while read -r name state _; do
   [[ $state != limit && $name =~ ^(review|audit)-([0-9]+)$ ]] || continue
   number=${BASH_REMATCH[2]}
@@ -486,13 +632,10 @@ while read -r name state _; do
     # The squash commit, or the merged head when the gate could not read main after it.
     squash=$(jq -er '(.squash // .head) | select(type == "string" and test("^[0-9a-f]{40}$"))' \
       "$batch_merged") || { failed=1; continue; }
-    log=$HOME/.local/state/workflow/wake.log
     if delivery=$(session batch-merged "$name" "$squash" 2>&1); then
       nudged+="$name "
-      echo "$squash" >"$mark" || { failed=1; continue; }
-      mkdir -p "${log%/*}" &&
-        printf '%s %s merged in a batch as %s; session nudged\n' "$NOW" "$name" "$squash" >>"$log" ||
-        failed=1
+      keep "$mark" "$squash" || { failed=1; continue; }
+      wake_log "$name merged in a batch as $squash; session nudged" || failed=1
     else
       echo "$delivery" >&2
       failed=1
@@ -515,10 +658,8 @@ while read -r name state _; do
     [[ ! -e $mark ]] || continue
     if delivery=$(session conflict-found "$name" "$head" 2>&1); then
       nudged+="$name "
-      echo "$head" >"$mark" || { failed=1; continue; }
-      log=$HOME/.local/state/workflow/wake.log
-      mkdir -p "${log%/*}" &&
-        printf '%s %s merge conflict on %s; reviewer nudged\n' "$NOW" "$name" "$head" >>"$log" || failed=1
+      keep "$mark" "$head" || { failed=1; continue; }
+      wake_log "$name merge conflict on $head; reviewer nudged" || failed=1
     else
       echo "$delivery" >&2
       failed=1
@@ -587,15 +728,11 @@ while read -r name state _; do
   [[ $lost == false ]] || wake=lost-check
   if delivery=$(session "$wake" "$name" "$head" 2>&1); then
     nudged+="$name "
-    echo "$head" >"$mark" || { failed=1; continue; }
-    log=$HOME/.local/state/workflow/wake.log
-    mkdir -p "${log%/*}" &&
-      printf '%s %s %s on %s; reviewer nudged\n' "$NOW" "$name" "${wake//-/ }" "$head" >>"$log" || failed=1
+    keep "$mark" "$head" || { failed=1; continue; }
+    wake_log "$name ${wake//-/ } on $head; reviewer nudged" || failed=1
   else
     echo "$delivery" >&2
-    log=$HOME/.local/state/workflow/wake.log
-    mkdir -p "${log%/*}" &&
-      printf '%s %s wake failed: %s\n' "$NOW" "$name" "$delivery" >>"$log"
+    wake_log "$name wake failed: $delivery"
     failed=1
   fi
 done <<<"$running"
@@ -605,11 +742,6 @@ else
 fi
 
 # Step 8.
-wake_log() {
-  local log=$HOME/.local/state/workflow/wake.log
-  mkdir -p "${log%/*}" && printf '%s %s\n' "$NOW" "$*" >>"$log"
-}
-
 # When a note was last written, in seconds.
 written_at() {
   stat -c %Y "$1" 2>/dev/null 9>&-
@@ -632,6 +764,7 @@ screen_sum() {
 # A line for the wake, kept until the orchestrator was told it. `key` names it once.
 note_for_wake() {
   local key=$1 line=$2 folder=$main/$SHIPLINE_STATE_FOLDER/stuck.pending
+  ((shadow == 0)) || folder=$SHIPLINE_SHADOW_NOTES/stuck.pending
   mkdir -p "$folder" && jq -n --arg line "$line" '{line: $line}' >"$folder/$key.json"
 }
 
@@ -680,7 +813,7 @@ while read -r name state _; do
     delivery=$(session status-check "$name" 2>&1)
     sent=$?
     if ((sent == 0)); then
-      echo "$since" >"$mark" || failed=1
+      keep "$mark" "$since" || failed=1
       wake_log "$name idle $(((NOW - since) / 60)) min waiting for its own job or turn; status check sent" ||
         failed=1
     elif ((sent != 3)); then
@@ -694,8 +827,10 @@ while read -r name state _; do
   # above if it had said so. Ready is counted from when the tick first saw it ready.
   ready=$main/$SHIPLINE_STATE_FOLDER/$name.ready-seen
   if [[ $name == ticket-* ]] && grep -qE "^$number false " <<<"$pulls"; then
-    [[ -r $ready ]] || echo "$NOW" >"$ready" || failed=1
+    [[ -r $ready ]] || keep "$ready" "$NOW" || failed=1
+    # A shadow tick counts from now what the real tick notes now.
     ready_at=""
+    ((shadow == 0)) || ready_at=$NOW
     [[ ! -r $ready ]] || read -r ready_at <"$ready"
     idle_at=""
     [[ ! -e $notes.idle ]] || idle_at=$(written_at "$notes.idle")
@@ -706,7 +841,7 @@ while read -r name state _; do
       delivery=$(session finish-ready "$name" 2>&1)
       sent=$?
       if ((sent == 0)); then
-        echo "$ready_at" >"$mark" || failed=1
+        keep "$mark" "$ready_at" || failed=1
         wake_log "$name idle on ready pull request $number without worker finished; told to finish" ||
           failed=1
       elif ((sent != 3)); then
@@ -716,7 +851,7 @@ while read -r name state _; do
       fi
     fi
   elif [[ $name == ticket-* ]]; then
-    rm -f "$ready"
+    ((shadow)) || rm -f "$ready"
   fi
 
   # What it runs: a wait loop that finds its own shell never ends, whatever its screen shows.
@@ -726,7 +861,7 @@ while read -r name state _; do
       mark=$main/$SHIPLINE_STATE_FOLDER/$name.loop-noted
       if [[ ! -r $mark || $(<"$mark") != "$loop" ]]; then
         if note_for_wake "$name-loop-$NOW" "wait loop finds itself? $name (running: $loop)"; then
-          printf '%s\n' "$loop" >"$mark" || failed=1
+          keep "$mark" "$loop" || failed=1
           wake_log "$name runs a wait loop that finds its own shell: $loop" || failed=1
         else
           failed=1
@@ -740,17 +875,17 @@ while read -r name state _; do
   # Busy, and not a session that ended its turn to wait for its own job.
   seen=$main/$SHIPLINE_STATE_FOLDER/$name.screen-seen
   if [[ $state != busy || -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]]; then
-    rm -f "$seen"
+    ((shadow)) || rm -f "$seen"
     continue
   fi
   if asks_permission "$name"; then
-    rm -f "$seen"
+    ((shadow)) || rm -f "$seen"
     continue
   fi
   sum=$(screen_sum "$name") || continue
   read -r last_sum last_since <"$seen" 2>/dev/null || last_sum=""
   if [[ $last_sum != "$sum" || ! $last_since =~ ^[0-9]+$ ]]; then
-    echo "$sum $NOW" >"$seen" || failed=1
+    keep "$seen" "$sum $NOW" || failed=1
     continue
   fi
   ((NOW - last_since >= STUCK_AFTER_SECONDS)) || continue
@@ -759,7 +894,7 @@ while read -r name state _; do
   what=$(jq -r '.running // ""' <<<"$activity")
   line="stuck? $name ($(((NOW - last_since) / 60)) min, running: ${what:-no command})"
   if note_for_wake "$name-stuck-$last_since" "$line"; then
-    echo "$last_since" >"$mark" || failed=1
+    keep "$mark" "$last_since" || failed=1
     wake_log "$line" || failed=1
   else
     failed=1
@@ -767,7 +902,7 @@ while read -r name state _; do
 done <<<"$running"
 
 # Record reviewer-start notices before waking the orchestrator. Their reviewers start below.
-python3 -B "$here/merge_driver.py" --hand-backs 9>&- || failed=1
+((shadow)) || python3 -B "$here/merge_driver.py" --hand-backs 9>&- || failed=1
 running=$(session list) || failed=1
 
 # A draft goes to the cloud, if its screen check allows, by the cloud default (a Codex fix
@@ -794,7 +929,11 @@ while read -r number draft base; do
   if [[ -e $main/$SHIPLINE_STATE_FOLDER/merge-review-$number ]]; then
     ((local_starts_held == 0)) || continue
     # A hand-back's fresh reviewer, at its pull request's place in the order.
-    python3 -B "$here/merge_driver.py" --start-hand-back "$number" 9>&-
+    if ((shadow)); then
+      shadow_start review "$number"
+    else
+      python3 -B "$here/merge_driver.py" --start-hand-back "$number" 9>&-
+    fi
     started=$?
     ((started == 0 || started == 75)) || failed=1
     continue
@@ -838,7 +977,7 @@ while read -r number draft base; do
       --jq '"\(.state) \(.headRefName) \(.headRefOid)"' 9>&-) || { failed=1; continue; }
     mark=$main/$SHIPLINE_STATE_FOLDER/review-$number.head
     if [[ $base == main ]]; then
-      rm -f "$mark" || { failed=1; continue; }
+      ((shadow)) || rm -f "$mark" || { failed=1; continue; }
     else
       [[ ! -r $mark || $(<"$mark") != "${head##* }" ]] || continue
     fi
@@ -858,18 +997,25 @@ while read -r number draft base; do
     fi
     read -r round sent_back <<<"$history"
     branch=${head#* }
-    python3 -B "$here/reviewer_start.py" "$main/$SHIPLINE_STATE_FOLDER" "$number" "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&-
+    if ((shadow)); then
+      python3 -B "$here/reviewer_start.py" --shadow "$main/$SHIPLINE_STATE_FOLDER" "$number" "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&- &&
+        shadow_start review "$number"
+    else
+      python3 -B "$here/reviewer_start.py" "$main/$SHIPLINE_STATE_FOLDER" "$number" "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&-
+    fi
     started=$?
     ((started == 0 || started == 2)) || failed=1
   fi
 done <<<"$pulls"
 
-python3 -B "$here/reviewer_start.py" --reconcile "$main/$SHIPLINE_STATE_FOLDER" 9>&- || failed=1
+if ((shadow == 0)); then
+  python3 -B "$here/reviewer_start.py" --reconcile "$main/$SHIPLINE_STATE_FOLDER" 9>&- || failed=1
 
-# After this tick's own starts, which count as starts too: the next draft ticket gets the label
-# when one may start, and the next tick starts its worker.
-python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
-  failed=1
+  # After this tick's own starts, which count as starts too: the next draft ticket gets the label
+  # when one may start, and the next tick starts its worker.
+  python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
+    failed=1
+fi
 
 wake_done=1
 bash "$here/wake" "${woken[@]}" 9>&- || failed=1

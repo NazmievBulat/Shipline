@@ -4,6 +4,11 @@
 #
 #   shipline [--repo <path>] <command> [arguments]
 #
+# `shipline tick --shadow` takes a tick's decisions on the repository and carries out none: it
+# writes them to `.local/shipline/shadow.log` there, to be compared with the decisions of an
+# installation that still runs its own copy of the scripts (`tools/compare-shadow`; `tick` says
+# how).
+#
 # The repository is the one whose checkout `--repo` names, else `SHIPLINE_REPO`, else the one
 # the current directory is in (`workflow_config.py`); it is passed on as `SHIPLINE_REPO`.
 # The scripts are those of the Shipline checkout this file is in, links followed, so a link

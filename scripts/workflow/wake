@@ -47,6 +47,10 @@
 # reached by a message, as one session reaches another, which only a session can send: a short
 # `claude -p` on Claude Haiku 5.5, with no settings and the one tool, sends it.
 #
+# A shadow run (`tick --shadow`) names its own log in SHIPLINE_SHADOW: the check-in goes there,
+# in the same words, and is not sent, and the wake writes no note of its own. It also reads the
+# notes the shadow tick took for it, which that tick keeps in SHIPLINE_SHADOW_NOTES.
+#
 # `gh`, `claude` and `date` are found on the PATH, so a test can replace them.
 set -uo pipefail
 
@@ -71,6 +75,8 @@ PENDING=$STATE/wake.pending
 RETRY_SECONDS=$((5 * 60))
 # The questions to the owner the orchestrator was told of, one "<session> <asked at>" a line.
 ASKED=$STATE/wake.asked
+shadow=${SHIPLINE_SHADOW:-}
+[[ -z $shadow ]] || LOG=$shadow
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 github_ready=1
@@ -83,7 +89,7 @@ export SHIPLINE_CONFIG
 # The repository's main checkout, never the checkout these scripts are in.
 main=$SHIPLINE_REPO
 resent=("$@")
-mkdir -p "$STATE"
+[[ -n $shadow ]] || mkdir -p "$STATE"
 main_report=$main/$SHIPLINE_STATE_FOLDER/main-status
 main_pending=$main/$SHIPLINE_STATE_FOLDER/main-status.pending
 # The first push the package audit refused because an advisory service could not be reached
@@ -152,23 +158,25 @@ if [[ -d $lost ]]; then
   done < <(find "$lost" -type f -name '*.json' -print0 | sort -z)
 fi
 # Rule breaks travel with the lost checks: told at any hour, on a line of their own.
-if [[ -d $breaks ]]; then
+for folder in "$breaks" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/rule-breaks.pending"}; do
+  [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"rule break: \(.name) said review finished without a merge handoff"' "$event"); then
       lost_files+=("$event")
       lost_lines+=("$line")
     fi
-  done < <(find "$breaks" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
-fi
+  done < <(find "$folder" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+done
 
-if [[ -d $stuck ]]; then
+for folder in "$stuck" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/stuck.pending"}; do
+  [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '.line | strings' "$event"); then
       stuck_files+=("$event")
       stuck_lines+=("$line")
     fi
-  done < <(find "$stuck" -type f -name '*.json' -print0 | sort -z)
-fi
+  done < <(find "$folder" -type f -name '*.json' -print0 | sort -z)
+done
 
 # Seconds since the last look, or a day when there was none.
 since_last_look() {
@@ -258,14 +266,14 @@ if ((${#resent[@]} == 0)); then
     (($(since_last_look) + 30 >= LOOK_EVERY_SECONDS)) || exit 0
   fi
 fi
-echo "$NOW" >"$LOOKED"
+[[ -n $shadow ]] || echo "$NOW" >"$LOOKED"
 # The names not yet told go first, without the ones woken again since.
 if [[ -s $PENDING ]]; then
   mapfile -t waiting < <(grep -vxF -f <(printf '%s\n' "${resent[@]}" "") "$PENDING")
   resent=("${waiting[@]}" "${resent[@]}")
 fi
 # Written down before anything can fail; removed once the orchestrator was told.
-((${#resent[@]} == 0)) || printf '%s\n' "${resent[@]}" >"$PENDING"
+[[ -n $shadow ]] || ((${#resent[@]} == 0)) || printf '%s\n' "${resent[@]}" >"$PENDING"
 
 log() {
   printf '%s\n' "$@" >>"$LOG"
@@ -358,6 +366,7 @@ find_orchestrator() {
 # waits 3 seconds for it and says so.
 send_to() {
   local to=$1 message=$2 answer
+  [[ -z $shadow ]] || return 0
   answer=$(cd "$STATE" && timeout "$SEND_SECONDS" claude -p --model "$CHAT_MODEL" --setting-sources "" \
     --tools SendMessage --output-format stream-json --verbose \
     --system-prompt "You deliver one message between Claude sessions. Call SendMessage exactly once, with the recipient and the text given, the text unchanged. Then answer with one word: sent." \
@@ -444,6 +453,10 @@ if [[ -n $service_line ]]; then
 fi
 
 if send_to "$name" "$message"; then
+  if [[ -n $shadow ]]; then
+    log "  told $name: $message"
+    exit "$failed"
+  fi
   echo "$seen" >"$TOLD"
   # A question told before stays told while it is open, also while its session works again on
   # its own job and so is not in this check-in.

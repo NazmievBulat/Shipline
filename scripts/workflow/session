@@ -1398,6 +1398,12 @@ codex_limit() {
   resets="$(LC_ALL=C TZ=UTC date -d "@$at" '+%b %-d, %Y, %-I:%M%P') (UTC)"
 }
 
+# A shadow run (`tick --shadow`) reads the sessions and changes none, whoever calls this.
+if [[ -n ${SHIPLINE_SHADOW:-} && ! ${1:-} =~ ^(list|running|load|room)$ ]]; then
+  echo "a shadow run does not run session ${1:-}" >&2
+  exit 1
+fi
+
 case ${1:-} in
   start)
     check_load_per_processor
