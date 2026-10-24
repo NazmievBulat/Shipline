@@ -88,7 +88,8 @@ The tick's explicit `SHIPLINE_CONFIG` and `XDG_CONFIG_HOME` settings reach every
 starts, with relative paths made absolute before changing folders. A session's own `shipline`
 calls therefore select the same file. `runner/install.sh` uses this same lookup and reports the
 selected external config path. It checks the config against `origin/main` only when reading the
-main checkout's `shipline.json`; an external config has no file there to compare with.
+main checkout's `shipline.json`; an external config has no file there to compare with. The
+installed runner commands remember that external path and still run on `origin/main`'s files.
 
 `examples/shipline.json` names every key for `example-app` with a server suite, a browser suite
 and an image check. A repository needs no config or adapter scripts of its own.

@@ -835,12 +835,13 @@ def test_a_pool_installs_from_an_external_file(machine: Path, source: str) -> No
     checkout = machine / "checkout"
     (checkout / ".github/runner").mkdir(parents=True)
     (checkout / ".github/runner/settings.sh").write_text("repository=example-app/example-app\n")
+    (checkout / "marker").write_text("main\n")
     _git(machine, "add", "--all")
     _git(machine, "commit", "--quiet", "-m", "main")
     _git(machine, "update-ref", "refs/remotes/origin/main", "HEAD")
     env = _env(machine)
     if source == "explicit":
-        path = machine / "named config/shipline.json"
+        path = machine / "named 'config/shipline.json"
         env["SHIPLINE_CONFIG"] = str(path)
     else:
         base = machine / ("config home" if source == "xdg" else "home/.config")
@@ -848,7 +849,8 @@ def test_a_pool_installs_from_an_external_file(machine: Path, source: str) -> No
             env["XDG_CONFIG_HOME"] = str(base)
         path = base / "shipline/example-app-example-app/shipline.json"
     path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({"runner": _RUNNER}))
+    path.write_text(json.dumps({"runner": {**_RUNNER, "image_build": 'cat marker >> "$BUILT"'}}))
+    (checkout / "marker").write_text("worktree\n")
     _settings(machine)
 
     def install() -> subprocess.CompletedProcess[str]:
@@ -861,7 +863,14 @@ def test_a_pool_installs_from_an_external_file(machine: Path, source: str) -> No
     assert done.returncode == 0, done.stderr
     assert str(path) in done.stdout
     assert "repository='example-app/example-app'" in (_installed(machine) / "pool-settings.sh").read_text()
-    assert (machine / "built").read_text() == "built\n"
+    assert (machine / "built").read_text() == "main\n"
+    # A service has neither the installer's named config nor its XDG home in its environment.
+    built = subprocess.run(
+        ["sh", str(_installed(machine) / "build-images.sh")],
+        cwd=checkout, env=_env(machine), capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert built.returncode == 0, built.stderr
+    assert (machine / "built").read_text() == "main\nmain\n"
     # Even when the checkout file is uncommitted, the selected external file wins.
     (checkout / "shipline.json").write_text('{"runner": {"prefix": "other-app"}}')
     done = install()

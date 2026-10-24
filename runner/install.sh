@@ -289,6 +289,10 @@ quoted() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
   printf 'label=%s\n' "$(quoted "$label")"
   printf 'planner_label=%s\n' "$(quoted "$planner_label")"
   printf 'checkout=%s\n' "$(quoted "$checkout")"
+  # Installed image/cache commands must keep the external file too, without unit changes.
+  if [ "$SHIPLINE_CONFIG" != "$SHIPLINE_REPO/shipline.json" ]; then
+    printf 'installation_config=%s\n' "$(quoted "$SHIPLINE_CONFIG")"
+  fi
   printf 'machine=%s\n' "$(quoted "$machine")"
   printf 'roles=%s\n' "$(quoted "$roles")"
   printf 'other_machines=%s\n' "$(quoted "$other_machines")"
