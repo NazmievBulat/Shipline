@@ -205,12 +205,14 @@ class Machine:
             "WORKFLOW_PROC_ROOT": str(self.proc),
         }
 
-    def run(self, *, after_minutes: int = 0, code: int = 0) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, *, after_minutes: int = 0, code: int = 0, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         self.now += after_minutes * MINUTE
         self._write_github()
         done = subprocess.run(
             ["python3", "-B", str(BALANCER)],
-            env=self._env(),
+            env={**self._env(), **(env or {})},
             capture_output=True,
             text=True,
             timeout=60,
@@ -666,7 +668,15 @@ def test_the_log_and_state_are_for_the_owner_alone(machine: Machine) -> None:
 
 @pytest.mark.parametrize(
     "line",
-    ["RUNNER_PREFIX=../x", "machine=box/other", "machine='box name'", "repository=../.."],
+    [
+        "RUNNER_PREFIX=../x",
+        "RUNNER_PREFIX=Example-App",
+        "RUNNER_PREFIX=example-app-",
+        "machine=box/other",
+        "machine='box name'",
+        "machine=Box",
+        "repository=../..",
+    ],
 )
 def test_settings_that_would_leave_their_names_change_nothing(machine: Machine, line: str) -> None:
     machine.settings(ordinary=3, docker=1, bounds="balance_ordinary=2-5\n", extra=line + "\n")
@@ -685,5 +695,15 @@ def test_a_state_file_that_is_not_the_balancers_is_started_over(machine: Machine
     machine.queue(ORDINARY, 10)
 
     machine.run()
+
+    assert machine.changes() == ["added an ordinary slot (3 to 4)"]
+
+
+def test_the_prefix_may_come_from_the_environment(machine: Machine) -> None:
+    text = machine.settings_file.read_text().replace("RUNNER_PREFIX=example-app\n", "")
+    machine.settings_file.write_text(text)
+    machine.queue(ORDINARY, 10)
+
+    machine.run(env={"RUNNER_PREFIX": "example-app"})
 
     assert machine.changes() == ["added an ordinary slot (3 to 4)"]

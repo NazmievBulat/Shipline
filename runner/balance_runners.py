@@ -46,7 +46,8 @@ changed, the queues, the forecast, the load and the memory. Its state (since whe
 queue was empty, the last change) is in `runner-balance.json` beside it.
 
 The settings are a Bash file, `~/.config/shipline/runner.sh` unless SHIPLINE_RUNNER_SETTINGS
-names another; a change of count is written back to its line there.
+names another; a change of count is written back to its line there. The prefix is the
+environment's RUNNER_PREFIX when the settings name none.
 """
 
 from __future__ import annotations
@@ -82,10 +83,11 @@ FORECAST_FRESH_SECONDS = 10 * 60
 # Room to add: the load this far under the ceiling, and this much memory for the kind added.
 LOAD_MARGIN = 4
 MEMORY_GB = {"ordinary": 3, "docker": 8}
-# What a repository, the prefix and a machine's name may be: they go into GitHub's paths, the
-# labels and the unit names. `.` and `..` are no owner or name.
+# What a repository, the prefix and a machine's name may be, as `render-units.sh` takes them:
+# they go into GitHub's paths, the labels and the unit names. `.` and `..` are no owner or name.
 REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
-NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+PREFIX = re.compile(r"[a-z]([a-z0-9-]{0,23}[a-z0-9])?")
+MACHINE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
 SETTINGS_SECONDS = 5
 # A Docker runner's VM may take a while to start; one that takes longer is not waited for.
 SYSTEMCTL_SECONDS = 180
@@ -190,10 +192,12 @@ class Machine:
 
 def machine(path: Path) -> Machine:
     values = read_settings(path)
+    # The pool's units are given the prefix; a machine's settings may name it too.
+    values["RUNNER_PREFIX"] = values.get("RUNNER_PREFIX") or os.environ.get("RUNNER_PREFIX", "")
     for needed, pattern in (
         ("repository", REPOSITORY),
-        ("RUNNER_PREFIX", NAME),
-        ("machine", NAME),
+        ("RUNNER_PREFIX", PREFIX),
+        ("machine", MACHINE),
     ):
         if not pattern.fullmatch(values.get(needed, "")):
             raise Refused(f"{path} names no {needed}")
