@@ -20,6 +20,8 @@ from functools import cache
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "workflow"
+# The command a repository calls Shipline by, `shipline <command>`.
+LAUNCHER = Path(__file__).resolve().parents[1] / "bin" / "shipline"
 # What the scripts read from the rest of a repository, held only as far as the tests read it.
 STAND_INS = Path(__file__).resolve().parent / "workflow" / "stand-ins"
 SESSION_LINK = "https://claude.ai/code/session_01TestLinkForWorkflow"
@@ -496,10 +498,33 @@ class Workflow:
     state: Path
     bin: Path
     env: dict[str, str]
+    # Shipline's own checkout, when it is kept apart from the repository (`install_shipline`);
+    # otherwise the scripts are in the repository's `scripts/workflow`.
+    home: Path | None = None
 
     @property
     def script(self) -> Path:
-        return self.repo / "scripts" / "workflow" / "session"
+        return (self.home or self.repo) / "scripts" / "workflow" / "session"
+
+    def shipline(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        stdin: str = "",
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """`shipline <command>` of the separate checkout, as a repository calls it."""
+        assert self.home, "install_shipline first"
+        return subprocess.run(
+            ["bash", str(self.home / "bin" / "shipline"), *args],
+            cwd=cwd or self.repo,
+            env={**self.env, **(env or {})},
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
 
     @property
     def cgroup_root(self) -> Path:
@@ -919,6 +944,34 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
     shutil.copytree(template / "repo", made.repo, symlinks=True)
     made.git("remote", "set-url", "origin", str(origin))
     return made
+
+
+def install_shipline(made: Workflow) -> Path:
+    """Keeps Shipline apart from the repository: a checkout of its own, `shipline` in the test's
+    folder, holding `bin/shipline` and the scripts the repository held, and a repository that
+    no longer holds a `scripts/workflow` (nor the gate's `pre-train-checks`, which were in it).
+    Its setup command and E2E planner stay in its `scripts`. Returns the checkout."""
+    home = made.root / "shipline"
+    held = made.repo / "scripts" / "workflow"
+    shutil.copytree(held, home / "scripts" / "workflow", symlinks=True)
+    (home / "scripts" / "workflow" / "pre-train-checks").unlink()
+    (home / "bin").mkdir()
+    shutil.copy2(LAUNCHER, home / "bin" / "shipline")
+    # A git checkout of its own, so a script that took the repository from its own folder
+    # would work on Shipline instead, and be seen to.
+    env = {**made.env, "GIT_DIR": str(home / ".git"), "GIT_WORK_TREE": str(home)}
+    for args in (
+        ["init", "--quiet", "--initial-branch=main"],
+        ["add", "-A"],
+        ["commit", "--quiet", "-m", "chore: shipline"],
+    ):
+        subprocess.run(["git", *args], cwd=home, env=env, capture_output=True, check=True)
+    made.git("rm", "-r", "--quiet", "scripts/workflow")
+    made.git("commit", "--quiet", "-m", "chore: shipline is called, not held")
+    made.git("push", "--quiet", "origin", "main")
+    shutil.rmtree(held, ignore_errors=True)
+    made.home = home
+    return home
 
 
 @cache

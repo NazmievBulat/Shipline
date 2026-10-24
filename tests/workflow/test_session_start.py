@@ -27,6 +27,8 @@ _ALLOWED_VARIABLES = {
     "XDG_RUNTIME_DIR",
     "XDG_STATE_HOME",
     "WORKFLOW_SESSION",
+    # The repository's main checkout, for `shipline` and the hooks in the session.
+    "SHIPLINE_REPO",
 }
 # What the shell that runs the stand-in `tmux` adds by itself.
 _SHELL_VARIABLES = {"PWD", "SHLVL", "_", "OLDPWD"}
@@ -193,6 +195,7 @@ def test_the_session_sees_only_the_listed_variables(workflow: Workflow) -> None:
     assert set(seen) - _SHELL_VARIABLES == _ALLOWED_VARIABLES | {"TMUX_TMPDIR"}
     assert seen["WORKFLOW_SESSION"] == "ticket-7"
     assert seen["HOME"] == workflow.env["HOME"]
+    assert seen["SHIPLINE_REPO"] == str(workflow.repo)
     gh_bin = workflow.script.parent / "gh-bin"
     assert seen["PATH"] == f"{gh_bin}:{workflow.env['PATH']}"
 

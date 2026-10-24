@@ -1,24 +1,33 @@
 #!/usr/bin/env bash
 # Adds the four hooks that call `notify` to the owner's Claude settings,
-# `~/.claude/settings.json`, so they apply in every worktree. Run once, by the owner:
+# `~/.claude/settings.json`, so they apply in every worktree. Run once, by the owner, in the
+# repository Shipline works on (or with it named, `--repo`):
 #
-#   scripts/workflow/install-hooks
+#   shipline install-hooks
 #
 # A hook that is already there is not added again, and every other setting and hook is left as
-# it is. The settings as they were before the first run are kept beside the file. The hooks call the script in the
-# main checkout, whichever worktree this was run from.
+# it is. The settings as they were before the first run are kept beside the file. The hooks call
+# `notify` through the launcher of this Shipline checkout, on the repository's main checkout,
+# whichever worktree this was run from. The link `~/.local/bin/shipline` is pointed at that
+# launcher (`launcher-link`). A hook written when the scripts were in the repository is replaced,
+# and kept exactly in `settings.json.shipline-replaced`: `shipline uninstall` puts it back.
 set -euo pipefail
 
 # Codex workers use a per-process callback, never an owner's global notify setting.
 [[ $# == 0 ]] || { echo "usage: install-hooks" >&2; exit 2; }
 settings=$HOME/.claude/settings.json
 backup=$settings.before-workflow-hooks
+record=$settings.shipline-replaced
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
-# Through `bash`, quiet and never failing: a session is not disturbed when the main checkout
-# is on a branch that does not have the script.
-command="bash $(printf '%q' "$main/scripts/workflow/notify") 2>/dev/null || true"
+source "$here/launcher-link"
+find_launcher
+# The repository (`workflow_config.py`): SHIPLINE_REPO, else the one of the current folder.
+config=$(python3 "$here/workflow_config.py" shell)
+eval "$config"
+# Through `bash`, quiet and never failing: a session is not disturbed when the checkout no
+# longer has the launcher or the script.
+command="bash $(printf '%q' "$launcher") --repo $(printf '%q' "$SHIPLINE_REPO") notify 2>/dev/null || true"
 
 before='{}'
 indent=2
@@ -34,16 +43,21 @@ if [[ -e $settings ]]; then
   indent=${#spaces}
   ((indent > 0)) || indent=2
 fi
+# Once the settings are known to be readable: a refusal above changes nothing.
+link_launcher
 
 # shellcheck disable=SC2016  # the dollars belong to jq
 after=$(jq --indent "$indent" --arg command "$command" '
-  # Ours is a command of exactly the shape written here, whatever checkout it names: one path,
-  # in which a character the shell reads is escaped.
+  # Ours is a command of exactly the shape written here, whatever checkouts it names, in whose
+  # paths a character the shell reads is escaped; or of the shape written when the scripts were
+  # in the repository: the one path of its `notify`.
   def is_ours:
-    (.command // "") | test("^bash ([^;&|\\\\]|\\\\.)*/scripts/workflow/notify 2>/dev/null \\|\\| true$");
+    (.command // "")
+    | test("^bash ([^;&|\\\\ ]|\\\\.)+/bin/shipline --repo ([^;&|\\\\ ]|\\\\.)+ notify 2>/dev/null \\|\\| true$")
+      or test("^bash ([^;&|\\\\]|\\\\.)*/scripts/workflow/notify 2>/dev/null \\|\\| true$");
   def calls_notify($matcher):
     any(.[]?; (.matcher // "") == $matcher and any(.hooks[]?; is_ours));
-  # A hook of ours that is there is pointed at this checkout, in case the checkout moved.
+  # A hook of ours that is there is pointed at these checkouts, in case one of them moved.
   def with_hook($event; $matcher):
     if (.hooks[$event] // []) | calls_notify($matcher) then
       .hooks[$event] |= map(
@@ -64,7 +78,24 @@ if [[ $(jq -S . <<<"$after") == "$(jq -S . <<<"$before")" ]]; then
   exit 0
 fi
 
+# The hooks of the shape written when the scripts were in the repository, which ours replace,
+# one an event, as they were. A later run adds what it replaces then.
+# shellcheck disable=SC2016  # the dollars belong to jq
+replaced=$(jq -c '
+  def held:
+    (.command // "") | test("^bash ([^;&|\\\\]|\\\\.)*/scripts/workflow/notify 2>/dev/null \\|\\| true$");
+  . as $settings
+  | reduce (["Stop", ""], ["UserPromptSubmit", ""], ["Notification", "permission_prompt"],
+      ["PreToolUse", "AskUserQuestion"]) as [$event, $matcher] ({};
+    ([$settings.hooks[$event][]? | select((.matcher // "") == $matcher) | .hooks[]? | select(held)]
+      | first) as $hook
+    | if $hook then .[$event] = {matcher: $matcher, hook: $hook} else . end)' <<<"$before")
+
 mkdir -p "$(dirname "$settings")"
+if [[ $replaced != "{}" ]]; then
+  [[ ! -e $record ]] || replaced=$(jq -c --argjson now "$replaced" '. + $now' "$record")
+  printf '%s\n' "$replaced" >"$record"
+fi
 # The first copy is the one from before any of this; a later run does not replace it.
 [[ ! -e $settings || -e $backup ]] || cp "$settings" "$backup"
 # Written through the file's own name, so a settings file that is a link stays one.

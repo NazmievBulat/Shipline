@@ -180,17 +180,31 @@ is_session_name() {
     { [[ $1 == analyst-* ]] && is_hunt_name "${1#analyst-}"; }
 }
 
-# The main checkout, whichever worktree this script was called from.
+# The repository's main checkout, whichever of its worktrees this script was called from
+# (`SHIPLINE_REPO`, else the one of the current folder), and Shipline's own checkout, which this
+# script is in.
 find_main_checkout() {
   local here
   here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   script_dir=$here
-  main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
-  # The repository's state folder and set-up command (`workflow_config.py`), read once a call:
-  # one Python start, which `list` below otherwise avoids.
+  # Its `bin`, for `shipline` in what a session runs, when this checkout has the launcher.
+  shipline_bin=$(cd "$here/../.." && pwd)/bin
+  # How a sentence names `notify waiting`: by the launcher's absolute path, which a session
+  # started before the switch, with neither on its PATH, runs as well; a copy of the scripts in
+  # a repository's tree, which has no launcher, by its path there.
+  notify_waiting="scripts/workflow/notify waiting"
+  if [[ -f $shipline_bin/shipline ]]; then
+    notify_waiting="$(printf '%q' "$shipline_bin/shipline") notify waiting"
+    shipline_bin+=:
+  else
+    shipline_bin=""
+  fi
+  # The repository, its state folder and set-up command (`workflow_config.py`), read once a
+  # call: one Python start, which `list` below otherwise avoids.
   local config
   config=$(python3 "$here/workflow_config.py" shell) || exit 1
   eval "$config"
+  main=$SHIPLINE_REPO
   cd "$main"
 }
 
@@ -692,7 +706,8 @@ launch() {
     HOME="$HOME" \
     USER="${USER:-$(id -un)}" \
     SHELL="${SHELL:-/bin/bash}" \
-    PATH="$script_dir/gh-bin:$PATH" \
+    PATH="$shipline_bin$script_dir/gh-bin:$PATH" \
+    SHIPLINE_REPO="$main" \
     LANG="${LANG:-C.UTF-8}" \
     TERM="${TERM:-xterm-256color}" \
     XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
@@ -1273,7 +1288,7 @@ cmd_nudge_idle() {
   if [[ $kind == status ]]; then
     [[ ! -e $notes.asking ]] || die "$name is waiting for the owner"
     [[ -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]] || die "$name is busy"
-    send_prompt "$name" "Status check: if what you were waiting for is done, carry on; if not, run \`scripts/workflow/notify waiting\` and end your turn."
+    send_prompt "$name" "Status check: if what you were waiting for is done, carry on; if not, run \`$notify_waiting\` and end your turn."
     return
   fi
   [[ -e $notes.idle ]] || die "$name is busy"
@@ -1478,7 +1493,7 @@ start_codex_worker() {
     "$common" "$push_queue" "model_reasoning_effort=$effort" "notify=$config" "$prompt"
   real_gh=$(command -v gh)
   touch "$notes.codex"
-  launch "$codex_name" "$worktree" "$command" "PATH=$script_dir/codex-bin:$PATH" "$name" "WORKFLOW_GH=$real_gh"
+  launch "$codex_name" "$worktree" "$command" "PATH=$script_dir/codex-bin:$shipline_bin$PATH" "$name" "WORKFLOW_GH=$real_gh"
   start_codex_bridge "$name" "$worktree"
 }
 
