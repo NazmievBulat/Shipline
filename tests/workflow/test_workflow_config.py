@@ -699,10 +699,11 @@ def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> d
     return texts
 
 
-# The SHA-256 of each text as the scripts wrote it before they read `shipline.json`.
+# The SHA-256 of each text as the scripts wrote it before they read `shipline.json`; the worker's
+# and the cloud worker's since they ask for the `Owner only:` line of a question to the owner.
 _TEXTS_BEFORE = {
-    "worker": "a1ada6cfb39264bb4b6501807f3feb74fbf51c2ea3c32c5b5b56f77a23838b36",
-    "cloud": "9603fac3798a46497342dda2b64491c2523c1e771d7620bb78e15b034c9d7bef",
+    "worker": "325cbf877af37ce9da33010ca5fadb43199e42a93e78235e72d234068a61438c",
+    "cloud": "d86282ba765d20c2c3507b1b0ae52509e72bed886b3eee028ed2c724cd25bfbe",
     "review": "ea932fce613e8e9c075daa884a2adee29b64ee5610f1fcd922f27aa6cd39c49a",
     "wake": "af21558438c99d72e165c8fb8ab4febdd80204e43f532a399697b4131441d080",
 }
