@@ -62,6 +62,7 @@ _DEFAULTS = {
     },
     "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
     "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
+    "machines": [],
     "hunts": {"areas": {}, "plans": None},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
     "commands": {"test": None},
@@ -158,6 +159,7 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     assert keys(example) == keys(_DEFAULTS)
     assert example["repository"].endswith("/example-app")
     assert example["runner"]["labels"]
+    assert example["machines"]
     assert example["hunts"]["areas"]
 
 
@@ -182,6 +184,51 @@ def test_the_test_folders_tools_parity_compares_are_read(tmp_path: Path) -> None
 
     _write(repo, {"parity": {"known": "tools/shipline/parity-known.txt"}})
     assert workflow_config.load(repo).parity.known == "tools/shipline/parity-known.txt"
+
+
+def test_the_machines_are_read_with_their_addresses_and_one_without_is_this_machine(
+    tmp_path: Path,
+) -> None:
+    repo = _repository(tmp_path)
+    _write(
+        repo,
+        {
+            "machines": [
+                {"name": "this machine"},
+                {"name": "runner-1", "address": "runner-1.example"},
+            ]
+        },
+    )
+
+    machines = workflow_config.load(repo).machines
+    assert [(machine.name, machine.address) for machine in machines] == [
+        ("this machine", None),
+        ("runner-1", "runner-1.example"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "machines,named",
+    [
+        ("{}", "machines must be a list"),
+        ('[{"address": "runner-1.example"}]', "machines.name must be a name"),
+        ('[{"name": ""}]', "machines.name must be a name"),
+        ('[{"name": "one", "port": 22}]', "unknown key machines.port"),
+        ('[{"name": "one"}, {"name": "one"}]', "machines must name each machine once"),
+        # ssh would read an address that starts with a dash as one of its own options.
+        ('[{"name": "one", "address": "-oProxyCommand=touch nope"}]', "machines.address"),
+        ('[{"name": "one", "address": "runner 1"}]', "machines.address"),
+        ('[{"name": "one", "address": ""}]', "machines.address"),
+    ],
+)
+def test_a_machine_that_cannot_be_read_is_refused_by_name(
+    tmp_path: Path, machines: str, named: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, f'{{"machines": {machines}}}')
+
+    with pytest.raises(workflow_config.ConfigError, match=f"shipline.json: {named}"):
+        workflow_config.load(repo)
 
 
 def test_the_repository_named_in_the_file_wins_over_the_runner_settings_and_origin(
