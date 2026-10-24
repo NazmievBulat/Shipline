@@ -3,6 +3,7 @@ scripts, except those the installation's known list names: a path rename or a te
 with its reason."""
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -482,6 +483,70 @@ def test_a_rename_of_the_scripts_folder_leaves_the_rules_paired_with_agents_md(
     assert (done.returncode, done.stdout, done.stderr) == (0, "", "")
 
 
+def test_a_star_in_a_rewrite_s_path_reaches_below_folders(tmp_path: Path) -> None:
+    known = "# The repository.\nrewrite scripts/workflow/* |$SHIPLINE_REPOSITORY|example/app|\n"
+    theirs = _TICK.replace("$SHIPLINE_REPOSITORY", "example/app")
+
+    done = _both(
+        tmp_path,
+        {"scripts/workflow/bin/tick*": _TICK},
+        {"scripts/workflow/bin/tick*": theirs},
+        known,
+    )
+
+    assert (done.returncode, done.stdout, done.stderr) == (0, "", "")
+
+
+def test_a_file_rename_inside_a_renamed_folder_wins(tmp_path: Path) -> None:
+    known = (
+        "# Its hunts keep their own folder.\nrename scripts/workflow/hunts/ scripts/hunts/\n"
+        "# Under an older name there.\nrename scripts/workflow/hunts/plan scripts/hunts/plans\n"
+    )
+
+    done = _both(
+        tmp_path,
+        {"scripts/workflow/hunts/a": "1\n", "scripts/workflow/hunts/plan": "2\n"},
+        {"scripts/hunts/a": "1\n", "scripts/hunts/plans": "2\n"},
+        known,
+    )
+
+    assert (done.returncode, done.stdout, done.stderr) == (0, "", "")
+
+
+def test_a_file_kept_in_shipline_only_leaves_the_checkout_s_own_file_printed(
+    tmp_path: Path,
+) -> None:
+    known = "# Shipline's own notes.\nrename scripts/workflow/README.md -\n"
+
+    done = _both(
+        tmp_path,
+        {"scripts/workflow/README.md": "notes\n"},
+        {"scripts/workflow/README.md": "notes\n"},
+        known,
+        "--summary",
+    )
+
+    assert (done.returncode, done.stdout) == (1, "1+ 0- - scripts/workflow/README.md\n")
+
+
+def test_the_summary_counts_what_is_left_after_the_rewrites(tmp_path: Path) -> None:
+    known = "# The repository.\nrewrite scripts/workflow/tick |$SHIPLINE_REPOSITORY|example/app|\n"
+    theirs = _TICK.replace("$SHIPLINE_REPOSITORY", "example/app").replace("exit 0", "exit 5")
+
+    done = _both(
+        tmp_path,
+        {"scripts/workflow/tick*": _TICK},
+        {"scripts/workflow/tick*": theirs},
+        known,
+        "--summary",
+    )
+
+    assert (done.returncode, done.stdout) == (
+        1,
+        "1+ 1- scripts/workflow/tick scripts/workflow/tick\n",
+    )
+
+
 def test_a_known_difference_found_nowhere_is_printed(tmp_path: Path) -> None:
     known = (
         "# The repository.\n"
@@ -542,12 +607,98 @@ def test_a_folder_that_is_no_checkout_is_refused(tmp_path: Path) -> None:
     assert "is not a git checkout" in done.stderr
 
 
-def test_it_is_run_with_one_checkout(tmp_path: Path) -> None:
+def test_it_is_run_with_one_checkout() -> None:
     done = subprocess.run(
         [sys.executable, "-B", str(_TOOL)], capture_output=True, text=True, timeout=60, check=False
     )
 
     assert (done.returncode, done.stderr) == (2, "usage: tools/parity [--summary] CHECKOUT\n")
+
+
+def test_a_checkout_in_the_middle_of_a_merge_is_refused(tmp_path: Path) -> None:
+    checkout = _checkout(tmp_path / "app", {"scripts/workflow/x": "base\n"})
+    git = [
+        "git",
+        "-C",
+        str(checkout),
+        "-c",
+        "user.name=Example",
+        "-c",
+        "user.email=owner@example.com",
+    ]
+    subprocess.run([*git, "commit", "-qm", "base"], check=True)
+    subprocess.run([*git, "checkout", "-qb", "other"], check=True)
+    (checkout / "scripts/workflow/x").write_text("other\n")
+    subprocess.run([*git, "commit", "-qam", "other"], check=True)
+    subprocess.run([*git, "checkout", "-q", "-"], check=True)
+    (checkout / "scripts/workflow/x").write_text("ours\n")
+    subprocess.run([*git, "commit", "-qam", "ours"], check=True)
+    subprocess.run([*git, "merge", "-q", "other"], capture_output=True, check=False)
+
+    done = _parity(_shipline(tmp_path, {"scripts/workflow/x": "other\n"}), checkout)
+
+    assert done.returncode == 2
+    assert done.stdout == ""
+    assert "is in the middle of a merge: scripts/workflow/x is not resolved" in done.stderr
+
+
+def test_a_test_folder_is_named_as_git_names_it(tmp_path: Path) -> None:
+    theirs = {
+        "shipline.json": '{"parity": {"workflow_tests": "./app//tests/"}}',
+        "app/tests/test_tick.py": "def test(): pass\n",
+    }
+
+    done = _both(tmp_path, {"tests/workflow/test_tick.py": "def test(): pass\n"}, theirs)
+
+    assert (done.returncode, done.stdout, done.stderr) == (0, "", "")
+
+
+def test_a_submodule_is_compared_by_its_commit(tmp_path: Path) -> None:
+    sha = "1" * 40
+    shipline = _shipline(tmp_path, {})
+    checkout = _checkout(tmp_path / "app", {})
+    for root, commit in ((shipline, sha), (checkout, "2" * 40)):
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"160000,{commit},scripts/workflow/vendor",
+            ],
+            check=True,
+        )
+
+    done = _parity(shipline, checkout)
+
+    assert done.returncode == 1
+    assert [line for line in done.stdout.splitlines()[2:] if line[:1] in "+-"] == [
+        f"-Subproject commit {sha}",
+        f"+Subproject commit {'2' * 40}",
+    ]
+
+
+def test_a_path_git_holds_that_is_not_utf_8_is_printed(tmp_path: Path) -> None:
+    shipline = _shipline(tmp_path, {})
+    checkout = _checkout(tmp_path / "app", {})
+    folder = checkout / "scripts/workflow"
+    folder.mkdir(parents=True)
+    with open(bytes(folder) + b"/bad\xff", "w") as file:
+        file.write("x\n")
+    subprocess.run(["git", "-C", str(checkout), "add", "-A"], check=True)
+
+    done = subprocess.run(
+        [sys.executable, "-B", str(shipline / "tools/parity"), "--summary", str(checkout)],
+        capture_output=True,
+        timeout=60,
+        check=False,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8:strict"},
+    )
+
+    assert (done.returncode, done.stderr) == (1, b"")
+    assert done.stdout == b"1+ 0- - scripts/workflow/bad\\udcff\n"
 
 
 def test_without_a_known_list_in_its_config_nothing_is_ignored(tmp_path: Path) -> None:

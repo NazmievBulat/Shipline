@@ -15,10 +15,13 @@ Shipline's trees are compared with their places in the checkout:
     runner/                     .github/runner/
 
 Each side is read as git's index holds it: the files git tracks, with their modes, as they were
-last added. Every changed, added or removed line is printed as a unified diff, Shipline's side
-first; a file on one side only as a diff with /dev/null, even when it is empty; a changed mode
-(executable or not, a symlink, a submodule) as a `mode:` line. With `--summary`, one line per
-file instead: `<added>+ <removed>- <shipline path> <checkout path>`, `-` for a side it is not on.
+last added; a checkout in the middle of a merge is refused. The checkout's shipline.json and
+known list are read as they are on disk.
+
+Every changed, added or removed line is printed as a unified diff, Shipline's side first; a file
+on one side only as a diff with /dev/null, even when it is empty; a changed mode (executable or
+not, a symlink, a submodule) as a `mode:` line. With `--summary`, one line per file instead:
+`<added>+ <removed>- <shipline path> <checkout path>`, `-` for a side it is not on.
 
 The known differences are the installation's, in the file `parity.known` of its shipline.json
 names; without one, nothing is known. `tools/parity-known.txt` is an example. Each entry is one
@@ -90,7 +93,8 @@ class Rewrite(Entry):
 @dataclass(frozen=True)
 class File:
     mode: str
-    content: bytes
+    # The blob git holds, or for a submodule the commit.
+    sha: str
 
 
 @dataclass
@@ -107,10 +111,11 @@ class Difference:
 
 
 def _inside(path: str, where: str) -> str:
+    """The path as git names it: `./a//b/` is `a/b/`."""
     pure = PurePosixPath(path)
     if pure.is_absolute() or ".." in pure.parts or str(pure) == ".":
         raise Refused(f"{where}: {path} is not a path inside a checkout")
-    return path
+    return str(pure) + ("/" if path.endswith("/") else "")
 
 
 def _unescaped(text: str) -> str:
@@ -141,8 +146,8 @@ def read_known(path: Path, name: str) -> list[Entry]:
             paths = rest.split()
             if len(paths) != 2 or paths == ["-", "-"]:
                 raise Refused(f"{where}: a rename names two paths")
-            named = [_inside(side, where) for side in paths if side != "-"]
-            if len({side.endswith("/") for side in named}) > 1:
+            paths = [side if side == "-" else _inside(side, where) for side in paths]
+            if len({side.endswith("/") for side in paths if side != "-"}) > 1:
                 raise Refused(f"{where}: a folder is renamed to a folder")
             entries.append(Rename(number, line, shipline=paths[0], checkout=paths[1]))
         elif kind == "rewrite":
@@ -153,7 +158,7 @@ def read_known(path: Path, name: str) -> list[Entry]:
             before, after = _unescaped(parts[0]), _unescaped(parts[1])
             if not before or before == after:
                 raise Refused(f"{where}: a rewrite changes its text")
-            _inside(pattern, where)
+            pattern = _inside(pattern, where)
             entries.append(Rewrite(number, line, pattern=pattern, before=before, after=after))
         else:
             raise Refused(f"{where}: not a rename or a rewrite")
@@ -199,19 +204,30 @@ def _git(checkout: Path, *arguments: str, given: bytes | None = None) -> bytes:
     return done.stdout
 
 
-def _contents(checkout: Path, shas: list[str]) -> dict[str, bytes]:
-    """The blobs named by `shas`, read by one `git cat-file`."""
-    given = "".join(f"{sha}\n" for sha in shas).encode()
+def contents(checkout: Path, files: list[File]) -> dict[str, bytes]:
+    """What each file holds, by its sha, read by one `git cat-file`. A submodule is its commit,
+    as `git diff` shows it."""
+    held = {
+        file.sha: f"Subproject commit {file.sha}\n".encode()
+        for file in files
+        if file.mode == "160000"
+    }
+    blobs = sorted({file.sha for file in files if file.mode != "160000"})
+    given = "".join(f"{sha}\n" for sha in blobs).encode()
     out = _git(checkout, "cat-file", "--batch", given=given)
-    contents: dict[str, bytes] = {}
     at = 0
     while at < len(out):
         header_end = out.index(b"\n", at)
-        sha, _kind, size = out[at:header_end].decode().split()
+        header = out[at:header_end].decode(errors="replace").split()
+        if len(header) != 3:
+            raise Refused(f"git cannot read {' '.join(header)} in {checkout}")
         start = header_end + 1
-        contents[sha] = out[start : start + int(size)]
-        at = start + int(size) + 1
-    return contents
+        held[header[0]] = out[start : start + int(header[2])]
+        at = start + int(header[2]) + 1
+    missing = [sha for sha in blobs if sha not in held]
+    if missing:
+        raise Refused(f"git cannot read {missing[0]} in {checkout}")
+    return held
 
 
 def tracked(checkout: Path) -> dict[str, File]:
@@ -222,18 +238,15 @@ def tracked(checkout: Path) -> dict[str, File]:
         top = ""
     if not top or Path(top).resolve() != checkout.resolve():
         raise Refused(f"{checkout} is not a git checkout")
-    entries = []
+    files = {}
     for record in _git(checkout, "ls-files", "-s", "-z").split(b"\0"):
         if record:
-            fields, _, path = record.partition(b"\t")
-            mode, sha, _stage = fields.decode().split()
-            entries.append((path.decode(errors="surrogateescape"), mode, sha))
-    contents = _contents(checkout, [sha for _, mode, sha in entries if mode != "160000"])
-    files = {}
-    for path, mode, sha in entries:
-        # A submodule is its commit, as `git diff` shows it.
-        content = f"Subproject commit {sha}\n".encode() if mode == "160000" else contents[sha]
-        files[path] = File(mode, content)
+            fields, _, raw = record.partition(b"\t")
+            mode, sha, stage = fields.decode().split()
+            path = raw.decode(errors="surrogateescape")
+            if stage != "0":
+                raise Refused(f"{checkout} is in the middle of a merge: {path} is not resolved")
+            files[path] = File(mode, sha)
     return files
 
 
@@ -289,12 +302,13 @@ def _difference(
     names: tuple[str | None, str | None],
     ours: File | None,
     theirs: File | None,
+    held: tuple[dict[str, bytes], dict[str, bytes]],
     rewrites: list[Rewrite],
 ) -> Difference | None:
     a_label = f"shipline/{names[0]}" if names[0] else "/dev/null"
     b_label = f"checkout/{names[1]}" if names[1] else "/dev/null"
-    a = ours.content if ours else b""
-    b = theirs.content if theirs else b""
+    a = held[0][ours.sha] if ours else b""
+    b = held[1][theirs.sha] if theirs else b""
     difference = Difference(*names, printed=[])
     try:
         a_text, b_text = a.decode(), b.decode()
@@ -347,16 +361,23 @@ def compare(shipline: Path, checkout: Path) -> tuple[list[Difference], list[Entr
             pairs.add((there if ours.get(there) == name else None, name))
 
     rewrites = [entry for entry in known if isinstance(entry, Rewrite)]
+    # Only the compared files are read.
+    held = (
+        contents(shipline, [ours_all[name] for name, _ in pairs if name]),
+        contents(checkout, [theirs_all[name] for _, name in pairs if name]),
+    )
     differences = []
-    for pair in sorted(pairs, key=lambda pair: pair[0] or pair[1] or ""):
+    for pair in sorted(pairs, key=lambda pair: (pair[0] or pair[1] or "", pair[0] or "")):
         ours_file = ours_all[pair[0]] if pair[0] else None
         theirs_file = theirs_all[pair[1]] if pair[1] else None
-        if found := _difference(pair, ours_file, theirs_file, rewrites):
+        if found := _difference(pair, ours_file, theirs_file, held, rewrites):
             differences.append(found)
     return differences, known, parity.known or ""
 
 
 def main(arguments: list[str]) -> int:
+    # A path git holds that is not UTF-8 is printed escaped, never a crash.
+    sys.stdout.reconfigure(errors="backslashreplace")
     summary = arguments[:1] == ["--summary"]
     if summary:
         arguments = arguments[1:]

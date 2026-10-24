@@ -335,12 +335,12 @@ def parity_of(given: Any) -> Parity:
         raise ConfigError(f"{FILE}: the file must be an object")
     only = {"parity": given.get("parity", {})}
     values = _merged({"parity": DEFAULTS["parity"]}, only, "")["parity"]
-    known = values["known"]
-    return Parity(
-        workflow_tests=_relative(values["workflow_tests"], "parity.workflow_tests"),
-        runner_tests=_relative(values["runner_tests"], "parity.runner_tests"),
-        known=None if known is None else _relative(known, "parity.known"),
-    )
+    # As git names a path: `./tests//flow/` is `tests/flow`.
+    named = {
+        key: None if value is None else str(PurePosixPath(_relative(value, f"parity.{key}")))
+        for key, value in values.items()
+    }
+    return Parity(**named)
 
 
 @cache
