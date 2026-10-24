@@ -467,14 +467,14 @@ def shell(config: Config) -> str:
     lines = [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]
     labels = " ".join(shlex.quote(label) for label in config.runner.labels)
     lines.append(f"SHIPLINE_RUNNER_LABELS=({labels})")
-    # The main checkout, exported: every program the script starts works on the same repository,
-    # whatever folder it starts in.
-    lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")
     # The hunt areas, and at the same place in the other array the screens of each, joined.
     areas = config.hunts.areas
     lines.append(f"SHIPLINE_HUNT_AREAS=({' '.join(shlex.quote(area) for area in areas)})")
     screens = " ".join(shlex.quote(", ".join(paths)) for paths in areas.values())
     lines.append(f"SHIPLINE_HUNT_SCREENS=({screens})")
+    # The main checkout, exported: every program the script starts works on the same repository,
+    # whatever folder it starts in.
+    lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")
     return "\n".join(lines) + "\n"
 
 
