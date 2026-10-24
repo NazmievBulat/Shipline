@@ -27,15 +27,18 @@ available memory.
   session starts (above the ceiling). It moves one to the other kind when the other kind has
   queued for 5 minutes, this kind has nothing queued and there is no room to add: it drains
   one, then adds one of the other in the same step, when the memory the drained one frees is
-  enough for the other. A runner goes only once GitHub lists it idle, never mid-job; the
-  highest numbered one goes, and the step waits while it is busy.
+  enough for the other. A runner goes only once GitHub lists it online and idle, asked once more
+  just before it is stopped, never mid-job; the highest numbered one goes, and the step waits
+  while it is busy. Its count is written down before it stops, and a new runner's after it
+  starts, each put back when the other half fails.
 - At most one change every 5 minutes.
 - The forecast the tick writes (`~/.local/state/workflow/ci-demand.json`, or the path of
   `balance_forecast`) says how many ordinary and Docker jobs come within 30 minutes. This
   machine's share of a kind is that times its slots over all the pool's online slots of that
   kind on GitHub. A removal waits while the share would queue on one slot fewer; a slot is
   added before the wave when the share would queue on the slots there are and there is room,
-  never beyond the bounds. A forecast older than 10 minutes is ignored, and the queues alone
+  never beyond the bounds; a kind the machine has none of gets its first one when that slot's
+  share would be a whole job. A forecast older than 10 minutes is ignored, and the queues alone
   decide.
 
 Every change is one line of `~/.local/state/workflow/runner-balance.log`: the time, what
@@ -56,7 +59,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -84,6 +87,8 @@ MEMORY_GB = {"ordinary": 3, "docker": 8}
 REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 SETTINGS_SECONDS = 5
+# A Docker runner's VM may take a while to start; one that takes longer is not waited for.
+SYSTEMCTL_SECONDS = 180
 GITHUB_SECONDS = 30
 PER_PAGE = 100
 
@@ -311,7 +316,7 @@ def pool_slots(box: Machine, listed: list[dict[str, Any]]) -> dict[str, int]:
     for runner in listed:
         if runner.get("status") != "online":
             continue
-        for label in (label.get("name", "") for label in runner.get("labels") or []):
+        for label in (_label(label) for label in runner.get("labels") or []):
             if not label.startswith(box.prefix + "-") or label.endswith(("-main", "-planner")):
                 continue
             found["docker" if label.endswith("-docker") else "ordinary"] += 1
@@ -319,9 +324,22 @@ def pool_slots(box: Machine, listed: list[dict[str, Any]]) -> dict[str, int]:
     return found
 
 
-def idle(listed: list[dict[str, Any]], name: str) -> bool:
-    """GitHub lists the runner and it runs no job."""
-    return any(runner.get("name") == name and runner.get("busy") is False for runner in listed)
+def _label(label: Any) -> str:
+    return str(label.get("name", "")) if isinstance(label, dict) else ""
+
+
+def idle(box: Machine, listed: list[dict[str, Any]], name: str) -> bool:
+    """GitHub lists the runner online and running no job, read twice: in the listing, and once
+    more just before it is stopped, so a job it took since the listing keeps it."""
+
+    def free(runner: dict[str, Any]) -> bool:
+        return runner.get("status") == "online" and runner.get("busy") is False
+
+    found = next((runner for runner in listed if runner.get("name") == name), None)
+    if found is None or not free(found):
+        return False
+    again = _api(box.repository, f"actions/runners/{int(found['id'])}")
+    return again.get("name") == name and free(again)
 
 
 # The decision.
@@ -341,7 +359,8 @@ class View:
     empty_since: dict[str, int | None]
     last_change: int | None
     forecast: dict[str, float] | None = None
-    slots: dict[str, int] = field(default_factory=dict)
+    # The share a first slot of each kind would take, for a kind the machine has none of.
+    first_share: dict[str, float] | None = None
 
     def room(self, kind: str) -> bool:
         return (
@@ -361,7 +380,13 @@ class View:
         return self.waited(kind) >= QUEUED_FOR_SECONDS
 
     def wave(self, kind: str) -> bool:
-        return self.share is not None and self.share[kind] > self.counts[kind]
+        """The share would queue on the slots there are; with none, a first slot would take at
+        least one whole job."""
+        if self.share is None:
+            return False
+        if self.counts[kind] == 0:
+            return self.first_share is not None and self.first_share[kind] >= 1
+        return self.share[kind] > self.counts[kind]
 
     def held_for_wave(self, kind: str) -> bool:
         return self.share is not None and self.share[kind] > self.counts[kind] - 1
@@ -387,6 +412,8 @@ def decide(view: View) -> tuple[str, ...] | None:
             and not view.queues[kind].queued
             and other in below_max
             and not view.room(other)
+            and view.load is not None
+            and view.ceiling is not None
             and view.memory is not None
             and view.memory + MEMORY_GB[kind] >= MEMORY_GB[other]
         ):
@@ -418,9 +445,18 @@ def write_count(path: Path, kind: str, count: int) -> None:
 
 
 def systemctl(*arguments: str) -> None:
-    done = subprocess.run(
-        ["systemctl", "--user", *arguments], capture_output=True, text=True, check=False
-    )
+    try:
+        done = subprocess.run(
+            ["systemctl", "--user", *arguments],
+            capture_output=True,
+            text=True,
+            timeout=SYSTEMCTL_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise Refused(
+            f"systemctl {' '.join(arguments)} ran for more than {SYSTEMCTL_SECONDS} seconds"
+        ) from None
     if done.returncode:
         raise Refused(f"systemctl {' '.join(arguments)}: {done.stderr.strip() or done.stdout.strip()}")
 
@@ -443,7 +479,8 @@ def _log(view: View, what: str) -> None:
         else f"forecast ordinary {view.share['ordinary']:.1f} of {view.forecast['ordinary']:g}, "
         f"docker {view.share['docker']:.1f} of {view.forecast['docker']:g}"
     )
-    load = "load unread" if view.load is None else f"load {view.load:.2f} of {view.ceiling:g}"
+    ceiling = "?" if view.ceiling is None else f"{view.ceiling:g}"
+    load = "load unread" if view.load is None else f"load {view.load:.2f} of {ceiling}"
     memory = "memory unread" if view.memory is None else f"memory {view.memory:.1f} GB"
     line = (
         f"{datetime.fromtimestamp(view.moment, UTC).strftime('%Y-%m-%dT%H:%M:%SZ')} {what}; "
@@ -458,40 +495,59 @@ def _log(view: View, what: str) -> None:
     print(line)
 
 
+def _start(box: Machine, path: Path, kind: str, count: int) -> None:
+    """Start the next runner of the kind, then write its count; a count that cannot be written
+    stops the runner again."""
+    unit = box.unit(kind, count + 1)
+    systemctl("enable", "--now", unit)
+    try:
+        write_count(path, kind, count + 1)
+    except OSError:
+        systemctl("disable", "--now", unit)
+        raise
+
+
+def _stop(box: Machine, path: Path, kind: str, count: int) -> None:
+    """Write the count one lower, then stop the highest runner of the kind; a runner that does
+    not stop gets its count back."""
+    write_count(path, kind, count - 1)
+    try:
+        systemctl("disable", "--now", box.unit(kind, count))
+    except Refused:
+        write_count(path, kind, count)
+        raise
+
+
 def apply(
     change: tuple[str, ...], box: Machine, view: View, listed: list[dict[str, Any]], path: Path
 ) -> bool:
     """Make the change; False when it waits for a busy runner."""
     counts = view.counts
+    kind = change[1]
     if change[0] == "add":
-        kind = change[1]
-        systemctl("enable", "--now", box.unit(kind, counts[kind] + 1))
-        write_count(path, kind, counts[kind] + 1)
+        _start(box, path, kind, counts[kind])
         verb = "added" if kind == "ordinary" else "started"
         _log(view, f"{verb} {WORDS[kind]} ({counts[kind]} to {counts[kind] + 1})")
         return True
-    kind = change[1]
     name = box.runner_name(kind, counts[kind])
-    if not idle(listed, name):
+    if not idle(box, listed, name):
         print(f"{name} is not idle on GitHub; it is stopped once it is")
         return False
-    systemctl("disable", "--now", box.unit(kind, counts[kind]))
-    write_count(path, kind, counts[kind] - 1)
+    _stop(box, path, kind, counts[kind])
     if change[0] == "remove":
         verb = "removed" if kind == "ordinary" else "stopped"
         _log(view, f"{verb} {WORDS[kind]} ({counts[kind]} to {counts[kind] - 1})")
         return True
     other = change[2]
     try:
-        systemctl("enable", "--now", box.unit(other, counts[other] + 1))
-    except Refused as error:
+        _start(box, path, other, counts[other])
+    except (Refused, OSError) as error:
         _log(
             view,
             f"drained {WORDS[kind]} ({counts[kind]} to {counts[kind] - 1}) to move it, and "
             f"{WORDS[other]} did not start",
         )
         raise PartlyChanged(str(error)) from None
-    write_count(path, other, counts[other] + 1)
     _log(
         view,
         f"moved {WORDS[kind]} to {WORDS[other]} ({NAMES[kind]} {counts[kind]} to "
@@ -507,28 +563,33 @@ def balance() -> int:
     if box.off:
         print(f"balance off in {path}; the counts stay as they are")
         return 0
-    listed = runners(box)
     found = queues(box)
+    # After the queues, which take a call per run: the listing a stop is decided on is fresh.
+    listed = runners(box)
     load, ceiling = load_and_ceiling()
-    state = {}
+    state: dict[str, Any] = {}
     try:
         state = json.loads(STATE_FILE.read_text())
     except OSError, ValueError:
         pass
-    empty_since = {}
+    if not isinstance(state, dict) or not isinstance(state.get("empty_since") or {}, dict):
+        state = {}
+    if not isinstance(state.get("last_change"), (int, float)):
+        state.pop("last_change", None)
+    empty_since: dict[str, int | None] = {}
     for kind in KINDS:
         before = (state.get("empty_since") or {}).get(kind)
+        before = before if isinstance(before, (int, float)) else None
         empty_since[kind] = None if found[kind].queued else before if before is not None else moment
     forecast = read_forecast(box.forecast_path, moment)
     slots = pool_slots(box, listed)
-    share = (
-        None
-        if forecast is None
-        else {
+    share = first_share = None
+    if forecast is not None:
+        share = {
             kind: forecast[kind] * box.counts[kind] / max(slots[kind], box.counts[kind], 1)
             for kind in KINDS
         }
-    )
+        first_share = {kind: forecast[kind] / (slots[kind] + 1) for kind in KINDS}
     view = View(
         moment=moment,
         counts=box.counts,
@@ -541,7 +602,7 @@ def balance() -> int:
         empty_since=empty_since,
         last_change=state.get("last_change"),
         forecast=forecast,
-        slots=slots,
+        first_share=first_share,
     )
     change = decide(view)
     changed = False
@@ -574,7 +635,14 @@ def main() -> int:
         except Limited:
             print("the GitHub budget is paused; nothing changed this minute")
             return 0
-        except (Refused, OSError, ValueError, KeyError, TypeError) as error:
+        except (
+            Refused,
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            subprocess.SubprocessError,
+        ) as error:
             print(f"runner balance: {error}; nothing more changed", file=sys.stderr)
             return 1
 

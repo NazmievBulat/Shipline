@@ -45,14 +45,24 @@ elif urlsplit(path).path == api + "/runs":
     print(json.dumps({"total_count": len(runs), "workflow_runs": runs}))
 elif path == api + "/runners?per_page=100":
     print(json.dumps({"total_count": len(github["runners"]), "runners": github["runners"]}))
+elif found := re.fullmatch(api + r"/runners/(\\d+)", path):
+    # Asked again just before a stop: `busy-on-recheck` names a runner that took a job since.
+    runner = next(runner for runner in github["runners"] if runner["id"] == int(found[1]))
+    recheck = state / "busy-on-recheck"
+    if recheck.exists() and recheck.read_text().strip() == runner["name"]:
+        runner = {**runner, "busy": True}
+    print(json.dumps(runner))
 else:
     print(f"gh: could not answer {arguments}", file=sys.stderr)
     sys.exit(1)
 """
 
+# `fail-systemctl` makes every call fail, `fail-systemctl-<unit>` the calls for that unit, and
+# `slow-systemctl` makes each take a second.
 _FAKE_SYSTEMCTL = """#!/bin/bash
 echo "systemctl $*" >> "@STATE@/calls.log"
-[ ! -e "@STATE@/fail-systemctl" ]
+[ ! -e "@STATE@/slow-systemctl" ] || /bin/sleep 1
+[ ! -e "@STATE@/fail-systemctl" ] && [ ! -e "@STATE@/fail-systemctl-${@: -1}" ]
 """
 
 
@@ -179,22 +189,28 @@ class Machine:
             )
         )
 
-    def run(self, *, after_minutes: int = 0, code: int = 0) -> subprocess.CompletedProcess[str]:
-        self.now += after_minutes * MINUTE
+    def _write_github(self) -> None:
         (self.state / "github.json").write_text(
             json.dumps({"runs": self.runs, "jobs": self.jobs, "runners": self.runners})
         )
+
+    def _env(self) -> dict[str, str]:
+        return {
+            "PATH": f"{self.programs}:{os.environ['PATH']}",
+            "HOME": str(self.home),
+            "LANG": "C.UTF-8",
+            "SHIPLINE_RUNNER_SETTINGS": str(self.settings_file),
+            "WORKFLOW_NOW": str(self.now),
+            "WORKFLOW_LOADAVG_FILE": str(self.proc / "loadavg"),
+            "WORKFLOW_PROC_ROOT": str(self.proc),
+        }
+
+    def run(self, *, after_minutes: int = 0, code: int = 0) -> subprocess.CompletedProcess[str]:
+        self.now += after_minutes * MINUTE
+        self._write_github()
         done = subprocess.run(
             ["python3", "-B", str(BALANCER)],
-            env={
-                "PATH": f"{self.programs}:{os.environ['PATH']}",
-                "HOME": str(self.home),
-                "LANG": "C.UTF-8",
-                "SHIPLINE_RUNNER_SETTINGS": str(self.settings_file),
-                "WORKFLOW_NOW": str(self.now),
-                "WORKFLOW_LOADAVG_FILE": str(self.proc / "loadavg"),
-                "WORKFLOW_PROC_ROOT": str(self.proc),
-            },
+            env=self._env(),
             capture_output=True,
             text=True,
             timeout=60,
@@ -202,6 +218,17 @@ class Machine:
         )
         assert done.returncode == code, done.stdout + done.stderr
         return done
+
+    def start(self) -> subprocess.Popen[str]:
+        """A run in the background, for two at once."""
+        self._write_github()
+        return subprocess.Popen(
+            ["python3", "-B", str(BALANCER)],
+            env=self._env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
 
     def calls(self, tool: str) -> list[str]:
         log = self.state / "calls.log"
@@ -355,6 +382,56 @@ def test_a_runner_github_does_not_list_is_not_stopped(machine: Machine) -> None:
     assert machine.calls("systemctl") == []
 
 
+def test_a_runner_that_took_a_job_since_the_listing_is_not_stopped(machine: Machine) -> None:
+    _held_by_load(machine)
+    (machine.state / "busy-on-recheck").write_text("example-app-box-docker-1\n")
+
+    machine.run()
+
+    assert machine.calls("systemctl") == []
+    assert machine.count("docker_runners") == 1
+
+
+def test_an_offline_runner_is_not_stopped(machine: Machine) -> None:
+    _held_by_load(machine)
+    for runner in machine.runners:
+        if runner["name"] == "example-app-box-docker-1":
+            runner["status"] = "offline"
+
+    machine.run()
+
+    assert machine.calls("systemctl") == []
+
+
+def test_a_runner_that_does_not_stop_keeps_its_count(machine: Machine) -> None:
+    _held_by_load(machine)
+    (machine.state / "fail-systemctl").touch()
+
+    machine.run(code=1)
+
+    assert machine.count("docker_runners") == 1
+    assert machine.changes() == []
+
+
+def test_a_move_whose_new_runner_does_not_start_says_what_it_did(machine: Machine) -> None:
+    machine.queue(ORDINARY, 8)
+    machine.load(3.0)
+    (machine.state / "fail-systemctl-example-app-runner@4.service").touch()
+
+    machine.run(code=1)
+
+    assert (machine.count("docker_runners"), machine.count("ordinary_jobs")) == (0, 3)
+    assert machine.changes() == [
+        "drained a Docker runner (1 to 0) to move it, and an ordinary slot did not start"
+    ]
+    # It was a change: the next one waits its 5 minutes.
+    (machine.state / "fail-systemctl-example-app-runner@4.service").unlink()
+    machine.forget_calls()
+    machine.load(1.0)
+    machine.run(after_minutes=1)
+    assert machine.calls("systemctl") == []
+
+
 def test_the_highest_slot_goes_and_main_and_the_planner_are_never_touched(
     machine: Machine,
 ) -> None:
@@ -494,6 +571,19 @@ def test_a_forecast_brings_a_slot_back_before_the_wave(machine: Machine) -> None
     assert "forecast ordinary 6.0 of 10, docker 0.0 of 0" in machine.log_lines()[0]
 
 
+def test_a_forecast_starts_a_first_docker_runner_when_its_share_is_a_whole_job(
+    machine: Machine,
+) -> None:
+    machine.settings(ordinary=3, docker=0, bounds="balance_ordinary=2-5\nbalance_docker=0-2\n")
+    machine.registered(ordinary=3, docker=0)
+    # No Docker runner in the pool: a first one would take both jobs on their way.
+    machine.forecast(ordinary=0, docker=2)
+
+    machine.run()
+
+    assert machine.changes() == ["started a Docker runner (0 to 1)"]
+
+
 def test_a_forecast_never_adds_beyond_the_bounds(machine: Machine) -> None:
     machine.settings(ordinary=5, docker=1, bounds="balance_ordinary=2-5\nbalance_docker=0-1\n")
     machine.registered(ordinary=5, docker=1)
@@ -504,7 +594,7 @@ def test_a_forecast_never_adds_beyond_the_bounds(machine: Machine) -> None:
     assert machine.calls("systemctl") == []
 
 
-def test_two_runs_at_once_change_once(machine: Machine) -> None:
+def test_a_run_while_another_holds_the_lock_leaves(machine: Machine) -> None:
     machine.queue(ORDINARY, 10)
     lock = machine.home / ".local/state/workflow/runner-balance.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
@@ -515,6 +605,19 @@ def test_two_runs_at_once_change_once(machine: Machine) -> None:
 
     assert machine.calls("systemctl") == []
     assert "another balancer run" in done.stdout
+
+
+def test_two_runs_at_once_change_once(machine: Machine) -> None:
+    machine.queue(ORDINARY, 10)
+    (machine.state / "slow-systemctl").touch()
+
+    first, second = machine.start(), machine.start()
+
+    assert [first.wait(timeout=60), second.wait(timeout=60)] == [0, 0]
+    assert machine.calls("systemctl") == [
+        "systemctl --user enable --now example-app-runner@4.service"
+    ]
+    assert machine.count("ordinary_jobs") == 4
 
 
 def test_a_failed_github_read_changes_nothing(machine: Machine) -> None:
@@ -573,3 +676,14 @@ def test_settings_that_would_leave_their_names_change_nothing(machine: Machine, 
 
     assert machine.calls("systemctl") == [] and machine.calls("gh") == []
     assert "names no" in done.stderr
+
+
+def test_a_state_file_that_is_not_the_balancers_is_started_over(machine: Machine) -> None:
+    folder = machine.home / ".local/state/workflow"
+    folder.mkdir(parents=True)
+    (folder / "runner-balance.json").write_text('["not", "a", "state"]')
+    machine.queue(ORDINARY, 10)
+
+    machine.run()
+
+    assert machine.changes() == ["added an ordinary slot (3 to 4)"]
