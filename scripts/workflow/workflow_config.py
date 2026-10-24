@@ -18,7 +18,8 @@ runner tests `tools/parity` compares are in `tests/workflow` and `tests/runner`,
 no differences; no machines named, so `flow-page` samples only the machine it runs on; no hunt
 areas, so one hunt runs at a time, and no hunt plans file; no test command, which a repository
 names for its CI's test job (`ci_proof.py test`); a question to the owner marked `Owner only: no`
-gets its recommended reply after 15 minutes; no paths that call for a closer review.
+gets its recommended reply after 15 minutes; a quiet cloud worker is woken after 30 minutes; no
+paths that call for a closer review.
 
 `review.high_effort_paths` are regular expressions, each searched for in every path a pull
 request changes: a match runs its independent reviewer at high effort, not medium
@@ -89,6 +90,12 @@ DEFAULTS: dict[str, Any] = {
         "e2e_plan": "E2E: what to run",
         # The prefix of every check of the image workflow.
         "images": "Docker images",
+        # The job that audits the dependencies against published advisories (the gate reads
+        # "CI: dependencies" when none is named), and the title of the notice it writes on main
+        # when advisories alone failed it. Without the notice an advisory on main makes main red,
+        # as any other failure.
+        "dependency_audit": None,
+        "advisory_annotation": None,
     },
     # The titles of the annotations the CI planners write and the merge gate reads.
     "annotations": {
@@ -147,6 +154,8 @@ DEFAULTS: dict[str, Any] = {
     # Minutes a question to the owner marked `Owner only: no` waits before the tick types its
     # recommended reply; 0 turns that off.
     "answer_for_owner_after_minutes": 15,
+    # Minutes without a push or a report after which the tick wakes a cloud worker; 0 never does.
+    "cloud_wake_after_minutes": 30,
 }
 # The most such a wait may be: a day. Bash would wrap a number far larger.
 MOST_MINUTES = 24 * 60
@@ -176,6 +185,8 @@ class Checks:
     ci_plan: str
     e2e_plan: str
     images: str
+    dependency_audit: str | None = None
+    advisory_annotation: str | None = None
 
     @property
     def images_plan(self) -> str:
@@ -463,6 +474,7 @@ class Config:
     commands: Commands
     review: Review
     answer_for_owner_after_minutes: int
+    cloud_wake_after_minutes: int
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -837,6 +849,7 @@ def load(start: Path | None = None) -> Config:
             )
         ),
         answer_for_owner_after_minutes=values["answer_for_owner_after_minutes"],
+        cloud_wake_after_minutes=values["cloud_wake_after_minutes"],
         given=given,
         main=main,
     )
@@ -899,6 +912,7 @@ def as_dict(config: Config) -> dict[str, Any]:
         "commands": vars(config.commands).copy(),
         "review": {"high_effort_paths": list(config.review.high_effort_paths)},
         "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
+        "cloud_wake_after_minutes": config.cloud_wake_after_minutes,
     }
 
 

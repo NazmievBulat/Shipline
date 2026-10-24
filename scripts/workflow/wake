@@ -32,8 +32,18 @@
 # (priority high)`, `608 waits: shares scripts/workflow/merge_gate.py with 563`. Such a line
 # counts as a change for a check-in, and does not by itself make the wake look in the day.
 #
+# So do the orchestrator's decisions (`decide` records them): each ticket still held with its
+# reason and age, `38 held after 37: shares scripts/workflow/tick (2h10m)`, and the answers given
+# and the starts refused since the last check-in delivered, `answered 37 (product): the limit:
+# "ten"`, `start of 39 refused: shares scripts/workflow/tick with 37`. A new answer or refusal
+# counts as a change for a check-in as a start line does; the records are read past only once
+# the check-in carrying them was delivered.
+#
 # So do the findings of the tick's daily metrics run (`workflow-metrics --daily` notes them), once
 # per day: `Workflow metrics findings (report .local/analyses/metrics-<date>.md): <line>; <line>.`
+#
+# So does the last change of the machine's runner balancer (the tick notes it from
+# `runner-balance.log`), once: `Runner balance, last change: <line>.`
 #
 # An analysis the tick stopped (its analyst said "analysis finished", or its 40 minutes ran out)
 # is told once, at any hour and busy or not, tried again every 5 minutes until the message is
@@ -98,6 +108,10 @@ export SHIPLINE_CONFIG
 main=$SHIPLINE_REPO
 resent=("$@")
 mkdir -p "$STATE"
+# Main's line as the gate published it: green, pending, red, advisory (only advisories failed
+# its dependency audit, and merging goes on) or unknown. A change into or out of red, advisory or
+# unknown is noted in main-status.pending and told at any hour. Main stays advisory through the
+# pending of each merge, its line ending "; still advisory", until it is green, red or unknown.
 main_report=$main/$SHIPLINE_STATE_FOLDER/main-status
 main_pending=$main/$SHIPLINE_STATE_FOLDER/main-status.pending
 # The first push the package audit refused because an advisory service could not be reached
@@ -136,6 +150,14 @@ if [[ -d $starts ]]; then
     fi
   done < <(find "$starts" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
+decision_held=()
+decision_events=()
+decision_cursor=""
+if decided=$(python3 -B "$here/decisions.py" wake 2>/dev/null 9>&-) &&
+    decision_cursor=$(jq -er '.cursor | numbers' <<<"$decided"); then
+  mapfile -t decision_held < <(jq -r '.held[] | strings' <<<"$decided")
+  mapfile -t decision_events < <(jq -r '.events[] | strings' <<<"$decided")
+fi
 metrics=$main/$SHIPLINE_STATE_FOLDER/metrics-findings.pending
 metrics_files=()
 metrics_lines=()
@@ -147,6 +169,17 @@ if [[ -d $metrics ]]; then
       metrics_lines+=("$line")
     fi
   done < <(find "$metrics" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+fi
+balance=$main/$SHIPLINE_STATE_FOLDER/runner-balance.pending
+balance_files=()
+balance_lines=()
+if [[ -d $balance ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '"Runner balance, last change: \(.line | strings | select(length > 0))."' "$event"); then
+      balance_files+=("$event")
+      balance_lines+=("$line")
+    fi
+  done < <(find "$balance" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
 analyses=$main/$SHIPLINE_STATE_FOLDER/analyses.pending
 analysis_files=()
@@ -459,7 +492,8 @@ if ((${#resent[@]} == 0 && ${#handback_files[@]} == 0 && ${#cloud_files[@]} == 0
     exit "$failed"
   fi
   if [[ -r $TOLD && $(<"$TOLD") == "$seen" ]] &&
-      ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0)); then
+      ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0 && ${#balance_files[@]} == 0 &&
+        ${#decision_events[@]} == 0)); then
     log "  nothing changed since the last check-in; $name not told"
     exit "$failed"
   fi
@@ -483,7 +517,11 @@ if ((${#start_lines[@]})); then
   joined=$(printf '%s; ' "${start_lines[@]}")
   message+=" Ticket starts by the tick: ${joined%; }."
 fi
-for line in "${metrics_lines[@]}" "${analysis_lines[@]}"; do
+if ((${#decision_held[@]} + ${#decision_events[@]})); then
+  joined=$(printf '%s; ' "${decision_held[@]}" "${decision_events[@]}")
+  message+=" Decisions: ${joined%; }."
+fi
+for line in "${metrics_lines[@]}" "${analysis_lines[@]}" "${balance_lines[@]}"; do
   message+=" $line"
 done
 if [[ -n $service_line ]]; then
@@ -498,9 +536,13 @@ if send_to "$name" "$message"; then
     grep -xF -f <(asking_notes all; echo) >"$ASKED.new"
   mv "$ASKED.new" "$ASKED"
   rm -f "$PENDING"
-  for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${analysis_files[@]}"; do
+  for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${analysis_files[@]}" \
+      "${balance_files[@]}"; do
     rm -f -- "$event"
   done
+  if [[ -n $decision_cursor ]]; then
+    python3 -B "$here/decisions.py" wake-told "$decision_cursor" 9>&- || failed=1
+  fi
   # Do not acknowledge a newer outage noted while the message was being sent.
   if [[ -n $service_line && -r $service_pending && $(<"$service_pending") == "$service_line" ]]; then
     rm -f "$service_pending"

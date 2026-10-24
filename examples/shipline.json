@@ -22,7 +22,9 @@
     "ci_result": "Build result",
     "ci_plan": "Build: what to run",
     "e2e_plan": "Browser: what to run",
-    "images": "Images"
+    "images": "Images",
+    "dependency_audit": "Build: dependencies",
+    "advisory_annotation": "Advisory"
   },
   "annotations": {
     "merge_tested": "Merge built",
@@ -62,6 +64,7 @@
     "image_build": "tools/shipline/build-runner-images",
     "hub_cache": "tools/shipline/hub-cache"
   },
+  "cloud_wake_after_minutes": 45,
   "parity": {
     "workflow_tests": "tools/shipline/tests",
     "runner_tests": "tools/runner/tests",

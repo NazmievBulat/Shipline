@@ -74,6 +74,7 @@ jobs:
           - shard: 1
             files: >-
               tests/workflow/test_commands.py
+              tests/workflow/test_decisions.py
               tests/workflow/test_merge_when_current.py
           - shard: 2
             files: >-
@@ -83,6 +84,7 @@ jobs:
               tests/runner/test_programs.py
               tests/runner/test_rendering.py
               tests/tools/test_parity.py
+              tests/workflow/test_break_35.py
               tests/workflow/test_browser_test_slots.py
               tests/workflow/test_github_identity.py
               tests/workflow/test_install_hooks.py
@@ -104,6 +106,7 @@ jobs:
               tests/workflow/test_break_4_switch.py
               tests/workflow/test_check_parts.py
               tests/workflow/test_ci.py
+              tests/workflow/test_ci_demand.py
               tests/workflow/test_cloud_workers.py
               tests/workflow/test_codex_worker.py
               tests/workflow/test_conflict_review.py
@@ -122,6 +125,7 @@ jobs:
               tests/workflow/test_workflow_commands.py
           - shard: 4
             files: >-
+              tests/runner/test_balance_runners.py
               tests/workflow/test_checks_finished.py
               tests/workflow/test_flow_page.py
               tests/workflow/test_ci_minutes.py
