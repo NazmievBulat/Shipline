@@ -531,12 +531,15 @@ while read -r name state _; do
     mark=$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-$turn-${health%% *}-$head
   fi
   # A check GitHub lost after its run finished never completes: the gate runs CI again for it.
-  # In the line, the wake still comes again for a new turn or state of main.
+  # In the line, the wake still comes again for a new turn or state of main. A failed member's
+  # lost check is not run again: it is woken once per head as if its checks had finished.
   lost=false
   if jq -e --arg number "$number" --arg head "$head" '.lost[$number].head == $head' \
     <<<"$train" >/dev/null; then
     lost=true
-    if [[ $mark == */$name.train-nudged-* ]]; then
+    if jq -e --arg number "$number" '.lost[$number].failed == true' <<<"$train" >/dev/null; then
+      lost=failed
+    elif [[ $mark == */$name.train-nudged-* ]]; then
       mark=$mark-lost
     else
       mark=$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head
@@ -546,7 +549,7 @@ while read -r name state _; do
   # CI result is always scheduled, so a partial rollup before it exists is not done.
   # Only skipped image planners means the draft run; ready must get its new run first.
   # GitHub keeps skipped draft checks beside the ready run on the same head.
-  [[ $lost == true ]] || jq -e --arg result "$SHIPLINE_CI_RESULT" \
+  [[ $lost != false ]] || jq -e --arg result "$SHIPLINE_CI_RESULT" \
     --arg images "$SHIPLINE_IMAGES_PLAN" '.statusCheckRollup | type == "array" and
     any(.[]; .name == $result) and
     (all(.[]; .name != $images) or
@@ -580,7 +583,7 @@ while read -r name state _; do
     [[ $own == true ]] || continue
   fi
   wake=checks-finished
-  [[ $lost == false ]] || wake=lost-check
+  [[ $lost != true ]] || wake=lost-check
   if delivery=$(session "$wake" "$name" "$head" 2>&1); then
     nudged+="$name "
     echo "$head" >"$mark" || { failed=1; continue; }
