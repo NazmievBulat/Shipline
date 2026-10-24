@@ -138,3 +138,30 @@ def test_a_number_known_from_the_run_but_now_used_by_another_process_is_left_alo
         other.wait()
 
     assert done.stdout.split() == ["True", "True"], done.stdout + done.stderr
+
+
+def test_a_timed_out_command_carries_the_output_read_before_its_stop() -> None:
+    """What a command printed before its deadline is kept; its message stays the same."""
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]); import workflow_commands as w\n"
+            "try:\n"
+            "    w.run('sh', '-c', 'echo first; echo second >&2; exec sleep 600', timeout=1)\n"
+            "except w.CommandTimeout as error:\n"
+            "    print(error)\n"
+            "    print(error.output, end='')\n",
+            str(SCRIPTS),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.stdout.splitlines() == [
+        "sh -c echo first; echo second >&2; exec sleep 600 timed out after 1s",
+        "first",
+        "second",
+    ], done.stdout + done.stderr

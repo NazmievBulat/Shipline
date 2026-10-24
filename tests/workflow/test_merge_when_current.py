@@ -5609,6 +5609,86 @@ def test_a_batch_push_that_stalls_past_its_deadline_waits_for_the_next_call(
     assert all(member["scratch"]["pushed"] for member in _prefixes(github))
 
 
+def test_a_push_that_times_out_is_handed_back_with_the_hooks_step_and_last_lines(
+    github: GitHub,
+) -> None:
+    """The tick's gate refreshes the branch, and its hook stalls in a step past the deadline."""
+    workflow = github.workflow
+    # A passed review handed off from the pull request's worktree, then main moved on.
+    workflow.git("checkout", "main")
+    workflow.git("worktree", "add", str(workflow.worktree(7)), "ticket/seven")
+    workflow.list_pull_request(7, draft=False)
+    (workflow.state / "pr" / "7").write_text(f"OPEN ticket/seven {github.head}\n")
+    github.pulls["7"]["labels"] = [{"name": "workflow"}]
+    github.api[f"{_REPO}/pulls/7/reviews"] = [
+        {
+            "body": "<!-- workflow-review round=1 result=passed -->\nReviewed.",
+            "commit_id": github.head,
+        }
+    ]
+    github.save()
+    handed = workflow.run_script("merge-when-current", "--handoff", "7", cwd=workflow.worktree(7))
+    assert handed.returncode == 0, handed.stdout + handed.stderr
+    workflow.run("stop", "review-7")
+    github.batch_mode = github.driver_mode = True
+    old = github.base
+    workflow.git("commit", "--allow-empty", "-m", "fix: main moved")
+    github.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    github.main()
+    github.ci(github.base, github.head, tested_base=old)
+    hooks = workflow.bin / "hooks"
+    hooks.mkdir(exist_ok=True)
+    (hooks / "pre-push").write_text(
+        "#!/bin/bash\n"
+        "echo '$ sh scripts/slow-check.sh'\n"
+        "echo 'checking 41 of 90' >&2\n"
+        "exec /bin/sleep 30\n"
+    )
+    (hooks / "pre-push").chmod(0o755)
+    workflow.git("config", "core.hooksPath", str(hooks))
+    # The driver runs the gate it finds beside it: this one has a short deadline of its own.
+    beside = workflow.root / "beside"
+    beside.mkdir()
+    (beside / "merge-when-current").write_text(
+        "#!/bin/bash\nexec python3 -B -c 'import sys; "
+        f'sys.path.insert(0, "{workflow.script.parent}"); '
+        "import merge_gate as g; g.COMMAND_TIMEOUT = 3; "
+        'sys.argv = ["merge-when-current", *sys.argv[1:]]; sys.exit(g.main())\' "$@"\n'
+    )
+    github.save()
+
+    done = subprocess.run(
+        [
+            "python3",
+            "-B",
+            "-c",
+            "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+            "import merge_driver as d; d.gate.HERE = Path(sys.argv[2]); "
+            "d._drive_gate(Path('.local/workflow').resolve(), '7')",
+            str(workflow.script.parent),
+            str(beside),
+        ],
+        cwd=workflow.repo,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    refusal = _refusal(subprocess.CompletedProcess([], 0, "", done.stdout))
+    assert refusal == (
+        "merge refused: could not push the refreshed branch: git push timed out after 3s"
+    ), done.stdout
+    reason = json.loads((workflow.repo / ".local/workflow/merge-review-7").read_text())["reason"]
+    assert reason.startswith(refusal), reason
+    assert "$ sh scripts/slow-check.sh\nchecking 41 of 90" in reason, reason
+    assert (
+        workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == github.head
+    )
+
+
 # The package audit's own last lines (scripts/audit-against-base.py): a service it could not
 # reach after its tries, and an advisory the branch brings.
 UNREACHABLE = (

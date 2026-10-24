@@ -95,8 +95,10 @@ def mechanical_conflicts() -> ModuleType | None:
     return rules
 
 
-# How many of its last lines a failed push is refused with, when the repository words no refusal.
+# How many of its last lines a failed push is refused with, when the repository words no refusal,
+# and a push that outlasted its deadline.
 REFUSAL_LINES = 10
+TIMEOUT_REFUSAL_LINES = 20
 
 CONFIG = workflow_config.current()
 REPOSITORY = CONFIG.repository
@@ -168,6 +170,16 @@ class Refused(Exception):
     """Missing evidence is a refusal, never permission to merge."""
 
 
+class TimedOut(Refused):
+    """A command outlasted its deadline and was stopped."""
+
+    def __init__(self, message: str, output: str, timeout: float) -> None:
+        super().__init__(message)
+        # What it printed before it was stopped, and the deadline it outlasted.
+        self.output = output
+        self.timeout = timeout
+
+
 class Waiting(Refused):
     """An expected wait which the tick may retry without a reviewer."""
 
@@ -203,7 +215,7 @@ def command(
             errors=errors,
         )
     except CommandTimeout as error:
-        raise Refused(str(error)) from error
+        raise TimedOut(str(error), error.output, COMMAND_TIMEOUT) from error
     if done.returncode == 75 and os.environ.get("WORKFLOW_BACKGROUND_GITHUB") == "1":
         raise BudgetWaiting(done.stderr.strip())
     if check and done.returncode:
@@ -260,6 +272,8 @@ class Pushed:
     output: str
     # The hook's step that failed and its last lines, when the push failed.
     refusal: str
+    # Whether the push outlasted its deadline; `output` is what it printed before it was stopped.
+    timed_out: bool = False
 
 
 def push(*args: str, where: Path | None = None) -> Pushed:
@@ -275,20 +289,26 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         raise PackagesWaiting(failed)
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
     merged = ("env", "EIO_BACKEND=posix", "sh", "-c", 'exec "$@" 2>&1', "push", *git_args)
-    done = command(*merged, check=False)
-    if done.returncode and short_of_memory(done.stdout):
+    done, timeout = _push_once(merged)
+    if done.returncode and timeout is None and short_of_memory(done.stdout):
         command("sleep", str(PUSH_RETRY_SECONDS))
-        done = command(*merged, check=False)
+        done, timeout = _push_once(merged)
     output = done.stdout
     pushed = Pushed(
         done.returncode,
         output,
-        push_failure(output, checkout) if done.returncode else "",
+        push_failure(output, checkout, timeout) if done.returncode else "",
+        timeout is not None,
     )
     if advisory_service is None:
         return pushed
     folder = main_checkout() / CONFIG.state_folder
-    service = advisory_service.unreachable(output) if pushed.returncode else None
+    # A scan stopped at the deadline never concluded that a service was out.
+    service = (
+        advisory_service.unreachable(output)
+        if pushed.returncode and not pushed.timed_out
+        else None
+    )
     if service:
         folder.mkdir(parents=True, exist_ok=True)
         advisory_service.note_down(folder, service)
@@ -301,15 +321,28 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     return pushed
 
 
-def push_failure(output: str, checkout: Path) -> str:
-    """What a failed push says, led by the scan's memory error when it ran short.
+def _push_once(merged: tuple[str, ...]) -> tuple[subprocess.CompletedProcess[str], float | None]:
+    """The push, and the deadline it outlasted, if it did: then it failed with what it printed."""
+    try:
+        return command(*merged, check=False), None
+    except TimedOut as error:
+        # 124, as `timeout` reports a command it stopped.
+        return subprocess.CompletedProcess(merged, 124, error.output, ""), error.timeout
 
-    The first line is all the wake and a hand-back show, so a shortage is named there, before
-    the hook's step that failed and its last lines."""
+
+def push_failure(output: str, checkout: Path, timeout: float | None = None) -> str:
+    """What a failed push says, led by the deadline it outlasted, or by the scan's memory error
+    when it ran short.
+
+    The first line is all the wake and a hand-back show, so a timeout or a shortage is named
+    there, before the hook's step that failed, or was running, and its last lines."""
     if pushing_checkout:
         refusal = pushing_checkout.refusal(output, checkout)
     else:
-        refusal = "\n".join([line for line in output.splitlines() if line.strip()][-REFUSAL_LINES:])
+        lines = REFUSAL_LINES if timeout is None else TIMEOUT_REFUSAL_LINES
+        refusal = "\n".join([line for line in output.splitlines() if line.strip()][-lines:])
+    if timeout is not None:
+        return "\n".join(filter(None, [f"git push timed out after {timeout:g}s", refusal]))
     shortage = next(
         (line.strip() for line in output.splitlines() if short_of_memory(line)),
         None,
@@ -2884,11 +2917,11 @@ def _push_scratch(
         pushed = push("origin", f"{record['head']}:refs/heads/{record['branch']}")
         if pushed.returncode:
             failure = pushed.refusal
-            output = pushed.output
+            # A push that keeps stalling ends the batch, whatever its scan printed first.
+            output = "" if pushed.timed_out else pushed.output
     except Waiting:
         raise
     except Refused as error:
-        # A push that outlasted its deadline failed like any other.
         failure = str(error)
     if failure is not None:
         reason = f"could not push {whose} scratch branch: " + failure
