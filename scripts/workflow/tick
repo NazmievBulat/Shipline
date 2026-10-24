@@ -59,6 +59,10 @@
 #  11. From 08:00 UTC, once the day's metrics report is written, one analyst a day
 #      (`session start analyst day-<date>`, on Sunday `week-<date>` over 7 days), when the
 #      5-hour usage window allows a start: not above 85% unless it resets within the hour.
+#  12. `ci_demand.py`: the CI and image jobs the pushes on their way will start within half an
+#      hour (working cloud workers, busy local workers and reviewers, ready pull requests whose
+#      checks have not started, the merge line's prefixes still to be built), written to
+#      ~/.local/state/workflow/ci-demand.json for the runner balancer.
 #
 # Steps 1 and 2 are the one place a session is closed, and only when its work no longer exists.
 # The starts come last because the steps before them may free memory they need.
@@ -1284,6 +1288,32 @@ exec 8>&-
 # Step 11, after the starts the tickets wait for, and not while one waits for memory.
 if ((local_starts_held == 0 && started != 75)); then
   start_daily_analyst || failed=1
+fi
+
+# Step 12, after this tick's starts: the CI demand on its way, for the runner balancer.
+if running=$(session list); then
+  # 75: the GitHub budget is paused; the forecast is written again at a later tick.
+  python3 -B "$here/ci_demand.py" write "$main" "$snapshot" <<<"$running" 9>&- ||
+    (($? == 75)) || failed=1
+else
+  failed=1
+fi
+# The last change of this machine's runner balancer, once, for the wake's next check-in. One
+# older than a day (a first tick after an install, say) is no news.
+balance_log=$HOME/.local/state/workflow/runner-balance.log
+balance_told=$main/$SHIPLINE_STATE_FOLDER/runner-balance.told
+if [[ -s $balance_log ]] && balance_line=$(tail -n 1 "$balance_log") &&
+    [[ -n $balance_line && $balance_line != "$(cat "$balance_told" 2>/dev/null)" ]] &&
+    balance_at=$(date -u -d "${balance_line%% *}" +%s 2>/dev/null) &&
+    ((NOW - balance_at < 86400)); then
+  balance_pending=$main/$SHIPLINE_STATE_FOLDER/runner-balance.pending
+  if mkdir -p "$balance_pending" &&
+      jq -n --arg line "$balance_line" '{line: $line}' >"$balance_pending/.balance.json" &&
+      mv -- "$balance_pending/.balance.json" "$balance_pending/balance.json"; then
+    printf '%s\n' "$balance_line" >"$balance_told" || failed=1
+  else
+    failed=1
+  fi
 fi
 
 wake_done=1

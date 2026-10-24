@@ -124,6 +124,8 @@ def test_a_machine_s_runners_are_installed_by_the_prefix_and_its_own_settings(
         "other_machines='office'",
         "ordinary_jobs=2",
         "ordinary_blacksmith_jobs=1",
+        "ordinary_spares=1",
+        "docker_runners=0",
     ]
     # The repository's own command built the images, on main's files.
     assert (machine / "built").read_text() == "built\n"
@@ -151,6 +153,7 @@ def test_a_machine_s_runners_are_installed_by_the_prefix_and_its_own_settings(
         "--user enable --now example-app-runner@3.service",
         "--user enable --now example-app-runner-spare.service",
         "--user enable --now example-app-runner-lend.service",
+        "--user enable --now example-app-runner-balance.timer",
     ]
     # The programs that use GitHub are copies, not links into the checkout.
     assert not (_installed(machine) / "github_budget.py").is_symlink()
@@ -397,3 +400,62 @@ def test_a_service_that_restarts_while_the_images_build_finds_its_settings(machi
 
     assert done.returncode == 0, done.stderr
     assert (machine / "built").read_text() == "example-app-runner\n"
+
+
+_BOUNDS = "balance_ordinary=2-5\nbalance_docker=0-1\nbalance off\n"
+
+
+def test_the_balancers_bounds_go_from_the_machine_settings_into_the_installed_ones(
+    machine: Path,
+) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine, _SETTINGS + _BOUNDS)
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert (_installed(machine) / "pool-settings.sh").read_text().endswith(_BOUNDS)
+
+
+def test_a_reinstall_keeps_the_installed_bounds_when_the_machine_settings_name_none(
+    machine: Path,
+) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine)
+    assert _install(machine).returncode == 0
+    installed = _installed(machine) / "pool-settings.sh"
+    # The balancer moved a slot meanwhile, and its owner set bounds there.
+    installed.write_text(installed.read_text().replace("ordinary_jobs=2", "ordinary_jobs=3") + _BOUNDS)
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    text = installed.read_text()
+    # The counts are the machine settings' again; the bounds stay.
+    assert "ordinary_jobs=2\n" in text
+    assert text.endswith(_BOUNDS)
+
+
+def test_the_balancer_leaves_the_runners_alone_while_they_are_installed(machine: Path) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine)
+    lock = machine / "home/.local/state/workflow/runner-balance.lock"
+    # Docker is asked while the runners are down: a balancer run then would find them gone.
+    (machine / "bin/docker").write_text(
+        f'#!/bin/sh\nif flock -n "{lock}" true; then echo free; else echo held; fi >> "$CALLS.lock"\n'
+    )
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert set((machine / "calls.log.lock").read_text().split()) == {"held"}
+
+
+def test_a_machine_with_neither_kind_of_runner_gets_no_balancer(machine: Path) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine, "machine=home\nroles='planner'\n")
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert not [call for call in _calls(machine, "systemctl") if "balance" in call]

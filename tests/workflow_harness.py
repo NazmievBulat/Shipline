@@ -293,6 +293,11 @@ if [[ "$1 $2 $3 $5" == "api -X POST -f" && $4 == repos/*/issues/*/labels ]]; the
   echo "$number" >> "@STATE@/labelled"
   exit 0
 fi
+# The runs of a pull request's branch, for the CI demand forecast: none.
+if [[ "$1" == api && $2 == repos/*/actions/runs[?]branch=*'&per_page=30' && $# -eq 2 ]]; then
+  echo '{"total_count": 0, "workflow_runs": []}'
+  exit 0
+fi
 asked="label list --limit 1000 --json name --jq ${8}"
 if [ "$*" = "$asked" ] && [ ! -e "@STATE@/fail-gh-labels" ]; then
   touch "@STATE@/labels"
@@ -637,6 +642,21 @@ class Workflow:
         return subprocess.run(
             ["bash", str(self.script.parent / script), *args],
             cwd=cwd or self.repo,
+            env={**self.env, **(env or {})},
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+    def run_python(
+        self, script: str, *args: str, env: dict[str, str] | None = None, stdin: str = ""
+    ) -> subprocess.CompletedProcess[str]:
+        """A Python script of `scripts/workflow`, run as the tick runs it."""
+        return subprocess.run(
+            ["python3", "-B", str(self.script.parent / script), *args],
+            cwd=self.repo,
             env={**self.env, **(env or {})},
             input=stdin,
             capture_output=True,
