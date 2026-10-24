@@ -436,6 +436,114 @@ def test_the_link_is_pointed_at_this_checkout_and_a_file_of_the_owner_is_left_al
     assert f"{link} is not a link to Shipline; it was left as it is" in done.stderr
 
 
+@pytest.mark.parametrize("repository_source", ["current folder", "environment", "argument"])
+def test_the_flow_page_timer_runs_shipline_on_the_repository_s_main_checkout(
+    workflow: Workflow, repository_source: str
+) -> None:
+    worktree = workflow.add_worktree(7)
+    if repository_source == "current folder":
+        done = workflow.run_script("install-flow-page-timer", cwd=worktree)
+    elif repository_source == "environment":
+        done = workflow.run_script(
+            "install-flow-page-timer", env={"SHIPLINE_REPO": str(worktree)}, cwd=workflow.home
+        )
+    else:
+        done = workflow.shipline(
+            "--repo", str(worktree), "install-flow-page-timer", cwd=workflow.home
+        )
+
+    assert done.returncode == 0, done.stderr
+    units = Path(workflow.env["HOME"]) / ".config" / "systemd" / "user"
+    service = (units / "flow-page.service").read_text()
+    launcher = workflow.home / "bin" / "shipline"
+    assert f"WorkingDirectory={workflow.repo}" in service.splitlines()
+    assert f'ExecStart="{launcher}" --repo "{workflow.repo}" flow-page' in service.splitlines()
+    assert str(worktree) not in service
+    assert f"{workflow.repo}/scripts/workflow" not in service
+    assert not (workflow.repo / "scripts" / "workflow").exists()
+
+
+def test_shipline_flow_page_reads_the_named_repository_s_settings(workflow: Workflow) -> None:
+    settings = workflow.repo / ".github" / "runner" / "settings.sh"
+    settings.write_text(settings.read_text() + "flow_page_port=8800\n")
+
+    done = workflow.shipline(
+        "--repo", str(workflow.repo), "flow-page", "--settings", cwd=workflow.home
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split()[-1] == "8800"
+
+
+@pytest.mark.parametrize("old_units", [False, True])
+def test_the_flow_page_installer_writes_both_services_with_the_launcher_and_repository(
+    workflow: Workflow, old_units: bool
+) -> None:
+    settings = workflow.repo / ".github" / "runner" / "settings.sh"
+    settings.write_text(settings.read_text() + "flow_page_port=8800\n")
+    units = Path(workflow.env["HOME"]) / ".config" / "systemd" / "user"
+    if old_units:
+        units.mkdir(parents=True)
+        for name, arguments in (("flow-page", ""), ("flow-page-serve", " --serve 8800")):
+            (units / f"{name}.service").write_text(
+                f'[Service]\nExecStart="{workflow.repo}/scripts/workflow/flow-page"{arguments}\n'
+            )
+        (units / "flow-page.timer").write_text("[Timer]\nOnCalendar=hourly\n")
+
+    done = workflow.shipline("install-flow-page-timer")
+
+    assert done.returncode == 0, done.stderr
+    launcher = workflow.home / "bin" / "shipline"
+    for name, arguments in (("flow-page", ""), ("flow-page-serve", " --serve 8800")):
+        service = (units / f"{name}.service").read_text()
+        command = f'ExecStart="{launcher}" --repo "{workflow.repo}" flow-page{arguments}'
+        assert command in service.splitlines()
+        assert f"WorkingDirectory={workflow.repo}" in service.splitlines()
+        assert f"{workflow.repo}/scripts/workflow" not in service
+        # Run what systemd will run, asking for settings instead of starting the server.
+        args = command.removeprefix("ExecStart=")
+        if arguments:
+            args = args.removesuffix(arguments)
+        reached = subprocess.run(
+            ["bash", "-c", args + " --settings"],
+            cwd=workflow.home,
+            env=workflow.env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert reached.returncode == 0, reached.stderr
+        assert reached.stdout.split()[-1] == "8800"
+    assert "OnCalendar=*:0/10" in (units / "flow-page.timer").read_text().splitlines()
+    assert workflow.calls("systemctl") == [
+        "systemctl --user daemon-reload",
+        "systemctl --user enable --now flow-page.timer",
+        "systemctl --user enable flow-page-serve.service",
+        "systemctl --user restart flow-page-serve.service",
+    ]
+
+
+def test_the_flow_page_units_escape_spaces_percent_and_dollar_signs(workflow: Workflow) -> None:
+    home = workflow.home.rename(workflow.root / "shipline 100% $data")
+    workflow.home = home
+    workflow.repo = workflow.repo.rename(workflow.root / "example-app 100% $data")
+    settings = workflow.repo / ".github" / "runner" / "settings.sh"
+    settings.write_text(settings.read_text() + "flow_page_port=8800\n")
+
+    done = workflow.shipline("install-flow-page-timer")
+
+    assert done.returncode == 0, done.stderr
+    units = Path(workflow.env["HOME"]) / ".config" / "systemd" / "user"
+    escaped = str(workflow.repo).replace("%", "%%")
+    command_repo = escaped.replace("$", "$$")
+    launcher = str(home / "bin" / "shipline").replace("%", "%%").replace("$", "$$")
+    for name, arguments in (("flow-page", ""), ("flow-page-serve", " --serve 8800")):
+        lines = (units / f"{name}.service").read_text().splitlines()
+        assert f"WorkingDirectory={escaped}" in lines
+        assert f'ExecStart="{launcher}" --repo "{command_repo}" flow-page{arguments}' in lines
+
+
 # The SHA-256 of each sentence that names a command, as the scripts wrote it when the scripts
 # were in the repository and the sentence named the command by its path there.
 _SENTENCES_BEFORE = {
