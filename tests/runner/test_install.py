@@ -10,6 +10,19 @@ import sys
 from pathlib import Path
 
 import pytest
+from slot_stand_ins import (
+    FIRST,
+    LABEL,
+    MACHINE,
+    OTHER,
+    SHARED_JOB_MEMORY,
+    SPARE_UNIT,
+    STANDBY,
+    Machine,
+    make_machine,
+    ordinary_unit,
+    runner_name,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _INSTALL = _ROOT / "runner/install.sh"
@@ -123,7 +136,10 @@ def test_a_machine_s_runners_are_installed_by_the_prefix_and_its_own_settings(
         "roles='main ordinary planner'",
         "other_machines='office'",
         "ordinary_jobs=2",
+        "installed_slots=2",
         "ordinary_blacksmith_jobs=1",
+        "ordinary_spares=1",
+        "docker_runners=0",
     ]
     # The repository's own command built the images, on main's files.
     assert (machine / "built").read_text() == "built\n"
@@ -131,9 +147,7 @@ def test_a_machine_s_runners_are_installed_by_the_prefix_and_its_own_settings(
     units = machine / "home/.config/systemd/user"
     installed = sorted(path.name for path in units.iterdir() if path.is_file())
     assert installed == sorted(
-        name
-        for name in os.listdir(_EXPECTED)
-        if "hub-cache" not in name and "firewall" not in name
+        name for name in os.listdir(_EXPECTED) if "hub-cache" not in name and "firewall" not in name
     )
     for name in installed:
         assert (units / name).read_text() == (_EXPECTED / name).read_text(), name
@@ -151,6 +165,7 @@ def test_a_machine_s_runners_are_installed_by_the_prefix_and_its_own_settings(
         "--user enable --now example-app-runner@3.service",
         "--user enable --now example-app-runner-spare.service",
         "--user enable --now example-app-runner-lend.service",
+        "--user enable --now example-app-runner-balance.timer",
     ]
     # The programs that use GitHub are copies, not links into the checkout.
     assert not (_installed(machine) / "github_budget.py").is_symlink()
@@ -282,9 +297,10 @@ def test_no_value_of_the_file_runs_as_code(machine: Path) -> None:
 
     assert done.returncode == 0, done.stderr
     assert not (machine / "checkout/injected").exists()
-    assert "repository='example-owner/example-app'" in (
-        _installed(machine) / "pool-settings.sh"
-    ).read_text()
+    assert (
+        "repository='example-owner/example-app'"
+        in (_installed(machine) / "pool-settings.sh").read_text()
+    )
 
 
 def test_a_checkout_whose_file_is_not_main_s_is_refused(machine: Path) -> None:
@@ -397,3 +413,417 @@ def test_a_service_that_restarts_while_the_images_build_finds_its_settings(machi
 
     assert done.returncode == 0, done.stderr
     assert (machine / "built").read_text() == "example-app-runner\n"
+
+
+_BOUNDS = "balance_ordinary=2-5\nbalance_docker=0-1\nbalance off\n"
+
+
+def test_the_balancers_bounds_go_from_the_machine_settings_into_the_installed_ones(
+    machine: Path,
+) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine, _SETTINGS + _BOUNDS)
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert (_installed(machine) / "pool-settings.sh").read_text().endswith(_BOUNDS)
+
+
+def test_a_reinstall_keeps_the_installed_bounds_when_the_machine_settings_name_none(
+    machine: Path,
+) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine)
+    assert _install(machine).returncode == 0
+    installed = _installed(machine) / "pool-settings.sh"
+    # The balancer moved a slot meanwhile, and its owner set bounds there.
+    installed.write_text(installed.read_text().replace("ordinary_jobs=2", "ordinary_jobs=3") + _BOUNDS)
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    text = installed.read_text()
+    # The counts are the machine settings' again; the bounds stay.
+    assert "ordinary_jobs=2\n" in text
+    assert text.endswith(_BOUNDS)
+
+
+def test_the_balancer_leaves_the_runners_alone_while_they_are_installed(machine: Path) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine)
+    lock = machine / "home/.local/state/workflow/runner-balance.lock"
+    # Docker is asked while the runners are down: a balancer run then would find them gone.
+    (machine / "bin/docker").write_text(
+        f'#!/bin/sh\nif flock -n "{lock}" true; then echo free; else echo held; fi >> "$CALLS.lock"\n'
+    )
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert set((machine / "calls.log.lock").read_text().split()) == {"held"}
+
+
+def test_a_machine_with_neither_kind_of_runner_gets_no_balancer(machine: Path) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine, "machine=home\nroles='planner'\n")
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert not [call for call in _calls(machine, "systemctl") if "balance" in call]
+
+
+# A machine that gives all its PR slots to the other machines of its pool, and a machine's own
+# memory cap of one ordinary job (README.md, "Moving a machine's PR slots").
+
+
+@pytest.fixture
+def pool_machine(tmp_path: Path) -> Machine:
+    return make_machine(tmp_path)
+
+
+def _enabled(machine: Machine) -> list[str]:
+    return [call.split()[-1] for call in machine.calls("systemctl") if " enable --now " in call]
+
+
+def test_a_machine_of_a_pool_of_several_installs_with_no_ordinary_slot(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.settle(slots=0)
+
+    done = pool_machine.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "0 PR job slots, 1 spare" in done.stdout
+    assert "ordinary_jobs=0" in pool_machine.pool_settings.read_text().splitlines()
+
+
+def test_a_machine_with_no_ordinary_slot_keeps_its_spare_runner_and_supervisor(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.settle(slots=0)
+
+    pool_machine.install()
+
+    enabled = _enabled(pool_machine)
+    assert ordinary_unit(1) in enabled
+    assert ordinary_unit(2) not in enabled
+    assert SPARE_UNIT in enabled
+
+
+def test_the_only_machine_of_the_pool_is_refused_with_no_ordinary_slot(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.settle(slots=0, alone=True)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "There must be at least 1 ordinary runner" in done.stderr
+    assert "other_machines" in done.stderr
+    assert pool_machine.calls("systemctl") == []
+
+
+def test_a_machine_with_no_ordinary_slot_and_no_spare_is_refused(pool_machine: Machine) -> None:
+    """Its spare is what keeps pull request jobs running while no other machine is up."""
+    pool_machine.settle(slots=0, spares=0)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "There must be at least 1 ordinary runner" in done.stderr
+    assert "ordinary_spares" in done.stderr
+    assert pool_machine.calls("systemctl") == []
+
+
+def test_the_machines_own_job_memory_is_written_into_its_pool_settings(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.settle(slots=3, job_memory="6g")
+
+    done = pool_machine.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "job_memory=6g" in pool_machine.pool_settings.read_text().splitlines()
+
+
+def test_a_machine_without_a_job_memory_of_its_own_writes_none(pool_machine: Machine) -> None:
+    pool_machine.settle(slots=3)
+
+    done = pool_machine.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "job_memory" not in pool_machine.pool_settings.read_text()
+
+
+@pytest.mark.parametrize(
+    "given", ["6", "6 g", "6g; reboot", "$(id)", "0g", "6G", "6g\n7g", "512m", "1k"]
+)
+def test_a_job_memory_of_no_whole_gigabytes_is_refused(pool_machine: Machine, given: str) -> None:
+    pool_machine.settle(slots=3, job_memory=f"'{given}'")
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "job_memory" in done.stderr
+    assert pool_machine.calls("systemctl") == []
+
+
+def _memory_of_the_job_container(machine: Machine, kind: str = "ordinary") -> str:
+    done = machine.start_job_container(kind)
+    assert done.returncode == 0, done.stderr
+    (run,) = [call.split() for call in machine.calls("docker") if call.startswith("docker run ")]
+    return run[run.index("--memory") + 1]
+
+
+def test_a_job_container_is_capped_at_the_machines_own_job_memory(pool_machine: Machine) -> None:
+    pool_machine.installed_as(slots=3, job_memory="6g")
+
+    assert _memory_of_the_job_container(pool_machine) == "6g"
+
+
+def test_a_job_container_is_capped_at_the_shared_value_when_the_machine_names_none(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.installed_as(slots=3)
+
+    assert _memory_of_the_job_container(pool_machine) == SHARED_JOB_MEMORY
+
+
+def test_mains_job_containers_keep_the_shared_value_beside_the_machines_own(
+    pool_machine: Machine,
+) -> None:
+    """A machine's job_memory is the cap of its ordinary jobs; main's runners keep theirs."""
+    pool_machine.installed_as(slots=3, job_memory="6g")
+
+    assert _memory_of_the_job_container(pool_machine, "main") == SHARED_JOB_MEMORY
+
+
+# A move is both machines agreeing: the receiving machine installs first, then the giving one.
+
+
+def _holding(machine: str, number: int, status: str = "online") -> tuple[str, str, list[str]]:
+    """A machine's ordinary runner holding a PR slot."""
+    return (runner_name(machine, number=number), status, [STANDBY, LABEL, FIRST])
+
+
+def _installed_with_four(pool_machine: Machine, *others: tuple[str, str, list[str]]) -> None:
+    pool_machine.installed_as(slots=4)
+    pool_machine.runners(*[_holding(MACHINE, n) for n in range(1, 6)], *others)
+
+
+def test_lowering_the_slots_while_the_other_machine_is_off_is_refused(
+    pool_machine: Machine,
+) -> None:
+    _installed_with_four(pool_machine, _holding(OTHER, 1, "offline"), _holding(OTHER, 2, "offline"))
+    pool_machine.settle(slots=2)
+
+    before = pool_machine.installation()
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "Install the receiving machine first" in done.stderr
+    assert pool_machine.calls("systemctl") == []
+    assert "ordinary_jobs=4" in pool_machine.pool_settings.read_text().splitlines()
+    assert pool_machine.installation() == before
+
+
+
+def test_lowering_the_slots_installs_once_the_other_machine_holds_them(
+    pool_machine: Machine,
+) -> None:
+    _installed_with_four(pool_machine, _holding(OTHER, 1), _holding(OTHER, 2))
+    pool_machine.settle(slots=2)
+
+    done = pool_machine.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "ordinary_jobs=2" in pool_machine.pool_settings.read_text().splitlines()
+
+
+def test_main_docker_and_standby_runners_of_the_other_machine_hold_no_slot_given_up(
+    pool_machine: Machine,
+) -> None:
+    _installed_with_four(
+        pool_machine,
+        (runner_name(OTHER, "main"), "online", [f"{LABEL}-main", LABEL, FIRST]),
+        (runner_name(OTHER, "docker"), "online", [f"{LABEL}-docker"]),
+        (runner_name(OTHER, number=1), "online", [STANDBY]),
+    )
+    pool_machine.settle(slots=3)
+
+    before = pool_machine.installation()
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert pool_machine.calls("systemctl") == []
+    assert pool_machine.installation() == before
+
+
+
+def test_lowering_the_slots_with_github_s_runners_unreadable_is_refused(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.installed_as(slots=4)
+    pool_machine.lose_github()
+    pool_machine.settle(slots=2)
+
+    before = pool_machine.installation()
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "Could not read GitHub's runners" in done.stderr
+    assert pool_machine.calls("systemctl") == []
+    assert pool_machine.installation() == before
+
+
+
+def test_the_report_says_how_many_more_pr_jobs_the_room_holds(pool_machine: Machine) -> None:
+    pool_machine.installed_as(slots=2)
+    pool_machine.measure(available_gib=30)
+
+    done = pool_machine.usage("report", "--days", "7")
+
+    assert done.returncode == 0, done.stdout
+    lines = done.stdout.strip().splitlines()
+    assert lines[-2].startswith("Room for 2 more PR jobs of 10g each")
+    assert lines[-1].startswith("Room every day: yes")
+    in_jobs_of_6g = pool_machine.usage("report", "--days", "7", "--job-memory", "6g").stdout
+    assert "Room for 3 more PR jobs of 6g each" in in_jobs_of_6g
+
+
+def test_without_a_record_the_machine_holds_its_runners_with_the_label(
+    pool_machine: Machine,
+) -> None:
+    """A machine installed before installs were recorded still holds the slots GitHub lists."""
+    pool_machine.runners(
+        *[_holding(MACHINE, n) for n in range(1, 4)], _holding(OTHER, 1, "offline")
+    )
+    pool_machine.settle(slots=0)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "would give up 3 PR slots" in done.stderr
+    assert pool_machine.calls("systemctl") == []
+
+
+def test_the_usage_report_refuses_a_cap_of_no_whole_gigabytes(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.installed_as(slots=2)
+
+    done = pool_machine.usage("report", "--job-memory", "10240m")
+
+    assert done.returncode == 2
+    assert "whole gigabytes" in done.stderr
+
+
+def test_slots_moved_away_come_back_without_measured_room(tmp_path: Path) -> None:
+    """The busy machine takes its slots back first, though its week measured no room: that is
+    why they left. The other machine then gives them up, once those runners are online."""
+    home = make_machine(tmp_path / "home-machine")
+    home.installed_as(slots=0)
+    home.measure(available_gib=9, pressure=36)
+    home.settle(slots=4)
+
+    done = home.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "ordinary_jobs=4" in home.pool_settings.read_text().splitlines()
+    office = make_machine(tmp_path / "office-machine")
+    office.name = OTHER
+    office.installed_as(slots=4)
+    office.runners(*[_holding(MACHINE, n) for n in range(1, 5)], _holding(OTHER, 1))
+    office.settle(slots=0)
+
+    done = office.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "ordinary_jobs=0" in office.pool_settings.read_text().splitlines()
+
+
+def test_a_pool_machine_whose_identity_gives_no_token_takes_a_new_one(
+    pool_machine: Machine,
+) -> None:
+    """The runner list is read with the new identity, so a lapsed one can be replaced."""
+    pool_machine.installed_as(slots=4)
+    pool_machine.identity.mkdir(parents=True, exist_ok=True)
+    (pool_machine.identity / "app-id").write_text("12345\n")
+    token = pool_machine.root / "token"
+    token.write_text("stand-in\n")
+
+    done = pool_machine.install("--github-token", str(token))
+
+    assert done.returncode == 0, done.stderr
+    assert (pool_machine.identity / "token").read_text() == "stand-in\n"
+    assert not (pool_machine.identity / "app-id").exists()
+
+
+def test_a_refused_move_with_a_new_identity_leaves_the_counts_units_and_installed_copy(
+    pool_machine: Machine,
+) -> None:
+    """The new identity, which GitHub has just accepted, is all a refused move changes."""
+    _installed_with_four(pool_machine, _holding(OTHER, 1, "offline"))
+    pool_machine.settle(slots=2)
+    token = pool_machine.root / "token"
+    token.write_text("stand-in\n")
+    before = pool_machine.installation(identity=False)
+
+    done = pool_machine.install("--github-token", str(token))
+
+    assert done.returncode != 0
+    assert "Install the receiving machine first" in done.stderr
+    assert pool_machine.installation(identity=False) == before
+    assert pool_machine.calls("systemctl") == []
+    assert (pool_machine.identity / "token").read_text() == "stand-in\n"
+
+
+def test_an_identity_github_refuses_stops_the_install_with_nothing_changed(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.installed_as(slots=4)
+    pool_machine.refuse_new_identities()
+    pool_machine.settle(slots=4)
+    token = pool_machine.root / "token"
+    token.write_text("stand-in\n")
+    before = pool_machine.installation()
+
+    done = pool_machine.install("--github-token", str(token))
+
+    assert done.returncode != 0
+    assert "Resource not accessible" in done.stderr
+    assert pool_machine.installation() == before
+    assert pool_machine.calls("systemctl") == []
+
+
+def test_a_reinstall_at_the_count_the_balancer_changed_is_no_move(pool_machine: Machine) -> None:
+    """The balancer raised ordinary_jobs from the machine's 4 to 5; installing its 4 again gives
+    up no slot of the machine's own, though the other machine is off."""
+    _installed_with_four(pool_machine, _holding(OTHER, 1, "offline"))
+    settings = pool_machine.pool_settings
+    settings.write_text(settings.read_text().replace("\nordinary_jobs=4\n", "\nordinary_jobs=5\n"))
+    pool_machine.settle(slots=4)
+
+    done = pool_machine.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "ordinary_jobs=4" in settings.read_text().splitlines()
+
+
+def test_a_move_below_the_installed_count_is_checked_whatever_the_balancer_wrote(
+    pool_machine: Machine,
+) -> None:
+    _installed_with_four(pool_machine, _holding(OTHER, 1, "offline"))
+    settings = pool_machine.pool_settings
+    settings.write_text(settings.read_text().replace("\nordinary_jobs=4\n", "\nordinary_jobs=2\n"))
+    pool_machine.settle(slots=2)
+
+    done = pool_machine.install()
+
+    assert done.returncode != 0
+    assert "would give up 2 PR slots (4 to 2)" in done.stderr

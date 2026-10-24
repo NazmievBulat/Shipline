@@ -81,6 +81,7 @@ jobs:
               tests/runner/test_build_images.py
               tests/runner/test_install.py
               tests/runner/test_layout.py
+              tests/runner/test_ordinary_slots.py
               tests/runner/test_programs.py
               tests/runner/test_rendering.py
               tests/tools/test_parity.py
@@ -93,6 +94,7 @@ jobs:
               tests/workflow/test_notify.py
               tests/workflow/test_priority.py
               tests/workflow/test_review_effort.py
+              tests/workflow/test_self_update.py
               tests/workflow/test_session_memory.py
               tests/workflow/test_session_stop_and_cleanup.py
               tests/workflow/test_ticket_starts.py
@@ -106,6 +108,7 @@ jobs:
               tests/workflow/test_break_4_switch.py
               tests/workflow/test_check_parts.py
               tests/workflow/test_ci.py
+              tests/workflow/test_ci_demand.py
               tests/workflow/test_cloud_workers.py
               tests/workflow/test_codex_worker.py
               tests/workflow/test_conflict_review.py
@@ -124,6 +127,7 @@ jobs:
               tests/workflow/test_workflow_commands.py
           - shard: 4
             files: >-
+              tests/runner/test_balance_runners.py
               tests/workflow/test_checks_finished.py
               tests/workflow/test_flow_page.py
               tests/workflow/test_ci_minutes.py

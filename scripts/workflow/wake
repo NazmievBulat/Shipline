@@ -26,6 +26,10 @@
 # whose wait loop finds its own shell, `wait loop finds itself? ticket-426 (running: ...)`, each
 # ending `; nudge sent` when the tick nudged it, and one idle 50 minutes that no rule covers,
 # `idle, no rule: ticket-426 (50 min, last line: <line>)`.
+# So is what the tick's self-update of Shipline's own checkout (`self_update.py`) notes, once
+# each: `shipline rolled back: <bad sha> -> <good sha>, <reason>`, a checkout it left alone for
+# its local changes, and a pin that stops it. When several repositories share that checkout,
+# the first wake to send tells it.
 #
 # What the tick's automatic ticket start did, and why the next ticket waits, rides with the
 # next check-in, a line each, once per change (`ticket_starts.py` notes them): `started 611
@@ -42,6 +46,9 @@
 #
 # So do the findings of the tick's daily metrics run (`workflow-metrics --daily` notes them), once
 # per day: `Workflow metrics findings (report .local/analyses/metrics-<date>.md): <line>; <line>.`
+#
+# So does the last change of the machine's runner balancer (the tick notes it from
+# `runner-balance.log`), once: `Runner balance, last change: <line>.`
 #
 # An analysis the tick stopped (its analyst said "analysis finished", or its 40 minutes ran out)
 # is told once, at any hour and busy or not, tried again every 5 minutes until the message is
@@ -168,6 +175,17 @@ if [[ -d $metrics ]]; then
     fi
   done < <(find "$metrics" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
+balance=$main/$SHIPLINE_STATE_FOLDER/runner-balance.pending
+balance_files=()
+balance_lines=()
+if [[ -d $balance ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '"Runner balance, last change: \(.line | strings | select(length > 0))."' "$event"); then
+      balance_files+=("$event")
+      balance_lines+=("$line")
+    fi
+  done < <(find "$balance" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+fi
 analyses=$main/$SHIPLINE_STATE_FOLDER/analyses.pending
 analysis_files=()
 analysis_lines=()
@@ -235,6 +253,16 @@ if [[ -d $stuck ]]; then
       stuck_lines+=("$line")
     fi
   done < <(find "$stuck" -type f -name '*.json' -print0 | sort -z)
+fi
+# The self-update's notes are in the Shipline checkout these scripts are in, not the repository's.
+shipline=$(cd "$here/../.." && pwd)/.local/shipline/wake.pending
+if [[ -d $shipline ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '.line | strings' "$event"); then
+      stuck_files+=("$event")
+      stuck_lines+=("$line")
+    fi
+  done < <(find "$shipline" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
 
 # Seconds since the last look, or a day when there was none.
@@ -479,7 +507,8 @@ if ((${#resent[@]} == 0 && ${#handback_files[@]} == 0 && ${#cloud_files[@]} == 0
     exit "$failed"
   fi
   if [[ -r $TOLD && $(<"$TOLD") == "$seen" ]] &&
-      ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0 && ${#decision_events[@]} == 0)); then
+      ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0 && ${#balance_files[@]} == 0 &&
+        ${#decision_events[@]} == 0)); then
     log "  nothing changed since the last check-in; $name not told"
     exit "$failed"
   fi
@@ -507,7 +536,7 @@ if ((${#decision_held[@]} + ${#decision_events[@]})); then
   joined=$(printf '%s; ' "${decision_held[@]}" "${decision_events[@]}")
   message+=" Decisions: ${joined%; }."
 fi
-for line in "${metrics_lines[@]}" "${analysis_lines[@]}"; do
+for line in "${metrics_lines[@]}" "${analysis_lines[@]}" "${balance_lines[@]}"; do
   message+=" $line"
 done
 if [[ -n $service_line ]]; then
@@ -522,7 +551,8 @@ if send_to "$name" "$message"; then
     grep -xF -f <(asking_notes all; echo) >"$ASKED.new"
   mv "$ASKED.new" "$ASKED"
   rm -f "$PENDING"
-  for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${analysis_files[@]}"; do
+  for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${analysis_files[@]}" \
+      "${balance_files[@]}"; do
     rm -f -- "$event"
   done
   if [[ -n $decision_cursor ]]; then
@@ -542,9 +572,12 @@ if send_to "$name" "$message"; then
     done
   fi
   if ((${#stuck_files[@]})); then
-    mkdir -p "$main/$SHIPLINE_STATE_FOLDER/stuck.sent"
+    # stuck.pending to stuck.sent, and the self-update's wake.pending to wake.sent.
     for event in "${stuck_files[@]}"; do
-      mv -- "$event" "$main/$SHIPLINE_STATE_FOLDER/stuck.sent/${event##*/}"
+      sent=${event%/*}
+      sent=${sent%.pending}.sent
+      mkdir -p "$sent"
+      mv -- "$event" "$sent/${event##*/}"
     done
   fi
   if ((${#answer_files[@]})); then

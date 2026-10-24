@@ -103,12 +103,24 @@ if [ -z "$roles" ]; then
   exit 1
 fi
 recorded=
+recorded_jobs=
 if [ -f "$installed/pool-settings.sh" ]; then
   recorded=$(
     machine=
     . "$installed/pool-settings.sh"
     printf '%s' "$machine"
   )
+  # The PR slots this machine's own settings gave at its last install. The balancer changes
+  # ordinary_jobs as it runs (balance_runners.py), which is no move; a record written before
+  # installed_slots has only that.
+  recorded_jobs=$(
+    ordinary_jobs=
+    installed_slots=
+    . "$installed/pool-settings.sh"
+    printf '%s' "${installed_slots:-$ordinary_jobs}"
+  )
+  # A count that is no number is no record of one.
+  case "$recorded_jobs" in '' | *[!0-9]*) recorded_jobs= ;; esac
 fi
 # Two machines with the same name would take each other's runner registrations (`--replace`) and
 # retire each other's runners, so a machine is never taken to be one it was not named.
@@ -140,9 +152,26 @@ spares=0
 ! has_role ordinary || spares=$ordinary_spares
 
 if ! [ "$runners" -ge 0 ] 2>/dev/null || ! [ "$docker_runners" -ge 0 ] 2>/dev/null ||
-  { has_role ordinary && [ "$runners" -lt 1 ]; } ||
   [ $((runners + spares + docker_runners)) -gt "$most_runners" ]; then
   echo "There must be at least 1 ordinary runner, and at most $most_runners runners of both kinds together (including the spare)." >&2
+  exit 1
+fi
+# A machine of a pool of several may give all its PR slots to the others (README.md, "Moving a
+# machine's PR slots"): its spare still takes one while no other machine has an online ordinary
+# runner (keep-spare.sh), so it needs the spare. The only machine of the pool keeps one slot.
+if has_role ordinary && [ "$runners" -lt 1 ] &&
+  { [ -z "$other_machines" ] || [ "$spares" -lt 1 ]; }; then
+  echo "There must be at least 1 ordinary runner: $machine may have no PR slot of its own only while other_machines names another machine to take its PR jobs and it keeps its spare (ordinary_spares)." >&2
+  exit 1
+fi
+# The machine's own cap of one ordinary job, in place of settings.sh's `memory`: whole gigabytes,
+# as Docker reads them (runner-container.sh). Below a gigabyte no job would start.
+size=
+case "$job_memory" in
+  [1-9]*g) size=${job_memory%g} ;;
+esac
+if [ -n "$job_memory" ] && case "$size" in '' | *[!0-9]*) true ;; *) false ;; esac; then
+  echo "$machine_settings: job_memory must be whole gigabytes, such as 6g, not '$job_memory'." >&2
   exit 1
 fi
 ordinary_total=$((runners + spares))
@@ -183,8 +212,11 @@ printf '%s\n' "$SHIPLINE_IDENTITY_FOLDER" >"$tools/identity-folder"
 # The units for this prefix, rendered from systemd/.
 RUNNER_PREFIX=$prefix bash "$here/render-units.sh" "$tools/units"
 
-# Before anything is stopped or copied: a refused identity leaves the machine as it was. The
-# services running now take the new one at their next call.
+# Before anything is stopped or copied, and before the move's checks, which read GitHub's runners
+# with it: github_identity.py checks the new identity against GitHub before it replaces the old
+# one, so a refused identity leaves the machine as it was, and a refused move afterwards changes
+# no more than an identity GitHub has just accepted. The services running now take the new one at
+# their next call.
 if [ -n "$github_token" ]; then
   python3 "$tools/github_identity.py" install --repository "$repository" --token "$github_token"
 elif [ -n "$github_app_id" ]; then
@@ -197,8 +229,49 @@ gh() {
     python3 "$tools/github_budget.py" call --identity runner runner-install "$@"
 }
 
+# A move of PR slots is both machines agreeing (README.md, "Moving a machine's PR slots"): the
+# receiving machine installs first, and only then this one gives its slots up. So before anything
+# is stopped, a machine of a pool that would keep fewer PR slots than it holds needs GitHub to
+# list an online ordinary runner of another machine (`<machine>-<n>`, with the workflow label):
+# with none, the other machine is down, unreachable or not installed, and both counts stay. What
+# it holds is what its last install recorded, or else its own runners with the workflow label; a
+# first install holds none. A list it cannot read stops it too.
+if [ -n "$other_machines" ]; then
+  if ! listed=$(gh api --paginate "repos/$repository/actions/runners?per_page=100" --jq \
+    '.runners[] | [.name, .status, ([.labels[].name] | join(","))] | @tsv'); then
+    echo "Could not read GitHub's runners, so $machine cannot tell whether the other machines took its PR jobs: nothing was changed." >&2
+    exit 1
+  fi
+  others_ordinary="^($(printf '%s\n' $other_machines | paste -sd '|'))-[1-9][0-9]*\$"
+  held=$recorded_jobs
+  if [ -z "$held" ]; then
+    held=$(printf '%s\n' "$listed" | awk -F '\t' -v own="$own_runner" -v label="$label" '
+      $1 ~ own && index("," $3 ",", "," label ",") {n++} END {print n+0}')
+  fi
+  if [ "$runners" -lt "$held" ]; then
+    taken=$(printf '%s\n' "$listed" | awk -F '\t' -v others="$others_ordinary" -v label="$label" '
+      $1 ~ others && $2 == "online" && index("," $3 ",", "," label ",") {n++} END {print n+0}')
+    if [ "$taken" -lt 1 ]; then
+      echo "$machine would give up $((held - runners)) PR slots ($held to $runners), but GitHub lists no online ordinary runner of $other_machines with $label. Install the receiving machine first and wait for its runners (README.md, \"Moving a machine's PR slots\"): nothing was changed." >&2
+      exit 1
+    fi
+  fi
+fi
+
 mkdir -p "$installed" "$units"
 prefix=$prefix sh "$here/install-github-budget.sh"
+# The runner balancer leaves the runners alone until the install ends: it would find them stopped
+# and start more, or read pool-settings.sh half written. It holds the same lock while it changes
+# them, for at most the few minutes a runner takes to start.
+mkdir -p "$HOME/.local/state/workflow"
+exec 8>>"$HOME/.local/state/workflow/runner-balance.lock"
+flock -w 300 8 || { echo "The runner balancer did not let go of its lock in 5 minutes." >&2; exit 1; }
+# The runner balancer's own lines (its bounds, `balance off`): the machine settings', or, when
+# they name none, the installed ones, which outlast a reinstall. The counts are the ones this
+# install was given.
+balance_lines=$(python3 "$here/balance_runners.py" kept "$machine_settings")
+[ -n "$balance_lines" ] ||
+  balance_lines=$(python3 "$here/balance_runners.py" kept "$installed/pool-settings.sh")
 # What every script of this machine reads after settings.sh: the repository's names, its main
 # checkout, which machine this is and its counts. Each value is quoted for sh. Written before the
 # scripts are copied: a running service that restarts before this install stops it runs the new
@@ -214,7 +287,12 @@ quoted() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
   printf 'roles=%s\n' "$(quoted "$roles")"
   printf 'other_machines=%s\n' "$(quoted "$other_machines")"
   printf 'ordinary_jobs=%s\n' "$runners"
+  printf 'installed_slots=%s\n' "$runners"
   printf 'ordinary_blacksmith_jobs=%s\n' "$ordinary_blacksmith_jobs"
+  printf 'ordinary_spares=%s\n' "$spares"
+  printf 'docker_runners=%s\n' "$docker_runners"
+  [ -z "$balance_lines" ] || printf '%s\n' "$balance_lines"
+  [ -z "$job_memory" ] || printf 'job_memory=%s\n' "$job_memory"
 } >"$installed/pool-settings.tmp"
 mv "$installed/pool-settings.tmp" "$installed/pool-settings.sh"
 cp -L "$here"/*.sh "$here"/*.py "$installed/"
@@ -227,7 +305,8 @@ cp "$rendered/$container-firewall.service" "$installed/systemd/"
 cp "$rendered/$container-planner.service" "$rendered/$container"-main*.service "$units/"
 cp "$rendered/$container@.service" "$rendered/$container-docker@.service" \
   "$rendered/$container-spare.service" "$rendered/$container-lend.service" \
-  "$rendered/$container"-image.* "$rendered/$container"-usage.* "$units/"
+  "$rendered/$container"-image.* "$rendered/$container"-usage.* \
+  "$rendered/$container"-balance.* "$units/"
 if [ -n "$hub_cache" ]; then
   cp "$rendered/$hub_cache_container.service" "$rendered/$hub_cache_container"-watch.* "$units/"
 fi
@@ -334,6 +413,7 @@ has_role main || rm -f "$units"/default.target.wants/$container-main.service \
   "$units"/default.target.wants/$container-main-2.service \
   "$units"/default.target.wants/$container-lend.service
 has_role ordinary || rm -f "$units"/default.target.wants/$container-spare.service
+has_role ordinary || has_role docker || rm -f "$units"/timers.target.wants/$container-balance.timer
 systemctl --user daemon-reload
 
 # The mirror is an optimization, never a runner dependency. Its service retries if Docker Hub
@@ -376,6 +456,11 @@ while [ "$number" -le "$docker_runners" ]; do
   systemctl --user enable --now "$container-docker@$number.service"
   number=$((number + 1))
 done
+# After the runners it counts: it moves them between the kinds within the bounds of
+# pool-settings.sh, and changes nothing without them (balance_runners.py).
+if has_role ordinary || has_role docker; then
+  systemctl --user enable --now "$container-balance.timer"
+fi
 
 main_runners=0
 ! has_role main || main_runners=2

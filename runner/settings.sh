@@ -35,8 +35,11 @@ spare_poll_seconds=5
 subnet=172.30.0.0/24
 # Places 13 and 14 belong to main; place 15 belongs to the planner.
 most_runners=12
-# The most memory one job may use.
+# The most memory one job may use. A machine may name its own for its ordinary jobs, `job_memory`
+# in ~/.config/shipline/runner.sh, which install.sh writes into pool-settings.sh; without it this
+# one holds.
 memory=10g
+job_memory=
 # An address nobody owns (it is reserved for examples). The firewall answers it with "refused",
 # which is how keep-runner.sh can tell, without being root, that the firewall is in place.
 firewall_marker=192.0.2.1
@@ -58,6 +61,10 @@ hub_cache_port=5000
 # The most the cache may keep on this machine's disk. A job can pull any image of Docker Hub
 # through it, so above this the cache starts again empty (looked at every 10 minutes).
 hub_cache_most_megabytes=20480
+
+# The runner balancer (balance_runners.py) reads its own lines of pool-settings.sh, among them
+# `balance off`, which stops it. Every other script reads that line as nothing.
+balance() { :; }
 
 # One planning slot, outside the ordinary/Docker queue; place 15 stays in the firewall range.
 planner_place=15

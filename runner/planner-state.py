@@ -23,6 +23,26 @@ def _read(*command: str) -> str:
 _LISTING_SECONDS = 20
 
 
+def counts(maximum: int, reduced: int, here: Path | None = None) -> tuple[int, int]:
+    """The slots and the slots kept while hosted overflow has budget, as pool-settings.sh says
+    them now: the runner balancer (balance_runners.py) changes them while this runs. The ones it
+    had when the file cannot be read."""
+    here = here or Path(__file__).parent
+    try:
+        words = _read(
+            "sh",
+            "-c",
+            '. "$1/settings.sh" >/dev/null 2>&1; . "$1/pool-settings.sh" >/dev/null 2>&1; '
+            'printf "%s %s" "$ordinary_jobs" "$ordinary_blacksmith_jobs"',
+            "sh",
+            str(here),
+        ).split()
+        jobs, blacksmith = (int(word) for word in words)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return maximum, reduced
+    return jobs, blacksmith
+
+
 def others(
     machines: list[str], label: str, listing: Path | None = None, now: float | None = None
 ) -> tuple[int, int]:
@@ -101,6 +121,24 @@ def snapshot(
     }
 
 
+def _slots(maximum: int, reduced: int, repository: str, label: str, machines: list[str]) -> int:
+    """This machine's PR slots now, as the spare supervisor counts them: with the other machines
+    and the runner listing it saves, so a machine with no slot of its own shows the one its spare
+    takes while none of the others has an online ordinary runner (ordinary_slots.py)."""
+    return int(
+        _read(
+            sys.executable,
+            str(Path(__file__).with_name("ordinary_slots.py")),
+            str(maximum),
+            str(reduced),
+            repository,
+            label,
+            " ".join(machines),
+            str(Path(__file__).with_name("runners.tsv")),
+        )
+    )
+
+
 def main() -> None:
     maximum, reduced, repository = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
     # The other machines, the pool's label and its runners' container names (keep-planner.sh).
@@ -109,16 +147,8 @@ def main() -> None:
     folder.mkdir(parents=True, exist_ok=True)
     while True:
         try:
-            slots = int(
-                _read(
-                    sys.executable,
-                    str(Path(__file__).with_name("ordinary_slots.py")),
-                    str(maximum),
-                    str(reduced),
-                    repository,
-                    label,
-                )
-            )
+            maximum, reduced = counts(maximum, reduced)
+            slots = _slots(maximum, reduced, repository, label, machines)
             state = snapshot(slots, machines, label, container)
             temporary = folder / "state.tmp"
             temporary.write_text(json.dumps(state))
