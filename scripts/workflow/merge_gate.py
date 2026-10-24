@@ -3818,6 +3818,11 @@ def _prefix_state(member: dict[str, Any], folder: Path) -> Prefix:
                 pending.append(waits)
                 continue
         if state == "red":
+            waits = check_repair.runner_wait(folder, found[0], parts)
+            if waits:
+                pending.append(waits)
+                continue
+        if state == "red":
             return Prefix(
                 "red",
                 f"{workflow} run {found[0]['id']} of {whose} failed ({', '.join(failing)})",
@@ -4197,6 +4202,10 @@ def _whole_suite_run(
             except Refused, KeyError, TypeError, ValueError, IndexError:
                 # Unreadable evidence of the service proves no wait: refused as before.
                 waits = None
+            if waits:
+                return _batch_wait(f"merge train: {waits}")
+        if state == "red":
+            waits = check_repair.runner_wait(train.path.parent, found[0], parts)
             if waits:
                 return _batch_wait(f"merge train: {waits}")
         if state == "red":

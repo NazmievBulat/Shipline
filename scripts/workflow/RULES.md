@@ -699,10 +699,15 @@ of its head (it waits while one still runs), and for each failed, timed-out or c
 failing test is the first pytest line `FAILED <file>.py::<test>` (or `ERROR`), else the first
 Vitest `FAIL <file>.test.<ext> > <name>`, else the first Playwright
 `1) [project] › <file>.spec.ts:L:C › <name>`; with none, it is "not reported". A job failed
-for its runners when it timed out, or when it names no test and its log or annotations say
-that the runner was lost, disconnected or shut down, lost communication or could not be
+for its runners when it names no failing test and either it timed out or its log or annotations
+say that the runner was lost, disconnected or shut down, lost communication or could not be
 contacted, that the job exceeded its time, or "Failed to download action" or "Internal server
-error".
+error"; also a registry or BuildKit transport error ("short read" or "unexpected EOF" while
+resolving, pulling or exporting an image layer or manifest, including "failed to compute cache
+key", or "connection reset by peer", "i/o timeout" or "TLS handshake timeout" against a
+registry or pull-through cache), with no failing test found. The same classification applies
+to a prefix's and a whole suite's scratch runs. A run still in progress waits until every job
+completes before its failed jobs can be re-run; the handoff and merge-line place are kept.
 - A job that failed on a test of its own: the tick makes the pull request a draft, revokes its
   handoff, keeps its place in the line as a blocked member, and starts a worker at medium
   effort whose sentence names the job, its run and the first failing test (below). The wake

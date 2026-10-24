@@ -40,6 +40,22 @@ _INFRASTRUCTURE = re.compile(
     r"|(?<![0-9] )(?<![0-9] \()Internal server error",
     re.IGNORECASE,
 )
+# A transport failure needs build or registry context. A server under test can use the
+# same words; a BuildKit vertex's FROM/metadata/export line supplies context to its error.
+_TRANSPORT = re.compile(
+    r"\b(?:short read|unexpected EOF|connection reset by peer|i/o timeout|TLS handshake timeout)\b",
+    re.IGNORECASE,
+)
+_BUILD_TRANSPORT = re.compile(
+    r"\b(?:registry|pull-through cache|failed to solve|failed to compute cache key)\b"
+    r"|\b(?:pull\w*|resolv\w*|export\w*)\b[^\n]*\b(?:layer|manifest|image)\b"
+    r"|\b(?:layer|manifest)\b[^\n]*\b(?:pull\w*|resolv\w*|export\w*)\b"
+    r"|\bload metadata for\b|#\d+\s+(?:\[[^\]\n]+\]\s+)?(?-i:FROM)\s+\S+",
+    re.IGNORECASE,
+)
+_VERTEX = re.compile(r"(?<!\w)#(\d+)\s+")
+
+
 NOT_REPORTED = "not reported"
 # What a sentence may hold of GitHub's words: the sentence goes inside double quotes in a shell
 # command, so no quotation mark, dollar, backtick, backslash or comma (which ends its parts).
@@ -61,6 +77,23 @@ def first_test(diagnostics: str) -> str | None:
         if found:
             return found[1].strip()
     return None
+
+
+def transport_error(diagnostics: str) -> bool:
+    lines = diagnostics.splitlines()
+    vertices = {
+        vertex[1]
+        for line in lines
+        if _BUILD_TRANSPORT.search(line) and (vertex := _VERTEX.search(line))
+    }
+    return any(
+        _TRANSPORT.search(line)
+        and (
+            _BUILD_TRANSPORT.search(line)
+            or ((vertex := _VERTEX.search(line)) and vertex[1] in vertices)
+        )
+        for line in lines
+    )
 
 
 def path(folder: Path, number: str) -> Path:
@@ -150,12 +183,30 @@ def diagnose(pull: dict[str, Any]) -> Diagnosis:
                 raise gate.Waiting(f"run {found['id']} of the failed head is still running")
             if found.get("conclusion") not in ("success", "skipped", "neutral"):
                 failed_runs.append(found)
+    return diagnose_runs(
+        head,
+        [
+            (found, gate.api(f"{gate.API}/actions/runs/{found['id']}/jobs?per_page=100", "jobs"))
+            for found in failed_runs
+        ],
+    )
+
+
+def diagnose_runs(
+    head: str, failed_runs: list[tuple[dict[str, Any], list[dict[str, Any]]]]
+) -> Diagnosis:
+    """Classify completed runs, including a prefix or whole suite's scratch runs."""
+    import merge_gate as gate
+
     own: list[tuple[str, Repair]] = []
     # Why a reviewer judges it, unless a job named a failing test of its own.
     judgments: list[str] = []
     infrastructure: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
-    for found in failed_runs:
-        parts = gate.api(f"{gate.API}/actions/runs/{found['id']}/jobs?per_page=100", "jobs")
+    for found, parts in failed_runs:
+        if found.get("status") != "completed" or any(
+            job.get("status") != "completed" for job in parts
+        ):
+            raise gate.Waiting(f"run {found['id']} of the failed head is still running")
         failed = [
             job
             for job in parts
@@ -174,13 +225,15 @@ def diagnose(pull: dict[str, Any]) -> Diagnosis:
                 ]
             )
             test = first_test(diagnostics)
-            if job["conclusion"] == "timed_out" or (
-                test is None and _INFRASTRUCTURE.search(diagnostics)
+            if test is None and (
+                job["conclusion"] == "timed_out"
+                or _INFRASTRUCTURE.search(diagnostics)
+                or transport_error(diagnostics)
             ):
                 runners = True
                 continue
             name = safe(job.get("name", "")) or f"job {job['id']}"
-            if job["conclusion"] != "failure":
+            if job["conclusion"] != "failure" and test is None:
                 # A job cancelled beside a failing one (fail-fast) says nothing of its own.
                 cancelled.append(f"{name} of run {found['id']} was cancelled")
                 continue
@@ -211,6 +264,35 @@ def diagnose(pull: dict[str, Any]) -> Diagnosis:
     if infrastructure and len(infrastructure) == len(failed_runs):
         return Diagnosis("infrastructure", "its runners failed it", runs=infrastructure)
     return Diagnosis("judgment", "no failed job of its latest runs could be judged")
+
+
+def runner_wait(
+    folder: Path, found: dict[str, Any], parts: list[dict[str, Any]]
+) -> str | None:
+    """A red scratch run waits for completion, then gets the handoff's one runner retry."""
+    import merge_gate as gate
+
+    if found.get("status") != "completed" or any(
+        job.get("status") != "completed" for job in parts
+    ):
+        return f"run {found['id']} is still running; waiting before judging its failed jobs"
+    try:
+        # The verdict groups matrix parts into one check. Diagnostics and retry eligibility
+        # need every original job's ID, status and runner labels.
+        parts = gate.api(f"{gate.API}/actions/runs/{found['id']}/jobs?per_page=100", "jobs")
+        if any(job.get("status") != "completed" for job in parts):
+            return f"run {found['id']} is still running; waiting before judging its failed jobs"
+        if not marker(folder, found["id"]).exists() and not _retryable(gate, found, parts):
+            return None
+        diagnosis = diagnose_runs(found["head_sha"], [(found, parts)])
+    except gate.Waiting:
+        raise
+    except gate.Refused, KeyError, TypeError, ValueError, IndexError:
+        # Missing or unreadable diagnostics do not authorize an automatic retry.
+        return None
+    if diagnosis.kind != "infrastructure":
+        return None
+    return rerun(folder, diagnosis)
 
 
 def _retryable(gate: Any, found: dict[str, Any], parts: list[dict[str, Any]]) -> bool:
@@ -263,6 +345,11 @@ def rerun(folder: Path, diagnosis: Diagnosis) -> str | None:
                 waits.append(_REQUESTED.format(run=found["id"]))
                 continue
             # Its one re-run failed again, or was refused: a reviewer judges it.
+            if _state(claim) != "refused":
+                diagnosis.reason = f"its runners failed it again in run {found['id']}"
+                if _state(claim) != "repeated":
+                    gate.wake_log(diagnosis.reason)
+                    write_json(claim, {"state": "repeated"})
             return None
         if not _retryable(gate, found, parts):
             return None
@@ -295,6 +382,12 @@ def rerun(folder: Path, diagnosis: Diagnosis) -> str | None:
             raise
         if done.returncode:
             error = done.stderr.strip() or done.stdout.strip()
+            if "this workflow is already running" in error.lower():
+                # GitHub definitely refused the request: no retry was consumed. Its run
+                # list can lag behind the other jobs still running in this attempt.
+                claim.unlink()
+                waits.append(f"run {found['id']} is still running; waiting to re-run failed jobs")
+                continue
             write_json(claim, {"state": "refused", "error": error})
             gate.wake_log(f"automatic retry of run {found['id']} refused: {error}")
             return None

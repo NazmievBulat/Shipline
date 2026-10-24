@@ -221,7 +221,7 @@ def answer(args, cwd, env, out, err):
         print(log.read_text())
     elif args[:2] == ["run", "rerun"]:
         if (state / "fail-rerun").exists():
-            sys.exit("rerun refused")
+            sys.exit((state / "fail-rerun").read_text().strip() or "rerun refused")
     elif args[:2] == ["run", "cancel"]:
         # Each cancel is written down with the scratch branches GitHub still has at that moment.
         listed = check_output(["git", "--git-dir", data["origin"], "for-each-ref",
@@ -8389,6 +8389,14 @@ def test_prefix_transport_retry_keeps_the_prefix_until_the_second_result(
     job = next(j for j in jobs if j["name"] not in
                ("CI: what to run", "CI result", "Docker images: what to run", "E2E: what to run"))
     job.update(conclusion="failure", labels=["example-app-home-docker"])
+    if workflow_name == "ci":
+        # The grouped check copies the passing first part's ID; the failing log is the
+        # second part's. Classifying the grouped check would miss the transport failure.
+        job["name"] = "CI: server tests (2 of 2)"
+        jobs.insert(jobs.index(job), {
+            **job, "id": job["id"] + 100, "name": "CI: server tests (1 of 2)",
+            "conclusion": "success",
+        })
     logs = github.workflow.state / "job-logs"
     logs.mkdir(exist_ok=True)
     (logs / str(job["id"])).write_text(
@@ -8420,3 +8428,52 @@ def test_prefix_transport_retry_keeps_the_prefix_until_the_second_result(
     assert done.returncode == (0 if second == "passes" else 1), done.stdout + done.stderr
     assert len(rerun_calls(github.workflow)) == 1
     assert ("7" in _batch_state(github)["blocked"]) == (second != "passes")
+    if second != "passes":
+        assert f"its runners failed it again in run {run['id']}" in github.workflow.wake_log.read_text()
+
+
+@pytest.mark.parametrize("second", ["passes", "fails again"])
+@pytest.mark.parametrize("workflow_name", ["ci", "e2e"])
+def test_whole_suite_transport_retry_keeps_the_scratch_run(
+    github: GitHub, second: str, workflow_name: str
+) -> None:
+    if workflow_name == "ci":
+        tree = _selected_server_tests(github)
+    else:
+        tree = _changes(github)
+        github.e2e(github.head, tree, suite="selected: 3 of 48 spec files", run_id=900_020)
+    assert _batch_call(github).returncode == 3
+    suite = _suite(github)
+    if workflow_name == "ci":
+        github.e2e(suite["head"], tree, run_id=950_100, branch=suite["branch"])
+        github.ci_dispatched(suite["head"], suite["branch"], run_id=950_000, conclusion="failure")
+    else:
+        github.e2e(suite["head"], tree, run_id=950_000, branch=suite["branch"], conclusion="failure")
+    path = (f"{_REPO}/actions/workflows/{workflow_name}.yml/runs?head_sha={suite['head']}"
+            "&event=workflow_dispatch&per_page=100")
+    run = github.api[path]["workflow_runs"][0]
+    run["run_attempt"] = 1
+    jobs = github.api[f"{_REPO}/actions/runs/950000/jobs?per_page=100"]["jobs"]
+    for job in jobs:
+        job["labels"] = ["example-app-home-docker"]
+    logs = github.workflow.state / "job-logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "950002").write_text("failed to solve: registry: TLS handshake timeout\n")
+    github.api[f"{_REPO}/check-runs/950002/annotations?per_page=100"] = []
+    github.save()
+    for _ in range(2):
+        done = _batch_call(github)
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert _suite(github)["branch"] == suite["branch"]
+        assert "7" not in _batch_state(github)["blocked"]
+        assert rerun_calls(github.workflow) == [
+            "gh run rerun 950000 -R example-org/example-app --failed"]
+    run.update(run_attempt=2, conclusion="success" if second == "passes" else "failure")
+    for job in jobs[1:]:
+        job["conclusion"] = run["conclusion"]
+    github.save()
+    done = _batch_call(github)
+    assert done.returncode == (0 if second == "passes" else 1), done.stdout + done.stderr
+    assert len(rerun_calls(github.workflow)) == 1
+    if second != "passes":
+        assert "its runners failed it again in run 950000" in github.workflow.wake_log.read_text()

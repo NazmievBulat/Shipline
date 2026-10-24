@@ -2270,6 +2270,8 @@ def test_a_runner_error_is_rerun_once_then_handed_back_to_a_reviewer(
     else:
         assert not _note(workflow).exists()
         assert _started(workflow) == ["review-7"]
+        assert "its runners failed it again in run 20" in workflow.wake_log.read_text()
+        assert any("failed it again" in reason for reason in _handbacks(workflow))
 
 
 def test_a_runner_error_on_runners_the_gate_may_not_rerun_on_is_handed_back(
@@ -2471,8 +2473,9 @@ def test_a_failing_test_without_the_label_keeps_its_audit_path(handed: GitHub) -
 
 
 @pytest.mark.parametrize("workflow_name", ["ci", "images", "e2e"])
+@pytest.mark.parametrize("run_status", ["in_progress", "completed"])
 def test_transport_retry_waits_for_the_entire_run_and_keeps_the_handoff(
-    handed: GitHub, workflow_name: str
+    handed: GitHub, workflow_name: str, run_status: str
 ) -> None:
     workflow = handed.workflow
     _github_answers_repairs(workflow)
@@ -2486,7 +2489,7 @@ def test_transport_retry_waits_for_the_entire_run_and_keeps_the_handoff(
     jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
     jobs[-1]["name"] = "Docker images: image tests"
     jobs[0].update(status="in_progress", conclusion=None)
-    run.update(status="in_progress", conclusion=None)
+    run.update(status=run_status, conclusion="failure" if run_status == "completed" else None)
     handed.save()
     done = workflow.run_script("tick")
     assert done.returncode == 0, done.stdout + done.stderr
@@ -2509,11 +2512,68 @@ def test_transport_retry_waits_for_the_entire_run_and_keeps_the_handoff(
     "server under test: connection reset by peer\n",
     "server under test: i/o timeout\n",
     "server under test: unexpected EOF\n",
+    "unexpected EOF from server under test\n",
+    "failed to solve: failed to compute cache key: file not found\n",
+    "#1 [internal] load metadata for example-app\n#2 server under test: unexpected EOF\n",
 ])
 def test_transport_words_do_not_override_a_test_failure(handed: GitHub, log: str) -> None:
     workflow = handed.workflow
     _github_answers_repairs(workflow)
     _fail(handed, log=log)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh run rerun") == []
+    assert not _note(workflow).exists()
+    assert workflow.calls("gh pr ready") == ["gh pr ready 7 -R example-org/example-app --undo"]
+
+
+@pytest.mark.parametrize("log", [
+    "failed to solve: failed to compute cache key: short read: unexpected EOF\n",
+    "ERROR: unexpected EOF while exporting a manifest\n",
+    "ERROR: short read while resolving an image layer\n",
+    "registry pull: connection reset by peer\n",
+    "registry: i/o timeout\n",
+    "pull-through cache: TLS handshake timeout\n",
+    "failed to solve: connection reset by peer\n",
+])
+def test_registry_transport_errors_are_retried_through_the_handoff(
+    handed: GitHub, log: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log=log)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh run rerun") == ["gh run rerun 20 -R example-org/example-app --failed"]
+    assert _note(workflow).exists()
+    assert _started(workflow) == []
+
+
+
+def test_github_still_running_refusal_does_not_consume_the_retry(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log="failed to solve: short read: unexpected EOF\n")
+    refused = workflow.state / "fail-rerun"
+    refused.write_text("This workflow is already running")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _note(workflow).exists()
+    assert _started(workflow) == []
+    assert not (_folder(workflow) / "check-rerun-20.json").exists()
+    refused.unlink()
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("gh run rerun")) == 2
+    assert _note(workflow).exists()
+    assert json.loads((_folder(workflow) / "check-rerun-20.json").read_text())["state"] == "requested"
+
+
+
+def test_a_reported_test_wins_even_when_its_job_times_out(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, conclusion="timed_out", log="failed to solve: unexpected EOF\n" + _FAILED_TEST)
     done = workflow.run_script("tick")
     assert done.returncode == 0, done.stdout + done.stderr
     assert workflow.calls("gh run rerun") == []
