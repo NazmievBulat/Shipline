@@ -13,6 +13,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import workflow_config
 from github_budget import Limited, call
 
 MARKER = "<!-- cloud-worker -->"
@@ -26,12 +27,11 @@ def _write(path: Path, value: dict[str, object]) -> None:
 
 
 def _comments(number: str) -> list[dict[str, object]]:
-    repository = os.environ.get("WORKFLOW_REPOSITORY", "NazmievBulat/Shipline")
     result = call(
         "cloud-workers",
         "api",
         "--paginate",
-        f"repos/{repository}/issues/{number}/comments?per_page=100",
+        f"{workflow_config.current().api}/issues/{number}/comments?per_page=100",
         "--jq",
         ".[] | @json",
         timeout=30,
@@ -141,7 +141,9 @@ def _recover(path: Path) -> None:
                         if record.get("status") == "retryable"
                         else "no View address; reservation kept, retrying address recovery only"
                     ),
-                    "url": f"https://github.com/{os.environ.get('WORKFLOW_REPOSITORY', 'NazmievBulat/Shipline')}/pull/{number}",
+                    "url": (
+                        f"https://github.com/{workflow_config.current().repository}/pull/{number}"
+                    ),
                 },
             )
             record["launch_noted"] = True
@@ -264,7 +266,7 @@ def main() -> int:
     parser.add_argument("number", nargs="?")
     parser.add_argument("url", nargs="?")
     args = parser.parse_args()
-    notes = args.main / ".local/workflow"
+    notes = args.main / workflow_config.current().state_folder
     now = int(os.environ.get("WORKFLOW_NOW", time.time()))
     if args.command == "allowed":
         return 0 if _allowed(Path(__file__).parent) else 1

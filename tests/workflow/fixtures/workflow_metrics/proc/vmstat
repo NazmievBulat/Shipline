@@ -1,0 +1,4 @@
+nr_free_pages 1234567
+pswpin 1200
+pswpout 3400
+pgfault 99999
