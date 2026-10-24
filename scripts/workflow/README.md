@@ -81,6 +81,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `repository` | `owner/name` on GitHub | `repository` as Bash reads it from `.github/runner/settings.sh` (sourced in a `bash` of its own, with only `PATH` and `HOME`, for at most 5 seconds), else the `origin` remote on GitHub; a script that needs it stops when neither names one |
 | `state_folder` | the folder of the workflow's notes, in the main checkout and in each worktree | `.local/workflow` |
 | `worktree_setup` | the command that prepares a new worktree, run only when present | `scripts/setup-worktree` |
+| `refresh.clear_generated` | generated output a refresh clears in the pull request's worktree after it merges main and before it pushes: paths or globs (`*`, `?`, `[…]`, `**`) from the top of the checkout; only the ignored, untracked files under them are removed, and a path that is tracked, not ignored, outside the checkout or through a symbolic link is refused when the file is read | none: nothing is cleared |
 | `checks.ci_result` | the check that sums up CI | `CI result` |
 | `checks.ci_plan`, `checks.e2e_plan` | the planner checks of CI and of the browser suite | `CI: what to run`, `E2E: what to run` |
 | `checks.images` | the prefix of every image check; its planner is `<prefix>: what to run` | `Docker images` |

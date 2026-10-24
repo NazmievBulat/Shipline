@@ -4,6 +4,9 @@ Install after a green Blacksmith trial. Only the host reads the repository switc
 runner programs' own GitHub identity or its gh login: home gives up a slot only while Blacksmith
 takes automatic overflow.
 Budget reads include live reservations crossing a month boundary.
+
+A machine that gave all its PR slots to the other machines (install.sh) takes one back while none
+of them has an online ordinary runner, so PR jobs still run when the others are off.
 """
 
 import json
@@ -11,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -113,17 +117,54 @@ def _used(root: Path, now: datetime, label: str) -> int:
     return sum(costs.values())
 
 
+# The spare supervisor reads the listing every five seconds (planner-state.py); an older one is
+# no proof of anything.
+_LISTING_SECONDS = 20
+
+
+def others_online(machines: list[str], label: str, listing: Path) -> bool | None:
+    """Whether another machine has an online ordinary runner (`<machine>-<n>`, names.sh) with the
+    workflow label, in the spare supervisor's runner listing (keep-spare.sh). Main's runners are
+    not counted, even while one is lent to PR jobs: it is busy exactly when main has work. None
+    when the listing is missing, stale or unreadable."""
+    try:
+        if not 0 <= time.time() - listing.stat().st_mtime < _LISTING_SECONDS:
+            return None
+        rows = listing.read_text(encoding="utf-8").splitlines()
+    except (OSError, ValueError):
+        return None
+    names = re.compile(f"({'|'.join(map(re.escape, machines))})-[1-9][0-9]*")
+    for row in rows:
+        fields = row.split("\t")
+        if (
+            len(fields) == 5
+            and names.fullmatch(fields[1])
+            and fields[2] == "online"
+            and label in fields[4].split(",")
+        ):
+            return True
+    return False
+
+
 def slots(
     maximum: int,
     reduced: int,
     repository: str,
     label: str,
     *,
+    machines: list[str] | None = None,
+    listing: Path | None = None,
     root: Path | None = None,
     now: datetime | None = None,
 ) -> int:
     root = root or Path.home() / ".local/state/ci-overflow"
     now = now or datetime.now(UTC)
+    # No slot of its own: one while the listing shows no other machine's ordinary runner online.
+    # Without a listing to show it, none.
+    if maximum == 0:
+        if machines and listing and others_online(machines, label, listing) is False:
+            return 1
+        return 0
     try:
         if (
             reduced < maximum
@@ -143,4 +184,15 @@ if __name__ == "__main__":
         print("Home slot budget unavailable: no pool label given", file=sys.stderr)
         print(int(sys.argv[1]))
     else:
-        print(slots(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]))
+        # ordinary_slots.py <slots> <slots while Blacksmith overflows> <repository> <workflow label>
+        #   [<other machines> <runner listing>]
+        print(
+            slots(
+                int(sys.argv[1]),
+                int(sys.argv[2]),
+                sys.argv[3],
+                sys.argv[4],
+                machines=sys.argv[5].split() if len(sys.argv) > 5 else None,
+                listing=Path(sys.argv[6]) if len(sys.argv) > 6 else None,
+            )
+        )

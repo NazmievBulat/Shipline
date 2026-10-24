@@ -26,6 +26,10 @@
 # whose wait loop finds its own shell, `wait loop finds itself? ticket-426 (running: ...)`, each
 # ending `; nudge sent` when the tick nudged it, and one idle 50 minutes that no rule covers,
 # `idle, no rule: ticket-426 (50 min, last line: <line>)`.
+# So is what the tick's self-update of Shipline's own checkout (`self_update.py`) notes, once
+# each: `shipline rolled back: <bad sha> -> <good sha>, <reason>`, a checkout it left alone for
+# its local changes, and a pin that stops it. When several repositories share that checkout,
+# the first wake to send tells it.
 #
 # What the tick's automatic ticket start did, and why the next ticket waits, rides with the
 # next check-in, a line each, once per change (`ticket_starts.py` notes them): `started 611
@@ -248,6 +252,16 @@ if [[ -d $stuck ]]; then
       stuck_lines+=("$line")
     fi
   done < <(find "$stuck" -type f -name '*.json' -print0 | sort -z)
+fi
+# The self-update's notes are in the Shipline checkout these scripts are in, not the repository's.
+shipline=$(cd "$here/../.." && pwd)/.local/shipline/wake.pending
+if [[ -d $shipline ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '.line | strings' "$event"); then
+      stuck_files+=("$event")
+      stuck_lines+=("$line")
+    fi
+  done < <(find "$shipline" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
 
 # Seconds since the last look, or a day when there was none.
@@ -557,9 +571,12 @@ if send_to "$name" "$message"; then
     done
   fi
   if ((${#stuck_files[@]})); then
-    mkdir -p "$main/$SHIPLINE_STATE_FOLDER/stuck.sent"
+    # stuck.pending to stuck.sent, and the self-update's wake.pending to wake.sent.
     for event in "${stuck_files[@]}"; do
-      mv -- "$event" "$main/$SHIPLINE_STATE_FOLDER/stuck.sent/${event##*/}"
+      sent=${event%/*}
+      sent=${sent%.pending}.sent
+      mkdir -p "$sent"
+      mv -- "$event" "$sent/${event##*/}"
     done
   fi
   if ((${#answer_files[@]})); then

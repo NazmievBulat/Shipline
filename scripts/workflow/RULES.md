@@ -158,9 +158,10 @@ wakes the first member's reviewer or audit for a lost check, once for each turn 
 state of main and head, or drives its handoff, and the wake tells the orchestrator
 `lost check: <check> of run <id> on pull request N` at any hour, once per head.
 
-A stale run is refreshed by merging current main into the clean pull request worktree and
-pushing, then the gate exits without merging the pull request. Wait for that new CI run and
-call the gate again. Re-running an old workflow reuses the original merge commit and cannot
+A stale run is refreshed by merging current main into the clean pull request worktree,
+clearing the ignored, untracked generated output listed in `refresh.clear_generated` in that
+worktree before pushing, then the gate exits without merging the pull request. Wait for that
+new CI run and call the gate again. Re-running an old workflow reuses the original merge commit and cannot
 prove freshness. A run from before CI recorded its tested merge needs a fresh run too; if main
 is already in the branch, the gate pushes an empty commit. A conflict is left for the session
 to resolve, with `merge main: conflict in <files>` as the merge message. Never resolve a

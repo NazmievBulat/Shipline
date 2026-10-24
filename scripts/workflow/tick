@@ -68,6 +68,14 @@
 #      checks have not started, the merge line's prefixes still to be built), written to
 #      ~/.local/state/workflow/ci-demand.json for the runner balancer.
 #
+# Before all of these, before even the config is read, `self_update.py` keeps Shipline's own
+# checkout current: it moves it to Shipline's `main` once that commit's CI passed, or back to
+# the last good commit when the new one crashed 3 times in a row. When it moved, the tick runs
+# again from the start as the version now checked out. Each tick's end is counted on the
+# version it started on: a crash is an exit other than 0 or 1, or a traceback or an error of the
+# shell in what the tick and its steps print to standard error, which passes through
+# `self_update.py watch` on its way.
+#
 # Steps 1 and 2 are the one place a session is closed, and only when its work no longer exists.
 # The starts come last because the steps before them may free memory they need.
 # Audits are not started here: the orchestrator session starts one by hand, and only for a
@@ -115,6 +123,38 @@ ANALYST_DAILY_AT=${WORKFLOW_ANALYST_DAILY_AT-08:00}
 USAGE_CEILING=85
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# A self-update that cannot be done leaves the tick to go on as it is. One move a tick: the
+# tick that runs again after it moves nothing.
+moved=${SHIPLINE_TICK_MOVED:-}
+unset SHIPLINE_TICK_MOVED
+python3 -B "$here/self_update.py" start "$$" ${moved:+moved}
+kept=$?
+if ((kept == 10)) && [[ -z $moved ]]; then
+  SHIPLINE_TICK_MOVED=1 exec bash "$here/tick" "$@"
+fi
+# Set when this tick only found the one before it still running: it counts neither way.
+tick_skipped=""
+tick_watched=""
+# 12: the self-update crashed itself, which this tick's end counts.
+if ((kept == 0 || kept == 10 || kept == 12)); then
+  tick_watched=watched
+  exec 7>&2 2> >(python3 -B "$here/self_update.py" watch "$$" 2>&7 >&7 7>&-)
+fi
+tick_ended() {
+  if [[ -n $tick_watched ]]; then
+    # Everything printed before this line was read; what follows goes straight out. A watch
+    # that is gone must not end the tick before its end is counted.
+    trap '' PIPE
+    printf 'shipline-tick-ended %s\n' "$$" >&2
+    exec 2>&7 7>&-
+  fi
+  python3 -B "$here/self_update.py" end "$$" "$1" $tick_skipped $tick_watched 9>&- || true
+}
+trap 'tick_ended $?' EXIT
+# A tick that is stopped exits as stopped, not with the status of its last command.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 gh() { python3 "$here/github_budget.py" call tick "$@"; }
 source "$here/bridge-failed"
 # The repository, its check names, labels and state folder (`workflow_config.py`), read once.
@@ -142,6 +182,7 @@ mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
 exec 9>"$common/shipline-tick.lock"
 if ! flock --nonblock 9; then
   echo "the tick before this one is still running"
+  tick_skipped=skipped
   exit 0
 fi
 
@@ -152,12 +193,12 @@ export WORKFLOW_TRAIN_TICK
 WORKFLOW_TRAIN_TICK=$(mktemp -d)
 export WORKFLOW_SESSION_SNAPSHOT=$WORKFLOW_TRAIN_TICK/sessions
 python3 -c 'import json,sys,time; json.dump({"started": time.time()}, open(sys.argv[1], "w"))' "$WORKFLOW_TRAIN_TICK/context.json"
-trap 'rm -rf "$WORKFLOW_TRAIN_TICK"' EXIT
+trap 'tick_code=$?; rm -rf "$WORKFLOW_TRAIN_TICK"; tick_ended "$tick_code"' EXIT
 
 # The lock is closed for everything the tick calls: a `tmux` server started here lives on
 # after the tick, and would hold the lock for as long as its session runs.
 session() {
-  bash "$here/session" "$@" 9>&- 8>&-
+  bash "$here/session" "$@" 9>&- 8>&- 7>&-
 }
 
 # An audit ends with "audit finished", a worker with "worker finished", a hunt with "hunt
@@ -473,7 +514,7 @@ if [[ $METRICS_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] &&
   if mkdir -p "$HOME/.local/state/workflow"; then
     env -u WORKFLOW_TRAIN_TICK -u WORKFLOW_SESSION_SNAPSHOT -u WORKFLOW_DEFER_START \
       WORKFLOW_NOW="$NOW" setsid bash "$here/workflow-metrics" --daily </dev/null \
-      >>"$HOME/.local/state/workflow/metrics.log" 2>&1 9>&- &
+      >>"$HOME/.local/state/workflow/metrics.log" 2>&1 7>&- 9>&- &
   else
     failed=1
   fi
