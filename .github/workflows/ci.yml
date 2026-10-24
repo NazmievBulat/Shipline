@@ -107,7 +107,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.local/tmux
-          key: tmux-3.4-no-systemd-${{ runner.os }}-${{ runner.arch }}
+          # A new runner image may bring other libraries to link against.
+          key: tmux-3.4-no-systemd-${{ env.ImageOS }}-${{ runner.arch }}
       - name: Build tmux without systemd
         if: steps.tmux.outputs.cache-hit != 'true'
         run: |
