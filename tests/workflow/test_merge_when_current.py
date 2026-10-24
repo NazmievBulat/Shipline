@@ -5401,9 +5401,17 @@ def test_a_green_scratch_rerun_restores_the_isolated_members_earlier_place(
     # On the same main, the passed rerun is its prefix: it merges without another run.
     assert done.returncode == (2 if moved else 0), done.stdout + done.stderr
     assert _merges(github) == ([] if moved else ["7"])
-    # 7, 8 and 9; 8 and 9 again behind the new front after the failure; and, once 7 is back in
-    # front of them, 8 and 9 once more on top of it. A refresh dispatches nothing.
-    assert len(github.workflow.calls("gh workflow run ci.yml")) == (5 if moved else 7)
+    # 7, 8 and 9; then 8 and 9 without the failed member. Restoring 7 starts no replacement
+    # runs on the old main. If 7 merges, its new main is where 8 and 9 are tested next.
+    assert len(github.workflow.calls("gh workflow run ci.yml")) == 5
+    if not moved:
+        base = github.workflow.git("rev-parse", "origin/main")
+        done = _batch_call(github, "8")
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert len(github.workflow.calls("gh workflow run ci.yml")) == 7
+        assert _scratch(github, "8")["under"] == github.workflow.git(
+            "rev-parse", f"{base}^{{tree}}"
+        )
 
 
 def _restored_before_eight(
@@ -5569,6 +5577,20 @@ def test_an_old_scratch_name_is_cancelled_but_other_branches_are_untouched(githu
     assert list(_cancelled(github)) == ["901"]
     assert branch not in _scratch_branches(github)
     assert github.workflow.git("ls-remote", "origin", f"refs/heads/{other}")
+
+
+def test_planning_a_restored_prefix_does_not_rerun_its_failed_jobs(github: GitHub) -> None:
+    _restored_before_eight(github, passed=False)
+    assert _batch_call(github).returncode == 1
+    # Room for the restored member's retest, while the kept prefix still runs.
+    github.pulls["9"]["state"] = "CLOSED"
+    assert _batch_call(github).returncode == 3
+    _finish_prefix(github, "7", run_id=200)
+    batch_dependencies_red(github, annotation=UNREACHABLE, run_id=200)
+    advisory_service_answers(github.workflow, answers=True)
+    before = github.workflow.calls("gh run rerun")
+    _train(github)
+    assert github.workflow.calls("gh run rerun") == before
 
 
 @pytest.mark.parametrize("number", ["7", "9"])

@@ -2728,11 +2728,11 @@ class Train:
                 ):
                     # A restored prefix's own PR checks stay green while its replacement runs.
                     # Only an independent, passed prefix may take that pending turn.
-                    prefix = _prefix_state(member, self.path.parent)
-                    if prefix.state == "pending":
+                    state = _suite_state(member["scratch"])
+                    if state in (None, "pending"):
                         self.pending.append(number)
                         continue
-                    if prefix.state != "green":
+                    if state != "green":
                         continue
                 images = runs("images", head, pull=True)
                 if images:
