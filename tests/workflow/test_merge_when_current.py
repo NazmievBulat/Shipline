@@ -5838,10 +5838,10 @@ def _restored_before_eight(
     """Restore 7 on unchanged main, with a proof shortfall and 8 already tested alone."""
     _batch_setup(github, count=count, images=True, images_member=8)
     if late:
-        # 9 has not joined the ready line; leave room for 7 beside 8 after the failure.
+        # 9 has not joined the ready line. A one-slot window starts 8 alone after 7 fails.
         github.pulls["9"]["isDraft"] = True
         saved = _batch_state(github)
-        saved["window"] = 4
+        saved["window"] = 2
         (github.workflow.repo / ".local/workflow/merge-train.json").write_text(json.dumps(saved))
     assert _batch_call(github).returncode == 3
     isolated = _prefixes(github)[0]
@@ -5949,6 +5949,9 @@ def test_a_member_joining_during_a_restored_retest_waits_for_the_restored_front(
     # Read the older state shape, both before and after its green rerun was recognized.
     kept = _restored_before_eight(github, passed=False, reconciled=reconciled, late=True)
     assert _batch_call(github).returncode == 1
+    saved = _batch_state(github)
+    saved["window"] = 2
+    (github.workflow.repo / ".local/workflow/merge-train.json").write_text(json.dumps(saved))
     assert _batch_call(github).returncode == 3
     restored = _scratch(github, "7")
     assert restored and restored["pushed"]
