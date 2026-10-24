@@ -74,9 +74,24 @@ _DEFAULTS = {
     # The branches the merge gate tests its prefixes on are named by this, then a random name.
     "merge": {"scratch_prefix": "workflow/merge-batch-"},
     "hunts": {"areas": {}, "plans": None},
-    # A repository names its own; CI's test job fails without one (ci_proof.py), and E2E's
-    # browser job without its browser command.
-    "commands": {"test": None, "browser": None},
+    # A repository names its own; CI's test job fails without one (ci_proof.py).
+    "commands": {
+        name: None
+        for name in (
+            "test",
+            "browser",
+            "browser_tests_for_changes",
+            "server_tests_for_changes",
+            "pre_train_checks",
+            "mechanical_conflicts",
+            "browser_plan",
+            "hunt_app",
+            "hunt_browser",
+            "hunt_cursor",
+            "advisory_watch",
+            "push_checkout",
+        )
+    },
 }
 
 
