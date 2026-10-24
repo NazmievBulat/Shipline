@@ -1,0 +1,36 @@
+name: Diagnose
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  runner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Terminal width and ps
+        run: |
+          env | grep -E '^(COLUMNS|LINES|TERM|PS_[A-Z]+)=' || echo "no width variables"
+          ps --version
+          echo "widest ps aux line: $(ps aux | awk '{ print length }' | sort -n | tail -1)"
+          bash -c ": a command line long enough to pass the eightieth column of a narrow terminal, then codex exec; ps aux | grep -c 'codex exec'"
+          timeout 3 bash -c "while ps aux | grep -q 'codex exec'; do sleep 0.2; done"; echo "loop exit: $?"
+      - name: tmux and scopes
+        run: |
+          command -v tmux >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq tmux; }
+          tmux -V
+          ldd "$(command -v tmux)" | grep -i systemd || echo "tmux links no libsystemd"
+          for name in first second third; do
+            tmux -L "$name" new-session -d -s "$name" \
+              systemd-run --user --scope --quiet --collect -p MemoryMax=96M -- bash -c "sleep 60"
+          done
+          sleep 3
+          for name in first second third; do
+            pid=$(tmux -L "$name" list-panes -t "=$name" -F '#{pane_pid}')
+            path=$(sed -n 's/^0:://p' "/proc/$pid/cgroup")
+            echo "$name: $(tr '\0' ' ' < "/proc/$pid/cmdline") in $path, memory.max $(cat "/sys/fs/cgroup$path/memory.max" 2>&1)"
+          done
+          systemctl --user list-units --type=scope --no-pager | head -20
