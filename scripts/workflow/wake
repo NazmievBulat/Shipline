@@ -118,6 +118,60 @@ eval "$config"
 export SHIPLINE_CONFIG_JSON
 # The repository's main checkout, never the checkout these scripts are in.
 main=$SHIPLINE_REPO
+saved_line=""
+saved_day=$(date -u -d "@$((NOW - 86400))" +%F)
+saved_sent=$main/$SHIPLINE_STATE_FOLDER/prefix-savings.sent
+# A completed UTC day is stable. Keep its line until delivery succeeds, then acknowledge it
+# with the other daily findings; unchanged check-ins must not send it twice.
+# A shadow run writes no note of its own, so it neither reads nor keeps a savings report.
+if [[ -z $shadow ]] && ((github_ready)) &&
+    jq -e '.checks.prefix_only // [] | length > 0' <<<"$SHIPLINE_CONFIG" >/dev/null &&
+    [[ ! -r $saved_sent || $(<"$saved_sent") != "$saved_day" ]]; then
+  mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
+  (umask 077; touch "$main/$SHIPLINE_STATE_FOLDER/prefix-savings.lock")
+  exec 8>"$main/$SHIPLINE_STATE_FOLDER/prefix-savings.lock"
+  if ! flock -n 8; then
+    # A parallel report owns only this work; reset names must still reach the wake below.
+    exec 8>&-
+  elif [[ -r $saved_sent && $(<"$saved_sent") == "$saved_day" ]]; then
+    exec 8>&-
+  else
+    saved_pending=$main/$SHIPLINE_STATE_FOLDER/prefix-savings-$saved_day.pending
+    # Retry an unfinished date as well as an undelivered line before starting a newer day.
+    # Shell glob order puts .pending before .progress for the same date.
+    for saved_report in "$main/$SHIPLINE_STATE_FOLDER"/prefix-savings-????-??-??.{pending,progress}; do
+      [[ -f $saved_report ]] || continue
+      candidate=${saved_report##*/prefix-savings-}
+      candidate=${candidate%.*}
+      if [[ $candidate < $saved_day || $candidate == "$saved_day" ]]; then
+        saved_day=$candidate
+        saved_pending=$main/$SHIPLINE_STATE_FOLDER/prefix-savings-$saved_day.pending
+      fi
+    done
+    saved_progress=${saved_pending%.pending}.progress
+    saved_retry=$saved_progress.retry
+    if [[ -r $saved_pending ]]; then
+      saved_line=$(<"$saved_pending")
+    else
+      saved_after=0
+      if [[ -r $saved_retry ]]; then
+        read -r saved_after <"$saved_retry"
+        [[ $saved_after =~ ^[0-9]+$ ]] || saved_after=0
+      fi
+      if ((NOW >= saved_after)); then
+        if saved_line=$(WORKFLOW_BACKGROUND_GITHUB=1 timeout 120 python3 "$here/prefix_savings.py" \
+            --date "$saved_day" --progress "$saved_progress" 9>&- 8>&-); then
+          (umask 077; printf '%s\n' "$saved_line" >"$saved_pending.tmp")
+          mv "$saved_pending.tmp" "$saved_pending"
+          rm -f "$saved_retry"
+        else
+          saved_line=""
+          (umask 077; printf '%s\n' "$((NOW + LOOK_EVERY_SECONDS))" >"$saved_retry")
+        fi
+      fi
+    fi
+  fi
+fi
 resent=("$@")
 [[ -n $shadow ]] || mkdir -p "$STATE"
 # Main's line as the gate published it: green, pending, red, advisory (only advisories failed
@@ -552,7 +606,7 @@ if ((${#resent[@]} == 0 && ${#handback_files[@]} == 0 && ${#cloud_files[@]} == 0
   fi
   if [[ -r $TOLD && $(<"$TOLD") == "$seen" ]] &&
       ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0 && ${#balance_files[@]} == 0 &&
-        ${#decision_events[@]} == 0)); then
+        ${#decision_events[@]} == 0)) && [[ -z $saved_line ]]; then
     log "  nothing changed since the last check-in; $name not told"
     exit "$failed"
   fi
@@ -583,6 +637,7 @@ fi
 for line in "${metrics_lines[@]}" "${analysis_lines[@]}" "${balance_lines[@]}"; do
   message+=" $line"
 done
+[[ -z $saved_line ]] || message+=$'\n'"$saved_line"
 if [[ -n $service_line ]]; then
   message+=" Package audit: $service_line; pushes wait for it, nothing was found wrong."
 fi
@@ -591,6 +646,10 @@ if send_to "$name" "$message"; then
   if [[ -n $shadow ]]; then
     log "  told $name: $message"
     exit "$failed"
+  fi
+  if [[ -n $saved_line ]]; then
+    (umask 077; printf '%s\n' "$saved_day" >"$saved_sent")
+    rm -f "$saved_pending" "$saved_progress" "$saved_retry"
   fi
   echo "$seen" >"$TOLD"
   # A question told before stays told while it is open, also while its session works again on
