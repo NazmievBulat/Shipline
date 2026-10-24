@@ -6,6 +6,9 @@
   "event": "pull_request",
   "head_branch": "ticket/one",
   "head_sha": "0000000000000000000000000000000000000065",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "completed",
   "conclusion": "success",
   "created_at": "2026-10-22T09:00:00Z",
@@ -20,6 +23,9 @@
   "event": "pull_request",
   "head_branch": "ticket/one",
   "head_sha": "0000000000000000000000000000000000000066",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "completed",
   "conclusion": "success",
   "created_at": "2026-10-22T12:00:00Z",
@@ -34,6 +40,9 @@
   "event": "pull_request",
   "head_branch": "ticket/two",
   "head_sha": "0000000000000000000000000000000000000067",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "completed",
   "conclusion": "cancelled",
   "created_at": "2026-10-23T10:00:00Z",
@@ -48,6 +57,9 @@
   "event": "pull_request",
   "head_branch": "ticket/two",
   "head_sha": "0000000000000000000000000000000000000068",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "completed",
   "conclusion": "success",
   "created_at": "2026-10-23T14:00:00Z",
@@ -62,6 +74,9 @@
   "event": "pull_request",
   "head_branch": "ticket/four",
   "head_sha": "0000000000000000000000000000000000000069",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "completed",
   "conclusion": "success",
   "created_at": "2026-10-24T01:00:00Z",
@@ -76,6 +91,9 @@
   "event": "push",
   "head_branch": "main",
   "head_sha": "000000000000000000000000000000000000006a",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "completed",
   "conclusion": "success",
   "created_at": "2026-10-23T20:05:00Z",
@@ -90,6 +108,9 @@
   "event": "workflow_dispatch",
   "head_branch": "workflow/merge-batch-9",
   "head_sha": "000000000000000000000000000000000000006b",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "completed",
   "conclusion": "failure",
   "created_at": "2026-10-23T15:00:00Z",
@@ -104,6 +125,9 @@
   "event": "pull_request",
   "head_branch": "ticket/four",
   "head_sha": "000000000000000000000000000000000000006c",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "in_progress",
   "conclusion": null,
   "created_at": "2026-10-24T07:45:00Z",
@@ -118,6 +142,9 @@
   "event": "pull_request",
   "head_branch": "ticket/two",
   "head_sha": "00000000000000000000000000000000000000c9",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "completed",
   "conclusion": "success",
   "created_at": "2026-10-23T11:00:00Z",
@@ -132,6 +159,9 @@
   "event": "pull_request",
   "head_branch": "ticket/two",
   "head_sha": "000000000000000000000000000000000000012d",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "completed",
   "conclusion": "cancelled",
   "created_at": "2026-10-23T12:00:00Z",
@@ -146,6 +176,9 @@
   "event": "pull_request",
   "head_branch": null,
   "head_sha": "0000000000000000000000000000000000000191",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "completed",
   "conclusion": "success",
   "created_at": "2026-10-23T13:00:00Z",
@@ -160,6 +193,9 @@
   "event": "pull_request",
   "head_branch": "ticket/old",
   "head_sha": "0000000000000000000000000000000000000064",
+  "head_repository": {
+   "full_name": "example-org/example-app"
+  },
   "status": "completed",
   "conclusion": "success",
   "created_at": "2026-10-17T07:00:00Z",

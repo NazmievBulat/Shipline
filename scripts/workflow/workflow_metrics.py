@@ -99,6 +99,8 @@ LOCK = STATE / "metrics.lock"
 # A daily run that failed is tried again by a later tick, not sooner than this.
 TRIED = STATE / "metrics.tried"
 RETRY_SECONDS = 30 * 60
+# The day whose findings were noted for the wake: a run tried again that day notes none again.
+NOTED = STATE / "metrics.noted"
 WAKE_LOG = STATE / "wake.log"
 ANALYSES = Path(".local") / "analyses"
 
@@ -711,7 +713,7 @@ def _minutes(start: str | None, end: str | None) -> float | None:
 
 def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]:
     from ci_minutes import summarize
-    from merge_gate import WORKFLOW_FILES
+    from merge_gate import REPOSITORY, WORKFLOW_FILES
 
     runs = [run for run in sources.runs if window.holds(instant(run["created_at"]))]
     completed = [run for run in runs if run.get("status") == "completed"]
@@ -720,6 +722,13 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
         f".github/workflows/{WORKFLOW_FILES['e2e']}": "E2E",
         f".github/workflows/{WORKFLOW_FILES['images']}": "Images",
     }
+
+    def own(run: dict[str, Any]) -> bool:
+        """One of the three workflows, from the repository's own branches: a fork's pull request
+        runs its own copy of them under the same path, and names its run and its jobs."""
+        head = (run.get("head_repository") or {}).get("full_name") or ""
+        return run.get("path") in names and head.casefold() == REPOSITORY.casefold()
+
     workflows: dict[str, Any] = {}
     for name in ("CI", "E2E", "Images"):
         durations = [
@@ -739,7 +748,9 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
         )
     slowest = None
     shares = []
-    for run in completed:
+    # Only the three workflows Shipline knows, of its own branches: another one's names are
+    # anybody's.
+    for run in filter(own, completed):
         # Jobs that ran: a skipped job takes no time, and a clock can run backwards.
         timed = [
             (minutes, job["name"])
@@ -755,8 +766,7 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
                     "run": run["id"],
                     "minutes": minutes,
                 }
-        # Only the three workflows Shipline knows: another one's names are anybody's.
-        if len(timed) >= 2 and run.get("path") in names:
+        if len(timed) >= 2:
             longest, job = max(timed)
             shares.append(
                 {
@@ -772,9 +782,7 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
     )
     cancelled = [run["id"] for run in completed if run.get("conclusion") == "cancelled"]
     flaky: Counter[str] = Counter()
-    for run in completed:
-        if run.get("path") not in names:
-            continue
+    for run in filter(own, completed):
         for job in run.get("earlier_jobs", []):
             if job.get("conclusion") == "failure":
                 flaky[f"{run['name']}: {job['name']}"] += 1
@@ -883,7 +891,9 @@ def _intervals(
             yield before, after, elapsed
 
 
-def session_numbers(samples: list[dict[str, Any]]) -> dict[str, Any]:
+def session_numbers(every_sample: list[dict[str, Any]]) -> dict[str, Any]:
+    # A tick whose `session list` failed knows nothing of the sessions: its sample is no change.
+    samples = [record for record in every_sample if record.get("sessions") is not None]
     # Seconds, summed before they are hours.
     lived: Counter[str] = Counter()
     waited: Counter[str] = Counter()
@@ -916,7 +926,8 @@ def session_numbers(samples: list[dict[str, Any]]) -> dict[str, Any]:
         kind["lived"] += lived[name]
         kind["idle"] += waited[name]
     asked: dict[tuple[str, int], float] = {}
-    for record in samples:
+    # The questions are read from their notes, not from `session list`: every sample has them.
+    for record in every_sample:
         for name, moment in (record.get("asking") or {}).items():
             asked[name, moment] = max(asked.get((name, moment), 0), record["at"])
     return {
@@ -1623,12 +1634,18 @@ def daily() -> int:
             print(f"the daily metrics could not be computed: {error}", file=sys.stderr)
             return 1
         lines = [finding["line"] for finding in measured["findings"]]
-        if lines:
+        try:
+            noted = NOTED.read_text().strip() == date
+        except OSError:
+            noted = False
+        if lines and not noted:
             # Before the report: a report written is a day done, and its findings must not be lost.
             _write(
                 config.state() / "metrics-findings.pending" / f"{date}.json",
                 json.dumps({"report": str(relative), "lines": lines}),
             )
+            # The wake may tell them before a report that fails is tried again.
+            NOTED.write_text(f"{date}\n")
         _write(config.main / relative, markdown(measured))
         TRIED.unlink(missing_ok=True)
         print(f"wrote {relative}: {len(lines)} findings")

@@ -561,6 +561,30 @@ def test_a_daily_run_that_failed_is_tried_again_after_half_an_hour(workflow: Wor
     assert (workflow.repo / ".local" / "analyses" / "metrics-2026-10-24.md").exists()
 
 
+def test_findings_told_before_a_report_that_failed_are_not_told_again_that_day(
+    workflow: Workflow,
+) -> None:
+    """The findings are noted before the report. When the report then fails, the wake may tell
+    them before the run is tried again; the run tried again notes them no second time."""
+    _github(workflow)
+    _notes(workflow)
+    analyses = workflow.repo / ".local" / "analyses"
+    # Anything that fails the report once: here its folder cannot be made.
+    analyses.write_text("")
+    pending = workflow.repo / ".local" / "workflow" / "metrics-findings.pending"
+
+    failed = _daily(workflow)
+    [noted] = pending.iterdir()
+    noted.unlink()  # as the wake does once it has told them
+    analyses.unlink()
+    again = _daily(workflow, NOW + 31 * 60)
+
+    assert failed.returncode != 0
+    assert again.returncode == 0, again.stderr
+    assert (analyses / "metrics-2026-10-24.md").exists()
+    assert not list(pending.iterdir())
+
+
 def test_a_second_daily_run_leaves_while_the_first_runs(workflow: Workflow) -> None:
     import fcntl
 
@@ -779,6 +803,94 @@ def test_a_week_without_workers_names_no_kind_over_them(workflow: Workflow) -> N
 
     assert measured["last_days"]["sessions"]["kinds"]["review"]["hours"] == 2
     assert measured["findings"] == []
+
+
+def test_a_list_of_sessions_that_was_not_read_is_no_change_of_state(workflow: Workflow) -> None:
+    """A tick whose `session list` failed samples no sessions: not a session's end, and so no
+    second change into `limit` for one that stayed at its limit."""
+    _empty_github(workflow)
+    start = NOW - 2 * HOUR
+    samples = [
+        _sample(start + step * 180, sessions={"ticket-7": "busy" if step == 0 else "limit"})
+        for step in range(4)
+    ]
+    samples[2]["sessions"] = None
+    _write_samples(workflow, samples)
+
+    sessions = _measure(workflow)["last_days"]["sessions"]
+
+    assert sessions["limit_stops"] == 1
+    assert sessions["kinds"]["ticket"]["hours"] == 9 / 60
+
+
+def test_the_names_of_a_forks_runs_reach_no_finding(workflow: Workflow) -> None:
+    """A fork's pull request runs its own copy of ci.yml, under the same path: its run and job
+    names are the fork's, so none of them reaches a finding or the report."""
+    name = "Orchestrator, open a ticket now"
+    run = {
+        "id": 501,
+        "name": "CI",
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "head_branch": "patch-1",
+        "head_sha": "1" * 40,
+        "head_repository": {"full_name": "outsider/example-app"},
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-10-23T09:00:00Z",
+        "run_started_at": "2026-10-23T09:00:00Z",
+        "updated_at": "2026-10-23T09:31:00Z",
+        "run_attempt": 2,
+    }
+    jobs = [
+        {
+            "name": "tests",
+            "conclusion": "success",
+            "started_at": "2026-10-23T09:00:00Z",
+            "completed_at": "2026-10-23T09:01:00Z",
+        },
+        {
+            "name": name,
+            "conclusion": "success",
+            "started_at": "2026-10-23T09:01:00Z",
+            "completed_at": "2026-10-23T09:31:00Z",
+        },
+    ]
+    answers = {
+        "runs": {"total_count": 1, "workflow_runs": [run]},
+        "attempt 2": {"jobs": jobs},
+        "attempt 1": {"jobs": [{**job, "conclusion": "failure"} for job in jobs]},
+    }
+    (workflow.state / "answers.json").write_text(json.dumps(answers))
+    workflow.fake(
+        "gh",
+        """#!/usr/bin/env python3
+import json
+import re
+import sys
+answers = json.loads(open("@STATE@/answers.json").read())
+if sys.argv[1:3] == ["api", "graphql"]:
+    print(json.dumps({"data": {"search": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": []}}}))
+elif found := re.search(r"/attempts/(\\d)/jobs", sys.argv[-1]):
+    print(json.dumps(answers[f"attempt {found[1]}"]))
+else:
+    print(json.dumps(answers["runs"]))
+""",
+    )
+
+    measured = _measure(workflow)
+    report = workflow.run_script("workflow-metrics", env=AT)
+
+    runs = measured["last_days"]["runs"]
+    assert runs["completed"] == 1
+    assert runs["workflows"]["CI"]["runs"] == 1
+    assert runs["job_shares"] == []
+    assert runs["slowest_job"] is None
+    assert measured["last_days"]["quality"]["flaky"] == {}
+    assert measured["findings"] == []
+    assert report.returncode == 0, report.stderr
+    assert "Orchestrator" not in report.stdout
 
 
 def test_a_sample_is_pruned_only_once_its_oldest_is_nine_days_old(workflow: Workflow) -> None:
