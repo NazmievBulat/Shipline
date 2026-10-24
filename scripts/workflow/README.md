@@ -26,6 +26,10 @@ are reported once through the wake, with pending reports retained until delivery
 The owner answers cloud questions in the cloud session. Its reports are relayed
 from pull request comments, and its completion releases the reservation only once
 the pull request is ready. `session list` shows addresses and report ages.
+A cloud worker whose draft has had no push and no report for
+`cloud_wake_after_minutes` (30), with no open question, is woken once by the tick
+through `claude --cloud <address>` in a short-lived pane; an answered question wakes
+it at once. One still quiet that long after is named in the wake once.
 
 Dependency 614 supplies repository-local security rules for cloud pushes. The
 orchestrator records the first three cloud tickets' independent review round counts
@@ -54,6 +58,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `runner.labels` | the runner labels the merge gate may re-run failed jobs on | none: the gate re-runs nothing |
 | `runner.prefix` | the prefix the runner pool names its services and containers by; `workflow-metrics` reads their CPU | none: no runner figures |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
+| `cloud_wake_after_minutes` | the minutes without a push or a report after which the tick wakes a cloud worker by typing into its session; `0` never does | `30` |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the

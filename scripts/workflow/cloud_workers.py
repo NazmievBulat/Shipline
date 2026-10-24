@@ -10,14 +10,38 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
 import workflow_config
 from github_budget import Limited, call
 
+HERE = Path(__file__).resolve().parent
 MARKER = "<!-- cloud-worker -->"
 ADDRESS = r"https://claude\.ai/code/session_[\w-]+(?:\?\S*)?"
+# An answer to a worker's question: the orchestrator's comment, or an unmarked one from an
+# account that may write to the repository.
+ORCHESTRATOR = "<!-- shipline-orchestrator -->"
+WRITERS = ("admin", "maintain", "write")
+LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
+# What the tick types into a cloud session it wakes.
+STATUS = (
+    "Status check: nothing has been pushed or reported for {minutes} minutes. If your question "
+    "was answered, carry on; if something blocks you, report it as a question and carry on with "
+    "what it does not block; never end your turn to wait."
+)
+ANSWERED = (
+    "Your question on pull request {number} was answered in its comments. Read the answer and "
+    "carry on."
+)
+# How long an attach waits for the session's input box. A test names another.
+ATTACH_SECONDS = 60
+# Without a size `tmux` makes a window of 80 by 24, too small for the screen Claude draws.
+SCREEN = ("200", "50")
+# What Claude prints when the usage limit stopped it, as `limit-reset` reads it.
+LIMIT_LINE = re.compile(r"^\s*(?:⎿|●)?\s*You.{1,3}ve hit your (?:[A-Za-z0-9-]+ )*limit(?: |$)")
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 
 def _write(path: Path, value: dict[str, object]) -> None:
@@ -170,8 +194,47 @@ def _allowed(scripts: Path) -> bool:
     return False
 
 
+def _time(comment: dict[str, object]) -> int:
+    created = str(comment["created_at"]).replace("Z", "+00:00")
+    return int(datetime.fromisoformat(created).timestamp())
+
+
+def _answer(
+    comments: list[dict[str, object]], question: int, writers: dict[str, bool]
+) -> dict[str, object] | None:
+    """The first comment after the question that answers it. `writers` keeps, for this run,
+    whether each account asked about may write to the repository."""
+    for comment in comments:
+        body = str(comment["body"])
+        if int(str(comment["id"])) <= question:
+            continue
+        if body.startswith(ORCHESTRATOR):
+            return comment
+        if body.lstrip().startswith("<!--"):
+            continue
+        user = comment.get("user")
+        login = user.get("login") if isinstance(user, dict) else None
+        if not isinstance(login, str) or not LOGIN.fullmatch(login):
+            continue
+        if login not in writers:
+            asked = call(
+                "cloud-workers",
+                "api",
+                f"{workflow_config.current().api}/collaborators/{login}/permission",
+                "--jq",
+                ".permission",
+                timeout=30,
+            )
+            # An account GitHub does not know as a collaborator may not write.
+            writers[login] = asked.returncode == 0 and asked.stdout.strip() in WRITERS
+        if writers[login]:
+            return comment
+    return None
+
+
 def _poll(notes: Path, scripts: Path) -> int:
     failed = 0
+    writers: dict[str, bool] = {}
     for path in _records(notes):
         number = path.name.removeprefix("cloud-")
         try:
@@ -180,6 +243,8 @@ def _poll(notes: Path, scripts: Path) -> int:
             if not record.get("url"):
                 continue
             comments = _comments(number)
+            # Read this tick: a wake may go by its reports.
+            path.with_suffix(".unread").unlink(missing_ok=True)
             notified = False
             for comment in comments:
                 if comment["id"] <= record["last_comment_id"]:
@@ -188,9 +253,7 @@ def _poll(notes: Path, scripts: Path) -> int:
                     continue
                 body = comment["body"]
                 status = _status(body)
-                at = int(
-                    datetime.fromisoformat(comment["created_at"].replace("Z", "+00:00")).timestamp()
-                )
+                at = _time(comment)
                 record.update(
                     last_comment_id=comment["id"],
                     last_comment_at=at,
@@ -198,6 +261,8 @@ def _poll(notes: Path, scripts: Path) -> int:
                     message=body,
                     comment_url=comment.get("html_url", record["url"]),
                 )
+                record.pop("answer_id", None)
+                record.pop("answered_at", None)
                 if status == "blocked":
                     pending = notes / "cloud-events.pending"
                     pending.mkdir(exist_ok=True)
@@ -213,6 +278,12 @@ def _poll(notes: Path, scripts: Path) -> int:
                     (notes / f"{path.name}.asking").unlink(missing_ok=True)
                 _write(path, record)
                 print(f"{path.name}: {status} (comment {comment['id']})")
+            if record["status"] == "asking" and not record.get("answer_id"):
+                answer = _answer(comments, record["last_comment_id"], writers)
+                if answer:
+                    record.update(answer_id=answer["id"], answered_at=_time(answer))
+                    _write(path, record)
+                    print(f"{path.name}: question answered (comment {answer['id']})")
             # Retry a failed phone push through notify's existing deduplication path.
             if record["status"] == "asking" and not notified:
                 _notify(
@@ -226,13 +297,199 @@ def _poll(notes: Path, scripts: Path) -> int:
                 result.check_returncode()
                 if result.stdout.strip() == "false":
                     path.unlink()
-                    for suffix in ("asking", "pushed", "url"):
+                    for suffix in ("asking", "pushed", "url", "unread"):
                         (notes / f"{path.name}.{suffix}").unlink(missing_ok=True)
                     print(f"{path.name}: worker finished; ready for independent review")
         except Limited:
             break
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
             print(f"{path.name}: cannot relay comments: {error}", file=sys.stderr)
+            path.with_suffix(".unread").touch()
+            failed = 1
+    return failed
+
+
+def _log(line: str) -> None:
+    now = int(os.environ.get("WORKFLOW_NOW", time.time()))
+    log = Path.home() / ".local/state/workflow/wake.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a") as stream:
+        stream.write(f"{now} {line}\n")
+
+
+def _box(screen: str) -> tuple[list[str], str] | None:
+    """What is above the input box, and what is typed in it; None while no box is drawn."""
+    lines = screen.splitlines()
+    plain = [ANSI.sub("", line) for line in lines]
+    rules = [at for at, line in enumerate(plain) if line.startswith("─")]
+    if len(rules) < 2:
+        return None
+    top, bottom = rules[-2], rules[-1]
+    # The same reading of the box as `session` makes: dim suggestions are no text.
+    typed = subprocess.run(
+        ["bash", "-c", 'source "$1" && nonblank_input', "input-box", str(HERE / "input-box")],
+        input="\n".join(lines[top + 1 : bottom]) + "\n",
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    ).stdout
+    return plain[:top], typed.strip(" \t\n\u00a0")
+
+
+def _bare(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+def _type(tmux: Callable[..., subprocess.CompletedProcess[str]], pane: str, text: str) -> str:
+    """Types `text` into the attached session and sends it. The reason it did not, or ""."""
+    seconds = float(os.environ.get("WORKFLOW_CLOUD_ATTACH_SECONDS", ATTACH_SECONDS))
+    deadline = time.monotonic() + seconds
+
+    def box() -> tuple[list[str], str] | None:
+        shown = tmux("capture-pane", "-p", "-e", "-J", "-t", f"={pane}:")
+        if shown.returncode:
+            raise LookupError("the attach ended before its input box appeared")
+        return _box(shown.stdout)
+
+    try:
+        while (found := box()) is None:
+            if time.monotonic() >= deadline:
+                return f"no input box within {seconds:g} s"
+            time.sleep(0.2)
+        above, typed = found
+        if any(LIMIT_LINE.search(line) for line in [line for line in above if line.strip()][-3:]):
+            return "a usage limit is shown"
+        if typed:
+            return "its input box holds text that was not sent; nothing was typed"
+        if tmux("send-keys", "-t", f"={pane}:", "-l", text).returncode:
+            return "the text could not be typed"
+        for _ in range(20):
+            found = box()
+            if found and _bare(found[1]) == _bare(text):
+                break
+            time.sleep(0.1)
+        else:
+            return "the text did not appear in its input box; nothing was sent"
+        # Let the terminal's paste burst settle before Enter.
+        time.sleep(1)
+        found = box()
+        if not found or _bare(found[1]) != _bare(text):
+            return "its input changed before Enter; nothing was sent"
+        if tmux("send-keys", "-t", f"={pane}:", "Enter").returncode:
+            return "Enter could not be sent"
+        for _ in range(30):
+            found = box()
+            if found and not found[1]:
+                return ""
+            time.sleep(0.1)
+        return "its input box still holds the text after Enter"
+    except LookupError as error:
+        return str(error)
+
+
+def _attach(name: str, address: str, text: str) -> str:
+    """Attaches to a cloud session in a short-lived pane, sends `text` as a new turn and
+    detaches. Ending the pane ends only the local client; the cloud session goes on."""
+    if not re.fullmatch(ADDRESS, address):
+        return "the recorded address is not a cloud session address"
+    pane = f"wake-{name}"
+    # The caller's own Claude variables must not reach the client.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE")}
+
+    def tmux(*words: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["tmux", "-L", pane, *words],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+            timeout=10,
+        )
+
+    # Several words run without a shell, so the address is never read by one.
+    started = tmux(
+        "new-session", "-d", "-x", SCREEN[0], "-y", SCREEN[1], "-s", pane,
+        "claude", "--cloud", address,
+    )  # fmt: skip
+    if started.returncode:
+        return f"the pane could not be started: {started.stderr.strip()}"
+    try:
+        return _type(tmux, pane, text)
+    finally:
+        tmux("kill-server")
+
+
+def _wake(notes: Path, snapshot: Path) -> int:
+    """Wakes a cloud worker whose draft has had no push and no report for the configured wait,
+    once per quiet stretch, and one whose question was answered, at once. One still quiet that
+    long after its wake is named in the wake once. A failed attach is never tried again."""
+    minutes = workflow_config.current().cloud_wake_after_minutes
+    if not minutes:
+        return 0
+    wait = minutes * 60
+    now = int(os.environ.get("WORKFLOW_NOW", time.time()))
+    pulls = json.loads(snapshot.read_text())
+    failed = 0
+    for path in _records(notes):
+        number = path.name.removeprefix("cloud-")
+        try:
+            record = json.loads(path.read_text())
+            pull = pulls.get(number)
+            if not record.get("url") or not pull or pull.get("state") != "OPEN":
+                continue
+            # Its reports were not read this tick: an answer or a report may be missing.
+            if path.with_suffix(".unread").exists():
+                continue
+            if pull.get("isDraft") is not True:
+                continue
+            # A push is dated when the tick first sees its head.
+            if record.get("head") != pull["headRefOid"]:
+                record.update(head=pull["headRefOid"], pushed_at=now)
+                _write(path, record)
+            asking = record.get("status") == "asking"
+            if asking and not record.get("answer_id"):
+                continue
+            since = max(
+                record["started_at"],
+                record["pushed_at"],
+                record.get("last_comment_at") or 0,
+                record.get("answered_at") or 0,
+            )
+            if asking and record.get("answer_woken") != record["answer_id"]:
+                record["answer_woken"] = record["answer_id"]
+                text, reason = ANSWERED.format(number=number), "question answered"
+            elif now - since >= wait and record.get("woken") != since:
+                text = STATUS.format(minutes=minutes)
+                reason = f"{(now - since) // 60} min quiet"
+            else:
+                if (
+                    record.get("woken") == since
+                    and now - record["woken_at"] >= wait
+                    and record.get("stuck_noted") != since
+                ):
+                    how = "its wake failed" if record.get("wake_failed") == since else "woken once"
+                    line = f"stuck? {path.name} ({(now - since) // 60} min, {how})"
+                    pending = notes / "stuck.pending"
+                    pending.mkdir(exist_ok=True)
+                    _write(pending / f"{path.name}-stuck-{since}.json", {"line": line})
+                    record["stuck_noted"] = since
+                    _write(path, record)
+                    _log(line)
+                continue
+            # Written before the attach: a wake that fails or never returns is not tried again.
+            record.update(woken=since, woken_at=now)
+            _write(path, record)
+            error = _attach(path.name, record["url"], text)
+            if error:
+                record["wake_failed"] = since
+                _write(path, record)
+                _log(f"{path.name} wake failed: {error}")
+            else:
+                _log(f"woke {path.name} ({reason})")
+            print(f"{path.name}: {error or 'woken'}")
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            print(f"{path.name}: cannot wake: {error}", file=sys.stderr)
             failed = 1
     return failed
 
@@ -260,9 +517,11 @@ def main() -> int:
             "refused",
             "retryable",
             "allowed",
+            "wake",
         ),
     )
     parser.add_argument("main", type=Path)
+    # For `wake`, the tick's snapshot of the open pull requests (`tick_snapshot.py`).
     parser.add_argument("number", nargs="?")
     parser.add_argument("url", nargs="?")
     args = parser.parse_args()
@@ -272,6 +531,10 @@ def main() -> int:
         return 0 if _allowed(Path(__file__).parent) else 1
     if args.command == "poll":
         return _poll(notes, Path(__file__).parent)
+    if args.command == "wake":
+        if not args.number:
+            parser.error("the tick's snapshot of the pull requests is required")
+        return _wake(notes, Path(args.number))
     if args.command == "list":
         for path in _records(notes):
             try:

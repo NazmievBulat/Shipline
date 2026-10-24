@@ -146,6 +146,15 @@ if [ "$1 $2" = "api graphql" ]; then
   fi
   exit 0
 fi
+# Whether an account may write to the repository: `permission-<login>` names its level.
+if [[ $1 == api && $2 == repos/*/collaborators/*/permission ]]; then
+  [ "$3 $4" = "--jq .permission" ] || exit 1
+  [ ! -e "@STATE@/fail-gh-permission" ] || exit 1
+  login=${2%/permission}
+  login=${login##*/}
+  if [ -f "@STATE@/permission-$login" ]; then cat "@STATE@/permission-$login"; else echo read; fi
+  exit 0
+fi
 if [ "$1 $2" = "api --paginate" ]; then
   number=${3%/reviews}
   number=${number##*/}

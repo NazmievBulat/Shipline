@@ -3,6 +3,11 @@
 import fcntl
 import json
 import os
+import re
+import shutil
+import subprocess
+import tempfile
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -33,11 +38,11 @@ def _record(workflow: Workflow, number: int = 7) -> Path:
     return record
 
 
-def _comment(identity: int, text: str) -> dict[str, object]:
+def _comment(identity: int, text: str, at: int = _NOW) -> dict[str, object]:
     return {
         "id": identity,
         "body": f"{_MARKER}\n{text}",
-        "created_at": "2026-10-19T18:00:00Z",
+        "created_at": datetime.fromtimestamp(at, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "html_url": f"https://github.com/example-org/example-app/pull/7#issuecomment-{identity}",
     }
 
@@ -79,6 +84,10 @@ def test_cloud_start_records_the_printed_address_without_preparing_a_local_workt
     assert "Push only to the pull request's branch" in arguments[3]
     assert "never skip or weaken the pre-push hook" in arguments[3]
     assert "start, first push, any blocker with the exact error" in arguments[3]
+    assert (
+        "Never end your turn to wait for an answer: poll the pull request's comments every "
+        "three minutes instead." in arguments[3]
+    )
 
 
 def test_start_and_list_use_the_same_per_ticket_lock_as_local_workers(workflow: Workflow) -> None:
@@ -658,3 +667,243 @@ def test_existing_cloud_worker_keeps_provenance_for_its_fix_round(workflow: Work
     assert done.returncode == 0, done.stderr
     assert len(workflow.calls("tmux cloud-7 new-session")) == 1
     assert not workflow.is_running("ticket-7")
+
+
+_TMUX = shutil.which("tmux")
+_STATUS = (
+    "Status check: nothing has been pushed or reported for 30 minutes. If your question was "
+    "answered, carry on; if something blocks you, report it as a question and carry on with "
+    "what it does not block; never end your turn to wait."
+)
+_ANSWERED = (
+    "Your question on pull request 7 was answered in its comments. Read the answer and carry on."
+)
+# A cloud session as `claude --cloud <address>` shows it: Claude's input box, under a reply.
+# Each line typed into the box is recorded in `typed`. An `attach-*` file changes what it
+# shows: an expired session, no box at all, a usage limit, or words already in the box.
+_ATTACHED_CLAUDE = r"""#!/bin/bash
+if [[ $# == 2 && $1 == --cloud ]]; then
+  echo "$2" >> "@STATE@/attached"
+  if [ -e "@STATE@/attach-expired" ]; then echo "This session has expired."; exit 1; fi
+  if [ -e "@STATE@/attach-no-box" ]; then echo "Connecting..."; exec /bin/sleep 600; fi
+  draft=""
+  [ ! -f "@STATE@/attach-draft" ] || draft=$(cat "@STATE@/attach-draft")
+  rule=$(printf '─%.0s' {1..60})
+  draw() {
+    printf '\033[H\033[2J● Working on the ticket.\n'
+    [ ! -e "@STATE@/attach-limit" ] ||
+      printf "  ⎿  You've hit your session limit · resets 4pm (UTC)\n"
+    # The box has room for the text to wrap; the cursor waits after the prompt.
+    printf '\n%s\n> %s\0337\n\n\n%s\n  ? for shortcuts\0338' "$rule" "$draft" "$rule"
+  }
+  draw
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "@STATE@/typed"
+    draft=""
+    draw
+  done
+  exit 0
+fi
+exec "@STATE@/../claude-harness" "$@"
+"""
+
+
+@pytest.fixture
+def attachable(workflow: Workflow) -> Iterator[Workflow]:
+    """The real `tmux`, and a `claude` that attaches to a cloud session and records the typing."""
+    if _TMUX is None:
+        pytest.skip("tmux is not installed")  # noqa: TID251
+    # A socket path may be about 100 characters at most, so it cannot live in pytest's folder.
+    sockets = Path(tempfile.mkdtemp(prefix="wf-"))
+    (workflow.bin / "tmux").unlink()
+    (workflow.bin / "claude").rename(workflow.root / "claude-harness")
+    workflow.fake("claude", _ATTACHED_CLAUDE)
+    workflow.env["TMUX_TMPDIR"] = str(sockets)
+    workflow.orchestrator("busy")
+    try:
+        yield workflow
+    finally:
+        subprocess.run(
+            [_TMUX, "-L", "wake-cloud-7", "kill-server"],
+            env=workflow.env,
+            capture_output=True,
+            check=False,
+        )
+        shutil.rmtree(sockets, ignore_errors=True)
+
+
+def _tick_at(workflow: Workflow, minutes: int, **env: str) -> None:
+    done = workflow.run_script(
+        "tick", env={**_ENV, "WORKFLOW_NOW": str(_NOW + minutes * 60), **env}
+    )
+    assert done.returncode == 0, done.stderr
+
+
+def _lines(path: Path) -> list[str]:
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def _wake_log(workflow: Workflow) -> list[str]:
+    """The tick's lines of its wakes of cloud-7, among the lines of the wake's own passes."""
+    return [
+        line
+        for line in _lines(workflow.wake_log)
+        if re.fullmatch(r"[0-9]+ (woke cloud-7 .*|cloud-7 wake failed: .*)", line)
+    ]
+
+
+def _stuck(workflow: Workflow) -> list[str]:
+    return [message for message in workflow.sent() if "stuck? cloud-7" in message]
+
+
+def _pane_is_gone(workflow: Workflow) -> bool:
+    assert _TMUX is not None
+    asked = subprocess.run(
+        [_TMUX, "-L", "wake-cloud-7", "has-session", "-t", "=wake-cloud-7"],
+        env=workflow.env,
+        capture_output=True,
+        check=False,
+    )
+    return asked.returncode != 0
+
+
+def test_a_quiet_cloud_worker_is_woken_once_and_then_named_once(attachable: Workflow) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+
+    for minutes in (0, 29):
+        _tick_at(attachable, minutes)
+    assert not (attachable.state / "attached").exists()
+
+    _tick_at(attachable, 30)
+
+    assert _lines(attachable.state / "attached") == [_URL]
+    assert _lines(attachable.state / "typed") == [_STATUS]
+    assert _wake_log(attachable) == [f"{_NOW + 1800} woke cloud-7 (30 min quiet)"]
+    assert _pane_is_gone(attachable)
+    for minutes in (40, 59):
+        _tick_at(attachable, minutes)
+    assert _lines(attachable.state / "typed") == [_STATUS]
+    assert _stuck(attachable) == []
+
+    for minutes in (60, 70, 100):
+        _tick_at(attachable, minutes)
+
+    assert _lines(attachable.state / "typed") == [_STATUS]
+    [stuck] = _stuck(attachable)
+    assert "stuck? cloud-7 (60 min, woken once)" in stuck
+
+
+@pytest.mark.parametrize("news", ["push", "report"])
+def test_a_push_or_a_report_begins_a_new_quiet_stretch(attachable: Workflow, news: str) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _tick_at(attachable, 0)
+    if news == "push":
+        attachable.push_from_elsewhere(7)
+    else:
+        _comments(attachable, _comment(4, "First push.", at=_NOW + 1200))
+    _tick_at(attachable, 20)
+
+    _tick_at(attachable, 30)
+    assert not (attachable.state / "attached").exists()
+    _tick_at(attachable, 50)
+
+    assert _lines(attachable.state / "typed") == [_STATUS]
+
+
+@pytest.mark.parametrize("answerer", ["orchestrator", "writer", "reader"])
+def test_an_open_question_holds_the_wake_until_its_answer_then_wakes_at_once(
+    attachable: Workflow, answerer: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    question = _comment(4, "Which option should I take?")
+    _comments(attachable, question)
+    for minutes in (0, 30, 61, 95):
+        _tick_at(attachable, minutes)
+    assert not (attachable.state / "attached").exists()
+    assert _stuck(attachable) == []
+    answer = {
+        "id": 5,
+        "body": "Take the first option.",
+        "created_at": datetime.fromtimestamp(_NOW + 96 * 60, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "user": {"login": f"example-{answerer}"},
+    }
+    if answerer == "orchestrator":
+        answer["body"] = "<!-- shipline-orchestrator -->\nTake the first option."
+    if answerer == "writer":
+        (attachable.state / "permission-example-writer").write_text("write\n")
+    _comments(attachable, question, answer)
+
+    _tick_at(attachable, 97)
+    _tick_at(attachable, 100)
+
+    if answerer == "reader":
+        assert not (attachable.state / "attached").exists()
+        return
+    assert _lines(attachable.state / "typed") == [_ANSWERED]
+    assert _wake_log(attachable) == [f"{_NOW + 97 * 60} woke cloud-7 (question answered)"]
+    assert _pane_is_gone(attachable)
+
+
+@pytest.mark.parametrize("case", ["ready", "removed"])
+def test_a_ready_pull_request_or_a_removed_record_is_never_woken(
+    attachable: Workflow, case: str
+) -> None:
+    attachable.add_pull_request(7, draft=case != "ready")
+    record = _record(attachable)
+    _tick_at(attachable, 0)
+    if case == "removed":
+        record.unlink()
+
+    for minutes in (31, 61, 95):
+        _tick_at(attachable, minutes)
+
+    assert not (attachable.state / "attached").exists()
+    assert _wake_log(attachable) == []
+    assert _stuck(attachable) == []
+
+
+@pytest.mark.parametrize("failure", ["no-box", "expired", "limit", "draft"])
+def test_a_failed_attach_is_logged_once_never_retried_and_leaves_no_pane(
+    attachable: Workflow, failure: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    if failure == "draft":
+        (attachable.state / "attach-draft").write_text("words of the owner")
+    else:
+        (attachable.state / f"attach-{failure}").touch()
+    seconds = {"WORKFLOW_CLOUD_ATTACH_SECONDS": "2"}
+
+    for minutes in (0, 30, 33, 36, 45):
+        _tick_at(attachable, minutes, **seconds)
+
+    assert _lines(attachable.state / "attached") == [_URL]
+    assert not (attachable.state / "typed").exists()
+    [failed] = _wake_log(attachable)
+    assert f"{_NOW + 1800} cloud-7 wake failed: " in failed
+    assert _pane_is_gone(attachable)
+
+
+@pytest.mark.parametrize(("minutes", "woken_at"), [(0, None), (45, 45)])
+def test_the_configured_wait_moves_or_turns_off_the_wake(
+    attachable: Workflow, minutes: int, woken_at: int | None
+) -> None:
+    config = attachable.repo / "shipline.json"
+    config.write_text(
+        json.dumps({**json.loads(config.read_text()), "cloud_wake_after_minutes": minutes})
+    )
+    attachable.add_pull_request(7)
+    _record(attachable)
+
+    for at in (0, 30, 44, 45, 61, 95):
+        _tick_at(attachable, at)
+
+    if woken_at is None:
+        assert not (attachable.state / "attached").exists()
+        assert _stuck(attachable) == []
+        return
+    assert _wake_log(attachable)[0] == f"{_NOW + woken_at * 60} woke cloud-7 (45 min quiet)"
+    assert _lines(attachable.state / "typed") == [_STATUS.replace("30 minutes", "45 minutes")]
