@@ -1296,30 +1296,42 @@ def test_a_fix_that_passed_every_check_failing_on_red_main_merges(github: GitHub
 
 
 def _rerun_failed_jobs(
-    github: GitHub, run_id: int, head: str, plan: str, *, earlier_head: str | None = None
+    github: GitHub,
+    run_id: int,
+    head: str,
+    *carried: str,
+    earlier_head: str | None = None,
+    attempts: int = 2,
 ) -> None:
-    """Run `run_id` failed a job and re-ran its failed jobs alone: its second attempt passed,
-    and carried `plan` from its first attempt under a new job ID, without notes. The first
-    attempt ran `plan` on `earlier_head`, the head of the run unless a test says otherwise."""
+    """Run `run_id` failed a job and re-ran its failed jobs alone until its last attempt,
+    `attempts`, passed. Each re-run carried the `carried` jobs from the first attempt under a
+    new job ID, without notes. The first attempt ran on `earlier_head`, the head of the run
+    unless a test says otherwise."""
     for reply in github.api.values():
         for run in reply.get("workflow_runs", []) if isinstance(reply, dict) else []:
             if run["id"] == run_id:
-                run["run_attempt"] = 2
+                run["run_attempt"] = attempts
     latest = github.api[f"{_REPO}/actions/runs/{run_id}/jobs?per_page=100"]["jobs"]
-    first = deepcopy(latest)
-    for job in first:
-        job.update(run_id=run_id, run_attempt=1, head_sha=earlier_head or head)
-        if job["name"] != plan:
-            job["conclusion"] = "failure"
-    github.api[f"{_REPO}/actions/runs/{run_id}/attempts/1/jobs?per_page=100"] = {"jobs": first}
-    for job in latest:
-        job.update(run_id=run_id, run_attempt=2, head_sha=head)
-        if job["name"] == plan:
-            job["id"] = run_id + 500
-    github.api[f"{_REPO}/check-runs/{run_id + 500}/annotations?per_page=100"] = []
+    for attempt in range(1, attempts + 1):
+        listed = deepcopy(latest) if attempt < attempts else latest
+        for job in listed:
+            job.update(
+                run_id=run_id,
+                run_attempt=attempt,
+                head_sha=earlier_head or head if attempt == 1 else head,
+            )
+            if job["name"] not in carried and attempt < attempts:
+                job["conclusion"] = "failure"
+            if job["name"] in carried and attempt > 1:
+                job["id"] = run_id + 500 * (attempt - 1) + job["id"] % 100
+                github.api[f"{_REPO}/check-runs/{job['id']}/annotations?per_page=100"] = []
+        if attempt < attempts:
+            github.api[f"{_REPO}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100"] = {
+                "jobs": listed
+            }
 
 
-@pytest.mark.parametrize("earlier", ["same", "other main", "other head"])
+@pytest.mark.parametrize("earlier", ["same", "same, re-run twice", "other main", "other head"])
 def test_a_fix_whose_failed_jobs_alone_were_rerun_merges_on_red_main(
     github: GitHub, earlier: str
 ) -> None:
@@ -1334,11 +1346,12 @@ def test_a_fix_whose_failed_jobs_alone_were_rerun_merges_on_red_main(
         github.head,
         "CI: what to run",
         earlier_head=f"{9:040x}" if earlier == "other head" else None,
+        attempts=3 if earlier == "same, re-run twice" else 2,
     )
 
     done = github.run()
 
-    if earlier == "same":
+    if earlier.startswith("same"):
         assert done.returncode == 0, done.stdout + done.stderr
         assert (workflow.state / "merged").read_text() == "7"
         assert "passed every check failing on main: CI result, CI: web" in done.stdout
@@ -1378,6 +1391,33 @@ def test_a_fix_whose_failed_jobs_alone_were_rerun_takes_the_red_main_turn(
     (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
     assert workflow.run_script("main-status").returncode == 0
     assert _train(github)["first"] == ("8" if earlier == "same" else "7")
+
+
+def test_a_pass_over_mains_advisory_carried_into_a_rerun_is_not_the_fix(
+    github: GitHub,
+) -> None:
+    _two_stale_pulls(github)
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(github.base, head, run_id=30)
+    github.api[f"{_REPO}/actions/runs/30/jobs?per_page=100"]["jobs"].append(
+        {"id": 39, "name": "CI: dependencies", "status": "completed", "conclusion": "success"}
+    )
+    github.api[f"{_REPO}/check-runs/39/annotations?per_page=100"] = [
+        {"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}
+    ]
+    # Its warning is on the first attempt; the re-run carried the job without it.
+    _rerun_failed_jobs(github, 30, head, "CI: what to run", "CI: dependencies")
+    github.main("failure")
+    github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"] = [
+        {"id": 11, "name": "CI result", "status": "completed", "conclusion": "failure"},
+        {"id": 12, "name": "CI: dependencies", "status": "completed", "conclusion": "failure"},
+    ]
+    github.save()
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+    assert github.workflow.run_script("main-status").returncode == 0
+    assert _train(github)["first"] == "7"
 
 
 @pytest.mark.parametrize("conclusion", ["skipped", None])

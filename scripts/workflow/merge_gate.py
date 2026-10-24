@@ -449,22 +449,32 @@ def jobs(run: dict[str, Any]) -> list[dict[str, Any]]:
     return checks(api(f"{API}/actions/runs/{run['id']}/jobs?per_page=100", "jobs"))
 
 
-def plan_notes(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    """The notes of a "what to run" job, from the attempt of its run where it ran.
+def job_notes(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """The notes of a job, from the attempt of its run where it ran.
 
     A re-run of only the failed jobs carries a job that passed into the new attempt under
-    another ID and without its notes. Its notes are then those of the same job in the
-    latest earlier attempt of the same run on the same head that has them.
+    another ID and without its notes. A passed job's notes are then those of the same job in
+    the latest earlier attempt of the same run on the same head that has them.
     """
-    notes = api(f"{API}/check-runs/{plan['id']}/annotations?per_page=100")
-    attempt, run, head = plan.get("run_attempt"), plan.get("run_id"), plan.get("head_sha")
-    if notes or not isinstance(attempt, int) or run is None or not head:
+    notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+    attempt, run, head = job.get("run_attempt"), job.get("run_id"), job.get("head_sha")
+    if (
+        notes
+        or job.get("conclusion") != "success"
+        or not isinstance(attempt, int)
+        or run is None
+        or not head
+    ):
         return notes
     for earlier in range(attempt - 1, 0, -1):
-        for job in api(f"{API}/actions/runs/{run}/attempts/{earlier}/jobs?per_page=100", "jobs"):
-            if job.get("name") != plan["name"] or job.get("head_sha") != head:
+        for ran in api(f"{API}/actions/runs/{run}/attempts/{earlier}/jobs?per_page=100", "jobs"):
+            if (
+                ran.get("name") != job["name"]
+                or ran.get("head_sha") != head
+                or ran.get("conclusion") != "success"
+            ):
                 continue
-            notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+            notes = api(f"{API}/check-runs/{ran['id']}/annotations?per_page=100")
             if notes:
                 return notes
     return []
@@ -1123,7 +1133,7 @@ def strict_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     strict: list[dict[str, Any]] = []
     for job in parts:
         if job["name"] == "CI: dependencies" and job.get("conclusion") == "success":
-            notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
+            notes = job_notes(job)
             if any(note.get("title") == "Advisory on main" for note in notes):
                 job = {**job, "conclusion": "passed over an advisory on main"}
         strict.append(job)
@@ -1250,7 +1260,7 @@ def main_images_needed(head: str, ci: list[dict[str, Any]]) -> bool:
         for job in jobs(push):
             if job["name"] != CI_PLAN:
                 continue
-            notes = plan_notes(job)
+            notes = job_notes(job)
             before = next(
                 (note["message"].strip() for note in notes if note.get("title") == "Push base"),
                 None,
@@ -1318,12 +1328,9 @@ def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> 
         job["name"] == "playwright" and job.get("conclusion") == "success" for job in parts
     ):
         return False
-    planner = next(job for job in parts if job["name"] == E2E_PLAN)
-    notes = {
-        (note.get("title"), note["message"].strip())
-        for note in plan_notes(planner)
-    }
-    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= notes
+    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= _planner_notes(
+        parts, E2E_PLAN
+    )
 
 
 def inherited_image_jobs(
@@ -1367,7 +1374,7 @@ def inherited_image_jobs(
 
 def _planner_notes(parts: list[dict[str, Any]], plan: str) -> set[tuple[Any, str]]:
     planner = next(job for job in parts if job["name"] == plan)
-    return {(note.get("title"), note["message"].strip()) for note in plan_notes(planner)}
+    return {(note.get("title"), note["message"].strip()) for note in job_notes(planner)}
 
 
 def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
@@ -1405,7 +1412,7 @@ def tested_merge(parts: list[dict[str, Any]], base: str, head: str) -> str | Non
     for job in parts:
         if job["name"] != CI_PLAN:
             continue
-        for note in plan_notes(job):
+        for note in job_notes(job):
             if note.get("title") != NOTES.merge_tested:
                 continue
             merge = note["message"].strip()
@@ -1777,7 +1784,7 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
             return False
         tree = api(f"{API}/git/commits/{merge}")["tree"]["sha"]
         plan = next(job for job in image_jobs if job["name"] == IMAGES_PLAN)
-        notes = plan_notes(plan)
+        notes = job_notes(plan)
         if not any(
             note.get("title") == NOTES.files_tested and note["message"].strip() == tree
             for note in notes
@@ -4002,7 +4009,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             image_plan = next(
                 job for job in image_jobs if job["name"] == IMAGES_PLAN
             )
-            image_notes = plan_notes(image_plan)
+            image_notes = job_notes(image_plan)
             if not any(
                 note.get("title") == NOTES.files_tested and note["message"].strip() == tree
                 for note in image_notes
