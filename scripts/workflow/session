@@ -191,7 +191,16 @@ find_main_checkout() {
   script_dir=$here
   # Its `bin`, for `shipline` in what a session runs, when this checkout has the launcher.
   shipline_bin=$(cd "$here/../.." && pwd)/bin
-  [[ -f $shipline_bin/shipline ]] && shipline_bin+=: || shipline_bin=""
+  # How a sentence names `notify waiting`: by the launcher's absolute path, which a session
+  # started before the switch, with neither on its PATH, runs as well; a copy of the scripts in
+  # a repository's tree, which has no launcher, by its path there.
+  notify_waiting="scripts/workflow/notify waiting"
+  if [[ -f $shipline_bin/shipline ]]; then
+    notify_waiting="$(printf '%q' "$shipline_bin/shipline") notify waiting"
+    shipline_bin+=:
+  else
+    shipline_bin=""
+  fi
   # The repository, its state folder and set-up command (`workflow_config.py`), read once a
   # call: one Python start, which `list` below otherwise avoids.
   local config
@@ -1290,7 +1299,7 @@ cmd_nudge_idle() {
   if [[ $kind == status ]]; then
     [[ ! -e $notes.asking ]] || die "$name is waiting for the owner"
     [[ -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]] || die "$name is busy"
-    send_prompt "$name" "Status check: if what you were waiting for is done, carry on; if not, run \`shipline notify waiting\` and end your turn."
+    send_prompt "$name" "Status check: if what you were waiting for is done, carry on; if not, run \`$notify_waiting\` and end your turn."
     return
   fi
   [[ -e $notes.idle ]] || die "$name is busy"
