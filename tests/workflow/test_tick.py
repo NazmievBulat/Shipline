@@ -337,8 +337,7 @@ def test_a_session_is_not_stopped_for_the_words_of_the_other_kind(
 
 def test_a_second_tick_exits_while_the_first_holds_the_lock(workflow: Workflow) -> None:
     workflow.add_pull_request(7)
-    lock = workflow.repo / ".local" / "workflow" / "tick.lock"
-    lock.parent.mkdir(parents=True)
+    lock = workflow.repo / ".git" / "shipline-tick.lock"
     with lock.open("w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
 
@@ -483,8 +482,9 @@ def test_a_tick_can_be_run_from_a_worktree(workflow: Workflow) -> None:
 
     assert done.returncode == 0, done.stderr
     assert workflow.worktree(8).is_dir()
-    assert (workflow.repo / ".local" / "workflow" / "tick.lock").exists()
-    assert not (worktree / ".local" / "workflow" / "tick.lock").exists()
+    # One lock for the repository: in the git common directory, never in a worktree.
+    assert (workflow.repo / ".git" / "shipline-tick.lock").exists()
+    assert not list(worktree.rglob("*tick.lock"))
 
 
 _MARKS_8_READY_DURING_SETUP = """#!/bin/bash
