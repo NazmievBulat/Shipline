@@ -216,7 +216,7 @@ def pin() -> tuple[str, str] | None:
     if named:
         return "SHIPLINE_PIN", named
     try:
-        return str(NOTES / "pin"), (NOTES / "pin").read_text().strip()
+        return ".local/shipline/pin", (NOTES / "pin").read_text().strip()
     except FileNotFoundError:
         return None
 

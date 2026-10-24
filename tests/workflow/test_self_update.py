@@ -470,7 +470,7 @@ def test_a_pin_stops_updates_and_is_named_once(shipline: Shipline, by: str) -> N
         named = f"SHIPLINE_PIN ({shipline.first})"
     else:
         (shipline.notes / "pin").write_text(shipline.first + "\n")
-        named = f"{shipline.notes / 'pin'} ({shipline.first})"
+        named = f".local/shipline/pin ({shipline.first})"
     shipline.land()
 
     for _ in range(3):
