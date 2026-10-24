@@ -62,6 +62,7 @@ _DEFAULTS = {
     },
     "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
     "machines": [],
+    "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
     "hunts": {"areas": {}, "plans": None},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
     "commands": {"test": None},
@@ -216,6 +217,18 @@ def test_a_machine_that_cannot_be_read_is_refused_by_name(
 
     with pytest.raises(workflow_config.ConfigError, match=f"shipline.json: {named}"):
         workflow_config.load(repo)
+
+
+def test_the_test_folders_tools_parity_compares_are_read(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"parity": {"workflow_tests": "app/tests/flow"}})
+
+    parity = workflow_config.load(repo).parity
+    assert (parity.workflow_tests, parity.runner_tests) == ("app/tests/flow", "tests/runner")
+    assert parity.known is None
+
+    _write(repo, {"parity": {"known": "tools/shipline/parity-known.txt"}})
+    assert workflow_config.load(repo).parity.known == "tools/shipline/parity-known.txt"
 
 
 def test_the_repository_named_in_the_file_wins_over_the_runner_settings_and_origin(
@@ -382,6 +395,9 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"runner": {"labels": "home"}}', "runner.labels"),
         ('{"state_folder": "/var/workflow"}', "state_folder"),
         ('{"state_folder": "../workflow"}', "state_folder"),
+        ('{"parity": {"workflow_tests": "/srv/tests"}}', "parity.workflow_tests"),
+        ('{"parity": {"runner_tests": "../tests"}}', "parity.runner_tests"),
+        ('{"parity": {"known": "/srv/known.txt"}}', "parity.known"),
         ('{"repositry": "example-owner/example-app"}', "repositry"),
         ('{"checks": {"ci_results": "CI result"}}', "checks.ci_results"),
         ('{"hunts": {"areas": [{"name": "phone"}]}}', "hunts.areas"),
