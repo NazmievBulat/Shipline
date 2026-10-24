@@ -281,7 +281,7 @@ def _usable(account: str) -> None:
 
 
 def _as(account: str | None, *words: str) -> subprocess.CompletedProcess[str]:
-    """Runs a git step of the merged tree as the account the suites run as, with no hooks."""
+    """Runs a git step of the merged tree as `account` (the caller for None), with no hooks."""
     git = ["git", "-c", "core.hooksPath=/dev/null", *words]
     try:
         return run(*_as_tester(git, account), timeout=FETCH_SECONDS, errors="replace")
@@ -323,7 +323,9 @@ def _tree(main: str, named: str, account: str | None, setup: str) -> Iterator[st
             entry = pwd.getpwnam(account)
             for made in (common / "ci-tests", folder):
                 os.chown(made, entry.pw_uid, entry.pw_gid)
-        merged = _as(account, "-C", str(here), "merge-tree", "--write-tree", "--name-only",
+        # Made by the caller: it writes objects, and the object folders root's own commits and
+        # fetches made since the account was given the checkout are root's.
+        merged = _as(None, "-C", str(here), "merge-tree", "--write-tree", "--name-only",
                      "--no-messages", "HEAD", main)  # fmt: skip
         lines = merged.stdout.splitlines()
         if merged.returncode == 1 and len(lines) > 1:

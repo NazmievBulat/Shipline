@@ -947,7 +947,7 @@ def test_a_push_from_a_linked_worktree_leaves_that_worktree_as_it_was(workflow: 
     assert sorted(_worktrees(workflow)) == sorted([str(workflow.repo), str(linked)])
 
 
-def test_as_root_the_merged_tree_is_made_and_removed_as_the_account(workflow: Workflow) -> None:
+def test_as_root_the_merged_tree_is_filled_and_removed_as_the_account(workflow: Workflow) -> None:
     _cloud_repository(workflow, _WHERE_SUITE)
     _change(workflow, "server/orders.py")
     _main_moves_on(workflow)
@@ -965,8 +965,11 @@ def test_as_root_the_merged_tree_is_made_and_removed_as_the_account(workflow: Wo
 
     assert done.returncode == 0, done.stdout + done.stderr
     calls = [call.split(" -- ", 1)[1] for call in workflow.calls("runuser")]
-    for step in ("merge-tree", "worktree add", "read-tree", "worktree remove"):
+    for step in ("worktree add", "read-tree", "worktree remove"):
         assert any(call.startswith("git") and step in call for call in calls), step
+    # The merge writes objects, in folders root's own commits and fetches made after the
+    # checkout was given to the account: it is made by the caller, who may write in all of them.
+    assert not any("merge-tree" in call for call in calls)
     assert "./scripts/setup-worktree" in calls
     assert _where(workflow)[0].endswith("billing=yes")
     assert _worktrees(workflow) == [str(workflow.repo)]
