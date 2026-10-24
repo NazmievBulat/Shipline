@@ -1,0 +1,18 @@
+# The planner's runner, labelled example-app-planner: it takes only the jobs that plan what CI runs,
+# so a plan never waits behind a test job.
+[Unit]
+Description=example-app planner runner
+Requires=docker.service example-app-runner-network.service
+After=docker.service example-app-runner-network.service
+
+[Service]
+User=example-app-runner
+WorkingDirectory=/var/lib/example-app-runner
+ExecStart=/opt/example-app-runner/start-runner.sh planner 1
+Restart=always
+RestartSec=10
+TimeoutStopSec=330
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

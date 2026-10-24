@@ -9,7 +9,6 @@ import pytest
 from workflow_harness import Workflow, install_shipline
 
 
-
 @pytest.fixture
 def workflow(workflow: Workflow) -> Workflow:
     """Installed from a Shipline checkout of its own, as a repository installs it."""

@@ -1,8 +1,8 @@
 """What differs between the repositories that use Shipline, read from one file.
 
 A repository keeps `shipline.json` at the root of its main checkout: the main checkout of the
-repository being worked on (`SHIPLINE_REPO`, else the repository of the current directory, never
-the checkout these scripts are in), found from the git common directory, so a worktree reads the
+repository being worked on (`SHIPLINE_REPO`, else the repository of the current directory; never
+found from where these scripts are), found from the git common directory, so a worktree reads the
 same file as the main checkout. A key the file leaves out keeps its default, key by key; a key the
 file names that Shipline does not know, or a value of the wrong kind, is refused, so a typing
 error never passes as a default.
@@ -12,9 +12,11 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; the merge gate's scratch
-branches begin `workflow/merge-batch-`; no runner labels and no runner prefix; no test command,
-which a repository names for its CI's test job (`ci_proof.py test`), and no browser command,
-which it names for its E2E's browser job (`ci_proof.py browser`).
+branches begin `workflow/merge-batch-`; no runner prefix and no image build command, and runner
+labels built from the prefix and this machine's runner settings (`~/.config/shipline/runner.sh`),
+none without a prefix, with main's runners on the machine `home`; no test command, which a
+repository names for its CI's test job (`ci_proof.py test`), and no browser command, which it
+names for its E2E's browser job (`ci_proof.py browser`).
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -42,6 +44,12 @@ FILE = "shipline.json"
 # take to read it.
 RUNNER_SETTINGS = ".github/runner/settings.sh"
 RUNNER_SETTINGS_SECONDS = 5
+# What one machine of the runner pool holds, outside any repository: its own name and the other
+# machines' (`runner/README.md`). `SHIPLINE_RUNNER_SETTINGS` names another file.
+MACHINE_SETTINGS = "~/.config/shipline/runner.sh"
+# The prefix names a systemd unit and, as `<prefix>-runner`, a user of at most 32 characters.
+_PREFIX = re.compile(r"[a-z](?:[a-z0-9-]{0,23}[a-z0-9])?")
+_MACHINE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 
 # Every key the file may hold, with its default. The repository's default is found, not fixed.
 DEFAULTS: dict[str, Any] = {
@@ -75,7 +83,8 @@ DEFAULTS: dict[str, Any] = {
         },
     },
     "runner": {
-        # The runner labels of the machines the gate may re-run failed jobs on.
+        # The runner labels of the machines the gate may re-run failed jobs on; when the file
+        # names none, they are built from the prefix and the machines (`runner_labels`).
         "labels": [],
         "identity_folder": "~/.config/shipline-runner",
         # The prefix the runner pool names everything by: its images, network, services and
@@ -105,8 +114,6 @@ DEFAULTS: dict[str, Any] = {
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
-# A machine's name, as a runner label holds it.
-_MACHINE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 # A branch name's beginning, ended by `-` or `/` so the random name after it stands apart:
 # words of letters, digits, `_`, `.` and `-`, none beginning with `.` or `-` nor ending in
 # `.lock`, joined by single `/`; nothing `git ls-remote` reads as a pattern, and not a full ref.
@@ -240,8 +247,8 @@ def main_checkout(start: Path) -> Path:
 
 def repository_checkout() -> Path:
     """The main checkout of the repository Shipline works on: the one `SHIPLINE_REPO` names
-    (`shipline --repo` sets it), else the one the current directory is in. Never the checkout
-    these scripts are in, which is Shipline's own."""
+    (`shipline --repo` sets it), else the one the current directory is in. Never found from
+    where these scripts are: they are in Shipline's own checkout."""
     named = os.environ.get("SHIPLINE_REPO")
     if named:
         try:
@@ -331,6 +338,66 @@ def _from_runner_settings(main: Path) -> str | None:
     return done.stdout
 
 
+def machine_settings() -> Path:
+    """The file of this machine's runner settings: `SHIPLINE_RUNNER_SETTINGS`, else
+    MACHINE_SETTINGS in the home folder."""
+    return Path(os.environ.get("SHIPLINE_RUNNER_SETTINGS") or MACHINE_SETTINGS).expanduser()
+
+
+def _machines() -> list[str]:
+    """This machine's name and the other machines', as Bash reads `machine` and
+    `other_machines` from the machine settings: in a `bash` of its own, with only PATH and HOME,
+    for at most RUNNER_SETTINGS_SECONDS. None named when the file is missing."""
+    path = machine_settings()
+    if not path.is_file():
+        return []
+    refused = f"{path} names no machines Bash can read from it"
+    try:
+        done = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1" >/dev/null 2>&1 || exit 1; '
+                'printf "%s\\0" "${machine-}" "${other_machines[@]}"',
+                "settings",
+                str(path),
+            ],
+            env={key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ},
+            capture_output=True,
+            text=True,
+            timeout=RUNNER_SETTINGS_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise ConfigError(
+            f"{refused}: it ran for more than {RUNNER_SETTINGS_SECONDS} seconds"
+        ) from None
+    names = done.stdout.split("\0")[:-1]
+    if done.returncode or not names or not names[0]:
+        raise ConfigError(f"{refused}: it exited {done.returncode} and named no machine")
+    wrong = [name for name in names if not _MACHINE.fullmatch(name)]
+    if wrong:
+        raise ConfigError(f"{refused}: {wrong[0]!r} is not a machine name")
+    return names
+
+
+def runner_labels(prefix: str, machines: list[str]) -> tuple[str, ...]:
+    """The labels of the pool's runners: each machine's ordinary, main and Docker runners, and
+    the planner's (`runner/names.sh` names them the same way)."""
+    return (
+        *(
+            label
+            for machine in machines
+            for label in (
+                f"{prefix}-{machine}",
+                f"{prefix}-{machine}-main",
+                f"{prefix}-{machine}-docker",
+            )
+        ),
+        f"{prefix}-planner",
+    )
+
+
 def _from_origin(main: Path) -> str | None:
     done = subprocess.run(
         ["git", "-C", str(main), "config", "--get", "remote.origin.url"],
@@ -372,6 +439,15 @@ def load(start: Path | None = None) -> Config:
         raise ConfigError(f"{FILE}: labels.priority must name four different labels")
     if repository is not None and not _REPOSITORY.fullmatch(repository):
         raise ConfigError(f"{source}: repository must be owner/name, not {repository}")
+    prefix = values["runner"]["prefix"]
+    if prefix is not None and not _PREFIX.fullmatch(prefix):
+        raise ConfigError(
+            f"{FILE}: runner.prefix must be at most 25 lowercase letters, digits and hyphens, "
+            f"starting with a letter and ending with a letter or digit, not {prefix}"
+        )
+    labels = tuple(values["runner"]["labels"])
+    if "labels" not in given.get("runner", {}) and prefix is not None:
+        labels = runner_labels(prefix, _machines())
     if not _MACHINE.fullmatch(values["runner"]["main_machine"]):
         raise ConfigError(
             f"{FILE}: runner.main_machine must be a machine's name, "
@@ -392,7 +468,7 @@ def load(start: Path | None = None) -> Config:
         workflows=Workflows(**values["workflows"]),
         labels=Labels(**values["labels"]),
         runner=Runner(
-            labels=tuple(values["runner"]["labels"]),
+            labels=labels,
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
             main_machine=values["runner"]["main_machine"],

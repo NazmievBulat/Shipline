@@ -40,10 +40,10 @@ from workflow_commands import (
 )
 
 # The files a repository keeps for the gate are in its own `scripts/workflow`, in its main
-# checkout: the repository Shipline works on, not the checkout these scripts are in. Searched after
-# the scripts' own folder, so none of them stands in for one of the scripts.
+# checkout: the repository Shipline works on, not the checkout these scripts are in. Searched last,
+# so none of them stands in for one of the scripts or for a module of Python's own.
 REPOSITORY_FILES = workflow_config.current().main / "scripts" / "workflow"
-sys.path.insert(1, str(REPOSITORY_FILES))
+sys.path.append(str(REPOSITORY_FILES))
 
 # A repository may hold three helpers there, and the gate uses them when it does:
 # `advisory_service` tells a scan that could not reach a package advisory service, which is a
@@ -1356,9 +1356,10 @@ def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
 
 
 def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: str) -> bool:
-    """A green CI run that ran every server test on exactly this commit."""
+    """A green CI run that ran every server test on exactly this commit, run in parts or not."""
     if verdict(run, parts)[0] != "green" or not any(
-        job["name"] == "CI: server tests" and job.get("conclusion") == "success" for job in parts
+        job["name"] == "CI: server tests" and job.get("conclusion") == "success"
+        for job in checks(parts)
     ):
         return False
     return {(NOTES.merge_tested, head), (NOTES.server_tests, "whole")} <= _planner_notes(
@@ -3905,7 +3906,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             reason = f"behind {train.first}" if train.first else "for main to change"
             print(
                 f"merge train: pull request {number} waits {reason}; "
-                "run scripts/workflow/notify waiting and end the turn; the tick wakes you",
+                "run shipline notify waiting and end the turn; the tick wakes you",
                 flush=True,
             )
             command("bash", str(HERE / "notify"), "waiting")

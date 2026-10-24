@@ -1,0 +1,10 @@
+prefix=example-app
+user=example-app-runner
+programs=/opt/example-app-runner
+state=/var/lib/example-app-runner
+image=example-app-runner
+docker_image=example-app-runner-docker
+network=example-app-runner
+hub_cache=example-app-runner-hub-cache
+units=example-app-runner
+planner_label=example-app-planner
