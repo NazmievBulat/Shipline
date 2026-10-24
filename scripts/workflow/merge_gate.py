@@ -347,17 +347,27 @@ def _api(path: str, key: str | None = None, *, paginate: bool = True) -> Any:
     return pages[0]
 
 
+def workflow_runs(workflow: str, query: str, *, paginate: bool = True) -> list[dict[str, Any]]:
+    """The runs of one workflow that GitHub lists for `query`. A repository may hold no image or
+    browser workflow, as one set up with only its CI holds neither; GitHub answers HTTP 404 for
+    it, and it has no runs. Whether their checks are needed is read from the repository itself
+    (`images_needed`, `browser_needed`). A repository without its CI workflow stays an error."""
+    path = f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs?{query}"
+    try:
+        return api(path, "workflow_runs", paginate=paginate)
+    except Refused as error:
+        if workflow in ("e2e", "images") and re.search(r"\bHTTP 404\b", str(error)):
+            return []
+        raise
+
+
 def runs(
     workflow: str, head: str, *, pull: bool = False, scheduled: bool = False
 ) -> list[dict[str, Any]]:
     # Main is judged by the runs of its pushes (and manual reruns). A scheduled run of an
     # unchanged head is kept apart: it may report a failure, never hold or close the gate.
     event = "&event=pull_request" if pull else ""
-    found = api(
-        f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
-        f"?head_sha={head}{event}&per_page=100",
-        "workflow_runs",
-    )
+    found = workflow_runs(workflow, f"head_sha={head}{event}&per_page=100")
     return sorted(
         [
             run
@@ -398,11 +408,8 @@ class MainImages:
                 return
             # Nightly runs fill pages too: a missing page must never forget an older failure.
             self.page += 1
-            runs_page = api(
-                f"{API}/actions/workflows/{WORKFLOW_FILES['images']}/runs"
-                f"?branch=main&per_page=100&page={self.page}",
-                "workflow_runs",
-                paginate=False,
+            runs_page = workflow_runs(
+                "images", f"branch=main&per_page=100&page={self.page}", paginate=False
             )
             self.last = len(runs_page) < 100
             self.found += [
@@ -1240,7 +1247,11 @@ def images_needed(
     if any(check.get("name", "").startswith(IMAGES) for check in rollup):
         return True
     # Use the actual workflow's path filter, without a second maintained list of image inputs.
-    workflow = git("show", f"{workflow_ref or base}:.github/workflows/{WORKFLOW_FILES['images']}")
+    # A repository that holds no image workflow has no image checks, so no change needs them.
+    path = f".github/workflows/{WORKFLOW_FILES['images']}"
+    if not git("ls-tree", "--name-only", workflow_ref or base, "--", path):
+        return False
+    workflow = git("show", f"{workflow_ref or base}:{path}")
     section = workflow.split("  pull_request:", 1)[1].split("  push:", 1)[0]
     patterns = re.findall(r'^      - "([^"]+)"$', section, flags=re.MULTILINE)
     if not patterns:

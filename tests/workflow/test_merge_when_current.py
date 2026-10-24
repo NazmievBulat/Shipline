@@ -230,6 +230,9 @@ def answer(args, cwd, env, out, err):
             sys.exit("HTTP 502: Bad Gateway")
     elif args[0] == "api":
         path = args[-1]
+        # GitHub knows no workflow the repository does not hold.
+        if any(f"/actions/workflows/{name}/" in path for name in data.get("missing_workflows", [])):
+            sys.exit("gh: Not Found (HTTP 404)")
         if path not in data["api"]:
             if "event=workflow_dispatch" in path or "/actions/runs?branch=" in path:
                 print('{"workflow_runs": []}')
@@ -287,6 +290,8 @@ class GitHub:
     # The runs whose cancel GitHub refuses, and those whose next cancel fails in an outage.
     refuse_cancel: list[int] = field(default_factory=list[int])
     cancel_unavailable: list[int] = field(default_factory=list[int])
+    # The workflow files the repository does not hold, whose runs GitHub cannot list.
+    missing_workflows: list[str] = field(default_factory=list[str])
 
     def save(self) -> None:
         (self.workflow.state / "github.json").write_text(
@@ -308,6 +313,7 @@ class GitHub:
                     "push_after_view": self.push_after_view,
                     "refuse_cancel": self.refuse_cancel,
                     "cancel_unavailable": self.cancel_unavailable,
+                    "missing_workflows": self.missing_workflows,
                 }
             )
         )
@@ -1265,6 +1271,42 @@ def test_a_fresh_pull_request_merges_with_its_head_pinned(github: GitHub) -> Non
         f"--squash --match-head-commit {github.head}" in call
         for call in github.workflow.calls("gh pr merge")
     )
+
+
+def test_a_repository_without_an_image_or_browser_workflow_merges_without_their_checks(
+    github: GitHub,
+) -> None:
+    """A repository set up from nothing keeps only its CI workflow: GitHub lists no runs of a
+    workflow it does not hold, and no change needs its checks."""
+    workflow = github.workflow
+    workflow.git("checkout", "main")
+    workflow.git("rm", "--quiet", ".github/workflows/images.yml")
+    workflow.git("commit", "--quiet", "-m", "ci: no images")
+    workflow.git("push", "--quiet", "origin", "main")
+    github.base = workflow.git("rev-parse", "main")
+    workflow.git("checkout", "ticket/seven")
+    workflow.git("merge", "--quiet", "--no-edit", "main")
+    github.head = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "--quiet", "origin", "HEAD:ticket/seven")
+    github.pulls["7"]["headRefOid"] = github.head
+    github.main()
+    github.ci(github.base, github.head)
+    github.missing_workflows = ["images.yml", "e2e.yml"]
+
+    done = github.run()
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "merged").read_text() == "7"
+
+
+def test_a_repository_without_its_ci_workflow_never_merges(github: GitHub) -> None:
+    github.missing_workflows = ["ci.yml"]
+
+    done = github.run()
+
+    assert done.returncode != 0
+    assert "HTTP 404" in done.stdout + done.stderr
+    assert not (github.workflow.state / "merged").exists()
 
 
 def _notes_by_ci_proof(github: GitHub, checked_out: str, *suites: str) -> None:
