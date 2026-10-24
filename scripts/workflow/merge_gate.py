@@ -46,31 +46,17 @@ sys.path.append(str(REPOSITORY_FILES))
 
 # A repository may hold one helper there, and the gate uses it when it does: `run_proof` reads
 # and writes the `Workflow-Proof` line with which main skips a job its squash proved. Without it
-# no proof is read or written, so main never skips a job: a job counts as passed only where it
-# passed itself. A helper that is there but cannot start stops the gate. The repository's other
-# parts are commands its `shipline.json` names (`repository_command`).
+# the proof is Shipline's own (`ci_proof`), the one its example CI reads. A helper that is there
+# but cannot start stops the gate. The repository's other parts are commands its `shipline.json`
+# names (`repository_command`).
 try:
     from run_proof import RECEIPT, passed_jobs
     from run_proof import WHOLE as WHOLE_REQUEST
 except ModuleNotFoundError as error:
     if error.name != "run_proof":
         raise
-    RECEIPT = WHOLE_REQUEST = None
-
-    def passed_jobs(parts: list[dict[str, Any]]) -> set[str]:
-        """The jobs that passed in the run itself, a job run in parts once each of its parts
-        did; no proof line is read."""
-        grouped: dict[str, list[tuple[re.Match[str] | None, dict[str, Any]]]] = {}
-        for job in parts:
-            part = re.fullmatch(r"(.+) \((\d+) of (\d+)\)", job["name"])
-            grouped.setdefault(part[1] if part else job["name"], []).append((part, job))
-        return {
-            name
-            for name, group in grouped.items()
-            if all(job.get("conclusion") == "success" for _, job in group)
-            and sorted((int(part[2]), int(part[3])) for part, _ in group if part)
-            in ([], [(number, len(group)) for number in range(1, len(group) + 1)])
-        }
+    from ci_proof import RECEIPT, passed_jobs
+    from ci_proof import WHOLE as WHOLE_REQUEST
 
 
 # How many of its last lines a failed push is refused with, when the repository words no refusal.
@@ -1433,9 +1419,10 @@ def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
 
 
 def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: str) -> bool:
-    """A green CI run that ran every server test on exactly this commit."""
+    """A green CI run that ran every server test on exactly this commit, run in parts or not."""
     if verdict(run, parts)[0] != "green" or not any(
-        job["name"] == "CI: server tests" and job.get("conclusion") == "success" for job in parts
+        job["name"] == "CI: server tests" and job.get("conclusion") == "success"
+        for job in checks(parts)
     ):
         return False
     return {(NOTES.merge_tested, head), (NOTES.server_tests, "whole")} <= _planner_notes(

@@ -102,7 +102,7 @@ def test_without_commands_none_is_named(tmp_path: Path) -> None:
     config = workflow_config.load(_repository(tmp_path))
 
     assert [config.command(name) for name in _COMMANDS] == [None] * len(_COMMANDS)
-    assert workflow_config.as_dict(config)["commands"] == dict.fromkeys(_COMMANDS)
+    assert workflow_config.as_dict(config)["commands"] == dict.fromkeys(("test", *_COMMANDS))
 
 
 def test_a_command_s_program_is_found_in_the_main_checkout_from_a_worktree(
