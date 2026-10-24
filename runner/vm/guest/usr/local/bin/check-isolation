@@ -1,0 +1,120 @@
+#!/bin/bash
+# Runs inside the virtual machine in place of a job (vm-job, mode "check"), for
+# check-docker-runner.sh on the home machine. It prints one line for each thing it looked at and
+# "The check passed." as the last line only when every one of them held.
+#
+# Standard input: the address the firewall answers with "refused" (settings.sh), the name the home
+# machine's Docker gives itself, a line that stands for the registration token, "cache address port"
+# for the Docker Hub cache ("cache" alone when it is not running), then one "address port" for each
+# place this machine must not reach, where something is listening at that moment.
+set -u
+
+# The folder a job works in, and what it held when the image was built (vm.Dockerfile, list-work):
+# the image ships uv there, so a clean start is that folder as listed, not an empty one.
+work=/home/runner/_work
+shipped=/usr/local/share/shipline-runner/work-as-shipped
+
+failed=0
+good() { echo "ok      $*"; }
+bad() {
+  echo "FAILED  $*"
+  failed=1
+}
+
+# 0 connected, 1 refused, 124 no answer within four seconds.
+connect() {
+  timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
+}
+
+IFS= read -r firewall_marker
+IFS= read -r home_docker
+IFS= read -r secret
+read -r cache_word cache_address cache_port
+# A line out of place would turn an address this machine must not reach into the cache.
+if [ "${cache_word:-}" != cache ]; then
+  bad "the line for the Docker Hub cache is missing, so the lines of this check are out of place"
+  cache_address=
+fi
+
+# The internet is there, so a silence further down is the firewall and not a dead network.
+if curl --silent --show-error --fail --max-time 20 --output /dev/null https://github.com; then
+  good "github.com answers"
+else
+  bad "github.com does not answer: the machine has no way out, so nothing below proves anything"
+fi
+
+connect "$firewall_marker" 9
+[ $? -eq 1 ] && good "the firewall is in the way ($firewall_marker is refused)" ||
+  bad "the firewall is not in the way ($firewall_marker is not refused)"
+
+# The one place on the home machine a job may reach. It is an optimization: without it Docker pulls
+# from Docker Hub, so its absence is a note and never stops a runner (README.md, "Docker Hub cache").
+if [ -z "${cache_address:-}" ]; then
+  echo "note    the Docker Hub cache is not running on the home machine; Docker here pulls from Docker Hub"
+elif ! connect "$cache_address" "$cache_port"; then
+  echo "note    the Docker Hub cache at $cache_address port $cache_port does not answer; Docker here pulls from Docker Hub"
+elif docker info --format '{{.RegistryConfig.Mirrors}}' | grep --quiet --fixed-strings "http://$cache_address:$cache_port/"; then
+  good "the Docker Hub cache at $cache_address port $cache_port answers, and Docker here pulls through it"
+else
+  echo "note    the Docker Hub cache at $cache_address port $cache_port answers, but did not when this machine started; Docker here pulls from Docker Hub"
+fi
+
+# The firewall drops what goes to the home machine, the home network and other containers, so the
+# only right result is no answer. "Refused" is wrong too: it means the other side was reached.
+while read -r address port; do
+  # Docker in here takes 172.17.0.1 for itself, as Docker on the home machine does. Such an address
+  # leads back to this machine, whatever answers there.
+  if ip -4 route get "$address" | grep --quiet '^local '; then
+    good "$address is an address of this virtual machine itself, so nothing else is reached by it"
+    continue
+  fi
+  connect "$address" "$port"
+  case $? in
+    124) good "no answer from $address port $port" ;;
+    0) bad "$address port $port was reached" ;;
+    *) bad "$address port $port answered with a refusal, so it was reached" ;;
+  esac
+done
+
+# Docker here is this machine's own, and it starts empty: nothing of an earlier job is in it.
+mine=$(docker info --format '{{.ID}}')
+if [ -n "$mine" ] && [ "$mine" != "$home_docker" ]; then
+  good "Docker here is not the home machine's"
+else
+  bad "Docker here is the home machine's, or does not answer"
+fi
+left=$(docker ps --all --quiet; docker images --quiet; docker volume ls --quiet; docker network ls --quiet --filter type=custom)
+[ -z "$left" ] && good "no container, image, volume or network of an earlier job" ||
+  bad "something of an earlier job is here: $left"
+# A file added anywhere in the work folder, one taken away, or one of the image's own with other
+# contents, another mode or another owner, all show as a line that differs.
+if expected=$(cat "$shipped") && now=$(list-work "$work" 2>&1) && [ "$now" = "$expected" ]; then
+  good "the work folder holds what the image ships and nothing else"
+else
+  bad "the work folder is not as the image ships it, so something of an earlier job is here:
+$(diff <(printf '%s\n' "${expected:-}") <(printf '%s\n' "${now:-}") | grep '^[<>]')"
+fi
+
+# The line that stood for the registration token was read above, as the runner reads the token.
+# A job may use sudo, so it is looked for as root: on the channel it came by, and in what every
+# program here was started with.
+again=$(sudo timeout 3 cat /dev/virtio-ports/job 2>/dev/null | tr -d '\0' | head -c 200)
+# Nothing in this script was started with the line itself: `read` and `grep --file` take it from a
+# variable and from a file.
+held=$(printf '%s\n' "$secret" | sudo grep --files-with-matches --fixed-strings --text --file=/dev/stdin \
+  /proc/[0-9]*/environ /proc/[0-9]*/cmdline 2>/dev/null)
+if [ -n "$secret" ] && [ -z "$again" ] && [ -z "$held" ]; then
+  good "what arrived on the channel cannot be read a second time, and no program holds it"
+else
+  bad "what arrived on the channel can still be read: ${again:+on the channel} ${held}"
+fi
+
+# Docker works, and what this run makes would be found by the next run if anything were kept.
+if docker run --quiet --rm --volume leftover:/leftover busybox true >/dev/null &&
+  docker network create leftover >/dev/null && mkdir -p "$work/leftover"; then
+  good "Docker pulls an image and runs a container"
+else
+  bad "Docker could not pull an image and run a container"
+fi
+
+[ "$failed" -eq 0 ] && echo "The check passed." || echo "The check FAILED."

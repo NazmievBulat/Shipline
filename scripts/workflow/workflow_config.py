@@ -11,12 +11,14 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `.github/runner/settings.sh` when the runner pool names one, else the owner and name of the
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
-set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix; the workflow and runner tests `tools/parity` compares are in `tests/workflow` and
-`tests/runner`, and it knows of no differences; no machines named, so `flow-page` samples only
-the machine it runs on; no hunt areas, so one hunt runs at a time, and no hunt plans file; no
-test command, which a repository names for its CI's test job (`ci_proof.py test`); a question
-to the owner marked `Owner only: no` gets its recommended reply after 15 minutes.
+set-up command, run only when present, is `scripts/setup-worktree`; no runner prefix and no
+image build or hub cache command, and the runner label `<prefix>-home` and planner label
+`<label>-planner`, whose labels are the runner labels, none without a prefix; the workflow and
+runner tests `tools/parity` compares are in `tests/workflow` and `tests/runner`, and it knows of
+no differences; no machines named, so `flow-page` samples only the machine it runs on; no hunt
+areas, so one hunt runs at a time, and no hunt plans file; no test command, which a repository
+names for its CI's test job (`ci_proof.py test`); a question to the owner marked `Owner only: no`
+gets its recommended reply after 15 minutes.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -24,8 +26,9 @@ Python scripts import it (`current()`, once per run). A Bash script reads every 
     eval "$config"
 
 which prints `SHIPLINE_<KEY>=value` lines quoted for `eval`, the file itself among them as
-`SHIPLINE_CONFIG` for jq (`priority.jq`). Node (`codex-bridge.mjs`) and jq read the JSON with
-the same defaults.
+`SHIPLINE_CONFIG` for jq (`priority.jq`). A plain sh (`runner/install.sh`) reads
+`workflow_config.py sh`, the same with each list as one value. Node (`codex-bridge.mjs`) and jq
+read the JSON with the same defaults.
 """
 
 import json
@@ -34,6 +37,7 @@ import re
 import shlex
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path, PurePosixPath
@@ -44,6 +48,9 @@ FILE = "shipline.json"
 # take to read it.
 RUNNER_SETTINGS = ".github/runner/settings.sh"
 RUNNER_SETTINGS_SECONDS = 5
+# The prefix names a systemd unit and, as `<prefix>-runner`, a user of at most 32 characters.
+_PREFIX = re.compile(r"[a-z](?:[a-z0-9-]{0,23}[a-z0-9])?")
+_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 
 # Every key the file may hold, with its default. The repository's default is found, not fixed.
 DEFAULTS: dict[str, Any] = {
@@ -94,12 +101,25 @@ DEFAULTS: dict[str, Any] = {
         },
     },
     "runner": {
-        # The runner labels of the machines the gate may re-run failed jobs on.
+        # The runner labels of the machines the gate may re-run failed jobs on; when the file
+        # names none, they are built from the base label (`runner_labels`).
         "labels": [],
         "identity_folder": "~/.config/shipline-runner",
-        # The prefix the runner pool names its services and containers by; without it, there are
-        # no runner figures (`workflow_metrics.py`).
+        # The prefix the runner pool names everything by: its images, network, services and
+        # containers (`<prefix>-runner…`) and labels; without it, there are no runner figures
+        # (`workflow_metrics.py`).
         "prefix": None,
+        # The base label every machine's runners carry; `<prefix>-home` by default.
+        "label": None,
+        # The label the CI planner's runner carries; `<label>-planner` by default.
+        "planner_label": None,
+        # The command line, run from the main checkout, that builds the runner images; without
+        # it, the pool has no images to run.
+        "image_build": None,
+        # The command line, run from the main checkout, that runs the Docker Hub cache of the
+        # Docker-capable runners' virtual machines (`hub-cache.sh`); without it, they pull from
+        # Docker Hub directly.
+        "hub_cache": None,
     },
     # What `tools/parity` reads of a repository that keeps its own copy of the scripts: where its
     # workflow and runner tests are, and the file that lists the differences it expects.
@@ -201,6 +221,10 @@ class Runner:
     labels: tuple[str, ...]
     identity_folder: str
     prefix: str | None = None
+    label: str | None = None
+    planner_label: str | None = None
+    image_build: str | None = None
+    hub_cache: str | None = None
 
     @property
     def identity_path(self) -> Path:
@@ -510,6 +534,21 @@ def _from_runner_settings(main: Path) -> str | None:
     return done.stdout
 
 
+def runner_labels(label: str, planner_label: str | None = None) -> tuple[str, ...]:
+    """The labels every machine's runners carry, so GitHub gives a job to whichever machine has
+    one free: the base label, a spare's before it takes a slot, the merge train's first
+    member's, main's runners', the Docker runners' and the planner's, `<label>-planner` unless
+    the file names another."""
+    return (
+        label,
+        f"{label}-standby",
+        f"{label}-first",
+        f"{label}-main",
+        f"{label}-docker",
+        planner_label or f"{label}-planner",
+    )
+
+
 def _from_origin(main: Path) -> str | None:
     done = subprocess.run(
         ["git", "-C", str(main), "config", "--get", "remote.origin.url"],
@@ -556,6 +595,23 @@ def load(start: Path | None = None) -> Config:
         raise ConfigError(f"{FILE}: labels.priority must name four different labels")
     if repository is not None and not _REPOSITORY.fullmatch(repository):
         raise ConfigError(f"{source}: repository must be owner/name, not {repository}")
+    prefix = values["runner"]["prefix"]
+    if prefix is not None and not _PREFIX.fullmatch(prefix):
+        raise ConfigError(
+            f"{FILE}: runner.prefix must be at most 25 lowercase letters, digits and hyphens, "
+            f"starting with a letter and ending with a letter or digit, not {prefix}"
+        )
+    label = values["runner"]["label"] or (prefix and f"{prefix}-home")
+    planner_label = values["runner"]["planner_label"] or (label and f"{label}-planner")
+    for key, value in (("label", label), ("planner_label", planner_label)):
+        if value is not None and not _LABEL.fullmatch(value):
+            raise ConfigError(
+                f"{FILE}: runner.{key} must be lowercase letters, digits and hyphens, starting "
+                f"and ending with a letter or digit, not {value}"
+            )
+    labels = tuple(values["runner"]["labels"])
+    if "labels" not in given.get("runner", {}) and label is not None:
+        labels = runner_labels(label, planner_label)
     for name in RUN_AS_WORDS:
         if values["commands"][name] is not None:
             _words(values["commands"][name], name)
@@ -568,9 +624,13 @@ def load(start: Path | None = None) -> Config:
         workflows=Workflows(**values["workflows"]),
         labels=Labels(**values["labels"]),
         runner=Runner(
-            labels=tuple(values["runner"]["labels"]),
+            labels=labels,
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
+            label=label,
+            planner_label=planner_label,
+            image_build=values["runner"]["image_build"],
+            hub_cache=values["runner"]["hub_cache"],
         ),
         parity=parity_of(given),
         machines=tuple(Machine(**machine) for machine in values["machines"]),
@@ -621,6 +681,10 @@ def as_dict(config: Config) -> dict[str, Any]:
             "labels": list(config.runner.labels),
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
+            "label": config.runner.label,
+            "planner_label": config.runner.planner_label,
+            "image_build": config.runner.image_build,
+            "hub_cache": config.runner.hub_cache,
         },
         "parity": vars(config.parity).copy(),
         "machines": [
@@ -636,9 +700,11 @@ def as_dict(config: Config) -> dict[str, Any]:
     }
 
 
-def shell(config: Config) -> str:
+def shell(config: Config, *, posix: bool = False) -> str:
     """`KEY=value` lines for a Bash script's `eval`: every value, and the file for jq. The
-    repository is empty when nothing names it, and a script that needs it stops on that."""
+    repository is empty when nothing names it, and a script that needs it stops on that. With
+    `posix`, for a plain sh (`workflow_config.py sh`): each list is one value, its names quoted
+    for sh and joined by spaces, as Bash would write its array."""
     values = {
         "REPOSITORY": config.found_repository or "",
         "STATE_FOLDER": config.state_folder,
@@ -654,22 +720,30 @@ def shell(config: Config) -> str:
         "LABEL_AUDITED": config.labels.audited,
         **{f"PRIORITY_{key.upper()}": value for key, value in config.labels.priority.items()},
         "IDENTITY_FOLDER": config.runner.identity_folder,
+        # Empty when the file names none.
+        "RUNNER_PREFIX": config.runner.prefix or "",
+        "RUNNER_LABEL": config.runner.label or "",
+        "RUNNER_PLANNER_LABEL": config.runner.planner_label or "",
+        "RUNNER_IMAGE_BUILD": config.runner.image_build or "",
+        "RUNNER_HUB_CACHE": config.runner.hub_cache or "",
         "HUNT_PLANS": config.hunts.plans or "",
         "ANSWER_FOR_OWNER_AFTER_MINUTES": str(config.answer_for_owner_after_minutes),
         "CONFIG": json.dumps(config.given, separators=(",", ":")),
     }
     lines = [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]
-    labels = " ".join(shlex.quote(label) for label in config.runner.labels)
-    lines.append(f"SHIPLINE_RUNNER_LABELS=({labels})")
+
+    def listed(name: str, items: Iterable[str]) -> str:
+        words = " ".join(shlex.quote(item) for item in items)
+        return f"{name}={shlex.quote(words)}" if posix else f"{name}=({words})"
+
+    lines.append(listed("SHIPLINE_RUNNER_LABELS", config.runner.labels))
     # The hunt areas, and at the same place in the other array the screens of each, joined.
     areas = config.hunts.areas
-    lines.append(f"SHIPLINE_HUNT_AREAS=({' '.join(shlex.quote(area) for area in areas)})")
-    screens = " ".join(shlex.quote(", ".join(paths)) for paths in areas.values())
-    lines.append(f"SHIPLINE_HUNT_SCREENS=({screens})")
-    # Each command as an array of its words, empty when the repository has none.
+    lines.append(listed("SHIPLINE_HUNT_AREAS", areas))
+    lines.append(listed("SHIPLINE_HUNT_SCREENS", (", ".join(paths) for paths in areas.values())))
+    # Each command as its words, empty when the repository has none.
     for name in RUN_AS_WORDS:
-        words = " ".join(shlex.quote(word) for word in config.command(name) or [])
-        lines.append(f"SHIPLINE_COMMAND_{name.upper()}=({words})")
+        lines.append(listed(f"SHIPLINE_COMMAND_{name.upper()}", config.command(name) or []))
     # The main checkout, exported: every program the script starts works on the same repository,
     # whatever folder it starts in.
     lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")
@@ -677,15 +751,15 @@ def shell(config: Config) -> str:
 
 
 def main() -> int:
-    if len(sys.argv) not in (2, 3) or sys.argv[1] != "shell":
-        print("usage: workflow_config.py shell [folder]", file=sys.stderr)
+    if len(sys.argv) not in (2, 3) or sys.argv[1] not in ("shell", "sh"):
+        print("usage: workflow_config.py shell|sh [folder]", file=sys.stderr)
         return 2
     try:
         config = load(Path(sys.argv[2]) if len(sys.argv) == 3 else None)
     except ConfigError as error:
         print(error, file=sys.stderr)
         return 1
-    sys.stdout.write(shell(config))
+    sys.stdout.write(shell(config, posix=sys.argv[1] == "sh"))
     return 0
 
 
