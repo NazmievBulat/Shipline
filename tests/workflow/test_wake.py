@@ -858,3 +858,65 @@ def test_an_analysis_that_ended_without_its_report_is_told(night: Workflow) -> N
         " Workflow analysis day-2026-10-13 ended without publishing its report "
         "(.local/analyses/day-2026-10-13/report.md)." in night.sent()[-1]
     )
+
+
+# The questions the tick answered for the owner (`tick`, "Owner only: no").
+
+
+def _answered(workflow: Workflow, name: str, reply: str, at: dict[str, str]) -> None:
+    folder = workflow.repo / ".local" / "workflow" / "answered-for-owner.pending"
+    folder.mkdir(parents=True, exist_ok=True)
+    moment = int(at["WORKFLOW_NOW"])
+    (folder / f"{moment}-{name}.json").write_text(
+        json.dumps({"name": name, "reply": reply, "at": moment})
+    )
+
+
+def test_answers_given_overnight_wait_for_the_morning_check_in_and_are_listed_once(
+    night: Workflow,
+) -> None:
+    night.orchestrator("idle")
+    _answered(night, "ticket-7", "1", _at(23, 10))
+    _answered(night, "review-7", "merge it", _at(3, 12, day=14))
+
+    _wake(night, at=_at(23, 20))
+    _wake(night, at=_at(7, 50, day=14))
+    night.orchestrator("busy")
+    morning = _wake(night, at=_at(8, 0, day=14))
+    _wake(night, at=_at(8, 5, day=14))
+    _wake(night, at=_at(8, 30, day=14))
+
+    assert morning.returncode == 0, morning.stderr
+    sent = night.sent()
+    assert len(sent) == 2
+    assert "answered for the owner" not in sent[0]
+    assert (
+        '\nanswered for the owner: ticket-7, "1" (23:10)\n'
+        'answered for the owner: review-7, "merge it" (03:12)\n'
+    ) in sent[1]
+    assert not list((night.repo / ".local/workflow/answered-for-owner.pending").iterdir())
+    assert 'answered for the owner: ticket-7, "1" (23:10)' in night.wake_log.read_text()
+
+
+def test_an_answer_given_in_the_day_is_told_at_the_next_look_once(day: Workflow) -> None:
+    _answered(day, "review-7", "1", _at(14, 0))
+
+    told = _wake(day, at=_at(14, 3))
+    _wake(day, at=_at(14, 10))
+    _wake(day, at=_at(15, 0))
+
+    assert told.returncode == 0, told.stderr
+    [prompt] = day.sent()
+    assert '\nanswered for the owner: review-7, "1" (14:00)\n' in prompt
+
+
+def test_an_answer_the_wake_could_not_send_is_sent_later(day: Workflow) -> None:
+    _answered(day, "review-7", "1", _at(14, 0))
+    (day.state / "send-fails").touch()
+    _wake(day, at=_at(14, 3))
+    (day.state / "send-fails").unlink()
+
+    _wake(day, at=_at(14, 9))
+
+    assert '\nanswered for the owner: review-7, "1" (14:00)\n' in day.sent()[-1]
+    assert not list((day.repo / ".local/workflow/answered-for-owner.pending").iterdir())
