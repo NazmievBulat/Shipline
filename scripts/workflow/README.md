@@ -1,3 +1,31 @@
+# Running Shipline
+
+Shipline runs from a checkout of its own, kept apart from the repository it works on, which
+holds none of its scripts. Clone it to `~/.local/share/shipline`, or elsewhere: a copy of
+`bin/shipline` kept outside any checkout runs the one `SHIPLINE_HOME` names. A repository
+calls it as `shipline <command>`: its rules, hooks and package scripts never name a path
+inside Shipline. The first time, the launcher is run by its path:
+
+```bash
+~/.local/share/shipline/bin/shipline --repo /path/to/example-app install-timer
+~/.local/share/shipline/bin/shipline --repo /path/to/example-app install-hooks
+```
+
+Each of the two writes the launcher of this checkout and the repository's main checkout, and
+points the link `~/.local/bin/shipline` at that launcher. `shipline uninstall` takes it all off
+in one step: it puts back exactly the hooks and the timer the two replaced (kept in
+`~/.claude/settings.json.shipline-replaced` and as `workflow-tick.*.before-shipline`), or
+switches Shipline's timer off when there was none. A sentence that tells a session to run a
+command names the launcher by its absolute path, so a session started before the switch runs
+it too. The repository is the main checkout
+`--repo` names, else `SHIPLINE_REPO`, else the one the current folder is in; outside any
+repository, with none named, a command stops and says how to name one. A command started
+outside the repository runs in its main checkout. Every session gets `SHIPLINE_REPO` and the
+checkout's `bin` in its environment. The gate reads a repository's `run_proof.py` from its own
+`scripts/workflow`; its other parts are the commands its `shipline.json` names (below,
+"The repository's commands"), read from its main checkout; a missing one means none: no
+check, no helper, no selected test (the panel then notes that CI runs the whole suite).
+
 # Workflow workers
 
 The tick reads `WORKFLOW_WORKER_PROGRAM` from its environment first, then
@@ -63,6 +91,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `hunts.areas` | the areas of the application two hunts may keep to at once: an object of each area's name (small letters, digits and dashes) to its screens, paths starting with `/` without a space, comma, quotation mark, dollar, backtick or backslash | none: one hunt runs at a time, on every screen |
 | `hunts.plans` | the repository's file of hunt plans, which the sentence of a hunt with a plan names | none: the sentence names no file |
 | `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
+| `commands.*`, the others | the repository's own commands Shipline calls, each split into words (below) | none |
 | `answer_for_owner_after_minutes` | how long a question to the owner marked `Owner only: no` waits before the tick types its recommended reply (see `RULES.md`, "Asking the owner"); `0` turns that off, and it is at most `1440`, a day | `15` |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
@@ -85,11 +114,54 @@ How a script reads it:
   ```
 
   which sets `SHIPLINE_REPOSITORY`, `SHIPLINE_STATE_FOLDER`, `SHIPLINE_CI_RESULT`,
-  `SHIPLINE_LABEL_WORKFLOW`, `SHIPLINE_PRIORITY_HIGH` and the rest, and `SHIPLINE_CONFIG`, the
-  file itself.
+  `SHIPLINE_LABEL_WORKFLOW`, `SHIPLINE_PRIORITY_HIGH` and the rest, `SHIPLINE_CONFIG`, the
+  file itself, each command as an array of its words, `SHIPLINE_COMMAND_HUNT_APP` and the
+  others, empty when the repository names none, and exports `SHIPLINE_REPO`, the repository's
+  main checkout, to every program the script starts.
 - jq includes `priority.jq`, which reads the label names from `SHIPLINE_CONFIG` in the
   environment (export it first) with the same defaults.
 - Node (`codex-bridge.mjs`) reads the state folder from the file with the same default.
 
 The machine-wide state, `~/.local/state/workflow`, is shared by every repository on one
 machine, as is its GitHub budget, and is not part of the file.
+
+## The repository's commands
+
+What only the repository knows (which tests a change reaches, how its application runs) it
+gives Shipline as commands, under `commands` in `shipline.json`. Each but `test` (run by `bash`
+from the root of the checkout, above) is a command line, split into words as the shell splits
+them, with nothing expanded. A first word with a `/` in it is a
+program in the repository's main checkout, whichever worktree runs it; a first word without
+one is found on the `PATH`, and then the first later word with a `/` in it that is no option
+is the script it runs, read from the main checkout too (`node tools/shipline/hunt-browser.mjs`):
+a pull request's worktree never supplies the program. The command runs in the folder its caller is in, with the
+arguments below after its own words. A command the file leaves out is one the repository does
+not have, and Shipline does without it; a command it names but that cannot start stops the
+call. A session runs one as `shipline <command>`, the name with dashes
+(`shipline browser-tests-for-changes origin/main`).
+
+| Command | Called by, with | Answers | Without it |
+| --- | --- | --- | --- |
+| `browser_tests_for_changes` | the review panel in a conflict round, and sessions: `<base> [--files-from <file>]` and the session's own words | the browser specs the change reaches, one path a line | nothing is selected, and CI runs the whole browser suite |
+| `server_tests_for_changes` | the same: `<base> [--files-from <file>]` | one JSON object, `{"whole": bool, "tests": [paths], "total": int, "reasons": [str]}` | the whole server suite: `{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}` |
+| `pre_train_checks` | the merge gate, before a pull request joins the merge train, in its worktree | exits non-zero when a check failed; what it prints is shown | every pull request is admitted |
+| `mechanical_conflicts` | the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch | `resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line (paths without spaces), or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took | every conflict is left to the session, nothing is renumbered and main took no number |
+| `browser_plan` | the merge gate: the changed paths on standard input, each ended by a NUL | prints `needed` or `none` and exits 0; anything else, a crash or another exit included, counts as needed | every merge that changes a file needs browser tests while the merged tree holds the E2E workflow (`workflows.e2e`), and none does without it |
+| `hunt_app` | `session` when a hunt stops: `stop`, in the hunt's worktree; the hunter itself, by `shipline hunt-app` | | `session start hunt` refuses |
+| `hunt_browser` | the hunter, by `shipline hunt-browser`, which its sentence names | | the sentence names none |
+| `hunt_cursor` | `session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>` | what it prints is kept in the report folder's `cursor.log` | a Cursor hunt is refused |
+| `advisory_watch` | the merge gate: `unreachable` with a failed push's output, or a failed audit's annotations, on standard input; `answers <service>` | `unreachable` prints the advisory service the text says was unreachable, or nothing; `answers` exits 0 when the service answers again | no outage is read: a failed push is refused as it is |
+| `push_checkout` | the merge gate, before each push and after one that failed: `install <checkout>`; `refusal <checkout>` with the push's whole output on standard input | `install` installs what changed since its last install and exits non-zero with the reason when it failed, which is a wait; `refusal` prints the hook's failed step with its last lines | nothing is installed, and a failed push is refused with its last 10 lines |
+
+The merge gate keeps the outage an advisory watch found in its state folder:
+`advisory-service-down`, `{"service": ..., "since": "YYYY-MM-DD HH:MM UTC"}`, written by the
+first push of an outage and removed when a push succeeds or the tick finds the service
+answering, and `advisory-service.pending`, the line the wake tells once.
+
+A command reads nothing but what is given on its standard input. Files a repository kept beside
+the scripts before these commands existed, `scripts/workflow/pre-train-checks`,
+`advisory_service.py`, `pushing_checkout.py`, `mechanical_conflicts.py`,
+`server_tests_for_changes.py`, `browser_tests_for_changes.py` and `scripts/e2e-plan.py`, are no
+longer read: each becomes a command named here, which answers in the form above. Its program now
+lives in the main checkout whichever worktree runs it, so one that reads the change finds the
+checkout from the folder it runs in (`git rev-parse --show-toplevel`), not from its own path.

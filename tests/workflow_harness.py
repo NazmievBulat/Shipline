@@ -20,6 +20,8 @@ from functools import cache
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "workflow"
+# The command a repository calls Shipline by, `shipline <command>`.
+LAUNCHER = Path(__file__).resolve().parents[1] / "bin" / "shipline"
 # What the scripts read from the rest of a repository, held only as far as the tests read it.
 STAND_INS = Path(__file__).resolve().parent / "workflow" / "stand-ins"
 SESSION_LINK = "https://claude.ai/code/session_01TestLinkForWorkflow"
@@ -416,6 +418,13 @@ BOX
         after="@STATE@/screen-after-enter-$name"
         [ ! -f "$after" ] || mv "$after" "@STATE@/screen/$name"
       fi
+    elif [ "$3" = Escape ]; then
+      # What Escape puts back into the box (a message queued while the session worked), and
+      # what the session draws once interrupted, when a test gives them.
+      queued="@STATE@/input-after-escape-$name"
+      [ ! -f "$queued" ] || mv "$queued" "@STATE@/input-$name"
+      after="@STATE@/screen-after-escape-$name"
+      [ ! -f "$after" ] || mv "$after" "@STATE@/screen/$name"
     fi
     ;;
   *) exit 1 ;;
@@ -551,10 +560,33 @@ class Workflow:
     state: Path
     bin: Path
     env: dict[str, str]
+    # Shipline's own checkout, when it is kept apart from the repository (`install_shipline`);
+    # otherwise the scripts are in the repository's `scripts/workflow`.
+    home: Path | None = None
 
     @property
     def script(self) -> Path:
-        return self.repo / "scripts" / "workflow" / "session"
+        return (self.home or self.repo) / "scripts" / "workflow" / "session"
+
+    def shipline(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        stdin: str = "",
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """`shipline <command>` of the separate checkout, as a repository calls it."""
+        assert self.home, "install_shipline first"
+        return subprocess.run(
+            ["bash", str(self.home / "bin" / "shipline"), *args],
+            cwd=cwd or self.repo,
+            env={**self.env, **(env or {})},
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
 
     @property
     def cgroup_root(self) -> Path:
@@ -965,6 +997,11 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
     made.fake("systemd-run", _FAKE_SYSTEMD_RUN)
     made.fake("claude", _FAKE_CLAUDE)
     made.fake("codex", _FAKE_INSTALLER)
+    # The repository's commands the stand-in `shipline.json` names: the checks the merge gate
+    # runs before a pull request joins the train, its browser plan, a hunt's application and its
+    # Cursor hunter.
+    for command in ("pre-train-checks", "browser-plan", "hunt-app", "hunt-cursor"):
+        made.fake(command, (STAND_INS / command).read_text())
     made.fake(
         "df",
         "#!/bin/bash\necho 'Filesystem Inodes IUsed IFree IUse% Mounted on'\n"
@@ -990,6 +1027,33 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
     shutil.copytree(template / "repo", made.repo, symlinks=True)
     made.git("remote", "set-url", "origin", str(origin))
     return made
+
+
+def install_shipline(made: Workflow) -> Path:
+    """Keeps Shipline apart from the repository: a checkout of its own, `shipline` in the test's
+    folder, holding `bin/shipline` and the scripts the repository held, and a repository that
+    no longer holds a `scripts/workflow`. Its setup command stays in its `scripts`, and the
+    commands its `shipline.json` names stay on the `PATH`. Returns the checkout."""
+    home = made.root / "shipline"
+    held = made.repo / "scripts" / "workflow"
+    shutil.copytree(held, home / "scripts" / "workflow", symlinks=True)
+    (home / "bin").mkdir()
+    shutil.copy2(LAUNCHER, home / "bin" / "shipline")
+    # A git checkout of its own, so a script that took the repository from its own folder
+    # would work on Shipline instead, and be seen to.
+    env = {**made.env, "GIT_DIR": str(home / ".git"), "GIT_WORK_TREE": str(home)}
+    for args in (
+        ["init", "--quiet", "--initial-branch=main"],
+        ["add", "-A"],
+        ["commit", "--quiet", "-m", "chore: shipline"],
+    ):
+        subprocess.run(["git", *args], cwd=home, env=env, capture_output=True, check=True)
+    made.git("rm", "-r", "--quiet", "scripts/workflow")
+    made.git("commit", "--quiet", "-m", "chore: shipline is called, not held")
+    made.git("push", "--quiet", "origin", "main")
+    shutil.rmtree(held, ignore_errors=True)
+    made.home = home
+    return home
 
 
 @cache
@@ -1035,10 +1099,6 @@ def _template() -> Path:
     setup = scripts.parent / "setup-worktree"
     setup.write_text('#!/bin/bash\nexec worktree-setup "$@"\n')
     setup.chmod(0o755)
-    # The merge gate asks E2E's planner whether a merge needs browser tests.
-    shutil.copy2(STAND_INS / "e2e-plan.py", scripts.parent / "e2e-plan.py")
-    # The checks the merge gate runs before a pull request joins the train.
-    shutil.copy2(STAND_INS / "pre-train-checks", scripts / "pre-train-checks")
     # The prompt a Claude session is woken with when the Codex bridge's `await_turn` ends.
     (scripts / "tests").mkdir()
     shutil.copy2(STAND_INS / "await-turn-completed.json", scripts / "tests")
@@ -1058,7 +1118,8 @@ def _template() -> Path:
     runner_settings = repo / ".github" / "runner" / "settings.sh"
     runner_settings.parent.mkdir(parents=True)
     shutil.copy2(STAND_INS / "settings.sh", runner_settings)
-    # The runners the merge gate may re-run failed jobs on: every other value is its default.
+    # The runners the merge gate may re-run failed jobs on, and the repository's own commands
+    # Shipline calls (stand-ins on the `PATH`): every other value is its default.
     shutil.copy2(STAND_INS / "shipline.json", repo / "shipline.json")
     (repo / ".gitignore").write_text(".local/\n.claude/\n")
     git("add", "-A")

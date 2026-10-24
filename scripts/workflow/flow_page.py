@@ -986,7 +986,7 @@ def one_pass(folder: Path, printed: bool) -> int:
 
 def served() -> tuple[str, int] | None:
     """Where the local settings say the page is served, or None when they name nowhere."""
-    path = workflow_config.main_checkout() / workflow_config.RUNNER_SETTINGS
+    path = workflow_config.repository_checkout() / workflow_config.RUNNER_SETTINGS
     if not path.is_file():
         return None
     try:

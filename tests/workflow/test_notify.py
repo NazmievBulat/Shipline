@@ -743,8 +743,10 @@ def test_it_works_whichever_folder_the_hook_is_called_from(session: Workflow) ->
     elsewhere = session.root / "elsewhere"
     elsewhere.mkdir()
 
-    session.notify(_stop("Worker finished."), cwd=elsewhere)
-    session.notify(_PERMISSION, cwd=elsewhere)
+    # The hook names the repository, as `install-hooks` writes it.
+    named = {"SHIPLINE_REPO": str(session.repo)}
+    session.notify(_stop("Worker finished."), cwd=elsewhere, env=named)
+    session.notify(_PERMISSION, cwd=elsewhere, env=named)
 
     assert _idle(session).exists()
     [push] = session.pushes()
