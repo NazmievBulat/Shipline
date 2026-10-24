@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Records a decision of the orchestrator, checks it and does its act (`decisions.py` says which
+# kinds there are, what each checks and does).
+#
+#   decide <start|hold|answer|allowance|hand-back|restart|program> N ...
+#   decide --metrics SINCE UNTIL
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec python3 -B "$here/decisions.py" "$@"
