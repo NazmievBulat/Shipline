@@ -84,6 +84,8 @@ DEFAULT_PORT = 8765
 # numbers and heads aside (`NUMBERED`), a head of letters alone too.
 GAP_MESSAGES = 10
 HEAD = re.compile(r"\b[0-9a-f]{7,40}\b")
+# An absolute path in a message (a traceback's frame) keeps only its last part: the page is served.
+ABSOLUTE = re.compile(r"(?<![\w./:])/(?:[\w.@+-]+/)+")
 # What of a line read from GitHub, the journal or the wake log reaches the page: one line, no
 # control characters, at most this long. The page escapes it.
 WORDS_LENGTH = 120
@@ -371,9 +373,13 @@ def read_jobs(repository: str, runs: list[dict[str, Any]]) -> tuple[int, str | N
 
 
 def read_train(config: workflow_config.Config) -> Any:
-    """The merge line as the gate last saved it, read without its lock: the gate writes it whole."""
+    """The merge line as the gate last saved it, read without its lock: the gate writes it whole.
+    A missing file is not an empty line (`Train` reads it as one): it may be gone a moment while
+    the tick runs."""
     from merge_gate import Train
 
+    if not (config.state() / "merge-train.json").exists():
+        raise Unread("not found")
     return Train(config.state())
 
 
@@ -645,10 +651,10 @@ def work_now(
 
 def bottleneck(stages: dict[str, list[dict[str, Any]]], unread: str | None = None) -> str:
     """The stage, among being built, in review and the merge line, that holds the most pull
-    requests, the one with the older oldest on a tie. Without the open pull requests no stage
-    can be judged: `unread` says why they were not read."""
+    requests, the one with the older oldest on a tie. Without the open pull requests or the
+    merge train no stage can be judged: `unread` says which was not read and why."""
     if unread is not None:
-        return f"bottleneck unknown: the open pull requests were not read ({unread})"
+        return f"bottleneck unknown: {unread}"
     candidates = [
         (len(items), max((item["hours"] or 0) for item in items), stage)
         for stage, items in stages.items()
@@ -693,7 +699,7 @@ def merged_numbers(pulls: list[dict[str, Any]], label: str) -> dict[str, Any]:
 
 def _said(lines: list[tuple[float, str]], start: float, end: float) -> dict[str, int]:
     counted = Counter(
-        words(HEAD.sub("#", NUMBERED.sub("#", text)))
+        words(ABSOLUTE.sub(".../", HEAD.sub("#", NUMBERED.sub("#", text))))
         for moment, text in lines
         if start <= moment < end
     )
@@ -899,6 +905,9 @@ def measure(config: workflow_config.Config, moment: int) -> dict[str, Any]:
     try:
         train = read_train(config)
         _source(read, "merge train")
+    except Unread as error:
+        train = None
+        _source(read, "merge train", str(error))
     except (OSError, ValueError, TypeError, KeyError, AttributeError, ImportError) as error:
         train = None
         _source(read, "merge train", _cannot(error))
@@ -920,11 +929,14 @@ def measure(config: workflow_config.Config, moment: int) -> dict[str, Any]:
     samples = read_machines(config, moment)
     _source(read, "machines")
     stages = work_now(pulls, train, label, moment)
+    unknown = None
+    if pulls is None:
+        unknown = f"the open pull requests were not read ({read['open pull requests']['error']})"
+    elif train is None:
+        unknown = f"the merge train was not read ({read['merge train']['error']})"
     return {
         "now": iso(moment),
-        "bottleneck": bottleneck(
-            stages, None if pulls is not None else read["open pull requests"]["error"]
-        ),
+        "bottleneck": bottleneck(stages, unknown),
         "stages": {stage: {"items": items} for stage, items in stages.items()},
         "merged": merged_numbers(merged, label) if merged is not None else None,
         "line": line_numbers(

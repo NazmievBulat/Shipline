@@ -650,7 +650,49 @@ def test_a_train_file_that_cannot_be_read_is_named_without_its_path(workflow: Wo
     numbers = _pass(workflow)
 
     assert numbers["sources"]["merge train"]["error"] == "cannot be read: Is a directory"
+    assert numbers["bottleneck"] == (
+        "bottleneck unknown: the merge train was not read (cannot be read: Is a directory)"
+    )
     assert str(workflow.root) not in _site(workflow).read_text()
+
+
+def test_a_train_file_gone_while_the_tick_runs_is_no_empty_line(workflow: Workflow) -> None:
+    _sources(workflow)
+    (workflow.repo / ".local" / "workflow" / "merge-train.json").unlink()
+
+    numbers = _pass(workflow)
+
+    # Read as an empty line, the line's members would count as in review.
+    assert numbers["sources"]["merge train"]["error"] == "not found"
+    assert numbers["bottleneck"] == "bottleneck unknown: the merge train was not read (not found)"
+    assert "bottleneck unknown: the merge train was not read" in _site(workflow).read_text()
+
+
+def test_a_train_file_half_written_gives_no_bottleneck(workflow: Workflow) -> None:
+    _sources(workflow)
+    train = workflow.repo / ".local" / "workflow" / "merge-train.json"
+    whole = train.read_text()
+    train.write_text(whole[: len(whole) // 2])
+
+    numbers = _pass(workflow)
+
+    assert numbers["sources"]["merge train"]["error"] == "cannot be read (JSONDecodeError)"
+    assert numbers["bottleneck"].startswith("bottleneck unknown: the merge train was not read")
+
+
+def test_a_path_in_the_journal_keeps_only_its_last_part(workflow: Workflow) -> None:
+    folder = _sources(workflow)
+    frame = '  File "/home/example-user/example-app/scripts/workflow/merge_gate.py", line 7, in run'
+    with (folder / "journal.jsonl").open("a") as journal:
+        journal.write(
+            json.dumps({"__REALTIME_TIMESTAMP": "1792749660000000", "MESSAGE": frame}) + "\n"
+        )
+
+    numbers = _pass(workflow)
+
+    assert numbers["line"]["gaps"][0]["journal"]['File ".../merge_gate.py", line #, in run'] == 1
+    page = _site(workflow).read_text()
+    assert "merge_gate.py" in page and "/home/example-user" not in page
 
 
 def test_a_pass_leaves_while_another_one_runs(workflow: Workflow) -> None:
