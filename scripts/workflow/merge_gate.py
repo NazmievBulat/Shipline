@@ -450,14 +450,15 @@ def jobs(run: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def job_notes(job: dict[str, Any], parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The notes of a job of `parts`, the jobs of its run's latest attempt, from the attempt
-    where it ran.
+    """The notes of a job, from the attempt of its run where it ran; `parts` are the jobs
+    listed with it.
 
     A re-run of only the failed jobs carries a job that passed into the new attempt under
     another ID and without its notes. GitHub lists each job with the attempt it ran in, so a
-    carried job is one whose attempt is older than the latest one any job of the run ran in.
-    Its notes are then those of the same job, passed and on the same head, in that attempt. A
-    job that ran in the latest attempt has only its own notes, however few.
+    carried job is one whose attempt is older than the latest one any job listed with it ran
+    in (a re-run runs one job at least). Its notes are then those of the same job, passed and
+    on the same head, in that attempt. A job that ran in the latest attempt has only its own
+    notes, however few.
     """
     notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
     attempt, run, head = job.get("run_attempt"), job.get("run_id"), job.get("head_sha")

@@ -1108,6 +1108,34 @@ def test_an_image_fix_at_the_back_takes_the_red_main_turn(github: GitHub, proof:
     assert _train(github)["first"] == ("8" if proof == "fresh" else "7")
 
 
+def test_an_image_fix_whose_failed_jobs_alone_were_rerun_takes_the_red_main_turn(
+    github: GitHub,
+) -> None:
+    _two_stale_pulls(github)
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(github.base, head, run_id=30)
+    _main_image_run(github, 60, github.base, conclusion="failure")
+    original_head = github.head
+    github.head = head
+    _images(github)
+    github.head = original_head
+    github.api[f"{_REPO}/actions/runs/40/jobs?per_page=100"]["jobs"].append(
+        {
+            "id": 44,
+            "name": "Docker images: browser tests (1 of 2)",
+            "status": "completed",
+            "conclusion": "success",
+        }
+    )
+    _rerun_failed_jobs(github, 40, head, "Docker images: what to run")
+    github.save()
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+    assert github.workflow.run_script("main-status").returncode == 0
+    assert _train(github)["first"] == "8"
+
+
 def test_the_tick_wakes_a_red_main_fix_ahead_of_the_queue(github: GitHub) -> None:
     second = _two_stale_pulls(github)
     workflow = github.workflow
@@ -1535,8 +1563,9 @@ def test_a_pass_over_mains_advisory_carried_into_a_rerun_is_not_the_fix(
     github.api[f"{_REPO}/check-runs/39/annotations?per_page=100"] = [
         {"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}
     ]
-    # Its warning is on the first attempt; the re-run carried the job without it.
-    _rerun_failed_jobs(github, 30, head, "CI: what to run", "CI: dependencies")
+    # Its warning is on the first attempt; the re-run carried the job without it. The planner
+    # ran again with its notes, so the warning alone keeps 8 from being the fix.
+    _rerun_failed_jobs(github, 30, head, "CI: dependencies")
     github.main("failure")
     github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"] = [
         {"id": 11, "name": "CI result", "status": "completed", "conclusion": "failure"},
@@ -2427,8 +2456,9 @@ def test_the_tick_reports_a_failed_image_run_after_a_push_without_images(github:
     "filename", ["Dockerfile", "é.txt", "tab\tname.txt", "line\nname.txt", "raw\udcff.txt"]
 )
 @pytest.mark.parametrize("initial_push", [False, True])
+@pytest.mark.parametrize("rerun", [False, True])
 def test_main_waits_for_required_images_of_the_whole_push(
-    github: GitHub, filename: str, initial_push: bool
+    github: GitHub, filename: str, initial_push: bool, rerun: bool
 ) -> None:
     workflow = github.workflow
     before = "0" * 40 if initial_push else github.base
@@ -2450,6 +2480,9 @@ def test_main_waits_for_required_images_of_the_whole_push(
     github.api[f"{_REPO}/check-runs/13/annotations?per_page=100"] = [
         {"title": "Push base", "message": before}
     ]
+    if rerun:
+        # Main's CI re-ran its failed jobs alone and carried its planner without the note.
+        _rerun_failed_jobs(github, 10, github.base, "CI: what to run")
     github.save()
 
     status = workflow.run_script("main-status")
