@@ -53,8 +53,11 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `labels.priority.blocker` … `.low` | the four priority labels | `priority: blocker` … `priority: low` |
 | `runner.labels` | the runner labels the merge gate may re-run failed jobs on | none: the gate re-runs nothing |
 | `runner.prefix` | the prefix the runner pool names its services and containers by; `workflow-metrics` reads their CPU | none: no runner figures |
+| `runner.main_machine` | the one machine of the pool whose runners take main's jobs, labelled `<runner.prefix>-<runner.main_machine>-main`; the example workflows name that label | `home` |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
+| `merge.scratch_prefix` | the beginning of the merge gate's scratch branches, ended by `-` or `/`: the gate tests each prefix on one and deletes every branch that begins with it; the example workflows run the gate's dispatches on them on main's runners | `workflow/merge-batch-` |
 | `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
+| `commands.browser` | the command line that runs the repository's browser tests, from the root of its checkout: E2E's `playwright` job runs it (`ci_proof.py browser`), with the job's own arguments after it | none: the browser job fails, saying so |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the

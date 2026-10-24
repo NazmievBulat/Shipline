@@ -12,6 +12,7 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[2]
 _CI = _ROOT / ".github/workflows/ci.yml"
 _EXAMPLE = _ROOT / "examples/ci.yml"
+_E2E = _ROOT / "examples/e2e.yml"
 
 
 def _job(path: Path, job: str) -> str:
@@ -66,12 +67,13 @@ def test_a_test_file_in_a_folder_below_is_counted(tmp_path: Path) -> None:
     ]
 
 
-@pytest.mark.parametrize("path", [_CI, _EXAMPLE], ids=["own", "example"])
-def test_ci_runs_only_on_github_s_own_runners(path: Path) -> None:
-    runners = re.findall(r"^\s+runs-on: (.+)$", path.read_text(), re.M)
+def test_ci_runs_only_on_github_s_own_runners() -> None:
+    """Shipline's own; the examples' main runners are a repository's own choice
+    (test_ci_runner_choice.py)."""
+    runners = re.findall(r"^\s+runs-on: (.+)$", _CI.read_text(), re.M)
 
     assert runners and set(runners) == {"ubuntu-latest"}
-    assert "self-hosted" not in path.read_text()
+    assert "self-hosted" not in _CI.read_text()
 
 
 # The step that fails the summing-up job when any job that ran did not pass.
@@ -158,6 +160,40 @@ def test_the_example_s_jobs_carry_the_config_s_default_names() -> None:
     assert re.search(r"^  workflow_dispatch:$", text, re.M)
     assert "pull_request_target" not in text
     assert re.search(r"^permissions:\n  contents: read$", text, re.M)
+
+
+def test_the_example_e2e_s_jobs_carry_the_names_the_gate_reads() -> None:
+    text = _E2E.read_text()
+    names = re.findall(r"^    name: (.+)$", text, re.M)
+
+    assert names == ['"E2E: what to run"', "playwright"]
+    assert re.search(r"^  pull_request:\n  push:\n    branches: \[main\]\n", text, re.M)
+    assert re.search(r"^  workflow_dispatch:$", text, re.M)
+    assert "pull_request_target" not in text
+    assert re.search(r"^permissions:\n  contents: read$", text, re.M)
+
+
+def test_the_example_e2e_planner_notes_the_whole_browser_suite_and_main_s_inheritance() -> None:
+    plan = _job(_E2E, "plan")
+
+    assert "run: python3 scripts/workflow/ci_proof.py notes --whole browser_suite\n" in plan
+    assert "        if: github.event_name == 'push'\n" in plan
+    assert "run: python3 scripts/workflow/ci_proof.py inherited e2e\n" in plan
+    assert "inherited: ${{ steps.inherited.outputs.inherited || '[]' }}" in plan
+    assert re.search(r"^    permissions:\n      contents: read\n(?:      #.*\n)*"
+                     r"      actions: read\n      checks: read\n", plan, re.M)
+
+
+def test_the_example_e2e_runs_the_browser_command_unless_main_inherited_it() -> None:
+    browser = _job(_E2E, "playwright")
+
+    assert re.search(r"^    needs: plan$", browser, re.M)
+    assert (
+        "    if: ${{ !contains(fromJSON(needs.plan.outputs.inherited), 'playwright') }}\n"
+        in browser
+    )
+    assert "run: python3 scripts/workflow/ci_proof.py browser\n" in browser
+    assert "persist-credentials: false" in browser
 
 
 def test_ci_runs_for_pull_requests_main_and_the_merge_queue() -> None:

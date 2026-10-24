@@ -89,7 +89,7 @@ REPOSITORY = CONFIG.repository
 API = CONFIG.api
 HERE = Path(__file__).resolve().parent
 # The gate owns these branches: each holds one batch's test merge, never a pull request.
-SCRATCH_PREFIX = "workflow/merge-batch-"
+SCRATCH_PREFIX = CONFIG.merge.scratch_prefix
 E2E_PLAN = CONFIG.checks.e2e_plan
 CI_PLAN = CONFIG.checks.ci_plan
 CI_RESULT = CONFIG.checks.ci_result

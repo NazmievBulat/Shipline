@@ -1,0 +1,93 @@
+# The browser tests of a repository that uses Shipline, as `.github/workflows/e2e.yml`
+# (`workflows.e2e` in shipline.json): a planner that writes the notes the merge gate reads, and
+# one job, `playwright`, that runs the repository's own browser command (`commands.browser`).
+# The gate judges a run by its planner (`checks.e2e_plan`, here its default) and by every job
+# that ran; a repository that names another planner names its job so.
+#
+# Every job runs on GitHub's own runners, except when the repository has a runner pool and turns
+# main's runners on with the repository variable `CI_MAIN_RUNNER` set to `on`: then a push to
+# main, and the merge gate's dispatch on a scratch branch of its own, run on main's runners, so a
+# prefix of the merge line never waits behind pull requests' own runs. Each job names that
+# choice: `refs/heads/` and `merge.scratch_prefix`, and main's label,
+# `<runner.prefix>-<main_machine>-main` (here the defaults, with the runner prefix
+# `example-app`). A pull request never gets them: only a push to main or a dispatch, which needs
+# write access, does.
+name: E2E
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The merge gate runs the whole browser suite on a scratch branch of its own with
+  # `gh workflow run`.
+  workflow_dispatch:
+
+# Read-only for every run; a pull request from a fork gets no secrets either, as GitHub gives
+# `pull_request` runs of forks none.
+permissions:
+  contents: read
+
+# A pull request's newer push cancels its older run. Every commit of main and every scratch run
+# keeps its own: the merge gate reads each of them.
+concurrency:
+  group: e2e-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    # The gate reads its notes from this job alone (`checks.e2e_plan`).
+    name: "E2E: what to run"
+    runs-on: >-
+      ${{ vars.CI_MAIN_RUNNER == 'on' && (github.event_name == 'push' && github.ref == 'refs/heads/main'
+      || github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-'))
+      && fromJSON('["self-hosted", "example-app-home-main"]') || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # On main, reading the runs a squash's proof names, with their jobs and notes.
+      actions: read
+      checks: read
+    outputs:
+      inherited: ${{ steps.inherited.outputs.inherited || '[]' }}
+    steps:
+      # On a pull request this is GitHub's merge of it into main: the tree the gate checks.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: The notes the merge gate reads
+        # Every run runs the whole browser suite: the gate takes a prefix's browser run only
+        # when it was whole. A repository that runs a selection on its pull requests notes it
+        # with `--selected browser_suite N M specs`.
+        run: python3 scripts/workflow/ci_proof.py notes --whole browser_suite
+      # A squash the gate made carries its proof: main skips the browser job when it passed,
+      # whole, on the identical tree, and names the run it inherited. Any other push runs it.
+      - name: The jobs main inherits from its squash's proof
+        id: inherited
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/workflow/ci_proof.py inherited e2e
+
+  playwright:
+    # The gate's name for the job that runs the browser suite.
+    name: playwright
+    needs: plan
+    if: ${{ !contains(fromJSON(needs.plan.outputs.inherited), 'playwright') }}
+    runs-on: >-
+      ${{ vars.CI_MAIN_RUNNER == 'on' && (github.event_name == 'push' && github.ref == 'refs/heads/main'
+      || github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-'))
+      && fromJSON('["self-hosted", "example-app-home-main"]') || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      # Whatever the browser tests need installed, the browsers among them, comes before this.
+      - name: Browser tests
+        run: python3 scripts/workflow/ci_proof.py browser

@@ -587,11 +587,26 @@ def test_main_s_planner_inherits_nothing_when_github_answers_too_deep_to_read(
     assert "every job runs" in done.stderr
 
 
+# The test job's command and the browser job's: each runs the command of its own name.
+_COMMANDS = ["test", "browser"]
+
+
+@pytest.mark.parametrize("command", _COMMANDS)
 @pytest.mark.parametrize("checkout", ["main", "worktree"])
-def test_the_test_command_is_the_one_the_config_names(workflow: Workflow, checkout: str) -> None:
+def test_the_test_command_is_the_one_the_config_names(
+    workflow: Workflow, checkout: str, command: str
+) -> None:
     """It runs from the root of the checkout it is called in."""
+    other = next(name for name in _COMMANDS if name != command)
     (workflow.repo / "shipline.json").write_text(
-        json.dumps({"commands": {"test": "echo \"ran in $PWD\" > ran.txt; sh -c 'exit 3'"}})
+        json.dumps(
+            {
+                "commands": {
+                    command: "echo \"ran in $PWD\" > ran.txt; sh -c 'exit 3'",
+                    other: "echo other > ran.txt",
+                }
+            }
+        )
     )
     root = workflow.repo
     if checkout == "worktree":
@@ -599,7 +614,7 @@ def test_the_test_command_is_the_one_the_config_names(workflow: Workflow, checko
         workflow.git("worktree", "add", "--quiet", "--detach", str(root))
 
     done = subprocess.run(
-        [sys.executable, "-B", str(root / "scripts/workflow/ci_proof.py"), "test"],
+        [sys.executable, "-B", str(root / "scripts/workflow/ci_proof.py"), command],
         cwd=root / "scripts",
         env=workflow.env,
         capture_output=True,
@@ -612,23 +627,30 @@ def test_the_test_command_is_the_one_the_config_names(workflow: Workflow, checko
     assert (root / "ran.txt").read_text() == f"ran in {root}\n"
 
 
-def test_the_test_command_is_given_the_job_s_own_arguments(workflow: Workflow) -> None:
+@pytest.mark.parametrize("command", _COMMANDS)
+def test_the_test_command_is_given_the_job_s_own_arguments(
+    workflow: Workflow, command: str
+) -> None:
     (workflow.repo / "shipline.json").write_text(
-        json.dumps({"commands": {"test": "printf '[%s]' run"}})
+        json.dumps({"commands": {command: "printf '[%s]' run"}})
     )
 
-    done = _proof(workflow, "test", "--fast", "tests/a test.py")
+    done = _proof(workflow, command, "--fast", "tests/a test.py")
 
     assert done.returncode == 0, done.stderr
     assert done.stdout == "[run][--fast][tests/a test.py]"
 
 
+@pytest.mark.parametrize(
+    "command,tests", [("test", "tests"), ("browser", "browser tests")], ids=_COMMANDS
+)
 def test_a_repository_without_a_test_command_fails_its_test_job_saying_so(
-    workflow: Workflow,
+    workflow: Workflow, command: str, tests: str
 ) -> None:
-    done = _proof(workflow, "test")
+    done = _proof(workflow, command)
 
     assert done.returncode == 1
     assert done.stderr == (
-        "shipline.json names no commands.test, the command that runs this repository's tests\n"
+        f"shipline.json names no commands.{command}, "
+        f"the command that runs this repository's {tests}\n"
     )

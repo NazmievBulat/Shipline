@@ -803,7 +803,7 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
         "failed_scratch_runs": sum(
             1
             for run in completed
-            if (run.get("head_branch") or "").startswith("workflow/merge-batch-")
+            if (run.get("head_branch") or "").startswith(workflow_config.current().merge.scratch_prefix)
             and run.get("conclusion") == "failure"
         ),
     }

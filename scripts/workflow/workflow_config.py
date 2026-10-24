@@ -10,9 +10,10 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `.github/runner/settings.sh` when the runner pool names one, else the owner and name of the
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
-set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix; no test command, which a repository names for its CI's test job
-(`ci_proof.py test`).
+set-up command, run only when present, is `scripts/setup-worktree`; the merge gate's scratch
+branches begin `workflow/merge-batch-`; no runner labels and no runner prefix; no test command,
+which a repository names for its CI's test job (`ci_proof.py test`), and no browser command,
+which it names for its E2E's browser job (`ci_proof.py browser`).
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -80,15 +81,33 @@ DEFAULTS: dict[str, Any] = {
         # The prefix the runner pool names its services and containers by; without it, there are
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
+        # The one machine of the pool whose runners take main's jobs: they carry the label
+        # `<prefix>-<main_machine>-main` (`Runner.main_label`), which no other machine has.
+        "main_machine": "home",
+    },
+    "merge": {
+        # The merge gate's own branches, each one prefix's test merge: this, then a random name.
+        # The gate deletes every branch that begins with it, and the example workflows run the
+        # gate's dispatches on them on main's runners (examples/ci.yml).
+        "scratch_prefix": "workflow/merge-batch-",
     },
     "commands": {
-        # The command line that runs the repository's tests, from the root of its checkout.
+        # The command lines that run the repository's tests and its browser tests, from the root
+        # of its checkout.
         "test": None,
+        "browser": None,
     },
 }
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
+# A machine's name, as a runner label holds it.
+_MACHINE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+# A branch name's beginning, ended by `-` or `/` so it takes in only the gate's own branches:
+# words of letters, digits, `_`, `.` and `-`, none beginning with `.` or `-` nor ending in
+# `.lock`, joined by single `/`; nothing `git ls-remote` reads as a pattern, and not a full ref.
+_WORD = r"(?!refs/)[A-Za-z0-9_][A-Za-z0-9_.-]*(?<!\.lock)(?<!\.)"
+_SCRATCH_PREFIX = re.compile(rf"(?!.*\.\.){_WORD}(?:/{_WORD})*[-/]")
 
 
 class ConfigError(Exception):
@@ -136,16 +155,30 @@ class Runner:
     labels: tuple[str, ...]
     identity_folder: str
     prefix: str | None = None
+    main_machine: str = "home"
 
     @property
     def identity_path(self) -> Path:
         return Path(self.identity_folder).expanduser()
+
+    @property
+    def main_label(self) -> str | None:
+        """The label of main's runners; None without a runner pool."""
+        if self.prefix is None:
+            return None
+        return f"{self.prefix}-{self.main_machine}-main"
+
+
+@dataclass(frozen=True)
+class Merge:
+    scratch_prefix: str
 
 
 @dataclass(frozen=True)
 class Commands:
     # None when the file names none.
     test: str | None
+    browser: str | None
 
 
 @dataclass(frozen=True)
@@ -159,6 +192,7 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    merge: Merge
     commands: Commands
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
@@ -309,6 +343,17 @@ def load(start: Path = HERE) -> Config:
         raise ConfigError(f"{FILE}: labels.priority must name four different labels")
     if repository is not None and not _REPOSITORY.fullmatch(repository):
         raise ConfigError(f"{source}: repository must be owner/name, not {repository}")
+    if not _MACHINE.fullmatch(values["runner"]["main_machine"]):
+        raise ConfigError(
+            f"{FILE}: runner.main_machine must be a machine's name, "
+            f"not {values['runner']['main_machine']}"
+        )
+    scratch_prefix = values["merge"]["scratch_prefix"]
+    if not _SCRATCH_PREFIX.fullmatch(scratch_prefix):
+        raise ConfigError(
+            f"{FILE}: merge.scratch_prefix must be the beginning of a branch name, ended by "
+            f"- or /, not {scratch_prefix}"
+        )
     return Config(
         found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),
@@ -321,7 +366,9 @@ def load(start: Path = HERE) -> Config:
             labels=tuple(values["runner"]["labels"]),
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
+            main_machine=values["runner"]["main_machine"],
         ),
+        merge=Merge(scratch_prefix=scratch_prefix),
         commands=Commands(**values["commands"]),
         given=given,
         main=main,
@@ -352,7 +399,9 @@ def as_dict(config: Config) -> dict[str, Any]:
             "labels": list(config.runner.labels),
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
+            "main_machine": config.runner.main_machine,
         },
+        "merge": vars(config.merge).copy(),
         "commands": vars(config.commands).copy(),
     }
 

@@ -25,9 +25,11 @@ step output `inherited`, a JSON list, so those jobs skip themselves. Nothing is 
 everything checks out; whatever cannot be read means every job runs.
 
     ci_proof.py test [ARGUMENT ...]
+    ci_proof.py browser [ARGUMENT ...]
 
-runs the repository's own test command (`commands.test`) from the root of the checkout it is
-called in, with the job's arguments after it.
+runs the repository's own test command (`commands.test`), or its browser command
+(`commands.browser`), from the root of the checkout it is called in, with the job's arguments
+after it.
 """
 
 import argparse
@@ -309,28 +311,37 @@ def _main_inherited(args: list[str]) -> int:
     return 0
 
 
-def _main_test(args: list[str]) -> int:
-    config = workflow_config.current()
-    if config.commands.test is None:
+# What each command's tests are called when the file names no command for them.
+_TESTS = {"test": "tests", "browser": "browser tests"}
+
+
+def _run_command(name: str, args: list[str]) -> int:
+    line = getattr(workflow_config.current().commands, name)
+    if line is None:
         print(
-            f"{workflow_config.FILE} names no commands.test, "
-            "the command that runs this repository's tests",
+            f"{workflow_config.FILE} names no commands.{name}, "
+            f"the command that runs this repository's {_TESTS[name]}",
             file=sys.stderr,
         )
         return 1
     # The command line is the repository's own, as its file names it; the job's arguments
     # follow it as words of their own, so it must end where arguments may follow.
     return subprocess.run(
-        ["bash", "-c", config.commands.test + ' "$@"', "test", *args],
+        ["bash", "-c", line + ' "$@"', name, *args],
         cwd=_git("rev-parse", "--show-toplevel"),
         check=False,
     ).returncode
 
 
 def main() -> int:
-    commands = {"notes": _main_notes, "inherited": _main_inherited, "test": _main_test}
+    commands = {
+        "notes": _main_notes,
+        "inherited": _main_inherited,
+        "test": lambda args: _run_command("test", args),
+        "browser": lambda args: _run_command("browser", args),
+    }
     if len(sys.argv) < 2 or sys.argv[1] not in commands:
-        print("usage: ci_proof.py notes|inherited|test ...", file=sys.stderr)
+        print("usage: ci_proof.py notes|inherited|test|browser ...", file=sys.stderr)
         return 2
     try:
         return commands[sys.argv[1]](sys.argv[2:])
