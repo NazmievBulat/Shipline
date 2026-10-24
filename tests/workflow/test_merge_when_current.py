@@ -3485,6 +3485,7 @@ def _batch_call(github: GitHub, number: str = "7") -> subprocess.CompletedProces
     github.api, github.pulls = saved["api"], saved["pulls"]
     github.refuse_merge, github.after_merge = saved["refuse_merge"], saved["after_merge"]
     github.after_main = saved["after_main"]
+    github.cancel_unavailable = saved["cancel_unavailable"]
     return done
 
 
@@ -3833,8 +3834,9 @@ def test_a_member_leaving_the_line_keeps_the_prefixes_ahead_of_it(github: GitHub
 
 
 def _branch_runs(github: GitHub, branch: str, *runs: tuple[Any, ...]) -> None:
-    """The runs GitHub lists for `branch`, each `(id, status)` dispatched on it, or
-    `(id, status, its branch, its event)`; a completed one passed."""
+    """The runs GitHub lists for `branch`, each `(id, status)` of CI dispatched on it, or
+    `(id, status, its branch, its event)`, or `(id, status, its branch, its event, its
+    workflow)`; a completed one passed."""
     github.api[f"{_REPO}/actions/runs?branch={branch}&per_page=100"] = {
         "workflow_runs": [
             {
@@ -3842,6 +3844,7 @@ def _branch_runs(github: GitHub, branch: str, *runs: tuple[Any, ...]) -> None:
                 "head_sha": "0" * 40,
                 "head_branch": run[2] if len(run) > 2 else branch,
                 "event": run[3] if len(run) > 2 else "workflow_dispatch",
+                "path": f".github/workflows/{run[4] if len(run) > 4 else 'ci'}.yml",
                 "status": run[1],
                 "conclusion": "success" if run[1] == "completed" else None,
             }
@@ -3923,6 +3926,96 @@ def test_every_prefix_dropped_at_once_has_its_runs_cancelled(github: GitHub) -> 
     remaining = _scratch_branches(github)
     assert not set(old.values()) & set(remaining)
     assert sorted(remaining) == sorted(m["scratch"]["branch"] for m in _prefixes(github))
+
+
+def _dropped_nine(github: GitHub) -> dict[str, Any]:
+    """Members 7 to 9 tested at once; 9's prefix is dropped at the next call."""
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    dropped = _scratch(github, "9")
+    assert dropped is not None
+    github.pulls["9"]["state"] = "CLOSED"
+    return dropped
+
+
+def test_a_scratch_cancel_lost_to_an_outage_is_tried_again(github: GitHub) -> None:
+    dropped = _dropped_nine(github)
+    _branch_runs(github, dropped["branch"], (901, "in_progress"))
+    github.cancel_unavailable = [901]
+
+    assert _batch_call(github).returncode == 3
+    # The branch outlives the failed cancel, so the next sweep finds its run again.
+    assert dropped["branch"] in _scratch_branches(github)
+    assert not github.workflow.wake_log.exists() or "901" not in github.workflow.wake_log.read_text()
+    assert _batch_call(github).returncode == 3
+
+    assert len(github.workflow.calls("gh run cancel 901 ")) == 2
+    assert dropped["branch"] not in _scratch_branches(github)
+
+
+def test_a_run_github_lists_only_after_the_drop_is_still_cancelled(github: GitHub) -> None:
+    # GitHub accepts a dispatch before it lists the run: a prefix dropped in that window has
+    # its branch deleted while its run is still to come.
+    dropped = _dropped_nine(github)
+    assert "ci" in dropped["requested"], dropped
+    branch = dropped["branch"]
+
+    assert _batch_call(github).returncode == 3
+    assert branch not in _scratch_branches(github)
+    _branch_runs(github, branch, (901, "queued"))
+    assert _batch_call(github).returncode == 3
+
+    assert github.workflow.calls("gh run cancel 901 ")
+
+
+def _waiting_drops(github: GitHub) -> list[dict[str, Any]]:
+    return _batch_state(github).get("dropped", [])
+
+
+def test_a_dropped_prefix_is_watched_until_each_dispatched_run_was_seen(github: GitHub) -> None:
+    dropped = _dropped_nine(github)
+    branch = dropped["branch"]
+    assert _batch_call(github).returncode == 3
+    assert [entry["branch"] for entry in _waiting_drops(github)] == [branch]
+    # A run of each workflow it dispatched shows up: each is cancelled, or had finished.
+    runs = [
+        (900 + index, "completed" if index else "queued", branch, "workflow_dispatch", workflow)
+        for index, workflow in enumerate(dropped["requested"])
+    ]
+    _branch_runs(github, branch, *runs)
+    assert _batch_call(github).returncode == 3
+    assert list(_cancelled(github)) == ["900"]
+    assert _waiting_drops(github) == []
+    assert _batch_call(github).returncode == 3
+    assert list(_cancelled(github)) == ["900"]
+
+
+def test_a_dropped_prefix_whose_runs_never_show_is_given_up_after_the_deadline(
+    github: GitHub,
+) -> None:
+    dropped = _dropped_nine(github)
+    branch = dropped["branch"]
+    assert _batch_call(github).returncode == 3
+    path = github.workflow.repo / ".local/workflow/merge-train.json"
+    train = _batch_state(github)
+    # Still within its deadline, it stays watched.
+    train["dropped"][0]["dropped"] -= 29 * 60
+    path.write_text(json.dumps(train))
+    assert _batch_call(github).returncode == 3
+    assert [entry["branch"] for entry in _waiting_drops(github)] == [branch]
+    train = _batch_state(github)
+    train["dropped"][0]["dropped"] -= 2 * 60
+    path.write_text(json.dumps(train))
+
+    assert _batch_call(github).returncode == 3
+
+    assert _waiting_drops(github) == []
+    log = github.workflow.wake_log.read_text()
+    notes = [line for line in log.splitlines() if branch in line]
+    assert len(notes) == 1 and "gave up" in notes[0], log
+    assert _batch_call(github).returncode == 3
+    assert github.workflow.wake_log.read_text().count(branch) == 1
+    assert github.workflow.calls("gh run cancel") == []
 
 
 def test_a_refused_cancel_is_logged_once_and_the_branch_still_goes(github: GitHub) -> None:
