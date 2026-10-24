@@ -6366,6 +6366,51 @@ def test_deferred_images_require_passing_proof_on_the_tested_tree(
     assert not (github.workflow.state / "merged").exists()
 
 
+def test_a_deferred_image_prefix_cannot_pass_with_only_its_planner(github: GitHub) -> None:
+    _batch_setup(github, count=2, images=True, selected=True)
+    _prefix_only(github, ["images"])
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+    scratch = _scratch(github)
+    assert scratch is not None
+    image_run = github.api[
+        f"{_REPO}/actions/workflows/images.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0]
+    for job in github.api[f"{_REPO}/actions/runs/{image_run['id']}/jobs?per_page=100"]["jobs"]:
+        if job["name"] != "Docker images: what to run":
+            job["conclusion"] = "skipped"
+    done = _batch_call(github)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_a_scratch_run_finishing_or_rerunning_rejudges_red_main_fix_priority(github: GitHub) -> None:
+    tree = _changes(github, "docker/change.txt")
+    _prefix_only(github, ["images"])
+    _images(github, pull=False, conclusion="failure", release_conclusion="success")
+    assert _batch_call(github).returncode == 3
+    scratch = _suite(github)
+    assert _batch_state(github)["proofs"]["7"][1] is False
+    _finish_prefix(github, "7", scratch=scratch, tree=tree, run_id=800)
+    github.save()
+    assert _train(github)["priorities"]["7"] == "blocker"
+    assert _batch_state(github)["proofs"]["7"][1] is True
+    run = github.api[
+        f"{_REPO}/actions/workflows/images.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0]
+    run.update(run_attempt=2, status="in_progress", conclusion=None)
+    github.save()
+    assert _train(github)["priorities"]["7"] == "medium"
+    assert _batch_state(github)["proofs"]["7"][1] is False
+    run.update(status="completed", conclusion="success")
+    github.save()
+    assert _train(github)["priorities"]["7"] == "blocker"
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
 @pytest.mark.parametrize(
     "own",
     [

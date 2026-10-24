@@ -1574,6 +1574,7 @@ def _proves_whole(
             workflow_verdict(workflow, run, parts)[0] == "green"
             and (NOTES.files_tested, record["tree"]) in _planner_notes(parts, IMAGES_PLAN)
             and any(job["name"] != IMAGES_PLAN and job.get("conclusion") == "success"
+                    and CONFIG.checks.groups()["images"].contains(job["name"])
                     for job in parts)
         )
     if workflow == "ci":
@@ -1933,7 +1934,9 @@ def conflicting(pull: dict[str, Any]) -> bool:
     return pull["mergeable"] == "CONFLICTING" or pull["mergeStateStatus"] == "DIRTY"
 
 
-def fix_evidence(pull: dict[str, Any], base: str, health: Health) -> str | None:
+def fix_evidence(
+    pull: dict[str, Any], base: str, health: Health, suite: dict[str, Any] | None = None
+) -> str | None:
     """What a judgment of `proves_main_fix` rests on, or None when its CI has not passed.
 
     The tick reconciles every 3 minutes and each proof costs several GitHub requests from
@@ -1947,9 +1950,17 @@ def fix_evidence(pull: dict[str, Any], base: str, health: Health) -> str | None:
     checks = sorted(
         json.dumps(check, sort_keys=True, default=str) for check in pull["statusCheckRollup"]
     )
-    return hashlib.sha256(
-        json.dumps([pull["headRefOid"], base, sorted(health.failing), checks]).encode()
-    ).hexdigest()
+    evidence: list[Any] = [pull["headRefOid"], base, sorted(health.failing), checks]
+    if CONFIG.checks.prefix_only:
+        # Scratch checks finish independently of the PR rollup. A new attempt can also
+        # withdraw a previously proven fix, so both successful and failed judgments expire.
+        scratch = [
+            [workflow, run["id"], run.get("run_attempt", 1), run["status"], run.get("conclusion")]
+            for workflow in _suite_workflows(suite)
+            for run in _batch_runs(suite, workflow)
+        ] if suite else []
+        evidence += [CONFIG.checks.prefix_only, suite, scratch]
+    return hashlib.sha256(json.dumps(evidence).encode()).hexdigest()
 
 
 def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
@@ -2424,7 +2435,7 @@ class Train:
                     for number in remaining:
                         if number in self.unavailable or number in self.conflicts:
                             continue
-                        evidence = fix_evidence(pulls[number], base, current)
+                        evidence = fix_evidence(pulls[number], base, current, self.suites.get(number))
                         if evidence is None:
                             continue
                         judged = self.proofs.get(number)
@@ -3457,6 +3468,8 @@ def _prefix_state(member: dict[str, Any], folder: Path) -> Prefix:
             if workflow == "ci"
             else whole_suite(found[0], parts, tree)
             if workflow == "e2e"
+            else _proves_whole("images", found[0], parts, {**scratch, "tree": tree})
+            if "images" in CONFIG.checks.prefix_only
             else (NOTES.files_tested, tree) in _planner_notes(parts, IMAGES_PLAN)
         ):
             short.append(

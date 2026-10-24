@@ -132,6 +132,28 @@ def test_daily_prefix_savings_retries_delivery_then_sends_once(night: Workflow) 
     assert (night.repo / ".local/workflow/prefix-savings.sent").read_text().strip() == "2026-10-12"
 
 
+def test_an_unsent_daily_savings_report_survives_utc_midnight(night: Workflow) -> None:
+    _savings_day(night)
+    night.orchestrator("idle")
+    (night.state / "send-fails").touch()
+    # A reset check-in just before UTC midnight; ordinary night check-ins start afterward.
+    assert _wake(night, "ticket-7", at=_at(19, 59)).returncode == 1
+    pending = night.repo / ".local/workflow/prefix-savings-2026-10-12.pending"
+    assert pending.exists()
+    (night.state / "send-fails").unlink()
+    done = _wake(night, at=_at(20, 5))
+    assert done.returncode == 0, done.stderr
+    assert "saved (2026-10-12 UTC): images 24.00" in night.sent()[-1]
+    assert not pending.exists()
+    sent = night.repo / ".local/workflow/prefix-savings.sent"
+    assert sent.read_text().strip() == "2026-10-12"
+    assert _wake(night, at=_at(20, 26)).returncode == 0
+    assert "saved (2026-10-13 UTC): images 0.00" in night.sent()[-1]
+    assert sent.read_text().strip() == "2026-10-13"
+    assert _wake(night, at=_at(20, 47)).returncode == 0
+    assert len(night.sent()) == 3
+
+
 def test_at_night_an_idle_orchestrator_gets_a_check_in(night: Workflow) -> None:
     night.orchestrator("idle")
 
