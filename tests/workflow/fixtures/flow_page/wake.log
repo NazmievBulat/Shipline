@@ -1,0 +1,13 @@
+2026-10-23 10:00:00  every 20 minutes
+  usage: 5-hour window 20% used, resets in 2h10m, weekly 30%
+  sessions: ticket-41 busy; pull requests: drafts 41; main: red since 2026-10-23T09:30:00Z, CI result (0123456789ab); starts: allowed; tmp pressure: false
+1792753200 review-30 checks finished on aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reviewer nudged
+2026-10-23 22:00:00  every 20 minutes
+  usage: 5-hour window 40% used, resets in 2h10m, weekly 30%
+  sessions: ticket-41 busy; pull requests: drafts 41; main: green (0123456789ab); starts: allowed; tmp pressure: false
+1792796400 review-31 merge conflict on bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; reviewer nudged
+1792801800 review-32 merge conflict on cccccccccccccccccccccccccccccccccccccccc; reviewer nudged
+2026-10-24 02:00:00  every 20 minutes
+  usage: 5-hour window 60% used, resets in 2h10m, weekly 30%
+  sessions: ticket-41 busy; pull requests: drafts 41; main: pending, CI result (0123456789ab); starts: allowed; tmp pressure: false
+1792809000 ticket-41 idle 52 min waiting for its own job or turn; status check sent

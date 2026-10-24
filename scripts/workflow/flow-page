@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# One page of where the workflow's time goes and which stage is the bottleneck now
+# (`flow_page.py` reads and computes, `flow_page_html.py` renders); it writes nothing to GitHub.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec python3 -B "$here/flow_page.py" "$@"

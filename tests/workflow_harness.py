@@ -455,6 +455,31 @@ done
 """
 
 
+# Placed first on the scripts' `PYTHONPATH` by `Workflow.refuse_write`. It finds the file each
+# `os.write` goes to through `/proc/self/fd` and raises for the files the test named. It hides
+# a `sitecustomize` the system Python may bring, which the scripts do not need.
+_REFUSING_WRITE = """import json
+import os
+
+with open(@REFUSED@) as refused_file:
+    _refused = json.load(refused_file)
+_write = os.write
+
+
+def _refusing_write(fd, data, /):
+    try:
+        target = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        target = None
+    if target in _refused:
+        raise OSError(_refused[target], os.strerror(_refused[target]))
+    return _write(fd, data)
+
+
+os.write = _refusing_write
+"""
+
+
 @dataclass
 class Push:
     """One call of the stand-in `curl`."""
@@ -786,6 +811,21 @@ class Workflow:
     @property
     def wake_log(self) -> Path:
         return self.root / "home" / ".local" / "state" / "workflow" / "wake.log"
+
+    def refuse_write(self, file: Path, error: int) -> None:
+        """Makes each `os.write` of the scripts' Python to `file` raise a real `OSError(error)`.
+
+        Writes to every other file go through.
+        """
+        hooks = self.root / "python-hooks"
+        hooks.mkdir(exist_ok=True)
+        listed = hooks / "refused.json"
+        refused = json.loads(listed.read_text()) if listed.exists() else {}
+        refused[str(file.resolve())] = error
+        listed.write_text(json.dumps(refused))
+        hook = _REFUSING_WRITE.replace("@REFUSED@", repr(str(listed)))
+        (hooks / "sitecustomize.py").write_text(hook)
+        self.env["PYTHONPATH"] = str(hooks)
 
     def fake(self, tool: str, text: str) -> None:
         path = self.bin / tool

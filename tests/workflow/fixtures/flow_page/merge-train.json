@@ -1,0 +1,28 @@
+{
+ "waiting": [
+  "46",
+  "44",
+  "45",
+  "48",
+  "51"
+ ],
+ "priorities": {
+  "44": "high"
+ },
+ "blocked": {
+  "46": "head-46",
+  "48": "head-48"
+ },
+ "refreshable": [
+  "48"
+ ],
+ "conflicts": {
+  "45": "head-45"
+ },
+ "suspended": {
+  "51": "head-51:main: red"
+ },
+ "unavailable": [
+  "48"
+ ]
+}
