@@ -168,7 +168,8 @@ are written from the measured reports, never from guesses.
    on each. Nothing names where the jobs go: every machine's runners carry the same labels, so
    GitHub gives a job to whichever runner is free.
 4. A machine may keep no PR slot of its own (`ordinary_jobs=0`) while the pool has another
-   machine; the only machine of a pool keeps at least one. PR jobs still run when no other machine
+   machine; the only machine of a pool keeps at least one, and so does at least one machine of
+   every pool: two machines with none would each take a slot and give it back as the other did. PR jobs still run when no other machine
    has an online ordinary runner: the giving machine's spare then takes one slot, and gives it
    back once another machine's ordinary runner is online again (`keep-spare.sh`,
    `ordinary_slots.py`). Main's runner lent to PR jobs does not count, as it is busy exactly when

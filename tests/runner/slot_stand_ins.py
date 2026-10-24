@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -166,14 +167,15 @@ class Machine:
         settings.write_text("\n".join(lines) + "\n")
 
     def runners(self, *listed: tuple[str, str, list[str]]) -> None:
-        """What GitHub lists: (name, status, labels) of each runner."""
+        """What GitHub lists: (name, status, labels) of each runner. A runner that is "busy" is
+        online and running a job."""
         runners = [
             {
                 "id": number,
                 "name": name,
                 "os": "Linux",
-                "status": status,
-                "busy": False,
+                "status": "online" if status == "busy" else status,
+                "busy": status == "busy",
                 "labels": [{"name": label} for label in ["self-hosted", *labels]],
             }
             for number, (name, status, labels) in enumerate(listed, start=1)
@@ -217,12 +219,10 @@ class Machine:
         """One round of the spare supervisor, up to its first pause (ROUND)."""
         return self._run("sh", str(self.installed / "keep-spare.sh"))
 
-    def ordinary_slots(self) -> int:
-        """The ordinary slots of this machine now, from the runner list the spare supervisor
-        read: called as keep-spare.sh calls it."""
-        listing = self.root / "listing.tsv"
+    def _listing(self, path: Path, age: float = 0) -> None:
+        """Write GitHub's runner list as the spare supervisor saves it, `age` seconds old."""
         runners = json.loads((self.state / "runners.json").read_text())["runners"]
-        listing.write_text(
+        path.write_text(
             "".join(
                 "\t".join(
                     [
@@ -237,6 +237,14 @@ class Machine:
                 for runner in runners
             )
         )
+        then = time.time() - age
+        os.utime(path, (then, then))
+
+    def ordinary_slots(self, age: float = 0) -> int:
+        """The ordinary slots of this machine now, from the runner list the spare supervisor
+        read `age` seconds ago: called as keep-spare.sh calls it."""
+        listing = self.root / "listing.tsv"
+        self._listing(listing, age)
         done = self._run(
             "sh",
             "-c",
@@ -250,13 +258,33 @@ class Machine:
         assert done.returncode == 0, done.stderr
         return int(done.stdout.strip())
 
-    def start_job_container(self) -> subprocess.CompletedProcess[str]:
-        """Start an ordinary job's container as keep-runner.sh starts it."""
+    def planner_slots(self) -> int:
+        """The ordinary slots of this machine the planner's snapshot counts (planner-state.py),
+        from the runner list the spare supervisor saved beside it."""
+        self._listing(self.installed / "runners.tsv")
+        done = self._run(
+            "sh",
+            "-c",
+            ". ./settings.sh && . ./pool-settings.sh && . ./names.sh && python3 -c '"
+            "import importlib.util, sys\n"
+            'spec = importlib.util.spec_from_file_location("planner_state", "planner-state.py")\n'
+            "state = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(state)\n"
+            "print(state._slots(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4],"
+            " sys.argv[5].split()))' "
+            '"$ordinary_jobs" "$ordinary_blacksmith_jobs" "$repository" "$label" "$other_machines"',
+            cwd=self.installed,
+        )
+        assert done.returncode == 0, done.stderr
+        return int(done.stdout.strip())
+
+    def start_job_container(self, kind: str = "ordinary") -> subprocess.CompletedProcess[str]:
+        """Start a job's container as keep-runner.sh starts it: an ordinary one, or main's."""
         return self._run(
             "sh",
             "-c",
             ". ./settings.sh && . ./pool-settings.sh && . ./names.sh && . ./runner-container.sh && "
-            f"start_container ordinary {PREFIX}-runner-1 {PREFIX}-runner-1 </dev/null",
+            f"start_container {kind} {PREFIX}-runner-1 {PREFIX}-runner-1 </dev/null",
             cwd=self.installed,
         )
 

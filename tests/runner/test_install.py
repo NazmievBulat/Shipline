@@ -307,6 +307,7 @@ def test_the_only_machine_of_the_pool_is_refused_with_no_ordinary_slot(
 
     assert done.returncode != 0
     assert "There must be at least 1 ordinary runner" in done.stderr
+    assert "other_machines" in done.stderr
     assert pool_machine.calls("systemctl") == []
 
 
@@ -318,6 +319,7 @@ def test_a_machine_with_no_ordinary_slot_and_no_spare_is_refused(pool_machine: M
 
     assert done.returncode != 0
     assert "There must be at least 1 ordinary runner" in done.stderr
+    assert "ordinary_spares" in done.stderr
     assert pool_machine.calls("systemctl") == []
 
 
@@ -341,10 +343,10 @@ def test_a_machine_without_a_job_memory_of_its_own_writes_none(pool_machine: Mac
     assert "job_memory" not in pool_machine.pool_settings.read_text()
 
 
-@pytest.mark.parametrize("given", ["6", "6 g", "6g; reboot", "$(id)", "0g", "6G", "6g\n7g"])
-def test_a_job_memory_docker_cannot_read_as_a_size_is_refused(
-    pool_machine: Machine, given: str
-) -> None:
+@pytest.mark.parametrize(
+    "given", ["6", "6 g", "6g; reboot", "$(id)", "0g", "6G", "6g\n7g", "512m", "1k"]
+)
+def test_a_job_memory_of_no_whole_gigabytes_is_refused(pool_machine: Machine, given: str) -> None:
     pool_machine.settle(slots=3, job_memory=f"'{given}'")
 
     done = pool_machine.install()
@@ -354,8 +356,8 @@ def test_a_job_memory_docker_cannot_read_as_a_size_is_refused(
     assert pool_machine.calls("systemctl") == []
 
 
-def _memory_of_the_job_container(machine: Machine) -> str:
-    done = machine.start_job_container()
+def _memory_of_the_job_container(machine: Machine, kind: str = "ordinary") -> str:
+    done = machine.start_job_container(kind)
     assert done.returncode == 0, done.stderr
     (run,) = [call.split() for call in machine.calls("docker") if call.startswith("docker run ")]
     return run[run.index("--memory") + 1]
@@ -373,3 +375,12 @@ def test_a_job_container_is_capped_at_the_shared_value_when_the_machine_names_no
     pool_machine.installed_as(slots=3)
 
     assert _memory_of_the_job_container(pool_machine) == SHARED_JOB_MEMORY
+
+
+def test_mains_job_containers_keep_the_shared_value_beside_the_machines_own(
+    pool_machine: Machine,
+) -> None:
+    """A machine's job_memory is the cap of its ordinary jobs; main's runners keep theirs."""
+    pool_machine.installed_as(slots=3, job_memory="6g")
+
+    assert _memory_of_the_job_container(pool_machine, "main") == SHARED_JOB_MEMORY

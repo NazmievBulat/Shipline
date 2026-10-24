@@ -130,8 +130,8 @@ def others_online(machines: list[str], label: str, listing: Path) -> bool | None
     try:
         if not 0 <= time.time() - listing.stat().st_mtime < _LISTING_SECONDS:
             return None
-        rows = listing.read_text().splitlines()
-    except OSError:
+        rows = listing.read_text(encoding="utf-8").splitlines()
+    except (OSError, ValueError):
         return None
     names = re.compile(f"({'|'.join(map(re.escape, machines))})-[1-9][0-9]*")
     for row in rows:

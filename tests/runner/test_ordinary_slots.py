@@ -54,6 +54,34 @@ def test_one_slot_while_every_other_machines_ordinary_runner_is_offline(machine:
     assert machine.ordinary_slots() == 1
 
 
+def test_no_slot_while_another_machines_ordinary_runner_runs_a_job(machine: Machine) -> None:
+    machine.runners(_other("busy"), _spare())
+
+    assert machine.ordinary_slots() == 0
+
+
+def test_no_slot_from_a_runner_list_older_than_the_supervisors_rounds(machine: Machine) -> None:
+    """An old list is no proof that the other machine is off now."""
+    machine.runners(_other("offline"), _spare())
+
+    assert machine.ordinary_slots(age=60) == 0
+
+
+def test_the_planner_counts_the_slot_the_spare_takes(machine: Machine) -> None:
+    """Else the planner would see no free slot here while the spare waits for a job."""
+    machine.runners(_other("offline"), _spare(LABEL, FIRST))
+
+    assert machine.planner_slots() == 1
+
+
+def test_the_planner_counts_no_slot_while_another_machines_ordinary_runner_is_online(
+    machine: Machine,
+) -> None:
+    machine.runners(_other("online"), _spare())
+
+    assert machine.planner_slots() == 0
+
+
 def test_one_slot_when_the_runner_list_names_no_other_machines_runner(machine: Machine) -> None:
     machine.runners(_spare())
 
@@ -111,6 +139,16 @@ def test_the_spare_gives_the_slot_back_once_another_machines_ordinary_runner_is_
 
     assert done.returncode == ROUND, done.stderr
     assert machine.labels_of(SPARE) == ["self-hosted", STANDBY]
+
+
+def test_a_spare_running_a_job_keeps_its_slot_until_the_job_ends(machine: Machine) -> None:
+    """The other machine is back, but a job that started on the spare is not cut off."""
+    machine.runners(_other("online"), (SPARE, "busy", [STANDBY, LABEL, FIRST]))
+
+    done = machine.spare_round()
+
+    assert done.returncode == ROUND, done.stderr
+    assert machine.labels_of(SPARE) == ["self-hosted", STANDBY, LABEL, FIRST]
 
 
 def test_the_spare_takes_no_slot_while_another_machines_ordinary_runner_is_online(

@@ -73,7 +73,10 @@ start_container() {
       --volume "$HOME/.local/state/ci-overflow/ledger:/home/runner/.local/state/ci-overflow/ledger" \
       "$image"
   else
-    # This machine's own cap of an ordinary job when it names one (settings.sh).
-    docker run "$@" --memory "${job_memory:-$memory}" --shm-size 4g "$image"
+    # An ordinary job gets this machine's own cap when it names one (settings.sh); main's keep the
+    # shared one.
+    cap=$memory
+    [ "$container_kind" != ordinary ] || cap=${job_memory:-$memory}
+    docker run "$@" --memory "$cap" --shm-size 4g "$image"
   fi
 }

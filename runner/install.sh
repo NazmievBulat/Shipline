@@ -134,24 +134,27 @@ has_role docker || docker_runners=0
 spares=0
 ! has_role ordinary || spares=$ordinary_spares
 
-# A machine of a pool of several may give all its PR slots to the others (README.md, "Moving a
-# machine's PR slots"): its spare still takes one while no other machine has an online ordinary
-# runner (keep-spare.sh), so it needs the spare. The only machine of the pool keeps one slot.
 if ! [ "$runners" -ge 0 ] 2>/dev/null || ! [ "$docker_runners" -ge 0 ] 2>/dev/null ||
-  { has_role ordinary && [ "$runners" -lt 1 ] &&
-    { [ -z "$other_machines" ] || [ "$spares" -lt 1 ]; }; } ||
   [ $((runners + spares + docker_runners)) -gt "$most_runners" ]; then
   echo "There must be at least 1 ordinary runner, and at most $most_runners runners of both kinds together (including the spare)." >&2
   exit 1
 fi
-# The machine's own cap of one ordinary job, in place of settings.sh's `memory`. Docker reads it
-# as a whole number with its unit (runner-container.sh).
+# A machine of a pool of several may give all its PR slots to the others (README.md, "Moving a
+# machine's PR slots"): its spare still takes one while no other machine has an online ordinary
+# runner (keep-spare.sh), so it needs the spare. The only machine of the pool keeps one slot.
+if has_role ordinary && [ "$runners" -lt 1 ] &&
+  { [ -z "$other_machines" ] || [ "$spares" -lt 1 ]; }; then
+  echo "There must be at least 1 ordinary runner: $machine may have no PR slot of its own only while other_machines names another machine to take its PR jobs and it keeps its spare (ordinary_spares)." >&2
+  exit 1
+fi
+# The machine's own cap of one ordinary job, in place of settings.sh's `memory`: whole gigabytes,
+# as Docker reads them (runner-container.sh). Below a gigabyte no job would start.
 size=
 case "$job_memory" in
-  [1-9]*[kmg]) size=${job_memory%?} ;;
+  [1-9]*g) size=${job_memory%g} ;;
 esac
 if [ -n "$job_memory" ] && case "$size" in '' | *[!0-9]*) true ;; *) false ;; esac; then
-  echo "$machine_settings: job_memory must be a size Docker reads, a whole number and k, m or g (6g), not '$job_memory'." >&2
+  echo "$machine_settings: job_memory must be whole gigabytes, such as 6g, not '$job_memory'." >&2
   exit 1
 fi
 ordinary_total=$((runners + spares))

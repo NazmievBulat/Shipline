@@ -101,6 +101,24 @@ def snapshot(
     }
 
 
+def _slots(maximum: int, reduced: int, repository: str, label: str, machines: list[str]) -> int:
+    """This machine's PR slots now, as the spare supervisor counts them: with the other machines
+    and the runner listing it saves, so a machine with no slot of its own shows the one its spare
+    takes while none of the others has an online ordinary runner (ordinary_slots.py)."""
+    return int(
+        _read(
+            sys.executable,
+            str(Path(__file__).with_name("ordinary_slots.py")),
+            str(maximum),
+            str(reduced),
+            repository,
+            label,
+            " ".join(machines),
+            str(Path(__file__).with_name("runners.tsv")),
+        )
+    )
+
+
 def main() -> None:
     maximum, reduced, repository = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
     # The other machines, the pool's label and its runners' container names (keep-planner.sh).
@@ -109,16 +127,7 @@ def main() -> None:
     folder.mkdir(parents=True, exist_ok=True)
     while True:
         try:
-            slots = int(
-                _read(
-                    sys.executable,
-                    str(Path(__file__).with_name("ordinary_slots.py")),
-                    str(maximum),
-                    str(reduced),
-                    repository,
-                    label,
-                )
-            )
+            slots = _slots(maximum, reduced, repository, label, machines)
             state = snapshot(slots, machines, label, container)
             temporary = folder / "state.tmp"
             temporary.write_text(json.dumps(state))
