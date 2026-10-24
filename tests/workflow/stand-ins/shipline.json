@@ -1,0 +1,5 @@
+{
+  "runner": {
+    "labels": ["example-app-home", "example-app-home-main", "example-app-home-docker", "home-planner"]
+  }
+}

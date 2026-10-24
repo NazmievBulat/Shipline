@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from merge_gate import API, REPOSITORY, api, command
+from merge_gate import API, REPOSITORY, WORKFLOW_FILES, api, command
 from merge_train_metrics import instant
 
 
@@ -123,7 +123,7 @@ def main() -> None:
 
     def discover(workflow: str, first: str, last: str) -> list[dict[str, Any]]:
         filters: dict[str, str | int] = {"created": f"{first}..{last}", "per_page": 100}
-        path = f"{API}/actions/workflows/{workflow}.yml/runs"
+        path = f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
         # One API read per page: a large --paginate call can exceed the gate reader's
         # timeout even while every individual request succeeds. Check the search cap on
         # page one, before fetching hundreds of runs only to split the interval again.

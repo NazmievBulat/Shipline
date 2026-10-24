@@ -52,6 +52,7 @@ from typing import Any
 
 import priority
 import tick_snapshot
+import workflow_config
 from github_budget import Limited, call
 
 # Memory and load under the ceilings this long before an automatic start.
@@ -78,7 +79,8 @@ MACHINE_WAIT = (
 # The wait lines of one pick told at most.
 TOLD_WAITS = 8
 
-LABEL = "workflow"
+CONFIG = workflow_config.current()
+LABEL = CONFIG.labels.workflow
 CLOUD_MARK = "Worker: cloud"
 OWNER_MARK = "Start: owner only"
 # Any file name of the repository, route folders like `[runId]` and `(group)` among them.
@@ -214,7 +216,7 @@ class Files:
 
     @property
     def notes(self) -> Path:
-        return self.main / ".local" / "workflow"
+        return self.main / CONFIG.state_folder
 
     def kept(self, number: str) -> tuple[list[str], list[str]] | None:
         """The saved paths and the words of their source."""
@@ -442,13 +444,12 @@ def tell(notes: Path, lines: dict[str, str], started: str | None) -> None:
 
 
 def add_label(number: str) -> bool:
-    repository = os.environ.get("WORKFLOW_REPOSITORY", "NazmievBulat/Shipline")
     done = call(
         "tick",
         "api",
         "-X",
         "POST",
-        f"repos/{repository}/issues/{number}/labels",
+        f"{CONFIG.api}/issues/{number}/labels",
         "-f",
         f"labels[]={LABEL}",
     )
@@ -456,7 +457,7 @@ def add_label(number: str) -> bool:
 
 
 def pick(main: Path, snapshot: Path) -> int:
-    notes = main / ".local" / "workflow"
+    notes = main / CONFIG.state_folder
     notes.mkdir(parents=True, exist_ok=True)
     moment = now()
     pulls: dict[str, dict[str, Any]] = json.loads(snapshot.read_text())
@@ -589,7 +590,7 @@ def files_of(main: Path, number: str) -> int:
         done.check_returncode()
         pull = {**json.loads(done.stdout), "number": int(number)}
     finder = Files(main, model_calls=1)
-    (main / ".local" / "workflow").mkdir(parents=True, exist_ok=True)
+    (main / CONFIG.state_folder).mkdir(parents=True, exist_ok=True)
     found = finder.of(pull, finder.fetch([pull]))
     if found is None:
         print(f"the files of {number} could not be found; asked again next time", file=sys.stderr)
