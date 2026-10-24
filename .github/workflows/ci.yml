@@ -114,7 +114,7 @@ jobs:
         if: steps.tmux.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -q && sudo apt-get install -yq libevent-dev libncurses-dev
-          curl -fsSL -o "$RUNNER_TEMP/tmux.tar.gz" \
+          curl -fsSL --connect-timeout 20 --max-time 300 -o "$RUNNER_TEMP/tmux.tar.gz" \
             https://github.com/tmux/tmux/releases/download/3.4/tmux-3.4.tar.gz
           echo "551ab8dea0bf505c0ad6b7bb35ef567cdde0ccb84357df142c254f35a23e19aa  $RUNNER_TEMP/tmux.tar.gz" |
             sha256sum -c -

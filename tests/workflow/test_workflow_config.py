@@ -103,6 +103,8 @@ def test_without_a_file_every_value_is_its_default(tmp_path: Path) -> None:
         "https://github.com/example-owner/example-app.git",
         "https://github.com/example-owner/example-app",
         "https://github.com/example-owner/example-app/",
+        "https://github.com/example-owner/example-app.git/",
+        "https://example-user@github.com/example-owner/example-app.git",
         "git@github.com:example-owner/example-app.git",
         "ssh://git@github.com/example-owner/example-app.git",
     ],

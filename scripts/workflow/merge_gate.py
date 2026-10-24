@@ -1123,13 +1123,17 @@ def browser_needed(base: str, merge: str) -> bool:
 
     The gate reads the exact difference from main, so a merge that changes nothing needs
     none; the planner runs on an empty diff only because it cannot tell one from a misread.
+    A repository that holds no planner has no browser suite, so no change needs one.
     """
+    planner = HERE.parent / "e2e-plan.py"
+    if not planner.exists():
+        return False
     changed = command(
         "git", "diff", "--no-renames", "--name-only", "-z", base, merge, errors="surrogateescape"
     ).stdout.split("\0")[:-1]
     if not changed:
         return False
-    found = importlib.util.spec_from_file_location("e2e_plan", HERE.parent / "e2e-plan.py")
+    found = importlib.util.spec_from_file_location("e2e_plan", planner)
     if found is None or found.loader is None:
         raise Refused("could not read the E2E planner")
     plan = importlib.util.module_from_spec(found)

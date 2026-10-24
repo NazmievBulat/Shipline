@@ -234,7 +234,10 @@ def _from_origin(main: Path) -> str | None:
         check=False,
     )
     url = done.stdout.strip().removesuffix("/").removesuffix(".git")
-    found = re.fullmatch(r"(?:https://|ssh://git@|git@)github\.com[:/]([^/]+/[^/]+)", url)
+    # `git clone https://name@github.com/...` keeps the user name in the URL.
+    found = re.fullmatch(
+        r"(?:https://(?:[^/@]+@)?|ssh://git@|git@)github\.com[:/]([^/]+/[^/]+)", url
+    )
     return found[1] if done.returncode == 0 and found else None
 
 
