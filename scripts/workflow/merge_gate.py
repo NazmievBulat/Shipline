@@ -3272,6 +3272,9 @@ def _queued_prefix(
                     entry["state"] = "rerun refused"
                     train.save()
                     _queue_warning(folder, run, f"scratch run {key} queue recovery rerun refused")
+                else:
+                    # Attempt 2 is the same run: a dropped prefix must still be able to cancel it.
+                    (folder / f"cancel-{key}").unlink(missing_ok=True)
                 return
             # Cancellation lost a race to the run finishing: judge its real result.
         elif entry["state"] in ("rerun requested", "rerun refused"):

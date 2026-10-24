@@ -8594,6 +8594,31 @@ def test_a_rerun_lost_to_an_outage_is_sent_again_while_the_first_attempt_stays_c
     assert len(github.workflow.calls("gh run rerun 100 ")) == 2
 
 
+def test_a_recovered_run_is_still_cancelled_when_its_prefix_is_dropped(github: GitHub) -> None:
+    _queue_config(github)
+    _batch_setup(github)
+    assert _batch_call(github).returncode == 3
+    _queued_prefix_job(github, number="9")
+    github.save()
+    assert github.workflow.run_script("merge-when-current", "--train-status").returncode == 0
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 1
+    dropped = _scratch(github, "9")
+    assert dropped is not None
+    github.api[
+        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={dropped['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0].update(status="completed", conclusion="cancelled")
+    github.save()
+    assert github.workflow.run_script("merge-when-current", "--train-status").returncode == 0
+    assert len(github.workflow.calls("gh run rerun 100 ")) == 1
+    # Its second attempt, the same run, holds ordinary runners when the prefix is dropped.
+    _branch_runs(github, dropped["branch"], (100, "in_progress"))
+    github.pulls["9"]["state"] = "CLOSED"
+    _batch_call(github)
+    assert len(github.workflow.calls("gh run cancel 100 ")) == 2
+    assert dropped["branch"] not in _scratch_branches(github)
+
+
 def test_train_status_recovers_a_later_prefix_without_polluting_its_json(github: GitHub) -> None:
     _queue_config(github)
     _batch_setup(github)
