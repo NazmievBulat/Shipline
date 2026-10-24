@@ -33,8 +33,9 @@
 #
 # What the tick's automatic ticket start did, and why the next ticket waits, rides with the
 # next check-in, a line each, once per change (`ticket_starts.py` notes them): `started 611
-# (priority high)`, `608 waits: shares scripts/workflow/merge_gate.py with 563`. Such a line
-# counts as a change for a check-in, and does not by itself make the wake look in the day.
+# (priority high)`, `608 waits: shares scripts/workflow/merge_gate.py with 563`, and, for a hot
+# path of shipline.json, `612 waits: hot path web/src/pages/** with 598`. Such a line counts as
+# a change for a check-in, and does not by itself make the wake look in the day.
 #
 # So do the orchestrator's decisions (`decide` records them): each ticket still held with its
 # reason and age, `38 held after 37: shares scripts/workflow/tick (2h10m)`, and the answers given

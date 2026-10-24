@@ -153,6 +153,13 @@ DEFAULTS: dict[str, Any] = {
         # The repository's file of hunt plans, which a hunt with a plan is told of.
         "plans": None,
     },
+    # Path patterns of the few files many tickets edit (`*` stays inside a folder, `**` crosses
+    # folders): two tickets on one never run at once, and the merge line serves its members
+    # back to back.
+    "hot_paths": [],
+    # The reviewer of a small conflict on a handed-off pull request, `{"effort": ...,
+    # "model": ..., "max_changed_lines": N}`: None is the usual one, Opus at high effort.
+    "conflict_review": None,
     "review": {"high_effort_paths": []},
     "merge_train": {"queued_limit_minutes": 20},
     # Minutes a question to the owner marked `Owner only: no` waits before the tick types its
@@ -169,6 +176,9 @@ MOST_MINUTES = 24 * 60
 # The keys of one machine.
 MACHINE_KEYS = ("name", "address")
 
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# A model name as `claude --model` takes it: a word a command line can hold unquoted.
+_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # A suite's keys, and its worker count when it names none: by its name, else one.
 SUITE_KEYS = ("select", "run", "workers", "part", "probe")
 SUITE_WORKERS = {"server": 4, "browser": 2}
@@ -510,6 +520,14 @@ class Review:
 
 
 @dataclass(frozen=True)
+class ConflictReview:
+    effort: str
+    model: str
+    # A resolution larger than this, in lines of the conflicting files, gets the usual reviewer.
+    max_changed_lines: int
+
+
+@dataclass(frozen=True)
 class MergeTrain:
     queued_limit_minutes: int
 
@@ -530,6 +548,9 @@ class Config:
     machines: tuple[Machine, ...]
     hunts: Hunts
     commands: Commands
+    hot_paths: tuple[str, ...]
+    # None when the file names none: the usual conflict reviewer.
+    conflict_review: ConflictReview | None
     review: Review
     merge_train: MergeTrain
     answer_for_owner_after_minutes: int
@@ -584,6 +605,10 @@ class Config:
         """The checkout a state folder is in, however many folders deep it is named."""
         return state.parents[len(PurePosixPath(self.state_folder).parts) - 1]
 
+    def hot_paths_of(self, path: str) -> list[str]:
+        """The hot paths a file of the repository matches, in the order of the file."""
+        return [hot for hot in self.hot_paths if _hot_pattern(hot).fullmatch(path)]
+
 
 def main_checkout(start: Path) -> Path:
     done = subprocess.run(
@@ -630,6 +655,8 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
         name = where + key
         if key not in given:
             merged[key] = default
+        elif name in _READERS:
+            merged[key] = _READERS[name](given[key], name)
         elif name == "machines":
             merged[key] = _machines(given[key])
         elif name == "hunts.areas":
@@ -662,6 +689,131 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
     return merged
 
 
+def _hot_paths(value: Any, name: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise ConfigError(f"{FILE}: {name} must be a list of paths")
+    for item in value:
+        path = PurePosixPath(item)
+        # A `!` takes files back in a path filter; here it would match nothing.
+        if path.is_absolute() or ".." in path.parts or item.startswith("!"):
+            raise ConfigError(f"{FILE}: {name} must be paths inside the checkout, not {item}")
+    return value
+
+
+def _conflict_review(value: Any, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{FILE}: {name} must be an object")
+    keys = ("effort", "model", "max_changed_lines")
+    if unknown := sorted(set(value) - set(keys)):
+        raise ConfigError(f"{FILE}: unknown key {', '.join(f'{name}.{key}' for key in unknown)}")
+    if missing := [key for key in keys if key not in value]:
+        raise ConfigError(f"{FILE}: {name} must name {', '.join(missing)}")
+    if value["effort"] not in EFFORTS:
+        raise ConfigError(f"{FILE}: {name}.effort must be one of {', '.join(EFFORTS)}")
+    # `codex` and `cloud` name kinds of worker for `session start`, not a model.
+    if (
+        not isinstance(value["model"], str)
+        or not _MODEL.fullmatch(value["model"])
+        or value["model"] in ("codex", "cloud")
+    ):
+        raise ConfigError(
+            f"{FILE}: {name}.model must be a model name, not {json.dumps(value['model'])}"
+        )
+    lines = value["max_changed_lines"]
+    if not isinstance(lines, int) or isinstance(lines, bool) or lines < 1:
+        raise ConfigError(f"{FILE}: {name}.max_changed_lines must be a whole number above 0")
+    return value
+
+
+# The keys whose values are read by a reader of their own, by their full name.
+_READERS = {"hot_paths": _hot_paths, "conflict_review": _conflict_review}
+
+
+def path_pattern(pattern: str) -> re.Pattern[str]:
+    """One path pattern as a regular expression, by the rules of GitHub's path filters (the merge
+    gate's `path_filter`, `hot_paths`). `*` is any characters but `/`, `**` is any characters,
+    and `**/` where a folder's name starts is zero or more folders (inside a name, `**` is any
+    characters and the `/` stays). `?` and `+` make what stands before them
+    zero or one, or one or more, of it. `[...]` is one character of its set, with `-` ranges.
+    A backslash makes the next character itself, and every other character is itself.
+
+    GitHub does not document a `?` or `+` with nothing before it, or a `[` that no `]` closes
+    (nor an empty `[]`): each of those is read as the character itself.
+    """
+    # Each part is what one piece of the pattern matches and how often it may stand: at least
+    # `fewest` (0 or 1) times, and at most once or, with `many`, any number of times. Repeating
+    # a part only changes those two, so no repetition ever nests inside another.
+    parts: list[tuple[str, int, bool]] = []
+    at = 0
+    while at < len(pattern):
+        char = pattern[at]
+        if pattern.startswith("**/", at) and pattern[at - 1 : at] in ("", "/"):
+            # Zero or more folders: repeating it, however, is still that.
+            parts.append(("(?:.*/)?", 1, False))
+            at += 3
+            continue
+        if pattern.startswith("**", at):
+            parts.append((".", 0, True))
+            at += 2
+            continue
+        at += 1
+        if char == "*":
+            parts.append(("[^/]", 0, True))
+        elif char in "?+" and parts:
+            expression, fewest, many = parts[-1]
+            if expression != "(?:.*/)?":
+                parts[-1] = (expression, 0, many) if char == "?" else (expression, fewest, True)
+        elif char == "\\" and at < len(pattern):
+            parts.append((re.escape(pattern[at]), 1, False))
+            at += 1
+        elif char == "[" and (found := _pattern_set(pattern, at)):
+            expression, at = found
+            parts.append((expression, 1, False))
+        else:
+            parts.append((re.escape(char), 1, False))
+    times = {(1, False): "", (0, False): "?", (1, True): "+", (0, True): "*"}
+    return re.compile(
+        "".join(expression + times[fewest, many] for expression, fewest, many in parts),
+        flags=re.DOTALL,
+    )
+
+
+def _pattern_set(pattern: str, at: int) -> tuple[str, int] | None:
+    """The set that starts at `at`, just after a `[`, as one character of a regular expression,
+    and where the pattern goes on after its `]`; None when no `]` closes a set of at least one
+    character. A backslash makes the next character itself. A `-` between two characters of
+    a-z, of A-Z or of 0-9 is the range from the first to the second, as GitHub allows ranges
+    only there; any other `-`, and a range that runs backwards, is the characters themselves.
+    """
+    chars: list[tuple[str, bool]] = []
+    while at < len(pattern) and (pattern[at] != "]" or not chars):
+        if pattern[at] == "]":
+            return None
+        escaped = pattern[at] == "\\" and at + 1 < len(pattern)
+        if escaped:
+            at += 1
+        chars.append((pattern[at], escaped))
+        at += 1
+    if at == len(pattern):
+        return None
+    members: list[str] = []
+    index = 0
+    while index < len(chars):
+        char = chars[index][0]
+        last = chars[index + 2][0] if index + 2 < len(chars) else ""
+        ranged = any(first <= char <= last <= final for first, final in ("az", "AZ", "09"))
+        if chars[index + 1 : index + 2] == [("-", False)] and ranged:
+            members.append(f"{re.escape(char)}-{re.escape(last)}")
+            index += 3
+        else:
+            members.append(re.escape(char))
+            index += 1
+    return f"[{''.join(members)}]", at + 1
+
+
+@cache
+def _hot_pattern(pattern: str) -> re.Pattern[str]:
+    return path_pattern(pattern)
 def _machines(given: Any) -> list[dict[str, str]]:
     if not isinstance(given, list):
         raise ConfigError(f"{FILE}: machines must be a list of machines")
@@ -962,6 +1114,10 @@ def load(start: Path | None = None) -> Config:
         machines=tuple(Machine(**machine) for machine in values["machines"]),
         hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
         commands=Commands(**values["commands"]),
+        hot_paths=tuple(values["hot_paths"]),
+        conflict_review=ConflictReview(**values["conflict_review"])
+        if values["conflict_review"]
+        else None,
         review=Review(
             high_effort_paths=_patterns(
                 values["review"]["high_effort_paths"], "review.high_effort_paths"
@@ -1031,6 +1187,8 @@ def as_dict(config: Config) -> dict[str, Any]:
             "plans": config.hunts.plans,
         },
         "commands": vars(config.commands).copy(),
+        "hot_paths": list(config.hot_paths),
+        "conflict_review": vars(config.conflict_review).copy() if config.conflict_review else None,
         "review": {"high_effort_paths": list(config.review.high_effort_paths)},
         "merge_train": vars(config.merge_train).copy(),
         "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
