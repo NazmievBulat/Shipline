@@ -15,7 +15,9 @@
 #
 #   session start <worker|audit|review> <N> [effort] [model]
 #                               effort: low, medium, high, xhigh or max; when left out,
-#                               medium for a worker, high for an audit; reviewers always use high
+#                               medium for a worker, high for an audit, and for a reviewer what
+#                               `review-effort N` says; a conflict resolution's reviewer always
+#                               uses high
 #                               model: opus, sonnet, codex or cloud for workers; the owner's Claude
 #                               default when omitted. Audits and reviewers always use opus.
 #   session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>]
@@ -602,10 +604,14 @@ cmd_start() {
   if [[ -z $effort ]]; then
     effort=$WORKER_EFFORT
     [[ $kind == worker ]] || effort=$AUDIT_EFFORT
+    # A reviewer's level is read from what its pull request changes once nothing refuses the
+    # start; high when that cannot be told.
+    [[ $kind != review ]] || effort=
   fi
   # Audits and independent reviewers never run on a smaller model, whatever the owner's default becomes.
   [[ $kind == worker ]] || model=opus
-  [[ $kind != review ]] || effort=high
+  # A conflict resolution is reviewed at high whatever is given: it extends a passed round.
+  [[ $kind != review || $prompt != "Review conflict resolution "* ]] || effort=high
 
   cmd_cleanup
 
@@ -633,6 +639,11 @@ cmd_start() {
   worktree=$(worktree_of "$name")
   prepare_worktree "$worktree" "$kind"
   wait_for_resources
+  # Read once the start goes ahead: a start the tick defers is read again at the next tick.
+  if [[ -z $effort ]]; then
+    effort=$(bash "$script_dir/review-effort" "$number") || effort=high
+    [[ $effort == medium ]] || effort=high
+  fi
   if [[ $model == codex ]]; then
     start_codex_worker "$name" "$worktree" "$effort" "$prompt"
   else
