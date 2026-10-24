@@ -1824,20 +1824,23 @@ def lost_check(
     pull: dict[str, Any],
     known: list[dict[str, Any]] | None = None,
     read: Callable[[str], dict[str, Any]] | None = None,
+    *,
+    failed: bool = False,
 ) -> dict[str, Any] | None:
     """A check the rollup lists as queued or running whose workflow run completed at least
     LOST_AFTER_SECONDS ago, when every check not passing is lost so: a check still running for
     real may yet fail, and is waited for first. Each read run costs a request from the shared
     budget, so a check that started less than that ago ends the search: its run cannot have
     completed so long ago. `read` reads a run by its id; the tick passes one that keeps each
-    answer for the rest of the tick.
+    answer for the rest of the tick. A failed pull request's completed checks have had their
+    say: then only the checks not completed must each be lost.
     """
     now = float(os.environ.get("WORKFLOW_NOW") or time.time())
     seen = {str(run["id"]): run for run in known or []}
     # Every check that cannot be lost is ruled out before any run is read.
     waiting = []
     for check in pull["statusCheckRollup"]:
-        if _passing_check(check):
+        if _passing_check(check) or (failed and _completed_check(check)):
             continue
         if check.get("__typename") == "StatusContext" or check.get("status") == "COMPLETED":
             return None
@@ -2371,7 +2374,9 @@ class Train:
                 continue
             if number in self.blocked and self.blocked[number] != pull["headRefOid"]:
                 # A fix on a new head joins at the back when its reviewer calls the gate.
-                # Keep its audit eligible for a checks-finished wake until that claim.
+                # Keep its audit eligible for a checks-finished wake until that claim; a check
+                # GitHub lost beside its failure still ends that wait.
+                self._failed_lost(number, pull, None, lost, failed=failed_checks(pull))
                 continue
             if self.conflicts.get(number) != pull["headRefOid"]:
                 self.conflicts.pop(number, None)
@@ -2417,6 +2422,7 @@ class Train:
                 suite_states[number] = None
             if failed_checks(pull):
                 self.blocked[number] = pull["headRefOid"]
+                self._failed_lost(number, pull, None, lost)
             elif suite_states[number] == "red" and self.blocked.get(number) == pull["headRefOid"]:
                 # The gate blocked it when it told its session that a whole suite failed
                 # (_whole_suite_run). Until then it keeps its turn, so the finished run
@@ -2437,6 +2443,7 @@ class Train:
                             note_lost(self.path.parent, number, pull["headRefOid"], found)
                     if state == "red":
                         self.blocked[number] = pull["headRefOid"]
+                        self._failed_lost(number, pull, ci[:1], lost)
                     elif (
                         not ci
                         and number in marked
@@ -2531,7 +2538,7 @@ class Train:
         self.lost = {
             number: found
             for number, found in {**self.lost, **lost}.items()
-            if number in remaining
+            if (number in remaining or number in self.blocked)
             and found["head"] == pulls[number]["headRefOid"]
             and (number in lost or number == acting)
         }
@@ -2543,6 +2550,27 @@ class Train:
         }
         self._pending_turns(pulls, suite_states)
         self.save()
+
+    def _failed_lost(
+        self,
+        number: str,
+        pull: dict[str, Any],
+        known: list[dict[str, Any]] | None,
+        lost: dict[str, dict[str, Any]],
+        *,
+        failed: bool = True,
+    ) -> None:
+        """A failed member's check GitHub lost never completes, so its reviewer's checks-finished
+        wake would never come: the tick gives it that wake, and the orchestrator is told. One
+        not known to have failed failed only when a lost check's run did not pass."""
+        try:
+            found = lost_check(pull, known, failed=True)
+        except Refused, KeyError, TypeError, ValueError, IndexError:
+            # Unreadable runs prove nothing lost; the next reconcile looks again.
+            return
+        if found and (failed or found["conclusion"] != "success"):
+            lost[number] = {"head": pull["headRefOid"], **found, "failed": True}
+            note_lost(self.path.parent, number, pull["headRefOid"], found)
 
     def _pending_turns(self, pulls: dict[str, Any], suite_states: dict[str, str | None]) -> None:
         # Pending entries keep their FIFO slots. Only a green run tested on current main
@@ -2780,6 +2808,12 @@ def _passing_check(check: dict[str, Any]) -> bool:
         "SKIPPED",
         "NEUTRAL",
     )
+
+
+def _completed_check(check: dict[str, Any]) -> bool:
+    if check.get("__typename") == "StatusContext":
+        return check.get("state") in ("SUCCESS", "FAILURE", "ERROR")
+    return check.get("status") == "COMPLETED"
 
 
 def _passing_rollup(pull: dict[str, Any]) -> bool:

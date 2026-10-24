@@ -32,7 +32,8 @@
 #      A reviewer or audit whose pull request another member's gate call merged in a batch
 #      is told so once, to do its after-merge duties. One that waits for its checks before it
 #      joined the merge line is woken once per head for a check GitHub lost, as the gate defines
-#      it (`tick_lost_check.py`); an audit's pull request needs no label for that.
+#      it (`tick_lost_check.py`); an audit's pull request needs no label for that. A lost check
+#      beside a failure, before the line or in it, wakes as checks that finished.
 #   8. Waits that ended or stalled, for Claude workers and reviewers (never Codex bridges, hunts
 #      or audits): a session idle 50 minutes waiting for its own job or its turn in the train
 #      is asked once per idle stretch whether the wait is over; a worker idle 15 minutes on a
@@ -625,12 +626,15 @@ while read -r name state _; do
     mark=$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-$turn-${health%% *}-$head
   fi
   # A check GitHub lost after its run finished never completes: the gate runs CI again for it.
-  # In the line, the wake still comes again for a new turn or state of main.
+  # In the line, the wake still comes again for a new turn or state of main. A failed member's
+  # lost check is not run again: it is woken once per head as if its checks had finished.
   lost=false
   if jq -e --arg number "$number" --arg head "$head" '.lost[$number].head == $head' \
     <<<"$train" >/dev/null; then
     lost=true
-    if [[ $mark == */$name.train-nudged-* ]]; then
+    if jq -e --arg number "$number" '.lost[$number].failed == true' <<<"$train" >/dev/null; then
+      lost=failed
+    elif [[ $mark == */$name.train-nudged-* ]]; then
       mark=$mark-lost
     else
       mark=$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head
@@ -649,16 +653,22 @@ while read -r name state _; do
     elif .__typename == "StatusContext" then (.state | IN("SUCCESS", "FAILURE", "ERROR"))
     else false end)' <<<"$pull" >/dev/null; }; then
     # Before the line, a lost check is seen by no gate: the tick looks for one itself, as the
-    # gate would, and tells the session once per head. Each run is read once in this tick.
+    # gate would, and tells the session once per head. Each run is read once in this tick. One
+    # lost beside a failure is woken, once per head, as if its checks had finished.
     [[ $in_line == false && -e $notes.checks-wait ]] || continue
-    mark=$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head
-    [[ ! -e $mark ]] || continue
+    [[ ! -e $main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head ]] || continue
     WORKFLOW_BACKGROUND_GITHUB=1 python3 -B "$here/tick_lost_check.py" \
       "$main/$SHIPLINE_STATE_FOLDER" "$number" <<<"$pull" 9>&-
     found=$?
     ((found != 3)) || continue
-    ((found == 0)) || { failed=1; continue; }
-    lost=true
+    if ((found == 4)); then
+      lost=failed
+      mark=$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-$head
+    else
+      ((found == 0)) || { failed=1; continue; }
+      lost=true
+      mark=$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head
+    fi
   fi
   if [[ ! -e $notes.checks-wait ]]; then
     started=$(stat -c %Y "$notes.started" 9>&-) || continue
@@ -686,7 +696,7 @@ while read -r name state _; do
     [[ $own == true ]] || continue
   fi
   wake=checks-finished
-  [[ $lost == false ]] || wake=lost-check
+  [[ $lost != true ]] || wake=lost-check
   if delivery=$(session "$wake" "$name" "$head" 2>&1); then
     nudged+="$name "
     echo "$head" >"$mark" || { failed=1; continue; }
