@@ -1,0 +1,37 @@
+{
+  "repository": "example-owner/example-app",
+  "state_folder": ".local/shipline",
+  "worktree_setup": "tools/prepare-worktree",
+  "checks": {
+    "ci_result": "Build result",
+    "ci_plan": "Build: what to run",
+    "e2e_plan": "Browser: what to run",
+    "images": "Images"
+  },
+  "annotations": {
+    "merge_tested": "Merge built",
+    "files_tested": "Tree tested",
+    "server_tests": "Server suite",
+    "web_suite": "Web unit suite",
+    "browser_suite": "Browser specs"
+  },
+  "workflows": {
+    "ci": "build.yml",
+    "e2e": "browser.yml",
+    "images": "images.yml"
+  },
+  "labels": {
+    "workflow": "shipline",
+    "audited": "audited",
+    "priority": {
+      "blocker": "priority: blocker",
+      "high": "priority: high",
+      "medium": "priority: medium",
+      "low": "priority: low"
+    }
+  },
+  "runner": {
+    "labels": ["example-app-home", "example-app-home-main", "example-app-home-docker", "example-app-planner"],
+    "identity_folder": "~/.config/example-app-runner"
+  }
+}
