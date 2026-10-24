@@ -3655,6 +3655,10 @@ def _first_invalid(train: Train, record: dict[str, Any]) -> int:
     A prefix stands while its member waits at its approved head, eligible, in the order the
     line serves them. A restored front may have independent kept work beside it."""
     line = train.line()
+    front = train.front()
+    independent = any(
+        member["number"] == front and not member["ahead"] for member in record["members"]
+    )
     present = []
     for member in record["members"]:
         if member["number"] not in line:
@@ -3667,9 +3671,9 @@ def _first_invalid(train: Train, record: dict[str, Any]) -> int:
             index >= len(present)
             or served[index] != number
             or (
-                index == 0 and number != train.front()
-                and train.front() not in train.restored
-                and not any(m.get("kept") for m in record["members"])
+                index == 0 and number != front
+                and front not in train.restored
+                and not independent
             )
             or train.approved.get(number) != member["head"]
             or number in train.blocked

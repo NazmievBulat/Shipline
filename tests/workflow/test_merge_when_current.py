@@ -5415,10 +5415,10 @@ def test_a_green_scratch_rerun_restores_the_isolated_members_earlier_place(
 
 
 def _restored_before_eight(
-    github: GitHub, *, passed: bool, reconciled: bool = False
+    github: GitHub, *, passed: bool, reconciled: bool = False, count: int = 3
 ) -> dict[str, Any]:
     """Restore 7 on unchanged main, with a proof shortfall and 8 already tested alone."""
-    _batch_setup(github, images=True, images_member=8)
+    _batch_setup(github, count=count, images=True, images_member=8)
     assert _batch_call(github).returncode == 3
     isolated = _prefixes(github)[0]
     _finish_prefix(github, "7", conclusion="failure")
@@ -5591,6 +5591,18 @@ def test_planning_a_restored_prefix_does_not_rerun_its_failed_jobs(github: GitHu
     before = github.workflow.calls("gh run rerun")
     _train(github)
     assert github.workflow.calls("gh run rerun") == before
+
+
+def test_a_new_priority_front_still_invalidates_the_kept_line(github: GitHub) -> None:
+    kept = _restored_before_eight(github, passed=False, count=4)
+    assert _batch_call(github).returncode == 1
+    github.pulls["10"]["labels"] = [{"name": "priority: blocker"}]
+    github.workflow.git("checkout", "ticket/10")
+    done = _batch_call(github, "10")
+    assert done.returncode in (2, 3), done.stdout + done.stderr
+    assert "waiting for the members ahead of the next prefix" not in done.stdout
+    assert kept["scratch"]["branch"] not in _scratch_branches(github)
+    assert _merges(github) == []
 
 
 @pytest.mark.parametrize("number", ["7", "9"])
