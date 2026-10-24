@@ -221,6 +221,12 @@ def answer(args, cwd, env, out, err):
             log.write(" ".join([args[2], *listed]) + "\n")
         if int(args[2]) in data.get("refuse_cancel", []):
             sys.exit("Cannot cancel a workflow run that is completed.")
+        unavailable = data.get("cancel_unavailable", [])
+        if int(args[2]) in unavailable:
+            # GitHub fails this cancel once, as in an outage.
+            unavailable.remove(int(args[2]))
+            (state / "github.json").write_text(json.dumps(data))
+            sys.exit("HTTP 502: Bad Gateway")
     elif args[0] == "api":
         path = args[-1]
         if path not in data["api"]:
@@ -277,8 +283,9 @@ class GitHub:
     )
     # Whether another push lands on a pull request's branch after each of the gate's reads of it.
     push_after_view: dict[str, list[bool]] = field(default_factory=dict[str, list[bool]])
-    # The runs whose cancel GitHub refuses.
+    # The runs whose cancel GitHub refuses, and those whose next cancel fails in an outage.
     refuse_cancel: list[int] = field(default_factory=list[int])
+    cancel_unavailable: list[int] = field(default_factory=list[int])
 
     def save(self) -> None:
         (self.workflow.state / "github.json").write_text(
@@ -299,6 +306,7 @@ class GitHub:
                     "line_after_view": self.line_after_view,
                     "push_after_view": self.push_after_view,
                     "refuse_cancel": self.refuse_cancel,
+                    "cancel_unavailable": self.cancel_unavailable,
                 }
             )
         )
@@ -2834,7 +2842,7 @@ def test_an_inherited_main_run_still_running_is_cancelled_and_main_stays_green(
     assert done.stdout.startswith("main: green"), done.stdout + done.stderr
     assert workflow.calls("gh run cancel") == ["gh run cancel 10 -R NazmievBulat/Shipline"]
     receipt = _receipt(github)
-    assert receipt["cancelled_inherited"] == [{"run": 10, "tree": receipt["tree"]}]
+    assert receipt["cancelled_inherited"] == [{"run": 10, "attempt": 1, "tree": receipt["tree"]}]
     _cancelled_by_github(github)
     status = workflow.run_script("main-status")
     assert status.stdout.startswith("main: green"), status.stdout + status.stderr
@@ -2850,7 +2858,7 @@ def test_a_main_run_cancelled_otherwise_is_still_red(github: GitHub) -> None:
     assert status.stdout.startswith("main: red"), status.stdout + status.stderr
     # Listed for another tree, it is not this main's.
     path = github.workflow.repo / ".local/workflow/main-tree-green.json"
-    elsewhere = [{"run": 10, "tree": "0" * 40}]
+    elsewhere = [{"run": 10, "attempt": 1, "tree": "0" * 40}]
     path.write_text(json.dumps({**_receipt(github), "cancelled_inherited": elsewhere}))
     status = github.workflow.run_script("main-status")
     assert status.stdout.startswith("main: red"), status.stdout + status.stderr
@@ -2887,14 +2895,14 @@ def test_a_main_run_not_yet_inherited_is_never_cancelled(github: GitHub) -> None
 def test_the_cancelled_runs_of_another_tree_are_pruned(github: GitHub) -> None:
     _squash_with_pending_main(github)
     path = github.workflow.repo / ".local/workflow/main-tree-green.json"
-    older = {"run": 5, "tree": "0" * 40}
+    older = {"run": 5, "attempt": 1, "tree": "0" * 40}
     path.write_text(json.dumps({**_receipt(github), "cancelled_inherited": [older]}))
 
     done = github.workflow.run_script("main-status", "--tick-main-status")
 
     assert done.stdout.startswith("main: green"), done.stdout + done.stderr
     receipt = _receipt(github)
-    assert receipt["cancelled_inherited"] == [{"run": 10, "tree": receipt["tree"]}]
+    assert receipt["cancelled_inherited"] == [{"run": 10, "attempt": 1, "tree": receipt["tree"]}]
 
 
 def test_a_refused_cancel_of_main_is_logged_once(github: GitHub) -> None:
@@ -2912,7 +2920,9 @@ def test_a_refused_cancel_of_main_is_logged_once(github: GitHub) -> None:
     assert len(notes) == 1 and "Cannot cancel a workflow run that is completed." in notes[0]
 
 
-def test_an_inherited_image_run_of_main_is_cancelled_too(github: GitHub) -> None:
+def test_an_inherited_image_run_of_main_is_left_to_finish(github: GitHub) -> None:
+    # Main is judged by its latest image run on any earlier push too: cancelled, this one
+    # would decide main once a later push replaced its receipt.
     workflow = github.workflow
     _images(github, release_conclusion="success")
     _squash_with_pending_main(github)
@@ -2925,19 +2935,56 @@ def test_an_inherited_image_run_of_main_is_cancelled_too(github: GitHub) -> None
     done = workflow.run_script("main-status", "--tick-main-status")
 
     assert done.stdout.startswith("main: green"), done.stdout + done.stderr
-    assert sorted(workflow.calls("gh run cancel")) == [
-        "gh run cancel 10 -R NazmievBulat/Shipline",
-        "gh run cancel 60 -R NazmievBulat/Shipline",
-    ]
-    image = github.api[_MAIN_IMAGES]["workflow_runs"][0]
-    image.update(status="completed", conclusion="cancelled")
-    github.api[f"{_REPO}/actions/runs/60/jobs?per_page=100"]["jobs"][1].update(
-        status="completed", conclusion="cancelled"
-    )
-    github.save()
+    assert "Docker images run 40" in done.stdout
+    assert workflow.calls("gh run cancel") == ["gh run cancel 10 -R NazmievBulat/Shipline"]
+
+
+def test_a_cancelled_inherited_run_whose_summary_job_failed_after_the_cancel_stays_green(
+    github: GitHub,
+) -> None:
+    # "CI result" runs even in a cancelled run, and fails for the jobs cancelled under it.
+    workflow = github.workflow
+    _squash_with_pending_main(github)
+    assert workflow.run_script("main-status", "--tick-main-status").stdout.startswith("main: green")
+    _main_ci_run(github).update(status="completed", conclusion="cancelled")
+    _main_jobs(github, ("CI result", "completed", "failure"), ("CI: web", "completed", "cancelled"))
     status = workflow.run_script("main-status")
     assert status.stdout.startswith("main: green"), status.stdout + status.stderr
-    assert "Docker images run 40" in status.stdout
+
+
+def test_a_re_run_of_main_is_never_cancelled(github: GitHub) -> None:
+    # A second attempt, such as the tick's own retry of a failed main, decides main itself.
+    workflow = github.workflow
+    _squash_with_pending_main(github)
+    _main_ci_run(github)["run_attempt"] = 2
+    github.save()
+
+    done = workflow.run_script("main-status", "--tick-main-status")
+
+    assert done.stdout.startswith("main: green"), done.stdout + done.stderr
+    assert workflow.calls("gh run cancel") == []
+    # Cancelled by someone else, it is red as any other cancelled run.
+    _cancelled_by_github(github)
+    status = workflow.run_script("main-status")
+    assert status.stdout.startswith("main: red"), status.stdout + status.stderr
+
+
+def test_a_cancel_lost_to_a_github_outage_is_tried_again(github: GitHub) -> None:
+    workflow = github.workflow
+    _squash_with_pending_main(github)
+    github.cancel_unavailable = [10]
+    github.save()
+
+    for _ in range(2):
+        done = workflow.run_script("main-status", "--tick-main-status")
+        assert done.stdout.startswith("main: green"), done.stdout + done.stderr
+
+    assert len(workflow.calls("gh run cancel 10 ")) == 2
+    assert not workflow.wake_log.exists() or "run 10" not in workflow.wake_log.read_text()
+    assert len(workflow.calls("gh run cancel")) == 2
+    # Accepted, it is not asked again while GitHub still lists the run as finishing.
+    workflow.run_script("main-status", "--tick-main-status")
+    assert len(workflow.calls("gh run cancel")) == 2
 
 
 def _main_red_in_one_part(github: GitHub) -> None:

@@ -117,6 +117,8 @@ WINDOW_CEILING = 4
 # A check GitHub still lists as queued or running this long after its run completed was lost:
 # GitHub missed its end, and no wait brings it.
 LOST_AFTER_SECONDS = 10 * 60
+# How long the gate remembers that it asked GitHub to cancel a run.
+CANCEL_CLAIM_SECONDS = 24 * 60 * 60
 # How many times a handoff judges its own place again when the line changed it meanwhile.
 HANDOFF_ATTEMPTS = 3
 # How long a handoff's one check of its head, under the merge lock, may take.
@@ -492,18 +494,23 @@ def verdict(
     failed = [
         job["name"] for job in parts if job.get("conclusion") not in (None, "success", "skipped")
     ]
+    settled = (None, "success", "skipped", "cancelled")
     if (
         run.get("conclusion") == "cancelled"
-        and all(job.get("conclusion") in (None, "success", "skipped", "cancelled") for job in parts)
-        and (
-            lender_replanning(
-                str(run["id"]), head=run.get("head_sha"), attempt=run.get("run_attempt", 1)
-            )
-            # The gate cancelled it, still running, once main inherited its result: that
-            # result stands for it.
-            or cancelled_inherited(run)
+        and all(job.get("conclusion") in settled for job in parts)
+        and lender_replanning(
+            str(run["id"]), head=run.get("head_sha"), attempt=run.get("run_attempt", 1)
         )
     ):
+        return "pending", [plan]
+    if (
+        run.get("conclusion") == "cancelled"
+        # The summary job runs even in a cancelled run, and fails for the jobs cancelled under it.
+        and all(job.get("conclusion") in settled or job["name"] == plan for job in parts)
+        and cancelled_inherited(run)
+    ):
+        # The gate cancelled it, still running, once main inherited its result: that result
+        # stands for it.
         return "pending", [plan]
     if failed or run.get("conclusion") not in (None, "success"):
         return "red", failed or [label]
@@ -691,23 +698,37 @@ def wake_log(line: str) -> None:
 
 def _cancel(found: list[dict[str, Any]], folder: Path, whose: str) -> None:
     """Cancel each run of `found` still queued or running, so that it holds no runner ahead of
-    live work. A cancel GitHub refuses (the run already finishing) goes to the wake log once and
-    stops nothing; a cancel the shared budget held back was never sent and is tried next call."""
+    live work, each once. A cancel GitHub refuses (the run already finishing) goes to the wake
+    log once and stops nothing; one held back by the shared budget, or lost to a GitHub outage
+    or a stall, is tried again at the next call."""
+    for old in folder.glob("cancel-*"):
+        # A cancelled run has long ended by then.
+        if time.time() - old.stat().st_mtime > CANCEL_CLAIM_SECONDS:
+            old.unlink(missing_ok=True)
     for run in found:
-        refused = folder / f"cancel-refused-{run['id']}"
-        if run.get("status") == "completed" or refused.exists():
+        if run.get("status") == "completed":
+            continue
+        claim = folder / f"cancel-{run['id']}"
+        # Claim before contacting GitHub: a run still finishing after its cancel, which GitHub
+        # lists as running for a while, is not cancelled again.
+        try:
+            with claim.open("x") as output:
+                output.write(f"cancel requested for run {run['id']} of {whose}\n")
+        except FileExistsError:
             continue
         try:
             done = command("gh", "run", "cancel", str(run["id"]), "-R", REPOSITORY, check=False)
             error = (done.stderr.strip() or done.stdout.strip()) if done.returncode else ""
         except BudgetWaiting:
+            claim.unlink()
             raise
         except Refused as failure:
-            # A cancel that outlasted its deadline failed like any other.
             error = str(failure)
-        if error:
+        if error and transient(error):
+            claim.unlink()
+        elif error:
             note = f"could not cancel run {run['id']} of {whose}: {error}"
-            refused.write_text(note + "\n")
+            claim.write_text(note + "\n")
             wake_log(note)
 
 
@@ -923,7 +944,7 @@ def push_health(
     # Only pending checks may borrow a result. Main's own failures above always win.
     inherited = inherited_green(head)
     sources: list[str] = []
-    # Main's own runs whose result it inherited: under the lock they are cancelled, below.
+    # Main's own CI runs whose result it inherited: under the lock they are cancelled, below.
     redundant: list[dict[str, Any]] = []
     if inherited:
         ci_inherited = False
@@ -962,7 +983,6 @@ def push_health(
                     ),
                 ]
                 sources.append(f"Docker images run {inherited['images_run']}")
-                redundant += images
         elif ci_inherited and not own_images and main_images_needed(head, ci):
             # Main asks this after its own green CI above; an inherited CI asks it here. An
             # earlier push's image run in the list does not stand in for the head's own.
@@ -1009,23 +1029,39 @@ def inherited_green(head: str) -> dict[str, Any] | None:
     return None
 
 
+def _cancel_entry(run: dict[str, Any], tree: str) -> dict[str, Any]:
+    # A re-run is another attempt: only the attempt the gate cancelled reads as inherited.
+    return {"run": run["id"], "attempt": run.get("run_attempt", 1), "tree": tree}
+
+
 def cancelled_inherited(run: dict[str, Any]) -> bool:
-    """Whether the gate cancelled this run of main because main inherited its result on this
-    very tree. Any other cancelled run of main is red."""
+    """Whether the gate cancelled this attempt of a run of main because main inherited its
+    result on this very tree. Any other cancelled run of main is red."""
     if run.get("head_branch") != "main" or not run.get("head_sha"):
         return False
     receipt = inherited_green(run["head_sha"])
     listed = receipt.get("cancelled_inherited") if receipt else None
-    return isinstance(listed, list) and {"run": run["id"], "tree": receipt["tree"]} in listed
+    return isinstance(listed, list) and _cancel_entry(run, receipt["tree"]) in listed
 
 
 def cancel_inherited(
-    head: str, receipt: dict[str, Any], found: list[dict[str, Any]], folder: Path
+    head: str, receipt: dict[str, Any], ci: list[dict[str, Any]], folder: Path
 ) -> None:
-    """Cancel main's runs of `head` still queued or running whose result main inherited. Each
+    """Cancel main's CI runs of `head` still queued or running whose result main inherited. Each
     is listed in the receipt first, with the tree it belongs to, so its cancellation never
-    turns main red; the runs of another tree leave the list."""
-    found = [run for run in found if run["head_sha"] == head and run.get("status") != "completed"]
+    turns main red; the runs of another tree leave the list.
+
+    Only CI: main is judged by the CI runs of its head alone, but by its latest image run on any
+    earlier push too, where a cancelled one would decide main once a later receipt replaced its
+    entry. A re-run, the gate's own retry of a failed main included, is never cancelled: its
+    result decides main."""
+    found = [
+        run
+        for run in ci
+        if run["head_sha"] == head
+        and run.get("status") != "completed"
+        and run.get("run_attempt", 1) == 1
+    ]
     if not found:
         return
     tree = receipt["tree"]
@@ -1034,11 +1070,7 @@ def cancel_inherited(
         for entry in receipt.get("cancelled_inherited") or []
         if isinstance(entry, dict) and entry.get("tree") == tree
     ]
-    listed += [
-        {"run": run["id"], "tree": tree}
-        for run in found
-        if {"run": run["id"], "tree": tree} not in listed
-    ]
+    listed += [_cancel_entry(run, tree) for run in found if _cancel_entry(run, tree) not in listed]
     if listed != receipt.get("cancelled_inherited"):
         with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as output:
             json.dump({**receipt, "cancelled_inherited": listed}, output)
