@@ -58,6 +58,9 @@
 #                               changed for 45 minutes, or whose wait loop finds itself, and
 #                               tell it so (the tick does this, once); with `again`, only send
 #                               that message once more when its Enter was not taken
+#   session would-nudge <ticket-N|review-N> <still|loop> [again]
+#                               nudge-busy's checks alone, pressing nothing: exit 0 when it
+#                               would press, 3 when it would not (a shadow tick asks)
 #   session running <name>      what the session's Bash tool runs, as JSON, and whether it is
 #                               a wait loop that finds itself (`running_command.py`)
 #   session bridge <ticket-N>   start the bridge of a Codex worker again when it ended while
@@ -164,6 +167,7 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session status-check <ticket-N|review-N>
        session finish-ready <ticket-N>
        session nudge-busy <ticket-N|review-N> <still|loop> [again]
+       session would-nudge <ticket-N|review-N> <still|loop> [again]
        session running <ticket-N|audit-N|review-N|hunt-name|analyst-name>
        session bridge <ticket-N>
        session cleanup [hunts]
@@ -1456,8 +1460,11 @@ shows_queued_message() {
 #
 # With `again`, the call only sends this message once more, typed by an earlier call whose
 # Enter was not taken: it exits 3 unless the box holds exactly that, and never presses Escape.
-cmd_nudge_busy() {
-  local name=$1 kind=$2 again=${3:-} notes typed poll screen message
+# What `nudge-busy` checks before it presses anything: it exits 3 when it would press nothing,
+# and dies when it cannot. `would-nudge` runs these alone, for a shadow tick, which presses
+# nothing. Sets message, notes, typed and screen for the caller.
+nudge_checks() {
+  local name=$1 kind=$2 again=$3
   message="That loop finds its own command line and never ends. Check the process by its number."
   [[ $kind != still ]] ||
     message="The command has produced nothing for 45 minutes. Check whether it is still running and go on."
@@ -1482,8 +1489,7 @@ cmd_nudge_busy() {
   if [[ $again == again ]]; then
     if [[ -n $typed && -r $notes.typed && $(cat "$notes.typed") == "$message" ]] &&
         holds_own_text "$name"; then
-      send_prompt "$name" "$message"
-      return
+      return 0
     fi
     echo "$name does not hold the message in its box; nothing was pressed" >&2
     exit 3
@@ -1495,6 +1501,20 @@ cmd_nudge_busy() {
   if shows_queued_message "$screen"; then
     echo "$name has a message queued; nothing was pressed" >&2
     exit 3
+  fi
+}
+
+cmd_would_nudge() {
+  local name=$1 kind=$2 again=${3:-} notes typed screen message
+  nudge_checks "$name" "$kind" "$again"
+}
+
+cmd_nudge_busy() {
+  local name=$1 kind=$2 again=${3:-} notes typed poll screen message
+  nudge_checks "$name" "$kind" "$again"
+  if [[ $again == again ]]; then
+    send_prompt "$name" "$message"
+    return
   fi
   tmux -L "$name" send-keys -t "=$name:" Escape 2>/dev/null || die "Escape could not be sent to $name"
   # Claude draws the interrupt, and puts back into the box what was queued while it worked.
@@ -1797,7 +1817,7 @@ codex_limit() {
 }
 
 # A shadow run (`tick --shadow`) reads the sessions and changes none, whoever calls this.
-if [[ -n ${SHIPLINE_SHADOW:-} && ! ${1:-} =~ ^(list|running|load|room)$ ]]; then
+if [[ -n ${SHIPLINE_SHADOW:-} && ! ${1:-} =~ ^(list|running|load|room|would-nudge)$ ]]; then
   echo "a shadow run does not run session ${1:-}" >&2
   exit 1
 fi
@@ -1885,11 +1905,15 @@ case ${1:-} in
     find_main_checkout
     cmd_nudge_idle "$2" finish
     ;;
-  nudge-busy)
+  nudge-busy | would-nudge)
     [[ ($# -eq 3 || ($# -eq 4 && $4 == again)) && $2 =~ ^(ticket|review)-[0-9]+$ &&
        $3 =~ ^(still|loop)$ ]] || usage
     find_main_checkout
-    cmd_nudge_busy "$2" "$3" "${4:-}"
+    if [[ $1 == would-nudge ]]; then
+      cmd_would_nudge "$2" "$3" "${4:-}"
+    else
+      cmd_nudge_busy "$2" "$3" "${4:-}"
+    fi
     ;;
   running)
     [[ $# -eq 2 ]] && is_session_name "$2" || usage

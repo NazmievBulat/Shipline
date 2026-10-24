@@ -279,12 +279,15 @@ if ((shadow)); then
   # A real tick that still runs from its last start may write the marks this one reads, and
   # takes the decisions of its next start too: this shadow tick takes none, and says so, and
   # `compare-shadow` leaves out the real decisions beside it. SHIPLINE_SHADOW_BESIDE names the
-  # real tick's service (the README sets it).
+  # real tick's service (the README sets it), a oneshot that is `activating` while it runs; a
+  # state that cannot be read skips the tick too.
   beside=${SHIPLINE_SHADOW_BESIDE:-}
   if [[ -n $beside ]]; then
     [[ $beside =~ ^[A-Za-z0-9@._-]+$ ]] || { echo "SHIPLINE_SHADOW_BESIDE is no unit" >&2; exit 2; }
-    if systemctl --user is-active --quiet "$beside" 9>&-; then
-      shadow_note "shadow tick skipped: $beside still runs"
+    beside_state=$(systemctl --user show -p ActiveState --value "$beside" 2>/dev/null 9>&-) ||
+      beside_state=unreadable
+    if [[ ! $beside_state =~ ^(inactive|failed)$ ]]; then
+      shadow_note "shadow tick skipped: $beside is ${beside_state:-unreadable}"
       exit 0
     fi
   fi
@@ -365,6 +368,11 @@ shadow_hand_back() {
   shadow_start review "$number"
 }
 
+# Whether `session nudge-busy` would press anything in the session now (`session would-nudge`).
+shadow_would_nudge() {
+  bash "$here/session" would-nudge "$@" >/dev/null 2>&1 9>&-
+}
+
 # What `session cleanup` decides beside removing worktrees: it stops the sessions of a pull
 # request closed without merging. They leave the tick's list, as they do in the real tick.
 shadow_cleanup() {
@@ -412,8 +420,10 @@ shadow_session() {
     # The worktrees of finished work stay: removing them decides nothing the real tick logs.
     cleanup) [[ ${2:-} == hunts ]] || shadow_cleanup ;;
     # The tick itself logs each message it would have typed, in the wake log's words.
-    checks-finished | conflict-found | lost-check | batch-merged | status-check | finish-ready | \
-      nudge-busy) ;;
+    checks-finished | conflict-found | lost-check | batch-merged | status-check | finish-ready) ;;
+    # A nudge goes as `session nudge-busy` would send it, pressing nothing: it presses nothing
+    # either in the states it checks (exit 3).
+    nudge-busy) bash "$here/session" would-nudge "${@:2}" 9>&- ;;
     *) shadow_note "session $*" ;;
   esac
 }
@@ -1313,8 +1323,17 @@ while read -r name state _; do
             nudge_busy "$name" loop loop
           elif ((NOW - first_at < LOOP_NAMED_AFTER_SECONDS)); then
             later=true
-            shadow_due $((last_since + LOOP_STILL_SECONDS - NOW)) \
-              "wait loop finds itself? $name (running: $loop); nudge sent"
+            # Nudged once its screen has stood still 5 minutes, or named after 15, whichever
+            # comes first.
+            if ((last_since + LOOP_STILL_SECONDS <= first_at + LOOP_NAMED_AFTER_SECONDS)); then
+              shadow_would_nudge "$name" loop && outcome="; nudge sent"
+              shadow_due $((last_since + LOOP_STILL_SECONDS - NOW)) \
+                "wait loop finds itself? $name (running: $loop)$outcome"
+              outcome=""
+            else
+              shadow_due $((first_at + LOOP_NAMED_AFTER_SECONDS - NOW)) \
+                "wait loop finds itself? $name (running: $loop)"
+            fi
           fi
         fi
         line="wait loop finds itself? $name (running: $loop)$outcome"
@@ -1367,7 +1386,7 @@ while read -r name state _; do
     if ((shadow)) && [[ ! -r $mark || $(<"$mark") != "$last_since $head" ]] &&
         ! asks_permission "$name"; then
       outcome=""
-      quiet "$name" && outcome="; nudge sent"
+      quiet "$name" && shadow_would_nudge "$name" still && outcome="; nudge sent"
       shadow_due $((last_since + STUCK_AFTER_SECONDS - NOW)) \
         "stuck? $name ($((STUCK_AFTER_SECONDS / 60)) min, running: ${what:-no command})$outcome"
     fi

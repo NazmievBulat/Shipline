@@ -87,7 +87,7 @@ _STAMPED = re.compile(r"^(\d+) (.+)$")
 # What a shadow tick, or its wake, found coming due within the seconds it looks ahead.
 _DUE = re.compile(r"^(due|ends) within (\d+) s: (.+)$")
 # A shadow tick its bound stopped, and one that took nothing beside a real tick still running.
-_CUT = re.compile(r"^shadow tick (?:cut short after \d+ s|skipped: \S+ still runs)$")
+_CUT = re.compile(r"^shadow tick (?:cut short after \d+ s|skipped: \S+ is \S+)$")
 # The real side's clock is read up to this long before what it decided came due by it.
 SLACK_SECONDS = 5
 # A check-in of the wake: its local time, why it looked, then its lines, indented.
@@ -127,13 +127,14 @@ _TICK_LINES = [
         r"told to finish$"
     ),
     re.compile(rf"^(?P<who>{_NAME}) finish message failed: .*$"),
-    re.compile(rf"^(?P<who>{_NAME}) runs a wait loop that finds its own shell: .*$"),
     re.compile(rf"^wait loop finds itself\? (?P<who>{_NAME}) \(running: .*$"),
     # With what the tick did of it after the bracket: "; nudge sent", "; nudge failed".
     re.compile(rf"^stuck\? (?P<who>{_NAME}) \((?:\d+ min, running: |nudge not taken).*$"),
     re.compile(rf"^idle, no rule: (?P<who>{_NAME}) \(\d+ min, last line: .*\)$"),
+    re.compile(r"^(?P<who>worker-program-\d+) names no worker program .*$"),
     re.compile(
-        rf"^(?P<who>{_NAME}) (?:still|loop) nudge (?:failed|failed again|sent again|not taken).*$"
+        rf"^(?P<who>{_NAME}) (?:still|loop|stuck) nudge "
+        r"(?:failed|failed again|sent again|not taken).*$"
     ),
 ]
 # What a check-in did: told the orchestrator, or why it told nobody.
@@ -241,8 +242,6 @@ def read_log(path: Path) -> Log:
                 log.runs.append(at)
             elif _CUT.match(words):
                 log.cut.append(at)
-                if words.startswith("shadow tick skipped"):
-                    log.runs.append(at)
             elif decision := _tick_line(words, at):
                 decision.due = due
                 (log.decisions if due is None else log.due).append(decision)
@@ -318,7 +317,9 @@ def timing(real: list[Decision], due: list[Decision], notes: list[Decision]) -> 
             if line.words.startswith(_RESENT):
                 names = line.words.removeprefix(_RESENT).split()
                 reasons += [f"{name} was sent its instruction again" for name in names]
-            elif line.words.startswith(("wake: stuck? ", "wake: idle, no rule: ")):
+            elif line.words.startswith(
+                ("wake: stuck? ", "wake: idle, no rule: ", "wake: wait loop finds itself? ")
+            ):
                 reasons.append(line.words.removeprefix("wake: "))
             else:
                 reasons = []

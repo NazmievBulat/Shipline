@@ -84,6 +84,8 @@ RETRY_SECONDS=$((5 * 60))
 ASKED=$STATE/wake.asked
 shadow=${SHIPLINE_SHADOW:-}
 [[ -z $shadow ]] || LOG=$shadow
+# The shadow tick's own notes are read only in a shadow run.
+[[ -n $shadow ]] || unset SHIPLINE_SHADOW_NOTES
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 github_ready=1

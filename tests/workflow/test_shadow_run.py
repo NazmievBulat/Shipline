@@ -821,27 +821,51 @@ def test_a_shadow_tick_takes_no_clock_but_a_time(workflow: Workflow) -> None:
     assert not (workflow.repo / "x").exists()
 
 
-def test_a_shadow_tick_beside_a_real_tick_still_running_takes_nothing(workflow: Workflow) -> None:
+@pytest.mark.parametrize(
+    ("state", "skipped"),
+    [
+        ("activating", True),
+        ("deactivating", True),
+        ("", True),
+        ("inactive", False),
+        ("failed", False),
+    ],
+)
+def test_a_shadow_tick_beside_a_real_tick_still_running_takes_nothing(
+    workflow: Workflow, state: str, skipped: bool
+) -> None:
     workflow.add_pull_request(7)
-    # `systemctl --user is-active` says the real tick's service still runs.
-    workflow.fake("systemctl", '#!/bin/bash\necho "systemctl $*" >> "@STATE@/calls.log"\n')
+    # The real tick's service, a oneshot, is `activating` while its tick runs.
+    workflow.fake(
+        "systemctl",
+        f'#!/bin/bash\necho "systemctl $*" >> "@STATE@/calls.log"\n[ -n "{state}" ] || exit 1\n'
+        f"echo {state}\n",
+    )
 
     done = workflow.run_script(
         "tick", "--shadow", env={**_CLOCK, "SHIPLINE_SHADOW_BESIDE": "workflow-tick.service"}
     )
 
     assert done.returncode == 0, done.stderr
-    assert _shadow_log(workflow).read_text() == (
-        f"{_NOW} shadow tick\n{_NOW} shadow tick skipped: workflow-tick.service still runs\n"
-    )
-    assert workflow.calls() == ["systemctl --user is-active --quiet workflow-tick.service"]
+    assert workflow.calls("systemctl") == [
+        "systemctl --user show -p ActiveState --value workflow-tick.service"
+    ]
+    log = _shadow_log(workflow).read_text()
+    if skipped:
+        assert log == (
+            f"{_NOW} shadow tick\n"
+            f"{_NOW} shadow tick skipped: workflow-tick.service is {state or 'unreadable'}\n"
+        )
+        assert workflow.calls("gh") == []
+    else:
+        assert "ticket-7 started" in _decisions(_shadow_log(workflow))
 
 
 def test_the_real_decisions_beside_a_skipped_shadow_tick_are_not_compared(tmp_path: Path) -> None:
     shadow = (
         f"{_NOW} shadow tick\n"
         f"{_NOW + 180} shadow tick\n"
-        f"{_NOW + 180} shadow tick skipped: workflow-tick.service still runs\n"
+        f"{_NOW + 180} shadow tick skipped: workflow-tick.service is activating\n"
     )
     wake = f"{_NOW + 200} review-10 checks finished on {'a' * 40}; reviewer nudged\n"
 
@@ -928,6 +952,64 @@ def test_a_stuck_session_is_nudged_in_the_real_tick_and_logged_by_the_shadow(
     assert len(workflow.calls("tmux ticket-20 send-keys")) > typed
     compared = _compare("--shadow", str(_shadow_log(workflow)), "--wake", str(workflow.wake_log))
     assert compared.returncode == 0, compared.stdout
+
+
+def test_a_stuck_session_with_a_message_queued_is_named_not_nudged_in_both_ticks(
+    workflow: Workflow,
+) -> None:
+    from test_tick_waits import _captured, _runs, _session
+
+    _session(workflow)
+    _runs(workflow, "ticket-7", "pytest tests")
+    workflow.screen(_captured("busy-queued"), "ticket-7")
+    _settled(workflow)
+    first = workflow.run_script("tick", env={"TZ": "UTC", "WORKFLOW_NOW": str(_NOW - 2700)})
+    assert first.returncode == 0, first.stderr
+
+    _ticks(workflow, _NOW, late=80)
+
+    line = "stuck? ticket-7 (45 min, running: pytest tests)"
+    assert f"{_NOW} {line}\n" in _shadow_log(workflow).read_text()
+    assert f"{_NOW + 80} stuck? ticket-7 (46 min, running: pytest tests)\n" in (
+        workflow.wake_log.read_text()
+    )
+    assert [call for call in workflow.calls("tmux ticket-7 send-keys")] == []
+    compared = _compare("--shadow", str(_shadow_log(workflow)), "--wake", str(workflow.wake_log))
+    assert compared.returncode == 0, compared.stdout
+
+
+def test_would_nudge_answers_as_nudge_busy_and_presses_nothing(workflow: Workflow) -> None:
+    from test_tick_waits import _captured, _session
+
+    _session(workflow)
+    shadow = {"SHIPLINE_SHADOW": str(_shadow_log(workflow))}
+    workflow.screen("● Running the tests." + _BOX, "ticket-7")
+    would = workflow.run("would-nudge", "ticket-7", "still", env=shadow)
+    workflow.screen(_captured("busy-queued"), "ticket-7")
+    queued = workflow.run("would-nudge", "ticket-7", "still", env=shadow)
+
+    assert would.returncode == 0, would.stderr
+    assert queued.returncode == 3
+    assert queued.stderr == "ticket-7 has a message queued; nothing was pressed\n"
+    assert workflow.calls("tmux ticket-7 send-keys") == []
+
+
+def test_a_check_in_brought_about_by_a_wait_loop_that_came_due_is_timing(tmp_path: Path) -> None:
+    loop = "wait loop finds itself? ticket-14 (running: until pgrep -f x; do sleep 5; done)"
+    shadow = f"{_NOW} shadow tick\n{_NOW} due within 30 s: {loop}\n"
+    wake = (
+        f"{_NOW + 80} {loop}\n"
+        "2026-09-21 17:01:20  every 20 minutes\n"
+        f"  {loop}\n"
+        "  told Check-in: Wake check-in, 17:01.\n"
+    )
+
+    done = _compare(*_logs(tmp_path, shadow, wake, "\n"))
+
+    assert done.returncode == 0, done.stdout
+    assert done.stdout.endswith(
+        ": none differs; 3 came due between a shadow tick and the real one\n"
+    )
 
 
 def test_the_readme_runs_the_shadow_tick_on_a_timer_of_its_own_and_bounds_it() -> None:
