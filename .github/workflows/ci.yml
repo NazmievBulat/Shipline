@@ -94,6 +94,7 @@ jobs:
               tests/workflow/test_workflow_metrics.py
           - shard: 3
             files: >-
+              tests/workflow/test_break_4_switch.py
               tests/workflow/test_check_parts.py
               tests/workflow/test_ci.py
               tests/workflow/test_cloud_workers.py
@@ -101,6 +102,7 @@ jobs:
               tests/workflow/test_conflict_review.py
               tests/workflow/test_github_budget.py
               tests/workflow/test_input_box.py
+              tests/workflow/test_install_path.py
               tests/workflow/test_install_timer.py
               tests/workflow/test_path_filter.py
               tests/workflow/test_push_slots.py
