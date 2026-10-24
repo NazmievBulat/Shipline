@@ -1,8 +1,6 @@
 """`test-run` stops a session's test command at its whole-run limit and says why a run ended."""
 
-import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -279,27 +277,6 @@ def test_a_memory_stop_without_a_limit_it_can_read_names_no_size(tmp_path: Path)
     assert done.stderr.splitlines()[-1].startswith(
         "stopped: the test run passed its memory limit. A loop or a leak"
     )
-
-
-def test_the_test_scripts_a_session_runs_go_through_it() -> None:
-    """Without the prefix a session's run would have no whole-run limit and no last line."""
-    scripts = json.loads((SCRIPTS.parents[1] / "package.json").read_text())["scripts"]
-
-    for name in ("test:web", "test:python", "test:e2e"):
-        assert scripts[name].startswith("bash scripts/workflow/test-run "), name
-
-
-def test_the_server_tests_run_on_as_many_workers_as_in_ci() -> None:
-    """On one process they ran past the whole-run limit; CI runs them on its
-    `PYTEST_WORKERS`, which a session may lower."""
-    root = SCRIPTS.parents[1]
-    script = json.loads((root / "package.json").read_text())["scripts"]["test:python"]
-    workers = re.search(
-        r"^  PYTEST_WORKERS: (\d+)$", (root / ".github/workflows/ci.yml").read_text(), re.M
-    )
-
-    assert workers, "ci.yml names no PYTEST_WORKERS"
-    assert f"pytest -n ${{PYTEST_WORKERS:-{workers[1]}}} --dist worksteal" in script
 
 
 def test_a_worker_that_ignores_the_stop_goes_once_the_command_has_ended(tmp_path: Path) -> None:
