@@ -89,6 +89,7 @@ _DEFAULTS = {
             "push_checkout",
         )
     },
+    "review": {"high_effort_paths": []},
     "answer_for_owner_after_minutes": 15,
 }
 
@@ -188,6 +189,15 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     assert all(label.startswith("example-app-") for label in example["runner"]["labels"])
     assert example["machines"]
     assert example["hunts"]["areas"]
+
+
+@pytest.mark.parametrize("paths", [["("], "^db/", [""], [3]])
+def test_review_paths_must_be_a_list_of_regular_expressions(tmp_path: Path, paths: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"review": {"high_effort_paths": paths}})
+
+    with pytest.raises(workflow_config.ConfigError, match="review.high_effort_paths"):
+        workflow_config.load(repo)
 
 
 def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
