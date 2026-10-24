@@ -677,6 +677,8 @@ def _wait_for(path: Path) -> bool:
 
 def test_every_tick_samples_the_machine(workflow: Workflow) -> None:
     _proc(workflow)
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
 
     done = workflow.run_script("tick", env={**AT, "WORKFLOW_NOW": str(NOW - HOUR)})
 
@@ -685,6 +687,20 @@ def test_every_tick_samples_the_machine(workflow: Workflow) -> None:
     [sample] = [json.loads(line) for line in machine.read_text().splitlines()]
     assert sample["at"] == NOW - HOUR
     assert sample["load"] == 1.25
+    assert sample["sessions"] == {"ticket-7": "busy"}
+
+
+def test_a_tick_whose_list_of_sessions_failed_samples_them_as_unread(workflow: Workflow) -> None:
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    workflow.break_session("list", only_call=1)
+
+    done = workflow.run_script("tick", env={**AT, "WORKFLOW_NOW": str(NOW - HOUR)})
+
+    assert done.returncode != 0
+    machine = workflow.root / "home" / ".local" / "state" / "workflow" / "machine.jsonl"
+    [sample] = [json.loads(line) for line in machine.read_text().splitlines()]
+    assert sample["sessions"] is None
 
 
 def test_the_tick_starts_the_daily_run_from_0750_utc(workflow: Workflow) -> None:

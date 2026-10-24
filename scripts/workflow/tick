@@ -330,9 +330,10 @@ if [[ -z $program && -r $main/$SHIPLINE_STATE_FOLDER/worker-program ]]; then
 fi
 program=${program:-claude}
 [[ $program =~ ^(claude|codex|cloud)$ ]] || { echo "invalid worker program: $program" >&2; exit 1; }
-running=$(session list) || failed=1
-# From the sessions just listed: it asks GitHub nothing.
-bash "$here/workflow-metrics" --sample 9>&- || failed=1
+listed=-
+running=$(session list) || { failed=1; listed=unread; }
+# From the sessions just listed: the sample asks GitHub nothing and lists nothing again.
+bash "$here/workflow-metrics" --sample --sessions "$listed" <<<"$running" 9>&- || failed=1
 
 # Before GitHub is asked anything: a hunt has no pull request, and its time runs out whether
 # or not GitHub answers.

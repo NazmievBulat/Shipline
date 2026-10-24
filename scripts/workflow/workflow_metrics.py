@@ -2,9 +2,11 @@
 
     workflow-metrics [--days N] [--json]   the report of the last day and of the last N days
                                            (7), as Markdown or as JSON
-    workflow-metrics --sample              one sample of the machine and the sessions, added to
+    workflow-metrics --sample [--sessions -|unread]
+                                           one sample of the machine and the sessions, added to
                                            ~/.local/state/workflow/machine.jsonl (kept 8 days);
-                                           every tick takes one, from local reads only
+                                           every tick takes one, from local reads only, and gives
+                                           it the `session list` it read on standard input
     workflow-metrics --daily               the tick's daily run: the report to
                                            .local/analyses/metrics-<date>.md in the main
                                            checkout, and its findings to the wake
@@ -257,6 +259,14 @@ def _groups(prefix: str | None) -> dict[str, int]:
     return found
 
 
+def _states(listed: str) -> dict[str, str]:
+    return {
+        words[0]: words[1]
+        for words in (line.split() for line in listed.splitlines())
+        if len(words) >= 2
+    }
+
+
 def _sessions() -> dict[str, str] | None:
     """Each running session's state, from `session list`; None when it cannot be read."""
     try:
@@ -271,11 +281,7 @@ def _sessions() -> dict[str, str] | None:
         return None
     if done.returncode:
         return None
-    return {
-        words[0]: words[1]
-        for words in (line.split() for line in done.stdout.splitlines())
-        if len(words) >= 2
-    }
+    return _states(done.stdout)
 
 
 def _asking(config: workflow_config.Config) -> dict[str, int]:
@@ -304,7 +310,9 @@ def _first_number(path: Path) -> int | None:
     return int(words[0]) if words and words[0].isdigit() else None
 
 
-def sample() -> int:
+def sample(listed: str | None = None) -> int:
+    """With `listed`, the sessions are what the caller listed: "-" reads them from standard
+    input, "unread" says they could not be read."""
     config = workflow_config.current()
     vmstat = _fields(PROC / "vmstat")
     root = _fields(CGROUP_ROOT / "cpu.stat")
@@ -323,7 +331,13 @@ def sample() -> int:
         ),
         # The runner pool names its services and containers by `runner.prefix`.
         "groups": _groups(config.runner.prefix),
-        "sessions": _sessions(),
+        "sessions": (
+            _sessions()
+            if listed is None
+            else None
+            if listed == "unread"
+            else _states(sys.stdin.read())
+        ),
         "asking": _asking(config),
     }
     STATE.mkdir(parents=True, exist_ok=True)
@@ -1630,13 +1644,18 @@ def main() -> int:
     parser.add_argument("--days", type=int, default=7, help="the longer window, in days (7)")
     parser.add_argument("--json", action="store_true", help="the numbers as JSON")
     parser.add_argument("--sample", action="store_true", help="add one sample of the machine")
+    parser.add_argument(
+        "--sessions",
+        choices=("-", "unread"),
+        help="with --sample: the sessions on standard input, or none could be read",
+    )
     parser.add_argument("--daily", action="store_true", help="the tick's daily run")
     args = parser.parse_args()
     if args.days < 1:
         parser.error("--days must be at least 1")
     try:
         if args.sample:
-            return sample()
+            return sample(args.sessions)
         if args.daily:
             return daily()
         from merge_gate import Refused
