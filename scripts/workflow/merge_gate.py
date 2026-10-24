@@ -1659,7 +1659,7 @@ def path_filter(patterns: list[str]) -> Callable[[str], bool]:
     starting with `!` takes the file back, so negated patterns alone match nothing.
     """
     rules = [
-        (pattern.startswith("!"), _filter_pattern(pattern.removeprefix("!")))
+        (pattern.startswith("!"), workflow_config.path_pattern(pattern.removeprefix("!")))
         for pattern in patterns
     ]
 
@@ -1671,87 +1671,6 @@ def path_filter(patterns: list[str]) -> Callable[[str], bool]:
         return started
 
     return matches
-
-
-def _filter_pattern(pattern: str) -> re.Pattern[str]:
-    """One filter pattern as a regular expression. `*` is any characters but `/`, `**` is any
-    characters, and `**/` where a folder's name starts is zero or more folders (inside a name,
-    `**` is any characters and the `/` stays). `?` and `+` make what stands before them
-    zero or one, or one or more, of it. `[...]` is one character of its set, with `-` ranges.
-    A backslash makes the next character itself, and every other character is itself.
-
-    GitHub does not document a `?` or `+` with nothing before it, or a `[` that no `]` closes
-    (nor an empty `[]`): each of those is read as the character itself.
-    """
-    # Each part is what one piece of the pattern matches and how often it may stand: at least
-    # `fewest` (0 or 1) times, and at most once or, with `many`, any number of times. Repeating
-    # a part only changes those two, so no repetition ever nests inside another.
-    parts: list[tuple[str, int, bool]] = []
-    at = 0
-    while at < len(pattern):
-        char = pattern[at]
-        if pattern.startswith("**/", at) and pattern[at - 1 : at] in ("", "/"):
-            # Zero or more folders: repeating it, however, is still that.
-            parts.append(("(?:.*/)?", 1, False))
-            at += 3
-            continue
-        if pattern.startswith("**", at):
-            parts.append((".", 0, True))
-            at += 2
-            continue
-        at += 1
-        if char == "*":
-            parts.append(("[^/]", 0, True))
-        elif char in "?+" and parts:
-            expression, fewest, many = parts[-1]
-            if expression != "(?:.*/)?":
-                parts[-1] = (expression, 0, many) if char == "?" else (expression, fewest, True)
-        elif char == "\\" and at < len(pattern):
-            parts.append((re.escape(pattern[at]), 1, False))
-            at += 1
-        elif char == "[" and (found := _filter_set(pattern, at)):
-            expression, at = found
-            parts.append((expression, 1, False))
-        else:
-            parts.append((re.escape(char), 1, False))
-    times = {(1, False): "", (0, False): "?", (1, True): "+", (0, True): "*"}
-    return re.compile(
-        "".join(expression + times[fewest, many] for expression, fewest, many in parts),
-        flags=re.DOTALL,
-    )
-
-
-def _filter_set(pattern: str, at: int) -> tuple[str, int] | None:
-    """The set that starts at `at`, just after a `[`, as one character of a regular expression,
-    and where the pattern goes on after its `]`; None when no `]` closes a set of at least one
-    character. A backslash makes the next character itself. A `-` between two characters of
-    a-z, of A-Z or of 0-9 is the range from the first to the second, as GitHub allows ranges
-    only there; any other `-`, and a range that runs backwards, is the characters themselves.
-    """
-    chars: list[tuple[str, bool]] = []
-    while at < len(pattern) and (pattern[at] != "]" or not chars):
-        if pattern[at] == "]":
-            return None
-        escaped = pattern[at] == "\\" and at + 1 < len(pattern)
-        if escaped:
-            at += 1
-        chars.append((pattern[at], escaped))
-        at += 1
-    if at == len(pattern):
-        return None
-    members: list[str] = []
-    index = 0
-    while index < len(chars):
-        char = chars[index][0]
-        last = chars[index + 2][0] if index + 2 < len(chars) else ""
-        ranged = any(first <= char <= last <= final for first, final in ("az", "AZ", "09"))
-        if chars[index + 1 : index + 2] == [("-", False)] and ranged:
-            members.append(f"{re.escape(char)}-{re.escape(last)}")
-            index += 3
-        else:
-            members.append(re.escape(char))
-            index += 1
-    return f"[{''.join(members)}]", at + 1
 
 
 def browser_needed(base: str, merge: str) -> bool:
@@ -2444,6 +2363,9 @@ class Train:
         self.proofs: dict[str, list[Any]] = data.get("proofs", {})
         # Each member's priority as its labels said at the last reconcile.
         self.priorities: dict[str, str] = data.get("priorities", {})
+        # The hot paths of shipline.json each member's change touches, read on its head with
+        # those hot paths: `{"head": ..., "patterns": [...], "paths": [...]}`.
+        self.hot: dict[str, dict[str, Any]] = data.get("hot_paths", {})
         # The head each member's lost-check push made: a check lost on it is not pushed for again.
         self.reruns: dict[str, str] = data.get("reruns", {})
         # Each member's lost check at the last reconcile, with its head, for the tick's wake.
@@ -2482,18 +2404,49 @@ class Train:
             if isinstance(record, dict) and isinstance(record.get("branch"), str)
         }
 
+    def rank(self, number: str) -> tuple[int, int]:
+        # Proven fixes share the first place, keeping their order of joining.
+        return (
+            (0, 0)
+            if number in self.fixes
+            else (1, priority.rank(self.priorities.get(number, priority.UNLABELLED)))
+        )
+
     def line(self) -> list[str]:
         """The waiting members in the order they are served: the fix of a red main first,
-        then by priority, then by the order of joining within one priority."""
-        return sorted(
-            self.queue,
-            # Proven fixes share the first place, keeping their order of joining.
-            key=lambda number: (
-                (0, 0)
-                if number in self.fixes
-                else (1, priority.rank(self.priorities.get(number, priority.UNLABELLED)))
-            ),
-        )
+        then by priority, then by the order of joining within one priority, members that
+        share a hot path back to back at the place of the earliest of them."""
+        return list(self.hot_groups())
+
+    def hot_paths_of(self, number: str) -> set[str]:
+        record = self.hot.get(number)
+        if not record or record.get("patterns") != list(CONFIG.hot_paths):
+            return set()
+        return set(record.get("paths", []))
+
+    def hot_groups(self) -> dict[str, str | None]:
+        """Every member in the order served, with the hot path that put it beside a member of
+        its group, or None. Members of one priority that share a hot path, directly or through
+        another, make one group; it is served where its earliest member joined."""
+        served: dict[str, str | None] = {}
+        joined = sorted(self.queue, key=self.rank)
+        if not CONFIG.hot_paths:
+            return dict.fromkeys(joined)
+        for number in joined:
+            if number in served:
+                continue
+            group, why = [number], {number: None}
+            for current in group:
+                for other in joined:
+                    if other in why or other in served or self.rank(other) != self.rank(number):
+                        continue
+                    both = self.hot_paths_of(current) & self.hot_paths_of(other)
+                    if shared := [hot for hot in CONFIG.hot_paths if hot in both]:
+                        group.append(other)
+                        why[other] = shared[0]
+                        why[current] = why[current] or shared[0]
+            served.update((member, why[member]) for member in sorted(group, key=joined.index))
+        return served
 
     def front(self) -> str | None:
         eligible = [
@@ -2549,6 +2502,8 @@ class Train:
                     "lost": self.lost,
                     "retest": self.retest,
                     "dropped": self.dropped,
+                    # Only with hot paths named: without them the line is saved as before.
+                    **({"hot_paths": self.hot} if self.hot else {}),
                 },
                 output,
             )
@@ -2615,6 +2570,8 @@ class Train:
                 [self.path.read_text() if self.path.exists() else "", base, pulls,
                  CONFIG.checks.prefix_only]
                 + inputs(self.queue)
+                # Named hot paths change the order, though nothing on GitHub changed.
+                + ([list(CONFIG.hot_paths)] if CONFIG.hot_paths else [])
             )
 
         previous = train_reads.load(context / "reconciled.json")
@@ -2808,6 +2765,7 @@ class Train:
         self.queue = remaining
         # A label changed while waiting moves its pull request at this turn.
         self.priorities = {number: priority.of(pulls[number].get("labels")) for number in remaining}
+        self.read_hot_paths(pulls)
         self.fixes = []
         proofs: dict[str, list[Any]] = {}
         # The update that fixes an advisory on main goes first too, so main turns green.
@@ -2979,6 +2937,43 @@ class Train:
                         self.passing.append(number)
                 except Refused, KeyError, TypeError, ValueError, IndexError:
                     continue
+
+    def read_hot_paths(self, pulls: dict[str, Any]) -> None:
+        """Which hot paths each member's change touches, read again for a new head only."""
+        patterns = list(CONFIG.hot_paths)
+        kept = {
+            number: record
+            for number, record in self.hot.items()
+            if number in self.queue
+            and record.get("head") == pulls[number]["headRefOid"]
+            and record.get("patterns") == patterns
+        }
+        if patterns:
+            base = None
+            for number in self.queue:
+                if number in kept:
+                    continue
+                head = pulls[number]["headRefOid"]
+                try:
+                    base = base or git("ls-remote", "origin", "refs/heads/main").split()[0]
+                    paths = {
+                        hot for file in changed_files(base, head) for hot in CONFIG.hot_paths_of(file)
+                    }
+                except BudgetWaiting:
+                    raise
+                except Waiting:
+                    # GitHub stalls: the members not read yet are read at the next turn, not
+                    # each waited for under the merge lock.
+                    break
+                except Refused, IndexError:
+                    # Unread, it is served as without hot paths, and read again next time.
+                    continue
+                kept[number] = {
+                    "head": head,
+                    "patterns": patterns,
+                    "paths": [hot for hot in patterns if hot in paths],
+                }
+        self.hot = kept
 
     def suspend(self, number: str, head: str, health: str) -> None:
         self.suspended[number] = f"{head}:{health}"
@@ -3198,6 +3193,16 @@ def _merge_tree(base: str, head: str) -> str | None:
     if not re.fullmatch(r"[0-9a-f]{40}", tree):
         raise Refused("git did not return a batch tree")
     return tree
+
+
+def changed_files(base: str, head: str) -> list[str]:
+    """The files a pull request's change touches: from where it left main to its head."""
+    for commit, ref in ((base, "refs/heads/main"), (head, head)):
+        if command("git", "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode:
+            git("fetch", "origin", ref)
+    fork = command("git", "merge-base", base, head).stdout.strip()
+    listed = command("git", "diff", "--name-only", "--no-renames", "-z", fork, head).stdout
+    return [path for path in listed.split("\0") if path]
 
 
 def _taken_migrations(head: str, base: str) -> list[str]:
@@ -4523,6 +4528,18 @@ def train_status(folder: Path) -> int:
                         else train.priorities.get(number, priority.UNLABELLED)
                         for number in train.line()
                     },
+                    # The hot path that served each member beside one of its group.
+                    **(
+                        {
+                            "hot_paths": {
+                                number: hot
+                                for number, hot in train.hot_groups().items()
+                                if hot is not None
+                            }
+                        }
+                        if CONFIG.hot_paths
+                        else {}
+                    ),
                     "turn": train.turn,
                     # A check GitHub lost on a member's head: the tick wakes its reviewer.
                     "lost": train.lost,
@@ -4614,6 +4631,15 @@ def _failing(pull: dict[str, Any]) -> set[str]:
     return {check.get("name", check.get("context", "unknown")) for check in _failed_rollup(pull)}
 
 
+def _usual_reviewer(folder: Path, number: str, head: str, why: str) -> NoReturn:
+    """Leave the round to the usual reviewer: the tick stops this one and starts that one."""
+    (folder / f"review-{number}.usual-reviewer").write_text(head + "\n")
+    raise Refused(
+        f"this round needs the usual reviewer: {why}; end with review finished, and the tick "
+        "starts the usual reviewer"
+    )
+
+
 def handoff(number: str, folder: Path) -> int:
     """A published passed round is required before the reviewer can leave.
 
@@ -4647,7 +4673,7 @@ def handoff(number: str, folder: Path) -> int:
     latest = max(enumerate(rounds), key=lambda r: (r[1][0], r[0]))[1] if rounds else None
     if latest is None or latest[1:] != ("passed", head):
         raise Refused("the latest independent round must have passed on the current head")
-    from conflict_review import Scope, passed
+    from conflict_review import Scope, named_reviewer, passed
 
     current = next(
         review
@@ -4664,6 +4690,13 @@ def handoff(number: str, folder: Path) -> int:
     )
     if "<!-- workflow-conflict" in current["body"] and conflict is None:
         raise Refused("conflict round needs full review: invalid conflict marker")
+    # The cheaper reviewer `conflict_review` names was started for a small conflict: anything
+    # beyond resolving it within its lines is the usual reviewer's.
+    named = CONFIG.conflict_review if named_reviewer(folder, number) else None
+    if named is not None and conflict is None:
+        _usual_reviewer(
+            folder, number, head, "the reviewer of a small conflict passes no full review"
+        )
     if conflict:
         try:
             scope = Scope.read(folder, number)
@@ -4673,6 +4706,24 @@ def handoff(number: str, folder: Path) -> int:
                 or passed(reviews, scope.head) is None
             ):
                 raise ValueError("conflict round lacks its scope or earlier passed round")
+            if named is not None:
+                try:
+                    lines, outside = scope.size(Path.cwd(), head)
+                except (ValueError, subprocess.SubprocessError, CommandTimeout) as error:
+                    _usual_reviewer(folder, number, head, str(error))
+                if outside:
+                    _usual_reviewer(
+                        folder, number, head, f"the resolution changes {', '.join(outside)} too"
+                    )
+                if lines > named.max_changed_lines:
+                    _usual_reviewer(
+                        folder,
+                        number,
+                        head,
+                        f"the conflict and its resolution take {lines} lines in "
+                        f"{', '.join(scope.files)}, more than the {named.max_changed_lines} of "
+                        "conflict_review.max_changed_lines",
+                    )
             scope.validate(Path.cwd(), head)
         except (ValueError, OSError, TypeError) as error:
             raise Refused(f"conflict round needs full review: {error}") from error
