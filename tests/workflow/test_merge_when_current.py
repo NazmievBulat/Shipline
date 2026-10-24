@@ -14,7 +14,7 @@ import sys
 import time
 from collections.abc import Iterator
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -1097,6 +1097,38 @@ def test_a_hot_path_never_moves_a_member_across_priorities(github: GitHub) -> No
     # 9 is medium: it shares 7's hot path but stays behind every high member.
     assert train["waiting"] == ["7", "8", "9"]
     assert train["hot_paths"] == {}
+
+
+@pytest.mark.parametrize("failing", ["ls-remote", "fetch"])
+def test_a_stalled_github_is_waited_for_once_when_hot_paths_are_read(
+    gate: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failing: str
+) -> None:
+    """Each read of GitHub may take minutes under the merge lock: thirty members with new
+    heads wait for one stalled read, not one each."""
+    monkeypatch.setattr(gate, "CONFIG", replace(gate.CONFIG, hot_paths=("web/src/pages/**",)))
+    numbers = [str(100 + index) for index in range(30)]
+    train = gate.Train(tmp_path)
+    train.queue = numbers
+    pulls = {number: {"headRefOid": f"{int(number):040x}"} for number in numbers}
+    calls: list[str] = []
+
+    def git(*args: str) -> str:
+        calls.append(args[0])
+        if args[0] == failing:
+            raise gate.Waiting(f"git {args[0]} timed out")
+        return "f" * 40 + "\trefs/heads/main"
+
+    monkeypatch.setattr(gate, "git", git)
+    # No member's head is in the local store yet: each would be fetched.
+    monkeypatch.setattr(
+        gate, "command", lambda *args, **_: subprocess.CompletedProcess(args, 1, "", "")
+    )
+
+    train.read_hot_paths(pulls)
+
+    assert calls.count(failing) == 1
+    # Unread, each is served as without hot paths and read again at the next turn.
+    assert train.hot == {}
 
 
 def test_a_member_whose_new_head_leaves_the_hot_path_is_served_by_joining_again(

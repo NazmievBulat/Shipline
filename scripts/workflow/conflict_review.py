@@ -26,7 +26,8 @@ from workflow_commands import GIT_READ_TIMEOUT, CommandTimeout, run
 
 _ROUND = re.compile(r"^<!-- workflow-review round=([0-9]+) result=(sent-back|passed) -->")
 _SHA = re.compile(r"[0-9a-f]{40}")
-_PATH = re.compile(r"[A-Za-z0-9_.@/-]+")
+# Route folders like `(group)` and `[id]` among them; nothing a quoted command line expands.
+_PATH = re.compile(r"[A-Za-z0-9_.@/()\[\]-]+")
 # The reviewer of every conflict when shipline.json names no other.
 USUAL = ("high", "opus")
 
@@ -96,6 +97,9 @@ class Scope:
             "git",
             "-C",
             str(root),
+            # The owner's `diff3` would add the common ancestor's lines to the conflict's size.
+            "-c",
+            "merge.conflictStyle=merge",
             "merge-tree",
             "--write-tree",
             self.head,

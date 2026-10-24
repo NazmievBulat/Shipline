@@ -2901,6 +2901,10 @@ class Train:
                     }
                 except BudgetWaiting:
                     raise
+                except Waiting:
+                    # GitHub stalls: the members not read yet are read at the next turn, not
+                    # each waited for under the merge lock.
+                    break
                 except Refused, IndexError:
                     # Unread, it is served as without hot paths, and read again next time.
                     continue

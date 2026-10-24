@@ -453,6 +453,69 @@ def test_a_resolution_over_its_lines_or_in_another_file_gets_the_usual_reviewer(
     assert (folder / "review-7.conflict-reviewer").exists() == (reviewer == "medium sonnet\n")
 
 
+def test_the_common_ancestor_shown_by_the_owner_s_git_is_not_counted(workflow: Workflow) -> None:
+    """With `merge.conflictStyle` at `diff3`, git writes the common ancestor into each block too:
+    its lines are not the conflict's."""
+    workflow.add_worktree(7, draft=False)
+    head, main = _conflict(workflow)
+    workflow.git("config", "merge.conflictStyle", "diff3")
+    _conflict_review(workflow, 6)
+    _begin_merge(workflow, main)
+    folder = _folder(workflow)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "review-7.conflict.json").write_text(
+        json.dumps({"head": head, "main": main, "files": [_FILE]})
+    )
+
+    assert _reviewer(workflow) == "medium sonnet\n"
+
+
+@pytest.mark.parametrize(
+    ("file", "kept"),
+    [
+        ("web/src/app/(menu)/settings/page.tsx", True),
+        ("web/src/app/runs/[runId]/page.tsx", True),
+        ("web/src/app/odd name.tsx", False),
+        ("web/src/app/$(touch x).tsx", False),
+        ("web/src/app/`id`.tsx", False),
+        ('web/src/app/"page".tsx', False),
+        ("web/src/app/a,b.tsx", False),
+    ],
+)
+def test_a_scope_takes_route_folders_and_nothing_a_command_line_expands(
+    workflow: Workflow, file: str, kept: bool
+) -> None:
+    """A route group `(menu)` or a dynamic segment `[runId]` is an ordinary folder of a web
+    app: its conflict gets the conflict round, and so the reviewer `conflict_review` names."""
+    folder = _folder(workflow)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "review-7.conflict.json").write_text(
+        json.dumps({"head": "a" * 40, "main": "b" * 40, "files": [file]})
+    )
+
+    done = subprocess.run(
+        [
+            "python3",
+            "-B",
+            "-c",
+            "import sys; from pathlib import Path; from conflict_review import Scope; "
+            "print(Scope.read(Path(sys.argv[1]), '7').files)",
+            str(folder),
+        ],
+        cwd=workflow.script.parent,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if kept:
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert done.stdout == f"{[file]}\n"
+    else:
+        assert "invalid conflict review scope" in done.stderr
+
+
 def test_without_a_named_conflict_reviewer_every_conflict_gets_the_usual_one(
     workflow: Workflow,
 ) -> None:
