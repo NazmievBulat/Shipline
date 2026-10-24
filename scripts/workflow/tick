@@ -910,12 +910,60 @@ done <<<"$running"
 python3 -B "$here/merge_driver.py" --hand-backs 9>&- || failed=1
 running=$(session list) || failed=1
 
-# A draft goes to the cloud, if its screen check allows, by the cloud default (a Codex fix
-# round stays on Codex), or by a reservation or a cloud-built marker of its own.
+# The program the orchestrator recorded for ticket N in `worker-program-N`, in `recorded`, or
+# nothing. A record that names no program is read as none, and named in the wake once for
+# what it holds.
+recorded_program() {
+  local record=$main/$SHIPLINE_STATE_FOLDER/worker-program-$1 text sum line
+  recorded=""
+  if [[ ! -e $record ]]; then
+    rm -f "$record.noted"
+    return 0
+  fi
+  if { text=$(<"$record"); } 2>/dev/null &&
+      [[ $text =~ ^[[:space:]]*(cloud|claude|codex)[[:space:]]*$ ]]; then
+    recorded=${BASH_REMATCH[1]}
+    rm -f "$record.noted"
+    return 0
+  fi
+  sum=$(cksum <"$record" 2>/dev/null) && sum=${sum%% *} || sum=unreadable
+  [[ ! -r $record.noted || $(<"$record.noted") != "$sum" ]] || return 0
+  line="worker-program-$1 names no worker program (cloud, claude or codex); read as no record"
+  if note_for_wake "worker-program-$1-$sum" "$line"; then
+    echo "$sum" >"$record.noted" || failed=1
+    wake_log "$line" || failed=1
+  else
+    failed=1
+  fi
+}
+
+# Whether a draft goes to the cloud, if its screen check allows: always by a reservation of
+# its own; else by the program recorded for it; else by the cloud default (a Codex fix round
+# stays on Codex) or a cloud-built marker of its own. The starts held for memory and the
+# worker start both ask this, so they never disagree.
 cloud_candidate() {
   local notes=$main/$SHIPLINE_STATE_FOLDER
-  [[ ( $program == cloud && ! -e $notes/codex-built-$1 ) ||
-     -e $notes/cloud-built-$1 || -e $notes/cloud-$1 ]]
+  [[ ! -e $notes/cloud-$1 ]] || return 0
+  recorded_program "$1"
+  if [[ -n $recorded ]]; then
+    [[ $recorded == cloud ]]
+    return
+  fi
+  [[ ( $program == cloud && ! -e $notes/codex-built-$1 ) || -e $notes/cloud-built-$1 ]]
+}
+
+# Whether a draft not started in the cloud goes to Codex, if its screen check allows: never
+# with a reservation; else by the program recorded for it; else by the Codex default
+# or a Codex-built marker of its own.
+codex_candidate() {
+  local notes=$main/$SHIPLINE_STATE_FOLDER
+  [[ ! -e $notes/cloud-$1 ]] || return 1
+  recorded_program "$1"
+  if [[ -n $recorded ]]; then
+    [[ $recorded == codex ]]
+    return
+  fi
+  [[ $program == codex || -e $notes/codex-built-$1 ]]
 }
 
 # A start that waits for memory (75) holds later local starts. Cloud starts use no
@@ -955,14 +1003,12 @@ while read -r number draft base; do
     [[ $draft == true ]] && python3 -B "$here/cloud_workers.py" retryable "$main" "$number" || continue
   fi
   if [[ $draft == true ]]; then
-    # A reservation or a cloud-built marker keeps fix rounds in the cloud even after
-    # the default changes. Both alternative programs share the conservative screen routing.
+    # A reservation, a recorded program or a fix-round marker holds even after the default
+    # changes. Both alternative programs share the conservative screen routing.
     if cloud_candidate "$number" && node "$here/codex-eligible.mjs" "$number" 9>&-; then
       python3 -B "$here/cloud_workers.py" allowed "$main" || continue
       session start worker "$number" medium cloud
-    elif [[ ! -e $main/$SHIPLINE_STATE_FOLDER/cloud-$number &&
-          ( $program == codex || -e $main/$SHIPLINE_STATE_FOLDER/codex-built-$number ) ]] &&
-      node "$here/codex-eligible.mjs" "$number" 9>&-; then
+    elif codex_candidate "$number" && node "$here/codex-eligible.mjs" "$number" 9>&-; then
       ((local_starts_held == 0)) || continue
       session start worker "$number" medium codex
     else
