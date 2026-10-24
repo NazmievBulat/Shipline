@@ -5963,6 +5963,7 @@ def test_a_member_joining_during_a_restored_retest_waits_for_the_restored_front(
     (github.workflow.repo / ".local/workflow/merge-train.json").write_text(json.dumps(saved))
     done = _batch_call(github, "9")
     assert done.returncode == 3, done.stdout + done.stderr
+    assert "9" in _batch_state(github)["waiting"]
     for member in _prefixes(github):
         if member["number"] == "9":
             assert "7" in member["ahead"], member

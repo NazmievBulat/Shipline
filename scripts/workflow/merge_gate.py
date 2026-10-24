@@ -3844,6 +3844,10 @@ def _extend_line(train: Train, base: str, fresh: bool) -> None:
     members = record["members"]
     if members:
         _restore_prefixes(train, record, base)
+        if train.restored and any(member.get("kept") for member in members):
+            # Only work saved at restoration may go first. New prefixes wait until it
+            # drains, then include the restored front in their dependencies.
+            return
     first = train.front()
     starting = not members
     if (
@@ -4439,7 +4443,11 @@ def _merge_prefixes(
             )
         except (Refused, OSError) as error:
             print(f"could not record inherited prefix green: {error}", flush=True)
-        if train.prefixes and any(m.get("kept") for m in train.prefixes["members"]):
+        if train.restored or (
+            train.prefixes and any(m.get("kept") for m in train.prefixes["members"])
+        ):
+            # The squash dropped independent retests, even when the last kept prefix
+            # merged. Recompute pending state before filling slots on the new main.
             train.reconcile(acting=acting)
             _refill(train, actual)
     if acting not in merged:
