@@ -76,6 +76,7 @@ jobs:
               tests/workflow/test_merge_when_current.py
           - shard: 2
             files: >-
+              tests/tools/test_parity.py
               tests/workflow/test_browser_test_slots.py
               tests/workflow/test_github_identity.py
               tests/workflow/test_install_hooks.py
