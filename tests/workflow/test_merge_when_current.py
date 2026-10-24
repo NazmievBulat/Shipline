@@ -1828,6 +1828,26 @@ def _advisory_config(github: GitHub) -> None:
     github.workflow.git("update-index", "--skip-worktree", "shipline.json")
 
 
+def _advisory_watch(github: GitHub) -> None:
+    """The repository's advisory watch (`commands.advisory_watch`): it names the service an
+    output says could not be reached, as "<service>'s advisory service could not be reached"."""
+    github.workflow.fake(
+        "example-advisory",
+        "#!/bin/bash\n"
+        'echo "example-advisory $* (in $PWD)" >> "@STATE@/calls.log"\n'
+        "case $1 in\n"
+        "  unreachable) grep -o \"[A-Za-z]*'s advisory service could not be reached\" "
+        "| head -n 1 | cut -d \"'\" -f 1 ;;\n"
+        "  answers) exit 1 ;;\n"
+        "esac\n",
+    )
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config.setdefault("commands", {})["advisory_watch"] = "example-advisory"
+    path.write_text(json.dumps(config))
+    github.workflow.git("update-index", "--skip-worktree", "shipline.json")
+
+
 def _main_audit_failed(
     github: GitHub, *notes: dict[str, Any], audit: str = _AUDIT, others: tuple[str, ...] = ()
 ) -> None:
@@ -2084,13 +2104,7 @@ def test_an_outage_beside_mains_advisories_is_red_and_says_what_was_found(
     github: GitHub,
 ) -> None:
     _advisory_config(github)
-    (github.workflow.script.parent / "advisory_service.py").write_text(
-        'ANNOTATION = "Advisory service unreachable"\n'
-        "def unreachable(output):\n"
-        '    return "PyPI" if "PyPI" in output else None\n'
-        "def answers(service):\n"
-        "    return False\n"
-    )
+    _advisory_watch(github)
     outage = {
         "title": "Advisory service unreachable",
         "annotation_level": "failure",
@@ -2106,6 +2120,22 @@ def test_an_outage_beside_mains_advisories_is_red_and_says_what_was_found(
         "GHSA-1 in vite (path traversal)"
     ) in line
     assert "nothing was found wrong" not in line
+
+
+def test_an_advisory_whose_own_words_name_an_outage_is_still_advisories_alone(
+    github: GitHub,
+) -> None:
+    """A published advisory's summary may say anything; only the audit's other annotations are
+    read for an outage."""
+    _advisory_config(github)
+    _advisory_watch(github)
+    lines = ["GHSA-5 in example-lib (fails when npm's advisory service could not be reached)"]
+    _main_audit_failed(github, _advisories_notice(lines))
+
+    line = github.workflow.run_script("main-status").stdout
+
+    assert line.startswith("main: advisory since"), line
+    assert "could not reach" not in line
 
 
 @pytest.mark.parametrize("warned", [True, False])
@@ -3854,6 +3884,9 @@ def _train(github: GitHub) -> dict[str, Any]:
 two_stale_pulls = _two_stale_pulls
 line_up = _line
 train_status = _train
+blocked_first = _blocked_first
+refreshed_first = _refreshed_first
+waiting_reviewers = _waiting_reviewers
 
 
 def test_an_audit_with_a_new_fix_still_gets_its_checks_finished_wake(github: GitHub) -> None:
@@ -7841,9 +7874,7 @@ def _held(workflow: Workflow) -> list[float]:
 
 def _after_the_checks(workflow: Workflow, script: str) -> None:
     """Run `script` as the pre-train checks: after the handoff's own checks, before the lock."""
-    checks = workflow.script.with_name("pre-train-checks")
-    checks.write_text("#!/bin/bash\n" + script + "\nexit 0\n")
-    checks.chmod(0o755)
+    workflow.fake("pre-train-checks", "#!/bin/bash\n" + script + "\nexit 0\n")
 
 
 def _waiting(workflow: Workflow) -> list[str]:
@@ -8015,8 +8046,7 @@ def test_each_handoff_refusal_still_fires(github: GitHub, case: str, refusal: st
     elif case == "branch":
         workflow.git("checkout", "--detach", cwd=worktree)
     elif case == "pre-train checks":
-        checks = workflow.script.with_name("pre-train-checks")
-        checks.write_text("#!/bin/bash\necho 'inventory is stale' >&2\nexit 1\n")
+        workflow.fake("pre-train-checks", "#!/bin/bash\necho 'inventory is stale' >&2\nexit 1\n")
         # An earlier handoff of it waits in the line: it leaves the line, and its note goes.
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7"]}))

@@ -1,0 +1,8 @@
+● Bash(git push origin ticket/change-7)
+
+╭──────────────────────────────╮
+│ Bash command                 │
+│ Do you want to proceed?      │
+│ ❯ 1. Yes                     │
+│   2. No                      │
+╰──────────────────────────────╯

@@ -1,5 +1,6 @@
 """The tick keeps waits moving: it keeps a waiting session's cache alive, tells a
-worker that is ready but not finished to finish, and names a stuck session in the wake."""
+worker that is ready but not finished to finish, nudges a stuck session and names it in the
+wake, and names an idle session that no rule covers."""
 
 import json
 import os
@@ -16,6 +17,16 @@ _STATUS = (
     "`scripts/workflow/notify waiting` and end your turn."
 )
 _FINISH = "Pull request 7 is ready, but you have not finished."
+_STILL = (
+    "The command has produced nothing for 45 minutes. Check whether it is still running and go on."
+)
+_LOOP = "That loop finds its own command line and never ends. Check the process by its number."
+_SCREENS = Path(__file__).parent / "fixtures" / "screens"
+
+
+def _captured(name: str) -> str:
+    """A screen captured from a session, kept under `fixtures/screens`."""
+    return (_SCREENS / f"{name}.txt").read_text()
 
 
 def _tick(workflow: Workflow, at: int) -> None:
@@ -380,14 +391,15 @@ def _tool_shell(command: str) -> list[str]:
     ]
 
 
-def _runs(workflow: Workflow, name: str, command: str) -> None:
-    """The session's Bash tool runs `command`, in the session's own control group."""
+def _runs(workflow: Workflow, name: str, command: str, pid: int = 6000) -> None:
+    """The session's Bash tool runs `command`, in the session's own control group. A higher
+    `pid` is a command started later."""
     group = workflow.cgroup_root / f"user.slice/app.slice/tmux-spawn-{name}.scope"
-    pid = 6000
     folder = workflow.root / "proc" / str(pid)
     folder.mkdir(parents=True)
     (folder / "cmdline").write_bytes(b"\0".join(a.encode() for a in _tool_shell(command)) + b"\0")
-    (group / "cgroup.procs").write_text(f"{pid}\n")
+    with (group / "cgroup.procs").open("a") as procs:
+        procs.write(f"{pid}\n")
 
 
 def _busy_screen(
@@ -407,28 +419,227 @@ def _pending(workflow: Workflow) -> list[str]:
     return sorted(json.loads(event.read_text())["line"] for event in folder.iterdir())
 
 
-@pytest.mark.parametrize("name", ["ticket-7", "review-7"])
-def test_a_busy_screen_unchanged_for_45_minutes_is_named_once_with_its_command(
-    workflow: Workflow, name: str
-) -> None:
+def _keys(workflow: Workflow, name: str) -> list[str]:
+    """What was sent to the session, a word each: `Escape`, `Enter` or the typed text."""
+    prefix = f"tmux {name} send-keys -t ={name}: "
+    return [
+        call.removeprefix(prefix).removeprefix("-l ")
+        for call in workflow.calls(f"tmux {name} send-keys")
+    ]
+
+
+def _still(workflow: Workflow, name: str = "ticket-7") -> None:
+    """A busy session whose screen has not changed since the first of two captures."""
     _session(workflow, name)
     _runs(workflow, name, "pytest tests\n  -x")
-    workflow.screen(_busy_screen("2m 3s"), name)
+    workflow.screen(_captured("busy-early"), name)
     _tick(workflow, _NOW)
     # Only the clocks, the spinner and the status line under the box moved.
-    workflow.screen(
-        _busy_screen("46m 59s", spinner="✶ Pondering", status="  12% context left"), name
-    )
+    workflow.screen(_captured("busy-later"), name)
+
+
+@pytest.mark.parametrize("name", ["ticket-7", "review-7"])
+def test_a_busy_screen_unchanged_for_45_minutes_is_nudged_once_and_named(
+    workflow: Workflow, name: str
+) -> None:
+    _still(workflow, name)
     _tick(workflow, _NOW + 2699)
     assert _pending(workflow) == []
+    assert _keys(workflow, name) == []
 
     _tick(workflow, _NOW + 2700)
     _tick(workflow, _NOW + 3600)
 
-    assert _pending(workflow) == [f"stuck? {name} (45 min, running: pytest tests)"]
-    assert f"stuck? {name} (45 min" in workflow.wake_log.read_text()
-    # Named, never interrupted.
-    assert workflow.calls(f"tmux {name} send-keys") == []
+    # Escape first, then the fixed text into the empty box, then the key that sends it.
+    assert _keys(workflow, name) == ["Escape", _STILL, "Enter"]
+    line = f"stuck? {name} (45 min, running: pytest tests); nudge sent"
+    assert _pending(workflow) == [line]
+    assert line in workflow.wake_log.read_text()
+
+
+def test_a_still_screen_is_nudged_again_on_a_new_head(workflow: Workflow) -> None:
+    _still(workflow)
+    _tick(workflow, _NOW + 2700)
+    assert _keys(workflow, "ticket-7").count(_STILL) == 1
+    # The interrupted session drew nothing new, but it committed.
+    workflow.git("commit", "--quiet", "--allow-empty", "-m", "fix: x", cwd=workflow.worktree(7))
+
+    _tick(workflow, _NOW + 2880)
+
+    assert _keys(workflow, "ticket-7").count(_STILL) == 2
+
+
+def test_a_still_screen_with_unsent_text_is_named_and_not_touched(workflow: Workflow) -> None:
+    _still(workflow)
+    (workflow.state / "input-ticket-7").write_text("also run the browser tests")
+
+    _tick(workflow, _NOW + 2700)
+
+    assert _keys(workflow, "ticket-7") == []
+    assert (workflow.state / "input-ticket-7").read_text() == "also run the browser tests"
+    assert _pending(workflow) == ["stuck? ticket-7 (45 min, running: pytest tests)"]
+
+
+def test_a_still_screen_asking_the_owner_is_named_and_not_touched(workflow: Workflow) -> None:
+    _session(workflow)
+    workflow.screen(_captured("busy-asks-owner"), "ticket-7")
+    _tick(workflow, _NOW)
+
+    _tick(workflow, _NOW + 2700)
+
+    assert _keys(workflow, "ticket-7") == []
+    assert _pending(workflow) == ["stuck? ticket-7 (45 min, running: no command)"]
+
+
+def test_text_that_escape_puts_back_in_the_box_is_not_sent(workflow: Workflow) -> None:
+    _still(workflow)
+    # A message the owner queued while the command ran comes back into the box.
+    (workflow.state / "input-after-escape-ticket-7").write_text("and then the docs")
+
+    _tick(workflow, _NOW + 2700)
+
+    assert _keys(workflow, "ticket-7") == ["Escape"]
+    assert (workflow.state / "input-ticket-7").read_text() == "and then the docs"
+    assert _pending(workflow) == [
+        "stuck? ticket-7 (45 min, running: pytest tests); interrupted, text left in its box"
+    ]
+
+
+@pytest.mark.parametrize("queued", ["queued", "no-break space", "plain spinner frame", "none"])
+def test_escape_is_never_pressed_on_a_message_queued_under_the_spinner(
+    workflow: Workflow, queued: str
+) -> None:
+    screen = _captured("busy-queued")
+    if queued == "no-break space":
+        screen = screen.replace("❯ what is", "❯\u00a0what is")
+    elif queued == "plain spinner frame":
+        screen = screen.replace("✶ Pondering", "* Pondering")
+    elif queued == "none":
+        # Only the prompt already sent, in the history above the reply, has the mark.
+        screen = screen.replace("\x1b[48;5;237m❯ what is going on here?\x1b[0m\n", "")
+    _session(workflow)
+    _runs(workflow, "ticket-7", "pytest tests")
+    workflow.screen(screen, "ticket-7")
+    _tick(workflow, _NOW)
+
+    _tick(workflow, _NOW + 2700)
+
+    if queued != "none":
+        assert _keys(workflow, "ticket-7") == []
+        assert _pending(workflow) == ["stuck? ticket-7 (45 min, running: pytest tests)"]
+    else:
+        assert _keys(workflow, "ticket-7") == ["Escape", _STILL, "Enter"]
+
+
+def test_a_nudge_whose_enter_was_not_taken_is_sent_again_without_escape(
+    workflow: Workflow,
+) -> None:
+    _still(workflow)
+    (workflow.state / "screen-after-escape-ticket-7").write_text(_captured("interrupted"))
+    (workflow.state / "swallow-enter-ticket-7").write_text("2")
+    done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 2700)})
+    assert done.returncode != 0
+    assert (workflow.state / "input-ticket-7").read_text() == _STILL
+
+    _tick(workflow, _NOW + 2880)
+    _tick(workflow, _NOW + 3060)
+
+    assert _keys(workflow, "ticket-7") == ["Escape", _STILL, "Enter", "Enter", "Enter"]
+    assert (workflow.state / "input-ticket-7").read_text() == ""
+    assert "ticket-7 still nudge sent again after its Enter was not taken" in (
+        workflow.wake_log.read_text()
+    )
+
+
+def test_a_nudge_is_sent_again_under_a_history_prompt_of_an_earlier_turn(
+    workflow: Workflow,
+) -> None:
+    _still(workflow)
+    # Interrupted: no spinner now, an earlier turn's time and the prompt sent after it above.
+    (workflow.state / "screen-after-escape-ticket-7").write_text(
+        "● Done with the first part.\n\n✻ Worked for 3m 2s\n\n❯ run the tests and fix what fails\n\n"
+        + _captured("interrupted")
+    )
+    (workflow.state / "swallow-enter-ticket-7").write_text("2")
+    workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 2700)})
+
+    _tick(workflow, _NOW + 2880)
+
+    assert (workflow.state / "input-ticket-7").read_text() == ""
+    assert _keys(workflow, "ticket-7").count("Escape") == 1
+
+
+def test_a_nudge_that_is_never_taken_is_tried_three_more_times_then_named(
+    workflow: Workflow,
+) -> None:
+    _still(workflow)
+    (workflow.state / "screen-after-escape-ticket-7").write_text(_captured("interrupted"))
+    (workflow.state / "swallow-enter-ticket-7").write_text("100")
+    codes = [
+        workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 2700 + 180 * n)}).returncode
+        for n in range(7)
+    ]
+
+    # The first try and three more fail; then the wake is told and the tick is quiet again.
+    assert codes == [1, 1, 1, 1, 0, 0, 0]
+    assert _keys(workflow, "ticket-7").count("Escape") == 1
+    assert _keys(workflow, "ticket-7").count("Enter") == 8
+    assert "stuck? ticket-7 (nudge not taken; its text stays in the box)" in _pending(workflow)
+
+
+def test_a_message_of_the_tick_left_in_the_box_is_not_sent_for_a_nudge(
+    workflow: Workflow,
+) -> None:
+    _still(workflow)
+    # An older message of the tick's own that did not go.
+    typed = workflow.notes(7) / "ticket-7.typed"
+    _written(typed, _NOW)
+    typed.write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+
+    _tick(workflow, _NOW + 2700)
+
+    assert _keys(workflow, "ticket-7") == []
+    assert _pending(workflow) == ["stuck? ticket-7 (45 min, running: pytest tests)"]
+
+
+def test_a_session_that_turns_busy_starts_its_45_minutes_then(workflow: Workflow) -> None:
+    notes = _session(workflow)
+    workflow.screen(_captured("busy-early"), "ticket-7")
+    _written(notes.with_name("ticket-7.idle"), _NOW)
+    _tick(workflow, _NOW)
+    # Its next prompt took away the idle note; the screen above the box looks the same.
+    notes.with_name("ticket-7.idle").unlink()
+
+    _tick(workflow, _NOW + 2700)
+    assert _keys(workflow, "ticket-7") == []
+    _tick(workflow, _NOW + 2700 + 2700)
+
+    assert _keys(workflow, "ticket-7") == ["Escape", _STILL, "Enter"]
+
+
+def test_a_nudge_that_could_not_be_typed_is_named_as_failed(workflow: Workflow) -> None:
+    _still(workflow)
+    (workflow.state / "send-keys-fails").touch()
+
+    done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 2700)})
+
+    assert done.returncode != 0
+    assert _pending(workflow) == ["stuck? ticket-7 (45 min, running: pytest tests); nudge failed"]
+    assert "ticket-7 stuck nudge failed" in workflow.wake_log.read_text()
+
+
+def test_the_tick_notes_when_a_screen_last_changed_for_session_list(workflow: Workflow) -> None:
+    _still(workflow)
+    _tick(workflow, _NOW + 600)
+
+    listed = workflow.run("list")
+
+    assert listed.returncode == 0, listed.stderr
+    # The first capture: the second differs only in what the sum leaves out.
+    assert listed.stdout.splitlines() == [
+        "ticket-7  busy  0 MB held  0 MB in swap  screen changed Sep 21, 2026, 2:13pm (UTC)"
+    ]
 
 
 def test_a_screen_that_changes_starts_the_45_minutes_again(workflow: Workflow) -> None:
@@ -444,7 +655,7 @@ def test_a_screen_that_changes_starts_the_45_minutes_again(workflow: Workflow) -
     _tick(workflow, _NOW + 2700)
     assert _pending(workflow) == []
     _tick(workflow, _NOW + 1800 + 2700)
-    assert _pending(workflow) == ["stuck? ticket-7 (45 min, running: no command)"]
+    assert _pending(workflow) == ["stuck? ticket-7 (45 min, running: no command); nudge sent"]
 
 
 @pytest.mark.parametrize("note", ["idle", "job-wait", "checks-wait"])
@@ -473,22 +684,116 @@ def test_a_permission_dialog_is_waiting_for_the_owner_not_stuck(workflow: Workfl
     _tick(workflow, _NOW + 3600)
 
     assert _pending(workflow) == []
+    assert _keys(workflow, "ticket-7") == []
 
 
 # 4. A wait loop that finds itself.
 
 
-def test_a_wait_loop_that_finds_its_own_shell_is_named_once(workflow: Workflow) -> None:
+def test_a_wait_loop_that_finds_its_own_shell_is_nudged_once_and_named(
+    workflow: Workflow,
+) -> None:
     _session(workflow)
+    workflow.screen(_captured("busy-loop"), "ticket-7")
     _runs(workflow, "ticket-7", 'while pgrep -f "codex exec" >/dev/null; do sleep 30; done')
 
     _tick(workflow, _NOW)
     _tick(workflow, _NOW + 180)
+    # Not before its screen has stood still for 5 minutes.
+    assert _keys(workflow, "ticket-7") == []
+    _tick(workflow, _NOW + 300)
+    # Interrupted, the session drew its answer; the loop is still the one that ran.
+    workflow.screen(_captured("interrupted"), "ticket-7")
+    _tick(workflow, _NOW + 480)
 
+    assert _keys(workflow, "ticket-7") == ["Escape", _LOOP, "Enter"]
+    assert _pending(workflow) == [
+        'wait loop finds itself? ticket-7 (running: while pgrep -f "codex exec" >/dev/null; '
+        "do sleep 30; done); nudge sent"
+    ]
+
+
+def test_a_wait_loop_left_in_the_background_does_not_interrupt_other_work(
+    workflow: Workflow,
+) -> None:
+    _session(workflow)
+    _runs(workflow, "ticket-7", 'while pgrep -f "codex exec" >/dev/null; do sleep 30; done')
+    _runs(workflow, "ticket-7", "pytest tests", pid=6001)
+
+    _tick(workflow, _NOW)
+
+    assert _keys(workflow, "ticket-7") == []
     assert _pending(workflow) == [
         'wait loop finds itself? ticket-7 (running: while pgrep -f "codex exec" >/dev/null; '
         "do sleep 30; done)"
     ]
+
+
+def test_a_wait_loop_on_a_screen_that_moves_is_named_when_the_turn_ends(
+    workflow: Workflow,
+) -> None:
+    notes = _session(workflow)
+    _runs(workflow, "ticket-7", 'while pgrep -f "codex exec" >/dev/null; do sleep 30; done')
+    for at, step in ((_NOW, "one"), (_NOW + 180, "two"), (_NOW + 360, "three")):
+        # The session edits files while the loop runs in the background.
+        workflow.screen(f"● Update(scripts/{step}.py)\n  ⎿  Updated\n" + _BOX, "ticket-7")
+        _tick(workflow, at)
+    assert _pending(workflow) == []
+    _written(notes.with_name("ticket-7.idle"), _NOW + 400)
+
+    _tick(workflow, _NOW + 540)
+
+    assert _keys(workflow, "ticket-7") == []
+    assert _pending(workflow) == [
+        'wait loop finds itself? ticket-7 (running: while pgrep -f "codex exec" >/dev/null; '
+        "do sleep 30; done)"
+    ]
+
+
+def test_a_wait_loop_on_a_screen_that_keeps_moving_is_named_after_15_minutes(
+    workflow: Workflow,
+) -> None:
+    _session(workflow)
+    _runs(workflow, "ticket-7", 'while pgrep -f "codex exec" >/dev/null; do sleep 30; done')
+    for n in range(7):
+        workflow.screen(f"● Bash(while pgrep …)\n  ⎿  +{n} lines\n" + _BOX, "ticket-7")
+        _tick(workflow, _NOW + 180 * n)
+        assert _pending(workflow) == [] or n * 180 >= 900
+
+    assert _keys(workflow, "ticket-7") == []
+    assert _pending(workflow) == [
+        'wait loop finds itself? ticket-7 (running: while pgrep -f "codex exec" >/dev/null; '
+        "do sleep 30; done)"
+    ]
+
+
+@pytest.mark.parametrize("case", ["typed", "permission", "asks owner", "idle", "codex"])
+def test_a_wait_loop_in_a_session_that_must_not_be_disturbed_is_only_named(
+    workflow: Workflow, case: str
+) -> None:
+    notes = _session(workflow)
+    workflow.screen(_captured("busy-loop"), "ticket-7")
+    _runs(workflow, "ticket-7", 'while pgrep -f "codex exec" >/dev/null; do sleep 30; done')
+    if case == "typed":
+        (workflow.state / "input-ticket-7").write_text("merge it")
+    elif case == "permission":
+        workflow.screen(_captured("permission-dialog"), "ticket-7")
+    elif case == "asks owner":
+        workflow.screen(_captured("busy-asks-owner"), "ticket-7")
+    elif case == "idle":
+        # A loop the session left running in the background after its turn.
+        _written(notes.with_name("ticket-7.idle"), _NOW)
+    else:
+        _written(notes.with_name("ticket-7.codex"), _NOW)
+
+    _tick(workflow, _NOW)
+
+    assert _keys(workflow, "ticket-7") == []
+    if case != "codex":
+        assert _pending(workflow) == [
+            'wait loop finds itself? ticket-7 (running: while pgrep -f "codex exec" >/dev/null; '
+            "do sleep 30; done)"
+        ]
 
 
 def test_a_wait_loop_that_can_end_is_not_named(workflow: Workflow) -> None:
@@ -496,6 +801,90 @@ def test_a_wait_loop_that_can_end_is_not_named(workflow: Workflow) -> None:
     _runs(workflow, "ticket-7", 'while pgrep -f "[c]odex exec" >/dev/null; do sleep 30; done')
 
     _tick(workflow, _NOW)
+
+    assert _pending(workflow) == []
+
+
+# 5. An idle session that no rule covers.
+
+
+def _idle(workflow: Workflow, since: int, name: str = "ticket-7") -> Path:
+    notes = _session(workflow, name)
+    workflow.screen(_captured("idle-no-rule"), name)
+    _written(notes.with_name(f"{name}.idle"), since)
+    return notes
+
+
+@pytest.mark.parametrize("name", ["ticket-7", "review-7"])
+def test_an_idle_session_no_rule_covers_is_named_once_after_50_minutes(
+    workflow: Workflow, name: str
+) -> None:
+    _idle(workflow, _NOW - 2999, name)
+    _tick(workflow, _NOW)
+    assert _pending(workflow) == []
+
+    _tick(workflow, _NOW + 1)
+    _tick(workflow, _NOW + 600)
+
+    line = f"idle, no rule: {name} (50 min, last line: The pull request stays a draft for now.)"
+    assert _pending(workflow) == [line]
+    assert line in workflow.wake_log.read_text()
+    # The tick types nothing it has no rule for.
+    assert _keys(workflow, name) == []
+
+
+def test_the_idle_line_leaves_out_the_lines_claude_draws_after_a_turn(
+    workflow: Workflow,
+) -> None:
+    _idle(workflow, _NOW - 3000)
+    workflow.screen(
+        "● The pull request stays a draft for now.\n\n✻ Worked for 3m 2s\n\n" + _BOX, "ticket-7"
+    )
+
+    _tick(workflow, _NOW)
+
+    assert _pending(workflow) == [
+        "idle, no rule: ticket-7 (50 min, last line: The pull request stays a draft for now.)"
+    ]
+
+
+def test_an_idle_session_no_rule_covers_is_named_again_on_a_new_head(workflow: Workflow) -> None:
+    _idle(workflow, _NOW - 3000)
+    _tick(workflow, _NOW)
+    workflow.git("commit", "--quiet", "--allow-empty", "-m", "fix: x", cwd=workflow.worktree(7))
+
+    _tick(workflow, _NOW + 180)
+
+    assert len(_pending(workflow)) == 2
+
+
+@pytest.mark.parametrize(
+    "case", ["job-wait", "checks-wait", "asking", "question on screen", "typed", "finished"]
+)
+def test_an_idle_session_a_rule_covers_or_that_waits_for_the_owner_is_not_named(
+    workflow: Workflow, case: str
+) -> None:
+    notes = _idle(workflow, _NOW - 3000)
+    if case in ("job-wait", "checks-wait", "asking"):
+        _written(notes.with_name(f"ticket-7.{case}"), _NOW - 3000)
+    elif case == "question on screen":
+        workflow.screen("● Should the limit be 3 or 5? Reply 1 or 2.\n" + _BOX, "ticket-7")
+    elif case == "typed":
+        (workflow.state / "input-ticket-7").write_text("merge it")
+    else:
+        workflow.screen("● All done.\n\nworker finished\n" + _BOX, "ticket-7")
+
+    _tick(workflow, _NOW)
+
+    assert [line for line in _pending(workflow) if line.startswith("idle, no rule")] == []
+
+
+def test_a_worker_idle_on_a_ready_pull_request_is_told_to_finish_not_named(
+    workflow: Workflow,
+) -> None:
+    _ready_and_idle(workflow, idle_since=_NOW - 3600)
+    _tick(workflow, _NOW)
+    _tick(workflow, _NOW + 900)
 
     assert _pending(workflow) == []
 

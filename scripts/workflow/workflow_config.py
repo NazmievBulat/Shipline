@@ -49,6 +49,22 @@ DEFAULTS: dict[str, Any] = {
     "repository": None,
     "state_folder": ".local/workflow",
     "worktree_setup": "scripts/setup-worktree",
+    "commands": {
+        # The command line that runs the repository's tests, from the root of its checkout, by
+        # `bash -c` (`ci_proof.py test`).
+        "test": None,
+        # The repository's own commands Shipline calls, each split into words (`Config.command`).
+        "browser_tests_for_changes": None,
+        "server_tests_for_changes": None,
+        "pre_train_checks": None,
+        "mechanical_conflicts": None,
+        "browser_plan": None,
+        "hunt_app": None,
+        "hunt_browser": None,
+        "hunt_cursor": None,
+        "advisory_watch": None,
+        "push_checkout": None,
+    },
     "checks": {
         "ci_result": "CI result",
         "ci_plan": "CI: what to run",
@@ -101,10 +117,6 @@ DEFAULTS: dict[str, Any] = {
         "areas": {},
         # The repository's file of hunt plans, which a hunt with a plan is told of.
         "plans": None,
-    },
-    "commands": {
-        # The command line that runs the repository's tests, from the root of its checkout.
-        "test": None,
     },
 }
 # The keys of one machine.
@@ -199,8 +211,22 @@ class Hunts:
 
 @dataclass(frozen=True)
 class Commands:
-    # None when the file names none.
+    # Each None when the file names none.
     test: str | None
+    browser_tests_for_changes: str | None
+    server_tests_for_changes: str | None
+    pre_train_checks: str | None
+    mechanical_conflicts: str | None
+    browser_plan: str | None
+    hunt_app: str | None
+    hunt_browser: str | None
+    hunt_cursor: str | None
+    advisory_watch: str | None
+    push_checkout: str | None
+
+
+# The commands run as words, not by a shell: every one but `test`.
+RUN_AS_WORDS = tuple(name for name in DEFAULTS["commands"] if name != "test")
 
 
 @dataclass(frozen=True)
@@ -221,6 +247,20 @@ class Config:
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
+
+    def command(self, name: str) -> list[str] | None:
+        """The words a command is run with, or None when the repository has none. Its script is
+        the main checkout's (`_script`); the other words are passed as written."""
+        if name not in RUN_AS_WORDS:
+            raise KeyError(name)
+        line = getattr(self.commands, name)
+        if line is None:
+            return None
+        words = _words(line, name)
+        script = _script(words)
+        if script is not None:
+            words[script] = str(self.main / words[script])
+        return words
 
     @property
     def repository(self) -> str:
@@ -368,6 +408,32 @@ def _relative(value: str, name: str) -> str:
     return value
 
 
+def _words(line: str, name: str) -> list[str]:
+    """A command line split into words as the shell splits them, with nothing expanded."""
+    where = f"commands.{name}"
+    try:
+        words = shlex.split(line)
+    except ValueError as error:
+        raise ConfigError(f"{FILE}: {where} cannot be split into words: {error}") from None
+    script = _script(words)
+    if script is not None:
+        _relative(words[script], where)
+    return words
+
+
+def _script(words: list[str]) -> int | None:
+    """Which word is the repository's own program, read from its main checkout wherever the
+    command runs, so a pull request's worktree never supplies it: a first word with a folder
+    in it, or, after a program found on the PATH (an interpreter), the first word with a folder
+    in it that is no option. None when every word is found elsewhere."""
+    if "/" in words[0]:
+        return 0
+    return next(
+        (index for index, word in enumerate(words) if "/" in word and not word.startswith("-")),
+        None,
+    )
+
+
 def _plans(value: str | None) -> str | None:
     if value is not None and not (
         _PLANS.fullmatch(value) and _relative(value, "hunts.plans") == value
@@ -456,6 +522,9 @@ def load(start: Path | None = None) -> Config:
         raise ConfigError(f"{FILE}: labels.priority must name four different labels")
     if repository is not None and not _REPOSITORY.fullmatch(repository):
         raise ConfigError(f"{source}: repository must be owner/name, not {repository}")
+    for name in RUN_AS_WORDS:
+        if values["commands"][name] is not None:
+            _words(values["commands"][name], name)
     return Config(
         found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),
@@ -560,6 +629,10 @@ def shell(config: Config) -> str:
     lines.append(f"SHIPLINE_HUNT_AREAS=({' '.join(shlex.quote(area) for area in areas)})")
     screens = " ".join(shlex.quote(", ".join(paths)) for paths in areas.values())
     lines.append(f"SHIPLINE_HUNT_SCREENS=({screens})")
+    # Each command as an array of its words, empty when the repository has none.
+    for name in RUN_AS_WORDS:
+        words = " ".join(shlex.quote(word) for word in config.command(name) or [])
+        lines.append(f"SHIPLINE_COMMAND_{name.upper()}=({words})")
     # The main checkout, exported: every program the script starts works on the same repository,
     # whatever folder it starts in.
     lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")

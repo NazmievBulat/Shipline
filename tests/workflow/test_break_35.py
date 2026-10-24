@@ -5,7 +5,6 @@ and a Python lock file, a new advisory found on main, the one-line lock bump tha
 advisory service that does not answer, and the wake that has to name all of it."""
 
 import json
-import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +14,7 @@ from workflow.test_merge_when_current import (
     GitHub,
     _advisories_notice,
     _advisory_config,
+    _advisory_watch,
     _main_audit_failed,
     _pull_passed_over_mains_advisory,
     _train,
@@ -223,28 +223,6 @@ def test_the_lock_bump_still_goes_first_after_main_moved_under_it(
     assert train["priorities"]["8"] == "blocker", train
 
 
-def _advisory_service(github: GitHub) -> None:
-    """The repository's own helper that reads an unreachable advisory service from the audit's
-    annotation, as a repository that holds one has it beside the scripts."""
-    (github.workflow.script.parent / "advisory_service.py").write_text(
-        textwrap.dedent(
-            """\
-            ANNOTATION = "Advisory service unreachable"
-            def unreachable(output):
-                return "PyPI" if "PyPI" in output else None
-            def note_down(folder, service):
-                (folder / "advisory-service-down").write_text(service)
-            def note_up(folder):
-                (folder / "advisory-service-down").unlink(missing_ok=True)
-            def down(folder):
-                return None
-            def answers(service):
-                return False
-            """
-        )
-    )
-
-
 _OUTAGE = {
     "title": "Advisory service unreachable",
     "annotation_level": "failure",
@@ -257,7 +235,7 @@ def test_an_advisory_service_outage_keeps_main_red_by_its_own_rule(
     github: GitHub,
 ) -> None:
     _advisory_config(github)
-    _advisory_service(github)
+    _advisory_watch(github)
     _main_audit_failed(github, _OUTAGE)
     _pull_passed_over_mains_advisory(github)
 
@@ -277,7 +255,7 @@ def test_an_outage_beside_an_advisory_is_not_advisories_alone(
     """One lock file found an advisory, the other's service did not answer: the Python lock
     file was not audited, so main is not failing on advisories alone."""
     _advisory_config(github)
-    _advisory_service(github)
+    _advisory_watch(github)
     notes = [_OUTAGE, _advisories_notice(_BOTH[:1])]
     _main_audit_failed(github, *(notes if order == "outage first" else notes[::-1]))
 
