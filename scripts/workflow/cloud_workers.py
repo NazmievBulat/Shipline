@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -223,26 +224,9 @@ def _time(comment: dict[str, object]) -> int:
     return int(datetime.fromisoformat(created).timestamp())
 
 
-def _answer(
-    comments: list[dict[str, object]], question: int, writers: dict[str, bool]
-) -> dict[str, object] | None:
-    """The first comment after the question that answers it. `writers` keeps, for this run,
-    whether each account asked about may write to the repository."""
-    for comment in comments:
-        body = str(comment["body"]).lstrip()
-        if int(str(comment["id"])) <= question:
-            continue
-        # Every other role's comment begins with its marker. The worker posts from the owner's
-        # account, and GitHub's Claude connector signs what it posts.
-        if not body.startswith(ORCHESTRATOR) and (body.startswith("<!--") or SIGNED in body):
-            continue
-        if _may_write(comment, writers):
-            return comment
-    return None
-
-
-def _may_write(comment: dict[str, object], writers: dict[str, bool]) -> bool:
-    """Whether the comment's author may write to the repository, kept in `writers` for this run."""
+def _writes(comment: dict[str, object], writers: dict[str, bool]) -> bool:
+    """Whether the comment's author may write to the repository. Anyone may comment on a
+    public pull request. `writers` keeps, for this run, the accounts already asked about."""
     user = comment.get("user")
     login = user.get("login") if isinstance(user, dict) else None
     if not isinstance(login, str) or not LOGIN.fullmatch(login):
@@ -259,6 +243,28 @@ def _may_write(comment: dict[str, object], writers: dict[str, bool]) -> bool:
         # An account GitHub does not know as a collaborator may not write.
         writers[login] = asked.returncode == 0 and asked.stdout.strip() in WRITERS
     return writers[login]
+
+
+def _answer(
+    comments: list[dict[str, object]], question: int, writers: dict[str, bool]
+) -> dict[str, object] | None:
+    """The first comment after the question that answers it."""
+    for comment in comments:
+        body = str(comment["body"]).strip()
+        if int(str(comment["id"])) <= question or not body:
+            continue
+        if not body.startswith(ORCHESTRATOR):
+            # Every other role's comment begins with its marker, and a command to a bot
+            # (`@codex review`) with its name. The worker posts from the owner's account, and
+            # GitHub's Claude connector signs what it posts on its last line; a quoted reply
+            # begins with the quote, which may hold that line too.
+            if body.startswith(("<!--", "@")):
+                continue
+            if body.splitlines()[-1].strip() == SIGNED and not body.startswith(">"):
+                continue
+        if _writes(comment, writers):
+            return comment
+    return None
 
 
 def _question(body: str) -> tuple[str, str, str]:
@@ -329,7 +335,7 @@ def _answer_for_owner(
         return
     asked = next((comment for comment in comments if comment["id"] == question), None)
     # Anyone can comment on a public pull request, the marker included.
-    if not asked or not _may_write(asked, writers):
+    if not asked or not _writes(asked, writers):
         return
     owner, reply, line = _question(str(asked["body"]))
     if owner == "missing" or (owner == "no" and not reply):
@@ -352,7 +358,10 @@ def _answer_for_owner(
     # again, since.
     fresh = _comments(number)
     if _answer(fresh, question, writers) or any(
-        comment["id"] > question and str(comment["body"]).startswith(MARKER) for comment in fresh
+        comment["id"] > question
+        and str(comment["body"]).startswith(MARKER)
+        and _writes(comment, writers)
+        for comment in fresh
     ):
         return
     text = ANSWERED_FOR_OWNER + reply + (f"\n\n> {line}" if line else "")
@@ -395,6 +404,9 @@ def _poll(notes: Path, scripts: Path) -> int:
                 if comment["id"] <= record["last_comment_id"]:
                     continue
                 if not comment["body"].startswith(MARKER):
+                    continue
+                # A marked comment from an account that may not write is no report.
+                if not _writes(comment, writers):
                     continue
                 body = comment["body"]
                 status = _status(body)
@@ -550,6 +562,7 @@ def _attach(name: str, address: str, text: str) -> str:
     if not re.fullmatch(ADDRESS, address):
         return "the recorded address is not a cloud session address"
     pane = f"wake-{name}"
+    group = None
     # A clean environment, as `session` gives its panes: nothing of the tick's own reaches the
     # client. TMUX_TMPDIR goes along, or the server would put its socket elsewhere.
     env = {
@@ -583,6 +596,9 @@ def _attach(name: str, address: str, text: str) -> str:
         )  # fmt: skip
         if started.returncode:
             return f"the pane could not be started: {started.stderr.strip()}"
+        listed = tmux("list-panes", "-t", f"={pane}", "-F", "#{pane_pid}").stdout.strip()
+        # The pane's command leads a process group of its own.
+        group = int(listed) if listed.isdigit() else None
         return _type(tmux, pane, text)
     except (OSError, subprocess.SubprocessError) as error:
         return f"the pane failed: {error}"
@@ -591,6 +607,22 @@ def _attach(name: str, address: str, text: str) -> str:
             tmux("kill-server")
         except (OSError, subprocess.SubprocessError):
             pass
+        # Ending the server hangs up the client; one that ignores the hang-up is ended too.
+        if group:
+            _end_group(group)
+
+
+def _end_group(group: int) -> None:
+    for _ in range(10):
+        try:
+            os.killpg(group, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def _wake(notes: Path, snapshot: Path) -> int:
@@ -707,6 +739,8 @@ def main() -> int:
     if args.command == "wake":
         if not args.number:
             parser.error("the tick's snapshot of the pull requests is required")
+        # A wake ended mid-attach still ends its pane, in the attach's `finally`.
+        signal.signal(signal.SIGTERM, lambda number, _frame: sys.exit(128 + number))
         return _wake(notes, Path(args.number))
     if args.command == "list":
         for path in _records(notes):
