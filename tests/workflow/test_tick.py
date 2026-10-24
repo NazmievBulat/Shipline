@@ -1,6 +1,8 @@
 """`tick` does, every few minutes, the part of the workflow that has one right answer."""
 
+import errno
 import fcntl
+import os
 from pathlib import Path
 
 import pytest
@@ -171,6 +173,36 @@ def test_a_small_or_a_busy_session_is_not_squeezed(
 
     assert done.returncode == 0, done.stderr
     assert _reclaimed(group) == ""
+
+
+def test_a_tick_whose_only_problem_is_a_partial_reclaim_succeeds(workflow: Workflow) -> None:
+    workflow.add_worktree(7)
+    group = workflow.running("ticket-7", held=301 * _MB)
+    _idle(workflow, "ticket-7")
+    workflow.refuse_write(group / "memory.reclaim", errno.EAGAIN)
+    # How a `dd` that is not GNU's words the same refusal.
+    workflow.fake(
+        "dd", '#!/bin/bash\ncat > /dev/null\necho "dd: IO error: Would block" >&2\nexit 1\n'
+    )
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stderr
+    assert done.stderr == ""
+    assert "ticket-7 squeezed: 301 MB held" in done.stdout
+    assert _reclaimed(group) == ""
+
+
+def test_a_tick_whose_squeeze_is_refused_for_another_reason_fails(workflow: Workflow) -> None:
+    workflow.add_worktree(7)
+    group = workflow.running("ticket-7", held=301 * _MB)
+    _idle(workflow, "ticket-7")
+    workflow.refuse_write(group / "memory.reclaim", errno.EACCES)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 1
+    assert f"{group}/memory.reclaim: {os.strerror(errno.EACCES)}" in done.stderr
 
 
 def test_a_session_whose_memory_cannot_be_read_is_not_squeezed(workflow: Workflow) -> None:
