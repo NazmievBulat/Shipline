@@ -44,6 +44,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `repository` | `owner/name` on GitHub | `repository` as Bash reads it from `.github/runner/settings.sh` (sourced in a `bash` of its own, with only `PATH` and `HOME`, for at most 5 seconds), else the `origin` remote on GitHub; a script that needs it stops when neither names one |
 | `state_folder` | the folder of the workflow's notes, in the main checkout and in each worktree | `.local/workflow` |
 | `worktree_setup` | the command that prepares a new worktree, run only when present | `scripts/setup-worktree` |
+| `commands.*` | the repository's own commands Shipline calls (below) | none |
 | `checks.ci_result` | the check that sums up CI | `CI result` |
 | `checks.ci_plan`, `checks.e2e_plan` | the planner checks of CI and of the browser suite | `CI: what to run`, `E2E: what to run` |
 | `checks.images` | the prefix of every image check; its planner is `<prefix>: what to run` | `Docker images` |
@@ -75,11 +76,42 @@ How a script reads it:
   ```
 
   which sets `SHIPLINE_REPOSITORY`, `SHIPLINE_STATE_FOLDER`, `SHIPLINE_CI_RESULT`,
-  `SHIPLINE_LABEL_WORKFLOW`, `SHIPLINE_PRIORITY_HIGH` and the rest, and `SHIPLINE_CONFIG`, the
-  file itself.
+  `SHIPLINE_LABEL_WORKFLOW`, `SHIPLINE_PRIORITY_HIGH` and the rest, `SHIPLINE_CONFIG`, the
+  file itself, and each command as an array of its words, `SHIPLINE_COMMAND_HUNT_APP` and the
+  others, empty when the repository names none.
 - jq includes `priority.jq`, which reads the label names from `SHIPLINE_CONFIG` in the
   environment (export it first) with the same defaults.
 - Node (`codex-bridge.mjs`) reads the state folder from the file with the same default.
 
 The machine-wide state, `~/.local/state/workflow`, is shared by every repository on one
 machine, as is its GitHub budget, and is not part of the file.
+
+## The repository's commands
+
+What only the repository knows (which tests a change reaches, how its application runs) it
+gives Shipline as commands, under `commands` in `shipline.json`. Each is a command line, split
+into words as the shell splits them, with nothing expanded. A first word with a `/` in it is a
+program in the repository's main checkout, whichever worktree runs it; a first word without
+one is found on the `PATH`. The command runs in the folder its caller is in, with the
+arguments below after its own words. A command the file leaves out is one the repository does
+not have, and Shipline does without it; a command it names but that cannot start stops the
+call. A session runs one as `shipline <command>`, the name with dashes
+(`shipline browser-tests-for-changes origin/main`).
+
+| Command | Called by, with | Answers | Without it |
+| --- | --- | --- | --- |
+| `browser_tests_for_changes` | the review panel in a conflict round, and sessions: `<base> [--files-from <file>]` and the session's own words | the browser specs the change reaches, one path a line | nothing is selected, and CI runs the whole browser suite |
+| `server_tests_for_changes` | the same: `<base> [--files-from <file>]` | one JSON object, `{"whole": bool, "tests": [paths], "total": int, "reasons": [str]}` | the whole server suite: `{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}` |
+| `pre_train_checks` | the merge gate, before a pull request joins the merge train, in its worktree | exits non-zero when a check failed; what it prints is shown | every pull request is admitted |
+| `mechanical_conflicts` | the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch | `resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line, or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took | every conflict is left to the session, nothing is renumbered and main took no number |
+| `browser_plan` | the merge gate: the changed paths on standard input, each ended by a NUL | exits 0 when the merge needs browser tests, 1 when not; anything else counts as needed | every merge that changes a file needs browser tests |
+| `hunt_app` | `session` when a hunt stops: `stop`; the hunter itself, by `shipline hunt-app` | | `session start hunt` refuses |
+| `hunt_browser` | the hunter, by `shipline hunt-browser`, which its sentence names | | the sentence names none |
+| `hunt_cursor` | `session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>` | what it prints is kept in the report folder's `cursor.log` | a Cursor hunt is refused |
+| `advisory_watch` | the merge gate: `unreachable` with a failed push's output, or a failed audit's annotations, on standard input; `answers <service>` | `unreachable` prints the advisory service the text says was unreachable, or nothing; `answers` exits 0 when the service answers again | no outage is read: a failed push is refused as it is |
+| `push_checkout` | the merge gate, before and after each push: `install <checkout>`; `refusal <checkout>` with the push's whole output on standard input | `install` installs what changed since its last install and exits non-zero with the reason when it failed, which is a wait; `refusal` prints the hook's failed step with its last lines | nothing is installed, and a failed push is refused with its last 10 lines |
+
+The merge gate keeps the outage an advisory watch found in its state folder:
+`advisory-service-down`, `{"service": ..., "since": "YYYY-MM-DD HH:MM UTC"}`, written by the
+first push of an outage and removed when a push succeeds or the tick finds the service
+answering, and `advisory-service.pending`, the line the wake tells once.

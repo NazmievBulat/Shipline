@@ -180,8 +180,8 @@ worker, reviewer and audit alike:
   nothing is built until the owner answers. A backend choice that is a product decision is
   asked in text, recommendation first.
   Any other choice is made and written into the pull request description.
-- Run the repository's fast pre-train checks from the pull request's worktree before marking
-  ready. They also run before a handoff or gate call admits it to the merge train; a failure
+- Run the repository's fast pre-train checks, `shipline pre-train-checks`, from the pull
+  request's worktree before marking ready. They also run before a handoff or gate call admits it to the merge train; a failure
   refuses admission. They supplement CI, which still runs its normal checks.
 - Run `scripts/workflow/weaker-tests --base <base> --working-tree` before marking ready.
   Explain each item in the description: why the change is correct and how the test still
@@ -190,7 +190,9 @@ worker, reviewer and audit alike:
 - Before a browser test run, `scripts/workflow/session protect ticket-N`; after it,
   `scripts/workflow/session unprotect ticket-N`.
 - To finish, run one round each of the test coverage reviewer and `codex review --base <base>`,
-  and test what was built, using the repository's local browser test selection. Fix the
+  and test what was built, using the repository's local browser test selection,
+  `shipline browser-tests-for-changes <base>`; when the repository configures none, it says
+  so, nothing is selected and CI runs the whole suite. Fix the
   findings and run
   one round on those fixes. Then mark ready and stop; the independent reviewer does the deep
   check. A job longer than this pull request
@@ -327,7 +329,8 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
    test. A gap in a task requirement or bug fix counts toward sending back; optional extra
    coverage does not. Judge coverage yourself too; run `codex review --base <base>` only
    when Codex did not build this pull request.
-   Test what was built with the repository's local browser test selection; use the browser
+   Test what was built with the repository's local browser test selection
+   (`shipline browser-tests-for-changes <base>`); use the browser
    by hand for
    screens, protecting `review-N` before and unprotecting it after the run.
 2. Read only earlier independent reviews for this pull request from
@@ -378,10 +381,8 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
   which passes only when
   each of them that ran passed. One listed as skipped while "CI: what to run" passed was not
   needed. The image check is every check whose name begins with "Docker images": "what to
-  run", the parts of the browser tests ("browser tests (1 of 3)" and on), the image tests
-  and the parts of the release tests. Each of them that ran must pass. One listed as
-  skipped while "Docker images: what to run" passed was not needed (the release tests of a
-  pull request that does not change the release setup), and is not waited for. The image
+  run" and the jobs it starts. Each of them that ran must pass. One listed as skipped while
+  "Docker images: what to run" passed was not needed, and is not waited for. The image
   check does not run for a draft: a pull request that changes what goes into the images lists
   all of them as skipped until it is marked ready, and then a new run starts. Those skipped
   checks are not a pass; the run that started after the pull request was marked ready is
@@ -406,8 +407,7 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
   `DIRTY`), when the pull request below it merged (the next point), or when `main` changed a
   file the branch changes or depends on, or the merge gate requires fresh CI on current main.
   Each such merge is a push, and on a pull request that
-  changes the images each push sends the image check to the back of the Docker runners'
-  queue. A ready pull request that merges `main` in because of a conflict says so in the
+  changes the images each push sends the image check to the back of its runners' queue. A ready pull request that merges `main` in because of a conflict says so in the
   commit message (`merge main: conflict in <files>`).
 - After the merge, for each pull request built on this one: set its base to `main` and merge
   `main` into its branch. Ask about a conflict that is not mechanical. A ready one labelled
@@ -436,7 +436,9 @@ Commit as `merge main: conflict in <files>` and push without force. Run the main
 `review-panel N`: it verifies that this is one merge of H and the recorded main, and gives
 the panel the diffs against both parents for F, with the task and earlier passed round.
 Read its completed reports, narrowed weaker-tests report and reached test selections. Run
-every selected server test and the local browser test selection, protecting `review-N`
+every selected server test (`server-tests.json`) and the local browser test selection
+(`browser-tests.txt`, empty when the repository configures none, and CI then runs the whole
+browser suite), protecting `review-N`
 before and unprotecting it after browser runs. The usual cap of three local browser test
 files and two workers still applies; CI runs the rest. For a changed screen, use the
 browser by hand too. The panel's local browser selection is limited to the files listed in
@@ -543,10 +545,10 @@ only at the front of the train. Expected waits keep the note; a gate refresh rec
 own pushed head. After a merge the tick records the stacked children, changes their bases
 to `main` and merges `main` into each clean branch worktree and pushes. It keeps the parent
 note until that work finishes, so a restart can continue after a base was changed.
-A conflict first gets a mechanical refresh in the kept worktree for recognized migration-chain
-or decision-record renumbering and separate additions to a Markdown list, with the relevant
-migration and decision-list checks before committing and pushing; success advances the note
-and keeps its train place.
+A conflict first gets a mechanical refresh in the kept worktree by the repository's configured
+conflict command, which resolves only the conflicts it recognizes and checks its own result
+before the gate commits and pushes; success advances the note and keeps its train place. A
+repository that configures none has no recognized conflict.
 A failed check, unrecognized conflict, unrelated head change or gate refusal needing judgment drops the
 note, revokes batch approval and requests one fresh reviewer. A child with its own session
 is left to that session; an unlabelled child keeps its orchestrator-managed audit path.
@@ -647,7 +649,9 @@ The orchestrator session does what needs judgment:
 - It starts a hunt when the owner asks for one:
   `scripts/workflow/session start hunt <name> [plan|explore] [claude|codex|cursor]`, the name saying
   what the hunt is (`plan-phone-2`). One hunt runs at a time, and the script refuses a second:
-  each runs a browser and a copy of the application. To compare hunter programs it runs the
+  each runs a browser and a copy of the application. The copy is run by the repository's
+  configured hunt command, and a Cursor hunter is its configured one too; without them the
+  script refuses the hunt in a sentence. To compare hunter programs it runs the
   same kind of hunt once with each, one after the other.
 - When a hunt has ended, it reads the report in `.local/hunts/<name>` of the main checkout.
   A Codex or Cursor hunter's report it publishes as a document with the pictures; a Claude Code hunter
