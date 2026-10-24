@@ -1,13 +1,14 @@
 """The runner programs' own GitHub identity, so their requests leave the owner's budget alone.
 
 The spare supervisor, runner registration, the lender, the slot helper and the installer use it
-when `~/.config/example-app-runner` (mode 700) holds one of these, each file mode 600:
+when its folder (mode 700) holds one of these, each file mode 600:
 
 - `token`: a fine-grained personal access token of a second account of the organization;
 - `app-id`, `app-key.pem` and `installation-id`: a GitHub App installed on the repository. Its
   installation token lasts an hour; it is made from the key when needed and kept in
   `installation-token.json` until ten minutes before its end.
 
+The folder is `runner.identity_folder` of `shipline.json`, `~/.config/shipline-runner` by default.
 Without either they use the gh login, as before. `install` checks a new identity against GitHub
 before it replaces the old one. No token is printed or logged.
 """
@@ -68,7 +69,12 @@ class IdentityError(Exception):
 
 
 def folder() -> Path:
-    return Path.home() / ".config/example-app-runner"
+    try:
+        import workflow_config
+    except ImportError:
+        # The runner install's copy has no config reader beside it, and keeps the default.
+        return Path.home() / ".config/shipline-runner"
+    return workflow_config.current().runner.identity_path
 
 
 def configured() -> bool:
@@ -337,14 +343,25 @@ def main() -> None:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     installing = commands.add_parser("install")
-    installing.add_argument("--repository", required=True)
+    installing.add_argument(
+        "--repository", help="owner/name; by default the repository of shipline.json"
+    )
     kind = installing.add_mutually_exclusive_group(required=True)
     kind.add_argument("--token", type=Path, help="a file holding a fine-grained token")
     kind.add_argument("--app", nargs=2, metavar=("APP_ID", "KEY_FILE"))
     arguments = parser.parse_args()
+    repository = arguments.repository
+    if repository is None:
+        import workflow_config
+
+        try:
+            repository = workflow_config.current().repository
+        except workflow_config.ConfigError as error:
+            print(f"The runners' GitHub identity was not changed: {error}", file=sys.stderr)
+            sys.exit(1)
     try:
         made = install(
-            arguments.repository,
+            repository,
             token_file=arguments.token,
             app=(arguments.app[0], Path(arguments.app[1])) if arguments.app else None,
         )
