@@ -3,4 +3,4 @@ Description=Empty the Docker Hub cache for CI virtual machines when it holds mor
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/share/example-app-runner/hub-cache.sh watch
+ExecStart=%h/.local/share/@PREFIX@-runner/hub-cache.sh watch

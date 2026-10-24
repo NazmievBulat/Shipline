@@ -2,8 +2,8 @@
 Description=CI runner reserved for main (a fresh container for each job)
 
 [Service]
-ExecStart=%h/.local/share/example-app-runner/keep-runner.sh 2 main
-ExecStopPost=-/usr/bin/docker rm -f example-app-runner-main-2
+ExecStart=%h/.local/share/@PREFIX@-runner/keep-runner.sh 2 main
+ExecStopPost=-/usr/bin/docker rm -f @PREFIX@-runner-main-2
 Restart=always
 RestartSec=30
 

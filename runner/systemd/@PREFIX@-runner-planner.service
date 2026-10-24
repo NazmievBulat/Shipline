@@ -1,9 +1,9 @@
 [Unit]
-Description=One small isolated CI planner for example-app
+Description=One small isolated CI planner for @PREFIX@
 
 [Service]
-ExecStart=%h/.local/share/example-app-runner/keep-planner.sh
-ExecStopPost=-/usr/bin/docker rm -f example-app-runner-planner
+ExecStart=%h/.local/share/@PREFIX@-runner/keep-planner.sh
+ExecStopPost=-/usr/bin/docker rm -f @PREFIX@-runner-planner
 Restart=always
 RestartSec=30
 

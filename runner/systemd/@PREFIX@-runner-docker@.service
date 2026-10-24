@@ -1,9 +1,9 @@
 [Unit]
-Description=CI runner %i for example-app jobs that need Docker (a fresh virtual machine for each job)
+Description=CI runner %i for @PREFIX@ jobs that need Docker (a fresh virtual machine for each job)
 
 [Service]
-ExecStart=%h/.local/share/example-app-runner/keep-runner.sh %i docker
-ExecStopPost=-/usr/bin/docker rm -f example-app-runner-docker-%i
+ExecStart=%h/.local/share/@PREFIX@-runner/keep-runner.sh %i docker
+ExecStopPost=-/usr/bin/docker rm -f @PREFIX@-runner-docker-%i
 Restart=always
 RestartSec=30
 

@@ -1,10 +1,9 @@
 [Unit]
-Description=Builds the example-app runner images every week
+Description=Weekly rebuild of the example-app CI runner images (GitHub refuses runners that fall far behind)
 
 [Timer]
 OnCalendar=weekly
 Persistent=true
-RandomizedDelaySec=1h
 
 [Install]
 WantedBy=timers.target

@@ -1,17 +1,10 @@
-# The lender: while main has no job, lends main's runners to pull request jobs, the merge
-# train's first member's first (`<label>-first`), and takes them back when main needs them.
 [Unit]
-Description=example-app runner lender
-After=network-online.target
-Wants=network-online.target
+Description=Lend an idle runner of main to example-app PR jobs, the merge train's first member first
 
 [Service]
-User=example-app-runner
-WorkingDirectory=/var/lib/example-app-runner
-ExecStart=/usr/bin/python3 /opt/example-app-runner/lend_runners.py
+ExecStart=/bin/sh %h/.local/share/example-app-runner/keep-lending.sh
 Restart=always
 RestartSec=30
-NoNewPrivileges=true
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

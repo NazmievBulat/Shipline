@@ -1,5 +1,5 @@
 [Unit]
-Description=Weekly rebuild of the example-app CI runner images (GitHub refuses runners that fall far behind)
+Description=Weekly rebuild of the @PREFIX@ CI runner images (GitHub refuses runners that fall far behind)
 
 [Timer]
 OnCalendar=weekly

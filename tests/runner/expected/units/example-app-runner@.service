@@ -1,21 +1,11 @@
-# One ordinary runner of the pool, slot %i: a container of the image example-app-runner, named
-# `<machine>-%i`. Every machine's runners carry the same labels, so GitHub gives a job to
-# whichever machine has one free.
 [Unit]
-Description=example-app ordinary runner %i
-Requires=docker.service example-app-runner-network.service
-After=docker.service example-app-runner-network.service example-app-runner-hub-cache.service
-Wants=example-app-runner-hub-cache.service
+Description=CI runner %i for example-app (a fresh container for each job)
 
 [Service]
-User=example-app-runner
-WorkingDirectory=/var/lib/example-app-runner
-ExecStart=/opt/example-app-runner/start-runner.sh ordinary %i
+ExecStart=%h/.local/share/example-app-runner/keep-runner.sh %i
+ExecStopPost=-/usr/bin/docker rm -f example-app-runner-%i
 Restart=always
-RestartSec=10
-# A job that is running is given its time to end before the container goes.
-TimeoutStopSec=330
-KillMode=mixed
+RestartSec=30
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
