@@ -1,10 +1,6 @@
-# One sample of what the pool's runners use, written for the usage report.
 [Unit]
-Description=example-app runner usage sample
+Description=Write one line of the memory, swap, CPU pressure and busy runners of this CI machine
 
 [Service]
 Type=oneshot
-User=example-app-runner
-WorkingDirectory=/var/lib/example-app-runner
-ExecStart=/opt/example-app-runner/sample-usage.sh
-NoNewPrivileges=true
+ExecStart=/bin/sh %h/.local/share/example-app-runner/sample-usage.sh

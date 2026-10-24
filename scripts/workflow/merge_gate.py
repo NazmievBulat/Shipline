@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,15 @@ CONFIG = workflow_config.current()
 REPOSITORY = CONFIG.repository
 API = CONFIG.api
 HERE = Path(__file__).resolve().parent
+# How a line names `notify waiting`: by the launcher's absolute path, which a session started
+# before the switch, with neither on its PATH, runs as well; a copy of the scripts in a
+# repository's tree, which has no launcher, by its path there.
+LAUNCHER = HERE.parents[1] / "bin" / "shipline"
+NOTIFY_WAITING = (
+    f"{shlex.quote(str(LAUNCHER))} notify waiting"
+    if LAUNCHER.is_file()
+    else "scripts/workflow/notify waiting"
+)
 # The gate owns these branches: each holds one batch's test merge, never a pull request.
 SCRATCH_PREFIX = CONFIG.merge.scratch_prefix
 E2E_PLAN = CONFIG.checks.e2e_plan
@@ -1983,7 +1993,7 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
 def publish_first(number: str | None, batch: dict[str, Any] | None) -> None:
     """Tell the runners' lender which pull request is first, and the branch its batch is tested
     on: their CI and browser jobs get a runner before other pull requests' jobs
-    (.github/runner/lend_runners.py). The train is never held up for this note."""
+    (runner/lend_runners.py). The train is never held up for this note."""
     path = Path.home() / ".local/state/workflow/train-first.json"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -4130,7 +4140,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             reason = f"behind {train.first}" if train.first else "for main to change"
             print(
                 f"merge train: pull request {number} waits {reason}; "
-                "run shipline notify waiting and end the turn; the tick wakes you",
+                f"run {NOTIFY_WAITING} and end the turn; the tick wakes you",
                 flush=True,
             )
             command("bash", str(HERE / "notify"), "waiting")

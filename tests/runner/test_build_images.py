@@ -1,8 +1,10 @@
-"""`runner/build-images.sh` builds the runner images: the install runs it, and so does a weekly
-timer, because GitHub refuses runners that fall far behind. The repository's own command
-(`runner.image_build`) builds them when it names one; else the pool builds its own Dockerfile,
-and its virtual machine's only on a machine with /dev/kvm."""
+"""The repository builds the runner images and runs the Docker Hub cache with commands of its own,
+`runner.image_build` and `runner.hub_cache` of its shipline.json, and Shipline's
+`runner/build-images.sh` and `runner/hub-cache.sh` run them: the install and a weekly timer the
+first, the cache's units the second. Both the command and its files are main's as last fetched,
+never what the checkout holds."""
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -10,40 +12,55 @@ from pathlib import Path
 import pytest
 
 _RUNNER = Path(__file__).resolve().parents[2] / "runner"
-_BUILD = _RUNNER / "build-images.sh"
+
+_GIT_ENV = {
+    "PATH": os.environ["PATH"],
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_AUTHOR_NAME": "Tester",
+    "GIT_AUTHOR_EMAIL": "tester@example.com",
+    "GIT_COMMITTER_NAME": "Tester",
+    "GIT_COMMITTER_EMAIL": "tester@example.com",
+}
+
+
+def _git(checkout: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=checkout, env=_GIT_ENV, capture_output=True, check=True)
 
 
 @pytest.fixture
 def machine(tmp_path: Path) -> Path:
-    """A folder with a stand-in `docker` that writes down each call, and a checkout to run in."""
-    bin_folder = tmp_path / "bin"
-    bin_folder.mkdir()
-    docker = bin_folder / "docker"
-    docker.write_text(
-        "#!/bin/bash\n"
-        f"echo \"docker $*\" >> '{tmp_path}/calls.log'\n"
-        f"[[ ! -e '{tmp_path}/fail' ]]\n"
-    )
-    docker.chmod(0o755)
-    (tmp_path / "checkout").mkdir()
+    """A home folder and the repository's main checkout, with no main yet."""
+    (tmp_path / "home").mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _git(checkout, "init", "--quiet", "--initial-branch=main")
     return tmp_path
 
 
-def _build(
-    machine: Path, *, kvm: bool, prefix: str = "example-app", command: str | None = None
+def _main(machine: Path, runner: dict[str, str], files: dict[str, str] | None = None) -> None:
+    """Commit a shipline.json naming `runner`, and `files`, as main, as last fetched from origin."""
+    checkout = machine / "checkout"
+    config = {"runner": {"prefix": "example-app", **runner}}
+    for name, text in {"shipline.json": json.dumps(config), **(files or {})}.items():
+        (checkout / name).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / name).write_text(text)
+    _git(checkout, "add", "--all")
+    _git(checkout, "commit", "--quiet", "-m", "main")
+    _git(checkout, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+
+def _run(
+    machine: Path, script: str, *args: str, prefix: str = "example-app"
 ) -> subprocess.CompletedProcess[str]:
-    if kvm:
-        (machine / "kvm").touch()
     env = {
-        "PATH": f"{machine / 'bin'}:{os.environ['PATH']}",
-        "HOME": "/nonexistent",
+        **_GIT_ENV,
+        "HOME": str(machine / "home"),
         "RUNNER_PREFIX": prefix,
-        "RUNNER_KVM": str(machine / "kvm"),
+        "BUILT": str(machine / "built"),
     }
-    if command is not None:
-        env["SHIPLINE_RUNNER_IMAGE_BUILD"] = command
     return subprocess.run(
-        ["bash", str(_BUILD)],
+        ["bash", str(_RUNNER / script), *args],
         cwd=machine / "checkout",
         env=env,
         capture_output=True,
@@ -52,58 +69,90 @@ def _build(
     )
 
 
-def _calls(machine: Path) -> list[str]:
-    log = machine / "calls.log"
-    return log.read_text().splitlines() if log.exists() else []
+_SHOW = 'printf "%s|%s|%s|%s\\n" "$RUNNER_PREFIX" "$RUNNER_FILES" "$(cat marker)" "$*" >> "$BUILT"'
 
 
-def test_with_kvm_the_pool_builds_its_ordinary_image_then_its_docker_image(machine: Path) -> None:
-    done = _build(machine, kvm=True)
+def test_the_repository_s_image_command_builds_them_on_main_s_files(machine: Path) -> None:
+    _main(machine, {"image_build": _SHOW}, {"marker": "main's"})
+
+    done = _run(machine, "build-images.sh")
 
     assert done.returncode == 0, done.stderr
-    assert _calls(machine) == [
-        f"docker build --pull -t example-app-runner {_RUNNER}",
-        f"docker build --pull -t example-app-runner-docker {_RUNNER / 'vm'}",
+    assert (machine / "built").read_text() == f"example-app|{_RUNNER}|main's|\n"
+
+
+def test_what_the_checkout_holds_beside_main_never_runs(machine: Path) -> None:
+    """The checkout may hold another branch, a fork's pull request among them: the build still
+    takes main's command and main's files, and leaves the checkout as it was."""
+    _main(machine, {"image_build": 'cat marker > "$BUILT"'}, {"marker": "main's\n"})
+    checkout = machine / "checkout"
+    fork = {"runner": {"prefix": "example-app", "image_build": 'echo fork > "$BUILT"; touch ran'}}
+    (checkout / "shipline.json").write_text(json.dumps(fork))
+    (checkout / "marker").write_text("the fork's\n")
+
+    done = _run(machine, "build-images.sh")
+
+    assert done.returncode == 0, done.stderr
+    assert (machine / "built").read_text() == "main's\n"
+    assert not (checkout / "ran").exists()
+    assert (checkout / "marker").read_text() == "the fork's\n"
+
+
+def test_a_failing_image_command_fails_the_build(machine: Path) -> None:
+    _main(machine, {"image_build": "exit 3"})
+
+    assert _run(machine, "build-images.sh").returncode == 3
+
+
+def test_without_an_image_command_nothing_is_built_and_it_says_so(machine: Path) -> None:
+    _main(machine, {})
+
+    done = _run(machine, "build-images.sh")
+
+    assert done.returncode != 0
+    assert "runner.image_build" in done.stderr
+
+
+def test_without_main_nothing_runs(machine: Path) -> None:
+    done = _run(machine, "build-images.sh")
+
+    assert done.returncode != 0
+    assert "origin/main" in done.stderr
+
+
+def test_the_hub_cache_command_runs_on_main_s_files_with_its_arguments(machine: Path) -> None:
+    show = (
+        'printf "%s %s %s %s:%s %s\\n" "$*" "$HUB_CACHE_CONTAINER" "$HUB_CACHE_NETWORK" '
+        '"$HUB_CACHE_ADDRESS" "$HUB_CACHE_PORT" "$(cat marker)" >> "$BUILT"\n'
+    )
+    # The arguments go after the command line, as `commands.test`'s do.
+    _main(machine, {"hub_cache": "sh tools/cache"}, {"marker": "main's", "tools/cache": show})
+
+    assert _run(machine, "hub-cache.sh").returncode == 0
+    done = _run(machine, "hub-cache.sh", "watch")
+
+    assert done.returncode == 0, done.stderr
+    assert (machine / "built").read_text().splitlines() == [
+        " example-app-hub-cache example-app-hub-cache 172.31.255.2:5000 main's",
+        "watch example-app-hub-cache example-app-hub-cache 172.31.255.2:5000 main's",
     ]
 
 
-def test_without_kvm_only_the_ordinary_image_is_built(machine: Path) -> None:
-    done = _build(machine, kvm=False)
+def test_without_a_hub_cache_command_there_is_no_cache(machine: Path) -> None:
+    _main(machine, {})
 
-    assert done.returncode == 0, done.stderr
-    assert _calls(machine) == [f"docker build --pull -t example-app-runner {_RUNNER}"]
-
-
-def test_a_failed_build_stops_and_says_so(machine: Path) -> None:
-    (machine / "fail").touch()
-
-    done = _build(machine, kvm=True)
+    done = _run(machine, "hub-cache.sh")
 
     assert done.returncode != 0
-    assert _calls(machine) == [f"docker build --pull -t example-app-runner {_RUNNER}"]
-
-
-def test_the_repository_s_own_command_builds_them_from_its_checkout(machine: Path) -> None:
-    command = "printf '%s %s\\n' \"$RUNNER_PREFIX\" \"$PWD\" > built; echo 'one word' >> built"
-
-    done = _build(machine, kvm=True, command=command)
-
-    assert done.returncode == 0, done.stderr
-    built = (machine / "checkout/built").read_text().splitlines()
-    assert built == [f"example-app {machine / 'checkout'}", "one word"]
-    assert _calls(machine) == []
-
-
-def test_the_repository_s_failing_command_fails_the_build(machine: Path) -> None:
-    done = _build(machine, kvm=False, command="exit 3")
-
-    assert done.returncode == 3
+    assert "runner.hub_cache" in done.stderr
 
 
 @pytest.mark.parametrize("prefix", ["", "Example", "a b", "a;b"])
 def test_a_prefix_that_cannot_name_an_image_is_refused(machine: Path, prefix: str) -> None:
-    done = _build(machine, kvm=True, prefix=prefix)
+    _main(machine, {"image_build": 'touch "$BUILT"'})
+
+    done = _run(machine, "build-images.sh", prefix=prefix)
 
     assert done.returncode != 0
-    assert "RUNNER_PREFIX" in done.stderr
-    assert _calls(machine) == []
+    assert "prefix" in done.stderr
+    assert not (machine / "built").exists()

@@ -1,15 +1,9 @@
-# Builds the runner images again: GitHub refuses runners that fall far behind its own version.
-# The install writes the checkout link and images.env; the build runs from the repository's main
-# checkout, with the repository's own command when its shipline.json names one.
 [Unit]
-Description=example-app runner images build
-Requires=docker.service
-After=docker.service network-online.target
-Wants=network-online.target
+Description=Rebuild the example-app CI runner images on the newest runner from GitHub
 
 [Service]
 Type=oneshot
-User=example-app-runner
-WorkingDirectory=/var/lib/example-app-runner/checkout
-EnvironmentFile=/var/lib/example-app-runner/images.env
-ExecStart=/opt/example-app-runner/build-images.sh
+ExecStart=%h/.local/share/example-app-runner/build-images.sh
+# Waiting runners hold containers of the old images, so they start again on the new ones. A job
+# that happens to run at that moment is cut off and has to be run again.
+ExecStartPost=/usr/bin/systemctl --user try-restart example-app-runner-main.service example-app-runner-main-2.service example-app-runner-planner.service example-app-runner@*.service example-app-runner-docker@*.service

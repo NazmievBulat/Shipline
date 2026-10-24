@@ -21,7 +21,9 @@
 name: E2E
 
 on:
+  # A draft runs no browser tests: marking it ready starts its run on the current head.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   # The merge gate runs the whole browser suite on a scratch branch of its own with
@@ -34,15 +36,18 @@ permissions:
   contents: read
 
 # A pull request's newer push cancels its older run. Every commit of main and every scratch run
-# keeps its own: the merge gate reads each of them.
+# keeps its own: the merge gate reads each of them. A draft's runs have a group of their own, so
+# the run of a last push to a draft never cancels the run of its marking ready.
 concurrency:
-  group: e2e-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  group: e2e-${{ github.event_name }}-${{ github.event_name == 'pull_request' && format('{0}-draft-{1}', github.ref, github.event.pull_request.draft) || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   plan:
     # The gate reads its notes from this job alone (`checks.e2e_plan`).
     name: "E2E: what to run"
+    # Skipped while the pull request is a draft; the browser job is skipped by its own check.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: >-
       ${{ vars.CI_MAIN_RUNNER == 'on' && (github.event_name == 'push' && github.ref == 'refs/heads/main'
       || github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-'))
@@ -81,7 +86,10 @@ jobs:
     # The gate's name for the job that runs the browser suite.
     name: playwright
     needs: plan
-    if: ${{ !contains(fromJSON(needs.plan.outputs.inherited), 'playwright') }}
+    # Skipped while the pull request is a draft, and on main when main inherited it.
+    if: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+      && !contains(fromJSON(needs.plan.outputs.inherited), 'playwright') }}
     runs-on: >-
       ${{ vars.CI_MAIN_RUNNER == 'on' && (github.event_name == 'push' && github.ref == 'refs/heads/main'
       || github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-'))

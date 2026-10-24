@@ -24,7 +24,8 @@ trap 'exit 130' INT TERM
 
 while true; do
   python3 "$here/github_budget.py" wait --identity runner keep-spare
-  slots=$(python3 "$here/ordinary_slots.py" "$ordinary_jobs" "$ordinary_blacksmith_jobs" "$repository")
+  slots=$(python3 "$here/ordinary_slots.py" "$ordinary_jobs" "$ordinary_blacksmith_jobs" "$repository" \
+    "$label")
   # Count every registration with the workflow label, even one we did not create, but not those of
   # another machine (names.sh): each machine has slots of its own. Nor one of main's runners lent
   # to PR jobs (lend_runners.py): that is no PR slot. An offline runner may return; a busy runner

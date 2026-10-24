@@ -1,21 +1,11 @@
-# One Docker-capable runner, slot %i: a virtual machine of the image example-app-runner-docker, for
-# the jobs that run Docker themselves, labelled with this machine's Docker label. Only on a
-# machine that has /dev/kvm.
 [Unit]
-Description=example-app Docker runner %i
-ConditionPathExists=/dev/kvm
-Requires=docker.service example-app-runner-network.service
-After=docker.service example-app-runner-network.service example-app-runner-hub-cache.service
-Wants=example-app-runner-hub-cache.service
+Description=CI runner %i for example-app jobs that need Docker (a fresh virtual machine for each job)
 
 [Service]
-User=example-app-runner
-WorkingDirectory=/var/lib/example-app-runner
-ExecStart=/opt/example-app-runner/start-runner.sh docker %i
+ExecStart=%h/.local/share/example-app-runner/keep-runner.sh %i docker
+ExecStopPost=-/usr/bin/docker rm -f example-app-runner-docker-%i
 Restart=always
-RestartSec=10
-TimeoutStopSec=330
-KillMode=mixed
+RestartSec=30
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

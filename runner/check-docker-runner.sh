@@ -14,11 +14,15 @@
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/settings.sh"
+if [ -f "$here/pool-settings.sh" ]; then
+  . "$here/pool-settings.sh"
+fi
+. "$here/names.sh"
 . "$here/runner-container.sh"
 
-name=example-app-runner-docker-check
+name=$container-docker-check
 neighbour=$network-check-neighbour
-cache=example-app-hub-cache
+cache=$hub_cache_container
 cache_other_port=$((hub_cache_port + 1))
 cache_listens=
 work=$(mktemp -d)
@@ -180,6 +184,6 @@ if [ "$failed" -eq 0 ]; then
   echo "The Docker-capable runner is shut in."
 else
   echo "The Docker-capable runner is NOT shut in. Stop it until this is understood:"
-  echo "  systemctl --user stop 'example-app-runner-docker@*'"
+  echo "  systemctl --user stop '$container-docker@*'"
   exit 1
 fi

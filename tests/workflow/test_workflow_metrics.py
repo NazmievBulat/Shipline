@@ -497,8 +497,9 @@ def test_a_sample_reads_the_runner_pool_s_services_and_containers_by_its_prefix(
     system = workflow.cgroup_root / "system.slice"
     for folder, used in (
         (app / "example-app-runner-keep-slots.service", 10),
-        (system / "example-app-runner-1.service", 20),
-        (system / "docker-1.scope/example-app-runner-docker-2.scope", 30),
+        (system / "example-app-runner@1.service", 20),
+        (system / "example-app-runner-docker@2.service", 30),
+        (system / "docker-1.scope/example-app-runner-hub-cache.scope", 5),
         # The repository's own services share the prefix, but are not the pool's.
         (app / "example-app-web.service", 40),
         (app / "example-app.service", 50),
@@ -513,8 +514,9 @@ def test_a_sample_reads_the_runner_pool_s_services_and_containers_by_its_prefix(
     [sample] = [json.loads(line) for line in machine.read_text().splitlines()]
     assert sample["groups"] == {
         "example-app-runner-keep-slots": 10,
-        "example-app-runner-1": 20,
-        "example-app-runner-docker-2": 30,
+        "example-app-runner@1": 20,
+        "example-app-runner-docker@2": 30,
+        "example-app-runner-hub-cache": 5,
     }
 
 

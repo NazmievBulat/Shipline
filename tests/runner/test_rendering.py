@@ -1,5 +1,5 @@
 """One prefix names the whole runner pool: `runner/render-units.sh` writes the systemd units from
-their templates in `runner/units/` and prints the pool's names, and for the prefix `example-app`
+their templates in `runner/systemd/` and prints the pool's names (`runner/names.sh`), and for the prefix `example-app`
 they are the files under `tests/runner/expected/`. Nothing but the prefix varies."""
 
 import importlib.util
@@ -13,7 +13,7 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[2]
 _RUNNER = _ROOT / "runner"
 _RENDER = _RUNNER / "render-units.sh"
-_TEMPLATES = _RUNNER / "units"
+_TEMPLATES = _RUNNER / "systemd"
 _EXPECTED = Path(__file__).resolve().parent / "expected"
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -77,7 +77,9 @@ def test_every_unit_is_named_by_the_prefix_and_names_no_one_s_home(tmp_path: Pat
     assert _run(str(tmp_path)).returncode == 0
 
     for name, text in _files(tmp_path).items():
-        assert re.fullmatch(r"example-app-runner(?:-[a-z-]+)?@?\.(?:service|timer)", name)
+        assert re.fullmatch(
+            r"example-app-(?:runner|hub-cache)(?:-[a-z0-9-]+)?@?\.(?:service|timer)", name
+        ), name
         assert "/home/" not in text and "~" not in text, name
 
 
@@ -103,16 +105,28 @@ def test_without_a_prefix_nothing_is_written(tmp_path: Path) -> None:
 
 
 def test_the_labels_are_the_ones_the_merge_gate_reads() -> None:
-    done = _run("--labels", "home", "office")
+    done = _run("--labels")
 
     assert done.returncode == 0, done.stderr
-    assert tuple(done.stdout.splitlines()) == workflow_config.runner_labels(
-        "example-app", ["home", "office"]
+    assert tuple(done.stdout.splitlines()) == workflow_config.runner_labels("example-app-home")
+
+
+def test_a_named_label_builds_the_labels() -> None:
+    env = {**_ENV, "RUNNER_PREFIX": "example-app", "RUNNER_LABEL": "example-pool"}
+    done = subprocess.run(
+        ["bash", str(_RENDER), "--labels"], env=env, capture_output=True, text=True, check=False
     )
 
+    assert tuple(done.stdout.splitlines()) == workflow_config.runner_labels("example-pool")
 
-def test_a_machine_name_that_cannot_name_a_label_is_refused() -> None:
-    done = _run("--labels", "home", "../office")
+
+@pytest.mark.parametrize("label", ["Example", "a b", "a/b", "-a"])
+def test_a_label_that_is_not_a_plain_name_is_refused(label: str) -> None:
+    env = {**_ENV, "RUNNER_PREFIX": "example-app", "RUNNER_LABEL": label}
+    done = subprocess.run(
+        ["bash", str(_RENDER), "--labels"], env=env, capture_output=True, text=True, check=False
+    )
 
     assert done.returncode != 0
+    assert "RUNNER_LABEL" in done.stderr
     assert done.stdout == ""

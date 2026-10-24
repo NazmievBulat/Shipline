@@ -34,7 +34,7 @@ MAIN = [
         labels=(),
         identity_folder="",
         prefix=_EXAMPLE_RUNNER["prefix"],
-        label=workflow_config.home_label(_EXAMPLE_RUNNER["prefix"]),
+        label=_EXAMPLE_RUNNER["label"],
     ).main_label,
 ]
 
