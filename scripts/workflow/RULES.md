@@ -73,6 +73,16 @@ job the pull request skipped, which main always runs, waits for main's own succe
 nothing merges meanwhile, so no later push cancels that run. The squash commit carries the
 gate's proof (a `Workflow-Proof` line): main's CI and E2E skip a job that line shows passed,
 whole, on the identical tree, and name the run they inherited.
+`checks.prefix_only` in `shipline.json` lists the groups `images` (the image workflow's jobs),
+`browser_whole` (E2E's `playwright` job) and `server_whole` (CI's `CI: server tests` job).
+For a listed group, a pull request's ready, push and refresh runs keep the fast checks and
+the tests selected by its change; the whole group runs only on its prefix or, for a first
+member merging alone, the gate's scratch branch. The gate waits for that scratch proof,
+records it in the squash and lets main inherit it on the identical tree, including image jobs.
+A group the path filters need none of runs nowhere; an absent or empty list keeps the usual
+checks. The wake reports the previous UTC day's runner minutes saved once a day: each
+merged pull request's proven scratch group job minutes times its own CI runs whose planner
+recorded that group as deferred, with reruns of the same run counted once.
 Main's other checks still run, and any failure makes main red as before. A push to main the
 gate did not make runs everything. A different tree waits for main's own checks, then the
 gate is called again; a stale pull request is refreshed meanwhile. The tick reports a red, advisory or unreadable main in the
@@ -99,7 +109,8 @@ grows by one after each merge and halves after a failed prefix, never below 1 an
 `scripts/workflow/merge_gate.py`). A member merges as soon as its own prefix passed and every
 member ahead of it merged; its squash must match its prefix's tree, and main inherits that
 prefix's green result. A first member whose own CI tested its merge with the current main
-merges by its own checks and needs no prefix. Each member must still have a passed review
+merges by its own checks; any listed `checks.prefix_only` groups must first pass on its
+prefix or the gate's scratch run. Each member must still have a passed review
 and a gate call on its current head. A member whose prefix failed once every member ahead of
 it merged is blocked as a failed check, and its own gate call reports it; the prefixes behind
 it hold its change, so they are built again from the new front without it, and their failure

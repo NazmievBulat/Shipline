@@ -106,7 +106,7 @@ WORKFLOW_FILES = {
     "images": CONFIG.workflows.images,
 }
 # What a dispatched whole-suite run is called in the gate's words, by its workflow.
-WHOLE = {"e2e": "the whole browser suite", "ci": "every server test"}
+WHOLE = {"e2e": "the whole browser suite", "ci": "every server test", "images": IMAGES}
 SQUASH_ATTEMPTS = 3
 SQUASH_RETRY_SECONDS = 10
 # A scratch push that fails waits for the next call; a hook that keeps refusing for a reason
@@ -1875,7 +1875,19 @@ def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: s
 def _proves_whole(
     workflow: str, run: dict[str, Any], parts: list[dict[str, Any]], record: dict[str, Any]
 ) -> bool:
+    if workflow == "images":
+        return (
+            workflow_verdict(workflow, run, parts)[0] == "green"
+            and (NOTES.files_tested, record["tree"]) in _planner_notes(parts, IMAGES_PLAN)
+            and any(job["name"] != IMAGES_PLAN and job.get("conclusion") == "success"
+                    and CONFIG.checks.groups()["images"].contains(job["name"])
+                    for job in parts)
+        )
     if workflow == "ci":
+        if "server_whole" in CONFIG.checks.prefix_only and {
+            (NOTES.merge_tested, record["head"]), (NOTES.server_tests, "none")
+        } <= _planner_notes(parts, CI_PLAN):
+            return verdict(run, parts)[0] == "green"
         return whole_server_tests(run, parts, record["head"])
     return whole_suite(run, parts, record["tree"])
 
@@ -2069,7 +2081,7 @@ def lost_check(
     seen = {str(run["id"]): run for run in known or []}
     # Every check that cannot be lost is ruled out before any run is read.
     waiting = []
-    for check in pull["statusCheckRollup"]:
+    for check in own_checks(pull):
         if _passing_check(check) or (failed and _completed_check(check)):
             continue
         if check.get("__typename") == "StatusContext" or check.get("status") == "COMPLETED":
@@ -2215,10 +2227,18 @@ def _lender_cancelled_check(check: dict[str, Any], head: str | None) -> bool:
     )
 
 
+def own_checks(pull: dict[str, Any]) -> list[dict[str, Any]]:
+    """Selected tests still decide the PR; deferred image jobs decide only its scratch run."""
+    return [check for check in pull["statusCheckRollup"] if not (
+        "images" in CONFIG.checks.prefix_only
+        and (check.get("name", "") == IMAGES or check.get("name", "").startswith(IMAGES + ":"))
+    )]
+
+
 def _failed_rollup(pull: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         check
-        for check in pull["statusCheckRollup"]
+        for check in own_checks(pull)
         if (
             check.get("conclusion")
             in ("FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE")
@@ -2240,7 +2260,9 @@ def conflicting(pull: dict[str, Any]) -> bool:
     return pull["mergeable"] == "CONFLICTING" or pull["mergeStateStatus"] == "DIRTY"
 
 
-def fix_evidence(pull: dict[str, Any], base: str, health: Health) -> str | None:
+def fix_evidence(
+    pull: dict[str, Any], base: str, health: Health, suite: dict[str, Any] | None = None
+) -> str | None:
     """What a judgment of `proves_main_fix` rests on, or None when its CI has not passed.
 
     The tick reconciles every 3 minutes and each proof costs several GitHub requests from
@@ -2254,9 +2276,17 @@ def fix_evidence(pull: dict[str, Any], base: str, health: Health) -> str | None:
     checks = sorted(
         json.dumps(check, sort_keys=True, default=str) for check in pull["statusCheckRollup"]
     )
-    return hashlib.sha256(
-        json.dumps([pull["headRefOid"], base, sorted(health.failing), checks]).encode()
-    ).hexdigest()
+    evidence: list[Any] = [pull["headRefOid"], base, sorted(health.failing), checks]
+    if CONFIG.checks.prefix_only:
+        # Scratch checks finish independently of the PR rollup. A new attempt can also
+        # withdraw a previously proven fix, so both successful and failed judgments expire.
+        scratch = [
+            [workflow, run["id"], run.get("run_attempt", 1), run["status"], run.get("conclusion")]
+            for workflow in _suite_workflows(suite)
+            for run in _batch_runs(suite, workflow)
+        ] if suite else []
+        evidence += [CONFIG.checks.prefix_only, suite, scratch]
+    return hashlib.sha256(json.dumps(evidence).encode()).hexdigest()
 
 
 def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
@@ -2278,6 +2308,22 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
         passed = {job["name"] for job in strict_jobs(parts) if job.get("conclusion") == "success"}
         if set(health.failing) <= passed:
             return True
+        if CONFIG.checks.prefix_only:
+            tree = api(f"{API}/git/commits/{merge}")["tree"]["sha"]
+            for suite in Train(CONFIG.state()).suites.values():
+                if [suite["base"], suite["member"], suite["tree"]] != [base, head, tree]:
+                    continue
+                for workflow in _suite_workflows(suite):
+                    found = _batch_runs(suite, workflow)
+                    if found:
+                        proven = jobs(found[0])
+                        if _proves_whole(workflow, found[0], proven, suite):
+                            passed |= {job["name"] for job in strict_jobs(proven)
+                                       if job.get("conclusion") == "success"}
+            if set(health.failing) <= passed:
+                return True
+            if "images" in CONFIG.checks.prefix_only:
+                return False
         # Image failures need evidence for the very same tree as the fresh CI merge.
         images = runs("images", head, pull=True)
         if not images:
@@ -2566,7 +2612,8 @@ class Train:
 
         def signature() -> str:
             return train_reads.digest(
-                [self.path.read_text() if self.path.exists() else "", base, pulls]
+                [self.path.read_text() if self.path.exists() else "", base, pulls,
+                 CONFIG.checks.prefix_only]
                 + inputs(self.queue)
             )
 
@@ -2775,7 +2822,9 @@ class Train:
                         # An advisory's fix is proven whatever main it was tested on: main
                         # moves under it while the line keeps merging.
                         advisory = current.state == "advisory"
-                        evidence = fix_evidence(pulls[number], "" if advisory else base, current)
+                        evidence = fix_evidence(
+                            pulls[number], "" if advisory else base, current, self.suites.get(number)
+                        )
                         if evidence is None:
                             continue
                         judged = self.proofs.get(number)
@@ -2891,10 +2940,10 @@ class Train:
                     continue
                 if state != "green":
                     continue
-                images = runs("images", head, pull=True)
+                images = [] if "images" in CONFIG.checks.prefix_only else runs("images", head, pull=True)
                 if images:
                     state = verdict(images[0], jobs(images[0]), images=True)[0]
-                elif images_needed(head, base, pull["statusCheckRollup"]):
+                elif "images" not in CONFIG.checks.prefix_only and images_needed(head, base, pull["statusCheckRollup"]):
                     state = "pending"
                 if state == "pending":
                     self.pending.append(number)
@@ -3097,7 +3146,7 @@ def _completed_check(check: dict[str, Any]) -> bool:
 
 
 def _passing_rollup(pull: dict[str, Any]) -> bool:
-    return all(_passing_check(check) for check in pull["statusCheckRollup"])
+    return all(_passing_check(check) for check in own_checks(pull))
 
 
 def _batch_ready(pull: dict[str, Any], base: str, *, settling: bool = False) -> bool:
@@ -3129,6 +3178,8 @@ def _batch_ready(pull: dict[str, Any], base: str, *, settling: bool = False) -> 
         "migrations/versions",
     ):
         return False
+    if "images" in CONFIG.checks.prefix_only:
+        return True
     images = runs("images", head, pull=True)
     if images_needed(head, base, pull["statusCheckRollup"]) and not images:
         return False
@@ -3297,7 +3348,9 @@ def squash_proof(
     sources = []
     for key, (run, parts) in evidence.items():
         workflow = key.split("_", 1)[0]
-        if workflow not in ("ci", "e2e"):
+        if workflow not in ("ci", "e2e") and not (
+            workflow == "images" and "images" in CONFIG.checks.prefix_only
+        ):
             continue
         passed = sorted(passed_jobs(parts))
         if workflow == "ci":
@@ -3842,10 +3895,12 @@ def _prefix_state(member: dict[str, Any], folder: Path) -> Prefix:
         # A manual run is every server test and the whole browser suite; the notes say so,
         # whatever a later CI plans, and they name the tested files.
         if not (
-            whole_server_tests(found[0], parts, scratch["head"])
+            _proves_whole("ci", found[0], parts, {**scratch, "tree": tree})
             if workflow == "ci"
             else whole_suite(found[0], parts, tree)
             if workflow == "e2e"
+            else _proves_whole("images", found[0], parts, {**scratch, "tree": tree})
+            if "images" in CONFIG.checks.prefix_only
             else (NOTES.files_tested, tree) in _planner_notes(parts, IMAGES_PLAN)
         ):
             short.append(
@@ -4283,6 +4338,7 @@ def train_status(folder: Path) -> int:
                     if published.exists()
                     else None,
                     "first": train.first,
+                    "prefix_only": CONFIG.checks.prefix_only,
                     # Keep failed entries' slots internally, but let the tick deliver their
                     # ordinary checks-finished wake instead of waiting for a train turn.
                     "waiting": [
@@ -4594,13 +4650,18 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
         needed: list[str] = []
         if merge_sha:
             local = _merge_tree(base, head)
-            if server_tests_selected(parts):
+            if server_tests_selected(parts) or (
+                "server_whole" in CONFIG.checks.prefix_only
+                and (NOTES.server_tests, "none") not in _planner_notes(parts, CI_PLAN)
+            ):
                 needed.append("ci")
             # A local conflict GitHub does not see names no changed files: it needs proof too.
             if local is None or browser_needed(base, local):
-                own = runs("e2e", head, pull=True)[:1]
+                own = [] if "browser_whole" in CONFIG.checks.prefix_only else runs("e2e", head, pull=True)[:1]
                 if not (own and whole_suite(own[0], jobs(own[0]), tree)):
                     needed.append("e2e")
+            if "images" in CONFIG.checks.prefix_only and images_needed(head, base, []):
+                needed.append("images")
             if needed and local != tree:
                 raise Refused(
                     "a local merge of this pull request differs from the merge CI tested; "
@@ -4610,15 +4671,17 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
         # The first members of the line are tested at once, each as a prefix on a scratch
         # branch. A fresh first member merges by its own checks meanwhile, below; on a red
         # main, its fix does too, judged by its own proof.
-        lined = _run_line(train, base, health, folder, number, merge_sha is not None)
+        deferred_workflows = {CONFIG.checks.groups()[group].workflow for group in CONFIG.checks.prefix_only}
+        lined = _run_line(train, base, health, folder, number,
+                          merge_sha is not None and not deferred_workflows.intersection(needed))
         if lined is not None:
             return lined
         if merge_sha is None:
             return refresh_pull(pull, base, train, number)
         strict = strict_jobs(parts)
         passed_checks = {job["name"] for job in strict if job.get("conclusion") == "success"}
-        images = runs("images", head, pull=True)
-        if images_needed(head, base, pull["statusCheckRollup"]) and not images:
+        images = [] if "images" in CONFIG.checks.prefix_only else runs("images", head, pull=True)
+        if "images" not in CONFIG.checks.prefix_only and images_needed(head, base, pull["statusCheckRollup"]) and not images:
             raise Waiting(f"{IMAGES} checks have not started for this pull request head")
         image_jobs: list[dict[str, Any]] = []
         if images:
@@ -4643,7 +4706,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
                 for note in image_notes
             ):
                 return refresh_pull(pull, base, train, number)
-        for check in pull["statusCheckRollup"]:
+        for check in own_checks(pull):
             if not _passing_check(check):
                 if failed_checks(pull):
                     raise Refused(
@@ -4659,6 +4722,19 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             waited = _whole_suite_run(train, number, base, head, tree, needed)
             if waited is not None:
                 return waited
+        evidence = {"ci": (ci[0], strict)}
+        suite = train.suites.get(number, {})
+        for workflow, run_id in suite.get("passed", {}).items():
+            run = {"id": run_id}
+            proven = strict_jobs(jobs(run)) if workflow == "ci" else jobs(run)
+            evidence["ci_suite" if workflow == "ci" else workflow] = run, proven
+            passed_checks |= {job["name"] for job in proven if job.get("conclusion") == "success"}
+            if workflow == "images":
+                images, image_jobs = [run], proven
+            if workflow == "ci" and "server_whole" in CONFIG.checks.prefix_only:
+                # Main may inherit each job proven on this tree, including the deferred suite.
+                passed_names = {job["name"] for job in proven if job.get("conclusion") == "success"}
+                strict = [job for job in strict if job["name"] not in passed_names] + proven
         # From here a selected "CI: server tests" stands for every server test: they passed on this
         # very tree, so it may prove the fix of a red main and be inherited by main.
         # Catch a main push outside cooperating sessions while the checks were being read.
@@ -4673,14 +4749,6 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             raise Waiting("merging stopped: " + current_health.line)
         if current_base != base:
             raise Waiting("main moved during the freshness check; run this gate again")
-        evidence = {"ci": (ci[0], strict)}
-        suite = train.suites.get(number, {})
-        for workflow, run_id in suite.get("passed", {}).items():
-            run = {"id": run_id}
-            evidence["ci_suite" if workflow == "ci" else workflow] = (
-                run,
-                strict_jobs(jobs(run)) if workflow == "ci" else jobs(run),
-            )
         if "e2e" not in evidence and browser_needed(base, tree):
             own = runs("e2e", head, pull=True)[:1]
             if own and whole_suite(own[0], jobs(own[0]), tree):
@@ -4701,7 +4769,8 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             )
         train.remove(number)
         try:
-            record_green(folder, base, tree, ci[0], strict, images, image_jobs)
+            receipt_ci = evidence.get("ci_suite", evidence["ci"])[0] if "server_whole" in CONFIG.checks.prefix_only else ci[0]
+            record_green(folder, base, tree, receipt_ci, strict, images, image_jobs)
         except (Refused, OSError) as error:
             # The squash succeeded. Losing a receipt only makes the next turn wait.
             print(f"could not record inherited green: {error}", flush=True)

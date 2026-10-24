@@ -80,6 +80,33 @@ def _tested_merge(workflow: Workflow) -> tuple[str, str, str]:
     return merge, workflow.git("rev-parse", "HEAD^{tree}"), head
 
 
+@pytest.mark.parametrize("group", ["images", "browser_whole", "server_whole"])
+@pytest.mark.parametrize("event", ["pull_request", "workflow_dispatch", "push"])
+@pytest.mark.parametrize("configured", [False, True])
+def test_prefix_only_output_defers_only_configured_needed_pr_groups(
+    workflow: Workflow, group: str, event: str, configured: bool,
+) -> None:
+    (workflow.repo / "shipline.json").write_text(json.dumps({
+        "checks": {"prefix_only": [group] if configured else []}
+    }))
+    output = workflow.root / "outputs"
+    done = _proof(workflow, "prefix-only", "--needed", group,
+                  env={"GITHUB_EVENT_NAME": event, "GITHUB_OUTPUT": str(output)})
+    assert done.returncode == 0, done.stderr
+    expected = [group] if configured and event == "pull_request" else []
+    assert json.loads(output.read_text().split("=", 1)[1]) == expected
+    assert annotations(done.stdout) == [{"title": "Prefix-only groups", "message": json.dumps(expected)}]
+
+
+def test_a_group_no_path_filter_needs_is_not_deferred(workflow: Workflow) -> None:
+    (workflow.repo / "shipline.json").write_text(json.dumps({
+        "checks": {"prefix_only": ["images", "browser_whole", "server_whole"]}
+    }))
+    done = _proof(workflow, "prefix-only", env={"GITHUB_EVENT_NAME": "pull_request"})
+    assert done.returncode == 0, done.stderr
+    assert annotations(done.stdout) == [{"title": "Prefix-only groups", "message": "[]"}]
+
+
 def test_a_whole_run_notes_its_tested_merge_its_files_and_whole_suites(
     workflow: Workflow,
 ) -> None:
@@ -372,6 +399,47 @@ def test_a_proof_on_the_identical_tree_lets_main_inherit_the_jobs_that_passed(
 
     assert _inherited(workflow, github) == {"CI result": 20, "CI: server tests": 20, "CI: web": 20}
     assert _inherited(workflow, github, "e2e") == {"E2E: what to run": 30, "playwright": 30}
+
+
+@pytest.mark.parametrize("invalid", [None, "tree", "failed", "fork", "missing part", "carried planner"])
+def test_main_inherits_image_parts_only_from_valid_scratch_proof(
+    workflow: Workflow, invalid: str | None,
+) -> None:
+    (workflow.repo / "shipline.json").write_text(json.dumps({"checks": {"prefix_only": ["images"]}}))
+    github = _github(_receipt(sources=[{
+        "workflow": "images", "run": 40, "jobs": ["Docker images: browser tests"]
+    }]))
+    ok = {"status": "completed", "conclusion": "success"}
+    github[f"{_API}/actions/runs/40"] = {
+        "id": 40, "event": "workflow_dispatch", "head_sha": _MERGE,
+        "head_repository": {"full_name": "example-org/example-app"},
+        "path": ".github/workflows/images.yml", **ok,
+    }
+    planner = {"id": 41, "name": "Docker images: what to run", **ok}
+    parts = [planner, *({"id": 41 + n, "name": f"Docker images: browser tests ({n} of 3)", **ok}
+                         for n in (1, 2, 3))]
+    github[f"{_API}/actions/runs/40/jobs?per_page=100"] = {"jobs": parts}
+    notes = [{"title": "Files tested", "message": _TREE}]
+    github[f"{_API}/check-runs/41/annotations?per_page=100"] = notes
+    if invalid == "tree":
+        notes[0]["message"] = "0" * 40
+    elif invalid == "failed":
+        parts[-1]["conclusion"] = "failure"
+    elif invalid == "fork":
+        github[f"{_API}/actions/runs/40"]["head_repository"]["full_name"] = "example-other/example-app"
+    elif invalid == "missing part":
+        parts.pop()
+    elif invalid == "carried planner":
+        planner.update(run_id=40, run_attempt=2, head_sha=_MERGE,
+                       created_at="2026-10-12T12:00:00Z", started_at="2026-10-12T10:00:00Z",
+                       completed_at="2026-10-12T10:01:00Z")
+        github[f"{_API}/check-runs/41/annotations?per_page=100"] = []
+        github[f"{_API}/actions/runs/40/attempts/1/jobs?per_page=100"] = {"jobs": [
+            {**planner, "id": 45, "run_attempt": 1, "created_at": "2026-10-12T09:59:00Z"}
+        ]}
+        github[f"{_API}/check-runs/45/annotations?per_page=100"] = notes
+    expected = {"Docker images: browser tests": 40} if invalid in (None, "carried planner") else {}
+    assert _inherited(workflow, github, "images") == expected
 
 
 def test_the_gate_s_own_proof_is_read_back(workflow: Workflow) -> None:

@@ -38,6 +38,12 @@ the merge line's lane on main's runners: only when the runner pool's lender note
 LANE_SECONDS ago, that one of main's runners is online and idle with it, and this planner could
 claim one of the free runners the note counts. The pool's planner reads that note; on GitHub's
 own runners there is none, and the prefix takes the ordinary choice.
+
+    ci_proof.py prefix-only [--needed GROUP] ...
+
+hands workflows the configured groups to defer on pull request events, after their existing
+path selectors have named the groups needed. It notes those deferrals in the CI planner for
+the wake's daily savings report. Scratch dispatches and main defer nothing.
 """
 
 import argparse
@@ -67,7 +73,8 @@ SUITE_JOBS = {
     "playwright": "browser_suite",
 }
 # The workflows a proof may name, by the gate's own names for them.
-PROVEN = ("ci", "e2e")
+PROVEN = ("ci", "e2e", "images")
+DEFERRED = "Prefix-only groups"
 READ_TIMEOUT = 30
 # The lender's note to the pool's planner, in its home (runner/lend_runners.py), and how old it
 # may be: the lender writes it every round, a few seconds apart.
@@ -165,12 +172,12 @@ def receipt(message: str) -> dict[str, Any] | None:
     return None
 
 
-def read(path: str, key: str | None = None) -> Any:
+def read(path: str, key: str | None = None, *, paginate: bool = True) -> Any:
     """One GitHub read through `gh api`, every page of it; `key` names the list of a paged
     object, such as a run's `jobs`."""
     try:
         done = subprocess.run(
-            ["gh", "api", "--paginate", path],
+            ["gh", "api", *(["--paginate"] if paginate else []), path],
             capture_output=True,
             text=True,
             check=False,
@@ -214,11 +221,12 @@ def _source_jobs(source: dict[str, Any], tree: str, api: Callable[..., Any]) -> 
     ):
         return {}
     parts = api(f"{config.api}/actions/runs/{source['run']}/jobs?per_page=100", "jobs")
-    plan = config.checks.ci_plan if workflow == "ci" else config.checks.e2e_plan
+    plan = {"ci": config.checks.ci_plan, "e2e": config.checks.e2e_plan,
+            "images": config.checks.images_plan}[workflow]
     planner = next(job for job in parts if job["name"] == plan)
     noted = {
         (note.get("title"), note["message"].strip())
-        for note in api(f"{config.api}/check-runs/{planner['id']}/annotations?per_page=100")
+        for note in planner_notes(planner, api)
     }
     if workflow == "ci":
         merges = [message for title, message in noted if title == titles.merge_tested]
@@ -230,7 +238,9 @@ def _source_jobs(source: dict[str, Any], tree: str, api: Callable[..., Any]) -> 
             merge["parents"][-1]["sha"],
         ):
             return {}
-    elif not {(titles.files_tested, tree), (titles.browser_suite, "whole")} <= noted:
+    elif workflow == "e2e" and not {(titles.files_tested, tree), (titles.browser_suite, "whole")} <= noted:
+        return {}
+    elif workflow == "images" and (titles.files_tested, tree) not in noted:
         return {}
     passed = passed_jobs(parts)
     return {
@@ -239,6 +249,26 @@ def _source_jobs(source: dict[str, Any], tree: str, api: Callable[..., Any]) -> 
         if job in passed
         and (job not in SUITE_JOBS or (getattr(titles, SUITE_JOBS[job]), "whole") in noted)
     }
+
+
+def planner_notes(planner: dict[str, Any], api: Callable[..., Any] = read) -> list[dict[str, Any]]:
+    """A failed-jobs rerun carries a successful planner, whose notes belong to its old copy."""
+    config = workflow_config.current()
+    notes = api(f"{config.api}/check-runs/{planner['id']}/annotations?per_page=100")
+    started, created = planner.get("started_at"), planner.get("created_at")
+    if (notes or planner.get("conclusion") != "success" or not started or not created
+            or datetime.fromisoformat(started) >= datetime.fromisoformat(created)):
+        return notes
+    for attempt in range(planner.get("run_attempt", 1) - 1, 0, -1):
+        copies = api(f"{config.api}/actions/runs/{planner['run_id']}/attempts/{attempt}/jobs?per_page=100", "jobs")
+        for old in copies:
+            if (old["name"] == planner["name"] and old.get("head_sha") == planner.get("head_sha")
+                    and old.get("conclusion") == "success"
+                    and old.get("started_at") == started
+                    and old.get("completed_at") == planner.get("completed_at")
+                    and old.get("created_at") and datetime.fromisoformat(old["created_at"]) <= datetime.fromisoformat(started)):
+                return api(f"{config.api}/check-runs/{old['id']}/annotations?per_page=100")
+    return []
 
 
 def inherited(sha: str, workflow: str, api: Callable[..., Any] = read) -> dict[str, int]:
@@ -398,6 +428,24 @@ def _main_lane(args: list[str]) -> int:
     return 0
 
 
+def _main_prefix_only(args: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ci_proof.py prefix-only")
+    config = workflow_config.current()
+    parser.add_argument("--needed", action="append", default=[], choices=config.checks.groups())
+    given = parser.parse_args(args)
+    groups = [group for group in config.checks.prefix_only if group in given.needed]
+    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+        groups = []
+    print(notice(DEFERRED, json.dumps(groups)))
+    line = "prefix_only=" + json.dumps(groups) + "\n"
+    if output := os.environ.get("GITHUB_OUTPUT"):
+        with open(output, "a") as handed:
+            handed.write(line)
+    else:
+        sys.stdout.write(line)
+    return 0
+
+
 def main() -> int:
     commands = {
         "notes": _main_notes,
@@ -405,9 +453,10 @@ def main() -> int:
         "test": lambda args: _run_command("test", args),
         "browser": lambda args: _run_command("browser", args),
         "main-lane": _main_lane,
+        "prefix-only": _main_prefix_only,
     }
     if len(sys.argv) < 2 or sys.argv[1] not in commands:
-        print("usage: ci_proof.py notes|inherited|test|browser|main-lane ...", file=sys.stderr)
+        print("usage: ci_proof.py notes|inherited|test|browser|main-lane|prefix-only ...", file=sys.stderr)
         return 2
     try:
         return commands[sys.argv[1]](sys.argv[2:])

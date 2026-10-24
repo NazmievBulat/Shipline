@@ -129,7 +129,8 @@ def test_the_summing_up_check_needs_every_job(path: Path, job: str, name: str) -
     text = _job(path, job)
 
     assert re.search(rf"^    name: {name}$", text, re.M)
-    assert re.search(r"^    needs: \[plan, tests\]$", text, re.M)
+    needs = re.search(r"^    needs: \[([^\]]+)\]$", text, re.M)
+    assert needs and needs[1].split(", ") == [other for other in _jobs(path) if other != job]
     assert _condition(text) == f"always() && ({_NOT_A_DRAFT})"
     assert _EVERY_JOB_PASSED in text
 
@@ -171,7 +172,9 @@ def test_the_test_job_runs_the_config_s_command_unless_main_inherited_it(path: P
 
     assert re.search(r'^    name: "CI: server tests[" (]', tests, re.M)
     assert re.search(r"^    needs: plan$", tests, re.M)
-    assert _condition(tests) == f"${{{{ ({_NOT_A_DRAFT}) && {_NOT_INHERITED} }}}}"
+    selection = ("&& contains(fromJSON(needs.plan.outputs.needed), 'server_whole') "
+                 "&& !contains(fromJSON(needs.plan.outputs.prefix_only), 'server_whole') ") if path == _EXAMPLE else ""
+    assert _condition(tests) == f"${{{{ ({_NOT_A_DRAFT}) {selection}&& {_NOT_INHERITED} }}}}"
     assert "python3 scripts/workflow/ci_proof.py test" in tests
 
 
@@ -185,7 +188,8 @@ def test_the_example_s_jobs_carry_the_config_s_default_names() -> None:
     text = _EXAMPLE.read_text()
     names = re.findall(r"^    name: (.+)$", text, re.M)
 
-    assert names == ['"CI: what to run"', '"CI: server tests"', "CI result"]
+    assert names == ['"CI: what to run"', '"CI: server tests"',
+                     '"CI: selected server tests"', '"CI: fast checks"', "CI result"]
     assert re.search(
         r"^  pull_request:\n    types: \[opened, synchronize, reopened, ready_for_review\]\n"
         r"  push:\n    branches: \[main\]\n",
@@ -216,7 +220,8 @@ def test_the_example_e2e_s_jobs_carry_the_names_the_gate_reads() -> None:
 def test_the_example_e2e_planner_notes_the_whole_browser_suite_and_main_s_inheritance() -> None:
     plan = _job(_E2E, "plan")
 
-    assert "run: python3 scripts/workflow/ci_proof.py notes --whole browser_suite\n" in plan
+    # Whole unless the change needs no browser test, or a pull request defers the suite.
+    assert "python3 scripts/workflow/ci_proof.py notes --whole browser_suite\n" in plan
     assert "        if: github.event_name == 'push'\n" in plan
     assert "run: python3 scripts/workflow/ci_proof.py inherited e2e\n" in plan
     assert "inherited: ${{ steps.inherited.outputs.inherited || '[]' }}" in plan
@@ -225,11 +230,12 @@ def test_the_example_e2e_planner_notes_the_whole_browser_suite_and_main_s_inheri
 
 
 def test_the_example_e2e_runs_the_browser_command_unless_main_inherited_it() -> None:
-    browser = _job(_E2E, "playwright")
+    browser = _job(_E2E, "browser")
 
+    assert re.search(r"^    name: playwright$", browser, re.M)
     assert re.search(r"^    needs: plan$", browser, re.M)
     assert "!contains(fromJSON(needs.plan.outputs.inherited), 'playwright') }}" in browser
-    assert "run: python3 scripts/workflow/ci_proof.py browser\n" in browser
+    assert "command = ['python3', 'scripts/workflow/ci_proof.py', 'browser']\n" in browser
     assert "persist-credentials: false" in browser
 
 
@@ -276,7 +282,7 @@ def test_every_job_is_skipped_while_the_pull_request_is_a_draft(path: Path, resu
     ready (`ready_for_review`) starts its run on the current head."""
     jobs = {job: _condition(_job(path, job)) for job in _jobs(path)}
 
-    assert sorted(jobs) == sorted(["plan", "tests", result])
+    assert sorted(jobs) == sorted(["plan", "tests", result] + (["selected", "fast"] if path == _EXAMPLE else []))
     assert jobs["plan"] == _NOT_A_DRAFT
     assert all(condition and f"({_NOT_A_DRAFT})" in condition for job, condition in jobs.items()
                if job != "plan")
@@ -288,11 +294,11 @@ def test_every_e2e_job_is_skipped_while_the_pull_request_is_a_draft() -> None:
     jobs = {job: _condition(_job(_E2E, job)) for job in _jobs(_E2E)}
     group = re.search(r"^concurrency:\n  group: (.+)\n", _E2E.read_text(), re.M)
 
-    assert sorted(jobs) == ["plan", "playwright"]
+    assert sorted(jobs) == ["browser", "plan"]
     assert jobs["plan"] == _NOT_A_DRAFT
-    assert jobs["playwright"] == (
-        f"${{{{ ({_NOT_A_DRAFT}) && !contains(fromJSON(needs.plan.outputs.inherited), "
-        "'playwright') }}"
+    assert jobs["browser"] == (
+        f"${{{{ ({_NOT_A_DRAFT}) && needs.plan.outputs.needed == 'true' "
+        "&& !contains(fromJSON(needs.plan.outputs.inherited), 'playwright') }}"
     )
     assert group and group[1] == (
         "e2e-${{ github.event_name }}-${{ github.event_name == 'pull_request'"

@@ -1,6 +1,6 @@
 # The browser tests of a repository that uses Shipline, as `.github/workflows/e2e.yml`
 # (`workflows.e2e` in shipline.json): a planner that writes the notes the merge gate reads, and
-# one job, `playwright`, that runs the repository's own browser command (`commands.browser`).
+# one job, `playwright` (job `browser`), that runs the repository's own browser command (`commands.browser`).
 # The gate judges a run by its planner (`checks.e2e_plan`, here its default) and by every job
 # that ran; a repository that names another planner names its job so.
 #
@@ -25,6 +25,9 @@
 # workflows and branches meant for them with a runner group, have outside contributors' runs
 # approved before they start, and let only the gate's identity create branches of the prefix,
 # in any case.
+#
+# tools/ci-plan, the repository's own selector, also returns browser_files and browser_total; it
+# keeps the repository's existing browser selector and path filters in every event mode.
 name: E2E
 
 on:
@@ -66,6 +69,9 @@ jobs:
       actions: read
       checks: read
     outputs:
+      needed: ${{ steps.selection.outputs.needed }}
+      files: ${{ steps.selection.outputs.files }}
+      prefix_only: ${{ steps.deferred.outputs.prefix_only || '[]' }}
       inherited: ${{ steps.inherited.outputs.inherited || '[]' }}
       main_lane: ${{ steps.lane.outputs.main_lane || 'false' }}
     steps:
@@ -76,11 +82,31 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
-      - name: The notes the merge gate reads
-        # Every run runs the whole browser suite: the gate takes a prefix's browser run only
-        # when it was whole. A repository that runs a selection on its pull requests notes it
-        # with `--selected browser_suite N M specs`.
-        run: python3 scripts/workflow/ci_proof.py notes --whole browser_suite
+      - name: The existing browser selection
+        id: selection
+        run: |
+          tools/ci-plan > "$RUNNER_TEMP/selection.json"
+          echo "needed=$(jq -c '.needed | index("browser_whole") != null' "$RUNNER_TEMP/selection.json")" >> "$GITHUB_OUTPUT"
+          echo "files=$(jq -c '.browser_files' "$RUNNER_TEMP/selection.json")" >> "$GITHUB_OUTPUT"
+      - name: Defer the whole suite only for a pull request
+        id: deferred
+        if: steps.selection.outputs.needed == 'true'
+        run: python3 scripts/workflow/ci_proof.py prefix-only --needed browser_whole
+      # The gate takes a prefix's browser run only when it was whole.
+      - name: The notes the gate reads
+        env:
+          DEFERRED: ${{ steps.deferred.outputs.prefix_only || '[]' }}
+          NEEDED: ${{ steps.selection.outputs.needed }}
+        run: |
+          if [[ $NEEDED != true ]]; then
+            python3 scripts/workflow/ci_proof.py notes --none browser_suite
+          elif jq -e 'index("browser_whole") != null' <<< "$DEFERRED" >/dev/null; then
+            ran=$(jq '.browser_files | length' "$RUNNER_TEMP/selection.json")
+            total=$(jq '.browser_total' "$RUNNER_TEMP/selection.json")
+            python3 scripts/workflow/ci_proof.py notes --selected browser_suite "$ran" "$total" files
+          else
+            python3 scripts/workflow/ci_proof.py notes --whole browser_suite
+          fi
       # The merge gate's first run of a prefix takes the merge line's lane on main's runners only
       # when the pool's lender notes one of them online and idle with it (`ci_proof.py
       # main-lane`). Only the pool's planner runner sees that note: elsewhere the lane is never
@@ -93,20 +119,22 @@ jobs:
         run: python3 scripts/workflow/ci_proof.py main-lane
       # A squash the gate made carries its proof: main skips the browser job when it passed,
       # whole, on the identical tree, and names the run it inherited. Any other push runs it.
-      - name: The jobs main inherits from its squash's proof
+      - name: Browser tests main inherits on the identical tree
         id: inherited
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/workflow/ci_proof.py inherited e2e
 
-  playwright:
+  browser:
     # The gate's name for the job that runs the browser suite.
     name: playwright
     needs: plan
-    # Skipped while the pull request is a draft, and on main when main inherited it.
+    # Skipped while the pull request is a draft, when the change needs no browser test, and on
+    # main when main inherited it.
     if: >-
       ${{ (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+      && needs.plan.outputs.needed == 'true'
       && !contains(fromJSON(needs.plan.outputs.inherited), 'playwright') }}
     # A push to main on main's runners; the gate's first run of a prefix in the merge line's lane
     # when its planner found it free; every other run on the ordinary choice.
@@ -115,7 +143,7 @@ jobs:
       && fromJSON('["self-hosted", "example-app-home-main"]') || github.run_attempt == '1'
       && needs.plan.outputs.main_lane == 'true' && fromJSON('["self-hosted", "example-app-home-main-batch"]'))
       || 'ubuntu-latest' }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
         with:
@@ -124,5 +152,18 @@ jobs:
         with:
           python-version: "3.14"
       # Whatever the browser tests need installed, the browsers among them, comes before this.
+      # The repository's browser command (`commands.browser`), whole on scratch and main, and
+      # on the selected files on a deferred pull request.
       - name: Browser tests
-        run: python3 scripts/workflow/ci_proof.py browser
+        env:
+          DEFERRED: ${{ needs.plan.outputs.prefix_only }}
+          FILES: ${{ needs.plan.outputs.files }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          selected = 'browser_whole' in json.loads(os.environ['DEFERRED'])
+          files = json.loads(os.environ['FILES'])
+          command = ['python3', 'scripts/workflow/ci_proof.py', 'browser']
+          if not selected or files:
+              subprocess.run([*command, *files] if selected else command, check=True)
+          PY
