@@ -1896,6 +1896,9 @@ class Train:
         self.proofs: dict[str, list[Any]] = data.get("proofs", {})
         # Each member's priority as its labels said at the last reconcile.
         self.priorities: dict[str, str] = data.get("priorities", {})
+        # The hot paths of shipline.json each member's change touches, read on its head with
+        # those hot paths: `{"head": ..., "patterns": [...], "paths": [...]}`.
+        self.hot: dict[str, dict[str, Any]] = data.get("hot_paths", {})
         # The head each member's lost-check push made: a check lost on it is not pushed for again.
         self.reruns: dict[str, str] = data.get("reruns", {})
         # Each member's lost check at the last reconcile, with its head, for the tick's wake.
@@ -1934,18 +1937,47 @@ class Train:
             if isinstance(record, dict) and isinstance(record.get("branch"), str)
         }
 
+    def rank(self, number: str) -> tuple[int, int]:
+        # Proven fixes share the first place, keeping their order of joining.
+        return (
+            (0, 0)
+            if number in self.fixes
+            else (1, priority.rank(self.priorities.get(number, priority.UNLABELLED)))
+        )
+
     def line(self) -> list[str]:
         """The waiting members in the order they are served: the fix of a red main first,
-        then by priority, then by the order of joining within one priority."""
-        return sorted(
-            self.queue,
-            # Proven fixes share the first place, keeping their order of joining.
-            key=lambda number: (
-                (0, 0)
-                if number in self.fixes
-                else (1, priority.rank(self.priorities.get(number, priority.UNLABELLED)))
-            ),
-        )
+        then by priority, then by the order of joining within one priority, members that
+        share a hot path back to back at the place of the earliest of them."""
+        return list(self.hot_groups())
+
+    def hot_paths_of(self, number: str) -> set[str]:
+        record = self.hot.get(number)
+        if not record or record.get("patterns") != list(CONFIG.hot_paths):
+            return set()
+        return set(record.get("paths", []))
+
+    def hot_groups(self) -> dict[str, str | None]:
+        """Every member in the order served, with the hot path that put it beside a member of
+        its group, or None. Members of one priority that share a hot path, directly or through
+        another, make one group; it is served where its earliest member joined."""
+        served: dict[str, str | None] = {}
+        joined = sorted(self.queue, key=self.rank)
+        for number in joined:
+            if number in served:
+                continue
+            group, why = [number], {number: None}
+            for current in group:
+                for other in joined:
+                    if other in why or other in served or self.rank(other) != self.rank(number):
+                        continue
+                    both = self.hot_paths_of(current) & self.hot_paths_of(other)
+                    if shared := [hot for hot in CONFIG.hot_paths if hot in both]:
+                        group.append(other)
+                        why[other] = shared[0]
+                        why[current] = why[current] or shared[0]
+            served.update((member, why[member]) for member in sorted(group, key=joined.index))
+        return served
 
     def front(self) -> str | None:
         eligible = [
@@ -2001,6 +2033,8 @@ class Train:
                     "lost": self.lost,
                     "retest": self.retest,
                     "dropped": self.dropped,
+                    # Only with hot paths named: without them the line is saved as before.
+                    **({"hot_paths": self.hot} if self.hot else {}),
                 },
                 output,
             )
@@ -2066,6 +2100,8 @@ class Train:
             return train_reads.digest(
                 [self.path.read_text() if self.path.exists() else "", base, pulls]
                 + inputs(self.queue)
+                # Named hot paths change the order, though nothing on GitHub changed.
+                + ([list(CONFIG.hot_paths)] if CONFIG.hot_paths else [])
             )
 
         previous = train_reads.load(context / "reconciled.json")
@@ -2226,6 +2262,7 @@ class Train:
         self.queue = remaining
         # A label changed while waiting moves its pull request at this turn.
         self.priorities = {number: priority.of(pulls[number].get("labels")) for number in remaining}
+        self.read_hot_paths(pulls)
         self.fixes = []
         proofs: dict[str, list[Any]] = {}
         if health.startswith("main: red"):
@@ -2366,6 +2403,39 @@ class Train:
                         self.passing.append(number)
                 except Refused, KeyError, TypeError, ValueError, IndexError:
                     continue
+
+    def read_hot_paths(self, pulls: dict[str, Any]) -> None:
+        """Which hot paths each member's change touches, read again for a new head only."""
+        patterns = list(CONFIG.hot_paths)
+        kept = {
+            number: record
+            for number, record in self.hot.items()
+            if number in self.queue
+            and record.get("head") == pulls[number]["headRefOid"]
+            and record.get("patterns") == patterns
+        }
+        if patterns:
+            base = None
+            for number in self.queue:
+                if number in kept:
+                    continue
+                head = pulls[number]["headRefOid"]
+                try:
+                    base = base or git("ls-remote", "origin", "refs/heads/main").split()[0]
+                    paths = {
+                        hot for file in changed_files(base, head) for hot in CONFIG.hot_paths_of(file)
+                    }
+                except BudgetWaiting:
+                    raise
+                except Refused, IndexError:
+                    # Unread, it is served as without hot paths, and read again next time.
+                    continue
+                kept[number] = {
+                    "head": head,
+                    "patterns": patterns,
+                    "paths": [hot for hot in patterns if hot in paths],
+                }
+        self.hot = kept
 
     def suspend(self, number: str, head: str, health: str) -> None:
         self.suspended[number] = f"{head}:{health}"
@@ -2577,6 +2647,16 @@ def _merge_tree(base: str, head: str) -> str | None:
     if not re.fullmatch(r"[0-9a-f]{40}", tree):
         raise Refused("git did not return a batch tree")
     return tree
+
+
+def changed_files(base: str, head: str) -> list[str]:
+    """The files a pull request's change touches: from where it left main to its head."""
+    for commit, ref in ((base, "refs/heads/main"), (head, head)):
+        if command("git", "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode:
+            git("fetch", "origin", ref)
+    fork = command("git", "merge-base", base, head).stdout.strip()
+    listed = command("git", "diff", "--name-only", "--no-renames", "-z", fork, head).stdout
+    return [path for path in listed.split("\0") if path]
 
 
 def _taken_migrations(head: str, base: str) -> list[str]:
@@ -3704,6 +3784,18 @@ def train_status(folder: Path) -> int:
                         else train.priorities.get(number, priority.UNLABELLED)
                         for number in train.line()
                     },
+                    # The hot path that served each member beside one of its group.
+                    **(
+                        {
+                            "hot_paths": {
+                                number: hot
+                                for number, hot in train.hot_groups().items()
+                                if hot is not None
+                            }
+                        }
+                        if CONFIG.hot_paths
+                        else {}
+                    ),
                     "turn": train.turn,
                     # A check GitHub lost on a member's head: the tick wakes its reviewer.
                     "lost": train.lost,

@@ -1003,6 +1003,118 @@ def test_the_train_serves_by_priority_then_by_the_order_of_joining(
     assert saved["waiting"] == ["7", "8"]
 
 
+def _members_changing(github: GitHub, changes: dict[str, str]) -> None:
+    """Members joined in this order, each one commit on main changing its own file."""
+    workflow = github.workflow
+    names = {"7": "seven", "8": "eight", "9": "nine", "10": "ten"}
+    for run, (number, path) in enumerate(changes.items()):
+        branch = f"ticket/{names[number]}"
+        checkout = workflow.repo if number == "7" else workflow.root / names[number]
+        if number != "7":
+            workflow.running(f"review-{number}")
+            workflow.git("worktree", "add", "-b", branch, str(checkout), github.base)
+        (checkout / path).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / path).write_text(f"changed by {number}\n")
+        workflow.git("add", path, cwd=checkout)
+        workflow.git("commit", "--quiet", "-m", f"feat: {number}", cwd=checkout)
+        head = workflow.git("rev-parse", "HEAD", cwd=checkout)
+        workflow.git("push", "--quiet", "origin", f"HEAD:{branch}", cwd=checkout)
+        github.pulls[number] = {
+            **deepcopy(github.pulls["7"]),
+            "headRefOid": head,
+            "headRefName": branch,
+        }
+        if number == "7":
+            github.head = head
+        github.ci(github.base, head, run_id=20 + 10 * run)
+    github.save()
+    _line(github, list(changes))
+
+
+def _hot(github: GitHub, *paths: str) -> None:
+    config = github.workflow.repo / "shipline.json"
+    config.write_text(json.dumps({**json.loads(config.read_text()), "hot_paths": list(paths)}))
+
+
+@pytest.mark.parametrize("hot", [True, False], ids=["hot path", "no hot paths"])
+def test_members_sharing_a_hot_path_are_served_back_to_back(github: GitHub, hot: bool) -> None:
+    """9 is refreshed once on 7's squash instead of conflicting with it after 8's."""
+    if hot:
+        _hot(github, "web/src/pages/**")
+    _members_changing(
+        github,
+        {
+            "7": "web/src/pages/menu.tsx",
+            "8": "src/example_app/other.py",
+            "9": "web/src/pages/settings.tsx",
+            "10": "web/src/pages/menu.tsx",
+        },
+    )
+
+    train = _train(github)
+
+    assert train["waiting"] == (["7", "9", "10", "8"] if hot else ["7", "8", "9", "10"])
+    if hot:
+        assert train["hot_paths"] == {
+            "7": "web/src/pages/**",
+            "9": "web/src/pages/**",
+            "10": "web/src/pages/**",
+        }
+    else:
+        assert "hot_paths" not in train
+    # The order of joining is kept, so a member leaving the group restores it.
+    saved = json.loads((github.workflow.repo / ".local/workflow/merge-train.json").read_text())
+    assert saved["waiting"] == ["7", "8", "9", "10"]
+
+
+def test_a_hot_path_never_moves_a_member_across_priorities(github: GitHub) -> None:
+    _hot(github, "web/src/pages/**")
+    _members_changing(
+        github,
+        {
+            "7": "web/src/pages/menu.tsx",
+            "8": "src/example_app/other.py",
+            "9": "web/src/pages/settings.tsx",
+        },
+    )
+    _labelled(github, {"7": ["priority: high"], "8": ["priority: high"]})
+
+    train = _train(github)
+
+    # 9 is medium: it shares 7's hot path but stays behind every high member.
+    assert train["waiting"] == ["7", "8", "9"]
+    assert train["hot_paths"] == {}
+
+
+def test_a_member_whose_new_head_leaves_the_hot_path_is_served_by_joining_again(
+    github: GitHub,
+) -> None:
+    _hot(github, "web/src/pages/**")
+    _members_changing(
+        github,
+        {
+            "7": "web/src/pages/menu.tsx",
+            "8": "src/example_app/other.py",
+            "9": "web/src/pages/settings.tsx",
+        },
+    )
+    assert _train(github)["waiting"] == ["7", "9", "8"]
+
+    # 9 drops its change to the page: its new head changes another file.
+    nine = github.workflow.root / "nine"
+    github.workflow.git("rm", "--quiet", "web/src/pages/settings.tsx", cwd=nine)
+    (nine / "docs.md").write_text("docs\n")
+    github.workflow.git("add", "docs.md", cwd=nine)
+    github.workflow.git("commit", "--quiet", "-m", "fix: docs only", cwd=nine)
+    head = github.workflow.git("rev-parse", "HEAD", cwd=nine)
+    github.workflow.git("push", "--quiet", "origin", "HEAD:ticket/nine", cwd=nine)
+    github.pulls["9"]["headRefOid"] = head
+    github.ci(github.base, head, run_id=90)
+    github.save()
+
+    assert _train(github)["waiting"] == ["7", "8", "9"]
+
+
 def test_a_label_changed_while_waiting_moves_the_pull_request_at_the_next_turn(
     github: GitHub,
 ) -> None:
