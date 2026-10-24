@@ -80,10 +80,20 @@ def test_ci_runs_for_pull_requests_main_and_the_merge_queue() -> None:
 
 
 def test_the_tests_use_a_tmux_that_leaves_each_pane_where_it_was_started() -> None:
-    """A tmux built with systemd support moves each new pane into a scope of its own, racing the
-    scope a session starts its command in; the session's memory limit is then lost."""
+    """A tmux built with systemd support moves each new pane into a scope of its own; the tests
+    run the scripts with one that leaves each pane where it was started."""
     text = _CI.read_text()
 
     assert "./configure --prefix=\"$HOME/.local/tmux\" --disable-systemd" in text
     assert 'echo "$HOME/.local/tmux/bin" >> "$GITHUB_PATH"' in text
     assert 'if ldd "$(command -v tmux)" | grep -q libsystemd; then' in text
+
+
+def test_the_tests_of_the_memory_limits_also_get_a_tmux_with_systemd_support() -> None:
+    """Sessions keep their limits whichever tmux starts them (#41): CI builds the second one and
+    names it to the tests, which would otherwise leave it out."""
+    text = _CI.read_text()
+
+    assert './configure --prefix="$HOME/.local/tmux-systemd" --enable-systemd' in text
+    assert 'ldd "$tmux_with_systemd" | grep -q libsystemd ||' in text
+    assert 'echo "WORKFLOW_TEST_TMUX_WITH_SYSTEMD=$tmux_with_systemd" >> "$GITHUB_ENV"' in text
