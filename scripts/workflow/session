@@ -58,6 +58,10 @@
 #                               changed for 45 minutes, or whose wait loop finds itself, and
 #                               tell it so (the tick does this, once); with `again`, only send
 #                               that message once more when its Enter was not taken
+#   session answer-for-owner <ticket-N|review-N|audit-N> <asked>
+#                               type the recommended reply of a question to the owner its
+#                               session marked `Owner only: no`, the one noted as asked at
+#                               <asked> (the tick does this, after a wait)
 #   session running <name>      what the session's Bash tool runs, as JSON, and whether it is
 #                               a wait loop that finds itself (`running_command.py`)
 #   session bridge <ticket-N>   start the bridge of a Codex worker again when it ended while
@@ -108,9 +112,10 @@ HUNT_EFFORT=high
 
 # The end of the sentence a session is started with. The worktree holds the branch of the pull
 # request, and a branch made before a rule changed has the old AGENTS.md, or none of that
-# section: the session is sent to the file on `main`. It is put inside double quotes in a shell
+# section: the session is sent to the file on `main`. It repeats the line a question to the owner
+# carries, which the tick reads to answer for him. It is put inside double quotes in a shell
 # command, so it has no quotation mark, dollar, backtick or backslash.
-RULES_ON_MAIN="by the rules of AGENTS.md as it is on main, not the copy in this worktree; read them with: git fetch origin main && git show origin/main:AGENTS.md"
+RULES_ON_MAIN="by the rules of AGENTS.md as it is on main, not the copy in this worktree, any question to the owner carrying the line Owner only: yes or Owner only: no just before its reply words, the recommended one first (yes for money, privacy, legal text, text sent to a model and the product decisions the rules keep for the owner); read them with: git fetch origin main && git show origin/main:AGENTS.md"
 
 # The end of the first sentence a hunt is started with. Its worktree is the commit it hunts, so
 # the copy of AGENTS.md there is the right one. What follows it (the plans file, the area and its
@@ -164,6 +169,7 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session status-check <ticket-N|review-N>
        session finish-ready <ticket-N>
        session nudge-busy <ticket-N|review-N> <still|loop> [again]
+       session answer-for-owner <ticket-N|review-N|audit-N> <asked>
        session running <ticket-N|audit-N|review-N|hunt-name|analyst-name>
        session bridge <ticket-N>
        session cleanup [hunts]
@@ -530,7 +536,7 @@ cloud_sentence_of() {
   sentence_of "ticket-$1"
   # Unquoted for the set-up command alone: the text has no other dollar, backtick or backslash.
   cat <<EOF
-Cloud differences: work in your own cloud checkout and use the pull request's branch, not a local workflow worktree. Push only to the pull request's branch, never force-push, and never skip or weaken the pre-push hook. Run the repository's setup command, $SHIPLINE_WORKTREE_SETUP, when it has one, before testing and pushing. A database server cannot run as root: run it as a separate unprivileged user when this container runs as root. Run long suites in the background and wait for their results. Use a reviewer subagent in place of codex review, including verdicts for unit, API and browser coverage. Use only the selected local browser tests and at most two workers. Local session protect/unprotect commands and the phone bridge are unavailable here. Every report is a comment on this pull request starting with <!-- cloud-worker -->: report the start, first push, any blocker with the exact error, any question for the owner, and ready. A question for the owner ends on its last line with the question or the short words to type back. A blocker has a line starting with Blocked and includes the exact error. Mark ready only after completing the worker's required work, then report with worker finished on the last line. Never merge. If a task explicitly asks for a comment-only smoke test, follow that task and stop after its requested comment.
+Cloud differences: work in your own cloud checkout and use the pull request's branch, not a local workflow worktree. Push only to the pull request's branch, never force-push, and never skip or weaken the pre-push hook. Run the repository's setup command, $SHIPLINE_WORKTREE_SETUP, when it has one, before testing and pushing. A database server cannot run as root: run it as a separate unprivileged user when this container runs as root. Run long suites in the background and wait for their results. Use a reviewer subagent in place of codex review, including verdicts for unit, API and browser coverage. Use only the selected local browser tests and at most two workers. Local session protect/unprotect commands and the phone bridge are unavailable here. Every report is a comment on this pull request starting with <!-- cloud-worker -->: report the start, first push, any blocker with the exact error, any question for the owner, and ready. A question for the owner ends on its last line with the question or the short words to type back, with the line Owner only: yes or Owner only: no just before those words. A blocker has a line starting with Blocked and includes the exact error. Mark ready only after completing the worker's required work, then report with worker finished on the last line. Never merge. If a task explicitly asks for a comment-only smoke test, follow that task and stop after its requested comment.
 EOF
 }
 
@@ -1509,6 +1515,36 @@ cmd_nudge_busy() {
   send_prompt "$name" "$message"
 }
 
+# The tick's answer, on the owner's behalf, to a question its session marked `Owner only: no`:
+# the recommended reply the stop hook noted (`notify`). Only to the question noted as asked at
+# <asked>, still open, with the session idle on it; never to a Codex worker, to one waiting on a
+# prompt for the owner or stopped on the usage limit. A question answered meanwhile, or any text
+# in the box but this reply, exits 3, so that the tick passes over the session quietly. The reply counts as the owner's: the
+# session's prompt hook drops the question.
+cmd_answer_for_owner() {
+  local name=$1 asked=$2 notes typed reply
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  require_running "$name"
+  [[ ! -e $notes.codex ]] || die "$name is a Codex worker; its bridge relays"
+  [[ ! -e $notes.interaction-blocked ]] || die "$name is waiting on a prompt for the owner"
+  # The owner may have answered since the tick read the notes: that is no failure.
+  if ! [[ -e $notes.idle && -r $notes.asking && $(<"$notes.asking") == "$asked" ]] ||
+    ! reply=$(jq -er --arg asked "$asked" \
+      'select(.asked == $asked and .owner_only == "no") | .reply | strings' "$notes.question" 2>/dev/null); then
+    echo "$name no longer asks that question; nothing was typed into it" >&2
+    exit 3
+  fi
+  ! stopped_on_limit "$name" || die "$name is stopped on the usage limit"
+  read_prompt_box
+  # Only this reply, typed by an earlier tick and not sent, is sent from the box: another message
+  # of the tick's left there would go in its place.
+  if [[ -n $typed ]] && ! { [[ -r $notes.typed && $(<"$notes.typed") == "$reply" ]] && holds_own_text "$name"; }; then
+    echo "$name has text in its box that was not sent; nothing was typed into it" >&2
+    exit 3
+  fi
+  send_prompt "$name" "$reply"
+}
+
 # What the session's Bash tool runs, as JSON (`running_command.py`).
 cmd_running() {
   local groups
@@ -1884,6 +1920,11 @@ case ${1:-} in
        $3 =~ ^(still|loop)$ ]] || usage
     find_main_checkout
     cmd_nudge_busy "$2" "$3" "${4:-}"
+    ;;
+  answer-for-owner)
+    [[ $# -eq 3 && $2 =~ ^(ticket|review|audit)-[0-9]+$ && $3 =~ ^[0-9]+\ [0-9]+$ ]] || usage
+    find_main_checkout
+    cmd_answer_for_owner "$2" "$3"
     ;;
   running)
     [[ $# -eq 2 ]] && is_session_name "$2" || usage

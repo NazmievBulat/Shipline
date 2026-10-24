@@ -101,6 +101,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 Change `merge.scratch_prefix` only while the merge line is empty: the gate deletes, and cancels
 the runs of, only the scratch branches of the prefix it reads, so those of the old one would stay.
 | `commands.*`, the others | the repository's own commands Shipline calls, each split into words (below) | none |
+| `answer_for_owner_after_minutes` | how long a question to the owner marked `Owner only: no` waits before the tick types its recommended reply (see `RULES.md`, "Asking the owner"); `0` turns that off, and it is at most `1440`, a day | `15` |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the
