@@ -65,7 +65,22 @@ _DEFAULTS = {
     "machines": [],
     "hunts": {"areas": {}, "plans": None},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
-    "commands": {"test": None},
+    "commands": {
+        name: None
+        for name in (
+            "test",
+            "browser_tests_for_changes",
+            "server_tests_for_changes",
+            "pre_train_checks",
+            "mechanical_conflicts",
+            "browser_plan",
+            "hunt_app",
+            "hunt_browser",
+            "hunt_cursor",
+            "advisory_watch",
+            "push_checkout",
+        )
+    },
 }
 
 

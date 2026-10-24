@@ -1,0 +1,7 @@
+● Bash(pytest tests)
+  ⎿  Interrupted · What should Claude do instead?
+
+────────────────────────────────────────
+> 
+────────────────────────────────────────
+  ? for shortcuts
