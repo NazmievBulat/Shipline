@@ -63,6 +63,9 @@ _DEFAULTS = {
     "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
     "commands": {"test": None},
+    # No hot paths, and the conflict reviewer of today.
+    "hot_paths": [],
+    "conflict_review": None,
 }
 
 
@@ -152,7 +155,10 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
             return {prefix}
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 
-    assert keys(example) == keys(_DEFAULTS)
+    # The conflict reviewer is one object, named whole or left out.
+    named = {**_DEFAULTS, "conflict_review": {"effort": "", "model": "", "max_changed_lines": 0}}
+    assert keys(example) == keys(named)
+    assert example["hot_paths"]
     assert example["repository"].endswith("/example-app")
     assert example["runner"]["labels"]
 
@@ -165,6 +171,110 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
 
     _write(repo, {"runner": {"prefix": ""}})
     with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be a name"):
+        workflow_config.load(repo)
+
+
+def test_hot_paths_match_by_github_s_rules(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"hot_paths": ["src/example_app/*.py", "web/src/pages/**", "docs/**/list.md"]})
+
+    config = workflow_config.load(repo)
+
+    assert config.hot_paths == ("src/example_app/*.py", "web/src/pages/**", "docs/**/list.md")
+    # `*` stays inside a folder, `**` crosses them, `**/` is zero or more folders.
+    assert config.hot_paths_of("src/example_app/models.py") == ["src/example_app/*.py"]
+    assert config.hot_paths_of("src/example_app/api/routes.py") == []
+    assert config.hot_paths_of("web/src/pages/menu/settings.tsx") == ["web/src/pages/**"]
+    assert config.hot_paths_of("web/src/app.tsx") == []
+    assert config.hot_paths_of("docs/list.md") == ["docs/**/list.md"]
+    assert config.hot_paths_of("docs/guide/list.md") == ["docs/**/list.md"]
+
+
+def test_without_hot_paths_no_file_is_hot(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+
+    config = workflow_config.load(repo)
+
+    assert config.hot_paths == ()
+    assert config.hot_paths_of("src/example_app/models.py") == []
+    assert config.conflict_review is None
+
+
+@pytest.mark.parametrize(
+    ("hot_paths", "refusal"),
+    [
+        ("src/**", "hot_paths must be a list of paths"),
+        ([""], "hot_paths must be a list of paths"),
+        (["/src/**"], "hot_paths must be paths inside the checkout"),
+        (["src/../web/**"], "hot_paths must be paths inside the checkout"),
+        (["!src/app.py"], "hot_paths must be paths inside the checkout"),
+    ],
+)
+def test_a_hot_path_that_is_not_a_path_inside_the_checkout_is_refused(
+    tmp_path: Path, hot_paths: Any, refusal: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"hot_paths": hot_paths})
+
+    with pytest.raises(workflow_config.ConfigError, match=refusal):
+        workflow_config.load(repo)
+
+
+def test_the_conflict_reviewer_is_read_whole(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    named = {"effort": "medium", "model": "claude-sonnet-5-5", "max_changed_lines": 40}
+    _write(repo, {"conflict_review": named})
+
+    config = workflow_config.load(repo)
+
+    assert config.conflict_review == workflow_config.ConflictReview(
+        effort="medium", model="claude-sonnet-5-5", max_changed_lines=40
+    )
+    assert _as_json(config)["conflict_review"] == named
+
+
+@pytest.mark.parametrize(
+    ("value", "refusal"),
+    [
+        ("medium", "conflict_review must be an object"),
+        ({"effort": "medium", "model": "sonnet"}, "conflict_review must name max_changed_lines"),
+        (
+            {"effort": "medium", "model": "sonnet", "max_changed_lines": 40, "files": 2},
+            "unknown key conflict_review.files",
+        ),
+        (
+            {"effort": "lowest", "model": "sonnet", "max_changed_lines": 40},
+            "conflict_review.effort must be one of low, medium, high, xhigh, max",
+        ),
+        (
+            {"effort": "medium", "model": "sonnet; touch nope", "max_changed_lines": 40},
+            "conflict_review.model must be a model name",
+        ),
+        (
+            {"effort": "medium", "model": "", "max_changed_lines": 40},
+            "conflict_review.model must be a model name",
+        ),
+        (
+            {"effort": "medium", "model": "sonnet", "max_changed_lines": 0},
+            "conflict_review.max_changed_lines must be a whole number above 0",
+        ),
+        (
+            {"effort": "medium", "model": "sonnet", "max_changed_lines": "40"},
+            "conflict_review.max_changed_lines must be a whole number above 0",
+        ),
+        (
+            {"effort": "medium", "model": "sonnet", "max_changed_lines": True},
+            "conflict_review.max_changed_lines must be a whole number above 0",
+        ),
+    ],
+)
+def test_a_conflict_reviewer_named_wrong_is_refused(
+    tmp_path: Path, value: Any, refusal: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"conflict_review": value})
+
+    with pytest.raises(workflow_config.ConfigError, match=refusal):
         workflow_config.load(repo)
 
 

@@ -1286,7 +1286,7 @@ def path_filter(patterns: list[str]) -> Callable[[str], bool]:
     starting with `!` takes the file back, so negated patterns alone match nothing.
     """
     rules = [
-        (pattern.startswith("!"), _filter_pattern(pattern.removeprefix("!")))
+        (pattern.startswith("!"), workflow_config.path_pattern(pattern.removeprefix("!")))
         for pattern in patterns
     ]
 
@@ -1298,87 +1298,6 @@ def path_filter(patterns: list[str]) -> Callable[[str], bool]:
         return started
 
     return matches
-
-
-def _filter_pattern(pattern: str) -> re.Pattern[str]:
-    """One filter pattern as a regular expression. `*` is any characters but `/`, `**` is any
-    characters, and `**/` where a folder's name starts is zero or more folders (inside a name,
-    `**` is any characters and the `/` stays). `?` and `+` make what stands before them
-    zero or one, or one or more, of it. `[...]` is one character of its set, with `-` ranges.
-    A backslash makes the next character itself, and every other character is itself.
-
-    GitHub does not document a `?` or `+` with nothing before it, or a `[` that no `]` closes
-    (nor an empty `[]`): each of those is read as the character itself.
-    """
-    # Each part is what one piece of the pattern matches and how often it may stand: at least
-    # `fewest` (0 or 1) times, and at most once or, with `many`, any number of times. Repeating
-    # a part only changes those two, so no repetition ever nests inside another.
-    parts: list[tuple[str, int, bool]] = []
-    at = 0
-    while at < len(pattern):
-        char = pattern[at]
-        if pattern.startswith("**/", at) and pattern[at - 1 : at] in ("", "/"):
-            # Zero or more folders: repeating it, however, is still that.
-            parts.append(("(?:.*/)?", 1, False))
-            at += 3
-            continue
-        if pattern.startswith("**", at):
-            parts.append((".", 0, True))
-            at += 2
-            continue
-        at += 1
-        if char == "*":
-            parts.append(("[^/]", 0, True))
-        elif char in "?+" and parts:
-            expression, fewest, many = parts[-1]
-            if expression != "(?:.*/)?":
-                parts[-1] = (expression, 0, many) if char == "?" else (expression, fewest, True)
-        elif char == "\\" and at < len(pattern):
-            parts.append((re.escape(pattern[at]), 1, False))
-            at += 1
-        elif char == "[" and (found := _filter_set(pattern, at)):
-            expression, at = found
-            parts.append((expression, 1, False))
-        else:
-            parts.append((re.escape(char), 1, False))
-    times = {(1, False): "", (0, False): "?", (1, True): "+", (0, True): "*"}
-    return re.compile(
-        "".join(expression + times[fewest, many] for expression, fewest, many in parts),
-        flags=re.DOTALL,
-    )
-
-
-def _filter_set(pattern: str, at: int) -> tuple[str, int] | None:
-    """The set that starts at `at`, just after a `[`, as one character of a regular expression,
-    and where the pattern goes on after its `]`; None when no `]` closes a set of at least one
-    character. A backslash makes the next character itself. A `-` between two characters of
-    a-z, of A-Z or of 0-9 is the range from the first to the second, as GitHub allows ranges
-    only there; any other `-`, and a range that runs backwards, is the characters themselves.
-    """
-    chars: list[tuple[str, bool]] = []
-    while at < len(pattern) and (pattern[at] != "]" or not chars):
-        if pattern[at] == "]":
-            return None
-        escaped = pattern[at] == "\\" and at + 1 < len(pattern)
-        if escaped:
-            at += 1
-        chars.append((pattern[at], escaped))
-        at += 1
-    if at == len(pattern):
-        return None
-    members: list[str] = []
-    index = 0
-    while index < len(chars):
-        char = chars[index][0]
-        last = chars[index + 2][0] if index + 2 < len(chars) else ""
-        ranged = any(first <= char <= last <= final for first, final in ("az", "AZ", "09"))
-        if chars[index + 1 : index + 2] == [("-", False)] and ranged:
-            members.append(f"{re.escape(char)}-{re.escape(last)}")
-            index += 3
-        else:
-            members.append(re.escape(char))
-            index += 1
-    return f"[{''.join(members)}]", at + 1
 
 
 def browser_needed(base: str, merge: str) -> bool:

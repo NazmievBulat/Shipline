@@ -37,5 +37,11 @@
   },
   "commands": {
     "test": "tools/run-tests"
+  },
+  "hot_paths": ["src/example_app/models.py", "web/src/pages/**"],
+  "conflict_review": {
+    "effort": "medium",
+    "model": "sonnet",
+    "max_changed_lines": 40
   }
 }

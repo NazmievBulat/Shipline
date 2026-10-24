@@ -55,6 +55,8 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `runner.prefix` | the prefix the runner pool names its services and containers by; `workflow-metrics` reads their CPU | none: no runner figures |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
 | `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
+| `hot_paths` | path patterns of the few files many tickets edit, by GitHub's path filter rules (`*` stays inside a folder, `**` crosses folders): two tickets whose files match the same one never run at once, a pull request waiting in the merge line counting as running, and the merge line serves members sharing one back to back within their priority | none |
+| `conflict_review` | `{"effort": ..., "model": ..., "max_changed_lines": N}`: the reviewer of a conflict on a handed-off pull request whose conflicting hunks, and then whose resolution, stay within `N` lines of the conflicting files and touch no other file; a larger one gets the usual reviewer | none: Claude Opus at high effort for every conflict |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the
