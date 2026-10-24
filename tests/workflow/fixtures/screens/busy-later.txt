@@ -1,0 +1,9 @@
+● Bash(pytest tests)
+  ⎿  Running… (46m 59s)
+
+✶ Pondering… (46m 59s · ↓ 2.1k tokens · esc to interrupt)
+
+────────────────────────────────────────
+> 
+────────────────────────────────────────
+  12% context left

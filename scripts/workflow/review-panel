@@ -37,6 +37,22 @@ run_one() {
   git -C "$main" worktree remove --force "$checkout" >/dev/null 2>&1 || true
 }
 
+# The tests a conflict's resolution reaches from `base`, by the repository's selection of one
+# kind (`server` or `browser`, its words after the base), given the conflicting files. Without a
+# server selection the whole server suite is reached; without a browser one no spec is selected,
+# and the task says CI runs the whole browser suite.
+select_tests() {
+  local kind=$1 base=$2
+  shift 2
+  if (($# > 0)); then
+    "$@" "$base" --files-from .review/conflict-files.txt
+  elif [[ $kind == server ]]; then
+    jq -n '{whole: true, tests: [], total: 0, reasons: ["no server test selection is configured"]}'
+  else
+    printf '\nNo browser test selection is configured: CI runs the whole browser suite.\n' >>.review/task.md
+  fi
+}
+
 number=${1:-}
 [[ $number =~ ^[0-9]+$ ]] || { echo "usage: review-panel N [cursor|codex ...]" >&2; exit 2; }
 shift
@@ -86,22 +102,9 @@ if [[ $full_review == false && -f $main/$SHIPLINE_STATE_FOLDER/review-$number.co
   python3 -B "$here/conflict_review.py" panel "$main/$SHIPLINE_STATE_FOLDER" "$number" "$inputs" "$head" <<<"$reviews"
   scope_result=$?
   if ((scope_result == 0)); then
-    # The repository's own test selectors, in its main checkout's `scripts/workflow`. Without
-    # one there is no selection: the whole server suite, and no browser test chosen here, so CI
-    # runs the whole browser suite; the task says so.
-    selectors=$main/scripts/workflow
-    if ! (cd "$inputs" &&
-        if [[ -f $selectors/server_tests_for_changes.py ]]; then
-          python3 -B "$selectors/server_tests_for_changes.py" "$head^1" --files-from .review/conflict-files.txt > .review/server-tests.json
-        else
-          echo '{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}' > .review/server-tests.json
-        fi &&
-        if [[ -f $selectors/browser_tests_for_changes.py ]]; then
-          python3 -B "$selectors/browser_tests_for_changes.py" "$head^1" --files-from .review/conflict-files.txt > .review/browser-tests.txt
-        else
-          : > .review/browser-tests.txt &&
-            printf '\nNo browser test selection is configured: CI runs the whole browser suite.\n' >> .review/task.md
-        fi); then
+    # The repository's own test selections (`shipline.json`).
+    if ! (cd "$inputs" && select_tests server "$head^1" "${SHIPLINE_COMMAND_SERVER_TESTS_FOR_CHANGES[@]}" > .review/server-tests.json &&
+        select_tests browser "$head^1" "${SHIPLINE_COMMAND_BROWSER_TESTS_FOR_CHANGES[@]}" > .review/browser-tests.txt); then
       git worktree remove --force "$inputs" >/dev/null 2>&1
       echo "could not select tests for the conflict resolution" >&2
       exit 1

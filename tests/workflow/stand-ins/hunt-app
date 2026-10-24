@@ -1,0 +1,4 @@
+#!/bin/bash
+# A stand-in for the repository's `hunt_app` command, which runs the copy of the application a
+# hunt uses and stops it when the hunt stops: the tests read only that a hunt may start.
+exit 0
