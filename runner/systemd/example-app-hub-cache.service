@@ -1,0 +1,12 @@
+[Unit]
+Description=Shared Docker Hub pull-through cache for CI virtual machines
+
+[Service]
+ExecStartPre=-/usr/bin/docker rm -f example-app-hub-cache
+ExecStart=%h/.local/share/example-app-runner/hub-cache.sh
+ExecStopPost=-/usr/bin/docker rm -f example-app-hub-cache
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
