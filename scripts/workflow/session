@@ -162,7 +162,8 @@ find_main_checkout() {
   here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   script_dir=$here
   main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
-  # The repository's state folder and set-up command (`workflow_config.py`), read once.
+  # The repository's state folder and set-up command (`workflow_config.py`), read once a call:
+  # one Python start, which `list` below otherwise avoids.
   local config
   config=$(python3 "$here/workflow_config.py" shell) || exit 1
   eval "$config"

@@ -750,8 +750,12 @@ def test_the_identity_folder_and_repository_of_the_runners_come_from_the_file(
 
 
 _GATE_READS = """
-import json, sys
+import json, subprocess, sys, types
 sys.path.insert(0, "scripts/workflow")
+# A repository's proof helper, so the gate words a squash's proof.
+sys.modules["run_proof"] = types.SimpleNamespace(
+    RECEIPT="Workflow-Proof: ", WHOLE="whole", passed_jobs=lambda parts: {"CI: web"}
+)
 import merge_gate as g
 
 head, tree = "1" * 40, "2" * 40
@@ -759,74 +763,139 @@ names = json.loads(sys.argv[1])
 g.api = lambda path, key=None, **given: [
     {"title": names["merge_tested"], "message": head},
     {"title": names["server_tests"], "message": "whole"},
+    {"title": names["web_suite"], "message": "whole"},
     {"title": names["files_tested"], "message": tree},
     {"title": names["browser_suite"], "message": "whole"},
 ]
 run = {"id": 5, "status": "completed", "conclusion": "success", "run_attempt": 1}
 done = {"status": "completed", "conclusion": "success", "labels": []}
 ci = [
-    {"id": 1, "name": g.CI_PLAN, **done},
-    {"id": 2, "name": g.CI_RESULT, **done},
+    {"id": 1, "name": names["ci_plan"], **done},
+    {"id": 2, "name": names["ci_result"], **done},
     {"id": 3, "name": "CI: server tests", **done},
+    {"id": 8, "name": "CI: web", **done},
 ]
-e2e = [{"id": 4, "name": g.E2E_PLAN, **done}, {"id": 6, "name": "playwright", **done}]
+e2e = [{"id": 4, "name": names["e2e_plan"], **done}, {"id": 6, "name": "playwright", **done}]
 failed = [{"id": 7, "name": "CI: lint", "status": "completed", "conclusion": "failure",
            "labels": ["self-hosted", "example-app-home"]}]
+try:
+    images = g.images_needed("HEAD", "HEAD~1", [], workflow_ref="HEAD")
+except g.Refused:
+    images = None
 print(json.dumps({
     "every server test": g.whole_server_tests(run, ci, head),
     "fewer server tests": g.server_tests_selected(ci),
     "whole browser suite": g.whole_suite(run, e2e, tree),
+    "whole web suite": '"CI: web"' in g.squash_proof(head, tree, {"ci": (run, ci)}),
+    "images by their workflow": images,
     "re-run at home": g._rerunnable(run, failed, first=True),
 }))
 """
 
+_IMAGES_WORKFLOW = """name: Images
+on:
+  pull_request:
+    paths:
+      - "docker/**"
+  push:
+    branches: [main]
+"""
 
-def _gate_reads(workflow: Workflow, titles: dict[str, str]) -> dict[str, bool]:
+
+def _gate_reads(workflow: Workflow, names: dict[str, str]) -> dict[str, bool | None]:
     done = subprocess.run(
-        ["python3", "-B", "-c", _GATE_READS, json.dumps(titles)],
+        ["python3", "-B", "-c", _GATE_READS, json.dumps(names)],
         cwd=workflow.repo,
         env=workflow.env,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+    assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
 
 
-def test_the_gate_reads_the_named_annotation_titles_and_runner_labels(
+def test_the_gate_reads_the_named_checks_titles_workflow_files_and_runner_labels(
     workflow: Workflow,
 ) -> None:
-    default = dict(_DEFAULTS["annotations"])
+    default = {**_DEFAULTS["annotations"], **_DEFAULTS["checks"]}
     named = {
         "merge_tested": "Merge built",
         "files_tested": "Tree tested",
         "server_tests": "Server suite",
         "web_suite": "Web unit suite",
         "browser_suite": "Browser specs",
+        "ci_result": "Build result",
+        "ci_plan": "Build: what to run",
+        "e2e_plan": "Browser: what to run",
+        "images": "Images",
     }
     proven = {
         "every server test": True,
         "fewer server tests": False,
         "whole browser suite": True,
+        "whole web suite": True,
+        "images by their workflow": True,
         "re-run at home": True,
     }
-    unproven = {
-        "every server test": False,
-        "fewer server tests": True,
-        "whole browser suite": False,
-        "re-run at home": False,
-    }
-    # The harness's repository names its home runners and no titles: the defaults count.
+    # A change under docker/ that the image workflow's path filter names.
+    _commit_on_main(
+        workflow,
+        {".github/workflows/images.yml": _IMAGES_WORKFLOW, "docker/app/Dockerfile": "FROM x\n"},
+    )
+    # The harness's repository names its home runners and nothing else: the defaults count.
     assert _gate_reads(workflow, default) == proven
 
+    # The same workflow as container.yml, with every name of the file, in one commit.
+    workflow.git("rm", "--quiet", ".github/workflows/images.yml")
     _commit_on_main(
         workflow,
         {
+            ".github/workflows/container.yml": _IMAGES_WORKFLOW,
+            "docker/app/Dockerfile": "FROM y\n",
             "shipline.json": json.dumps(
-                {"annotations": named, "runner": {"labels": ["example-app-elsewhere"]}}
-            )
+                {
+                    "annotations": {key: named[key] for key in _DEFAULTS["annotations"]},
+                    "checks": {key: named[key] for key in _DEFAULTS["checks"]},
+                    "workflows": {"images": "container.yml"},
+                    "runner": {"labels": ["example-app-elsewhere"]},
+                }
+            ),
         },
     )
 
     assert _gate_reads(workflow, named) == {**proven, "re-run at home": False}
-    assert _gate_reads(workflow, default) == unproven
+    unproven = {
+        "every server test": False,
+        "fewer server tests": True,
+        "whole browser suite": False,
+        "whole web suite": False,
+        "images by their workflow": True,
+        "re-run at home": False,
+    }
+    # The default titles, on checks of the named names: nothing is proven by them.
+    checks = {key: named[key] for key in ("ci_plan", "e2e_plan", "ci_result")}
+    assert _gate_reads(workflow, {**default, **checks}) == unproven
+
+
+def test_without_a_repository_only_what_needs_one_stops(workflow: Workflow) -> None:
+    # The harness's origin is a folder: with no runner settings, nothing names the repository.
+    (workflow.repo / ".github/runner/settings.sh").unlink()
+    scripts = workflow.repo / "scripts/workflow"
+    shell = subprocess.run(
+        ["python3", str(scripts / "workflow_config.py"), "shell"],
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert shell.returncode == 0, shell.stderr
+    assert "SHIPLINE_REPOSITORY=''\n" in shell.stdout
+    assert "SHIPLINE_STATE_FOLDER=.local/workflow\n" in shell.stdout
+
+    listed = workflow.run("list")
+    assert listed.returncode == 0, listed.stderr
+
+    tick = workflow.run_script("tick")
+    assert tick.returncode == 1
+    assert "cannot tell which repository" in tick.stderr

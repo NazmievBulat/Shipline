@@ -1804,7 +1804,9 @@ class Train:
             # Local authorizations and owner questions can change while the tick runs.
             notes = []
             for number in self.queue:
-                root = CONFIG.state(main_checkout() / ".claude/worktrees" / f"ticket-{number}")
+                root = CONFIG.state(
+                    CONFIG.checkout_of(self.path.parent) / ".claude/worktrees" / f"ticket-{number}"
+                )
                 paths = [
                     *root.glob("*.owner-blocked"),
                     *root.glob("*.interaction-blocked"),
@@ -1877,7 +1879,9 @@ class Train:
                 continue
             if self.conflicts.get(number) != pull["headRefOid"]:
                 self.conflicts.pop(number, None)
-            notes = CONFIG.state(main_checkout() / ".claude" / "worktrees" / f"ticket-{number}")
+            notes = CONFIG.state(
+                CONFIG.checkout_of(self.path.parent) / ".claude" / "worktrees" / f"ticket-{number}"
+            )
             # The session running the gate is acting now, whatever note an answered permission
             # dialog or a wake by its own job left behind.
             delegated = (

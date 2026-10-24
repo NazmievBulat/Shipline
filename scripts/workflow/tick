@@ -72,6 +72,12 @@ source "$here/bridge-failed"
 # The repository, its check names, labels and state folder (`workflow_config.py`), read once.
 config=$(python3 "$here/workflow_config.py" shell) || exit 1
 eval "$config"
+if [[ -z $SHIPLINE_REPOSITORY ]]; then
+  echo "cannot tell which repository the workflow works on: shipline.json names none," \
+    ".github/runner/settings.sh is missing or names none, and origin names no GitHub" \
+    "repository" >&2
+  exit 1
+fi
 # priority.jq reads the label names from it.
 export SHIPLINE_CONFIG
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)") || exit 1

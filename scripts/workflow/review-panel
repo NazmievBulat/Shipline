@@ -53,6 +53,7 @@ done
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)") || exit 1
 config=$(python3 "$here/workflow_config.py" shell) || exit 1
 eval "$config"
+[[ -n $SHIPLINE_REPOSITORY ]] || { echo "cannot tell which repository to review in" >&2; exit 1; }
 cd "$main" || exit 1
 task=$(gh pr view "$number" --json title,body,baseRefName,headRefOid) || exit 1
 head=$(jq -er .headRefOid <<<"$task") || exit 1

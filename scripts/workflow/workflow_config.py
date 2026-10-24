@@ -302,9 +302,10 @@ def as_dict(config: Config) -> dict[str, Any]:
 
 
 def shell(config: Config) -> str:
-    """`KEY=value` lines for a Bash script's `eval`: every value, and the file for jq."""
+    """`KEY=value` lines for a Bash script's `eval`: every value, and the file for jq. The
+    repository is empty when nothing names it, and a script that needs it stops on that."""
     values = {
-        "REPOSITORY": config.repository,
+        "REPOSITORY": config.found_repository or "",
         "STATE_FOLDER": config.state_folder,
         "WORKTREE_SETUP": config.worktree_setup,
         "CI_RESULT": config.checks.ci_result,

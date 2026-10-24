@@ -24,8 +24,18 @@ function stateFolder() {
   } catch (error) {
     if (error.code !== "ENOENT") throw error
   }
-  const folder = config.state_folder ?? ".local/workflow"
-  if (typeof folder !== "string" || !folder.trim()) throw new Error("shipline.json: state_folder")
+  if (config === null || typeof config !== "object" || Array.isArray(config)) {
+    throw new Error("shipline.json: the file must be an object")
+  }
+  const folder = "state_folder" in config ? config.state_folder : ".local/workflow"
+  if (
+    typeof folder !== "string" ||
+    !folder.trim() ||
+    folder.startsWith("/") ||
+    folder.split("/").includes("..")
+  ) {
+    throw new Error("shipline.json: state_folder must be a path inside the checkout")
+  }
   return folder
 }
 const notes = `${worktree}/${stateFolder()}/${name}`
