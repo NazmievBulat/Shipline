@@ -40,6 +40,10 @@
 #                               whether that wait is over (the tick does this, to keep its cache)
 #   session finish-ready <ticket-N>
 #                               tell an idle worker whose pull request is ready to finish
+#   session answer-for-owner <ticket-N|review-N|audit-N> <asked>
+#                               type the recommended reply of a question to the owner its
+#                               session marked `Owner only: no`, the one noted as asked at
+#                               <asked> (the tick does this, after a wait)
 #   session running <name>      what the session's Bash tool runs, as JSON, and whether it is
 #                               a wait loop that finds itself (`running_command.py`)
 #   session bridge <ticket-N>   start the bridge of a Codex worker again when it ended while
@@ -129,6 +133,7 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session batch-merged <review-N> <squash>
        session status-check <ticket-N|review-N>
        session finish-ready <ticket-N>
+       session answer-for-owner <ticket-N|review-N|audit-N> <asked>
        session running <ticket-N|audit-N|review-N|hunt-name>
        session bridge <ticket-N>
        session cleanup [hunts]
@@ -1145,6 +1150,32 @@ cmd_nudge_idle() {
   send_prompt "$name" "Pull request ${name#ticket-} is ready, but you have not finished. Finish by the rules: when nothing is left to do, name each ticket pull request this session opened and say that it waits for the owner's start, then say \`worker finished\` on a line of its own."
 }
 
+# The tick's answer, on the owner's behalf, to a question its session marked `Owner only: no`:
+# the recommended reply the stop hook noted (`notify`). Only to the question noted as asked at
+# <asked>, still open, with the session idle on it; never to a Codex worker, to one waiting on a
+# prompt for the owner or stopped on the usage limit. Text of someone else's in the box exits 3,
+# so that the tick passes over the session quietly. The reply counts as the owner's: the
+# session's prompt hook drops the question.
+cmd_answer_for_owner() {
+  local name=$1 asked=$2 notes typed reply
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  require_running "$name"
+  [[ ! -e $notes.codex ]] || die "$name is a Codex worker; its bridge relays"
+  [[ ! -e $notes.interaction-blocked ]] || die "$name is waiting on a prompt for the owner"
+  [[ -e $notes.idle && -r $notes.asking && $(<"$notes.asking") == "$asked" ]] ||
+    die "$name no longer asks that question"
+  reply=$(jq -er --arg asked "$asked" \
+    'select(.asked == $asked and .owner_only == "no") | .reply | strings' "$notes.question" 2>/dev/null) ||
+    die "$name has no reply to give for the owner"
+  ! stopped_on_limit "$name" || die "$name is stopped on the usage limit"
+  read_prompt_box
+  if [[ -n $typed ]] && ! holds_own_text "$name"; then
+    echo "$name has text in its box that was not sent; nothing was typed into it" >&2
+    exit 3
+  fi
+  send_prompt "$name" "$reply"
+}
+
 # What the session's Bash tool runs, as JSON (`running_command.py`).
 cmd_running() {
   local groups
@@ -1464,6 +1495,11 @@ case ${1:-} in
     [[ $# -eq 2 && $2 =~ ^ticket-[0-9]+$ ]] || usage
     find_main_checkout
     cmd_nudge_idle "$2" finish
+    ;;
+  answer-for-owner)
+    [[ $# -eq 3 && $2 =~ ^(ticket|review|audit)-[0-9]+$ && $3 =~ ^[0-9]+\ [0-9]+$ ]] || usage
+    find_main_checkout
+    cmd_answer_for_owner "$2" "$3"
     ;;
   running)
     [[ $# -eq 2 ]] && is_session_name "$2" || usage
