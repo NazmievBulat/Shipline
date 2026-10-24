@@ -26,11 +26,30 @@ def test_ci_runs_four_shards() -> None:
     assert all(_shards().values())
 
 
+def _test_files(root: Path) -> list[str]:
+    """The files pytest collects tests from under `tests/workflow`: its default `python_files`,
+    in every folder below it too."""
+    folder = root / "tests/workflow"
+    found = {*folder.rglob("test_*.py"), *folder.rglob("*_test.py")}
+    return sorted(str(path.relative_to(root)) for path in found)
+
+
 def test_every_test_file_runs_in_exactly_one_shard() -> None:
     listed = [path for files in _shards().values() for path in files]
-    tests = sorted(str(path.relative_to(_ROOT)) for path in (_ROOT / "tests/workflow").glob("test_*.py"))
 
-    assert sorted(listed) == tests
+    assert sorted(listed) == _test_files(_ROOT)
+
+
+def test_a_test_file_in_a_folder_below_is_counted(tmp_path: Path) -> None:
+    below = tmp_path / "tests/workflow/below"
+    below.mkdir(parents=True)
+    (below / "test_nested.py").touch()
+    (below / "nested_test.py").touch()
+
+    assert _test_files(tmp_path) == [
+        "tests/workflow/below/nested_test.py",
+        "tests/workflow/below/test_nested.py",
+    ]
 
 
 def test_ci_runs_only_on_github_s_own_runners() -> None:

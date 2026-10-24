@@ -263,6 +263,9 @@ def _reviews_asked(workflow: Workflow) -> list[str]:
     [
         "https://github.com/example-org/other-app.git",
         "https://github.com/example-org/other-app",
+        "https://github.com/example-org/other-app.git/",
+        # `git clone https://name@github.com/...` keeps the user name in the URL.
+        "https://example-user@github.com/example-org/other-app.git",
         "git@github.com:example-org/other-app.git",
         "ssh://git@github.com/example-org/other-app.git",
     ],
@@ -339,6 +342,15 @@ def test_the_codex_gh_takes_the_repository_from_origin_without_the_runner_settin
     assert own.returncode == 0, own.stderr
     assert own.stdout.strip() == "allowed " + " ".join(_own_body("example-org/other-app"))
     assert other.returncode == 1 and "Codex worker" in other.stderr
+
+
+def test_the_codex_gh_reads_a_user_name_in_origin(workflow: Workflow) -> None:
+    _settings(workflow).unlink()
+    _origin(workflow, "https://example-user@github.com/example-org/other-app.git")
+
+    own = _codex_gh(workflow, *_own_body("example-org/other-app"))
+
+    assert own.returncode == 0, own.stderr
 
 
 def test_the_codex_gh_takes_the_repository_from_the_runner_settings_when_they_are_there(

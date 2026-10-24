@@ -487,7 +487,7 @@ class GitHub:
 @pytest.fixture
 def github(workflow: Workflow) -> Iterator[GitHub]:
     images = workflow.repo / ".github/workflows/images.yml"
-    images.parent.mkdir(parents=True, exist_ok=True)  # The harness copies ci.yml there.
+    images.parent.mkdir(parents=True, exist_ok=True)
     images.write_text('on:\n  pull_request:\n    paths:\n      - "docker/**"\n  push:\n')
     (workflow.repo / "shared.txt").write_text("original\n")
     workflow.git("add", ".github")
