@@ -17,9 +17,11 @@
 #                               effort: low, medium, high, xhigh or max; when left out,
 #                               medium for a worker, high for an audit, and for a reviewer what
 #                               `review-effort N` says; a conflict resolution's reviewer always
-#                               uses high
+#                               uses high, but the effort `conflict_review` names for a small one
 #                               model: opus, sonnet, codex or cloud for workers; the owner's Claude
-#                               default when omitted. Audits and reviewers always use opus.
+#                               default when omitted. Audits and reviewers always use opus, but
+#                               for the reviewer of a small conflict `conflict_review` of
+#                               shipline.json names (`conflict_review.py reviewer`).
 #   session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>]
 #                               name: small letters, digits and dashes; it names the report.
 #                               When left out, a hunt with a plan, by Claude Code, on every
@@ -639,6 +641,21 @@ cmd_start() {
   for other in "ticket-$number" "audit-$number" "review-$number" "codex-$number" "cloud-$number"; do
     ! is_running "$other" || die "$other is already running"
   done
+  if [[ $kind == review ]]; then
+    # A conflict resolution's reviewer is high on Opus, unless shipline.json names the reviewer
+    # of a small conflict and this is one. Chosen under the start lock, with no reviewer running:
+    # the choice is noted for the gate. Any other reviewer's level is `review-effort`'s, below.
+    local choice
+    choice=$(python3 -B "$script_dir/conflict_review.py" reviewer \
+      "$main/$SHIPLINE_STATE_FOLDER" "$number") || choice="high opus"
+    if [[ $prompt == "Review conflict resolution "* ]]; then
+      read -r effort model <<<"$choice"
+      [[ $effort =~ ^(low|medium|high|xhigh|max)$ && $model =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ &&
+         $model != codex && $model != cloud ]] || { effort=high; model=opus; }
+    else
+      rm -f "$main/$SHIPLINE_STATE_FOLDER/review-$number.conflict-reviewer"
+    fi
+  fi
 
   if [[ $model == cloud ]]; then
     start_cloud_worker "$number" "$effort"
