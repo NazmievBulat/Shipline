@@ -1,8 +1,12 @@
 """CI runs every test file in exactly one of its shards, on GitHub's own runners, and its last job,
-`CI`, passes only when every shard passed. A draft pull request runs none of its jobs."""
+`CI`, passes only when every job that ran passed. It writes the merge gate's notes with
+`ci_proof.py`, as the example CI of a repository using Shipline does (examples/ci.yml). A draft
+pull request runs none of its own jobs."""
 
 import importlib
+import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,10 +15,19 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CI = _ROOT / ".github/workflows/ci.yml"
+_EXAMPLE = _ROOT / "examples/ci.yml"
 _SCRIPTS = _ROOT / "scripts/workflow"
 
 # A pull request's run while it is a draft; main's push and the merge queue have no pull request.
 _NOT_A_DRAFT = "github.event_name != 'pull_request' || github.event.pull_request.draft == false"
+
+
+def _job(path: Path, job: str) -> str:
+    """The lines of one job of a workflow, up to the next job."""
+    jobs = path.read_text().split("\njobs:\n", 1)[1]
+    found = re.search(rf"^  {job}:\n.*?(?=^  [\w-]+:$|\Z)", jobs, re.M | re.S)
+    assert found, job
+    return found[0]
 
 
 def _shards() -> dict[int, list[str]]:
@@ -61,21 +74,113 @@ def test_a_test_file_in_a_folder_below_is_counted(tmp_path: Path) -> None:
     ]
 
 
-def test_ci_runs_only_on_github_s_own_runners() -> None:
-    runners = re.findall(r"^\s+runs-on: (.+)$", _CI.read_text(), re.M)
+@pytest.mark.parametrize("path", [_CI, _EXAMPLE], ids=["own", "example"])
+def test_ci_runs_only_on_github_s_own_runners(path: Path) -> None:
+    runners = re.findall(r"^\s+runs-on: (.+)$", path.read_text(), re.M)
 
     assert runners and set(runners) == {"ubuntu-latest"}
-    assert "self-hosted" not in _CI.read_text()
+    assert "self-hosted" not in path.read_text()
 
 
-def test_the_check_the_merge_queue_requires_needs_every_shard() -> None:
-    text = _CI.read_text()
-    job = text[text.index("\n  ci:\n") :]
+# The step that fails the summing-up job when any job that ran did not pass.
+_EVERY_JOB_PASSED = """\
+      - name: Every job that ran passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) echo "a job ended: $result"; exit 1 ;;
+            esac
+          done
+"""
 
-    assert re.search(r"^    name: CI$", job, re.M)
-    assert re.search(r"^    needs: tests$", job, re.M)
-    assert _jobs()["ci"] == f"always() && ({_NOT_A_DRAFT})"
-    assert 'test "${{ needs.tests.result }}" = success' in job
+
+@pytest.mark.parametrize(
+    "path,job,name,condition",
+    [
+        (_CI, "ci", "CI", f"always() && ({_NOT_A_DRAFT})"),
+        (_EXAMPLE, "result", "CI result", "always()"),
+    ],
+    ids=["own", "example"],
+)
+def test_the_summing_up_check_needs_every_job(
+    path: Path, job: str, name: str, condition: str
+) -> None:
+    text = _job(path, job)
+
+    assert re.search(rf"^    name: {name}$", text, re.M)
+    assert re.search(r"^    needs: \[plan, tests\]$", text, re.M)
+    assert _condition(text) == condition
+    assert _EVERY_JOB_PASSED in text
+
+
+@pytest.mark.parametrize("ended", ["success skipped", "success failure", "cancelled success"])
+def test_the_summing_up_check_passes_only_when_every_job_that_ran_passed(ended: str) -> None:
+    script = _EVERY_JOB_PASSED.split("run: |\n", 1)[1]
+    done = subprocess.run(
+        ["bash", "-c", "\n".join(line.removeprefix(" " * 10) for line in script.splitlines())],
+        env={"PATH": "/usr/bin:/bin", "RESULTS": ended},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode == (0 if ended == "success skipped" else 1), done.stdout
+
+
+@pytest.mark.parametrize("path", [_CI, _EXAMPLE], ids=["own", "example"])
+def test_the_planner_writes_the_gate_s_notes_and_main_s_inheritance(path: Path) -> None:
+    plan = _job(path, "plan")
+
+    assert re.search(r'^    name: "CI: what to run"$', plan, re.M)
+    assert "run: python3 scripts/workflow/ci_proof.py notes --whole server_tests\n" in plan
+    assert "        if: github.event_name == 'push'\n" in plan
+    assert "run: python3 scripts/workflow/ci_proof.py inherited ci\n" in plan
+    assert "inherited: ${{ steps.inherited.outputs.inherited || '[]' }}" in plan
+    # The only job that reads more than the repository, and only what main's inheritance reads.
+    assert re.search(r"^    permissions:\n      contents: read\n(?:      #.*\n)*"
+                     r"      actions: read\n      checks: read\n", plan, re.M)
+
+
+_NOT_INHERITED = "!contains(fromJSON(needs.plan.outputs.inherited), 'CI: server tests')"
+
+
+@pytest.mark.parametrize(
+    "path,condition",
+    [
+        (_CI, f"${{{{ ({_NOT_A_DRAFT}) && {_NOT_INHERITED} }}}}"),
+        (_EXAMPLE, f"${{{{ {_NOT_INHERITED} }}}}"),
+    ],
+    ids=["own", "example"],
+)
+def test_the_test_job_runs_the_config_s_command_unless_main_inherited_it(
+    path: Path, condition: str
+) -> None:
+    tests = _job(path, "tests")
+
+    assert re.search(r'^    name: "CI: server tests[" (]', tests, re.M)
+    assert re.search(r"^    needs: plan$", tests, re.M)
+    assert _condition(tests) == condition
+    assert "python3 scripts/workflow/ci_proof.py test" in tests
+
+
+def test_shipline_names_its_own_test_command() -> None:
+    config = json.loads((_ROOT / "shipline.json").read_text())
+
+    assert config["commands"]["test"] == "python -m pytest -rs"
+
+
+def test_the_example_s_jobs_carry_the_config_s_default_names() -> None:
+    text = _EXAMPLE.read_text()
+    names = re.findall(r"^    name: (.+)$", text, re.M)
+
+    assert names == ['"CI: what to run"', '"CI: server tests"', "CI result"]
+    assert re.search(r"^  pull_request:\n  push:\n    branches: \[main\]\n", text, re.M)
+    assert re.search(r"^  workflow_dispatch:$", text, re.M)
+    assert "pull_request_target" not in text
+    assert re.search(r"^permissions:\n  contents: read$", text, re.M)
 
 
 def test_ci_runs_for_pull_requests_main_and_the_merge_queue() -> None:
@@ -92,28 +197,36 @@ def test_ci_runs_for_pull_requests_main_and_the_merge_queue() -> None:
     assert re.search(r"^permissions:\n  contents: read$", _CI.read_text(), re.M)
 
 
-def _jobs() -> dict[str, str | None]:
-    """Each job of ci.yml by its key, with the condition it runs under (its job-level `if`)."""
-    text = _CI.read_text().split("\njobs:\n", 1)[1]
-    found: dict[str, str | None] = {}
-    for key, body in re.findall(r"^  (\w[\w-]*):\n((?:(?:    .*)?\n)*)", text + "\n", re.M):
-        condition = re.search(r"^    if: (.+)$", body, re.M)
-        found[key] = condition[1] if condition else None
-    return found
+def _condition(job: str) -> str | None:
+    """The condition a job runs under (its job-level `if`), a folded one on one line."""
+    found = re.search(r"^    if: (?:>-\n((?:      .*\n)+)|(.+)$)", job, re.M)
+    if not found:
+        return None
+    return found[2] or " ".join(line.strip() for line in found[1].splitlines())
 
 
-def test_ci_has_the_shards_and_the_check_the_merge_queue_requires() -> None:
-    assert sorted(_jobs()) == ["ci", "tests"]
+def _jobs(path: Path) -> list[str]:
+    jobs = path.read_text().split("\njobs:\n", 1)[1]
+    return re.findall(r"^  ([\w-]+):$", jobs, re.M)
+
+
+def test_a_folded_condition_is_read_on_one_line() -> None:
+    job = "  tests:\n    if: >-\n      ${{ one\n      && two }}\n    runs-on: ubuntu-latest\n"
+
+    assert _condition(job) == "${{ one && two }}"
+    assert _condition("  ci:\n    if: always()\n") == "always()"
+    assert _condition("  ci:\n    steps:\n      - if: never\n") is None
 
 
 def test_every_job_is_skipped_while_the_pull_request_is_a_draft() -> None:
     """A draft's run ends at once and takes no runner for the tests; marking the pull request
     ready (`ready_for_review`) starts its run on the current head."""
-    jobs = _jobs()
+    jobs = {job: _condition(_job(_CI, job)) for job in _jobs(_CI)}
 
-    assert jobs["tests"] == _NOT_A_DRAFT
-    assert jobs["ci"] == f"always() && ({_NOT_A_DRAFT})"
-    assert all(condition and _NOT_A_DRAFT in condition for condition in jobs.values())
+    assert sorted(jobs) == ["ci", "plan", "tests"]
+    assert jobs["plan"] == _NOT_A_DRAFT
+    assert all(condition and f"({_NOT_A_DRAFT})" in condition for job, condition in jobs.items()
+               if job != "plan")
 
 
 def test_main_s_push_and_the_merge_queue_are_not_filtered() -> None:
@@ -133,14 +246,16 @@ def gate() -> Any:
         sys.path.remove(str(_SCRIPTS))
 
 
-def _verdict(gate: Any, run: str, shards: str, result: str) -> str:
+def _verdict(gate: Any, run: str, jobs: str, result: str) -> str:
     """The merge gate's verdict of a completed pull request run, its result job by the name the
     gate requires."""
-    parts = [
-        {"id": 2, "name": f"tests ({shard} of 4)", "status": "completed", "conclusion": shards}
+    parts = [{"id": 2, "name": "CI: what to run", "status": "completed", "conclusion": jobs}]
+    parts += [
+        {"id": 3, "name": f"CI: server tests ({shard} of 4)", "status": "completed",
+         "conclusion": jobs}
         for shard in range(1, 5)
     ]
-    parts.append({"id": 3, "name": gate.CI_RESULT, "status": "completed", "conclusion": result})
+    parts.append({"id": 4, "name": gate.CI_RESULT, "status": "completed", "conclusion": result})
     state, _ = gate.verdict(
         {"id": 1, "status": "completed", "conclusion": run, "head_sha": "head"}, parts
     )
