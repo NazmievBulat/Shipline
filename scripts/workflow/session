@@ -64,7 +64,7 @@
 #                               `hunts`, only those of hunts and analysts, which needs no
 #                               answer from GitHub
 #
-# `gh`, `tmux`, `systemd-run`, `claude`, `codex`, `git`, `sleep`, `flock`, `dd` and `nproc` are
+# `gh`, `tmux`, `systemd-run`, `claude`, `codex`, `git`, `sleep`, `flock` and `nproc` are
 # found on the PATH, and the system paths below can be pointed elsewhere, so a test can replace
 # all of them.
 set -euo pipefail
@@ -337,12 +337,10 @@ size_of() {
   if (($1 % 1073741824 == 0)); then echo "$(($1 / 1073741824)) GB"; else megabytes "$1"; fi
 }
 
-# Writes a value to a control group file that must already exist. Sets write_error on failure.
+# Writes a value to a control group file that must already exist (`group_write.py`). Sets
+# write_error on failure; returns 75 when the kernel did only part of it (EAGAIN).
 write_group_file() {
-  local file=$1 value=$2
-  write_error="$file does not exist"
-  [[ -f $file ]] || return 1
-  write_error=$(printf '%s' "$value" | LC_ALL=C dd of="$file" conv=nocreat status=none 2>&1)
+  write_error=$(python3 -B "$script_dir/group_write.py" "$1" "$2" 2>&1)
 }
 
 memory_is_short() {
@@ -1320,8 +1318,8 @@ cmd_squeeze() {
   groups=$(session_groups "$name") || die "$name has no control group of its own"
   while read -r group; do
     held=$(read_number "$group/memory.current") || die "cannot read $group/memory.current"
-    write_group_file "$group/memory.reclaim" "$held" ||
-      [[ $write_error == *"Resource temporarily unavailable"* ]] || die "$write_error"
+    # A reclaim the kernel could do only in part is done; any other refusal is not.
+    write_group_file "$group/memory.reclaim" "$held" || (($? == 75)) || die "$write_error"
   done <<<"$groups"
   echo "$name squeezed: $(megabytes "$(read_number "${groups%%$'\n'*}/memory.current")") held"
 }

@@ -1,5 +1,7 @@
 """`session list`, `squeeze`, `protect` and `unprotect` read and move a session's memory."""
 
+import errno
+import os
 from pathlib import Path
 
 import pytest
@@ -7,17 +9,29 @@ from workflow_harness import Workflow
 
 _MB = 1024 * 1024
 
-_DD_FREED_ONLY_PART = """#!/bin/bash
-cat > /dev/null
-echo "dd: error writing 'memory.reclaim': Resource temporarily unavailable" >&2
-exit 1
-"""
+# How two `dd` implementations word a write the kernel refused with EAGAIN.
+_DD_WORDINGS = {
+    "GNU": "dd: error writing 'memory.reclaim': Resource temporarily unavailable",
+    "other": "dd: IO error: Would block",
+}
 
-_DD_NOT_ALLOWED = """#!/bin/bash
-cat > /dev/null
-echo "dd: failed to open 'memory.reclaim': Permission denied" >&2
-exit 1
-"""
+
+def _dd_says(workflow: Workflow, wording: str) -> None:
+    """A `dd` on the PATH that fails every write with `wording`."""
+    workflow.fake(
+        "dd",
+        f'#!/bin/bash\necho "dd $*" >> "@STATE@/calls.log"\ncat > /dev/null\n'
+        f'echo "{wording}" >&2\nexit 1\n',
+    )
+
+
+def _partial_reclaim(workflow: Workflow, group: Path) -> None:
+    """The kernel frees only part of what the group was asked to give back, and says EAGAIN.
+
+    A `dd` that is not GNU's would word it its own way.
+    """
+    workflow.refuse_write(group / "memory.reclaim", errno.EAGAIN)
+    _dd_says(workflow, _DD_WORDINGS["other"])
 
 
 def _files(folder: Path) -> list[str]:
@@ -88,22 +102,85 @@ def test_squeeze_asks_the_kernel_to_reclaim_all_the_session_holds(workflow: Work
 
 
 def test_squeeze_succeeds_when_the_kernel_could_free_only_part(workflow: Workflow) -> None:
-    workflow.running("ticket-7", held=900 * _MB)
-    workflow.fake("dd", _DD_FREED_ONLY_PART)
+    group = workflow.running("ticket-7", held=900 * _MB)
+    _partial_reclaim(workflow, group)
 
     done = workflow.run("squeeze", "ticket-7")
 
     assert done.returncode == 0, done.stderr
+    assert done.stdout == "ticket-7 squeezed: 900 MB held\n"
+    assert done.stderr == ""
+    # The refusal was met, not passed by.
+    assert (group / "memory.reclaim").read_text() == ""
 
 
-def test_squeeze_fails_when_the_write_is_refused_for_another_reason(workflow: Workflow) -> None:
-    workflow.running("ticket-7", held=900 * _MB)
-    workflow.fake("dd", _DD_NOT_ALLOWED)
+@pytest.mark.parametrize("dd", _DD_WORDINGS)
+def test_what_a_dd_on_the_path_prints_decides_nothing(workflow: Workflow, dd: str) -> None:
+    group = workflow.running("ticket-7", held=900 * _MB)
+    _dd_says(workflow, _DD_WORDINGS[dd])
 
     done = workflow.run("squeeze", "ticket-7")
 
-    assert done.returncode != 0
-    assert "Permission denied" in done.stderr
+    assert done.returncode == 0, done.stderr
+    assert (group / "memory.reclaim").read_text() == str(900 * _MB)
+    assert workflow.calls("dd") == []
+
+
+def test_a_partial_reclaim_of_a_codex_workers_bridge_still_squeezes_its_codex_group(
+    workflow: Workflow,
+) -> None:
+    workflow.add_worktree(7)
+    workflow.notes(7).mkdir(parents=True)
+    (workflow.notes(7) / "ticket-7.codex").touch()
+    bridge = workflow.running("ticket-7", held=900 * _MB)
+    codex = workflow.running("codex-7", held=500 * _MB)
+    _partial_reclaim(workflow, bridge)
+
+    done = workflow.run("squeeze", "ticket-7")
+
+    assert done.returncode == 0, done.stderr
+    assert (bridge / "memory.reclaim").read_text() == ""
+    assert (codex / "memory.reclaim").read_text() == str(500 * _MB)
+
+
+@pytest.mark.parametrize(
+    "error", [errno.EACCES, errno.EINVAL, errno.EBUSY, errno.EIO], ids=errno.errorcode.get
+)
+def test_squeeze_fails_when_the_write_is_refused_for_another_reason(
+    workflow: Workflow, error: int
+) -> None:
+    group = workflow.running("ticket-7", held=900 * _MB)
+    workflow.refuse_write(group / "memory.reclaim", error)
+
+    done = workflow.run("squeeze", "ticket-7")
+
+    assert done.returncode == 1
+    assert done.stderr == f"{group}/memory.reclaim: {os.strerror(error)}\n"
+    assert done.stdout == ""
+
+
+def test_squeeze_fails_when_the_reclaim_file_cannot_be_opened(workflow: Workflow) -> None:
+    group = workflow.running("ticket-7", held=900 * _MB)
+    (group / "memory.reclaim").unlink()
+    (group / "memory.reclaim").mkdir()
+
+    done = workflow.run("squeeze", "ticket-7")
+
+    assert done.returncode == 1
+    assert done.stderr == f"{group}/memory.reclaim: {os.strerror(errno.EISDIR)}\n"
+
+
+@pytest.mark.parametrize("command", ["protect", "unprotect"])
+def test_protection_fails_when_the_kernel_says_eagain(workflow: Workflow, command: str) -> None:
+    """Only a reclaim may stop short; a protection the kernel did not take is not set."""
+    group = workflow.running("ticket-7")
+    workflow.refuse_write(group / "memory.low", errno.EAGAIN)
+
+    done = workflow.run(command, "ticket-7")
+
+    assert done.returncode == 1
+    assert done.stderr == f"{group}/memory.low: {os.strerror(errno.EAGAIN)}\n"
+    assert done.stdout == ""
 
 
 def test_protect_keeps_four_gigabytes_from_being_reclaimed(workflow: Workflow) -> None:

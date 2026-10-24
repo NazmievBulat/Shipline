@@ -42,6 +42,11 @@ Cloud uses the same screen exclusions as Codex: screen changes and unclear tasks
 with no diff stay with local Claude. Test IDs and data-only route lists retain the
 existing exceptions. A cloud-built ticket returns to the cloud for a fix round,
 even after the default changes, subject to the same screen exclusions.
+A ticket's own record, the single word `cloud`, `claude` or `codex` in
+`.local/workflow/worker-program-N`, overrides the default and these fix-round
+markers for that ticket, under the same screen exclusions; only a cloud
+reservation outranks it. A record holding anything else is read as no record,
+and the wake names it once.
 Independent reviewers always stay local.
 
 Cloud starts bypass the local memory and load checks. The tick waits when the
