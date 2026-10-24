@@ -16,17 +16,21 @@ is the same for a person and a cloud worker.
 
 `--run` then runs the repository's push checks (`commands.push_checks`) and each suite that
 has a selection: its `run` command with `{workers}` filled in and the selected files after it,
-none for the whole suite. `--extra-only`, the form for the pre-push hook, runs the suites only,
-and only when `SHIPLINE_CLOUD_WORKER=1`: any other push runs no more than it did before.
+none for the whole suite. They run where CI tests: in place when this branch holds the main it
+was compared with, else in a temporary worktree of HEAD merged with that main (`_tree`); a
+branch that conflicts with it is refused. `--extra-only`, the form for the pre-push hook, runs
+the suites only, and only when `SHIPLINE_CLOUD_WORKER=1`: any other push runs no more than it
+did before.
 
 As root, every suite and probe runs as the unprivileged account `SHIPLINE_CLOUD_TEST_USER`
-names (`runuser -u <account> --`); without one, nothing runs. A suite with a `probe` runs only
-when its probe says a browser can start, and is otherwise left to CI. Each suite reports its
-time and has LIMIT_SECONDS; past it, it gets a TERM, and a KILL GRACE_SECONDS later, and counts
-as timed out. After a timeout of the whole server suite, `--server-part "K of N"` (or
-`SHIPLINE_CLOUD_SERVER_PART`) runs only that part of it, by the server suite's `part`
-argument, as CI parts it; CI runs the rest. A failed or timed-out suite refuses the push, once
-every suite ran.
+names (`runuser -u <account> --`); without one, or when the account cannot write the checkout
+or git does not trust it there, nothing runs. A suite with a `probe` runs only when its probe
+says a browser can start, and is otherwise left to CI. Each suite reports its time and has
+LIMIT_SECONDS; past it, it gets a TERM, and a KILL GRACE_SECONDS later, and counts as timed
+out. After a timeout of the server suite, `--server-part "K of N"` (or
+`SHIPLINE_CLOUD_SERVER_PART`) runs only that part of its selection, by the server suite's
+`part` argument with the selected files after it, as CI parts it; CI runs the rest. A failed
+or timed-out suite refuses the push, once every suite ran.
 
 Exits 0 when the push may go, 1 when it is refused, 2 on a wrong call.
 """
@@ -41,6 +45,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -209,8 +215,8 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _base(named: str | None) -> tuple[str, str]:
-    """Where the change starts, and how to say it."""
+def _base(named: str | None) -> tuple[str, str, str]:
+    """Where the change starts, how to say it, and the main it is tested with."""
     if named is None:
         # Named in full: a single-branch clone's fetch would not update `origin/main`.
         _git(
@@ -222,7 +228,7 @@ def _base(named: str | None) -> tuple[str, str]:
         )
         named = "origin/main"
     base = _git("merge-base", named, "HEAD").strip()
-    return base, f"against {base[:12]}, where this branch left {named}"
+    return base, f"against {base[:12]}, where this branch left {named}", named
 
 
 def _account(run_tests: bool) -> str | None:
@@ -243,6 +249,90 @@ def _account(run_tests: bool) -> str | None:
             f"SHIPLINE_CLOUD_TEST_USER names no unprivileged account: {account!r}"
         ) from None
     return account
+
+
+def _usable(account: str) -> None:
+    """Refuses before any test when the account cannot write the checkout, or git does not
+    trust it as the account: every suite would fail for that, not for the change."""
+    top = Path.cwd()
+    checks = (["test", "-w", str(top)], ["git", "-C", str(top), "rev-parse", "--show-toplevel"])
+    for check in checks:
+        try:
+            done = run(*_as_tester(check, account), timeout=FETCH_SECONDS, errors="replace")
+        except CommandTimeout, OSError:
+            done = None
+        if done is None or done.returncode:
+            raise Refused(
+                f"{account} cannot write {top}, or git does not trust it as {account}: give it "
+                f"the checkout with chown -R {account} {top} and mark it safe for git with "
+                f"git config --global --add safe.directory {top}, as root and as {account}"
+            )
+
+
+def _as(account: str | None, *words: str) -> subprocess.CompletedProcess[str]:
+    """Runs a git step of the merged tree as the account the suites run as."""
+    try:
+        return run(*_as_tester(list(words), account), timeout=FETCH_SECONDS, errors="replace")
+    except (CommandTimeout, OSError) as error:
+        raise Refused(f"{' '.join(words[:2])} failed: {error}") from None
+
+
+@contextmanager
+def _tree(main: str, account: str | None, setup: str) -> Iterator[str | None]:
+    """Where the suites run, as CI tests: here when this branch holds `main`, else a worktree of
+    HEAD merged with it, set up as a session's worktree is and removed after, whatever happens.
+    Yields None for here, else how to say it."""
+    held = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", main, "HEAD"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+    )
+    if held.returncode == 0:
+        yield None
+        return
+    here = Path.cwd()
+    folder = Path(tempfile.mkdtemp(prefix="ci-tests-merged-"))
+    try:
+        if account:
+            entry = pwd.getpwnam(account)
+            os.chown(folder, entry.pw_uid, entry.pw_gid)
+        added = _as(account, "git", "worktree", "add", "--quiet", "--detach", str(folder), "HEAD")
+        if added.returncode:
+            raise Refused(f"cannot make a worktree to merge {main} in: {added.stderr.strip()}")
+        # Not committed: a merge commit would need a name, and nothing keeps it.
+        merged = _as(account, "git", "-C", str(folder), "merge", "--quiet", "--no-commit",
+                     "--no-ff", main)  # fmt: skip
+        if merged.returncode:
+            conflicted = _as(account, "git", "-C", str(folder), "diff", "--name-only",
+                             "--diff-filter=U").stdout.split()  # fmt: skip
+            if conflicted:
+                raise Refused(
+                    f"this branch conflicts with {main} in {' '.join(conflicted)}: "
+                    "merge it into the branch, then push"
+                )
+            raise Refused(f"cannot merge {main} in: {merged.stderr.strip()}")
+        os.chdir(folder)
+        if os.access(setup, os.X_OK) and Path(setup).is_file():
+            code = run_shown(*_as_tester([f"./{setup}"], account), timeout=LIMIT_SECONDS, grace=0)
+            if code != 0:
+                raise Refused(f"the set-up of the merged tree, {setup}, failed")
+        yield f"this branch merged with {main}"
+    finally:
+        os.chdir(here)
+        for words in (
+            _as_tester(["git", "worktree", "remove", "--force", str(folder)], account),
+            ["rm", "-rf", "--", str(folder)],
+            ["git", "worktree", "prune"],
+        ):
+            with suppress(subprocess.TimeoutExpired):
+                subprocess.run(
+                    words,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=FETCH_SECONDS,
+                    check=False,
+                )
 
 
 def main(argv: list[str]) -> int:
@@ -277,6 +367,8 @@ def main(argv: list[str]) -> int:
             )
         account = _account(arguments.run)
         os.chdir(_git("rev-parse", "--show-toplevel").strip())
+        if account:
+            _usable(account)
         push_checks = config.command("push_checks")
         if arguments.run and not arguments.extra_only and push_checks:
             _say("push checks: running")
@@ -284,7 +376,7 @@ def main(argv: list[str]) -> int:
             _say(f"push checks: {outcome} in {_duration(took)}")
             if outcome != "passed":
                 raise Refused("the push checks failed")
-        base, against = _base(arguments.base)
+        base, against, main = _base(arguments.base)
         changed = _git("diff", "--name-only", "--no-renames", "-z", base).split("\0")
         changed = [path for path in changed if path]
         _say(f"ci-tests-for-changes: {against}, {len(changed)} changed files")
@@ -296,51 +388,68 @@ def main(argv: list[str]) -> int:
             _say(f"{suite.name}: {selection}")
         if not arguments.run:
             return 0
-        refused = []
-        for suite, selection in selections:
-            if not selection.whole and not selection.files:
-                continue
-            if suite.probe:
-                error = _probe(suite, account)
-                if error is not None:
-                    who = account or "this user"
-                    _say(f"{suite.name}: left to CI: no browser can start as {who}: {error}")
-                    continue
-            words = _filled(config.words(suite.run), {"workers": str(suite.workers)})
-            # CI parts the whole suite; a selection runs whole, whatever part is named.
-            shard = part if suite.name == SERVER and selection.whole else None
-            if shard:
-                assert suite.part
-                words += _filled(
-                    shlex.split(suite.part), {"shards": str(shard[1]), "shard": str(shard[0])}
-                )
-            elif suite.name == SERVER and part:
-                _say(f"{suite.name}: a selection, not the whole suite, so no part of it is named")
-            if not selection.whole:
-                words += selection.files
-            _say(f"{suite.name}: running" + (f" as {account}" if account else ""))
-            outcome, took = _run(_as_tester(words, account), limit, grace)
-            if outcome == "timed out":
-                _say(
-                    f"{suite.name}: timed out after {_duration(took)}, "
-                    f"the limit is {_duration(limit)}"
-                )
-            elif shard:
-                rest = "; CI runs the rest" if outcome == "passed" else ""
-                _say(
-                    f"{suite.name}: part {shard[0]} of {shard[1]} {outcome} "
-                    f"in {_duration(took)}{rest}"
-                )
-            else:
-                _say(f"{suite.name}: {outcome} in {_duration(took)}")
-            if outcome != "passed":
-                refused.append(f"{suite.name} {outcome}")
+        if not any(selection.whole or selection.files for _, selection in selections):
+            return 0
+        with _tree(main, account, config.worktree_setup) as merged:
+            refused = _suites(selections, config, part, account, merged, limit, grace)
         if refused:
             raise Refused(", ".join(refused))
     except (Refused, workflow_config.ConfigError) as error:
         _say(f"the push is refused: {error}")
         return 1
     return 0
+
+
+def _suites(
+    selections: list[tuple[Suite, Selection]],
+    config: workflow_config.Config,
+    part: tuple[int, int] | None,
+    account: str | None,
+    merged: str | None,
+    limit: float,
+    grace: float,
+) -> list[str]:
+    """Runs each suite that has a selection, in the current folder; what failed."""
+    refused = []
+    for suite, selection in selections:
+        if not selection.whole and not selection.files:
+            continue
+        if suite.probe:
+            error = _probe(suite, account)
+            if error is not None:
+                who = account or "this user"
+                _say(f"{suite.name}: left to CI: no browser can start as {who}: {error}")
+                continue
+        words = _filled(config.words(suite.run), {"workers": str(suite.workers)})
+        # A part of whatever the server suite selected, the selected files after the part.
+        shard = part if suite.name == SERVER else None
+        if shard:
+            assert suite.part
+            words += _filled(
+                shlex.split(suite.part), {"shards": str(shard[1]), "shard": str(shard[0])}
+            )
+        if not selection.whole:
+            words += selection.files
+        _say(
+            f"{suite.name}: running"
+            + (f" on {merged}" if merged else "")
+            + (f" as {account}" if account else "")
+        )
+        outcome, took = _run(_as_tester(words, account), limit, grace)
+        if outcome == "timed out":
+            _say(
+                f"{suite.name}: timed out after {_duration(took)}, the limit is {_duration(limit)}"
+            )
+        elif shard:
+            rest = "; CI runs the rest" if outcome == "passed" else ""
+            _say(
+                f"{suite.name}: part {shard[0]} of {shard[1]} {outcome} in {_duration(took)}{rest}"
+            )
+        else:
+            _say(f"{suite.name}: {outcome} in {_duration(took)}")
+        if outcome != "passed":
+            refused.append(f"{suite.name} {outcome}")
+    return refused
 
 
 if __name__ == "__main__":

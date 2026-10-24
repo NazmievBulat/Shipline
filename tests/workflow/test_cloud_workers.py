@@ -100,10 +100,12 @@ def test_the_cloud_worker_is_told_to_push_as_one_so_its_push_runs_cis_tests(
     ) in sentence
     assert (
         "When this container runs as root, also export SHIPLINE_CLOUD_TEST_USER naming the "
-        "unprivileged user the tests run as."
+        "unprivileged user the tests run as, give that user the checkout with chown -R, and "
+        "mark the checkout safe for git with git config --global --add safe.directory, as root "
+        "and as that user."
     ) in sentence
     assert (
-        'Only after the whole server suite timed out in a push, export '
+        'Only after the server suite timed out in a push, export '
         'SHIPLINE_CLOUD_SERVER_PART="1 of 4" (or another part) to run that part as CI parts '
         "it, and unset it once it is not needed."
     ) in sentence

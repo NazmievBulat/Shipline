@@ -753,7 +753,7 @@ def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> d
 _TEXTS_BEFORE = {
     "worker": "a1ada6cfb39264bb4b6501807f3feb74fbf51c2ea3c32c5b5b56f77a23838b36",
     # Since it tells a cloud worker to push as one, so its push runs CI's tests.
-    "cloud": "3610c7e249e26366012b90235d8251c806ec1040dec51cbca5c7690da05f13d6",
+    "cloud": "86629eb1011172ab215e6c2fe4695f88abe6e5769825a8a59f0e8cb79e1c41b3",
     "review": "ea932fce613e8e9c075daa884a2adee29b64ee5610f1fcd922f27aa6cd39c49a",
     "wake": "af21558438c99d72e165c8fb8ab4febdd80204e43f532a399697b4131441d080",
 }

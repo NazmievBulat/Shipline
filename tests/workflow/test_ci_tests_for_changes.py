@@ -228,7 +228,19 @@ echo "runuser $*" >> "@STATE@/calls.log"
 [ "$1" = -u ] && [ "$3" = -- ] || exit 2
 account=$2
 shift 3
+if [ "$1" = test ] && [ -e "@STATE@/account-cannot-write" ]; then exit 1; fi
+if [ "$1" = git ] && [ -e "@STATE@/account-untrusted" ]; then
+  echo "fatal: detected dubious ownership in repository" >&2
+  exit 128
+fi
 RAN_AS=$account exec "$@"
+"""
+
+# Runs as a suite and says where: the top of its tree, and whether that tree holds what main
+# gained since the branch left it.
+_WHERE = """#!/bin/bash
+echo "where $(git rev-parse --show-toplevel) billing=$([ -f server/billing.py ] && echo yes || echo no)" >> "@STATE@/calls.log"
+[ ! -e "@STATE@/fail-where" ] || exit 1
 """
 
 _PUSH_CHECKS = """#!/bin/bash
@@ -263,6 +275,7 @@ def _cloud_repository(workflow: Workflow, suites: dict[str, Any] = _SUITES) -> N
         ("suite-run", _RUNNER),
         ("browser-starts", _PROBE),
         ("runuser", _RUNUSER),
+        ("where-run", _WHERE),
         ("push-checks", _PUSH_CHECKS),
     ):
         workflow.fake(tool, text)
@@ -528,7 +541,10 @@ def test_as_root_every_suite_and_the_probe_run_as_the_test_account(workflow: Wor
         "run server --workers 4 server/orders_test.py as=nobody",
         "run browser --workers=2 web/cart.spec.ts as=nobody",
     ]
+    top = str(workflow.repo)
     assert workflow.calls("runuser") == [
+        f"runuser -u nobody -- test -w {top}",
+        f"runuser -u nobody -- git -C {top} rev-parse --show-toplevel",
         "runuser -u nobody -- suite-run server --workers 4 server/orders_test.py",
         "runuser -u nobody -- browser-starts",
         "runuser -u nobody -- suite-run browser --workers=2 web/cart.spec.ts",
@@ -664,15 +680,19 @@ def test_a_local_push_with_a_part_left_set_runs_no_extra_suite(workflow: Workflo
     assert _runs(workflow) == []
 
 
-def test_a_part_applies_only_to_the_whole_server_suite(workflow: Workflow) -> None:
+def test_a_part_applies_to_a_selection_of_the_server_suite_too(workflow: Workflow) -> None:
     _cloud_repository(workflow, {"server": _SUITES["server"]})
-    _change(workflow, "server/orders.py")
+    _change(workflow, "server/orders.py", "server/users.py")
 
     done = _run(workflow, "--run", "--extra-only", "--server-part", "1 of 4", env=_CLOUD)
 
     assert done.returncode == 0, done.stdout + done.stderr
-    assert _runs(workflow) == ["run server --workers 4 server/orders_test.py as=self"]
-    assert "server: a selection, not the whole suite, so no part of it is named" in done.stdout
+    assert _runs(workflow) == [
+        "run server --workers 4 --shard 1/4 server/orders_test.py server/users_test.py as=self"
+    ]
+    assert re.search(
+        r"^server: part 1 of 4 passed in 0m [0-9]+s; CI runs the rest$", done.stdout, re.MULTILINE
+    )
 
 
 @pytest.mark.parametrize(
@@ -747,5 +767,122 @@ def test_as_root_an_account_that_is_no_unprivileged_one_is_refused(
 
     assert done.returncode == 1
     assert f"SHIPLINE_CLOUD_TEST_USER names no unprivileged account: {account!r}" in done.stdout
+    assert workflow.calls("push-checks") == []
+    assert _runs(workflow) == []
+
+
+def _where(workflow: Workflow) -> list[str]:
+    return workflow.calls("where ")
+
+
+def _worktrees(workflow: Workflow) -> list[str]:
+    listed = workflow.git("worktree", "list", "--porcelain").splitlines()
+    return [line.removeprefix("worktree ") for line in listed if line.startswith("worktree ")]
+
+
+_WHERE_SUITE = {"server": {**_SUITES["server"], "run": "where-run"}}
+
+
+def test_a_branch_that_holds_main_runs_its_suites_in_place(workflow: Workflow) -> None:
+    _cloud_repository(workflow, _WHERE_SUITE)
+    _change(workflow, "server/orders.py")
+
+    done = _run(workflow, "--run", "--extra-only", env=_CLOUD)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _where(workflow) == [f"where {workflow.repo} billing=no"]
+    assert workflow.calls("worktree-setup") == []
+    assert _worktrees(workflow) == [str(workflow.repo)]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_when_main_moved_on_the_suites_run_on_the_branch_merged_with_it(
+    workflow: Workflow, fails: bool
+) -> None:
+    _cloud_repository(workflow, _WHERE_SUITE)
+    _change(workflow, "server/orders.py")
+    _main_moves_on(workflow)
+    head = workflow.git("rev-parse", "HEAD")
+    if fails:
+        (workflow.state / "fail-where").touch()
+
+    done = _run(workflow, "--run", "--extra-only", env=_CLOUD)
+
+    assert done.returncode == (1 if fails else 0), done.stdout + done.stderr
+    [where] = _where(workflow)
+    tree = where.split()[1]
+    assert tree != str(workflow.repo)
+    assert where.endswith("billing=yes")
+    # Set up as a session's worktree is, then removed, and the branch left as it was.
+    assert len(workflow.calls("worktree-setup")) == 1
+    assert not Path(tree).exists()
+    assert _worktrees(workflow) == [str(workflow.repo)]
+    assert workflow.git("rev-parse", "HEAD") == head
+    assert workflow.git("status", "--porcelain") == ""
+    assert "server: running on this branch merged with origin/main" in done.stdout
+
+
+def test_a_suite_stopped_on_the_merged_tree_still_removes_it(workflow: Workflow) -> None:
+    _cloud_repository(workflow, {"server": _SUITES["server"]})
+    _change(workflow, "server/orders.py")
+    _main_moves_on(workflow)
+    (workflow.state / "hang-server").touch()
+
+    done = _run(
+        workflow,
+        "--run",
+        "--extra-only",
+        env={**_CLOUD, "WORKFLOW_CLOUD_SUITE_SECONDS": "1", "WORKFLOW_CLOUD_SUITE_GRACE": "1"},
+    )
+
+    assert done.returncode == 1
+    assert "server: timed out after" in done.stdout
+    assert _worktrees(workflow) == [str(workflow.repo)]
+
+
+def test_a_branch_that_conflicts_with_main_is_refused_and_told_to_merge_it(
+    workflow: Workflow,
+) -> None:
+    _cloud_repository(workflow, _WHERE_SUITE)
+    (workflow.repo / "server/orders.py").write_text("the branch's\n")
+    workflow.git("commit", "--quiet", "-am", "feat: the branch's orders")
+    workflow.git("checkout", "--quiet", "main")
+    (workflow.repo / "server/orders.py").write_text("main's\n")
+    workflow.git("commit", "--quiet", "-am", "feat: main's orders")
+    workflow.git("push", "--quiet", "origin", "main")
+    workflow.git("checkout", "--quiet", "ticket/change")
+
+    done = _run(workflow, "--run", "--extra-only", env=_CLOUD)
+
+    assert done.returncode == 1
+    assert done.stdout.endswith(
+        "the push is refused: this branch conflicts with origin/main in server/orders.py: "
+        "merge it into the branch, then push\n"
+    ), done.stdout
+    assert _where(workflow) == []
+    assert _worktrees(workflow) == [str(workflow.repo)]
+
+
+@pytest.mark.parametrize("cannot", ["account-cannot-write", "account-untrusted"])
+def test_as_root_a_checkout_the_account_cannot_use_is_refused_with_the_remedy(
+    workflow: Workflow, cannot: str
+) -> None:
+    _cloud_repository(workflow)
+    _change(workflow, "server/orders.py")
+    (workflow.state / cannot).touch()
+
+    done = _run(
+        workflow,
+        "--run",
+        env={**_CLOUD, "WORKFLOW_EUID": "0", "SHIPLINE_CLOUD_TEST_USER": "nobody"},
+    )
+
+    top = workflow.repo
+    assert done.returncode == 1
+    assert done.stdout.endswith(
+        f"the push is refused: nobody cannot write {top}, or git does not trust it as nobody: "
+        f"give it the checkout with chown -R nobody {top} and mark it safe for git with "
+        f"git config --global --add safe.directory {top}, as root and as nobody\n"
+    ), done.stdout
     assert workflow.calls("push-checks") == []
     assert _runs(workflow) == []

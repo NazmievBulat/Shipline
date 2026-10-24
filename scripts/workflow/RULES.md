@@ -317,14 +317,20 @@ is skipped for anyone. The suites are the `cloud_pre_push.suites` of `shipline.j
 chosen by its selection command as CI chooses it, against where the branch left main, with
 the working changes and without the local cap of three browser specs.
 `shipline ci-tests-for-changes` alone prints that choice and why, the same for anyone;
-`--run` runs the repository's push checks (`commands.push_checks`) first.
-When the worker runs as root, it exports `SHIPLINE_CLOUD_TEST_USER`, and every suite and
-browser probe runs as that unprivileged account; as root without it, the push is refused
-before any test runs. Each suite reports its time and has 25 minutes; a failed or timed-out
-suite refuses the push. When no browser can start, the browser suite is left to CI with the
-probe's error. Only after the whole server suite timed out does the worker export
-`SHIPLINE_CLOUD_SERVER_PART="1 of 4"` (or another part), which runs that part as CI parts it
-and leaves the rest to CI; a failing part still refuses. It unsets it once it is not needed.
+`--run` runs the repository's push checks (`commands.push_checks`) first. The suites test
+what CI tests: when main has moved on since the branch left it, they run in a temporary
+worktree of the branch merged with the fetched main, set up by the repository's setup command
+and removed afterwards; a branch that conflicts with main is refused and told to merge it.
+When the worker runs as root, it exports `SHIPLINE_CLOUD_TEST_USER`, gives that unprivileged
+account the checkout (`chown -R`) and marks it safe for git (`safe.directory`), as root and as
+the account; every suite and browser probe runs as the account. As root without it, or with
+an account that cannot write the checkout or that git does not trust there, the push is
+refused before any test runs, naming the remedy. Each suite reports its time and has 25
+minutes; a failed or timed-out suite refuses the push. When no browser can start, the browser
+suite is left to CI with the probe's error. Only after the server suite timed out does the
+worker export `SHIPLINE_CLOUD_SERVER_PART="1 of 4"` (or another part), which runs that part
+of the selected server tests as CI parts it and leaves the rest to CI; a failing part still
+refuses. It unsets it once it is not needed.
 Reports and failed deliveries are remembered locally. The workflow does not read cloud
 transcripts or stop cloud sessions; the owner answers in the cloud session.
 
