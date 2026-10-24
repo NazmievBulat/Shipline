@@ -1,7 +1,6 @@
 """One machine-wide merge gate. Only the standard library and git/gh are needed."""
 
 import fcntl
-import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -1250,17 +1249,129 @@ def images_needed(
         return True
     # Use the actual workflow's path filter, without a second maintained list of image inputs.
     workflow = git("show", f"{workflow_ref or base}:.github/workflows/{WORKFLOW_FILES['images']}")
-    section = workflow.split("  pull_request:", 1)[1].split("  push:", 1)[0]
-    patterns = re.findall(r'^      - "([^"]+)"$', section, flags=re.MULTILINE)
-    if not patterns:
-        raise Refused("could not read the Images workflow path filter")
-    # NUL delimiters preserve filenames that Git would otherwise quote or split across lines.
+    matches = path_filter(pull_request_paths(workflow))
+    # NUL delimiters preserve filenames that Git would otherwise quote or split across lines;
+    # the last NUL ends the list, and the empty entry after it is no file.
     paths = (
         command("git", "ls-tree", "-r", "--name-only", "-z", head, errors="surrogateescape")
         if base == "0" * 40
         else command("git", "diff", "--name-only", "-z", f"{base}...{head}", errors="surrogateescape")
-    ).stdout.split("\0")
-    return any(fnmatch.fnmatchcase(path, pattern) for path in paths for pattern in patterns)
+    ).stdout.split("\0")[:-1]
+    return any(matches(path) for path in paths)
+
+
+def pull_request_paths(workflow: str) -> list[str]:
+    """The `paths:` of a workflow's `pull_request:` trigger, each entry as YAML reads it."""
+    if "  pull_request:" not in workflow:
+        raise Refused("could not read the Images workflow path filter")
+    section = workflow.split("  pull_request:", 1)[1].split("  push:", 1)[0]
+    entries = re.findall(r'^      - "((?:[^"\\]|\\.)+)"$', section, flags=re.MULTILINE)
+    try:
+        # A double-quoted YAML entry escapes as JSON does: "\\" is one backslash.
+        patterns = [json.loads(f'"{entry}"') for entry in entries]
+    except json.JSONDecodeError as error:
+        raise Refused(f"could not read the Images workflow path filter: {error}") from error
+    if not patterns:
+        raise Refused("could not read the Images workflow path filter")
+    return patterns
+
+
+def path_filter(patterns: list[str]) -> Callable[[str], bool]:
+    """Whether a changed file starts the workflow, by GitHub's filter pattern rules.
+
+    The patterns are read in order and the last one that matches a file decides: a pattern
+    starting with `!` takes the file back, so negated patterns alone match nothing.
+    """
+    rules = [
+        (pattern.startswith("!"), _filter_pattern(pattern.removeprefix("!")))
+        for pattern in patterns
+    ]
+
+    def matches(path: str) -> bool:
+        started = False
+        for negated, rule in rules:
+            if rule.fullmatch(path):
+                started = not negated
+        return started
+
+    return matches
+
+
+def _filter_pattern(pattern: str) -> re.Pattern[str]:
+    """One filter pattern as a regular expression. `*` is any characters but `/`, `**` is any
+    characters, and `**/` is zero or more folders. `?` and `+` make what stands before them
+    zero or one, or one or more, of it. `[...]` is one character of its set, with `-` ranges.
+    A backslash makes the next character itself, and every other character is itself.
+
+    GitHub does not document a `?` or `+` with nothing before it, or a `[` that no `]` closes
+    (nor an empty `[]`): each of those is read as the character itself.
+    """
+    # Each part is what one piece of the pattern matches and how often it may stand: at least
+    # `fewest` (0 or 1) times, and at most once or, with `many`, any number of times. Repeating
+    # a part only changes those two, so no repetition ever nests inside another.
+    parts: list[tuple[str, int, bool]] = []
+    at = 0
+    while at < len(pattern):
+        char = pattern[at]
+        if pattern.startswith("**/", at):
+            # Zero or more folders: repeating it, however, is still that.
+            parts.append(("(?:.*/)?", 1, False))
+            at += 3
+            continue
+        if pattern.startswith("**", at):
+            parts.append((".", 0, True))
+            at += 2
+            continue
+        at += 1
+        if char == "*":
+            parts.append(("[^/]", 0, True))
+        elif char in "?+" and parts:
+            expression, fewest, many = parts[-1]
+            if expression != "(?:.*/)?":
+                parts[-1] = (expression, 0, many) if char == "?" else (expression, fewest, True)
+        elif char == "\\" and at < len(pattern):
+            parts.append((re.escape(pattern[at]), 1, False))
+            at += 1
+        elif char == "[" and (found := _filter_set(pattern, at)):
+            expression, at = found
+            parts.append((expression, 1, False))
+        else:
+            parts.append((re.escape(char), 1, False))
+    times = {(1, False): "", (0, False): "?", (1, True): "+", (0, True): "*"}
+    return re.compile(
+        "".join(expression + times[fewest, many] for expression, fewest, many in parts),
+        flags=re.DOTALL,
+    )
+
+
+def _filter_set(pattern: str, at: int) -> tuple[str, int] | None:
+    """The set that starts at `at`, just after a `[`, as one character of a regular expression,
+    and where the pattern goes on after its `]`; None when no `]` closes a set of at least one
+    character. A backslash makes the next character itself. A `-` between two characters is
+    the range from the first to the second; any other `-`, and a range that runs backwards,
+    is the characters themselves."""
+    chars: list[tuple[str, bool]] = []
+    while at < len(pattern) and (pattern[at] != "]" or not chars):
+        if pattern[at] == "]":
+            return None
+        escaped = pattern[at] == "\\" and at + 1 < len(pattern)
+        at += escaped
+        chars.append((pattern[at], escaped))
+        at += 1
+    if at == len(pattern):
+        return None
+    members: list[str] = []
+    index = 0
+    while index < len(chars):
+        char = chars[index][0]
+        last = chars[index + 2][0] if index + 2 < len(chars) else ""
+        if chars[index + 1 : index + 2] == [("-", False)] and char <= last:
+            members.append(f"{re.escape(char)}-{re.escape(last)}")
+            index += 3
+        else:
+            members.append(re.escape(char))
+            index += 1
+    return f"[{''.join(members)}]", at + 1
 
 
 def browser_needed(base: str, merge: str) -> bool:

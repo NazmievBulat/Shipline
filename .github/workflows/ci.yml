@@ -59,6 +59,7 @@ jobs:
               tests/workflow/test_github_budget.py
               tests/workflow/test_input_box.py
               tests/workflow/test_install_timer.py
+              tests/workflow/test_path_filter.py
               tests/workflow/test_push_slots.py
               tests/workflow/test_review_panel.py
               tests/workflow/test_session_start.py
