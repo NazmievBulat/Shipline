@@ -84,6 +84,10 @@ case ${1:-} in
     shift
     ;;
 esac
+# Anchor an explicit relative config before --repo can change the current directory.
+if [[ -n ${SHIPLINE_CONFIG:-} && $SHIPLINE_CONFIG != /* && $SHIPLINE_CONFIG != '~/'* ]]; then
+  export SHIPLINE_CONFIG=$PWD/$SHIPLINE_CONFIG
+fi
 if [[ -n ${SHIPLINE_REPO:-} ]]; then
   # Absolute, so a script that changes its folder still names the same repository.
   [[ $SHIPLINE_REPO == /* ]] || SHIPLINE_REPO=$PWD/$SHIPLINE_REPO
@@ -117,15 +121,15 @@ for known in "${CONFIGURED[@]}"; do
   # failure. CI runs the whole suite.
   case $command in
     *-tests-for-changes)
-      echo "this repository names no $key command in shipline.json: no test is selected, and CI runs the whole suite" >&2
+      echo "this repository names no $key command in ${SHIPLINE_CONFIG:-shipline.json}: no test is selected, and CI runs the whole suite" >&2
       exit 0
       ;;
     pre-train-checks)
-      echo "this repository names no $key command in shipline.json: there is no check to fail" >&2
+      echo "this repository names no $key command in ${SHIPLINE_CONFIG:-shipline.json}: there is no check to fail" >&2
       exit 0
       ;;
   esac
-  echo "this repository names no $key command in shipline.json" >&2
+  echo "this repository names no $key command in ${SHIPLINE_CONFIG:-shipline.json}" >&2
   exit 1
 done
 echo "shipline: unknown command $command" >&2

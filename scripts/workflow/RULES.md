@@ -121,7 +121,11 @@ and a gate call on its current head. A member whose prefix failed once every mem
 it merged is blocked as a failed check, and its own gate call reports it; the prefixes behind
 it hold its change, so they are built again from the new front without it, and their failure
 is not their members' own. A green rerun of that failed run, on the tree main has now,
-restores its place and is its next prefix. A member that conflicts with one ahead of it waits
+restores its place and is its next prefix; prefixes already built on the current main are
+kept while their members stay ready at the same heads, and the restored member tests on main
+alone beside them. A kept prefix may merge first once it passes while the restored member's
+prefix is pending; every squash must still match its prefix's tested tree. A member that
+conflicts with one ahead of it waits
 for its own turn. A main changed from outside the gate, a changed or unready member, or a
 line now served in another order drops the prefixes from the first one that no longer
 stands, and they are built again. A scratch run that passed without proving
@@ -348,10 +352,22 @@ subagent when
 `codex review` would run locally. It pushes only to its pull request's branch, never
 force-pushes and never skips or weakens the pre-push hook. It reports the start, first push,
 blockers with their exact errors, owner questions and ready by pull request comments beginning with
-`<!-- cloud-worker -->`. It never ends its turn to wait for an answer; it polls the pull
-request's comments every three minutes instead. The tick relays the reports without a model:
-a final question rings the phone once through `notify` and appears in the wake as `asking the
-owner: cloud-N`; a `Blocked` report is told to the orchestrator once. A final `worker finished`
+`<!-- cloud-worker -->`. A question ends as "Asking the owner" says: the choices one line each,
+each beginning with its reply word, the line `Owner only: yes` or `Owner only: no`, and the
+reply words, the recommended one first. An answer it is given in its session it reports on the
+pull request before it carries on. It never ends its turn to wait for an answer; it polls the
+pull request's comments every three minutes instead. The tick relays the reports without a
+model: a final question rings the phone once through `notify` and appears in the wake as
+`asking the owner: cloud-N`; a `Blocked` report is told to the orchestrator once. A question
+marked `Owner only: no` with no answer after `answer_for_owner_after_minutes` gets its
+recommended reply as in "Asking the owner", once, in a comment of the tick,
+`<!-- shipline-orchestrator --> answered for the owner: <reply word>`, quoting that choice's
+line when it has one, and its worker is woken as after any answer. An answer from the owner or
+the orchestrator that comes first wins, the same words asked again after any answer wait for the
+owner, and only a question from an account that may write to the repository is answered. One
+without the line, without a reply word, or with a recommendation other than its first reply word
+(a choice marked recommended, or a sentence that recommends another), waits for the owner and
+is named in the wake once; the morning check-in lists the answers. A final `worker finished`
 removes the record only once the pull request is ready, letting the normal independent review
 start. Reports and failed deliveries are remembered locally. The workflow does not read cloud
 transcripts or stop cloud sessions; the owner answers in the cloud session or on the pull
@@ -750,10 +766,15 @@ of its head (it waits while one still runs), and for each failed, timed-out or c
 failing test is the first pytest line `FAILED <file>.py::<test>` (or `ERROR`), else the first
 Vitest `FAIL <file>.test.<ext> > <name>`, else the first Playwright
 `1) [project] › <file>.spec.ts:L:C › <name>`; with none, it is "not reported". A job failed
-for its runners when it timed out, or when it names no test and its log or annotations say
-that the runner was lost, disconnected or shut down, lost communication or could not be
+for its runners when it names no failing test and either it timed out or its log or annotations
+say that the runner was lost, disconnected or shut down, lost communication or could not be
 contacted, that the job exceeded its time, or "Failed to download action" or "Internal server
-error".
+error"; also a registry or BuildKit transport error ("short read" or "unexpected EOF" while
+resolving, pulling or exporting an image layer or manifest, including "failed to compute cache
+key", or "connection reset by peer", "i/o timeout" or "TLS handshake timeout" against a
+registry or pull-through cache), with no failing test found. The same classification applies
+to a prefix's and a whole suite's scratch runs. A run still in progress waits until every job
+completes before its failed jobs can be re-run; the handoff and merge-line place are kept.
 - A job that failed on a test of its own: the tick makes the pull request a draft, revokes its
   handoff, keeps its place in the line as a blocked member, and starts a worker at medium
   effort whose sentence names the job, its run and the first failing test (below). The wake

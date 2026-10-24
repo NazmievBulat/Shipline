@@ -308,6 +308,22 @@ if [[ "$1" == api && $2 == repos/*/actions/runs[?]branch=*'&per_page=30' && $# -
   echo '{"total_count": 0, "workflow_runs": []}'
   exit 0
 fi
+# A comment posted on a pull request joins its comments, as GitHub lists them next, written by
+# the login `gh` uses; its id is printed.
+if [[ "$1 $2 $3 $5 $7 $8" == "api -X POST -f --jq .id" && $4 == repos/*/issues/*/comments ]]; then
+  [ ! -e "@STATE@/fail-gh-comment" ] || exit 1
+  number=${4%/comments}
+  number=${number##*/}
+  comments="@STATE@/comments-$number.json"
+  [ -f "$comments" ] || echo '[[]]' > "$comments"
+  jq --arg body "${6#body=}" '.[-1] += [{id: (([.[][].id] | max // 0) + 1), body: $body,
+    created_at: "2026-10-19T18:00:00Z", user: {login: "example-owner"}}]' "$comments" \
+    > "$comments.new" && mv "$comments.new" "$comments"
+  # GitHub kept the comment, but its answer was lost.
+  [ ! -e "@STATE@/lose-gh-comment-answer" ] || exit 1
+  jq '[.[][].id] | max' "$comments"
+  exit 0
+fi
 asked="label list --limit 1000 --json name --jq ${8}"
 if [ "$*" = "$asked" ] && [ ! -e "@STATE@/fail-gh-labels" ]; then
   touch "@STATE@/labels"
