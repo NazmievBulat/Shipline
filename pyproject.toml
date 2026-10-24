@@ -10,7 +10,7 @@ dependencies = []
 test = ["pytest==9.1.1", "pytest-timeout==2.4.0", "pytest-xdist==3.8.0"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests/workflow"]
+testpaths = ["tests/workflow", "tests/runner"]
 pythonpath = ["tests"]
 timeout = 120
 # A passing test leaves no temporary files; the last two runs keep those of their failures.

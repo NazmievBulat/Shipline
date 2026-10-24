@@ -16,7 +16,9 @@ def _shards() -> dict[int, list[str]]:
         if found := re.fullmatch(r"\s+- shard: (\d+)", line):
             shard = int(found[1])
             shards[shard] = []
-        elif shard is not None and (found := re.fullmatch(r"\s+(tests/workflow/\S+\.py)", line)):
+        elif shard is not None and (
+            found := re.fullmatch(r"\s+(tests/(?:workflow|runner)/\S+\.py)", line)
+        ):
             shards[shard].append(found[1])
     return shards
 
@@ -27,10 +29,11 @@ def test_ci_runs_four_shards() -> None:
 
 
 def _test_files(root: Path) -> list[str]:
-    """The files pytest collects tests from under `tests/workflow`: its default `python_files`,
-    in every folder below it too."""
-    folder = root / "tests/workflow"
-    found = {*folder.rglob("test_*.py"), *folder.rglob("*_test.py")}
+    """The files pytest collects tests from under `tests/workflow` and `tests/runner`: its default
+    `python_files`, in every folder below them too."""
+    found = set()
+    for folder in (root / "tests/workflow", root / "tests/runner"):
+        found |= {*folder.rglob("test_*.py"), *folder.rglob("*_test.py")}
     return sorted(str(path.relative_to(root)) for path in found)
 
 
@@ -45,8 +48,11 @@ def test_a_test_file_in_a_folder_below_is_counted(tmp_path: Path) -> None:
     below.mkdir(parents=True)
     (below / "test_nested.py").touch()
     (below / "nested_test.py").touch()
+    (tmp_path / "tests/runner").mkdir()
+    (tmp_path / "tests/runner/test_pool.py").touch()
 
     assert _test_files(tmp_path) == [
+        "tests/runner/test_pool.py",
         "tests/workflow/below/nested_test.py",
         "tests/workflow/below/test_nested.py",
     ]
