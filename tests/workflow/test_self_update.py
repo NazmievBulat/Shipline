@@ -17,6 +17,7 @@ _SLUG = "example-owner/shipline"
 _URL = f"https://github.com/{_SLUG}.git"
 _START = 1_790_000_000
 _MOVED = 10
+_NOT_KEPT = 11
 
 # Answers only the question the self-update asks: the CI runs of one commit of Shipline's main.
 # `ci/<sha>` holds "<status> <conclusion>"; without it no run exists yet.
@@ -141,11 +142,14 @@ class Shipline:
         self.now += minutes * 60
         self.env["WORKFLOW_NOW"] = str(self.now)
 
-    def run(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, *args: str, env: dict[str, str] | None = None, stdin: str = ""
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["python3", "-B", str(self.home / "scripts" / "workflow" / "self_update.py"), *args],
             cwd=self.repo,
             env={**self.env, **(env or {})},
+            input=stdin,
             capture_output=True,
             text=True,
             timeout=60,
@@ -157,7 +161,7 @@ class Shipline:
         the start exited with."""
         pid = str(os.getpid())
         started = self.run("start", pid, env=env)
-        assert started.returncode in (0, _MOVED), started.stderr
+        assert started.returncode in (0, _MOVED, _NOT_KEPT), started.stderr
         ended = self.run("end", pid, str(code), env=env)
         assert ended.returncode == 0, ended.stderr
         self.later(3)
@@ -284,7 +288,7 @@ def test_a_version_is_good_after_5_ticks_without_failing(shipline: Shipline) -> 
     shipline.tick()
     for _ in range(3):
         shipline.tick()
-    shipline.tick(code=1)
+    shipline.tick(code=2)
     for _ in range(4):
         shipline.tick()
     assert shipline.versions() == [shipline.first]
@@ -306,18 +310,18 @@ def test_the_last_three_good_commits_are_kept(shipline: Shipline) -> None:
     assert shipline.versions() == [*reversed(landed)]
 
 
-def test_three_failed_ticks_in_a_row_roll_back_and_two_do_not(shipline: Shipline) -> None:
+def test_three_crashed_ticks_in_a_row_roll_back_and_two_do_not(shipline: Shipline) -> None:
     shipline.good()
     bad = shipline.land()
     shipline.later(10)
-    assert shipline.tick(code=1) == _MOVED
-    shipline.tick(code=1)
+    assert shipline.tick(code=2) == _MOVED
+    shipline.tick(code=2)
     shipline.tick()
-    shipline.tick(code=1)
-    shipline.tick(code=1)
+    shipline.tick(code=2)
+    shipline.tick(code=2)
 
     # Two in a row: it stays.
-    assert shipline.tick(code=1) == 0
+    assert shipline.tick(code=2) == 0
     assert shipline.head == bad
     assert shipline.notices() == []
 
@@ -326,12 +330,12 @@ def test_three_failed_ticks_in_a_row_roll_back_and_two_do_not(shipline: Shipline
     assert shipline.head == shipline.first
     assert shipline.git("status", "--porcelain") == ""
     assert shipline.notices() == [
-        f"shipline rolled back: {bad} -> {shipline.first}, the tick failed 3 times in a row "
-        "(last: exit 1)"
+        f"shipline rolled back: {bad} -> {shipline.first}, the tick crashed 3 times in a row "
+        "(last: exit 2)"
     ]
 
 
-def test_a_tick_that_ended_without_its_end_counts_as_failed(shipline: Shipline) -> None:
+def test_a_tick_that_ended_without_its_end_counts_as_crashed(shipline: Shipline) -> None:
     shipline.good()
     bad = shipline.land()
     shipline.later(10)
@@ -347,7 +351,7 @@ def test_a_tick_that_ended_without_its_end_counts_as_failed(shipline: Shipline) 
 
     assert shipline.head == shipline.first
     assert shipline.notices() == [
-        f"shipline rolled back: {bad} -> {shipline.first}, the tick failed 3 times in a row "
+        f"shipline rolled back: {bad} -> {shipline.first}, the tick crashed 3 times in a row "
         "(last: it ended without its end)"
     ]
 
@@ -406,6 +410,26 @@ def test_three_crashed_merge_gate_runs_in_a_row_roll_back(shipline: Shipline) ->
     ]
 
 
+def test_a_gate_crash_holds_a_version_back_from_good_until_the_gate_runs_well(
+    shipline: Shipline,
+) -> None:
+    shipline.good()
+    landed = shipline.land()
+    shipline.later(10)
+    shipline.tick()
+    shipline.tick()
+    _gate(shipline, 1, _TRACEBACK)
+    for _ in range(6):
+        shipline.tick()
+    assert shipline.versions() == [shipline.first]
+
+    # The gate runs again without a crash; the ticks since the crash count.
+    _gate(shipline, 3, "merge waiting: main moved\n")
+    shipline.tick()
+
+    assert shipline.versions() == [landed, shipline.first]
+
+
 def test_a_timed_out_or_unknown_gate_exit_is_a_crash(shipline: Shipline) -> None:
     shipline.good()
     bad = shipline.land()
@@ -431,7 +455,7 @@ def test_a_rolled_back_commit_is_not_taken_again_until_main_moves_past_it(
     bad = shipline.land()
     shipline.later(10)
     for _ in range(3):
-        shipline.tick(code=1)
+        shipline.tick(code=2)
     assert shipline.tick() == _MOVED
     assert shipline.head == shipline.first
 
@@ -455,7 +479,7 @@ def test_a_good_version_is_not_rolled_back(shipline: Shipline) -> None:
     shipline.good()
 
     for _ in range(4):
-        assert shipline.tick(code=1) == 0
+        assert shipline.tick(code=2) == 0
 
     assert shipline.head == landed
     assert shipline.notices() == []
@@ -490,7 +514,7 @@ def test_a_pin_holds_a_failing_version(shipline: Shipline) -> None:
     (shipline.notes / "pin").write_text("")
 
     for _ in range(4):
-        assert shipline.tick(code=1) == 0
+        assert shipline.tick(code=2) == 0
 
     assert shipline.head == bad
 
@@ -498,7 +522,7 @@ def test_a_pin_holds_a_failing_version(shipline: Shipline) -> None:
 def test_a_checkout_without_a_remote_is_left_alone_and_holds_no_notes(shipline: Shipline) -> None:
     shipline.git("remote", "remove", "origin")
 
-    assert shipline.tick() == 0
+    assert shipline.tick() == _NOT_KEPT
 
     assert not (shipline.home / ".local").exists()
 
@@ -507,7 +531,7 @@ def test_a_checkout_that_is_the_repository_itself_is_left_alone(shipline: Shipli
     shipline.land()
     shipline.later(10)
 
-    assert shipline.tick(env={"SHIPLINE_REPO": str(shipline.home)}) == 0
+    assert shipline.tick(env={"SHIPLINE_REPO": str(shipline.home)}) == _NOT_KEPT
 
     assert shipline.head == shipline.first
     assert not (shipline.home / ".local").exists()
@@ -565,17 +589,59 @@ def test_the_tick_moves_its_checkout_and_runs_the_new_version_at_once(workflow: 
     assert not any((home / ".local" / "shipline" / "runs").iterdir())
 
 
-def test_the_tick_counts_its_own_failed_exit(workflow: Workflow) -> None:
+def test_a_handled_failure_of_the_tick_is_no_crash(workflow: Workflow) -> None:
     home, _ = _harness_shipline(workflow, "in_progress -")
+    # GitHub cannot be reached: the tick says so and exits 1.
     (workflow.state / "fail-gh-list").touch()
     env = {"SHIPLINE_REPO": str(workflow.repo)}
 
     done = workflow.shipline("tick", env=env)
 
     assert done.returncode == 1
+    assert "cannot list the pull requests" in done.stderr
+    trial = json.loads((home / ".local" / "shipline" / "trial.json").read_text())
+    assert trial["tick_failures"] == 0
+    assert trial["ticks"] == 1
+
+
+def test_a_traceback_of_a_step_is_a_crash_of_the_tick(workflow: Workflow) -> None:
+    home, _ = _harness_shipline(workflow, "in_progress -")
+    # The new version's snapshot step raises; the tick goes on and exits 1, as for a failure.
+    (home / "scripts" / "workflow" / "tick_snapshot.py").write_text(
+        "raise RuntimeError('the snapshot is broken')\n"
+    )
+    env = {"SHIPLINE_REPO": str(workflow.repo)}
+
+    done = workflow.shipline("tick", env=env)
+
+    assert done.returncode == 1
+    # What the steps print still reaches the journal.
+    assert "Traceback (most recent call last):" in done.stderr
+    assert "RuntimeError: the snapshot is broken" in done.stderr
+    assert "cannot list the pull requests" in done.stderr
+    assert "shipline-tick-ended" not in done.stderr
     trial = json.loads((home / ".local" / "shipline" / "trial.json").read_text())
     assert trial["tick_failures"] == 1
-    assert trial["ticks"] == 0
+    assert trial["last_tick"] == "RuntimeError: the snapshot is broken"
+    assert list((home / ".local" / "shipline" / "runs").iterdir()) == []
+
+
+def test_an_error_of_the_shell_is_a_crash_of_the_tick(workflow: Workflow) -> None:
+    home, _ = _harness_shipline(workflow, "in_progress -")
+    tick = home / "scripts" / "workflow" / "tick"
+    text = tick.read_text()
+    marker = "listed=-\n"
+    assert marker in text
+    tick.write_text(text.replace(marker, marker + 'echo "$not_set"\n', 1))
+    env = {"SHIPLINE_REPO": str(workflow.repo)}
+
+    done = workflow.shipline("tick", env=env)
+
+    # Bash leaves with 1 here: the error itself, seen by the watch, tells the crash.
+    assert done.returncode == 1
+    trial = json.loads((home / ".local" / "shipline" / "trial.json").read_text())
+    assert trial["tick_failures"] == 1
+    assert trial["last_tick"].endswith("not_set: unbound variable")
 
 
 def test_a_tick_skipped_for_the_one_before_it_is_not_counted(workflow: Workflow) -> None:
@@ -599,7 +665,7 @@ def test_the_wake_tells_a_roll_back_once_at_any_hour(workflow: Workflow) -> None
     workflow.orchestrator("busy")
     pending = home / ".local" / "shipline" / "wake.pending"
     pending.mkdir(parents=True)
-    line = f"shipline rolled back: {'b' * 40} -> {'a' * 40}, the tick failed 3 times in a row"
+    line = f"shipline rolled back: {'b' * 40} -> {'a' * 40}, the tick crashed 3 times in a row"
     (pending / "1790000000-rolled-back.json").write_text(json.dumps({"line": line}))
     (workflow.state / "send-fails").touch()
     # Noon in New York, when the wake looks in only for what cannot wait.
@@ -669,7 +735,7 @@ def test_a_tick_that_already_moved_does_not_move_again(shipline: Shipline) -> No
     bad = shipline.land()
     shipline.later(10)
     for _ in range(3):
-        shipline.tick(code=1)
+        shipline.tick(code=2)
     pid = str(os.getpid())
     assert shipline.run("start", pid).returncode == _MOVED
     shipline.land()
@@ -733,7 +799,7 @@ def test_an_update_before_any_version_is_good_goes_back_to_the_commit_it_came_fr
     bad = shipline.land()
     shipline.later(10)
     for _ in range(3):
-        shipline.tick(code=1)
+        shipline.tick(code=2)
 
     assert shipline.tick() == _MOVED
 
@@ -762,7 +828,7 @@ def test_a_checkout_inside_another_repository_is_left_alone(shipline: Shipline) 
         check=False,
     )
 
-    assert done.returncode == 0, done.stderr
+    assert done.returncode == _NOT_KEPT, done.stderr
     assert not (copy / ".local").exists()
 
 
@@ -780,7 +846,7 @@ def test_git_variables_of_the_caller_do_not_turn_it_on_another_repository(
     assert _git(shipline.repo, shipline.env, "log", "--oneline", "--all") == ""
 
 
-def test_a_tick_stopped_by_a_signal_counts_as_failed(workflow: Workflow) -> None:
+def test_a_tick_stopped_by_a_signal_counts_neither_way(workflow: Workflow) -> None:
     home, _ = _harness_shipline(workflow, "in_progress -")
     # The tick is stopped while it waits for the sessions to be listed.
     workflow.fake("tmux", "#!/bin/bash\n/bin/sleep 30\n")
@@ -805,6 +871,57 @@ def test_a_tick_stopped_by_a_signal_counts_as_failed(workflow: Workflow) -> None
         tick.kill()
         subprocess.run(["pkill", "-f", "/bin/sleep 30"], check=False)
 
+    # A shutdown or the owner stopped it; nothing says the version is broken.
     trial = json.loads((home / ".local" / "shipline" / "trial.json").read_text())
+    assert trial["tick_failures"] == trial["ticks"] == 0
+    assert not (runs / str(tick.pid)).exists()
+
+
+def test_the_watch_passes_everything_through_and_notes_the_first_crash(
+    shipline: Shipline,
+) -> None:
+    shipline.tick()
+    pid = str(os.getpid())
+    assert shipline.run("start", pid).returncode == 0
+    said = (
+        "the tick before this one is still running\n"
+        + _TRACEBACK
+        + "tick: line 3: x: unbound variable\n"
+        + "partial line shipline-tick-ended " + pid + "\n"
+        + "after the end\n"
+    )
+
+    watched = shipline.run("watch", pid, stdin=said)
+
+    assert watched.returncode == 0, watched.stderr
+    assert watched.stdout == said.replace("shipline-tick-ended " + pid + "\n", "\n")
+    assert (shipline.notes / "runs" / f"{pid}.crash").read_text() == "KeyError: 'head'\n"
+    assert (shipline.notes / "runs" / f"{pid}.drained").exists()
+
+    ended = shipline.run("end", pid, "1")
+    assert ended.returncode == 0, ended.stderr
+    trial = json.loads((shipline.notes / "trial.json").read_text())
     assert trial["tick_failures"] == 1
-    assert trial["last_tick"] == "exit 143"
+    assert trial["last_tick"] == "KeyError: 'head'"
+    assert list((shipline.notes / "runs").iterdir()) == []
+
+
+def test_no_move_while_another_repositorys_tick_holds_its_lock(shipline: Shipline) -> None:
+    import fcntl
+
+    other = shipline.root / "other"
+    other.mkdir()
+    _git(other, shipline.env, "init", "--quiet", "--initial-branch=main")
+    # The other repository's tick ran from this checkout before, and runs now.
+    assert shipline.run("start", "1", env={"SHIPLINE_REPO": str(other)}).returncode == 0
+    assert shipline.run("end", "1", "0", env={"SHIPLINE_REPO": str(other)}).returncode == 0
+    shipline.good()
+    shipline.land()
+    shipline.later(10)
+    with (other / ".git" / "shipline-tick.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert shipline.tick() == 0
+        assert shipline.head == shipline.first
+
+    shipline.later(10)
+    assert shipline.tick() == _MOVED
