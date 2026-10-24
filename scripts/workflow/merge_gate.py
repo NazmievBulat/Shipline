@@ -3,10 +3,10 @@
 import fcntl
 import fnmatch
 import hashlib
-import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -17,7 +17,6 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from types import ModuleType
 from typing import Any, NoReturn
 
 import priority
@@ -45,25 +44,11 @@ from workflow_commands import (
 REPOSITORY_FILES = workflow_config.current().main / "scripts" / "workflow"
 sys.path.insert(1, str(REPOSITORY_FILES))
 
-# A repository may hold three helpers there, and the gate uses them when it does:
-# `advisory_service` tells a scan that could not reach a package advisory service, which is a
-# wait; `pushing_checkout` installs the pushing checkout's packages before its hook and words a
-# hook's refusal; `run_proof` reads and writes the `Workflow-Proof` line with which main skips a
-# job its squash proved. Without them a failed push is refused with its last lines, nothing is
-# installed first, and no proof is read or written, so main never skips a job: a job counts as
-# passed only where it passed itself. A helper that is there but cannot start stops the gate.
-try:
-    import advisory_service
-except ModuleNotFoundError as error:
-    if error.name != "advisory_service":
-        raise
-    advisory_service = None
-try:
-    import pushing_checkout
-except ModuleNotFoundError as error:
-    if error.name != "pushing_checkout":
-        raise
-    pushing_checkout = None
+# A repository may hold one helper there, and the gate uses it when it does: `run_proof` reads
+# and writes the `Workflow-Proof` line with which main skips a job its squash proved. Without it
+# no proof is read or written, so main never skips a job: a job counts as passed only where it
+# passed itself. A helper that is there but cannot start stops the gate. The repository's other
+# parts are commands its `shipline.json` names (`repository_command`).
 try:
     from run_proof import RECEIPT, passed_jobs
     from run_proof import WHOLE as WHOLE_REQUEST
@@ -86,19 +71,6 @@ except ModuleNotFoundError as error:
             and sorted((int(part[2]), int(part[3])) for part, _ in group if part)
             in ([], [(number, len(group)) for number in range(1, len(group) + 1)])
         }
-
-
-def mechanical_conflicts() -> ModuleType | None:
-    """The repository's rules for the conflicts and migration numbers a refresh settles itself,
-    `mechanical_conflicts` among its files, read only when a refresh needs them. Without
-    them no conflict is mechanical and there are no migrations to renumber."""
-    try:
-        import mechanical_conflicts as rules
-    except ModuleNotFoundError as error:
-        if error.name != "mechanical_conflicts":
-            raise
-        return None
-    return rules
 
 
 # How many of its last lines a failed push is refused with, when the repository words no refusal.
@@ -196,7 +168,7 @@ class PackagesWaiting(PushWaiting):
 
 
 def command(
-    *args: str, check: bool = True, errors: str = "strict"
+    *args: str, check: bool = True, errors: str = "strict", input: str | None = None
 ) -> subprocess.CompletedProcess[str]:
     # A nested gate waits for the merge lock, then runs its own bounded commands, so its
     # whole run has no deadline of its own: one would kill a healthy push behind the lock.
@@ -207,6 +179,7 @@ def command(
             timeout=None if nested else COMMAND_TIMEOUT,
             unwind_on_interrupt=nested,
             errors=errors,
+            input=input,
         )
     except CommandTimeout as error:
         raise Refused(str(error)) from error
@@ -215,6 +188,94 @@ def command(
     if check and done.returncode:
         raise Refused(f"{' '.join(args)} failed: {done.stderr.strip() or done.stdout.strip()}")
     return done
+
+
+def repository_command(
+    name: str, *args: str, input: str | None = None, errors: str = "strict"
+) -> subprocess.CompletedProcess[str] | None:
+    """The repository's own command `name` (`shipline.json`), run with `args` in the current
+    folder and bounded like every command; None when the repository names none. A command that
+    is named but cannot start stops the gate's call."""
+    words = CONFIG.command(name)
+    if words is None:
+        return None
+    try:
+        return command(*words, *args, check=False, input=input, errors=errors)
+    except OSError as error:
+        raise Refused(
+            f"cannot run the repository's {name} command, {shlex.join(words)}: {error}"
+        ) from error
+
+
+def said(done: subprocess.CompletedProcess[str]) -> str:
+    """Why a repository's command failed, in its own words."""
+    return done.stderr.strip() or done.stdout.strip() or f"it exited {done.returncode}"
+
+
+def nonblank_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.strip()]
+
+
+# The gate's note of a package advisory service a push found unreachable, kept until a push
+# succeeds or the service answers again, and the line the wake tells once an outage.
+SERVICE_DOWN = "advisory-service-down"
+SERVICE_PENDING = "advisory-service.pending"
+
+
+def unreachable_service(text: str) -> str | None:
+    """The advisory service the repository's `advisory_watch` reads in `text` as unreachable;
+    None when it names none, or when the repository has no advisory watch."""
+    done = repository_command("advisory_watch", "unreachable", input=text)
+    if done is None:
+        return None
+    if done.returncode:
+        # Unread is no outage: the failure is told, and the push is refused as it is.
+        print(
+            f"the repository's advisory_watch could not read an output: {said(done)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    return next(iter(nonblank_lines(done.stdout)), "").strip() or None
+
+
+def service_answers(service: str) -> bool:
+    """Whether an advisory service answers again, by the repository's `advisory_watch`."""
+    done = repository_command("advisory_watch", "answers", service)
+    return done is not None and not done.returncode
+
+
+def service_down(folder: Path) -> dict[str, str] | None:
+    """The outage noted in `folder`; a note that cannot be read counts as none."""
+    try:
+        note = json.loads((folder / SERVICE_DOWN).read_text())
+    except (OSError, ValueError):
+        return None
+    if isinstance(note, dict) and isinstance(note.get("service"), str) and note["service"]:
+        return note
+    return None
+
+
+def note_service_down(folder: Path, service: str) -> None:
+    """Notes the first push of an outage, and the line that tells it once; a later push of the
+    same outage keeps the first note."""
+    if service_down(folder) is not None:
+        return
+    folder.mkdir(parents=True, exist_ok=True)
+    since = time.strftime(
+        "%Y-%m-%d %H:%M UTC", time.gmtime(float(os.environ.get("WORKFLOW_NOW") or time.time()))
+    )
+    for name, text in (
+        (SERVICE_DOWN, json.dumps({"service": service, "since": since}) + "\n"),
+        (SERVICE_PENDING, f"{service}'s advisory service unreachable since {since}\n"),
+    ):
+        with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as output:
+            output.write(text)
+        os.replace(output.name, folder / name)
+
+
+def note_service_up(folder: Path) -> None:
+    (folder / SERVICE_DOWN).unlink(missing_ok=True)
 
 
 def read_github(*args: str) -> subprocess.CompletedProcess[str]:
@@ -275,10 +336,12 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     gate sets it for every push it makes. The hook runs with the pushing checkout's packages,
     installed first when its lockfiles changed since their last install. A failed install, or
     a scan that could not reach an advisory service after its own tries, is a wait."""
-    checkout = pushing_checkout.top(where) if pushing_checkout else where or Path.cwd()
-    failed = pushing_checkout.install_if_changed(checkout) if pushing_checkout else ""
-    if failed:
-        raise PackagesWaiting(failed)
+    checkout = where or Path.cwd()
+    if CONFIG.command("push_checkout") is not None:
+        checkout = Path(git("-C", str(checkout), "rev-parse", "--show-toplevel"))
+        installed = repository_command("push_checkout", "install", str(checkout))
+        if installed and installed.returncode:
+            raise PackagesWaiting(said(installed))
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
     merged = ("env", "EIO_BACKEND=posix", "sh", "-c", 'exec "$@" 2>&1', "push", *git_args)
     done = command(*merged, check=False)
@@ -291,19 +354,18 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         output,
         push_failure(output, checkout) if done.returncode else "",
     )
-    if advisory_service is None:
+    if CONFIG.command("advisory_watch") is None:
         return pushed
     folder = main_checkout() / CONFIG.state_folder
-    service = advisory_service.unreachable(output) if pushed.returncode else None
+    service = unreachable_service(output) if pushed.returncode else None
     if service:
-        folder.mkdir(parents=True, exist_ok=True)
-        advisory_service.note_down(folder, service)
+        note_service_down(folder, service)
         raise ServiceWaiting(
             f"the pre-push scan could not reach {service}'s advisory service; "
             "nothing was found wrong with the branch"
         )
     if not pushed.returncode:
-        advisory_service.note_up(folder)
+        note_service_up(folder)
     return pushed
 
 
@@ -312,10 +374,11 @@ def push_failure(output: str, checkout: Path) -> str:
 
     The first line is all the wake and a hand-back show, so a shortage is named there, before
     the hook's step that failed and its last lines."""
-    if pushing_checkout:
-        refusal = pushing_checkout.refusal(output, checkout)
+    worded = repository_command("push_checkout", "refusal", str(checkout), input=output)
+    if worded and not worded.returncode and worded.stdout.strip():
+        refusal = worded.stdout.strip()
     else:
-        refusal = "\n".join([line for line in output.splitlines() if line.strip()][-REFUSAL_LINES:])
+        refusal = "\n".join(nonblank_lines(output)[-REFUSAL_LINES:])
     shortage = next(
         (line.strip() for line in output.splitlines() if short_of_memory(line)),
         None,
@@ -597,7 +660,7 @@ def _failed_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def unreached_service(parts: list[dict[str, Any]]) -> str | None:
     """The advisory service whose absence alone failed a CI run, from the audit's annotation:
     "CI: dependencies" is the only failed job besides "CI result", which follows it."""
-    if advisory_service is None:
+    if CONFIG.command("advisory_watch") is None:
         return None
     failed = _failed_jobs(parts)
     if {job["name"] for job in failed} - {CI_RESULT} != {"CI: dependencies"}:
@@ -610,10 +673,8 @@ def unreached_service(parts: list[dict[str, Any]]) -> str | None:
         raise
     except Refused:
         return None
-    for note in notes:
-        if note.get("title") == advisory_service.ANNOTATION:
-            return advisory_service.unreachable(note.get("message") or "")
-    return None
+    text = "".join(f"{note.get('message') or ''}\n" for note in notes)
+    return unreachable_service(text) if text.strip() else None
 
 
 def _retry_failed_main(
@@ -643,7 +704,7 @@ def _retry_failed_main(
             isinstance(attempt, int) and attempt >= 2
         ):
             return earlier
-        if not advisory_service.answers(service):
+        if not service_answers(service):
             return (
                 f"{earlier}; main run {run['id']} is re-run once {service}'s advisory "
                 "service answers"
@@ -841,7 +902,7 @@ def _service_wait(
         return None
     waits = f"{name} could not reach {service}'s advisory service, and nothing was found wrong"
     later = f"it is re-run once the service answers, {who}"
-    if not retry or not advisory_service.answers(service):
+    if not retry or not service_answers(service):
         return f"{waits}; {later}"
     return _rerun(
         run, folder, marker, f"after {service}'s advisory service answered again", name=name
@@ -1205,13 +1266,8 @@ def refresh_health(folder: Path, *, retry: bool = False) -> tuple[str, Health]:
 
 def _refresh_health(folder: Path, *, retry: bool = False) -> tuple[str, Health]:
     # The tick asks a service a push found unreachable, so that its next outage is told too.
-    if (
-        retry
-        and advisory_service
-        and (note := advisory_service.down(folder))
-        and advisory_service.answers(note["service"])
-    ):
-        advisory_service.note_up(folder)
+    if retry and (note := service_down(folder)) and service_answers(note["service"]):
+        note_service_up(folder)
     try:
         git("fetch", "origin", "main")
         head = git("rev-parse", "origin/main")
@@ -1269,26 +1325,28 @@ def images_needed(
 
 
 def browser_needed(base: str, merge: str) -> bool:
-    """Whether a merge needs browser tests at all, by E2E's own rule (scripts/e2e-plan.py).
+    """Whether a merge needs browser tests at all, by the repository's `browser_plan`.
 
     The gate reads the exact difference from main, so a merge that changes nothing needs
     none; the planner runs on an empty diff only because it cannot tell one from a misread.
-    A repository that holds no planner has no browser suite, so no change needs one.
+    The plan reads the changed paths, each ended by a NUL, and exits 0 when browser tests are
+    needed and 1 when not. Without a plan, or when it answers otherwise, every merge needs them.
     """
-    planner = CONFIG.main / "scripts" / "e2e-plan.py"
-    if not planner.exists():
-        return False
     changed = command(
         "git", "diff", "--no-renames", "--name-only", "-z", base, merge, errors="surrogateescape"
     ).stdout.split("\0")[:-1]
     if not changed:
         return False
-    found = importlib.util.spec_from_file_location("e2e_plan", planner)
-    if found is None or found.loader is None:
-        raise Refused("could not read the E2E planner")
-    plan = importlib.util.module_from_spec(found)
-    found.loader.exec_module(plan)
-    return plan.browser_needed([path.encode(errors="surrogateescape") for path in changed])
+    done = repository_command(
+        "browser_plan", input="".join(f"{path}\0" for path in changed), errors="surrogateescape"
+    )
+    if done is not None and done.returncode not in (0, 1):
+        print(
+            f"the browser plan could not answer, so browser tests run: {said(done)}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return done is None or done.returncode != 1
 
 
 def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> bool:
@@ -1426,7 +1484,9 @@ def refresh_pull(
     train.refreshable.discard(number)
     merged = command("git", "merge", "--no-ff", "--no-commit", base, check=False)
     message = "chore: test against current main"
-    rules = mechanical_conflicts()
+    # The repository's command that resolves the conflicts and moves the numbered files a
+    # refresh settles itself; without one no conflict is mechanical and nothing is renumbered.
+    rules = CONFIG.command("mechanical_conflicts") is not None
     if mechanical:
         conflicts = git("diff", "--name-only", "--diff-filter=U").splitlines()
         if conflicts:
@@ -1439,21 +1499,22 @@ def refresh_pull(
             and command("git", "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode
         ):
             raise Refused(merged.stderr.strip() or merged.stdout.strip())
-    if mechanical and rules is None and (conflicts or conflicting(pull)):
+    if mechanical and not rules and (conflicts or conflicting(pull)):
         # Without the repository's rules no conflict is mechanical, whether git or only GitHub
         # sees it: the reviewer resolves it.
         where = f" in {', '.join(conflicts)}" if conflicts else ""
         raise Refused(
             f"non-mechanical conflict{where}: the repository resolves no conflict mechanically"
         )
-    if mechanical and rules is not None:
-        try:
-            resolved = rules.resolve(head, base)
-        except rules.MechanicalConflict as error:
+    if mechanical and rules:
+        # It resolves the merge in the worktree, stages it and names each file it resolved.
+        done = repository_command("mechanical_conflicts", "resolve", head, base)
+        assert done is not None
+        if done.returncode:
             if conflicts:
-                raise Refused(f"non-mechanical conflict in {', '.join(conflicts)}: {error}") from error
-            raise Refused(str(error)) from error
-        message = "merge main: mechanical conflict in " + ", ".join(resolved)
+                raise Refused(f"non-mechanical conflict in {', '.join(conflicts)}: {said(done)}")
+            raise Refused(said(done))
+        message = "merge main: mechanical conflict in " + ", ".join(nonblank_lines(done.stdout))
         merged.returncode = 0
     if merged.returncode:
         conflicts = git("diff", "--name-only", "--diff-filter=U").splitlines()
@@ -1469,29 +1530,32 @@ def refresh_pull(
         raise Refused(merged.stderr.strip() or merged.stdout.strip())
     if (
         not mechanical
-        and rules is not None
+        and rules
         and not command("git", "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode
     ):
-        # Git merges two migrations numbered alike in different files cleanly; the migration
-        # tool then has two heads. The branch's new ones move past main's last, or wait as a
-        # conflict.
-        try:
-            moved = rules.renumber_migrations(head, base)
-        except rules.MigrationCollision as error:
-            message = "merge main: conflict in " + ", ".join(error.paths)
+        # Git merges two files numbered alike under different names cleanly; the tool that
+        # reads them in order then has two heads. The branch's new ones move past main's last,
+        # staged, or wait as a conflict: the command then names the files it could not move.
+        done = repository_command("mechanical_conflicts", "renumber", head, base)
+        assert done is not None
+        if done.returncode and (paths := nonblank_lines(done.stdout)):
+            message = "merge main: conflict in " + ", ".join(paths)
             Path(git("rev-parse", "--git-path", "MERGE_MSG")).write_text(message + "\n")
             train.conflicts[number] = head
             train.save()
             raise Refused(
-                f"main took the number of {', '.join(error.paths)} and it cannot be renumbered "
-                f"mechanically ({error}); renumber the branch's migrations after main's last, "
-                f"commit with '{message}', push, then wait for CI"
-            ) from error
-        except rules.MechanicalConflict as error:
-            raise Refused(str(error)) from error
+                f"main took the number of {', '.join(paths)} and it cannot be renumbered "
+                f"mechanically ({done.stderr.strip()}); renumber the branch's numbered files "
+                f"after main's last, commit with '{message}', push, then wait for CI"
+            )
+        if done.returncode:
+            raise Refused(said(done))
+        moved = [line.split(" ") for line in nonblank_lines(done.stdout)]
+        if any(len(pair) != 2 for pair in moved):
+            raise Refused(f"could not read the files the repository renumbered: {done.stdout}")
         if moved:
             message = "merge main: renumber migration " + ", ".join(
-                f"{Path(old).name} to {Path(new).name}" for old, new in moved.items()
+                f"{Path(old).name} to {Path(new).name}" for old, new in moved
             )
     # An older run without provenance cannot prove freshness. If main is already contained,
     # an empty commit requests a new pull_request event rather than replaying the old event.
@@ -2526,13 +2590,13 @@ def _merge_tree(base: str, head: str) -> str | None:
 
 
 def _taken_migrations(head: str, base: str) -> list[str]:
-    rules = mechanical_conflicts()
-    if rules is None:
+    """The branch's numbered files whose number main took, by the repository's command."""
+    done = repository_command("mechanical_conflicts", "taken", head, base)
+    if done is None:
         return []
-    try:
-        return rules.taken_migrations(head, base)
-    except rules.MechanicalConflict as error:
-        raise Refused(f"could not compare migration numbers: {error}") from error
+    if done.returncode:
+        raise Refused(f"could not compare numbered files: {said(done)}")
+    return nonblank_lines(done.stdout)
 
 
 def _batch_runs(batch: dict[str, Any], workflow: str) -> list[dict[str, Any]]:
@@ -2625,7 +2689,7 @@ def _batch_service_answered(batch: dict[str, Any], folder: Path) -> bool:
         except Refused:
             # Unread now is read on a later tick; the gate call decides the wait itself.
             return False
-        return service is not None and advisory_service.answers(service)
+        return service is not None and service_answers(service)
     return False
 
 
@@ -3683,12 +3747,11 @@ def train_status(folder: Path) -> int:
 def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> None:
     """A failed local inventory must neither join nor stay approved for a prefix.
 
-    A repository that holds no `pre-train-checks` among its files has none to fail. A caller
-    that does not hold the merge lock (a handoff) takes it only to leave the line."""
-    checks = REPOSITORY_FILES / "pre-train-checks"
-    if not checks.exists():
+    A repository that names no `pre_train_checks` command has none to fail. A caller that does
+    not hold the merge lock (a handoff) takes it only to leave the line."""
+    done = repository_command("pre_train_checks")
+    if done is None:
         return
-    done = command("bash", str(checks), check=False)
     print(done.stdout, end="", flush=True)
     print(done.stderr, end="", file=sys.stderr, flush=True)
     if done.returncode:
