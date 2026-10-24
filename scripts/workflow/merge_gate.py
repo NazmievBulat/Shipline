@@ -117,6 +117,11 @@ WINDOW_CEILING = 4
 # A check GitHub still lists as queued or running this long after its run completed was lost:
 # GitHub missed its end, and no wait brings it.
 LOST_AFTER_SECONDS = 10 * 60
+# How long the gate remembers that it asked GitHub to cancel a run.
+CANCEL_CLAIM_SECONDS = 24 * 60 * 60
+# How long after a scratch branch was dropped the sweep still looks for the runs dispatched on
+# it that GitHub has not listed yet: GitHub accepts a dispatch before it lists the run.
+DROPPED_RUNS_SECONDS = 30 * 60
 # How many times a handoff judges its own place again when the line changed it meanwhile.
 HANDOFF_ATTEMPTS = 3
 # How long a handoff's one check of its head, under the merge lock, may take.
@@ -494,13 +499,23 @@ def verdict(
     failed = [
         job["name"] for job in parts if job.get("conclusion") not in (None, "success", "skipped")
     ]
+    settled = (None, "success", "skipped", "cancelled")
     if (
         run.get("conclusion") == "cancelled"
-        and all(job.get("conclusion") in (None, "success", "skipped", "cancelled") for job in parts)
+        and all(job.get("conclusion") in settled for job in parts)
         and lender_replanning(
             str(run["id"]), head=run.get("head_sha"), attempt=run.get("run_attempt", 1)
         )
     ):
+        return "pending", [plan]
+    if (
+        run.get("conclusion") == "cancelled"
+        # The summary job runs even in a cancelled run, and fails for the jobs cancelled under it.
+        and all(job.get("conclusion") in settled or job["name"] == plan for job in parts)
+        and cancelled_inherited(run)
+    ):
+        # The gate cancelled it, still running, once main inherited its result: that result
+        # stands for it.
         return "pending", [plan]
     if failed or run.get("conclusion") not in (None, "success"):
         return "red", failed or [label]
@@ -679,6 +694,43 @@ def wake_log(line: str) -> None:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a") as output:
         output.write(f"{int(time.time())} {line}\n")
+
+
+def _cancel(found: list[dict[str, Any]], folder: Path, whose: str) -> None:
+    """Cancel each run of `found` still queued or running, so that it holds no runner ahead of
+    live work, each once. A cancel GitHub refuses (the run already finishing) goes to the wake
+    log once and stops nothing. One held back by the shared budget, or lost to a GitHub outage
+    or a stall, is a wait: the caller stops, and it is tried again at the next call."""
+    for old in folder.glob("cancel-*"):
+        # A cancelled run has long ended by then.
+        if time.time() - old.stat().st_mtime > CANCEL_CLAIM_SECONDS:
+            old.unlink(missing_ok=True)
+    for run in found:
+        if run.get("status") == "completed":
+            continue
+        claim = folder / f"cancel-{run['id']}"
+        # Claim before contacting GitHub: a run still finishing after its cancel, which GitHub
+        # lists as running for a while, is not cancelled again.
+        try:
+            with claim.open("x") as output:
+                output.write(f"cancel requested for run {run['id']} of {whose}\n")
+        except FileExistsError:
+            continue
+        try:
+            done = command("gh", "run", "cancel", str(run["id"]), "-R", REPOSITORY, check=False)
+            error = (done.stderr.strip() or done.stdout.strip()) if done.returncode else ""
+        except BudgetWaiting:
+            claim.unlink()
+            raise
+        except Refused as failure:
+            error = str(failure)
+        if error and transient(error):
+            claim.unlink()
+            raise Waiting(f"could not cancel run {run['id']} of {whose} yet: {error}")
+        if error:
+            note = f"could not cancel run {run['id']} of {whose}: {error}"
+            claim.write_text(note + "\n")
+            wake_log(note)
 
 
 def pull_service_wait(
@@ -894,6 +946,8 @@ def push_health(
     # Only pending checks may borrow a result. Main's own failures above always win.
     inherited = inherited_green(head)
     sources: list[str] = []
+    # Main's own CI runs whose result it inherited: under the lock they are cancelled, below.
+    redundant: list[dict[str, Any]] = []
     if inherited:
         ci_inherited = False
         unproven = inherited.get("ci_unproven")
@@ -917,6 +971,7 @@ def push_health(
                 assessments[0] = ("green", [], assessments[0][2])
                 sources.append(f"CI run {inherited['ci_run']}")
                 ci_inherited = True
+                redundant += ci
         own_images = any(run["head_sha"] == head for run in images)
         if inherited.get("images_run") and inherited.get("images_complete") is True:
             # Every image job passed on this very tree, which holds every earlier push of main
@@ -934,6 +989,14 @@ def push_health(
             # Main asks this after its own green CI above; an inherited CI asks it here. An
             # earlier push's image run in the list does not stand in for the head's own.
             assessments.append(("pending", [f"{IMAGES} have not started"], {}))
+        if retry and retry_folder is not None and redundant:
+            try:
+                cancel_inherited(head, inherited, redundant, retry_folder)
+            except Waiting:
+                # Never sent, or lost to an outage: the next tick under the lock cancels them.
+                pass
+            except (Refused, OSError) as error:
+                wake_log(f"could not cancel main's inherited runs of {head[:12]}: {error}")
     pending = [name for state, names, _ in assessments if state != "green" for name in names]
     if pending:
         return Health("pending", f"main: pending, {', '.join(pending)} ({head[:12]})")
@@ -966,6 +1029,56 @@ def inherited_green(head: str) -> dict[str, Any] | None:
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return None
+
+
+def _cancel_entry(run: dict[str, Any], tree: str) -> dict[str, Any]:
+    # A re-run is another attempt: only the attempt the gate cancelled reads as inherited.
+    return {"run": run["id"], "attempt": run.get("run_attempt", 1), "tree": tree}
+
+
+def cancelled_inherited(run: dict[str, Any]) -> bool:
+    """Whether the gate cancelled this attempt of a run of main because main inherited its
+    result on this very tree. Any other cancelled run of main is red."""
+    if run.get("head_branch") != "main" or not run.get("head_sha"):
+        return False
+    receipt = inherited_green(run["head_sha"])
+    listed = receipt.get("cancelled_inherited") if receipt else None
+    return isinstance(listed, list) and _cancel_entry(run, receipt["tree"]) in listed
+
+
+def cancel_inherited(
+    head: str, receipt: dict[str, Any], ci: list[dict[str, Any]], folder: Path
+) -> None:
+    """Cancel main's CI runs of `head` still queued or running whose result main inherited. Each
+    is listed in the receipt first, with the tree it belongs to, so its cancellation never
+    turns main red; the runs of another tree leave the list.
+
+    Only CI: main is judged by the CI runs of its head alone, but by its latest image run on any
+    earlier push too, where a cancelled one would decide main once a later receipt replaced its
+    entry. A re-run, the gate's own retry of a failed main included, is never cancelled: its
+    result decides main."""
+    found = [
+        run
+        for run in ci
+        if run["head_sha"] == head
+        and run.get("status") != "completed"
+        and run.get("run_attempt", 1) == 1
+    ]
+    if not found:
+        return
+    tree = receipt["tree"]
+    listed = [
+        entry
+        for entry in receipt.get("cancelled_inherited") or []
+        if isinstance(entry, dict) and entry.get("tree") == tree
+    ]
+    listed += [_cancel_entry(run, tree) for run in found if _cancel_entry(run, tree) not in listed]
+    if listed != receipt.get("cancelled_inherited"):
+        with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as output:
+            json.dump({**receipt, "cancelled_inherited": listed}, output)
+            temporary = output.name
+        os.replace(temporary, folder / "main-tree-green.json")
+    _cancel(found, folder, f"main {head[:12]}, inherited on identical tree {tree}")
 
 
 def strict_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1727,7 +1840,36 @@ class Train:
         # The last scratch run that fell short in a way a new scratch branch retests: its tested
         # tree and why (_retest). Cleared once a scratch run proves its tree.
         self.retest: dict[str, str] | None = data.get("retest")
+        # Scratch branches whose records left the line, with the workflows dispatched on them and
+        # when: the sweep cancels their runs until it has seen one of each (_sweep_scratch).
+        self.dropped: list[dict[str, Any]] = [
+            entry
+            for entry in data.get("dropped") or []
+            if isinstance(entry, dict)
+            and isinstance(entry.get("branch"), str)
+            and isinstance(entry.get("requested"), list)
+            and isinstance(entry.get("dropped"), (int, float))
+        ]
+        self.scratch = self.scratch_records()
         self.first = self.front()
+
+    def scratch_records(self) -> dict[str, dict[str, Any]]:
+        """Every scratch branch the line still names, with its record."""
+        records = [
+            *(
+                member["scratch"]
+                for member in (self.prefixes["members"] if self.prefixes else [])
+                if member["scratch"]
+            ),
+            *(failure["batch"] for failure in self.batch_failed.values()),
+            *self.proven.values(),
+            *self.suites.values(),
+        ]
+        return {
+            record["branch"]: record
+            for record in records
+            if isinstance(record, dict) and isinstance(record.get("branch"), str)
+        }
 
     def line(self) -> list[str]:
         """The waiting members in the order they are served: the fix of a red main first,
@@ -1760,6 +1902,17 @@ class Train:
         if first != self.first:
             self.turn += 1
             self.first = first
+        # A record that left the line may have runs GitHub does not list yet.
+        current = self.scratch_records()
+        watched = {entry["branch"] for entry in self.dropped}
+        for branch, record in self.scratch.items():
+            # A dispatch sent but never answered may have reached GitHub too.
+            sent = sorted({*record.get("requested", []), *record.get("dispatching", [])})
+            if branch not in current and branch not in watched and sent:
+                self.dropped.append(
+                    {"branch": branch, "requested": sent, "dropped": int(time.time())}
+                )
+        self.scratch = current
         with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False) as output:
             json.dump(
                 {
@@ -1784,6 +1937,7 @@ class Train:
                     "reruns": self.reruns,
                     "lost": self.lost,
                     "retest": self.retest,
+                    "dropped": self.dropped,
                 },
                 output,
             )
@@ -2595,26 +2749,105 @@ def _batch_report(train: Train, merged: list[str], acting: str, message: str) ->
 
 def _sweep_scratch(folder: Path) -> None:
     """Delete scratch branches that no saved batch, isolated failure awaiting a rerun or whole
-    browser suite run names."""
+    browser suite run names, each once its runs still queued or running are cancelled. A branch
+    whose runs cannot be read for now, or whose cancel is lost to an outage, stops the sweep and
+    is kept, with those after it, for the next; one that keeps failing is kept and passed over.
+
+    GitHub lists a dispatched run only some time after it accepted the dispatch: the runs of a
+    dropped branch are looked for, and cancelled, until one of each workflow dispatched on it
+    has been seen, or DROPPED_RUNS_SECONDS after the drop, when the gate gives up and says so."""
     try:
         train = Train(folder)
-        kept = {
-            member["scratch"]["branch"]
-            for member in (train.prefixes["members"] if train.prefixes else [])
-            if member["scratch"]
-        }
-        kept |= {failure["batch"]["branch"] for failure in train.batch_failed.values()}
-        kept |= {scratch["branch"] for scratch in train.proven.values()}
-        kept |= {suite["branch"] for suite in train.suites.values()}
+        before = json.dumps(train.dropped, sort_keys=True)
+        kept = set(train.scratch_records())
         listed = git("ls-remote", "origin", f"refs/heads/{SCRATCH_PREFIX}*")
-        for line in listed.splitlines():
-            ref = line.split()[1]
-            if ref.removeprefix("refs/heads/") not in kept:
-                deleted = push("origin", "--delete", ref)
+        branches = [line.split()[1].removeprefix("refs/heads/") for line in listed.splitlines()]
+    except (Refused, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+        print(f"could not delete old batch branches: {error}", flush=True)
+        return
+    watched = {entry["branch"]: entry for entry in train.dropped}
+    try:
+        for branch in branches:
+            if branch in kept:
+                continue
+            try:
+                # A dropped prefix's runs would hold runners ahead of the live prefixes' runs.
+                found = _scratch_runs(branch)
+                _cancel(found, folder, f"scratch branch {branch}")
+                if branch in watched:
+                    _seen(watched[branch], found)
+                deleted = push("origin", "--delete", f"refs/heads/{branch}")
                 if deleted.returncode:
                     raise Refused(deleted.refusal)
-    except (Refused, OSError, KeyError, IndexError, ValueError) as error:
+            except Waiting:
+                raise
+            except Refused as error:
+                print(f"could not delete old batch branch {branch}: {error}", flush=True)
+        for entry in list(train.dropped):
+            branch = entry["branch"]
+            try:
+                if branch in kept:
+                    train.dropped.remove(entry)
+                    continue
+                if branch not in branches:
+                    # Past the deadline too: one last look before giving up.
+                    found = _scratch_runs(branch)
+                    _cancel(found, folder, f"scratch branch {branch}")
+                    _seen(entry, found)
+                missing = sorted(set(entry["requested"]) - set(entry.get("seen", [])))
+                if not missing:
+                    train.dropped.remove(entry)
+                elif time.time() - entry["dropped"] > DROPPED_RUNS_SECONDS:
+                    wake_log(
+                        f"gave up looking for the {', '.join(missing)} run of dropped scratch "
+                        f"branch {branch}: GitHub listed none within "
+                        f"{DROPPED_RUNS_SECONDS // 60} minutes"
+                    )
+                    train.dropped.remove(entry)
+            except Waiting:
+                raise
+            except Refused as error:
+                print(f"could not look for the runs of {branch}: {error}", flush=True)
+    except (Refused, OSError, KeyError, IndexError, TypeError, ValueError) as error:
         print(f"could not delete old batch branches: {error}", flush=True)
+    finally:
+        if json.dumps(train.dropped, sort_keys=True) != before:
+            try:
+                train.save()
+            except OSError as error:
+                print(f"could not save the dropped scratch branches: {error}", flush=True)
+
+
+def _seen(entry: dict[str, Any], found: list[dict[str, Any]]) -> None:
+    """Note in a dropped branch's entry each dispatched workflow a run of which GitHub listed:
+    each was cancelled, or had finished."""
+    files = {
+        WORKFLOW_FILES[workflow]: workflow
+        for workflow in entry["requested"]
+        if workflow in WORKFLOW_FILES
+    }
+    seen = set(entry.get("seen", []))
+    seen |= {
+        files[name]
+        for run in found
+        if run.get("event") == "workflow_dispatch"
+        and (name := str(run.get("path", "")).rsplit("/", 1)[-1]) in files
+    }
+    entry["seen"] = sorted(seen)
+
+
+def _scratch_runs(branch: str) -> list[dict[str, Any]]:
+    """Every run of a scratch branch the gate made, across every workflow, read fresh from GitHub.
+
+    A branch of another name in the gate's namespace, and a pull request's own run, are never
+    the gate's to cancel."""
+    if not re.fullmatch(rf"{re.escape(SCRATCH_PREFIX)}[0-9a-f]{{32}}", branch):
+        return []
+    return [
+        run
+        for run in _api(f"{API}/actions/runs?branch={branch}&per_page=100", "workflow_runs")
+        if run.get("head_branch") == branch and run.get("event") != "pull_request"
+    ]
 
 
 @contextmanager
@@ -2668,6 +2901,10 @@ def _dispatch_scratch(train: Train, record: dict[str, Any], workflow: str) -> No
         return
     # Save only an accepted dispatch. If interrupted around the request, the
     # lookup above recovers an observable run; a never-sent request can retry.
+    # Until GitHub answers, the workflow is noted as being dispatched: dropped meanwhile, the
+    # record's branch is still watched for its run (_sweep_scratch).
+    record["dispatching"] = sorted({*record.get("dispatching", []), workflow})
+    train.save()
     dispatched = command(
         "gh",
         "workflow",
@@ -2679,7 +2916,9 @@ def _dispatch_scratch(train: Train, record: dict[str, Any], workflow: str) -> No
         record["branch"],
         check=False,
     )
+    record["dispatching"].remove(workflow)
     if dispatched.returncode:
+        train.save()
         raise Refused(f"batch {workflow} dispatch failed: {dispatched.stderr.strip()}")
     record["requested"].append(workflow)
     train.save()
