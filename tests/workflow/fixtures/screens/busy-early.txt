@@ -1,0 +1,9 @@
+● Bash(pytest tests)
+  ⎿  Running… (2m 3s)
+
+✻ Cogitating… (2m 3s · ↓ 2.1k tokens · esc to interrupt)
+
+────────────────────────────────────────
+> 
+────────────────────────────────────────
+  ? for shortcuts
