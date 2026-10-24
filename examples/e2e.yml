@@ -9,11 +9,15 @@
 # main, and the merge gate's dispatch on a scratch branch of its own, run on main's runners, so a
 # prefix of the merge line never waits behind pull requests' own runs. Each job names that
 # choice: `refs/heads/` and `merge.scratch_prefix`, and main's label, `<runner.label>-main`
-# (here the defaults, `<runner.prefix>-home` with the runner prefix `example-app`). A pull request's own run never gets them; a scratch run does, and runs the
-# merge line's members, and the workflow as they changed it, on main's machine. Only a push or
-# a dispatch, both needing write access, starts one, and GitHub compares the branch's name
-# without its case: a branch ruleset that lets only the gate's identity create branches of the
-# prefix, in any case, keeps every other one off main's runners.
+# (here the defaults, `<runner.prefix>-home` with the runner prefix `example-app`).
+#
+# The choice keeps every other run of this workflow, a pull request's among them, off main's
+# runners, but not a branch's own copy of the workflow: a scratch run runs the merge line's
+# members, and the workflow as they changed it, on main's machine, and any pushed branch may name
+# main's label itself. GitHub reads the prefix without its case. Keep main's runners to the
+# workflows and branches meant for them with a runner group, have outside contributors' runs
+# approved before they start, and let only the gate's identity create branches of the prefix,
+# in any case.
 name: E2E
 
 on:

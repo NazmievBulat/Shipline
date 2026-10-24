@@ -92,6 +92,9 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
 | `commands.browser` | the command line that runs the repository's browser tests, from the root of its checkout: E2E's `playwright` job runs it (`ci_proof.py browser`), with the job's own arguments after it | none: the browser job fails, saying so |
 
+Change `merge.scratch_prefix` only while the merge line is empty: the gate deletes, and cancels
+the runs of, only the scratch branches of the prefix it reads, so those of the old one would stay.
+
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the
 new one. The tick's own lock, `shipline-tick.lock` in the git common directory, does not move

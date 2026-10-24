@@ -3,14 +3,14 @@
 Runs on the home machine as `example-app-runner-lend.service`, as the runner programs' own GitHub
 identity (github_identity.py), or the owner's `gh` login without one, as the spare supervisor
 does. Main's runners register with `example-app-home-main` alone. While no job of a push to main,
-nor of the merge gate's run of a prefix on a scratch branch, is queued or running for main's
-runners (the merge line's runs are main's own: examples/ci.yml), this gives one idle main runner
-the pull request labels too: `example-app-home-first`, which the jobs of the train's first
-member ask for, and `example-app-home`, which every other pull request job asks for. While a job
-of the first member waits, the lent runner keeps only the first label, so it takes that job
-before older ones. When a job of main or of the merge line is under way, an idle lent runner
-loses both. A busy runner is never relabelled: its labels go with its registration when the job
-ends.
+nor of a dispatched run, the merge gate's runs of its prefixes among them, is queued or running
+for main's runners (the merge line's runs are main's own: examples/ci.yml), this gives one idle
+main runner the pull request labels too: `example-app-home-first`, which the jobs of the train's
+first member ask for, and `example-app-home`, which every other pull request job asks for. While
+a job of the first member waits, the lent runner keeps only the first label, so it takes that
+job before older ones. When a job of main or of a dispatched run is under way, an idle lent
+runner loses both. A busy runner is never relabelled: its labels go with its registration when
+the job ends.
 
 The merge gate writes the train's first member to `~/.local/state/workflow/train-first.json`
 (scripts/workflow/merge_gate.py). This copies it, with the time, into the folder the planner's
@@ -186,19 +186,17 @@ def _jobs_under_way(api: Api, repository: str, run: dict[str, Any]) -> list[dict
     return [job for job in jobs if job["status"] != "completed"]
 
 
-def main_waiting(api: Api, repository: str, labels: Labels, scratch_prefix: str) -> bool:
-    """A job of a push to main, or of the merge gate's run on a scratch branch, is queued or
-    running for main's runners."""
+def main_waiting(api: Api, repository: str, labels: Labels) -> bool:
+    """A job of a push to main, or of a dispatched run, is queued or running for main's runners.
+
+    The merge gate dispatches its prefixes' runs, and their jobs ask for main's label: what a
+    job asks for decides, not what its branch is called. Only runs under way are listed, so
+    finished dispatches never push one off the page."""
+    dispatched = f"repos/{repository}/actions/runs?event=workflow_dispatch&per_page=20&status="
     runs = [
         *_active(api, f"repos/{repository}/actions/runs?event=push&branch=main&per_page=10"),
-        # The gate dispatches at most a few prefixes' runs at once; GitHub lists the newest first.
-        *(
-            run
-            for run in _active(
-                api, f"repos/{repository}/actions/runs?event=workflow_dispatch&per_page=20"
-            )
-            if (run.get("head_branch") or "").startswith(scratch_prefix)
-        ),
+        *_active(api, f"{dispatched}queued"),
+        *_active(api, f"{dispatched}in_progress"),
     ]
     return any(
         labels.main in job["labels"]
@@ -412,8 +410,6 @@ def round_once(
     published: Path,
     own: str = "home-main",
     listing: Path | None = None,
-    *,
-    scratch_prefix: str,
 ) -> None:
     record = first.record()
     first_waiting = first.look(record, labels, cancel=False)
@@ -423,7 +419,7 @@ def round_once(
         for runner in registrations(api, repository, listing)
         if labels.main not in runner.labels or runner.name.startswith(own)
     ]
-    waiting = main_waiting(api, repository, labels, scratch_prefix)
+    waiting = main_waiting(api, repository, labels)
     changes = lending(runners, labels, main_waiting=waiting, first_waiting=first_waiting, most=most)
     for change, runner, label in changes:
         if change == "add":
@@ -489,7 +485,7 @@ def round_once(
 
 def main() -> None:
     repository, home, first_label, main_label = sys.argv[1:5]
-    most, seconds, own, scratch_prefix = int(sys.argv[5]), float(sys.argv[6]), *sys.argv[7:9]
+    most, seconds, own = int(sys.argv[5]), float(sys.argv[6]), sys.argv[7]
     labels = Labels(home=home, first=first_label, main=main_label)
     state = Path.home() / ".local/state"
     api = RoundReads()
@@ -512,7 +508,6 @@ def main() -> None:
                 state / "ci-overflow/home/first.json",
                 own,
                 Path(__file__).with_name("runners.tsv"),
-                scratch_prefix=scratch_prefix,
             )
         except Limited:
             continue

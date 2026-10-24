@@ -42,7 +42,8 @@ def _tokens(text: str) -> list[tuple[str, str]]:
 
 
 def _truthy(value: Any) -> bool:
-    return value not in (False, 0, "", None)
+    # No number, NaN, is falsy too.
+    return value not in (False, 0, "", None) and value == value
 
 
 def _text(value: Any) -> str:
@@ -156,32 +157,36 @@ class _Parser:
         return value
 
     def both(self) -> Any:
-        value = self.comparison()
+        value = self.equality()
         while self.peek() == "&&":
             self.take()
-            right = self.comparison()
+            right = self.equality()
             value = right if _truthy(value) else value
         return value
 
+    def equality(self) -> Any:
+        value = self.comparison()
+        while self.peek() in ("==", "!="):
+            operator = self.take()[1]
+            right = self.comparison()
+            value = _equal(value, right) == (operator == "==")
+        return value
+
     def comparison(self) -> Any:
+        """`<`, `>`, `<=` and `>=`, which bind tighter than `==` and `!=`."""
         value = self.unary()
-        while self.peek() in ("==", "!=", "<", ">", "<=", ">="):
+        while self.peek() in ("<", ">", "<=", ">="):
             operator = self.take()[1]
             right = self.unary()
-            if operator == "==":
-                value = _equal(value, right)
-            elif operator == "!=":
-                value = not _equal(value, right)
-            else:
-                value, right = _compared(value, right)
-                if isinstance(value, (dict, list, type(None))):
-                    raise ExpressionError(f"{operator} of {_kind(value)}")
-                value = {
-                    "<": value < right,
-                    ">": value > right,
-                    "<=": value <= right,
-                    ">=": value >= right,
-                }[operator]
+            value, right = _compared(value, right)
+            if isinstance(value, (dict, list, type(None))):
+                raise ExpressionError(f"{operator} of {_kind(value)}")
+            value = {
+                "<": value < right,
+                ">": value > right,
+                "<=": value <= right,
+                ">=": value >= right,
+            }[operator]
         return value
 
     def unary(self) -> Any:

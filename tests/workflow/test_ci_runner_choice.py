@@ -153,6 +153,9 @@ def test_the_rules_say_where_the_gate_s_scratch_runs_run() -> None:
         ("null == ''", {}, True),
         ("'on' == 0", {}, False),
         ("true == 1", {}, True),
+        # `<` binds tighter than `==`: 2 == true, as numbers 2 == 1.
+        ("2 == 1 < 3", {}, False),
+        ("!(2 != 1 < 3)", {}, False),
     ],
 )
 def test_expressions_are_worked_out_as_github_does(

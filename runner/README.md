@@ -2,10 +2,9 @@
 
 A repository that uses Shipline can run its CI on its own machines. This folder holds what a
 machine needs for that: the programs that register the runners, keep the ordinary slots and a
-spare, lend main's runners to pull request jobs while neither main nor the merge line's scratch
-runs have a job for them, plan, and sample usage; the installers; and the systemd units, as
-templates. Shipline's own CI runs on GitHub-hosted runners only: Shipline never registers a
-runner to Shipline itself.
+spare, lend main's runners to pull request jobs while main has none, plan, and sample usage;
+the installers; and the systemd units, as templates. Shipline's own CI runs on GitHub-hosted
+runners only: Shipline never registers a runner to Shipline itself.
 
 Nothing here names a repository, a machine, a user or a host. One prefix names everything, and
 what differs between machines stays on each machine, outside any repository.
@@ -79,7 +78,7 @@ the prefix `example-app` against `tests/runner/expected/`.
 | Unit | What it does |
 | --- | --- |
 | `<prefix>-runner@.service` | one ordinary runner, slot `%i`, in a container of `<prefix>-runner` |
-| `<prefix>-runner-main@.service` | one of main's runners, slot `%i`, which the lender lends while neither main nor the merge line's scratch runs have a job for it |
+| `<prefix>-runner-main@.service` | one of main's runners, slot `%i`, which the lender lends while main has no job |
 | `<prefix>-runner-docker@.service` | one Docker-capable runner, slot `%i`, in a virtual machine; only with `/dev/kvm` |
 | `<prefix>-runner-planner.service` | the planner's runner, for the jobs that plan what CI runs |
 | `<prefix>-runner-spare.service` | the spare supervisor, which keeps a registered spare runner ready |

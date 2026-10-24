@@ -1,6 +1,7 @@
 """The lender (`runner/lend_runners.py`) lends one of main's idle runners to pull request jobs only
 while neither main nor the merge gate's run of a prefix has a job queued or running for main's
-runners: the merge line's scratch runs are main's own (examples/ci.yml, examples/e2e.yml)."""
+runners: the merge line's scratch runs are main's own (examples/ci.yml, examples/e2e.yml). A
+dispatched run counts by what its jobs ask for, main's label, whatever its branch is called."""
 
 import importlib.util
 import json
@@ -39,13 +40,19 @@ def _runner(identity: int, name: str, *labels: str) -> dict[str, Any]:
     }
 
 
-def _run(identity: int, event: str, branch: str, path: str = ".github/workflows/ci.yml") -> Any:
+def _run(
+    identity: int,
+    event: str,
+    branch: str,
+    path: str = ".github/workflows/ci.yml",
+    status: str = "in_progress",
+) -> Any:
     return {
         "id": identity,
         "event": event,
         "head_branch": branch,
         "path": path,
-        "status": "in_progress",
+        "status": status,
         "head_sha": "1" * 40,
     }
 
@@ -76,10 +83,12 @@ class GitHub:
             return {"runners": self.runners}
         if path.startswith(f"{_API}/actions/runs?"):
             query = dict(part.split("=", 1) for part in path.split("?", 1)[1].split("&"))
+            # Newest first, as GitHub lists them.
             found = [
                 run
-                for run in self.runs.get(query["event"], [])
-                if "branch" not in query or run["head_branch"] == query["branch"]
+                for run in sorted(self.runs.get(query["event"], []), key=lambda run: -run["id"])
+                if ("branch" not in query or run["head_branch"] == query["branch"])
+                and ("status" not in query or run["status"] == query["status"])
             ]
             return {"workflow_runs": found[: int(query["per_page"])]}
         if path.endswith("/jobs?per_page=100"):
@@ -102,7 +111,6 @@ def _round(github: GitHub, tmp_path: Path) -> list[tuple[str, ...]]:
         1,
         first,
         tmp_path / "first.json",
-        scratch_prefix=_PREFIX,
     )
     return github.changes
 
@@ -117,6 +125,17 @@ _QUEUES = {
     "nothing under way": ({}, {}, []),
     "a merge-line job queued": (
         {"workflow_dispatch": [_run(10, "workflow_dispatch", _BATCH)]},
+        {10: [_job(1, "queued", LABELS.main)]},
+        _TAKEN_BACK,
+    ),
+    "a merge-line run queued": (
+        {"workflow_dispatch": [_run(10, "workflow_dispatch", _BATCH, status="queued")]},
+        {10: [_job(1, "queued", LABELS.main)]},
+        _TAKEN_BACK,
+    ),
+    # A repository that names another scratch prefix: its runs ask for main's label all the same.
+    "a merge-line job queued on another prefix": (
+        {"workflow_dispatch": [_run(10, "workflow_dispatch", "shipline/prefix-0123")]},
         {10: [_job(1, "queued", LABELS.main)]},
         _TAKEN_BACK,
     ),
@@ -187,9 +206,15 @@ def test_an_unlent_runner_is_not_lent_while_a_merge_line_job_is_queued(tmp_path:
     assert (published["free"], published["first_free"]) == (1, 1)
 
 
-def test_the_lender_is_given_the_scratch_prefix_from_the_pool_s_settings() -> None:
-    settings = (_ROOT / "runner/settings.sh").read_text()
-    keep = (_ROOT / "runner/keep-lending.sh").read_text()
+def test_a_merge_line_run_behind_many_finished_dispatches_still_counts(tmp_path: Path) -> None:
+    """GitHub lists the newest runs first: finished ones never push an active one off the page."""
+    finished = [
+        _run(100 + n, "workflow_dispatch", "feature/example", status="completed")
+        for n in range(30)
+    ]
+    github = GitHub(
+        {"workflow_dispatch": [_run(10, "workflow_dispatch", _BATCH), *finished]},
+        {10: [_job(1, "queued", LABELS.main)]},
+    )
 
-    assert f"\nscratch_prefix={_PREFIX}\n" in settings
-    assert '"$scratch_prefix"' in keep
+    assert _round(github, tmp_path) == _TAKEN_BACK

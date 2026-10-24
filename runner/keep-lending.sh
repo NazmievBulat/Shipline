@@ -7,4 +7,4 @@ here=$(dirname "$0")
 . "$here/settings.sh"
 # Main's runners of this machine are named home-main and home-main-2 (keep-runner.sh).
 exec python3 "$here/lend_runners.py" "$repository" "$label" "$first_label" "$main_label" \
-  "$main_lent" "$lend_poll_seconds" home-main "$scratch_prefix"
+  "$main_lent" "$lend_poll_seconds" home-main
