@@ -704,3 +704,115 @@ def test_the_daily_report_includes_the_decisions(workflow: Workflow) -> None:
     assert "| start | 0 done, 1 refused | 0 done, 1 refused |" in report.stdout
     assert "| answers per ticket | 9: 1 | 9: 1 |" in report.stdout
     assert "| hold episodes | none | 8 after 7, 3.0 h |" in report.stdout
+
+
+def test_an_interrupted_decision_on_a_pull_request_closed_meanwhile_is_closed_as_refused(
+    team: Workflow,
+) -> None:
+    _ticket(team, 8, "docs/two")
+    _ticket(team, 9, "docs/three")
+    (team.state / "fail-gh-patch").touch()
+    words = ("--question", "q", "--reply", "r", "--meaning", "m")
+    assert _decide(team, "answer", "8", "--area", "product", *words).returncode == 3
+    (team.state / "fail-gh-patch").unlink()
+    team.set_pull_request(8, "CLOSED", team.git("rev-parse", "origin/main"))
+
+    first = _decide(
+        team, "restart", "9", "--session", "ticket-9", "--judgment", "x", "--message", "y"
+    )
+    second = _decide(
+        team, "restart", "9", "--session", "ticket-9", "--judgment", "x", "--message", "y"
+    )
+
+    assert first.returncode == second.returncode == 0, first.stderr
+    [answer] = [record for record in _records(team) if record["kind"] == "answer"]
+    assert answer["status"] == "refused"
+    assert answer["reason"] == "checked again: 8 is not an open pull request"
+
+
+def test_a_delegated_start_obeys_hold_all_and_never_labels_a_running_ticket(
+    team: Workflow,
+) -> None:
+    _ticket(team, 8, "docs/two")
+    _ticket(team, 9, "docs/three")
+    team.running("ticket-9")
+    (team.repo / ".local/workflow").mkdir(parents=True, exist_ok=True)
+    plan = team.repo / ".local/workflow/start-plan"
+    plan.write_text("hold all\n")
+
+    held = _decide(team, "start", "8")
+    plan.unlink()
+    running = _decide(team, "start", "9")
+
+    assert held.returncode == running.returncode == 1
+    assert "hold all in start-plan" in held.stderr
+    assert "9 runs already" in running.stderr
+    plan.write_text("hold all\n")
+    assert _decide(team, "start", "8", "--owner", "start 8").returncode == 0
+    assert _labelled(team) == ["8"]
+
+
+def test_a_hold_ends_when_its_own_ticket_starts(team: Workflow) -> None:
+    _ticket(team, 7, "scripts/workflow/tick", labels=("workflow", "priority:+medium"))
+    _ticket(team, 8, "scripts/workflow")
+    assert _decide(team, "hold", "8", "--after", "7").returncode == 0
+
+    assert _decide(team, "start", "8", "--owner", "start 8 now").returncode == 0
+    _decide(team, "restart", "7", "--session", "ticket-7", "--judgment", "x", "--message", "y")
+
+    [hold] = [record for record in _records(team) if record["kind"] == "hold"]
+    assert hold["status"] == "ended"
+    assert hold["ended_because"] == "8 started"
+    assert "8 after 7" not in _plan(team)
+
+
+def test_an_answer_whose_reply_is_not_the_owners_words_is_refused(team: Workflow) -> None:
+    _ticket(team, 8, "docs/two")
+
+    done = _decide(
+        team,
+        "answer",
+        "8",
+        "--area",
+        "product",
+        "--question",
+        "q",
+        "--meaning",
+        "m",
+        "--reply",
+        "yes",
+        "--owner",
+        "no",
+    )
+
+    assert done.returncode == 1
+    assert "--reply differs from --owner" in done.stderr
+
+
+def test_the_metrics_read_iso_times(team: Workflow) -> None:
+    _ticket(team, 8, "docs/two")
+    moment = 1_790_000_000
+    _decide(
+        team,
+        "restart",
+        "8",
+        "--session",
+        "ticket-8",
+        "--judgment",
+        "x",
+        "--message",
+        "y",
+        at=moment,
+    )
+
+    inside = team.run_script(
+        "decide",
+        "--metrics",
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment - 60)),
+        time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(moment + 60)),
+    )
+    before = team.run_script("decide", "--metrics", "2020-01-01T00:00:00", "2020-01-02T00:00:00")
+
+    assert inside.returncode == before.returncode == 0, inside.stderr
+    assert json.loads(inside.stdout)["kinds"]["restart"] == {"done": 1, "refused": 0}
+    assert json.loads(before.stdout)["kinds"]["restart"] == {"done": 0, "refused": 0}

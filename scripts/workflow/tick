@@ -787,16 +787,18 @@ cloud_candidate() {
 # The starts, the program each worker gets and its launch, and the next ticket's label, go under
 # the lock of `decide`: an orchestrator's decision and the tick's start never cross. Every
 # session the tick starts closes it, as it closes the tick's own.
-decide_locked=0
+# Whether the starts and the pick go in this tick: the lock is held and what they read is fresh.
+starts_go=0
 exec 8>"$common/shipline-decide.lock"
 if flock --timeout 60 8; then
-  decide_locked=1
+  starts_go=1
   # A decision made since the snapshot may have labelled a ticket or chosen its program.
   records=$main/$SHIPLINE_STATE_FOLDER/decisions.jsonl
   if [[ -e $records && $records -nt $snapshot ]]; then
     if ! python3 "$here/tick_snapshot.py" create "$snapshot" 9>&- 8>&- || ! pulls=$(labelled_pulls); then
       echo "cannot list the pull requests again after a decision; starts wait for the next tick" >&2
       pulls=""
+      starts_go=0
       failed=1
     fi
   fi
@@ -804,6 +806,7 @@ if flock --timeout 60 8; then
   if ! unfinished=$(python3 -B "$here/decisions.py" unfinished 9>&- 8>&-); then
     echo "cannot read the decisions; starts wait for the next tick" >&2
     pulls=""
+    starts_go=0
     failed=1
   fi
 else
@@ -903,7 +906,7 @@ python3 -B "$here/reviewer_start.py" --reconcile "$main/$SHIPLINE_STATE_FOLDER" 
 
 # After this tick's own starts, which count as starts too: the next draft ticket gets the label
 # when one may start, and the next tick starts its worker.
-if ((decide_locked)); then
+if ((starts_go)); then
   python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
     failed=1
 fi

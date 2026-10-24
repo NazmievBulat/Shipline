@@ -112,6 +112,8 @@ CURSOR = "decisions.wake-cursor"
 LOCK = "shipline-decide.lock"
 # How long a call waits for the lock: the tick holds it while it starts workers.
 LOCK_SECONDS = 300
+# The answers and refused starts one check-in tells at most; the rest are named by their count.
+TOLD_EVENTS = 10
 
 CONFIG = workflow_config.current()
 LABEL = CONFIG.labels.workflow
@@ -328,6 +330,22 @@ def set_body(number: int, body: str) -> None:
         os.unlink(name)
 
 
+def body_now(number: int) -> str:
+    """The description as GitHub has it now: an edit made since this call began is kept."""
+    import tick_snapshot
+
+    done = gh("pr", "view", str(number), "--json", tick_snapshot.FIELDS)
+    found = json.loads(done.stdout)
+    if not isinstance(found, dict) or found.get("state", "OPEN") != "OPEN":
+        raise Refused(f"{number} is not an open pull request")
+    return found.get("body") or ""
+
+
+def same_text(first: str, second: str) -> bool:
+    """The same lines, whatever their line ends and the newlines at the end."""
+    return first.replace("\r\n", "\n").rstrip("\n") == second.replace("\r\n", "\n").rstrip("\n")
+
+
 def labels_of(pull: dict[str, Any]) -> set[str]:
     return {label.get("name") for label in pull.get("labels") or []}
 
@@ -392,8 +410,12 @@ def check_start(context: Context, number: int, after: int | None, owner: str | N
         return Plan("start", f"start {number}", details, evidence)
 
     queue = context.starts()
+    if queue.held_all:
+        raise Refused("hold all in start-plan")
     if queue.unclear:
         raise Refused(f"start-plan line not understood: {queue.unclear[0]}")
+    if str(number) in queue.busy:
+        raise Refused(f"{number} runs already: a session, a cloud record or the merge train")
     found = queue.files_of(pull)
     reason = queue.reason(pull, found)
     if reason is not None and not reason.startswith("shares "):
@@ -624,36 +646,39 @@ def act(context: Context, record: dict[str, Any]) -> None:
             lines.append(line)
         write_file(path, "\n".join(lines) + "\n")
     elif kind == "answer":
-        body = context.pull(number).get("body") or ""
-        if (changed := with_entry(body, details["entry"])) != body:
+        context.pull(number)
+        body = body_now(number)
+        if not same_text(changed := with_entry(body, details["entry"]), body):
             set_body(number, changed)
     elif kind == "allowance":
         write_file(context.notes / f"review-{number}.allow-round", f"{details['round']}\n")
     elif kind == "program":
-        body = context.pull(number).get("body") or ""
-        if (changed := with_program(body, details["line"])) != body:
+        context.pull(number)
+        body = body_now(number)
+        if not same_text(changed := with_program(body, details["line"]), body):
             set_body(number, changed)
         write_file(context.notes / f"worker-program-{number}", f"{details['program']}\n")
 
 
 def finish(context: Context, record: dict[str, Any]) -> dict[str, Any]:
-    """Finish an interrupted decision: a start is checked again, every other act repeated."""
-    if record["kind"] == "start":
-        pull = context.open_pulls().get(str(record["number"]))
-        if pull is None or LABEL not in labels_of(pull):
-            try:
+    """Finish an interrupted decision: a start is checked again, every other act repeated. One
+    that can no longer be done, as on a pull request closed meanwhile, is closed as refused."""
+    try:
+        if record["kind"] == "start":
+            pull = context.open_pulls().get(str(record["number"]))
+            if pull is None or LABEL not in labels_of(pull):
                 plan = check_start(
                     context, record["number"], record["details"].get("after"), record["owner_words"]
                 )
                 if plan.kind != "start":
                     raise Refused(f"it is now {plan.choice}; decide again")
-            except Refused as refusal:
-                closed = {**record, "status": "refused", "reason": f"checked again: {refusal}"}
-                append(context.notes, closed)
-                return closed
+                act(context, record)
+        else:
             act(context, record)
-    else:
-        act(context, record)
+    except Refused as refusal:
+        closed = {**record, "status": "refused", "reason": f"checked again: {refusal}"}
+        append(context.notes, closed)
+        return closed
     done = {**record, "status": "done"}
     append(context.notes, done)
     return done
@@ -784,6 +809,8 @@ def wake(notes: Path, moment: int) -> dict[str, Any]:
             )
         elif line.get("kind") == "start" and line.get("status") == "refused":
             events.append(f"start of {line['number']} refused: {line.get('reason')}")
+    if len(events) > TOLD_EVENTS:
+        events = [*events[:TOLD_EVENTS], f"and {len(events) - TOLD_EVENTS} more in {RECORDS}"]
     return {"held": held, "events": events, "cursor": len(lines)}
 
 
@@ -798,7 +825,10 @@ def metrics(notes: Path, since: float, until: float, moment: float | None = None
     kinds = {kind: {"done": 0, "refused": 0} for kind in KINDS}
     holds, answers = [], Counter()
     for record in records(notes).values():
-        at = instant(record["at"])
+        try:
+            at = instant(record["at"])
+        except KeyError, TypeError, ValueError:
+            continue
         status = {"ended": "done"}.get(record.get("status"), record.get("status"))
         if since <= at < until and status in ("done", "refused") and record.get("kind") in kinds:
             kinds[record["kind"]][status] += 1

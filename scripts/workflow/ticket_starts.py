@@ -579,6 +579,7 @@ def pick(main: Path, snapshot: Path) -> int:
     open_pulls = {number: pull for number, pull in pulls.items() if pull.get("state") == "OPEN"}
     # A hold `decide` recorded ends when its ticket or the one it waits for closes, or once
     # its ticket started. The tick holds the lock of `decide` while it picks.
+    decisions.repair(notes)
     decisions.close_holds(notes, open_pulls, moment)
     unfinished = decisions.unfinished(notes)
     queue = Queue.read(main, open_pulls)
