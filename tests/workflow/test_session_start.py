@@ -961,3 +961,25 @@ def test_an_analyst_that_tmux_refuses_leaves_no_report_folder(workflow: Workflow
     assert done.returncode != 0
     assert f"{_ANALYST} could not be started" in done.stderr
     assert not workflow.analysis_report("day-2026-10-24").exists()
+
+
+@pytest.mark.parametrize("reason", ["another start holds the lock", "the fetch fails"])
+def test_an_analyst_start_refused_for_a_passing_reason_leaves_nothing_and_says_try_later(
+    workflow: Workflow, reason: str
+) -> None:
+    """Exit 75, as a start deferred for memory: the tick tries the day's start again."""
+    lock_path = workflow.repo / ".local" / "workflow" / "start-analyst.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock:
+        if reason == "another start holds the lock":
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        else:
+            workflow.fake(
+                "git", '#!/bin/bash\n[[ $1 == fetch ]] && exit 128\nexec /usr/bin/git "$@"\n'
+            )
+        done = workflow.run("start", "analyst", "day-2026-10-24")
+
+    assert done.returncode == 75, done.stderr
+    assert not [call for call in workflow.calls("tmux") if " new-session " in call]
+    assert not workflow.analysis_report("day-2026-10-24").exists()
+    assert not workflow.analyst_worktree("day-2026-10-24").exists()

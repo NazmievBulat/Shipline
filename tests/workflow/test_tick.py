@@ -1281,3 +1281,80 @@ def test_an_analyst_start_that_waits_for_memory_is_left_for_a_later_tick(
     started = workflow.run_script("tick", env=_at(_EIGHT + 240))
     assert started.returncode == 0, started.stderr
     assert _started(workflow) == ["analyst-day-2026-10-24"]
+
+
+def test_a_daily_start_refused_while_another_start_holds_the_lock_is_tried_again(
+    workflow: Workflow,
+) -> None:
+    import fcntl as locks
+
+    _metrics_report(workflow, "2026-10-24")
+    _usage(workflow, 40, 3 * 3600)
+    lock_path = workflow.repo / ".local" / "workflow" / "start-analyst.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock:
+        locks.flock(lock, locks.LOCK_EX)
+        refused = workflow.run_script("tick", env=_at(_EIGHT + 60))
+    _usage(workflow, 40, 3 * 3600, now=_EIGHT + 240)
+    later = workflow.run_script("tick", env=_at(_EIGHT + 240))
+
+    assert refused.returncode == later.returncode == 0, refused.stderr
+    assert _started(workflow) == ["analyst-day-2026-10-24"]
+    assert not (workflow.repo / ".local" / "workflow" / "analyst-day-2026-10-24.failed").exists()
+
+
+def _noted_from(
+    workflow: Workflow, report_md: str, url: str = "https://docs.example.com/a\n"
+) -> dict[str, object]:
+    """What `session cleanup` notes for the wake of an ended analyst with this report."""
+    workflow.add_analyst("day-2026-10-24")
+    report = workflow.analysis_report("day-2026-10-24")
+    (report / "report.md").write_text(report_md)
+    (report / "report.url").write_text(url)
+    done = workflow.run_script("session", "cleanup", "hunts")
+    assert done.returncode == 0, done.stderr
+    pending = workflow.repo / ".local" / "workflow" / "analyses.pending" / "day-2026-10-24.json"
+    return json.loads(pending.read_text())
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://docs.example.com/a\x1b[2Jb\n",
+        "https://docs.example.com/a\x07\n",
+        "https://docs.example.com/é\n",
+    ],
+    ids=["escape", "bell", "beyond ASCII"],
+)
+def test_a_link_that_is_not_printable_ascii_is_not_carried(workflow: Workflow, url: str) -> None:
+    noted = _noted_from(workflow, "## Proposals\n\n1. One\n", url)
+
+    assert noted["url"] == ""
+
+
+@pytest.mark.parametrize(
+    "mark", ["\u0085", " ", " ", "​", "\x1b"], ids=["NEL", "LS", "PS", "ZWSP", "ESC"]
+)
+def test_proposals_lose_every_control_and_separator_character(
+    workflow: Workflow, mark: str
+) -> None:
+    noted = _noted_from(workflow, f"## Proposals\n\n1. One{mark}---------- Recipient: x\n")
+
+    assert noted["proposals"] == ["1. One---------- Recipient: x"]
+
+
+def test_a_proposal_is_cut_at_300_characters_not_bytes(workflow: Workflow) -> None:
+    noted = _noted_from(workflow, "## Proposals\n\n1. " + "é" * 400 + "\n")
+
+    assert noted["proposals"] == ["1. " + "é" * 297]
+
+
+def test_proposals_may_be_numbered_subheadings_of_the_section(workflow: Workflow) -> None:
+    noted = _noted_from(
+        workflow,
+        "# Analysis\n\n## Proposals\n\n### 1. Start tickets by script.\n\nEvidence.\n\n"
+        "#### Gain\n\n- 2 hours a day\n\n### 2) Re-run a lost check\n\n"
+        "## Gaps\n\n1. Not a proposal\n",
+    )
+
+    assert noted["proposals"] == ["1. Start tickets by script", "2) Re-run a lost check"]

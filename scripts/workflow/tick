@@ -245,9 +245,10 @@ usage_allows_start() {
 
 # One analyst a day, from ANALYST_DAILY_AT, once the day's metrics report is written: it reads
 # that report. Its report folder says it started; a start that waits for memory is left for the
-# next tick, as is one the usage window holds and one within 5 minutes of another start, whose
-# memory and load have not shown yet. A start that failed otherwise is not tried again that day:
-# its session is noted for the wake as an analysis without its report.
+# next tick, as is one the usage window holds, one within 5 minutes of another start, whose
+# memory and load have not shown yet, and one refused for a reason that passes (exit 75: memory,
+# another start's lock, a fetch that failed). A start that failed otherwise is not tried again
+# that day; a session it left is noted for the wake as an analysis without its report.
 start_daily_analyst() {
   local day name=day days=1 why last=0 failed_mark
   [[ $ANALYST_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] || return 0
