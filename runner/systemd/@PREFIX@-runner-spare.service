@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep one registered spare for the ordinary @PREFIX@ runners
+
+[Service]
+ExecStart=/bin/sh %h/.local/share/@PREFIX@-runner/keep-spare.sh
+# keep-spare.sh exits 130 on the TERM of a stop, so that its temporary file is removed.
+SuccessExitStatus=130
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
