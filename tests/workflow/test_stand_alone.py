@@ -9,7 +9,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from workflow_harness import Workflow
+from workflow_harness import Workflow, install_shipline
 
 _HELPERS = ("advisory_service", "pushing_checkout", "run_proof")
 # What a scan that could not reach an advisory service says, as an outage would read it.
@@ -432,6 +432,8 @@ def _installer(workflow: Workflow) -> Path:
 
 
 def test_install_timer_runs_without_the_gh_installer(workflow: Workflow) -> None:
+    # `install-timer` runs from a Shipline checkout of its own.
+    install_shipline(workflow)
     assert not _installer(workflow).exists()
 
     done = workflow.run_script("install-timer")
@@ -444,6 +446,8 @@ def test_install_timer_runs_without_the_gh_installer(workflow: Workflow) -> None
 
 
 def test_install_timer_runs_the_gh_installer_first_when_it_is_there(workflow: Workflow) -> None:
+    # `install-timer` runs from a Shipline checkout of its own.
+    install_shipline(workflow)
     _installer(workflow).write_text(f'echo "install-github-budget $*" >> "{workflow.state}/calls.log"\n')
 
     done = workflow.run_script("install-timer")
@@ -453,6 +457,8 @@ def test_install_timer_runs_the_gh_installer_first_when_it_is_there(workflow: Wo
 
 
 def test_install_timer_stops_when_the_gh_installer_fails(workflow: Workflow) -> None:
+    # `install-timer` runs from a Shipline checkout of its own.
+    install_shipline(workflow)
     _installer(workflow).write_text("exit 3\n")
 
     done = workflow.run_script("install-timer")

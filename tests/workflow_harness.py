@@ -20,6 +20,8 @@ from functools import cache
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "workflow"
+# The command a repository calls Shipline by, `shipline <command>`.
+LAUNCHER = Path(__file__).resolve().parents[1] / "bin" / "shipline"
 # What the scripts read from the rest of a repository, held only as far as the tests read it.
 STAND_INS = Path(__file__).resolve().parent / "workflow" / "stand-ins"
 SESSION_LINK = "https://claude.ai/code/session_01TestLinkForWorkflow"
@@ -40,6 +42,20 @@ RULES_ON_MAIN = (
     "by the rules of AGENTS.md as it is on main, not the copy in this worktree; "
     "read them with: git fetch origin main && git show origin/main:AGENTS.md"
 )
+
+
+# The pane's own process, which a `tmux` with systemd support moves into a scope of its own: it
+# only waits for its child, which makes the session's scope.
+PANE_WORDS = ["bash", "-c", '"$@"; exit', "bash"]
+
+_SIZES = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+
+
+def limit_bytes(size: str) -> int:
+    """A limit as systemd reads it (`8G`, `0`), in bytes."""
+    found = re.fullmatch(r"([0-9]+)([KMGT]?)", size)
+    assert found, size
+    return int(found[1]) * _SIZES[found[2]]
 
 
 def scope_words(name: str, unit: str, memory: str = "8G", swap: str = "4G") -> list[str]:
@@ -66,13 +82,27 @@ def scope_words(name: str, unit: str, memory: str = "8G", swap: str = "4G") -> l
     ]
 
 
+def in_scope(arguments: list[str], name: str, memory: str = "8G", swap: str = "4G") -> list[str]:
+    """What `tmux new-session` was given for a session, its pane, its scope and the check the
+    scope runs first left out once they are checked: the scope's limits, and the note
+    `<name>.limits` the check writes, in bytes as the kernel holds them."""
+    start = arguments.index("systemd-run")
+    assert arguments[start - len(PANE_WORDS) : start] == PANE_WORDS
+    words = scope_words(name, arguments[start + 5], memory, swap)
+    assert arguments[start : start + len(words)] == words
+    check = arguments[start + len(words) : start + len(words) + 6]
+    # The script `session` holds as IN_SCOPE: it reads the group the scope's process is in.
+    assert check[0].startswith('group=$2$(sed -n "s/^0:://p" /proc/self/cgroup); '), check
+    assert check[1] == "bash"
+    assert check[2].endswith(f"/{name}.limits"), check
+    assert check[3].endswith("/cgroup"), check
+    assert check[4:] == [str(limit_bytes(memory)), str(limit_bytes(swap))]
+    return arguments[: start - len(PANE_WORDS)] + arguments[start + len(words) + len(check) :]
+
+
 def session_arguments(state: Path, name: str) -> list[str]:
     """What `tmux new-session` was given for a session, its scope checked and left out."""
-    arguments = (state / "args" / name).read_text().splitlines()
-    start = arguments.index("systemd-run")
-    words = scope_words(name, arguments[start + 5])
-    assert arguments[start : start + len(words)] == words
-    return arguments[:start] + arguments[start + len(words) :]
+    return in_scope((state / "args" / name).read_text().splitlines(), name)
 
 
 def instruction(sentence: str) -> str:
@@ -299,6 +329,20 @@ case "$command" in
     fi
     env > "@STATE@/env/$name"
     printf '%s\\n' "$@" > "@STATE@/args/$name"
+    # What the check the session's scope runs first notes: the limits are in place. As when they
+    # are not, `limits-not-set-<name>` holds what the scope has instead, and the session ends at
+    # once; `scope-not-checked-<name>` leaves it as it is, with no note.
+    if [[ $name != cloud-* && ! -e "@STATE@/scope-not-checked-$name" ]]; then
+      words=("$@")
+      for ((at = 0; at < ${#words[@]}; at++)); do [ "${words[at]}" != -- ] || break; done
+      note=${words[at + 5]}
+      if [ -e "@STATE@/limits-not-set-$name" ]; then
+        cp "@STATE@/limits-not-set-$name" "$note"
+        rm -f "@STATE@/tmux/$name"
+      else
+        echo "in place" > "$note"
+      fi
+    fi
     if [[ $name == cloud-* ]]; then
       # Execute the real launcher argv after tmux's working-directory option.
       while [ "$1" != -c ]; do shift; done
@@ -392,11 +436,20 @@ _FAKE_SYSTEMCTL = """#!/bin/bash
 echo "systemctl $*" >> "@STATE@/calls.log"
 """
 
-# Runs what follows `--` in place, as the real one does once it has made the scope.
+# Runs what follows `--` in place, as the real one does once it has made the scope. The group the
+# process is in, under the test's control group folder, holds the limits it was given.
 _FAKE_SYSTEMD_RUN = """#!/bin/bash
 echo "systemd-run $*" >> "@STATE@/calls.log"
 [ ! -e "@STATE@/refuse-scope-$WORKFLOW_SESSION" ] || exit 1
-while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
+group="@STATE@/../cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+mkdir -p "$group"
+while [ $# -gt 0 ] && [ "$1" != -- ]; do
+  case $1 in
+    MemoryMax=*) numfmt --from=iec "${1#*=}" > "$group/memory.max" ;;
+    MemorySwapMax=*) numfmt --from=iec "${1#*=}" > "$group/memory.swap.max" ;;
+  esac
+  shift
+done
 shift
 exec "$@"
 """
@@ -503,10 +556,33 @@ class Workflow:
     state: Path
     bin: Path
     env: dict[str, str]
+    # Shipline's own checkout, when it is kept apart from the repository (`install_shipline`);
+    # otherwise the scripts are in the repository's `scripts/workflow`.
+    home: Path | None = None
 
     @property
     def script(self) -> Path:
-        return self.repo / "scripts" / "workflow" / "session"
+        return (self.home or self.repo) / "scripts" / "workflow" / "session"
+
+    def shipline(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        stdin: str = "",
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """`shipline <command>` of the separate checkout, as a repository calls it."""
+        assert self.home, "install_shipline first"
+        return subprocess.run(
+            ["bash", str(self.home / "bin" / "shipline"), *args],
+            cwd=cwd or self.repo,
+            env={**self.env, **(env or {})},
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
 
     @property
     def cgroup_root(self) -> Path:
@@ -722,8 +798,18 @@ class Workflow:
         self.git("worktree", "add", "--quiet", "-b", self.branch(number), str(path), "FETCH_HEAD")
         return path
 
-    def running(self, name: str, held: int = 0, swapped: int = 0, scope: str | None = None) -> Path:
-        """Mark a session as running in its own control group. Returns the group's folder."""
+    def running(
+        self,
+        name: str,
+        held: int = 0,
+        swapped: int = 0,
+        scope: str | None = None,
+        pane_scope: str | None = None,
+    ) -> Path:
+        """Mark a session as running in its own control group. Returns the group's folder.
+
+        With `pane_scope` the pane's own process is there, and its one child in `scope`, as
+        `session start` leaves them."""
         pid = str(4000 + len(list((self.state / "tmux").iterdir())))
         (self.state / "tmux" / name).touch()
         (self.state / "pid" / name).write_text(pid + "\n")
@@ -731,6 +817,12 @@ class Workflow:
         scope = scope or f"user.slice/app.slice/tmux-spawn-{name}.scope"
         process = self.root / "proc" / pid
         process.mkdir(parents=True)
+        if pane_scope is not None:
+            (process / "cgroup").write_text(f"0::/{pane_scope}\n")
+            (process / "task" / pid).mkdir(parents=True)
+            (process / "task" / pid / "children").write_text(f"{int(pid) + 500} \n")
+            process = self.root / "proc" / str(int(pid) + 500)
+            process.mkdir()
         (process / "cgroup").write_text(f"0::/{scope}\n")
         group = self.cgroup_root / scope
         group.mkdir(parents=True, exist_ok=True)
@@ -926,6 +1018,34 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
     shutil.copytree(template / "repo", made.repo, symlinks=True)
     made.git("remote", "set-url", "origin", str(origin))
     return made
+
+
+def install_shipline(made: Workflow) -> Path:
+    """Keeps Shipline apart from the repository: a checkout of its own, `shipline` in the test's
+    folder, holding `bin/shipline` and the scripts the repository held, and a repository that
+    no longer holds a `scripts/workflow` (nor the gate's `pre-train-checks`, which were in it).
+    Its setup command and E2E planner stay in its `scripts`. Returns the checkout."""
+    home = made.root / "shipline"
+    held = made.repo / "scripts" / "workflow"
+    shutil.copytree(held, home / "scripts" / "workflow", symlinks=True)
+    (home / "scripts" / "workflow" / "pre-train-checks").unlink()
+    (home / "bin").mkdir()
+    shutil.copy2(LAUNCHER, home / "bin" / "shipline")
+    # A git checkout of its own, so a script that took the repository from its own folder
+    # would work on Shipline instead, and be seen to.
+    env = {**made.env, "GIT_DIR": str(home / ".git"), "GIT_WORK_TREE": str(home)}
+    for args in (
+        ["init", "--quiet", "--initial-branch=main"],
+        ["add", "-A"],
+        ["commit", "--quiet", "-m", "chore: shipline"],
+    ):
+        subprocess.run(["git", *args], cwd=home, env=env, capture_output=True, check=True)
+    made.git("rm", "-r", "--quiet", "scripts/workflow")
+    made.git("commit", "--quiet", "-m", "chore: shipline is called, not held")
+    made.git("push", "--quiet", "origin", "main")
+    shutil.rmtree(held, ignore_errors=True)
+    made.home = home
+    return home
 
 
 @cache

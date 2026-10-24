@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from workflow_harness import SESSION_LINK, Workflow, instruction, scope_words
+from workflow_harness import SESSION_LINK, Workflow, in_scope, install_shipline, instruction
 
 
 def _codex(workflow: Workflow, draft: bool = True) -> None:
@@ -623,6 +623,8 @@ def test_installer_refuses_global_codex_option_and_preserves_settings(workflow: 
 
 
 def test_default_installer_does_not_change_codex_settings(workflow: Workflow) -> None:
+    # Installed from a Shipline checkout of its own, as a repository installs it.
+    install_shipline(workflow)
     assert workflow.run_script("install-hooks").returncode == 0
     assert not (workflow.root / "home" / ".codex" / "config.toml").exists()
 
@@ -1523,8 +1525,7 @@ def test_codex_and_its_bridge_each_run_in_a_scope_with_the_memory_limits(
     assert done.returncode == 0, done.stderr
     for name in ("codex-7", "ticket-7"):
         arguments = (workflow.state / "args" / name).read_text().splitlines()
-        start = arguments.index("systemd-run")
-        assert arguments[start:-1] == scope_words(name, arguments[start + 5])
+        assert in_scope(arguments, name)[-1].startswith(("codex ", "claude "))
 
 
 def test_list_shows_the_limit_of_codex_and_its_bridge_once(workflow: Workflow) -> None:

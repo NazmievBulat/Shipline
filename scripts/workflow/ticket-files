@@ -9,5 +9,6 @@
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 [[ $# -eq 1 && $1 =~ ^[0-9]+$ ]] || { echo "usage: ticket-files N" >&2; exit 2; }
-main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
-exec python3 -B "$here/ticket_starts.py" files "$main" "$1"
+config=$(python3 "$here/workflow_config.py" shell)
+eval "$config"
+exec python3 -B "$here/ticket_starts.py" files "$SHIPLINE_REPO" "$1"
