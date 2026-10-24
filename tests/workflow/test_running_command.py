@@ -1,6 +1,7 @@
 """What a session runs, and the wait loop that finds itself."""
 
 import json
+import os
 import shlex
 import subprocess
 import time
@@ -72,11 +73,12 @@ def processes(tmp_path: Path) -> _Processes:
         "while ps aux | grep -q 'codex exec'; do sleep 0.2; done",
     ],
 )
-# `ps aux | grep` finds its own `grep` only when `ps` lists it, which a busy machine can delay.
-@pytest.mark.serial
 def test_a_real_wait_loop_finds_its_own_shell_and_is_named(tmp_path: Path, command: str) -> None:
-    # Nothing named `codex exec` runs, yet the loop never ends.
-    shell = subprocess.Popen(_tool_shell(command))
+    # Nothing named `codex exec` runs, yet the loop never ends. A session's shell has no terminal
+    # size: with the 80 columns a test runner without a terminal may pass on, `ps` would cut the
+    # shell's own line before `codex exec`.
+    unsized = {key: value for key, value in os.environ.items() if key not in ("COLUMNS", "LINES")}
+    shell = subprocess.Popen(_tool_shell(command), env=unsized)
     try:
         time.sleep(1.5)
         assert shell.poll() is None, "the loop ended: pgrep did not find its own shell"
