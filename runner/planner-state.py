@@ -23,6 +23,26 @@ def _read(*command: str) -> str:
 _LISTING_SECONDS = 20
 
 
+def counts(maximum: int, reduced: int, here: Path | None = None) -> tuple[int, int]:
+    """The slots and the slots kept while hosted overflow has budget, as pool-settings.sh says
+    them now: the runner balancer (balance_runners.py) changes them while this runs. The ones it
+    had when the file cannot be read."""
+    here = here or Path(__file__).parent
+    try:
+        words = _read(
+            "sh",
+            "-c",
+            '. "$1/settings.sh" >/dev/null 2>&1; . "$1/pool-settings.sh" >/dev/null 2>&1; '
+            'printf "%s %s" "$ordinary_jobs" "$ordinary_blacksmith_jobs"',
+            "sh",
+            str(here),
+        ).split()
+        jobs, blacksmith = (int(word) for word in words)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return maximum, reduced
+    return jobs, blacksmith
+
+
 def others(
     machines: list[str], label: str, listing: Path | None = None, now: float | None = None
 ) -> tuple[int, int]:
@@ -109,6 +129,7 @@ def main() -> None:
     folder.mkdir(parents=True, exist_ok=True)
     while True:
         try:
+            maximum, reduced = counts(maximum, reduced)
             slots = int(
                 _read(
                     sys.executable,

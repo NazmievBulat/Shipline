@@ -320,6 +320,34 @@ def test_a_lost_check_is_noted_for_the_shadow_s_wake_and_not_in_the_live_state(
     assert log.count(told) == once
 
 
+def test_the_runner_balancer_s_change_is_told_by_the_shadow_s_wake_and_no_forecast_written(
+    workflow: Workflow,
+) -> None:
+    workflow.add_pull_request(8, draft=False)
+    workflow.orchestrator()
+    # 23:00 UTC: the wake looks, and tells the change with what else it has.
+    clock = {"TZ": "UTC", "WORKFLOW_NOW": str(_NOW + 6 * 3600)}
+    home_state = workflow.root / "home" / ".local" / "state" / "workflow"
+    change = "2026-09-21T16:58:00Z ordinary 2 -> 3: the queue waits"
+    _written(home_state / "runner-balance.log", _NOW, change + "\n")
+    state = workflow.repo / ".local" / "workflow"
+    # The shared GitHub budget counts the shadow's own reads.
+    budget = (home_state / "github-budget",)
+    before = _digest(state, home_state, leave_out=budget)
+
+    shadow = workflow.run_script("tick", "--shadow", env=clock)
+
+    assert shadow.returncode == 0, shadow.stdout + shadow.stderr
+    assert _digest(state, home_state, leave_out=budget) == before
+    assert f"Runner balance, last change: {change}." in _shadow_log(workflow).read_text()
+
+    real = workflow.run_script("tick", env=clock)
+
+    assert real.returncode == 0, real.stdout + real.stderr
+    assert (home_state / "ci-demand.json").exists()
+    assert (state / "runner-balance.told").read_text() == change + "\n"
+
+
 @pytest.mark.parametrize(("five", "starts"), [(40, True), (90, False)], ids=["room", "held"])
 def test_the_daily_analyst_starts_in_a_shadow_tick_as_in_the_real_one(
     workflow: Workflow, five: int, starts: bool
