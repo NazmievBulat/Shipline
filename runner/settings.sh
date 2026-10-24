@@ -29,6 +29,10 @@ main_cpu_shares=8192
 first_label=$label-first
 main_lent=1
 lend_poll_seconds=20
+# The beginning of the merge gate's scratch branches (`merge.scratch_prefix` of the repository's
+# shipline.json): the jobs of its runs there take main's runners, so the lender counts them as
+# main's own and lends nothing while one is queued or running.
+scratch_prefix=workflow/merge-batch-
 # After the Blacksmith trial and reinstall, use one PR slot while CI_BLACKSMITH and
 # CI_OVERFLOW are both on and a full run still fits below 90% (actual minutes plus
 # reservations). Keep three PR containers registered so the second PR slot can return
