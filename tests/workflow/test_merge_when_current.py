@@ -1295,6 +1295,91 @@ def test_a_fix_that_passed_every_check_failing_on_red_main_merges(github: GitHub
     assert "passed every check failing on main: CI result, CI: web" in done.stdout
 
 
+def _rerun_failed_jobs(
+    github: GitHub, run_id: int, head: str, plan: str, *, earlier_head: str | None = None
+) -> None:
+    """Run `run_id` failed a job and re-ran its failed jobs alone: its second attempt passed,
+    and carried `plan` from its first attempt under a new job ID, without notes. The first
+    attempt ran `plan` on `earlier_head`, the head of the run unless a test says otherwise."""
+    for reply in github.api.values():
+        for run in reply.get("workflow_runs", []) if isinstance(reply, dict) else []:
+            if run["id"] == run_id:
+                run["run_attempt"] = 2
+    latest = github.api[f"{_REPO}/actions/runs/{run_id}/jobs?per_page=100"]["jobs"]
+    first = deepcopy(latest)
+    for job in first:
+        job.update(run_id=run_id, run_attempt=1, head_sha=earlier_head or head)
+        if job["name"] != plan:
+            job["conclusion"] = "failure"
+    github.api[f"{_REPO}/actions/runs/{run_id}/attempts/1/jobs?per_page=100"] = {"jobs": first}
+    for job in latest:
+        job.update(run_id=run_id, run_attempt=2, head_sha=head)
+        if job["name"] == plan:
+            job["id"] = run_id + 500
+    github.api[f"{_REPO}/check-runs/{run_id + 500}/annotations?per_page=100"] = []
+
+
+@pytest.mark.parametrize("earlier", ["same", "other main", "other head"])
+def test_a_fix_whose_failed_jobs_alone_were_rerun_merges_on_red_main(
+    github: GitHub, earlier: str
+) -> None:
+    workflow = github.workflow
+    github.main("failure")
+    if earlier == "other main":
+        github.ci(github.base, github.head, tested_base=workflow.git("rev-parse", "main^"))
+    _pr_job(github, "CI: web", "success")
+    _rerun_failed_jobs(
+        github,
+        20,
+        github.head,
+        "CI: what to run",
+        earlier_head=f"{9:040x}" if earlier == "other head" else None,
+    )
+
+    done = github.run()
+
+    if earlier == "same":
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert (workflow.state / "merged").read_text() == "7"
+        assert "passed every check failing on main: CI result, CI: web" in done.stdout
+    else:
+        # The first attempt tested another merge: the pull request is refreshed, not merged.
+        assert done.returncode == 2, done.stdout + done.stderr
+        assert not (workflow.state / "merged").exists()
+
+
+@pytest.mark.parametrize("earlier", ["same", "other main", "other head"])
+def test_a_fix_whose_failed_jobs_alone_were_rerun_takes_the_red_main_turn(
+    github: GitHub, earlier: str
+) -> None:
+    _two_stale_pulls(github)
+    workflow = github.workflow
+    head = github.pulls["8"]["headRefOid"]
+    github.ci(
+        github.base,
+        head,
+        run_id=30,
+        tested_base=workflow.git("rev-parse", "main^") if earlier == "other main" else None,
+    )
+    github.api[f"{_REPO}/actions/runs/30/jobs?per_page=100"]["jobs"].append(
+        {"id": 39, "name": "CI: web", "status": "completed", "conclusion": "success"}
+    )
+    _rerun_failed_jobs(
+        github,
+        30,
+        head,
+        "CI: what to run",
+        earlier_head=f"{9:040x}" if earlier == "other head" else None,
+    )
+    github.main("failure")
+    github.save()
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["7", "8"]}))
+    assert workflow.run_script("main-status").returncode == 0
+    assert _train(github)["first"] == ("8" if earlier == "same" else "7")
+
+
 @pytest.mark.parametrize("conclusion", ["skipped", None])
 def test_a_pull_request_that_did_not_pass_main_failing_check_stays_blocked(
     github: GitHub, conclusion: str | None
@@ -1747,6 +1832,16 @@ def test_images_passed_on_the_tested_tree_allow_merging_with_unused_jobs_skipped
     _images(github)
     done = github.run()
     assert done.returncode == 0, done.stderr
+
+
+def test_images_whose_failed_jobs_alone_were_rerun_still_prove_their_tree(
+    github: GitHub,
+) -> None:
+    _images(github)
+    _rerun_failed_jobs(github, 40, github.head, "Docker images: what to run")
+    done = github.run()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (github.workflow.state / "merged").read_text() == "7"
 
 
 def test_images_of_an_older_merge_tree_request_new_ci(github: GitHub) -> None:
@@ -5916,6 +6011,16 @@ def test_a_failed_whole_suite_refuses_until_its_rerun_passes(github: GitHub) -> 
 
 def test_a_pull_request_whose_own_run_was_the_whole_suite_merges_at_once(github: GitHub) -> None:
     _changes(github)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert github.workflow.calls("gh workflow run") == []
+
+
+def test_an_own_whole_suite_whose_failed_jobs_alone_were_rerun_merges_at_once(
+    github: GitHub,
+) -> None:
+    _changes(github)
+    _rerun_failed_jobs(github, 900_020, github.head, "E2E: what to run")
     done = _batch_call(github)
     assert done.returncode == 0, done.stdout + done.stderr
     assert github.workflow.calls("gh workflow run") == []

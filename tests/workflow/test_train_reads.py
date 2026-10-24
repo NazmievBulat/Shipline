@@ -248,6 +248,44 @@ def test_run_jobs_and_annotations_share_the_member_cache_across_ticks(
     assert calls == paths * 2
 
 
+def test_an_earlier_attempts_jobs_and_notes_share_the_member_cache_across_ticks(
+    reads_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    _snapshot(tmp_path)
+    api = reads_module.workflow_config.current().api
+    # A re-run of the failed jobs alone carried "CI: what to run" into attempt 2 without notes.
+    carried = f"{api}/check-runs/521/annotations?per_page=100"
+    paths = [
+        f"{api}/actions/workflows/ci.yml/runs?head_sha=abc&event=pull_request&per_page=100",
+        f"{api}/actions/runs/20/jobs?per_page=100",
+        carried,
+        f"{api}/actions/runs/20/attempts/1/jobs?per_page=100",
+        f"{api}/check-runs/21/annotations?per_page=100",
+    ]
+    replies = [
+        [{"id": 20, "run_attempt": 2, "status": "completed", "conclusion": "success"}],
+        [{"id": 521, "status": "completed", "conclusion": "success"}],
+        [],
+        [{"id": 21, "status": "completed", "conclusion": "success"}],
+        [{"title": "Merge tested", "message": "merge"}],
+    ]
+    calls: list[str] = []
+
+    def read(path: str, reply: Any) -> Any:
+        calls.append(path)
+        return reply
+
+    for _ in range(2):
+        cache = reads_module.Reads(tmp_path, "main")
+        for path, reply in zip(paths, replies, strict=True):
+            assert cache.api(path, partial(read, path, reply)) == reply
+        cache.finish()
+        (tmp_path / "api.json").unlink()
+    # Only the carried job's empty notes are read again: they might not have been written yet.
+    assert calls == [*paths, carried]
+
+
 def test_a_gate_refresh_after_the_snapshot_keeps_its_advanced_handoff(handed: GitHub) -> None:
     workflow = handed.workflow
     env = _context(handed)
