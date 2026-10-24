@@ -35,6 +35,16 @@
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app-runner"
   },
+  "hunts": {
+    "areas": {
+      "phone": ["/calls", "/contacts"],
+      "billing": ["/invoices", "/settings/billing"]
+    },
+    "plans": "docs/hunt-plans.md"
+  },
+  "commands": {
+    "test": "tools/run-tests"
+  },
   "review": {
     "high_effort_paths": [
       "^db/migrations/", "^db/schema\\.sql$", "^app/models/",
