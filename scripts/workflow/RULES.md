@@ -12,6 +12,10 @@ A third kind of session has no pull request: a hunt, which uses the running appl
 browser and reports the bugs it finds. It is started by hand with a sentence of its own, and
 the repository's hunt rules are its whole instruction.
 
+A fourth kind has no pull request either: the analyst, a read-only session the tick starts once
+a day, which reads the workflow's own logs and proposes at most three changes to it (see
+"Analyse the workflow").
+
 The rules of a session are this file as it is on `main`, not the copy in its worktree: the
 worktree holds the branch of the pull request, and a branch made before a rule changed has the
 old rule, or none. The sentence a session is started with says so and names the commands:
@@ -494,6 +498,54 @@ A pull request whose base is not `main` is audited and labelled but not merged. 
 after the one under it has merged and its own checks pass; the orchestrator starts a short
 audit session for it then.
 
+## Analyse the workflow
+
+The analyst is the session `analyst-<name>`. The tick starts one a day, from 08:00 UTC once the
+day's metrics report is written, as `analyst-day-<date>` over the last day, and on Sunday as
+`analyst-week-<date>` over the last 7 days, when the 5-hour usage window allows a start (not
+above 85% unless it resets within the hour). By hand it is
+`scripts/workflow/session start analyst <name> [1-7]`, the number being the days it reads. Its
+sentence is "Analyse the workflow over the last day (or the last N days), as analyst-<name>, by
+the section Analyse the workflow of AGENTS.md in this worktree". It runs Claude Opus at medium
+effort in a copy of `main` on no branch, and has 40 minutes: the tick stops it then, whatever
+it is doing.
+
+1. It is read-only. It opens no ticket and no pull request, commits and pushes nothing,
+   changes no label, comments nowhere, starts, stops and types into no session, and asks the
+   owner nothing. The one thing it writes is its report folder, `$WORKFLOW_ANALYSIS_REPORT`:
+   `.local/analyses/<name>/` in the main checkout. Its permission prompts reach nobody: what it
+   cannot read without asking, it leaves out and names in the report.
+2. It reads, for the days its sentence names: the day's metrics report,
+   `.local/analyses/metrics-<date>.md` in the main checkout, and last week's for comparison;
+   the wake log, `~/.local/state/workflow/wake.log`, and the metrics log beside it; the tick's
+   log (`journalctl --user -u workflow-tick`); the gate's refusals and hand-backs and the
+   tick's notes in `.local/workflow/` of the main checkout; the sessions' closing messages, as
+   their pull requests' comments and reviews show them (`gh`, reading only); and the earlier
+   analyses. It computes no numbers of its own: every number it gives is the metrics report's,
+   and every other claim points to the lines that show it.
+3. It looks for gaps of these kinds, with the evidence for each:
+   - speed: where a pull request's time goes, and what changed since last week;
+   - a model doing a job with one right answer: a decision made by hand every day, a wait a
+     script could check, a nudge with a fixed text;
+   - something that depends on a session's memory and is lost on a restart or a compaction;
+   - a rule in this file that sessions do not follow, or follow at a cost;
+   - a failure that repeated: the same lost check, the same flaky test, the same refused push;
+   - a question to the owner that a rule or a standing decision already answers;
+   - tokens or machine time spent on something that bought no merge.
+4. It proposes at most three changes, fewer or none when the evidence holds no more. Each has
+   its evidence, its predicted gain, in the metrics report's numbers, and the quality signal
+   that would show its cost (a number of the report's quality part, such as sent-back reviews,
+   red runs on `main`, hunt findings or weaker tests). A proposal that raises throughput by
+   running fewer tests, skipping a job, shortening a review or widening a skip rule is refused:
+   quality signals are a constraint, not a trade.
+5. It writes `report.md` in its report folder. Its first section is headed `## Proposals`; each
+   proposal there is numbered `1.`, `2.`, `3.`, and the first line of each says the change in
+   one sentence, as the wake carries only those lines. Then come the gaps it found with their
+   evidence, and what it read and found no gap in.
+6. Within 35 minutes it publishes the report as a document, writes the link alone on the one
+   line of `report.url` in the same folder, and then says `analysis finished` on a line of its
+   own, as the last line. The tick stops it on that line.
+
 ## For the orchestrator session
 
 When it starts, and again after a restart, the orchestrator writes its session name as listed by `claude agents` to `.local/workflow/orchestrator` in the main checkout (one line).
@@ -530,7 +582,11 @@ Codex responses reach the owner through their Haiku bridges; the tick reads comp
 from the bridge and stops it together with Codex. It never starts an audit,
 and nothing waits for one. It never starts a hunt either. It stops an idle hunt whose screen
 has the line "hunt finished" and any hunt that still runs 65 minutes after its start, and
-`session cleanup` then removes the hunt's worktree; the report stays.
+`session cleanup` then removes the hunt's worktree; the report stays. It starts the daily
+analyst (see "Analyse the workflow"), stops it on the line "analysis finished", idle or not,
+or 40 minutes after its start. `session cleanup` notes its report for the wake, however the
+analyst ended, and removes its worktree; the wake tells the orchestrator once, at any hour and
+busy or not. A daily start that failed is not tried again that day.
 
 Every reviewer hands its passed review to the tick with `merge-when-current --handoff N`,
 then ends with `review finished` and is stopped as usual. When the tick stops a reviewer
@@ -668,6 +724,11 @@ The orchestrator session does what needs judgment:
   what the hunt is (`plan-phone-2`). One hunt runs at a time, and the script refuses a second:
   each runs a browser and a copy of the application. To compare hunter programs it runs the
   same kind of hunt once with each, one after the other.
+- When a check-in carries an analysis (`Workflow analysis day-<date> (report <link>): 1. ...`),
+  it opens a draft ticket for each proposal it judges worth it, as in step 5 of the audit
+  rules, naming the report, and gives the owner the link and the tickets it opened. The owner
+  can say which to drop; a dropped ticket's pull request it closes. An analysis that ended
+  without publishing its report it names to the owner, with its folder.
 - When a hunt has ended, it reads the report in `.local/hunts/<name>` of the main checkout.
   A Codex or Cursor hunter's report it publishes as a document with the pictures; a Claude Code hunter
   published its own (`report.url`). It gives the owner the link and the count of findings.
@@ -759,6 +820,8 @@ adds to `~/.claude/settings.json` (the owner runs it once).
 - A hunt that ends its turn rings the phone unless the last line of its last message is
   "hunt finished". A hunt asks the owner nothing, so a ring means it could not go on. A Codex or Cursor
   hunter has no hooks and never rings.
+- An analyst never rings, not even on a permission prompt: it asks nobody anything, and the
+  tick reads its closing line and stops it on its time.
 - A Claude worker, reviewer or audit that stops on the usage limit, in its own words (see "For the
   orchestrator session"), does not ring: it waits for the reset, not for the owner.
 - Claude's own weekly-limit line also waits for the reset without ringing when the usage
@@ -766,7 +829,7 @@ adds to `~/.claude/settings.json` (the owner runs it once).
   use a full usage window under the same check. The tick resends after the saved reset once,
   and the wake tells the orchestrator; unreadable or disagreeing figures leave it waiting
   for the orchestrator as before. Hunts are never resent.
-- A permission prompt always rings.
+- A permission prompt always rings, except an analyst's.
 - A question to the owner is plain text at the end of a turn (see "Asking the owner"), so it
   rings as that stop does. The question tool is not used; its hook stays, so that a session
   which used it anyway still rings.
