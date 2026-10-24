@@ -3,8 +3,10 @@ the merge line, by the gate's own definition (`merge_gate.lost_check`). The tick
 
     tick_lost_check.py <state folder> <number> < pull.json
 
-It exits 0 when a check was lost, noted for the wake once per head (`merge_gate.note_lost`), 3
-when none was, and 2 when a run could not be read; any other end is a failure too, never "none".
+It exits 0 when a check was lost, noted for the wake once per head (`merge_gate.note_lost`), 4
+when it was lost beside a failure (a failed check, or a lost check's run that did not pass),
+noted the same way, 3 when none was, and 2 when a run could not be read; any other end is a
+failure too, never "none".
 Each workflow run is read at most once per tick: its answer, an unreadable one too, is kept in
 the tick's own folder, which the tick removes when it exits. Outside a tick every run is read.
 """
@@ -20,6 +22,7 @@ import train_reads
 
 CACHE = "lost-check-runs.json"
 NONE = 3
+FAILED = 4
 
 
 class Unreadable(Exception):
@@ -49,14 +52,15 @@ def reader(folder: Path | None) -> Callable[[str], dict[str, Any]]:
 def main(folder: Path, number: str) -> int:
     pull = json.load(sys.stdin)
     try:
-        found = merge_gate.lost_check(pull, read=reader(train_reads.tick()))
+        # A failed check has had its say: only the checks not completed must each be lost.
+        found = merge_gate.lost_check(pull, read=reader(train_reads.tick()), failed=True)
     except Unreadable as error:
         print(f"cannot read a run of pull request {number}'s checks: {error}", file=sys.stderr)
         return 2
     if not found:
         return NONE
     merge_gate.note_lost(folder, number, pull["headRefOid"], found)
-    return 0
+    return FAILED if merge_gate.failed_checks(pull) or found["conclusion"] != "success" else 0
 
 
 if __name__ == "__main__":
