@@ -198,6 +198,53 @@ def test_the_gate_reads_the_notes_as_written(workflow: Workflow) -> None:
     assert json.loads(done.stdout) == [merge, True, True, False], done.stderr
 
 
+@pytest.mark.parametrize(
+    ("shards", "whole"), [([1, 2, 3, 4], True), ([1, 2, 4], False), ([1, 2, 2, 3, 4], False)]
+)
+def test_the_gate_takes_server_tests_in_parts_as_ci_proof_does(
+    workflow: Workflow, shards: list[int], whole: bool
+) -> None:
+    """Shipline's own CI runs `CI: server tests (N of 4)`: the gate's whole-suite proof takes
+    the parts as the one job, as `passed_jobs` does, and only when each part ran once."""
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            textwrap.dedent(
+                """\
+                import json, sys
+                sys.path.insert(0, sys.argv[1])
+                import merge_gate as g
+                import ci_proof as p
+                merge, shards = sys.argv[2], json.loads(sys.argv[3])
+                notes = [{"title": "Merge tested", "message": merge},
+                         {"title": "Server tests", "message": "whole"}]
+                g.api = lambda path, key=None, **given: notes
+                ok = {"status": "completed", "conclusion": "success"}
+                parts = [{"id": 1, "name": "CI: what to run", **ok},
+                         *({"id": 10 + n, "name": f"CI: server tests ({n} of 4)", **ok}
+                           for n in shards),
+                         {"id": 2, "name": "CI result", **ok}]
+                print(json.dumps(["CI: server tests" in p.passed_jobs(parts),
+                                  g.whole_server_tests({"id": 5, **ok}, parts, merge)]))
+                """
+            ),
+            str(workflow.script.parent),
+            _MERGE,
+            json.dumps(shards),
+        ],
+        cwd=workflow.repo,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert json.loads(done.stdout) == [whole, whole], done.stderr
+
+
 def test_a_whole_suites_request_is_its_own_line(workflow: Workflow) -> None:
     done = _python(
         workflow,

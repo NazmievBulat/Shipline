@@ -1351,9 +1351,10 @@ def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
 
 
 def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: str) -> bool:
-    """A green CI run that ran every server test on exactly this commit."""
+    """A green CI run that ran every server test on exactly this commit, run in parts or not."""
     if verdict(run, parts)[0] != "green" or not any(
-        job["name"] == "CI: server tests" and job.get("conclusion") == "success" for job in parts
+        job["name"] == "CI: server tests" and job.get("conclusion") == "success"
+        for job in checks(parts)
     ):
         return False
     return {(NOTES.merge_tested, head), (NOTES.server_tests, "whole")} <= _planner_notes(
