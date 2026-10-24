@@ -2,12 +2,14 @@
 
 import json
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 from workflow_harness import Workflow
+from workflow.test_ci_proof import _github, _python, _receipt, _API, _SQUASH, _TREE
 
 _NEW_YORK = ZoneInfo("America/New_York")
 
@@ -33,6 +35,246 @@ def _wake(
     workflow: Workflow, *woken: str, at: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     return workflow.run_script("wake", *woken, env=at or _at(23, 0))
+
+
+def _savings_day(workflow: Workflow) -> None:
+    """One merged PR, three ready/push/refresh runs, a duplicate ID and a skipped draft."""
+    groups = ["images", "browser_whole", "server_whole"]
+    (workflow.repo / "shipline.json").write_text(json.dumps({"checks": {"prefix_only": groups}}))
+    sources = [
+        {"workflow": "ci", "run": 20, "jobs": ["CI: server tests"]},
+        {"workflow": "e2e", "run": 30, "jobs": ["playwright"]},
+        {"workflow": "images", "run": 40, "jobs": ["Docker images: build", "Docker images: image tests"]},
+    ]
+    data = _github(_receipt(sources=sources))
+    ok = {"status": "completed", "conclusion": "success"}
+    data[f"{_API}/actions/runs/40"] = {
+        **data[f"{_API}/actions/runs/30"], "id": 40, "path": ".github/workflows/images.yml",
+    }
+    data[f"{_API}/actions/runs/40/jobs?per_page=100"] = {"jobs": [
+        {"id": 41, "name": "Docker images: what to run", **ok},
+        {"id": 42, "name": "Docker images: build", **ok},
+        {"id": 43, "name": "Docker images: image tests", **ok},
+    ]}
+    data[f"{_API}/check-runs/41/annotations?per_page=100"] = [{"title": "Files tested", "message": _TREE}]
+    for run in (20, 30, 40):
+        data[f"{_API}/actions/runs/{run}"].update(
+            event="workflow_dispatch", head_branch="workflow/merge-batch-example")
+    for run, durations in [(20, [0, 5, 5, 0, 0, 0]), (30, [0, 12]), (40, [0, 5, 7])]:
+        for job, minutes in zip(data[f"{_API}/actions/runs/{run}/jobs?per_page=100"]["jobs"], durations):
+            job.update(runner_name="example-runner", started_at="2026-10-12T10:00:00Z",
+                       completed_at=f"2026-10-12T10:{minutes:02d}:00Z")
+    data[f"{_API}/pulls/7"] = {
+        "merged_at": "2026-10-12T18:00:00Z", "created_at": "2026-10-11T09:00:00Z",
+        "merge_commit_sha": _SQUASH, "head": {"ref": "ticket/seven"}, "base": {"ref": "main"},
+    }
+    runs = []
+    for run, deferred in [(100, groups), (200, ["images", "server_whole"]),
+                          (300, ["browser_whole"]), (400, [])]:
+        runs.append({"id": run, "head_branch": "ticket/seven", "event": "pull_request",
+                     "created_at": "2026-10-12T11:00:00Z", "pull_requests": [{"number": 7}],
+                     "head_repository": {"full_name": "example-org/example-app"}})
+        data[f"{_API}/actions/runs/{run}/jobs?per_page=100"] = {"jobs": [
+            {"id": run + 1, "name": "CI: what to run", **ok,
+             "conclusion": "success" if deferred else "skipped"}
+        ]}
+        data[f"{_API}/check-runs/{run + 1}/annotations?per_page=100"] = [
+            {"title": "Prefix-only groups", "message": json.dumps(deferred)}
+        ]
+    data["pr-runs"] = {"workflow_runs": [*runs, runs[0]]}
+    fixture = workflow.state / "savings.json"
+    fixture.write_text(json.dumps(data))
+    workflow.fake("gh-before-savings", (workflow.bin / "gh").read_text())
+    workflow.fake("gh", f'''#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if args and args[0] == "api":
+    path = args[-1]
+    data = json.loads(Path({str(fixture)!r}).read_text())
+    if path.startswith("search/issues?"):
+        print(json.dumps({{"total_count": 1, "items": [{{"number": 7}}]}}))
+    elif "/actions/workflows/ci.yml/runs?branch=" in path:
+        print(json.dumps(data["pr-runs"]))
+    elif path in data:
+        print(json.dumps(data[path]))
+    else:
+        sys.exit("unexpected savings API request")
+else:
+    os.execv({str(workflow.bin / "gh-before-savings")!r}, ["gh", *args])
+''')
+
+
+def test_daily_prefix_savings_from_merged_proof_counts_only_avoided_runs(night: Workflow) -> None:
+    _savings_day(night)
+    night.orchestrator("idle")
+    done = _wake(night, at=_at(3, 0))
+    assert done.returncode == 0, done.stderr
+    line = ("Prefix-only runner minutes saved (2026-10-12 UTC): images 24.00; "
+            "browser_whole 24.00; server_whole 20.00; total 68.00.")
+    assert line in night.sent()[-1]
+
+
+def test_a_shadow_wake_keeps_no_savings_report_and_the_real_wake_still_sends_it(
+    night: Workflow,
+) -> None:
+    _savings_day(night)
+    night.orchestrator("idle")
+    shadow = night.root / "shadow.log"
+    done = night.run_script("wake", env={**_at(3, 0), "SHIPLINE_SHADOW": str(shadow)})
+    assert done.returncode == 0, done.stderr
+    state = night.repo / ".local/workflow"
+    assert not list(state.glob("prefix-savings*"))
+    assert "Prefix-only runner minutes saved" not in shadow.read_text()
+    assert _wake(night, at=_at(3, 0)).returncode == 0
+    assert "saved (2026-10-12 UTC): images 24.00" in night.sent()[-1]
+
+
+def test_daily_prefix_savings_retries_delivery_then_sends_once(night: Workflow) -> None:
+    _savings_day(night)
+    night.orchestrator("idle")
+    (night.state / "send-fails").touch()
+    first = _wake(night, at=_at(3, 0))
+    assert first.returncode == 1
+    (night.state / "send-fails").unlink()
+    done = _wake(night, at=_at(3, 21))
+    assert done.returncode == 0, done.stderr
+    line = ("Prefix-only runner minutes saved (2026-10-12 UTC): images 24.00; "
+            "browser_whole 24.00; server_whole 20.00; total 68.00.")
+    assert line in night.sent()[-1]
+    _wake(night, at=_at(3, 42))
+    assert len(night.sent()) == 2
+    assert (night.repo / ".local/workflow/prefix-savings.sent").read_text().strip() == "2026-10-12"
+
+
+def test_an_unsent_daily_savings_report_survives_utc_midnight(night: Workflow) -> None:
+    _savings_day(night)
+    night.orchestrator("idle")
+    (night.state / "send-fails").touch()
+    # A reset check-in just before UTC midnight; ordinary night check-ins start afterward.
+    assert _wake(night, "ticket-7", at=_at(19, 59)).returncode == 1
+    pending = night.repo / ".local/workflow/prefix-savings-2026-10-12.pending"
+    assert pending.exists()
+    (night.state / "send-fails").unlink()
+    done = _wake(night, at=_at(20, 5))
+    assert done.returncode == 0, done.stderr
+    assert "saved (2026-10-12 UTC): images 24.00" in night.sent()[-1]
+    assert not pending.exists()
+    sent = night.repo / ".local/workflow/prefix-savings.sent"
+    assert sent.read_text().strip() == "2026-10-12"
+    assert _wake(night, at=_at(20, 26)).returncode == 0
+    assert "saved (2026-10-13 UTC): images 0.00" in night.sent()[-1]
+    assert sent.read_text().strip() == "2026-10-13"
+    assert _wake(night, at=_at(20, 47)).returncode == 0
+    assert len(night.sent()) == 3
+
+
+def test_daily_savings_resumes_completed_pulls_after_a_read_failure(night: Workflow) -> None:
+    _savings_day(night)
+    progress = night.state / "prefix-savings.progress"
+    fixture = night.state / "savings.json"
+    code = '''
+        from pathlib import Path
+        import json
+        import prefix_savings as savings
+        progress, fixture = map(Path, sys.argv[2:])
+        data = json.loads(fixture.read_text())
+        api = "repos/example-org/example-app"
+        paths = []
+        def read(path, key=None, **kwargs):
+            paths.append(path)
+            if path.startswith("search/issues?"):
+                return {"total_count": 2, "items": [{"number": 7}, {"number": 8}]}
+            if path == api + "/pulls/8":
+                if not progress.exists() or "7" not in json.loads(progress.read_text())["done"]:
+                    raise AssertionError("first PR was not checkpointed")
+                if sys.argv[0] != "retry":
+                    raise p.Unreadable("temporary read failure")
+                return data[api + "/pulls/7"]
+            if "/actions/workflows/ci.yml/runs?" in path:
+                value = data["pr-runs"]
+                # The same branch/run fixture, attributed to the current PR.
+                value = json.loads(json.dumps(value))
+                number = 8 if api + "/pulls/8" in paths else 7
+                for run in value["workflow_runs"]:
+                    run["pull_requests"] = [{"number": number}]
+            else:
+                value = data[path]
+            return value[key] if key else value
+        try:
+            savings.report("2026-10-12", read, progress=progress)
+        except p.Unreadable:
+            pass
+        assert json.loads(progress.read_text())["done"]["7"]["images"] == 24
+        assert progress.stat().st_mode & 0o777 == 0o600
+        sys.argv[0] = "retry"
+        paths.clear()
+        line = savings.report("2026-10-12", read, progress=progress)
+        assert "images 48.00" in line and "total 136.00" in line
+        assert not any(path.startswith("search/issues?") or path == api + "/pulls/7" for path in paths)
+    '''
+    done = _python(night, code, str(progress), str(fixture))
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_failed_savings_reads_back_off_and_keep_their_day_across_midnight(night: Workflow) -> None:
+    _savings_day(night)
+    night.orchestrator("idle")
+    fixture = night.state / "savings.json"
+    data = json.loads(fixture.read_text())
+    complete = fixture.read_text()
+    del data[f"{_API}/git/commits/{_SQUASH}"]
+    fixture.write_text(json.dumps(data))
+    reads = night.state / "savings-reads.log"
+    fake = night.bin / "gh"
+    fake.write_text(fake.read_text().replace('    path = args[-1]\n',
+        f'    path = args[-1]\n    with open({str(reads)!r}, "a") as log: log.write(path + "\\n")\n'))
+    assert _wake(night, "ticket-7", at=_at(19, 50)).returncode == 0
+    progress = night.repo / ".local/workflow/prefix-savings-2026-10-12.progress"
+    assert progress.exists()
+    assert json.loads(progress.read_text())["date"] == "2026-10-12"
+    count = len(reads.read_text().splitlines())
+    assert _wake(night, "ticket-7", at=_at(19, 53)).returncode == 0
+    assert len(reads.read_text().splitlines()) == count
+    fixture.write_text(complete)
+    assert _wake(night, at=_at(20, 14)).returncode == 0
+    assert "saved (2026-10-12 UTC): images 24.00" in night.sent()[-1]
+    assert not progress.exists()
+    assert not progress.with_suffix(".progress.retry").exists()
+
+
+def test_savings_resumes_inside_one_pull_request_without_recounting_runs(night: Workflow) -> None:
+    _savings_day(night)
+    done = _python(night, '''
+        import json
+        from pathlib import Path
+        import prefix_savings as savings
+        progress, fixture = map(Path, sys.argv[2:])
+        data = json.loads(fixture.read_text())
+        api = "repos/example-org/example-app"
+        paths, failing = [], True
+        def read(path, key=None, **kwargs):
+            paths.append(path)
+            if path.startswith("search/issues?"):
+                return {"total_count": 1, "items": [{"number": 7}]}
+            if path == api + "/check-runs/201/annotations?per_page=100" and failing:
+                raise p.Unreadable("temporary read failure")
+            value = data["pr-runs"] if "/actions/workflows/ci.yml/runs?" in path else data[path]
+            return value[key] if key else value
+        try:
+            savings.report("2026-10-12", read, progress=progress)
+        except p.Unreadable:
+            pass
+        current = json.loads(progress.read_text())["current"]
+        assert current["next"] == 1 and current["totals"]["images"] == 12
+        failing = False
+        paths.clear()
+        line = savings.report("2026-10-12", read, progress=progress)
+        assert "images 24.00" in line and "total 68.00" in line
+        assert all("/actions/runs/100/" not in path for path in paths)
+        assert all("/git/commits/" not in path and "/pulls/" not in path for path in paths)
+    ''', str(night.state / "prefix-savings.progress"), str(night.state / "savings.json"))
+    assert done.returncode == 0, done.stdout + done.stderr
 
 
 def test_at_night_an_idle_orchestrator_gets_a_check_in(night: Workflow) -> None:
@@ -920,3 +1162,23 @@ def test_an_answer_the_wake_could_not_send_is_sent_later(day: Workflow) -> None:
 
     assert '\nanswered for the owner: review-7, "1" (14:00)\n' in day.sent()[-1]
     assert not list((day.repo / ".local/workflow/answered-for-owner.pending").iterdir())
+
+
+
+def test_a_prefix_queue_warning_is_told_once_and_kept_until_delivery(night: Workflow) -> None:
+    night.orchestrator("busy")
+    pending = night.repo / ".local/workflow/prefix-queues.pending"
+    pending.mkdir(parents=True)
+    event = pending / "100-2.json"
+    line = "scratch run 100 attempt 2 has a job queued past 20 minutes; still waiting"
+    event.write_text(json.dumps({"line": line}))
+    (night.state / "send-fails").touch()
+    assert _wake(night, at=_at(12, 0)).returncode == 1
+    assert event.exists()
+    (night.state / "send-fails").unlink()
+    assert _wake(night, at=_at(12, 5)).returncode == 0
+    assert _wake(night, at=_at(12, 10)).returncode == 0
+    assert len(night.sent()) == 2
+    assert f"\n{line}\n" in night.sent()[-1]
+    assert not event.exists()
+    assert (pending.with_name("prefix-queues.sent") / event.name).exists()

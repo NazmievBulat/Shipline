@@ -48,7 +48,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -98,6 +98,7 @@ DEFAULTS: dict[str, Any] = {
         # as any other failure.
         "dependency_audit": None,
         "advisory_annotation": None,
+        "prefix_only": [],
     },
     # The titles of the annotations the CI planners write and the merge gate reads.
     "annotations": {
@@ -153,6 +154,7 @@ DEFAULTS: dict[str, Any] = {
         "plans": None,
     },
     "review": {"high_effort_paths": []},
+    "merge_train": {"queued_limit_minutes": 20},
     # Minutes a question to the owner marked `Owner only: no` waits before the tick types its
     # recommended reply; 0 turns that off.
     "answer_for_owner_after_minutes": 15,
@@ -190,6 +192,18 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class CheckGroup:
+    workflow: str
+    jobs: tuple[str, ...]
+    suite: str | None = None
+
+    def contains(self, name: str) -> bool:
+        # Images is a whole workflow; its repository chooses the build and test job names.
+        return any(name == job or name.startswith(job + " (") or
+                   (job.endswith(":") and name.startswith(job + " ")) for job in self.jobs)
+
+
+@dataclass(frozen=True)
 class Checks:
     ci_result: str
     ci_plan: str
@@ -197,6 +211,14 @@ class Checks:
     images: str
     dependency_audit: str | None = None
     advisory_annotation: str | None = None
+    prefix_only: list[str] = field(default_factory=list)
+
+    def groups(self) -> dict[str, CheckGroup]:
+        return {
+            "images": CheckGroup("images", (f"{self.images}:",)),
+            "browser_whole": CheckGroup("e2e", ("playwright",), "browser_suite"),
+            "server_whole": CheckGroup("ci", ("CI: server tests",), "server_tests"),
+        }
 
     @property
     def images_plan(self) -> str:
@@ -488,6 +510,11 @@ class Review:
 
 
 @dataclass(frozen=True)
+class MergeTrain:
+    queued_limit_minutes: int
+
+
+@dataclass(frozen=True)
 class Config:
     # None when nothing names it: an error only for a script that needs it.
     found_repository: str | None
@@ -504,6 +531,7 @@ class Config:
     hunts: Hunts
     commands: Commands
     review: Review
+    merge_train: MergeTrain
     answer_for_owner_after_minutes: int
     cloud_wake_after_minutes: int
     cloud_pre_push: CloudPrePush
@@ -864,6 +892,11 @@ def load(start: Path | None = None) -> Config:
     except ValueError as error:
         raise ConfigError(f"{FILE} is not JSON: {error}") from error
     values = _merged(DEFAULTS, given, "")
+    groups = values["checks"]["prefix_only"]
+    if len(set(groups)) != len(groups) or set(groups) - set(Checks("", "", "", "").groups()):
+        raise ConfigError(
+            f"{FILE}: checks.prefix_only must name distinct groups: images, browser_whole, server_whole"
+        )
     # Where the repository was read, so a refusal names that place.
     repository, source = values["repository"], FILE
     if not repository:
@@ -934,6 +967,7 @@ def load(start: Path | None = None) -> Config:
                 values["review"]["high_effort_paths"], "review.high_effort_paths"
             )
         ),
+        merge_train=MergeTrain(**values["merge_train"]),
         answer_for_owner_after_minutes=values["answer_for_owner_after_minutes"],
         cloud_wake_after_minutes=values["cloud_wake_after_minutes"],
         cloud_pre_push=CloudPrePush(tuple(values["cloud_pre_push"]["suites"])),
@@ -998,6 +1032,7 @@ def as_dict(config: Config) -> dict[str, Any]:
         },
         "commands": vars(config.commands).copy(),
         "review": {"high_effort_paths": list(config.review.high_effort_paths)},
+        "merge_train": vars(config.merge_train).copy(),
         "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
         "cloud_wake_after_minutes": config.cloud_wake_after_minutes,
         "cloud_pre_push": {
