@@ -389,9 +389,9 @@ def _function_answer(name: str, entry: dict, words: list[str]) -> int:
         if type(result) is not bool:
             raise ValueError("browser_plan must return a bool")
         print("needed" if result else "none")
-    elif name == "advisory_watch" and subcommand == "answers":
-        return 0 if result else 1
-    elif result is None or result is False or result is True:
+    elif result is None or result is False:
+        return 1 if name == "advisory_watch" and subcommand == "answers" else 0
+    elif result is True:
         return 0
     elif isinstance(result, str):
         print(result)

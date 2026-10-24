@@ -1519,3 +1519,28 @@ def test_argument_only_calls_finish_with_standard_input_still_open(workflow: Wor
         if process.poll() is None:
             process.kill()
         process.communicate(timeout=10)
+
+
+@pytest.mark.parametrize("result, status, output", [
+    ("None", 1, ""), ("False", 1, ""), ("True", 0, ""), ("'available'", 0, "available\n"),
+])
+def test_function_answers_keeps_return_conversion(
+    workflow: Workflow, result: str, status: int, output: str,
+) -> None:
+    module = _module(workflow, f'''
+        def unreachable(output):
+            return None
+        def answers(service):
+            return {result}
+    ''')
+    _configure(workflow, advisory_watch={
+        "run": module, "form": "functions",
+        "functions": {"unreachable": "unreachable", "answers": "answers"},
+    })
+    done = _gate(workflow, '''
+        import json
+        done = g.repository_command("advisory_watch", "answers", "example-service")
+        print(json.dumps([done.returncode, done.stdout, done.stderr]))
+    ''')
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == [status, output, ""]
