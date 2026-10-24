@@ -28,7 +28,8 @@
 #      the ones after it waiting too.
 #   7. A reviewer marked as waiting for checks is woken once per head when all checks finish,
 #      even before publishing its round. Without a wait note, an idle reviewer needs a round
-#      it published on the head or an earlier commit of it. Owner questions are left alone.
+#      it published on the head or an earlier commit of it. Owner questions are left alone
+#      here.
 #      A reviewer or audit whose pull request another member's gate call merged in a batch
 #      is told so once, to do its after-merge duties. One that waits for its checks before it
 #      joined the merge line is woken once per head for a check GitHub lost, as the gate defines
@@ -42,7 +43,11 @@
 #      wait loop that finds its own shell (once per loop), are interrupted with Escape, told
 #      why and named in the wake. Those two are the only running commands interrupted. An
 #      idle session that no rule covers for 50 minutes is named in the wake once per head,
-#      and typed nothing. When each screen last changed is noted for `session list`.
+#      and typed nothing. When each screen last changed is noted for `session list`. A
+#      question to the owner that its Claude worker, reviewer or audit marked `Owner only: no`
+#      gets its recommended reply once it has waited `answer_for_owner_after_minutes` (15),
+#      once for the same words, and the wake is told; one without that line, or without a
+#      reply word, waits for the owner and is named in the wake once.
 #      A cloud worker whose draft had no push and no report for `cloud_wake_after_minutes`,
 #      with no open question, is woken once through `claude --cloud` and named in the wake if
 #      still quiet that long after; one whose question was answered is woken at once
@@ -542,7 +547,9 @@ WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/main-status" --tick-main-status 9>&- ||
 budget_ready || paused
 
 # Passed reviews can leave a durable merge handoff instead of a model waiting in line.
-# The driver calls the same gate and returns every refusal needing judgment to review.
+# The driver calls the same gate and returns every refusal needing judgment to review. A failing
+# test of a handoff's own makes it a draft, which a worker below fixes in its line place; its
+# runners' failure is re-run once (`check_repair.py`).
 WORKFLOW_BACKGROUND_GITHUB=1 python3 -B "$here/merge_driver.py" 9>&- || failed=1
 budget_ready || paused
 running=$(session list) || failed=1
@@ -1037,6 +1044,64 @@ done <<<"$running"
 # A cloud worker whose draft had no push and no report for `cloud_wake_after_minutes`, with no
 # open question, is woken once per quiet stretch, and one whose question was answered at once.
 python3 -B "$here/cloud_workers.py" wake "$main" "$snapshot" 9>&- || failed=1
+
+# A question to the owner marked `Owner only: no` gets its recommended reply once it has waited,
+# from the notes the stop hook wrote (`notify`): the time it was asked and the reply. Once for
+# the same words: asked again after the answer, the question waits for the owner. His own reply
+# drops the notes first; text in the box, a permission prompt or the usage limit stop it, as for
+# every other message of the tick. A question kept for him waits; one without the line, or marked
+# `no` without a reply word, waits too and is named in the wake once. Codex bridges relay and
+# never answer. 0 minutes in the config turns it all off.
+answer_after=$((10#${SHIPLINE_ANSWER_FOR_OWNER_AFTER_MINUTES:-15} * 60))
+if ((answer_after > 0)); then
+  running=$(session list) || failed=1
+  while read -r name state _; do
+    [[ $state == idle && $name =~ ^(ticket|review|audit)-([0-9]+)$ ]] || continue
+    notes=$main/.claude/worktrees/ticket-${BASH_REMATCH[2]}/$SHIPLINE_STATE_FOLDER/$name
+    [[ ! -e $notes.codex && -e $notes.idle && -r $notes.asking && -r $notes.question ]] || continue
+    IFS= read -r asked <"$notes.asking" && [[ $asked =~ ^([0-9]+)\ [0-9]+$ ]] || continue
+    asked_at=${BASH_REMATCH[1]}
+    # The note of an earlier question is not this one's.
+    question=$(jq -c --arg asked "$asked" 'select(.asked == $asked)' "$notes.question" 2>/dev/null) &&
+      [[ -n $question ]] || continue
+    owner_only=$(jq -r '.owner_only' <<<"$question")
+    reply=$(jq -r '.reply // "" | strings' <<<"$question")
+    if [[ $owner_only == missing || ( $owner_only == no && -z $reply ) ]]; then
+      mark=$main/$SHIPLINE_STATE_FOLDER/$name.owner-question-noted
+      [[ ! -r $mark || $(<"$mark") != "$asked" ]] || continue
+      what="without a reply word"
+      [[ $owner_only != missing ]] || what="without the Owner only line"
+      if note_for_wake "$name-owner-question-$asked_at" "owner question $what: $name"; then
+        echo "$asked" >"$mark" || failed=1
+        wake_log "$name asks the owner $what; it waits for him" || failed=1
+      else
+        failed=1
+      fi
+      continue
+    fi
+    [[ $owner_only == no ]] && ((NOW - asked_at >= answer_after)) || continue
+    mark=$main/$SHIPLINE_STATE_FOLDER/$name.answered-for-owner
+    [[ ! -r $mark || $(<"$mark") != "${asked#* }" ]] || continue
+    [[ $nudged != *" $name "* && ! -e $notes.interaction-blocked ]] || continue
+    ! asks_permission "$name" || continue
+    delivery=$(session answer-for-owner "$name" "$asked" 2>&1)
+    sent=$?
+    if ((sent == 0)); then
+      echo "${asked#* }" >"$mark" || failed=1
+      wake_log "answered for the owner: $name, \"$reply\"" || failed=1
+      # For the wake's check-in, which lists them so the owner can overrule them.
+      answered=$main/$SHIPLINE_STATE_FOLDER/answered-for-owner.pending
+      mkdir -p "$answered" &&
+        jq -n --arg name "$name" --arg reply "$reply" --argjson at "$NOW" \
+          '{name: $name, reply: $reply, at: $at}' >"$answered/.$NOW-$name.tmp" &&
+        mv -- "$answered/.$NOW-$name.tmp" "$answered/$NOW-$name.json" || failed=1
+    elif ((sent != 3)); then
+      echo "$delivery" >&2
+      wake_log "$name answer for the owner failed: $delivery"
+      failed=1
+    fi
+  done <<<"$running"
+fi
 
 # Record reviewer-start notices before waking the orchestrator. Their reviewers start below.
 python3 -B "$here/merge_driver.py" --hand-backs 9>&- || failed=1

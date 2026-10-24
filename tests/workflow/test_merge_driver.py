@@ -18,7 +18,7 @@ from workflow.test_merge_when_current import (
 from workflow.test_merge_when_current import (
     github as github_fixture,
 )
-from workflow_harness import Workflow
+from workflow_harness import Workflow, instruction, session_arguments
 
 github = github_fixture
 
@@ -1965,3 +1965,449 @@ def test_tick_whole_refresh_is_accepted_without_scratch_suites(handed: GitHub) -
     assert second.returncode == 0, second.stdout + second.stderr
     assert (workflow.state / "merged").read_text() == "7"
     assert not workflow.calls("gh workflow run")
+
+
+_RUNS = (
+    "repos/example-org/example-app/actions/workflows/ci.yml/runs"
+    "?head_sha={head}&event=pull_request&per_page=100"
+)
+
+
+def _github_answers_repairs(workflow: Workflow) -> None:
+    """`gh pr ready N --undo` makes N a draft; `gh run view R --job J --log-failed` prints the
+    failed log a test left in `job-logs/J`, and fails as GitHub does when there is none."""
+    (workflow.bin / "gh").rename(workflow.bin / "gh-stand-in")
+    workflow.fake(
+        "gh",
+        """#!/bin/bash
+if [[ "$1 $2" == "pr ready" && " $* " == *" --undo "* ]]; then
+  echo "gh $*" >> "@STATE@/calls.log"
+  jq --arg n "$3" '.pulls[$n].isDraft = true' "@STATE@/github.json" > "@STATE@/github.json.new"
+  mv "@STATE@/github.json.new" "@STATE@/github.json"
+  read -r _ labels < "@STATE@/listing/$3"
+  echo "true $labels" > "@STATE@/listing/$3"
+  echo true > "@STATE@/draft/$3"
+  exit 0
+fi
+if [[ "$1 $2" == "run view" && " $* " == *" --log-failed "* ]]; then
+  echo "gh $*" >> "@STATE@/calls.log"
+  while [[ $# -gt 0 && $1 != --job ]]; do shift; done
+  [[ -f "@STATE@/job-logs/$2" ]] || { echo "failed to get run log: log not found" >&2; exit 1; }
+  cat "@STATE@/job-logs/$2"
+  exit 0
+fi
+exec "$(dirname "$0")/gh-stand-in" "$@"
+""",
+    )
+    (workflow.state / "job-logs").mkdir(exist_ok=True)
+
+
+_FAILED_TEST = (
+    "2026-10-24T10:00:00.0000000Z \x1b[31mFAILED\x1b[0m tests/test_dates.py::test_parses_a_leap_day"
+    " - AssertionError: assert 28 == 29\n"
+)
+
+
+def _fail(
+    github: GitHub,
+    *,
+    log: str | None = _FAILED_TEST,
+    conclusion: str = "failure",
+    labels: tuple[str, ...] = ("example-app-home",),
+    run_id: int = 20,
+) -> None:
+    """The pull request's CI run on its head failed in its "CI: server tests" job."""
+    workflow = github.workflow
+    github.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    run = github.api[_RUNS.format(head=github.head)]["workflow_runs"][0]
+    run.update(conclusion="failure", run_attempt=1)
+    jobs = github.api[f"repos/example-org/example-app/actions/runs/{run_id}/jobs?per_page=100"]
+    for job in jobs["jobs"]:
+        job["labels"] = ["home-planner"]
+        if job["name"] == "CI result":
+            job["conclusion"] = "failure"
+    job_id = run_id + 3
+    jobs["jobs"].append(
+        {
+            "id": job_id,
+            "name": "CI: server tests",
+            "status": "completed",
+            "conclusion": conclusion,
+            "labels": list(labels),
+        }
+    )
+    github.api[f"repos/example-org/example-app/check-runs/{job_id}/annotations?per_page=100"] = []
+    if log is not None:
+        (workflow.state / "job-logs" / str(job_id)).write_text(log)
+    github.save()
+
+
+def _repair_sentence(
+    run: int = 20, test: str = "tests/test_dates.py::test_parses_a_leap_day"
+) -> str:
+    return instruction(
+        f"Fix the failed check of pull request 7: job CI: server tests of run {run}, "
+        f"first failing test {test}"
+    )
+
+
+def _fix_and_hand_off(github: GitHub, run_id: int = 50) -> None:
+    """The worker pushes a fix and marks ready; a fresh reviewer passes it and hands it off."""
+    workflow = github.workflow
+    root = workflow.worktree(7)
+    workflow.git("commit", "--allow-empty", "-m", "fix: parse a leap day", cwd=root)
+    github.head = workflow.git("rev-parse", "HEAD", cwd=root)
+    workflow.git("push", "origin", "HEAD:ticket/seven", cwd=root)
+    github.pulls["7"].update(isDraft=False, headRefOid=github.head)
+    github.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "SUCCESS"
+    (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {github.head}\n")
+    workflow.list_pull_request(7, draft=False)
+    github.ci(github.base, github.head, run_id=run_id)
+    reviews = github.api["repos/example-org/example-app/pulls/7/reviews"]
+    reviews.append(
+        {"body": "<!-- workflow-review round=2 result=passed -->\nFixed.", "commit_id": github.head}
+    )
+    github.save()
+    _handoff(github)
+
+
+def _behind(github: GitHub) -> None:
+    """Pull request 8 joined the line after 7; it has no session or handoff, so it only waits."""
+    workflow = github.workflow
+    workflow.git("branch", "ticket/eight", github.base)
+    workflow.git("push", "origin", "ticket/eight")
+    head = workflow.git("rev-parse", "ticket/eight")
+    github.pulls["8"] = {
+        **deepcopy(github.pulls["7"]),
+        "headRefOid": head,
+        "headRefName": "ticket/eight",
+        "labels": [],
+    }
+    github.ci(github.base, head, run_id=30)
+    workflow.list_pull_request(8, draft=False, labels=())
+    (workflow.state / "pr" / "8").write_text(f"OPEN ticket/eight {head}\n")
+    github.save()
+    path = _folder(workflow) / "merge-train.json"
+    train = json.loads(path.read_text())
+    train["waiting"] = ["7", "8"]
+    path.write_text(json.dumps(train))
+
+
+def _train(workflow: Workflow) -> dict:
+    return json.loads((_folder(workflow) / "merge-train.json").read_text())
+
+
+def test_a_failing_test_goes_to_a_medium_worker_naming_the_run_and_keeps_the_line_place(
+    handed: GitHub,
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _behind(handed)
+    failed = handed.head
+    _fail(handed)
+
+    first = workflow.run_script("tick")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert workflow.calls("gh pr ready") == ["gh pr ready 7 -R example-org/example-app --undo"]
+    assert not _note(workflow).exists()
+    assert _started(workflow) == []
+    assert "7" not in _train(workflow)["approved"]
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    assert _train(workflow)["blocked"]["7"] == failed
+
+    second = workflow.run_script("tick")
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _started(workflow) == ["ticket-7"]
+    assert session_arguments(workflow.state, "ticket-7")[-1] == (
+        f'claude --effort medium --remote-control ticket-7 "{_repair_sentence()}"'
+    )
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    workflow.run("stop", "ticket-7")
+    _fix_and_hand_off(handed)
+    workflow.run("stop", "review-7")
+
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    assert "7" not in _train(workflow)["blocked"]
+    # While the fix's CI runs, the handoff waits in its earlier place.
+    jobs = handed.api["repos/example-org/example-app/actions/runs/50/jobs?per_page=100"]["jobs"]
+    jobs[-1].update(status="in_progress", conclusion=None)
+    handed.pulls["7"]["statusCheckRollup"][0].update(status="IN_PROGRESS", conclusion=None)
+    handed.save()
+
+    third = workflow.run_script("tick")
+
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert _note(workflow).exists()
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    assert "7" not in _train(workflow)["blocked"]
+    jobs[-1].update(status="completed", conclusion="success")
+    handed.pulls["7"]["statusCheckRollup"][0].update(status="COMPLETED", conclusion="SUCCESS")
+    handed.save()
+
+    third = workflow.run_script("tick")
+
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert (workflow.state / "merged").read_text() == "7"
+    assert _started(workflow) == ["ticket-7"]
+    assert not (_folder(workflow) / "check-repair-7.json").exists()
+
+
+@pytest.mark.parametrize("rerun", ["fails again", "passes"])
+@pytest.mark.parametrize("failure", ["runner shut down", "timed out"])
+def test_a_runner_error_is_rerun_once_then_handed_back_to_a_reviewer(
+    handed: GitHub, failure: str, rerun: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    if failure == "timed out":
+        _fail(handed, conclusion="timed_out", log=None)
+    else:
+        _fail(handed, log="##[error]The runner has received a shutdown signal.\n")
+
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        # Re-run once; until GitHub shows the new attempt, the request is not sent again.
+        assert workflow.calls("gh run rerun") == [
+            "gh run rerun 20 -R example-org/example-app --failed"
+        ]
+        assert _note(workflow).exists()
+        assert _started(workflow) == []
+
+    # GitHub shows the new attempt running: the handoff waits for it.
+    run = handed.api[_RUNS.format(head=handed.head)]["workflow_runs"][0]
+    run.update(run_attempt=2, status="in_progress", conclusion=None)
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    for job in jobs:
+        job.update(status="in_progress", conclusion=None)
+    handed.pulls["7"]["statusCheckRollup"][0].update(status="IN_PROGRESS", conclusion=None)
+    handed.save()
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _note(workflow).exists()
+    assert _started(workflow) == []
+    passed = rerun == "passes"
+    run.update(status="completed", conclusion="success" if passed else "failure")
+    for job in jobs:
+        job.update(status="completed", conclusion="success")
+    if not passed:
+        jobs[-1]["conclusion"] = "failure" if failure == "runner shut down" else "timed_out"
+        jobs[1]["conclusion"] = "failure"
+    handed.pulls["7"]["statusCheckRollup"][0].update(
+        status="COMPLETED", conclusion="SUCCESS" if passed else "FAILURE"
+    )
+    handed.save()
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("gh run rerun")) == 1
+    assert workflow.calls("gh pr ready") == []
+    if passed:
+        assert (workflow.state / "merged").read_text() == "7"
+        assert _started(workflow) == []
+    else:
+        assert not _note(workflow).exists()
+        assert _started(workflow) == ["review-7"]
+
+
+def test_a_runner_error_on_runners_the_gate_may_not_rerun_on_is_handed_back(
+    handed: GitHub,
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(
+        handed,
+        labels=("ubuntu-latest",),
+        log="The hosted runner lost communication with the server.\n",
+    )
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh run rerun") == []
+    assert _started(workflow) == ["review-7"]
+    assert workflow.calls("gh pr ready") == []
+
+
+def _handbacks(workflow: Workflow) -> list[str]:
+    pending = _folder(workflow) / "merge-handbacks.pending"
+    return [json.loads(path.read_text())["reason"] for path in sorted(pending.iterdir())]
+
+
+@pytest.mark.parametrize("between", ["no tick", "a tick that saw only skipped checks"])
+def test_a_second_failing_test_in_a_row_goes_to_a_reviewer_not_another_worker(
+    handed: GitHub, between: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    _fix_and_hand_off(handed)
+    workflow.run("stop", "review-7")
+    if between != "no tick":
+        # The fix's checks have not started: only a skipped check from its draft shows.
+        handed.pulls["7"]["statusCheckRollup"] = [
+            {"name": "Docker images: what to run", "status": "COMPLETED", "conclusion": "SKIPPED"}
+        ]
+        run = handed.api[_RUNS.format(head=handed.head)]["workflow_runs"][0]
+        run.update(status="queued", conclusion=None)
+        handed.save()
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert _note(workflow).exists()
+        handed.pulls["7"]["statusCheckRollup"] = [
+            {"name": "CI result", "status": "COMPLETED", "conclusion": "SUCCESS"}
+        ]
+        run.update(status="completed", conclusion="success")
+        handed.save()
+    _fail(handed, run_id=50)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("gh pr ready")) == 1
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
+    assert not (_folder(workflow) / "check-repair-7.json").exists()
+    assert (
+        "pull request checks failed again after a worker's fix: job CI: server tests of run 50, "
+        "first failing test tests/test_dates.py::test_parses_a_leap_day"
+    ) in _handbacks(workflow)
+
+
+def test_a_failing_test_beside_a_cancelled_job_still_goes_to_a_worker(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed)
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    # Fail-fast cancelled another part when the test failed.
+    jobs.insert(
+        0,
+        {"id": 19, "name": "CI: web", "status": "completed", "conclusion": "cancelled"},
+    )
+    handed.api["repos/example-org/example-app/check-runs/19/annotations?per_page=100"] = []
+    (workflow.state / "job-logs/19").write_text("The operation was canceled.\n")
+    handed.save()
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh pr ready") == ["gh pr ready 7 -R example-org/example-app --undo"]
+    assert _started(workflow) == []
+    assert _handbacks(workflow) == [
+        "pull request checks failed on its own test: a worker fixes job CI: server tests of "
+        "run 20, first failing test tests/test_dates.py::test_parses_a_leap_day"
+    ]
+
+
+def test_a_failed_job_with_nothing_to_read_goes_to_a_reviewer(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log=None)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh pr ready") == []
+    assert _started(workflow) == ["review-7"]
+
+
+@pytest.mark.parametrize(
+    ("log", "test"),
+    [
+        (
+            "\x1b[31mFAIL\x1b[39m src/dates.test.ts > parses a leap day\n",
+            "src/dates.test.ts > parses a leap day",
+        ),
+        (
+            "  1) [chromium] › e2e/plan.spec.ts:12:5 › opens the plan\n",
+            "[chromium] > e2e/plan.spec.ts:12:5 > opens the plan",
+        ),
+        (
+            'FAILED tests/test_quote.py::test_reads["$(id)",`id`\\] - assert\n',
+            "tests/test_quote.py::test_reads[ (id) id ]",
+        ),
+        ("Error: Process completed with exit code 1.\n", "not reported"),
+        (
+            "FAILED tests/test_dates.py::test_totals[two items] - assert 3 == 4\n",
+            "tests/test_dates.py::test_totals[two items]",
+        ),
+        (
+            # The server under test answered 500: no runner of GitHub's failed it.
+            '"GET /health HTTP/1.1" 500 Internal Server Error\n',
+            "not reported",
+        ),
+    ],
+)
+def test_the_worker_sentence_names_the_first_failing_test_in_safe_words(
+    handed: GitHub, log: str, test: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log=log)
+
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    assert session_arguments(workflow.state, "ticket-7")[-1] == (
+        f'claude --effort medium --remote-control ticket-7 "{_repair_sentence(test=test)}"'
+    )
+
+
+@pytest.mark.parametrize("failure", ["runner lost", "timed out"])
+def test_a_runner_error_beside_a_part_fail_fast_cancelled_is_rerun_once(
+    handed: GitHub, failure: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    if failure == "timed out":
+        _fail(handed, conclusion="timed_out", log=None)
+    else:
+        _fail(handed, log="The self-hosted runner: home-1 lost communication with the server.\n")
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    # Fail-fast cancelled the other part of the matrix when the runner failed.
+    jobs.insert(
+        0,
+        {
+            "id": 19,
+            "name": "CI: server tests (2 of 2)",
+            "status": "completed",
+            "conclusion": "cancelled",
+            "labels": ["example-app-home"],
+        },
+    )
+    handed.api["repos/example-org/example-app/check-runs/19/annotations?per_page=100"] = []
+    (workflow.state / "job-logs/19").write_text("##[error]The operation was canceled.\n")
+    handed.save()
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh run rerun") == ["gh run rerun 20 -R example-org/example-app --failed"]
+    assert workflow.calls("gh pr ready") == []
+    assert _started(workflow) == []
+    assert _note(workflow).exists()
+
+
+def test_a_failing_test_without_the_label_keeps_its_audit_path(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    workflow.list_pull_request(7, draft=False, labels=())
+    handed.pulls["7"]["labels"] = []
+    _fail(handed)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh pr ready") == []
+    assert not _note(workflow).exists()
+    assert not (_folder(workflow) / "check-repair-7.json").exists()
+    assert (_folder(workflow) / "merge-review-7").exists()
+    assert _started(workflow) == []

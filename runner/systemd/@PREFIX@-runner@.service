@@ -1,0 +1,11 @@
+[Unit]
+Description=CI runner %i for @PREFIX@ (a fresh container for each job)
+
+[Service]
+ExecStart=%h/.local/share/@PREFIX@-runner/keep-runner.sh %i
+ExecStopPost=-/usr/bin/docker rm -f @PREFIX@-runner-%i
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

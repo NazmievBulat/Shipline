@@ -88,6 +88,7 @@ def test_cloud_start_records_the_printed_address_without_preparing_a_local_workt
     assert "Push only to the pull request's branch" in arguments[3]
     assert "never skip or weaken the pre-push hook" in arguments[3]
     assert "start, first push, any blocker with the exact error" in arguments[3]
+    assert "Owner only: yes or Owner only: no just before those words" in arguments[3]
     assert (
         "Never end your turn to wait for an answer: poll the pull request's comments every "
         "three minutes instead." in arguments[3]
