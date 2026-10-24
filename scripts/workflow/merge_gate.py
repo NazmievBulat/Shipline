@@ -1990,10 +1990,10 @@ class Train:
             base = git("ls-remote", "origin", "refs/heads/main").split()[0]
             train_reads.save(context / "main.json", {"head": base})
 
-        def signature() -> str:
+        def inputs(queue: list[str]) -> list[Any]:
             # Local authorizations and owner questions can change while the tick runs.
             notes = []
-            for number in self.queue:
+            for number in queue:
                 root = CONFIG.state(
                     CONFIG.checkout_of(self.path.parent) / ".claude/worktrees" / f"ticket-{number}"
                 )
@@ -2007,15 +2007,16 @@ class Train:
                     self.path.parent / f"merge-review-{number}",
                 ]
                 notes += [(str(path), path.stat().st_mtime_ns) for path in paths if path.exists()]
+            return [
+                health.read_text() if health.exists() else "",
+                sorted(notes),
+                (context / "sessions").read_text(),
+            ]
+
+        def signature() -> str:
             return train_reads.digest(
-                [
-                    self.path.read_text() if self.path.exists() else "",
-                    base,
-                    health.read_text() if health.exists() else "",
-                    pulls,
-                    sorted(notes),
-                    (context / "sessions").read_text(),
-                ]
+                [self.path.read_text() if self.path.exists() else "", base, pulls]
+                + inputs(self.queue)
             )
 
         previous = train_reads.load(context / "reconciled.json")
@@ -2023,6 +2024,8 @@ class Train:
         if delegated and previous.get("signature") == signature():
             self.suite_states = previous["suite_states"]
             return
+        queue = list(self.queue)
+        seen = inputs(queue)
         reads = train_reads.Reads(self.path.parent, base)
         _planning_reads = reads
         try:
@@ -2031,6 +2034,10 @@ class Train:
             reads.finish()
         finally:
             _planning_reads = None
+        # A note created or cleared while the scan ran may not be what it read: keep the
+        # result only for the inputs it saw, so the next reconcile computes it again.
+        if inputs(queue) != seen:
+            return
         train_reads.save(
             context / "reconciled.json",
             {
