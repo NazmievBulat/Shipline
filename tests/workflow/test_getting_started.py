@@ -8,12 +8,19 @@ gate merges."""
 import atexit
 import json
 import os
+import re
 import shutil
+import subprocess
 import tempfile
+from collections.abc import Iterator
 from functools import cache
 from pathlib import Path
 
 import pytest
+from stand_in_server import StandInServer
+from workflow.test_ci import _job
+from workflow.test_ci_proof import annotations
+from workflow.test_merge_when_current import _GH, GitHub
 from workflow_harness import Workflow, install_shipline
 
 _REPOSITORY = "example-org/example-app"
@@ -143,7 +150,11 @@ _MISSING = {
         "missing: python3 3.14 or later (found 3.13)",
     ),
     "node": ("node", None, "missing: node 22 or later"),
-    "old-node": ("node", "#!/bin/bash\necho v20.11.1\n", "missing: node 22 or later (found 20.11.1)"),
+    "old-node": (
+        "node",
+        "#!/bin/bash\necho v20.11.1\n",
+        "missing: node 22 or later (found 20.11.1)",
+    ),
     "claude": ("claude", None, "missing: claude (Claude Code)"),
 }
 
@@ -242,7 +253,9 @@ def test_labels_that_cannot_be_read_install_nothing(workflow: Workflow) -> None:
 
 
 @pytest.mark.parametrize("problem", ["no-folder", "no-repository", "bad-config"])
-def test_a_repository_that_cannot_be_read_installs_nothing(workflow: Workflow, problem: str) -> None:
+def test_a_repository_that_cannot_be_read_installs_nothing(
+    workflow: Workflow, problem: str
+) -> None:
     folder = workflow.root / "elsewhere"
     if problem == "no-repository":
         folder.mkdir()
@@ -271,3 +284,350 @@ def test_install_names_one_repository(workflow: Workflow, args: list[str]) -> No
 
     assert done.returncode == 2
     assert done.stderr == "usage: shipline install <repo-path>\n"
+
+
+# Shipline's checkout, its guide, and the address the guide clones Shipline from.
+_SOURCE = Path(__file__).resolve().parents[2]
+_GUIDE = _SOURCE / "docs" / "getting-started.md"
+_SHIPLINE_URL = "https://github.com/NazmievBulat/Shipline.git"
+_API = f"repos/{_REPOSITORY}"
+# The stand-in that answers what the guide asks of GitHub beyond the harness: opening a ticket.
+_GH_TICKET = """#!/bin/bash
+if [ "$1 $2" = "pr create" ]; then
+  echo "gh $*" >> "@STATE@/calls.log"
+  printf '%s\\n' "$@" > "@STATE@/created"
+  git branch --show-current > "@STATE@/created-branch"
+  echo "https://github.com/example-org/example-app/pull/7"
+  exit 0
+fi
+exec "${0%/*}/gh-original" "$@"
+"""
+_SAMPLE_TEST = """import unittest
+from pathlib import Path
+
+
+class Readme(unittest.TestCase):
+    def test_the_readme_names_the_application(self):
+        self.assertTrue(Path("README.md").read_text().startswith("# example-app\\n"))
+"""
+
+
+def _guide() -> dict[str, list[tuple[str, str]]]:
+    """The code blocks of the guide, by the heading of their section: language and text."""
+    sections: dict[str, list[tuple[str, str]]] = {}
+    heading = ""
+    text = _GUIDE.read_text()
+    for found in re.finditer(r"^## ([^\n]+)$|^```(\w+)\n(.*?)^```$", text, re.M | re.S):
+        if found[1]:
+            heading = found[1]
+        else:
+            sections.setdefault(heading, []).append((found[2], found[3]))
+    return sections
+
+
+def _published_shipline(workflow: Workflow) -> Path:
+    """Shipline as GitHub serves it: a repository of the scripts, the launcher and the example
+    CI. The guide's clone of its address is answered from here."""
+    published = workflow.root / "published-shipline"
+    assert workflow.home, "install_shipline first"
+    shutil.copytree(
+        workflow.home / "scripts" / "workflow",
+        published / "scripts" / "workflow",
+        ignore=shutil.ignore_patterns("__pycache__", "pre-train-checks"),
+    )
+    (published / "bin").mkdir()
+    shutil.copy2(_SOURCE / "bin" / "shipline", published / "bin" / "shipline")
+    (published / "examples").mkdir()
+    shutil.copy2(_SOURCE / "examples" / "ci.yml", published / "examples" / "ci.yml")
+    for args in (
+        ["init", "--quiet", "--initial-branch=main"],
+        ["add", "-A"],
+        ["commit", "--quiet", "-m", "chore: shipline"],
+    ):
+        workflow.git(*args, cwd=published)
+    return published
+
+
+def _sample(workflow: Workflow) -> None:
+    """A repository set up from nothing, its origin a bare repository of the test's."""
+    origin = workflow.root / "origin.git"
+    shutil.rmtree(workflow.repo)
+    shutil.rmtree(origin)
+    workflow.git(
+        "init", "--quiet", "--bare", "--initial-branch=main", str(origin), cwd=workflow.root
+    )
+    workflow.repo.mkdir()
+    workflow.git("init", "--quiet", "--initial-branch=main")
+    (workflow.repo / "README.md").write_text("# example-app\n")
+    (workflow.repo / "test_readme.py").write_text(_SAMPLE_TEST)
+    workflow.git("add", "-A")
+    workflow.git("commit", "--quiet", "-m", "chore: start")
+    workflow.git("remote", "add", "origin", str(origin))
+    workflow.git("push", "--quiet", "-u", "origin", "main")
+
+
+def _run(workflow: Workflow, script: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Commands as the reader runs them, `shipline` found through `~/.local/bin`."""
+    home = workflow.env["HOME"]
+    return subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        cwd=cwd,
+        env={**workflow.env, "PATH": f"{workflow.env['PATH']}:{home}/.local/bin"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def _follow(workflow: Workflow, heading: str, ran: list[str], cwd: Path | None = None) -> str:
+    """Does what the guide's section says: writes its JSON as `shipline.json`, runs its shell
+    commands. Returns what they printed."""
+    printed = ""
+    for language, text in _guide()[heading]:
+        if language == "json":
+            (workflow.repo / "shipline.json").write_text(text)
+            continue
+        assert language == "sh", language
+        done = _run(workflow, text, cwd or workflow.repo)
+        assert done.returncode == 0, f"{heading}:\n{text}\n{done.stdout}{done.stderr}"
+        printed += done.stdout
+    ran.append(heading)
+    return printed
+
+
+def _tick(workflow: Workflow) -> str:
+    """The tick as the installed service runs it: its folder, its environment, its command."""
+    unit = Path(workflow.env["HOME"]) / ".config" / "systemd" / "user" / "workflow-tick.service"
+    lines = unit.read_text().splitlines()
+    folder = next(line.split("=", 1)[1] for line in lines if line.startswith("WorkingDirectory="))
+    env = dict(
+        line.removeprefix('Environment="').removesuffix('"').split("=", 1)
+        for line in lines
+        if line.startswith("Environment=")
+    )
+    start = next(line.split("=", 1)[1] for line in lines if line.startswith("ExecStart="))
+    done = subprocess.run(
+        ["bash", "-c", start],
+        cwd=folder,
+        env={**workflow.env, **env},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    return done.stdout + done.stderr
+
+
+def _step(workflow_file: Path, job: str, name: str) -> str:
+    """The command of one step of a job of the repository's CI workflow."""
+    found = re.search(
+        rf"- name: {re.escape(name)}\n(?:\s+#.*\n|\s+\w[\w-]*:.*\n)*?\s+run: (.+)\n",
+        _job(workflow_file, job),
+    )
+    assert found, (job, name)
+    return found[1]
+
+
+def _ci(github: GitHub, head: str, run_id: int) -> None:
+    """The pull request's CI, as GitHub runs the repository's own workflow on its merge into
+    main: the planner's steps and the test job's, each in a checkout of that merge of its own;
+    GitHub keeps what the planner noted as its annotations."""
+    workflow = github.workflow
+    tree = workflow.git("merge-tree", "--write-tree", github.base, head).splitlines()[0]
+    merge = workflow.git(
+        "commit-tree", tree, "-p", github.base, "-p", head, "-m", "Merge head into main"
+    )
+    printed = {}
+    for job, steps in {
+        "plan": ["Shipline", "The notes the merge gate reads"],
+        "tests": ["Shipline", "Tests"],
+    }.items():
+        checkout = workflow.root / f"ci-{run_id}-{job}"
+        temp = workflow.root / f"ci-{run_id}-{job}-temp"
+        temp.mkdir()
+        workflow.git("worktree", "add", "--quiet", "--detach", str(checkout), merge)
+        printed[job] = ""
+        for name in steps:
+            command = _step(checkout / ".github" / "workflows" / "ci.yml", job, name)
+            done = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", command],
+                cwd=checkout,
+                env={**workflow.env, "RUNNER_TEMP": str(temp)},
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            assert done.returncode == 0, f"{job}: {command}\n{done.stdout}{done.stderr}"
+            printed[job] += done.stdout + done.stderr
+    jobs = ["CI: what to run", "CI: server tests", "CI result"]
+    github.api[
+        f"{_API}/actions/workflows/ci.yml/runs?head_sha={head}&event=pull_request&per_page=100"
+    ] = {
+        "workflow_runs": [
+            {
+                "id": run_id,
+                "head_sha": head,
+                "event": "pull_request",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
+    }
+    github.api[f"{_API}/actions/runs/{run_id}/jobs?per_page=100"] = {
+        "jobs": [
+            {"id": run_id + 1 + index, "name": name, "status": "completed", "conclusion": "success"}
+            for index, name in enumerate(jobs)
+        ]
+    }
+    github.api[f"{_API}/check-runs/{run_id + 1}/annotations?per_page=100"] = annotations(
+        printed["plan"]
+    )
+    github.api[f"{_API}/git/commits/{merge}"] = {
+        "parents": [{"sha": github.base}, {"sha": head}],
+        "tree": {"sha": tree},
+    }
+    github.pulls["7"]["statusCheckRollup"] = [
+        {"name": name, "status": "COMPLETED", "conclusion": "SUCCESS"} for name in jobs
+    ]
+    # The repository's own tests ran, through its configured command.
+    assert "Ran 1 test" in printed["tests"]
+
+
+def _said(workflow: Workflow, name: str, words: str) -> None:
+    """A stand-in session ended its turn with these words."""
+    notes = workflow.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / f"{name}.idle").touch()
+    workflow.screen(f"● Done.\n\n  {words}\n\n> \n", name)
+
+
+@pytest.fixture
+def github_stand_in(workflow: Workflow) -> Iterator[GitHub]:
+    """GitHub as the gate's tests stand in for it, before any repository exists there."""
+    workflow.fake("gh-original", (workflow.bin / "gh").read_text())
+    workflow.fake("gh-ticket", _GH_TICKET)
+    workflow.fake("gh.py", _GH)
+    server = StandInServer(workflow.bin / "gh.py", workflow.env)
+    workflow.fake("gh", server.client("gh-ticket"))
+    try:
+        yield GitHub(workflow, {}, {}, "", "")
+    finally:
+        server.close()
+
+
+def test_a_newcomer_installs_shipline_and_merges_a_first_pull_request_through_it(
+    workflow: Workflow, github_stand_in: GitHub
+) -> None:
+    github = github_stand_in
+    ran: list[str] = []
+    published = _published_shipline(workflow)
+    # Every clone of Shipline's address, the guide's and CI's, is answered from the test's.
+    workflow.env.update(
+        {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": f"url.{published}.insteadOf",
+            "GIT_CONFIG_VALUE_0": _SHIPLINE_URL,
+        }
+    )
+    _sample(workflow)
+    home = Path(workflow.env["HOME"])
+
+    _follow(workflow, "Get Shipline", ran, cwd=home)
+    workflow.home = home / ".local" / "share" / "shipline"
+    _follow(workflow, "Set up your repository", ran)
+    github.base = workflow.git("rev-parse", "main")
+    assert workflow.git("rev-parse", "origin/main") == github.base
+    github.main()
+    # The sample keeps no image or browser workflow.
+    github.missing_workflows = ["images.yml", "e2e.yml"]
+    github.api[_API] = {"full_name": _REPOSITORY, "permissions": {"push": True}}
+    github.save()
+    (workflow.state / "labels").write_text("")
+    _follow(workflow, "Install it for your repository", ran)
+    assert (workflow.state / "labels").read_text().splitlines() == _LABELS
+
+    _follow(workflow, "Open a first ticket", ran)
+    created = (workflow.state / "created").read_text().splitlines()
+    assert created[:5] == ["pr", "create", "--draft", "--label", "workflow"]
+    assert (workflow.state / "created-branch").read_text() == "ticket/hello\n"
+    assert workflow.git("branch", "--show-current") == "main"
+    # GitHub lists it: a draft labelled `workflow`.
+    ticket = workflow.git("rev-parse", "origin/ticket/hello")
+    (workflow.state / "pr" / "7").write_text(f"OPEN ticket/hello {ticket}\n")
+    workflow.list_pull_request(7, draft=True)
+    github.api[f"{_API}/pulls/7/reviews"] = []
+    github.save()
+
+    # The tick starts a worker for the draft, in a worktree of the ticket's branch.
+    _tick(workflow)
+    assert workflow.is_running("ticket-7")
+    worktree = workflow.worktree(7)
+    assert workflow.git("branch", "--show-current", cwd=worktree) == "ticket/hello"
+    listed = _follow(workflow, "Watch it go through", ran)
+    assert listed.split()[0] == "ticket-7"
+
+    # The worker builds the change, pushes it, marks the pull request ready and finishes.
+    (worktree / "README.md").write_text("# example-app\nHello.\n")
+    workflow.git("commit", "--quiet", "-am", "docs: the README says hello", cwd=worktree)
+    workflow.git("push", "--quiet", "origin", "HEAD:ticket/hello", cwd=worktree)
+    head = workflow.git("rev-parse", "HEAD", cwd=worktree)
+    (workflow.state / "pr" / "7").write_text(f"OPEN ticket/hello {head}\n")
+    workflow.list_pull_request(7, draft=False)
+    github.head = head
+    github.pulls["7"] = {
+        "state": "OPEN",
+        "isDraft": False,
+        "baseRefName": "main",
+        "headRefName": "ticket/hello",
+        "headRefOid": head,
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+        "statusCheckRollup": [],
+        "labels": [{"name": "workflow"}],
+    }
+    _ci(github, head, run_id=20)
+    github.save()
+    _said(workflow, "ticket-7", "Worker finished.")
+
+    # The tick stops the worker and starts a fresh reviewer.
+    _tick(workflow)
+    assert not workflow.is_running("ticket-7")
+    assert workflow.is_running("review-7")
+
+    # The reviewer publishes a passed round and hands the merge to the tick.
+    github.api[f"{_API}/pulls/7/reviews"] = [
+        {"body": "<!-- workflow-review round=1 result=passed -->\nReviewed.", "commit_id": head}
+    ]
+    github.save()
+    handoff = _run(workflow, "shipline merge-when-current --handoff 7", worktree)
+    assert handoff.returncode == 0, handoff.stdout + handoff.stderr
+    _said(workflow, "review-7", "Review finished.")
+    github.batch_mode = True
+    github.driver_mode = True
+    github.save()
+
+    # The tick merges it through the gate: one squashed commit on main.
+    ticked = _tick(workflow)
+    assert (workflow.state / "merged").exists(), ticked
+    assert (workflow.state / "merged").read_text() == "7"
+    assert any(
+        f"--squash --match-head-commit {head}" in call for call in workflow.calls("gh pr merge")
+    )
+    readme = workflow.git("--git-dir", str(workflow.root / "origin.git"), "show", "main:README.md")
+    assert readme == "# example-app\nHello."
+    assert not workflow.is_running("review-7")
+
+    _follow(workflow, "Stop it", ran)
+    assert workflow.calls("systemctl")[-1] == "systemctl --user disable --now workflow-tick.timer"
+    # Every command the guide shows ran here.
+    assert ran == list(_guide())
+
+
+def test_the_readme_points_to_the_guide() -> None:
+    readme = (_SOURCE / "README.md").read_text()
+    section = readme.split("\n## Getting started\n", 1)[1].split("\n## ", 1)[0]
+
+    assert "[`docs/getting-started.md`](docs/getting-started.md)" in section

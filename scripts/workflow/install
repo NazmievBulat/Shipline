@@ -37,7 +37,8 @@ missing=()
 system=$(uname -s)
 [[ $system == Linux ]] || missing+=("missing: Linux (this is $system)")
 if ! command -v systemctl >/dev/null || ! systemctl --user show-environment >/dev/null 2>&1; then
-  missing+=("missing: systemd user units (systemctl --user cannot reach the user's service manager)")
+  why="systemctl --user cannot reach the user's service manager"
+  missing+=("missing: systemd user units ($why)")
 fi
 for program in tmux git jq; do
   command -v "$program" >/dev/null || missing+=("missing: $program")
@@ -89,7 +90,8 @@ if ((${#absent[@]} > 0)); then
   answer=$(timeout "$GITHUB_SECONDS" gh api "repos/$SHIPLINE_REPOSITORY") ||
     refuse "cannot read $SHIPLINE_REPOSITORY with gh"
   if [[ $(jq -r '.permissions.push // false' <<<"$answer") != true ]]; then
-    lines=("missing: labels on $SHIPLINE_REPOSITORY that this gh account may not create; someone who may can create them with:")
+    who="someone who may can create them with:"
+    lines=("missing: labels on $SHIPLINE_REPOSITORY that this gh account may not create; $who")
     for label in "${absent[@]}"; do
       lines+=("  gh label create $(printf '%q' "$label") --repo $SHIPLINE_REPOSITORY")
     done
