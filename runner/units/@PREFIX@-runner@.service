@@ -1,5 +1,6 @@
-# One ordinary runner of the pool, slot %i: a container of the image @PREFIX@-runner that takes
-# pull request and main jobs labelled with this machine's ordinary label.
+# One ordinary runner of the pool, slot %i: a container of the image @PREFIX@-runner, named
+# `<machine>-%i`. Every machine's runners carry the same labels, so GitHub gives a job to
+# whichever machine has one free.
 [Unit]
 Description=@PREFIX@ ordinary runner %i
 Requires=docker.service @PREFIX@-runner-network.service

@@ -1,5 +1,5 @@
-# The spare supervisor: keeps a registered spare runner ready, so a slot that ends is replaced
-# without waiting for a new registration.
+# The spare supervisor: keeps a registered spare runner ready (`<label>-standby` until it takes
+# a slot), so a slot that ends is replaced without waiting for a new registration.
 [Unit]
 Description=@PREFIX@ spare runner supervisor
 Requires=docker.service

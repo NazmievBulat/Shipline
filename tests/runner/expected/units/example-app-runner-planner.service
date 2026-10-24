@@ -1,5 +1,5 @@
-# The planner's runner, labelled example-app-planner: it takes only the jobs that plan what CI runs,
-# so a plan never waits behind a test job.
+# The planner's runner, named `<machine>-planner`: it takes the jobs that plan what CI runs, so
+# a plan never waits behind a test job.
 [Unit]
 Description=example-app planner runner
 Requires=docker.service example-app-runner-network.service

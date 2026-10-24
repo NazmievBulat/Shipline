@@ -7,4 +7,6 @@ Type=oneshot
 User=example-app-runner
 WorkingDirectory=/var/lib/example-app-runner
 ExecStart=/opt/example-app-runner/sample-usage.sh
+# The next sample is due in a minute: one that hangs gives way to it.
+TimeoutStartSec=50s
 NoNewPrivileges=true

@@ -2,14 +2,16 @@
 # Builds the runner images. The install runs it, and so does `<prefix>-runner-image.timer` every
 # week: GitHub refuses runners that fall far behind its own version.
 #
-#   RUNNER_PREFIX=example-app [SHIPLINE_RUNNER_IMAGE_BUILD=<command>] build-images.sh
+#   RUNNER_PREFIX=example-app build-images.sh
 #
-# Run from the repository's main checkout. When the repository names its own command
-# (`runner.image_build` of its shipline.json, given here as SHIPLINE_RUNNER_IMAGE_BUILD), that
-# command builds them, from the checkout, with RUNNER_PREFIX set. Else the pool builds its own:
-# the ordinary image `<prefix>-runner` from the Dockerfile beside this file, then, only on a
-# machine with /dev/kvm, the Docker-capable `<prefix>-runner-docker` from `vm/`. `--pull` takes
-# each base image anew.
+# Run from the repository's main checkout. Only main, as last fetched (`origin/main`), counts:
+# its files are taken into a folder of their own, so a branch the checkout holds, a fork's pull
+# request among them, never runs here with the runner user's Docker rights. When main's
+# shipline.json names `runner.image_build`, that command line builds the images, in that folder,
+# with RUNNER_PREFIX set. Else the pool builds its own: the ordinary image `<prefix>-runner` from
+# the Dockerfile beside this file, then, only on a machine with /dev/kvm (RUNNER_KVM names
+# another path), the Docker-capable `<prefix>-runner-docker` from `vm/`. `--pull` takes each base
+# image anew.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -20,9 +22,24 @@ if [[ ! $prefix =~ ^[a-z]([a-z0-9-]{0,23}[a-z0-9])?$ ]]; then
   exit 1
 fi
 
-if [[ -n ${SHIPLINE_RUNNER_IMAGE_BUILD:-} ]]; then
+main=refs/remotes/origin/main
+if ! git rev-parse --quiet --verify "$main^{commit}" >/dev/null; then
+  echo "$PWD has no origin/main: run this from the repository's main checkout" >&2
+  exit 1
+fi
+tree=$(mktemp -d)
+trap 'rm -rf "$tree"' EXIT
+git archive --format=tar "$main" | tar -x -C "$tree"
+
+command=""
+if [[ -f $tree/shipline.json ]]; then
+  command=$(jq -r '.runner.image_build // empty' "$tree/shipline.json")
+fi
+if [[ -n $command ]]; then
+  cd "$tree"
   export RUNNER_PREFIX=$prefix
-  exec bash -c "$SHIPLINE_RUNNER_IMAGE_BUILD"
+  bash -c "$command"
+  exit 0
 fi
 
 docker build --pull -t "$prefix-runner" "$here"

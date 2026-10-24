@@ -1,6 +1,6 @@
-# One of main's runners, slot %i: a container of the image @PREFIX@-runner that takes main's
-# jobs, labelled with this machine's main label. The lender gives it to pull request jobs while
-# main has none.
+# One of main's runners, slot %i, on the main machine only: a container of the image
+# @PREFIX@-runner, named `<machine>-main`, that takes main's jobs (`<label>-main`). The lender
+# gives it to pull request jobs while main has none.
 [Unit]
 Description=@PREFIX@ main runner %i
 Requires=docker.service @PREFIX@-runner-network.service

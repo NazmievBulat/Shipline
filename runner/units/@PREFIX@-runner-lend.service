@@ -1,5 +1,5 @@
-# The lender: while main has no job, lends main's runners to pull request jobs, the first member
-# of the merge train first, and takes them back when main needs them.
+# The lender: while main has no job, lends main's runners to pull request jobs, the merge
+# train's first member's first (`<label>-first`), and takes them back when main needs them.
 [Unit]
 Description=@PREFIX@ runner lender
 After=network-online.target

@@ -1,6 +1,6 @@
 # Builds the runner images again: GitHub refuses runners that fall far behind its own version.
-# The install writes the checkout link and images.env; the build runs from the repository's main
-# checkout, with the repository's own command when its shipline.json names one.
+# It runs in the repository's main checkout, a link the install writes, and builds from main as
+# last fetched, with the repository's own command when main's shipline.json names one.
 [Unit]
 Description=example-app runner images build
 Requires=docker.service
@@ -11,5 +11,7 @@ Wants=network-online.target
 Type=oneshot
 User=example-app-runner
 WorkingDirectory=/var/lib/example-app-runner/checkout
-EnvironmentFile=/var/lib/example-app-runner/images.env
+Environment=RUNNER_PREFIX=example-app
 ExecStart=/opt/example-app-runner/build-images.sh
+# A build that hangs on a registry gives way, so next week's runs.
+TimeoutStartSec=2h
