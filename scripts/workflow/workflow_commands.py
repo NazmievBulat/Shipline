@@ -409,10 +409,7 @@ def _function_answer(name: str, entry: dict, words: list[str]) -> int:
 
 
 def _json_answer(name: str, entry: dict, words: list[str]) -> int:
-    done = subprocess.run(
-        words, capture_output=True, text=True,
-        errors="surrogateescape", timeout=COMMAND_TIMEOUT, check=False,
-    )
+    done = _run(*words, errors="surrogateescape", timeout=COMMAND_TIMEOUT)
     sys.stderr.write(done.stderr)
     if done.returncode:
         sys.stdout.write(done.stdout)
