@@ -134,18 +134,36 @@ checkout, readable by its owner alone, and leaves every note of the installation
 reads of GitHub are real calls, counted in the machine's shared GitHub budget beside the
 tick's own, and a reviewer's head pushed from elsewhere is fetched as the real tick fetches it.
 
-Each shadow tick runs just before the installation's own tick, so both see the same state, for
-example as a step before the tick in its service, which the owner adds by a drop-in:
+Each shadow tick runs on a timer of its own, 15 seconds before each of the installation's ticks
+(theirs runs every 3 minutes, up to 25 seconds late), so both read the same state and neither
+waits for the other. A shadow tick stops itself after 120 seconds, whatever it waits for, and
+its log says so; its service's own timeout is the last bound. The owner writes the two units:
 
-    # ~/.config/systemd/user/workflow-tick.service.d/shadow.conf
+    # ~/.config/systemd/user/shipline-shadow.service
+    [Unit]
+    Description=Shipline in shadow beside the workflow tick: decides, carries out nothing
+
     [Service]
-    ExecStartPre=-<path of the Shipline checkout>/bin/shipline --repo <checkout> tick --shadow
+    Type=oneshot
+    WorkingDirectory=<checkout>
+    Environment="PATH=<the PATH the installation's tick has>"
+    ExecStart=<path of the Shipline checkout>/bin/shipline --repo <checkout> tick --shadow
+    TimeoutStartSec=150
 
-The `-` keeps a failed shadow tick from holding the real one back. After the run:
+    # ~/.config/systemd/user/shipline-shadow.timer
+    [Timer]
+    OnCalendar=*:2/3:45
+    AccuracySec=1s
+
+    [Install]
+    WantedBy=timers.target
+
+and starts it with `systemctl --user enable --now shipline-shadow.timer`. After the run:
 
     journalctl --user -u workflow-tick.service -o short-unix --since <start> >tick.journal
     tools/compare-shadow --shadow <checkout>/.local/shipline/shadow.log \
       --wake ~/.local/state/workflow/wake.log --journal tick.journal
 
 lists every decision the two took differently, with both versions, and exits 0 when none
-differs. What the shadow tick prints, which the journal holds too, is no decision it reads.
+differs. A decision that came due in the seconds between the two ticks' clocks is a timing
+difference, counted on its last line and listed with `--timing`.

@@ -57,22 +57,24 @@
 # pull request that was built before the workflow existed. Hunts are not started here either.
 # The daily analyst is: it reads the logs and the metrics report, and asks the owner nothing.
 #
-# `tick --shadow` (`shipline tick --shadow`) takes the same decisions and carries out none:
-# no push, no label, no merge, no message, no session started, stopped or typed into, and no
-# note of the tick, the gate or the wake written. It runs beside an installation that still runs
-# its own copy of the scripts, just before that installation's own tick, and shows whether
-# Shipline decides as that copy does (`tools/compare-shadow`). Each decision is one line of
-# `.local/shipline/shadow.log` in the main checkout, in the words the real tick logs it in: the
-# wake log's for the nudges, the session command's for a stop, a squeeze, a resend, a bridge
-# and a start (without its link or figures), and the wake's check-in. It reads all the real tick
-# reads, the merge line as last saved (the gate's read path, without its lock), and notes the
-# train status whenever it changed. It does not run what only carries decisions out or keeps
-# records: the metrics, the cloud workers' poll, the worktree cleanup (it only drops from its
-# list the sessions cleanup stops, of a pull request closed without merging), main's report,
-# the merge driver and the automatic ticket start. A start is logged when `session start` would
-# make it: no session of its pull request running, room for it, and for a reviewer the checks
-# of `reviewer_start.py` (and of the merge driver, for a hand-back's). Its own lock keeps a
-# second shadow tick out, and never the real one.
+# `tick --shadow` (`shipline tick --shadow`) takes the same decisions and carries out none: no push,
+# no label, no merge, no message, no session started, stopped or typed into, and no note of the
+# tick, the gate or the wake written. It runs beside an installation that still runs its own copy of
+# the scripts, on a timer of its own just before that installation's own tick, never holding it
+# back, and shows whether Shipline decides as that copy does (`tools/compare-shadow`). It stops
+# itself after SHADOW_SECONDS and logs that it was cut short. What is not yet due but comes due
+# within SHADOW_AHEAD_SECONDS, the time the real tick reads its clock later, it logs as `due within
+# 60 s: <decision>`, and so does its wake. Each decision is one line of `.local/shipline/shadow.log`
+# in the main checkout, in the words the real tick logs it in: the wake log's for the nudges, the
+# session command's for a stop, a squeeze, a resend, a bridge and a start (without its link or
+# figures), and the wake's check-in. It reads all the real tick reads, the merge line as last saved
+# (the gate's read path, without its lock), and notes the train status whenever it changed. It does
+# not run what only carries decisions out or keeps records: the metrics, the cloud workers' poll,
+# the worktree cleanup (it only drops from its list the sessions cleanup stops, of a pull request
+# closed without merging), main's report, the merge driver and the automatic ticket start. A start
+# is logged when `session start` would make it: no session of its pull request running, room for it,
+# and for a reviewer the checks of `reviewer_start.py` (and of the merge driver, for a hand-back's).
+# Its own lock keeps a second shadow tick out, and never the real one.
 set -uo pipefail
 
 # A session that holds more than this while idle is squeezed.
@@ -105,6 +107,12 @@ METRICS_DAILY_AT=${WORKFLOW_METRICS_DAILY_AT-07:50}
 ANALYST_DAILY_AT=${WORKFLOW_ANALYST_DAILY_AT-08:00}
 # The 5-hour usage window above which, unless it resets within the hour, nothing starts.
 USAGE_CEILING=85
+
+# A shadow tick ends after this many seconds, whatever it waits for; a test names another.
+SHADOW_SECONDS=${WORKFLOW_SHADOW_SECONDS:-120}
+# How far past its own clock a shadow tick looks for what comes due: the real tick reads its
+# clock up to this much later.
+SHADOW_AHEAD_SECONDS=60
 
 shadow=0
 if (($#)); then
@@ -139,6 +147,26 @@ common=$(git -C "$main" rev-parse --path-format=absolute --git-common-dir) || ex
 # What the tick and the gate ask git, they ask of the repository, whichever folder ran it.
 cd "$main" || exit 1
 
+# A shadow tick runs under its own bound, as a tick of its own beside the real one: at its end it
+# is stopped, and its log says so, so that `compare-shadow` leaves out the real tick beside it.
+if ((shadow)) && [[ -z ${SHIPLINE_SHADOW_BOUND:-} ]]; then
+  SHIPLINE_SHADOW_BOUND=$NOW timeout --kill-after=5 "$SHADOW_SECONDS" \
+    bash "${BASH_SOURCE[0]}" --shadow
+  status=$?
+  log=$main/.local/shipline/shadow.log
+  if ((status == 124 || status == 137)) && [[ -f $log && ! -L $log ]]; then
+    printf '%s shadow tick cut short after %s s\n' "$NOW" "$SHADOW_SECONDS" >>"$log"
+  fi
+  exit "$status"
+fi
+# The bounded tick reads the clock as the one that started it.
+if ((shadow)); then
+  NOW=$SHIPLINE_SHADOW_BOUND
+  unset SHIPLINE_SHADOW_BOUND
+  # Stopped at its bound, it still removes what it made.
+  trap 'exit 143' TERM
+fi
+
 # A second tick exits while the first still runs. The lock is in the git common directory, where
 # no change of shipline.json moves it: a tick that reads a new state folder still waits for one
 # that read the old. A shadow tick has a lock of its own.
@@ -158,6 +186,8 @@ if ((shadow)); then
   (umask 077 && mkdir -p "${SHIPLINE_SHADOW%/*}" && : >>"$SHIPLINE_SHADOW") || exit 1
   # Git takes no lock it can do without, such as the index's in a session's worktree.
   export GIT_OPTIONAL_LOCKS=0
+  # The wake looks as far ahead as the tick (`shadow_due`).
+  export SHIPLINE_SHADOW_AHEAD=$SHADOW_AHEAD_SECONDS
 else
   mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
   exec 9>"$common/shipline-tick.lock"
@@ -180,6 +210,28 @@ trap 'rm -rf "$WORKFLOW_TRAIN_TICK"' EXIT
 shadow_note() {
   printf '%s %s\n' "$NOW" "$*" >>"$SHIPLINE_SHADOW"
 }
+# What a shadow tick finds not yet due, but due within SHADOW_AHEAD_SECONDS, the time the real
+# tick reads its clock later: the decision the real tick may take alone, in its own words, on a
+# line `compare-shadow` reads as the reason. Given the seconds until it comes due.
+shadow_due() {
+  local until=$1
+  shift
+  ((shadow && until > 0 && until <= SHADOW_AHEAD_SECONDS)) || return 0
+  shadow_note "due within $SHADOW_AHEAD_SECONDS s: $*"
+}
+# The seconds until a hunt or an analyst runs over its time, by the clock `find` reads.
+over_in() {
+  local started=$main/.claude/worktrees/$1/$SHIPLINE_STATE_FOLDER/$1.started at
+  at=$(stat -c %Y "$started" 2>/dev/null) || return 1
+  echo $((at + $2 * 60 - $(date +%s)))
+}
+shadow_over_due() {
+  local until
+  until=$(over_in "$1" "$2") || return 0
+  shadow_due "$until" "$1 is over its time"
+  shadow_due "$until" "$1 stopped"
+}
+
 # What the tick says it does: on its output, and in a shadow tick in its log.
 say() {
   if ((shadow)); then shadow_note "$*"; else echo "$*"; fi
@@ -592,8 +644,13 @@ local_duties() {
   while read -r name state rest; do
     [[ $state == limit && $name =~ ^(ticket|audit|review)- && $rest == *"  resets "* ]] || continue
     limit=${rest%%  resets *}
-    reset_has_passed "${limit##*  }" "${rest##*  resets }" || continue
     mark=$(resent_mark "$name")
+    reset_at=""
+    if ! reset_has_passed "${limit##*  }" "${rest##*  resets }"; then
+      [[ $reset_at =~ ^[0-9]+$ ]] && [[ ! -r $mark || $(<"$mark") != "$reset_at" ]] &&
+        shadow_due $((reset_at - NOW)) "$name was sent its instruction again"
+      continue
+    fi
     [[ ! -r $mark || $(<"$mark") != "$reset_at" ]] || continue
     ((shadow)) || mkdir -p "${mark%/*}" || { failed=1; continue; }
     if session resend "$name"; then
@@ -626,11 +683,16 @@ while read -r name _; do
   if [[ $name == hunt-* ]] && is_over_its_time "$name" "$HUNT_STOPPED_AFTER_MINUTES"; then
     say "$name is over its time"
     session stop "$name" || failed=1
+  elif [[ $name == hunt-* ]]; then
+    shadow_over_due "$name" "$HUNT_STOPPED_AFTER_MINUTES"
   elif [[ $name == analyst-* ]]; then
     if is_over_its_time "$name" "$ANALYST_STOPPED_AFTER_MINUTES"; then
       say "$name is over its time"
     else
-      said_finished "$name" || continue
+      if ! said_finished "$name"; then
+        shadow_over_due "$name" "$ANALYST_STOPPED_AFTER_MINUTES"
+        continue
+      fi
     fi
     session stop "$name" || failed=1
   fi
@@ -996,6 +1058,11 @@ while read -r name state _; do
       wake_log "$name status check failed: $delivery"
       failed=1
     fi
+  elif ((shadow)) && [[ $since =~ ^[0-9]+$ && ! -e $notes.asking ]] &&
+      ((NOW - since < KEEP_ALIVE_AFTER_SECONDS)) &&
+      [[ ! -r $mark || $(<"$mark") != "$since" ]] && quiet "$name"; then
+    shadow_due $((since + KEEP_ALIVE_AFTER_SECONDS - NOW)) "$name idle" \
+      "$((KEEP_ALIVE_AFTER_SECONDS / 60)) min waiting for its own job or turn; status check sent"
   fi
 
   # A worker whose pull request is ready, idle without "worker finished": the tick stopped it
@@ -1024,6 +1091,10 @@ while read -r name state _; do
         wake_log "$name finish message failed: $delivery"
         failed=1
       fi
+    elif ((shadow)) && [[ $ready_at =~ ^[0-9]+$ && $idle_at =~ ^[0-9]+$ ]] &&
+        [[ ! -r $mark || $(<"$mark") != "$ready_at" ]] && quiet "$name"; then
+      shadow_due $(((ready_at > idle_at ? ready_at : idle_at) + READY_UNFINISHED_SECONDS - NOW)) \
+        "$name idle on ready pull request $number without worker finished; told to finish"
     fi
   elif [[ $name == ticket-* ]]; then
     ((shadow)) || rm -f "$ready"
@@ -1063,10 +1134,15 @@ while read -r name state _; do
     keep "$seen" "$sum $NOW" || failed=1
     continue
   fi
-  ((NOW - last_since >= STUCK_AFTER_SECONDS)) || continue
   mark=$main/$SHIPLINE_STATE_FOLDER/$name.stuck-noted
-  [[ ! -r $mark || $(<"$mark") != "$last_since" ]] || continue
   what=$(jq -r '.running // ""' <<<"$activity")
+  if ((NOW - last_since < STUCK_AFTER_SECONDS)); then
+    [[ -r $mark && $(<"$mark") == "$last_since" ]] ||
+      shadow_due $((last_since + STUCK_AFTER_SECONDS - NOW)) \
+        "stuck? $name ($((STUCK_AFTER_SECONDS / 60)) min, running: ${what:-no command})"
+    continue
+  fi
+  [[ ! -r $mark || $(<"$mark") != "$last_since" ]] || continue
   line="stuck? $name ($(((NOW - last_since) / 60)) min, running: ${what:-no command})"
   if note_for_wake "$name-stuck-$last_since" "$line"; then
     keep "$mark" "$last_since" || failed=1

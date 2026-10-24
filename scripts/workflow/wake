@@ -281,13 +281,32 @@ if [[ -n $asking ]]; then
   untold=$(grep -vxF -f <(cat "$ASKED" 2>/dev/null; echo) <<<"$asking")
 fi
 
+# A shadow run also looks when the look comes due within SHIPLINE_SHADOW_AHEAD seconds, as far
+# as its tick looks ahead (the real tick reads its clock that much later), and the check-in's
+# first line says so: `compare-shadow` reads it as the reason only the real wake looked.
+ahead=0
+[[ -z $shadow ]] || ahead=${SHIPLINE_SHADOW_AHEAD:-0}
+due=""
+is_night() {
+  local hour
+  hour=$(date -d "@$1" +%-H)
+  ((hour >= NIGHT_FROM_HOUR || hour < NIGHT_UNTIL_HOUR))
+}
+# Whether this many seconds have passed since the last look, or will within `ahead`.
+looked_before() {
+  (($(since_last_look) + 30 >= $1)) && return 0
+  ((ahead && $(since_last_look) + 30 + ahead >= $1)) || return 1
+  due="due within $ahead s: "
+}
 if ((${#resent[@]} == 0)); then
   if [[ -s $PENDING || -s $main_pending || -n $service_line || ${#handback_files[@]} -gt 0 || ${#cloud_files[@]} -gt 0 || ${#analysis_files[@]} -gt 0 || ${#lost_files[@]} -gt 0 || ${#stuck_files[@]} -gt 0 || $tmp_alert == true || -n $untold ]]; then
-    (($(since_last_look) + 30 >= RETRY_SECONDS)) || exit 0
+    looked_before "$RETRY_SECONDS" || exit 0
   else
-    hour=$(date -d "@$NOW" +%-H)
-    ((hour >= NIGHT_FROM_HOUR || hour < NIGHT_UNTIL_HOUR)) || exit 0
-    (($(since_last_look) + 30 >= LOOK_EVERY_SECONDS)) || exit 0
+    if ! is_night "$NOW"; then
+      ((ahead)) && is_night $((NOW + ahead)) || exit 0
+      due="due within $ahead s: "
+    fi
+    looked_before "$LOOK_EVERY_SECONDS" || exit 0
   fi
 fi
 [[ -n $shadow ]] || echo "$NOW" >"$LOOKED"
@@ -423,7 +442,7 @@ seen="sessions: $(sessions_line "$sessions"); pull requests: $pulls; starts: $ga
 
 reason="every 20 minutes"
 ((${#resent[@]} == 0)) || reason="after a reset"
-log "$(date -d "@$NOW" '+%Y-%m-%d %H:%M:%S')  $reason" \
+log "$(date -d "@$NOW" '+%Y-%m-%d %H:%M:%S')  $due$reason" \
   "  usage: $usage" "  $seen"
 ((${#resent[@]} == 0)) || log "  the tick sent its instruction again to: ${resent[*]}"
 [[ -z $asking_line ]] || log "  asking the owner: $asking_line"
