@@ -209,23 +209,37 @@ def _gate(workflow: Workflow, code: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_the_gate_reads_the_files_a_repository_keeps_for_it_from_that_repository(
+def test_the_gate_runs_the_commands_a_repository_names_from_that_repository(
     workflow: Workflow,
 ) -> None:
     calls = workflow.state / "calls.log"
-    kept = workflow.repo / "scripts" / "workflow"
-    kept.mkdir()
-    (kept / "pre-train-checks").write_text(f'echo repository-checks >> "{calls}"\nexit 1\n')
-    (kept / "mechanical_conflicts.py").write_text(
-        "class MechanicalConflict(Exception):\n    pass\n"
-        "def taken_migrations(head, base):\n    return ['migrations/0002_taken.py']\n"
+    programs = {
+        "pre-train-checks": f'echo repository-checks >> "{calls}"\nexit 1\n',
+        "conflicts": 'echo migrations/0002_taken.py\n',
+        "browser-plan": "echo needed\n",
+    }
+    kept = workflow.repo / "tools" / "shipline"
+    kept.mkdir(parents=True)
+    for name, body in programs.items():
+        # The program runs from the test's bin folder, which allows running programs; the
+        # repository holds a link to it where its `shipline.json` names it.
+        workflow.fake(f"repository-{name}", "#!/bin/bash\n" + body)
+        (kept / name).symlink_to(workflow.bin / f"repository-{name}")
+    # The same path in Shipline's checkout is never the repository's.
+    (workflow.home / "tools" / "shipline").mkdir(parents=True)
+    workflow.fake("shipline-checks", f'#!/bin/bash\necho shipline-checks >> "{calls}"\nexit 0\n')
+    (workflow.home / "tools" / "shipline" / "pre-train-checks").symlink_to(
+        workflow.bin / "shipline-checks"
     )
-    # Beside the gate, in Shipline's checkout, is never the repository's.
-    (workflow.script.parent / "pre-train-checks").write_text(
-        f'echo shipline-checks >> "{calls}"\nexit 0\n'
-    )
+    config = json.loads((workflow.repo / "shipline.json").read_text())
+    config["commands"] = {
+        "pre_train_checks": "tools/shipline/pre-train-checks",
+        "mechanical_conflicts": "tools/shipline/conflicts",
+        "browser_plan": "tools/shipline/browser-plan",
+    }
+    (workflow.repo / "shipline.json").write_text(json.dumps(config))
     (workflow.repo / "app.txt").write_text("changed\n")
-    workflow.git("add", "app.txt")
+    workflow.git("add", "-A")
     workflow.git("commit", "--quiet", "-m", "feat: an app change")
 
     done = _gate(
@@ -247,7 +261,6 @@ def test_the_gate_reads_the_files_a_repository_keeps_for_it_from_that_repository
     assert done.stdout.splitlines() == [
         str(workflow.repo / ".local" / "workflow"),
         "['migrations/0002_taken.py']",
-        # The repository's E2E planner, in its `scripts`, says an app change needs the browser.
         "needed",
         "refused: pre-train checks failed; fix the inventory before joining the merge train",
     ], done.stderr
@@ -274,6 +287,12 @@ def _launched_commands() -> list[str]:
     text = (_SHIPLINE / "bin" / "shipline").read_text()
     listed = text.split("COMMANDS=(\n", 1)[1].split(")", 1)[0]
     return listed.split()
+
+
+def _configured_commands() -> list[str]:
+    """The repository's own commands `shipline` runs by the names its `shipline.json` gives."""
+    text = (_SHIPLINE / "bin" / "shipline").read_text()
+    return text.split("CONFIGURED=(\n", 1)[1].split(")", 1)[0].split()
 
 
 def _launch(
@@ -612,13 +631,16 @@ def test_the_rules_name_each_command_as_shipline_command() -> None:
         ]
         assert by_path == [], document
         assert "git-common-dir" not in text, document
-        assert set(re.findall(r"shipline ([a-z-]+)", text)) <= set(commands), document
+        named = set(re.findall(r"shipline ([a-z-]+)", text))
+        assert named <= set(commands) | set(_configured_commands()), document
     rules = (_WORKFLOW / "RULES.md").read_text()
     assert set(re.findall(r"`shipline ([a-z-]+)", rules)) == {
+        "browser-tests-for-changes",
         "install-hooks",
         "install-timer",
         "merge-when-current",
         "notify",
+        "pre-train-checks",
         "review-panel",
         "session",
         "tick",
