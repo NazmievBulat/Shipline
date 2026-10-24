@@ -375,6 +375,34 @@ def test_a_shadow_tick_neither_polls_nor_wakes_a_cloud_worker(workflow: Workflow
     assert calls.read_text().split() == ["poll", "wake"]
 
 
+def test_a_shadow_tick_neither_updates_shipline_nor_counts_its_end(workflow: Workflow) -> None:
+    # The self-update moves Shipline's checkout and counts each tick's end toward a rollback: a
+    # shadow tick is not the repository's tick, and does neither.
+    update = workflow.script.with_name("self_update.py")
+    calls = workflow.root / "self-update-calls"
+    update.write_text(
+        "import os, sys\n"
+        "def gate_ran(*_): pass\n"
+        "if __name__ == '__main__':\n"
+        "    with open(os.environ['UPDATE_CALLS'], 'a') as calls:\n"
+        "        calls.write(sys.argv[1] + '\\n')\n"
+        "    if sys.argv[1] == 'watch':\n"
+        "        sys.stdout.write(sys.stdin.read())\n"
+        "    sys.exit(0)\n"
+    )
+    env = {**_CLOCK, "UPDATE_CALLS": str(calls)}
+
+    shadow = workflow.run_script("tick", "--shadow", env=env)
+
+    assert shadow.returncode == 0, shadow.stdout + shadow.stderr
+    assert not calls.exists()
+
+    real = workflow.run_script("tick", env=env)
+
+    assert real.returncode == 0, real.stdout + real.stderr
+    assert sorted(calls.read_text().split()) == ["end", "start", "watch"]
+
+
 @pytest.mark.parametrize(("five", "starts"), [(40, True), (90, False)], ids=["room", "held"])
 def test_the_daily_analyst_starts_in_a_shadow_tick_as_in_the_real_one(
     workflow: Workflow, five: int, starts: bool
