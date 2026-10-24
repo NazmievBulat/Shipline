@@ -225,6 +225,35 @@ def test_the_example_s_jobs_fetch_shipline_before_they_run_its_scripts(
     )
 
 
+_EXAMPLES = [_ROOT / "examples" / name for name in ("ci.yml", "e2e.yml", "images.yml")]
+
+
+@pytest.mark.parametrize("path", _EXAMPLES, ids=lambda path: path.name)
+def test_all_example_steps_run_shipline_scripts_from_the_clone(path: Path) -> None:
+    for job in _jobs(path):
+        for step in re.findall(r"^      - .*?(?=^      - |\Z)", _job(path, job), re.M | re.S):
+            if not re.search(r"^      (?:- |  )run:", step, re.M):
+                continue
+            # Shell and embedded Python use the same clone, with their own quoting.
+            remaining = step.replace(_PROOF[_EXAMPLE], "").replace(_PROOF_IN_PYTHON, "")
+            assert "scripts/workflow" not in remaining, f"{path.name}: {job}: {step}"
+
+
+@pytest.mark.parametrize("path", _EXAMPLES, ids=lambda path: path.name)
+def test_each_example_job_clones_shipline_before_any_proof_step(path: Path) -> None:
+    calls = 0
+    for job in _jobs(path):
+        cloned = False
+        for step in re.findall(r"^      - .*?(?=^      - |\Z)", _job(path, job), re.M | re.S):
+            if "ci_proof.py" in step:
+                calls += 1
+                assert cloned, f"{path.name}: {job}: ci_proof.py runs before Shipline is cloned"
+            if _CLONE in step:
+                assert not re.search(r"^        if:", step, re.M), "the clone must always run"
+                cloned = True
+    assert calls, f"{path.name}: no ci_proof.py steps checked"
+
+
 def test_the_example_runs_each_of_ci_proof_s_commands_from_the_clone() -> None:
     plan, selected = _job(_EXAMPLE, "plan"), _job(_EXAMPLE, "selected")
 

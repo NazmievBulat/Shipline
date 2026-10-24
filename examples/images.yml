@@ -33,6 +33,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+      # Shipline's own scripts, which the repository does not hold: its main as it is now.
+      - name: Shipline
+        run: git clone --quiet --depth 1 https://github.com/NazmievBulat/Shipline.git "$RUNNER_TEMP/shipline"
       - name: The existing image path selection
         id: selection
         run: |
@@ -41,15 +44,15 @@ jobs:
       - name: Defer images only for a pull request
         id: deferred
         if: steps.selection.outputs.needed == 'true'
-        run: python3 scripts/workflow/ci_proof.py prefix-only --needed images
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" prefix-only --needed images
       - name: The tested tree
-        run: python3 scripts/workflow/ci_proof.py notes
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes
       - name: Images main inherits on the identical tree
         id: inherited
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/workflow/ci_proof.py inherited images
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" inherited images
   images:
     name: "Docker images: image tests"
     needs: plan
