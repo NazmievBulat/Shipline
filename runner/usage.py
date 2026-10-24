@@ -18,9 +18,8 @@ that hour; and whether every one of those hours had room (README.md, "A second m
 
 Before that last line it says how many more PR jobs that room holds: none unless every day had
 room, else the least memory available at a busiest hour, less the margin, in jobs of the cap one
-ordinary job of this machine gets (`--job-memory`, settings.sh's `memory` when it names none).
-`python3 usage.py room [--days N] [--job-memory 6g]` prints that number alone, which install.sh
-reads before it lets this machine take more PR slots (README.md, "Moving a machine's PR slots").
+ordinary job of this machine gets (`--job-memory`, settings.sh's `memory` when it names none):
+no more PR slots than that move to this machine (README.md, "Moving a machine's PR slots").
 """
 
 import argparse
@@ -205,24 +204,6 @@ def report(
     A day with an hour without lines counts as no room, as does a day with no line at all: a
     week of room needs a week of lines, and the hours a machine was off may be its busiest.
     """
-    text, room, _ = _measured(days, folder=folder, now=now, job_memory=job_memory)
-    return text, room
-
-
-def room_for_jobs(
-    days: int,
-    *,
-    folder: Path = LOG_FOLDER,
-    now: datetime | None = None,
-    job_memory: str = JOB_MEMORY,
-) -> int:
-    """How many more ordinary jobs the last `days` days measured room for (`report`)."""
-    return _measured(days, folder=folder, now=now, job_memory=job_memory)[2]
-
-
-def _measured(
-    days: int, *, folder: Path, now: datetime | None, job_memory: str
-) -> tuple[str, bool, int]:
     now = now or datetime.now(UTC)
     first = (now - timedelta(days=days)).strftime("%Y-%m-%d")
     hours: dict[str, list[tuple[float, int]]] = defaultdict(list)
@@ -266,22 +247,19 @@ def _measured(
         f"Room every day: {'yes' if room else 'no'} (CPU pressure under {MOST_PRESSURE:.0f}% and"
         f" more than {LEAST_AVAILABLE_MB // 1024} GiB available at the busiest hour)"
     )
-    return "\n".join(out), room, jobs
+    return "\n".join(out), room
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("sample").add_argument("machine")
-    for name in ("report", "room"):
-        command = commands.add_parser(name)
-        command.add_argument("--days", type=int, default=7)
-        command.add_argument("--job-memory", default=JOB_MEMORY, type=_whole_gigabytes)
+    reported = commands.add_parser("report")
+    reported.add_argument("--days", type=int, default=7)
+    reported.add_argument("--job-memory", default=JOB_MEMORY, type=_whole_gigabytes)
     arguments = parser.parse_args()
     if arguments.command == "sample":
         sample(arguments.machine)
-    elif arguments.command == "room":
-        print(room_for_jobs(arguments.days, job_memory=arguments.job_memory))
     else:
         text, room = report(arguments.days, job_memory=arguments.job_memory)
         print(text)

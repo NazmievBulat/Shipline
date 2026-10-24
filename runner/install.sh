@@ -208,6 +208,17 @@ printf '%s\n' "$SHIPLINE_IDENTITY_FOLDER" >"$tools/identity-folder"
 # The units for this prefix, rendered from systemd/.
 RUNNER_PREFIX=$prefix bash "$here/render-units.sh" "$tools/units"
 
+# Before anything is stopped or copied, and before the move's checks, which read GitHub's runners
+# with it: github_identity.py checks the new identity against GitHub before it replaces the old
+# one, so a refused identity leaves the machine as it was, and a refused move afterwards changes
+# no more than an identity GitHub has just accepted. The services running now take the new one at
+# their next call.
+if [ -n "$github_token" ]; then
+  python3 "$tools/github_identity.py" install --repository "$repository" --token "$github_token"
+elif [ -n "$github_app_id" ]; then
+  python3 "$tools/github_identity.py" install --repository "$repository" \
+    --app "$github_app_id" "$github_app_key"
+fi
 # This script's own calls are the runner programs' too.
 gh() {
   python3 "$tools/github_budget.py" wait --identity runner runner-install &&
@@ -241,36 +252,6 @@ if [ -n "$other_machines" ]; then
       exit 1
     fi
   fi
-  # The receiving side of a move: a machine on record takes no more PR slots than its last week
-  # of use measured room for, in jobs of its own cap (usage.py room).
-  if [ -n "$recorded_jobs" ] && [ "$runners" -gt "$recorded_jobs" ]; then
-    cap=${job_memory:-$memory}
-    case "$cap" in
-      [1-9]*g) ;;
-      *)
-        echo "$machine_settings: the room is counted in jobs of whole gigabytes, and memory is '$cap': name job_memory, such as 6g." >&2
-        exit 1
-        ;;
-    esac
-    if ! room=$(python3 "$here/usage.py" room --days 7 --job-memory "$cap"); then
-      echo "Could not read this machine's usage, so $machine cannot tell whether it has room for more PR slots: nothing was changed." >&2
-      exit 1
-    fi
-    if [ $((runners - recorded_jobs)) -gt "$room" ]; then
-      echo "$machine would take $((runners - recorded_jobs)) more PR slots ($recorded_jobs to $runners), but its last 7 days measured room for $room more of $cap each (usage.py report --days 7): nothing was changed." >&2
-      exit 1
-    fi
-  fi
-fi
-
-# After the move's checks, which refuse with nothing changed, and before anything is stopped or
-# copied: a refused identity leaves the machine as it was. The services running now take the new
-# one at their next call.
-if [ -n "$github_token" ]; then
-  python3 "$tools/github_identity.py" install --repository "$repository" --token "$github_token"
-elif [ -n "$github_app_id" ]; then
-  python3 "$tools/github_identity.py" install --repository "$repository" \
-    --app "$github_app_id" "$github_app_key"
 fi
 
 mkdir -p "$installed" "$units"

@@ -173,21 +173,23 @@ are written from the measured reports, never from guesses.
    nothing moves, and the report goes to the owner.
 3. The move is a change of each machine's own settings (`~/.config/shipline/runner.sh`) and an
    install of each, by the machine's owner and on the owner's word, the receiving machine first:
-   - The receiving machine raises its `ordinary_jobs` by the slots that move, and may name its
-     own `job_memory` (`6g`). `install.sh` refuses to raise it by more than the room its last
-     week measured (`usage.py room`), or when its usage cannot be read; a first install is not
-     checked.
+   - The receiving machine raises its `ordinary_jobs` by the slots that move, no more than the
+     report's `<n>`, and may name its own `job_memory` (`6g`).
    - Once its runners are online with the base label, the giving machine lowers its
      `ordinary_jobs` by as many and installs. `install.sh` refuses to lower it while GitHub
      lists no online ordinary runner of another machine with the base label: with the receiving
      machine down, unreachable or not installed, both counts stay as they are.
    - In a pool of several machines, `install.sh` reads GitHub's runners before it changes
-     anything, and an install whose list cannot be read is refused, raising or lowering alike.
-     A machine alone in its pool is not checked.
-   - Moving slots back is the same, the other way round.
+     anything but the runners' GitHub identity, which it checks against GitHub before it takes
+     it; an install whose list cannot be read is refused. A machine alone in its pool is not
+     checked.
 
    Nothing names where the jobs go: every machine's runners carry the same labels, so GitHub
    gives a job to whichever runner is free.
+
+   Moving slots back (step 6) is the same the other way round, and is bounded by no room: the
+   slots return to the machine they came from, which raises its `ordinary_jobs` again and
+   installs first; the other machine lowers its count once those runners are online.
 4. A machine may keep no PR slot of its own (`ordinary_jobs=0`) while the pool has another
    machine; the only machine of a pool keeps at least one, and so does at least one machine of
    every pool: two machines with none would each take a slot and give it back as the other did.

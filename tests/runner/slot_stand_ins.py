@@ -95,6 +95,13 @@ try:
 except OSError:
     sys.exit(1)
 path = (path or "").split("?", 1)[0]
+# The rights github_identity.py checks a new identity by, which this GitHub grants.
+if re.search(r"/(actions/runs|actions/variables|pulls)$", path) and method == "GET":
+    print("{}")
+    sys.exit(0)
+if path.endswith("/actions/runners/registration-token") and method == "POST":
+    print(json.dumps({"token": "stand-in-registration"}))
+    sys.exit(0)
 found = re.search(r"/actions/runners(?:/([0-9]+)(/labels(?:/([^/]+))?)?)?$", path)
 if not found:
     sys.exit(1)
@@ -168,7 +175,7 @@ class Machine:
         settings.parent.mkdir(parents=True, exist_ok=True)
         lines = [
             f"machine={self.name}",
-            f"other_machines={'' if alone else OTHER}",
+            f"other_machines={'' if alone else (MACHINE if self.name == OTHER else OTHER)}",
             "roles='ordinary'",
             f"ordinary_jobs={slots}",
         ]
@@ -242,11 +249,18 @@ class Machine:
     def install(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return self._run("sh", str(RUNNER / "install.sh"), *arguments, cwd=self.checkout)
 
-    def installation(self) -> dict[str, bytes]:
-        """Every file the install put in place: the installed copy, the units and the runners'
-        GitHub identity."""
+    @property
+    def identity(self) -> Path:
+        """The runners' own GitHub identity (github_identity.py)."""
+        return self.root / "home" / ".config" / "shipline-runner"
+
+    def installation(self, identity: bool = True) -> dict[str, bytes]:
+        """Every file the install put in place: the installed copy, the units and, unless told
+        otherwise, the runners' GitHub identity."""
         home = self.root / "home"
-        folders = [self.installed, home / ".config/systemd/user", home / ".config/shipline-runner"]
+        folders = [self.installed, home / ".config/systemd/user"]
+        if identity:
+            folders.append(self.identity)
         return {
             str(path): path.read_bytes()
             for folder in folders

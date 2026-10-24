@@ -619,80 +619,6 @@ def test_lowering_the_slots_with_github_s_runners_unreadable_is_refused(
 
 
 
-def test_taking_more_slots_without_a_measured_week_is_refused(pool_machine: Machine) -> None:
-    """The receiving side of a move: no week of use, no room measured for more PR jobs."""
-    pool_machine.installed_as(slots=2)
-    pool_machine.settle(slots=3)
-
-    before = pool_machine.installation()
-
-    done = pool_machine.install()
-
-    assert done.returncode != 0
-    assert "measured room for 0 more" in done.stderr
-    assert pool_machine.calls("systemctl") == []
-    assert "ordinary_jobs=2" in pool_machine.pool_settings.read_text().splitlines()
-    assert pool_machine.installation() == before
-
-
-
-def test_taking_as_many_more_slots_as_the_week_measured_room_for_installs(
-    pool_machine: Machine,
-) -> None:
-    # 30 GiB available at the busiest hour, less the 8 GiB margin: two more jobs of 10g.
-    pool_machine.installed_as(slots=2)
-    pool_machine.measure(available_gib=30)
-    pool_machine.settle(slots=4)
-
-    done = pool_machine.install()
-
-    assert done.returncode == 0, done.stderr
-    assert "ordinary_jobs=4" in pool_machine.pool_settings.read_text().splitlines()
-
-
-def test_taking_more_slots_than_the_week_measured_room_for_is_refused(
-    pool_machine: Machine,
-) -> None:
-    pool_machine.installed_as(slots=2)
-    pool_machine.measure(available_gib=30)
-    pool_machine.settle(slots=5)
-
-    before = pool_machine.installation()
-
-    done = pool_machine.install()
-
-    assert done.returncode != 0
-    assert "would take 3 more PR slots" in done.stderr
-    assert "measured room for 2 more of 10g each" in done.stderr
-    assert pool_machine.calls("systemctl") == []
-    assert pool_machine.installation() == before
-
-
-
-def test_the_room_is_counted_in_jobs_of_the_machines_own_cap(pool_machine: Machine) -> None:
-    # 30 GiB less 8 is three jobs of 6g, where it is two of the shared 10g.
-    pool_machine.installed_as(slots=2, job_memory="6g")
-    pool_machine.measure(available_gib=30)
-    pool_machine.settle(slots=5, job_memory="6g")
-
-    done = pool_machine.install()
-
-    assert done.returncode == 0, done.stderr
-
-
-def test_a_week_with_cpu_pressure_at_its_busiest_hours_has_room_for_no_more_slots(
-    pool_machine: Machine,
-) -> None:
-    pool_machine.installed_as(slots=2)
-    pool_machine.measure(available_gib=60, pressure=40)
-    pool_machine.settle(slots=3)
-
-    done = pool_machine.install()
-
-    assert done.returncode != 0
-    assert "measured room for 0 more" in done.stderr
-
-
 def test_the_report_says_how_many_more_pr_jobs_the_room_holds(pool_machine: Machine) -> None:
     pool_machine.installed_as(slots=2)
     pool_machine.measure(available_gib=30)
@@ -703,7 +629,8 @@ def test_the_report_says_how_many_more_pr_jobs_the_room_holds(pool_machine: Mach
     lines = done.stdout.strip().splitlines()
     assert lines[-2].startswith("Room for 2 more PR jobs of 10g each")
     assert lines[-1].startswith("Room every day: yes")
-    assert pool_machine.usage("room", "--job-memory", "6g").stdout.strip() == "3"
+    in_jobs_of_6g = pool_machine.usage("report", "--days", "7", "--job-memory", "6g").stdout
+    assert "Room for 3 more PR jobs of 6g each" in in_jobs_of_6g
 
 
 def test_without_a_record_the_machine_holds_its_runners_with_the_label(
@@ -722,42 +649,71 @@ def test_without_a_record_the_machine_holds_its_runners_with_the_label(
     assert pool_machine.calls("systemctl") == []
 
 
-def test_a_refused_move_installs_no_new_github_identity(pool_machine: Machine) -> None:
-    """The identity given with the install goes in only once the move's checks passed."""
+def test_the_usage_report_refuses_a_cap_of_no_whole_gigabytes(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.installed_as(slots=2)
+
+    done = pool_machine.usage("report", "--job-memory", "10240m")
+
+    assert done.returncode == 2
+    assert "whole gigabytes" in done.stderr
+
+
+def test_slots_moved_away_come_back_without_measured_room(tmp_path: Path) -> None:
+    """The busy machine takes its slots back first, though its week measured no room: that is
+    why they left. The other machine then gives them up, once those runners are online."""
+    home = make_machine(tmp_path / "home-machine")
+    home.installed_as(slots=0)
+    home.measure(available_gib=9, pressure=36)
+    home.settle(slots=4)
+
+    done = home.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "ordinary_jobs=4" in home.pool_settings.read_text().splitlines()
+    office = make_machine(tmp_path / "office-machine")
+    office.name = OTHER
+    office.installed_as(slots=4)
+    office.runners(*[_holding(MACHINE, n) for n in range(1, 5)], _holding(OTHER, 1))
+    office.settle(slots=0)
+
+    done = office.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "ordinary_jobs=0" in office.pool_settings.read_text().splitlines()
+
+
+def test_a_pool_machine_whose_identity_gives_no_token_takes_a_new_one(
+    pool_machine: Machine,
+) -> None:
+    """The runner list is read with the new identity, so a lapsed one can be replaced."""
+    pool_machine.installed_as(slots=4)
+    pool_machine.identity.mkdir(parents=True, exist_ok=True)
+    (pool_machine.identity / "app-id").write_text("12345\n")
+    token = pool_machine.root / "token"
+    token.write_text("stand-in\n")
+
+    done = pool_machine.install("--github-token", str(token))
+
+    assert done.returncode == 0, done.stderr
+    assert (pool_machine.identity / "token").read_text() == "stand-in\n"
+    assert not (pool_machine.identity / "app-id").exists()
+
+
+def test_a_refused_move_with_a_new_identity_leaves_the_counts_units_and_installed_copy(
+    pool_machine: Machine,
+) -> None:
+    """The new identity, which GitHub has just accepted, is all a refused move changes."""
     _installed_with_four(pool_machine, _holding(OTHER, 1, "offline"))
     pool_machine.settle(slots=2)
     token = pool_machine.root / "token"
     token.write_text("stand-in\n")
-    before = pool_machine.installation()
+    before = pool_machine.installation(identity=False)
 
     done = pool_machine.install("--github-token", str(token))
 
     assert done.returncode != 0
     assert "Install the receiving machine first" in done.stderr
-    assert pool_machine.installation() == before
-
-
-def test_a_machine_whose_memory_is_no_whole_gigabytes_is_told_to_name_job_memory(
-    pool_machine: Machine,
-) -> None:
-    pool_machine.installed_as(slots=2)
-    pool_machine.measure(available_gib=30)
-    pool_machine.settle(slots=3, extra="memory=10240m")
-
-    done = pool_machine.install()
-
-    assert done.returncode != 0
-    assert "name job_memory" in done.stderr
+    assert pool_machine.installation(identity=False) == before
     assert pool_machine.calls("systemctl") == []
-
-
-@pytest.mark.parametrize("command", ["room", "report"])
-def test_the_usage_report_refuses_a_cap_of_no_whole_gigabytes_with_or_without_room(
-    pool_machine: Machine, command: str
-) -> None:
-    pool_machine.installed_as(slots=2)
-
-    done = pool_machine.usage(command, "--job-memory", "10240m")
-
-    assert done.returncode == 2
-    assert "whole gigabytes" in done.stderr
