@@ -5833,10 +5833,16 @@ def test_a_green_scratch_rerun_restores_the_isolated_members_earlier_place(
 
 
 def _restored_before_eight(
-    github: GitHub, *, passed: bool, reconciled: bool = False, count: int = 3
+    github: GitHub, *, passed: bool, reconciled: bool = False, count: int = 3, late: bool = False
 ) -> dict[str, Any]:
     """Restore 7 on unchanged main, with a proof shortfall and 8 already tested alone."""
     _batch_setup(github, count=count, images=True, images_member=8)
+    if late:
+        # 9 has not joined the ready line; leave room for 7 beside 8 after the failure.
+        github.pulls["9"]["isDraft"] = True
+        saved = _batch_state(github)
+        saved["window"] = 4
+        (github.workflow.repo / ".local/workflow/merge-train.json").write_text(json.dumps(saved))
     assert _batch_call(github).returncode == 3
     isolated = _prefixes(github)[0]
     _finish_prefix(github, "7", conclusion="failure")
@@ -5934,6 +5940,56 @@ def test_restoration_keeps_an_existing_prefix_across_retests_and_gate_calls(
     done = _batch_call(github)
     assert done.returncode == 0, done.stdout + done.stderr
     assert _merges(github) == ["8", "7"]
+
+
+@pytest.mark.parametrize("reconciled", [False, True], ids=["failed-state", "proven-state"])
+def test_a_member_joining_during_a_restored_retest_waits_for_the_restored_front(
+    github: GitHub, reconciled: bool
+) -> None:
+    # Read the older state shape, both before and after its green rerun was recognized.
+    kept = _restored_before_eight(github, passed=False, reconciled=reconciled, late=True)
+    assert _batch_call(github).returncode == 1
+    assert _batch_call(github).returncode == 3
+    restored = _scratch(github, "7")
+    assert restored and restored["pushed"]
+
+    # 9 joins while 8 is kept and 7's replacement is running. Only the existing 8 may go first.
+    github.pulls["9"]["isDraft"] = False
+    saved = _batch_state(github)
+    saved["window"] = 4
+    (github.workflow.repo / ".local/workflow/merge-train.json").write_text(json.dumps(saved))
+    done = _batch_call(github, "9")
+    assert done.returncode == 3, done.stdout + done.stderr
+    for member in _prefixes(github):
+        if member["number"] == "9":
+            assert "7" in member["ahead"], member
+            assert not member.get("kept"), member
+    assert _scratch(github, "8")["branch"] == kept["scratch"]["branch"]
+
+    _finish_prefix(github, "8", run_id=1100)
+    done = _batch_call(github, "8")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["8"]
+    replacement = _scratch(github, "7")
+    assert replacement and replacement["pushed"]
+    assert replacement["branch"] != restored["branch"]
+    base = github.workflow.git("rev-parse", "origin/main")
+    assert replacement["under"] == github.workflow.git("rev-parse", f"{base}^{{tree}}")
+
+    for member in _prefixes(github):
+        if member["number"] == "9":
+            assert "7" in member["ahead"], member
+            _finish_prefix(github, "9", run_id=4100)
+    for _ in range(3):
+        for number in ("7", "9"):
+            done = _batch_call(github, number)
+            assert done.returncode == 3, done.stdout + done.stderr
+        assert _merges(github) == ["8"]
+        assert _scratch(github, "7")["branch"] == replacement["branch"]
+    _finish_prefix(github, "7", run_id=3100)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github)[:2] == ["8", "7"]
 
 
 @pytest.mark.parametrize("change", ["head", "main", "draft"])
