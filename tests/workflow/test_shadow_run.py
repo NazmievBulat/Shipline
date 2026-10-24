@@ -217,7 +217,9 @@ def test_a_shadow_tick_changes_nothing(workflow: Workflow) -> None:
     done = workflow.shipline("tick", "--shadow", env=_CLOCK)
 
     assert done.returncode == 0, done.stderr
-    assert not (workflow.state / "refused.log").exists(), (workflow.state / "refused.log").read_text()
+    assert not (workflow.state / "refused.log").exists(), (
+        workflow.state / "refused.log"
+    ).read_text()
     assert _digest(*roots, leave_out=leave_out) == before
     assert workflow.git("ls-remote", "origin") == origin
     assert workflow.git("worktree", "list", "--porcelain") == worktrees
@@ -401,8 +403,12 @@ def test_a_shadow_run_reads_a_limit_s_day_as_the_real_tick_does_and_keeps_no_not
     """An hour-only weekly limit gets its day from the usage figures; the real listing notes it."""
     workflow.add_worktree(7)
     workflow.running("ticket-7")
-    workflow.screen("  ⎿  You've hit your weekly limit · resets 3am (America/New_York)" + _BOX, "ticket-7")
-    workflow.usage(40, "2026-10-16T05:00:00+00:00", seven=100, seven_resets="2026-10-16T07:00:00+00:00")
+    workflow.screen(
+        "  ⎿  You've hit your weekly limit · resets 3am (America/New_York)" + _BOX, "ticket-7"
+    )
+    workflow.usage(
+        40, "2026-10-16T05:00:00+00:00", seven=100, seven_resets="2026-10-16T07:00:00+00:00"
+    )
     clock = {"WORKFLOW_NOW": "1792119600", "TZ": "UTC"}
     before = _digest(workflow.notes(7))
 
@@ -634,7 +640,8 @@ def test_the_wake_s_check_ins_are_compared_by_whom_they_told_and_their_own_lines
         return (
             "2026-09-21 17:00:00  after a reset\n"
             "  usage: 5-hour window 12% used, resets in 2h0m; load 0.5\n"
-            "  sessions: ticket-12 busy; pull requests: none; starts: allowed; tmp pressure: false\n"
+            "  sessions: ticket-12 busy; pull requests: none; starts: allowed;"
+            " tmp pressure: false\n"
             "  the tick sent its instruction again to: ticket-12\n"
             f"  asking the owner: review-15 ({waited} min)\n"
             f"  {told}\n"
@@ -726,4 +733,7 @@ def test_a_shadow_log_without_a_run_names_no_hours(tmp_path: Path) -> None:
     done = _compare(*_logs(tmp_path, ""))
 
     assert done.returncode == 2
-    assert done.stderr == "the shadow log holds no shadow tick: name the hours with --from and --until\n"
+    assert (
+        done.stderr
+        == "the shadow log holds no shadow tick: name the hours with --from and --until\n"
+    )

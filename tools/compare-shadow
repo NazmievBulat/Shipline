@@ -73,10 +73,13 @@ _TICK_LINES = [
         r"reviewer nudged|checks finished on \S+; reviewer nudged|lost check on \S+; "
         r"reviewer nudged|wake failed: .*)$"
     ),
-    re.compile(rf"^(?P<who>{_NAME}) idle \d+ min waiting for its own job or turn; status check sent$"),
+    re.compile(
+        rf"^(?P<who>{_NAME}) idle \d+ min waiting for its own job or turn; status check sent$"
+    ),
     re.compile(rf"^(?P<who>{_NAME}) status check failed: .*$"),
     re.compile(
-        rf"^(?P<who>{_NAME}) idle on ready pull request \d+ without worker finished; told to finish$"
+        rf"^(?P<who>{_NAME}) idle on ready pull request \d+ without worker finished; "
+        r"told to finish$"
     ),
     re.compile(rf"^(?P<who>{_NAME}) finish message failed: .*$"),
     re.compile(rf"^(?P<who>{_NAME}) runs a wait loop that finds its own shell: .*$"),
@@ -244,9 +247,7 @@ def main() -> int:
         description="List every decision a shadow tick and the real tick took differently."
     )
     parser.add_argument("--shadow", type=Path, default=Path(".local/shipline/shadow.log"))
-    parser.add_argument(
-        "--wake", type=Path, default=Path.home() / ".local/state/workflow/wake.log"
-    )
+    parser.add_argument("--wake", type=Path, default=Path.home() / ".local/state/workflow/wake.log")
     parser.add_argument("--journal", type=Path)
     parser.add_argument("--from", dest="start")
     parser.add_argument("--until", dest="end")
