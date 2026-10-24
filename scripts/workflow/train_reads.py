@@ -139,6 +139,14 @@ class Reads:
             if head_match:
                 for run in value:
                     self.owners[f"{config.api}/actions/runs/{run['id']}/jobs?per_page=100"] = owner
+                    # A job carried into a re-run of the failed jobs has its notes in the
+                    # attempt where it ran (merge_gate.job_notes).
+                    attempt = run.get("run_attempt")
+                    for earlier in range(1, attempt if isinstance(attempt, int) else 1):
+                        self.owners[
+                            f"{config.api}/actions/runs/{run['id']}/attempts/{earlier}/jobs"
+                            "?per_page=100"
+                        ] = owner
             elif "/jobs?" in path:
                 for job in value:
                     self.owners[
