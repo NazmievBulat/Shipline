@@ -184,22 +184,23 @@ asks_owner() {
 # `owner_only` from its line `Owner only: yes` or `Owner only: no` (the last such line; without
 # one, "missing", and the owner answers), and for `no` the recommended reply: the first reply
 # word after that line, digits or quoted words ("Reply 1 or 2", 'write "merge it"'), on one line
-# of at most 60 characters. Without one there is no `reply`, and the owner answers.
+# of at most 60 characters that starts with a letter or a digit: typed into Claude Code, `/clear`
+# or `!command` would run, not answer. Without one there is no `reply`, and the owner answers.
 question_of() {
   jq -cn --arg message "$1" --arg asked "$2" '
     ($message | split("\n")) as $lines
     | ([range(0; $lines | length)
-        | select($lines[.] | test("^[\\s>*_-]*owner only:[\\s*_]*(yes|no)[\\s*_.!]*$"; "i"))]
+        | select($lines[.] | test("^[\\s>*_`-]*owner only:[\\s*_`]*(yes|no)[\\s*_`.!]*$"; "i"))]
       | last) as $at
     | {asked: $asked}
     + if $at == null then {owner_only: "missing"}
-      else ($lines[$at] | capture("(?<said>yes|no)[\\s*_.!]*$"; "i").said | ascii_downcase) as $said
+      else ($lines[$at] | capture("(?<said>yes|no)[\\s*_`.!]*$"; "i").said | ascii_downcase) as $said
       | {owner_only: $said}
       + if $said == "yes" then {}
         else [$lines[$at + 1:] | join("\n")
-          | first(match("(?:^|[^[:alpha:]])(?:reply|type|write|answer|say|choose)(?:\\s+with)?\\s+[*_]*(?:\"([^\"\\n]+)\"|“([^”\\n]+)”|`([^`\\n]+)`|([0-9]+)(?![0-9]))"; "gi"))
+          | first(match("(?:^|[^[:alpha:]])(?:reply|type|write|answer|say|choose)(?:\\s+with)?\\s+[*_]*(?:\"([^\"\\n]+)\"|“([^”\\n]+)”|`([^`\\n]+)`|([0-9]+)(?![[:alnum:]]))"; "gi"))
           | [.captures[].string | strings] | first
-          | select(length <= 60 and (test("[[:cntrl:]]") | not))]
+          | select(length <= 60 and test("^[[:alnum:]]") and (test("[[:cntrl:]]") | not))]
         | if length == 0 then {} else {reply: .[0]} end
         end
       end'

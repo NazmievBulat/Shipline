@@ -85,6 +85,8 @@ DEFAULTS: dict[str, Any] = {
     # recommended reply; 0 turns that off.
     "answer_for_owner_after_minutes": 15,
 }
+# The most such a wait may be: a day. Bash would wrap a number far larger.
+MOST_MINUTES = 24 * 60
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
@@ -215,9 +217,10 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
         elif isinstance(default, int):
             value = given[key]
             # `true` is an int to Python, and no number of minutes.
-            if type(value) is not int or value < 0:
+            if type(value) is not int or not 0 <= value <= MOST_MINUTES:
                 raise ConfigError(
-                    f"{FILE}: {name} must be a whole number of 0 or more, not {json.dumps(value)}"
+                    f"{FILE}: {name} must be a whole number from 0 to {MOST_MINUTES}, "
+                    f"not {json.dumps(value)}"
                 )
             merged[key] = value
         else:

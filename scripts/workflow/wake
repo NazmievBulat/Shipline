@@ -37,7 +37,8 @@
 # line of its own with the reply it typed and when, `answered for the owner: ticket-426, "1"
 # (03:12)`, so that he can overrule it. One given at night waits for the morning check-in, the
 # first look from 8:00, which lists every answer since 20:00; one given in the day is told at the
-# next look. Either is told once, busy or not, tried again every 5 minutes until it is sent.
+# next look. Either is told once, busy or not, tried again every 5 minutes until it is sent; one
+# still not sent at 20:00 waits for the morning.
 #
 # A session that ended its turn with a question to the owner is named on a line of its own,
 # with how long it has waited: `asking the owner: review-156 (8 min)`. The stop hook (`notify`)

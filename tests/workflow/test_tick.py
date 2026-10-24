@@ -1198,3 +1198,51 @@ def test_the_same_question_asked_again_after_the_answer_waits_and_a_new_one_does
     _tick_at(workflow, _ASKED_AT + 5000 + 900)
 
     assert _replies(workflow) == ["1", "2"]
+
+
+def test_an_old_message_of_the_tick_left_in_the_box_is_not_sent_for_the_reply(
+    workflow: Workflow,
+) -> None:
+    notes = _asks_the_owner(workflow)
+    status = "Status check: if what you were waiting for is done, carry on."
+    notes.with_name("ticket-7.typed").write_text(status)
+    (workflow.state / "input-ticket-7").write_text(status)
+
+    _tick_at(workflow, _ASKED_AT + 900)
+
+    assert workflow.calls("tmux ticket-7 send-keys") == []
+    assert (workflow.state / "input-ticket-7").read_text() == status
+    assert _answered(workflow) == []
+    assert notes.with_name("ticket-7.answered-for-owner").exists() is False
+
+
+def test_a_reply_the_tick_typed_but_could_not_send_is_sent_at_the_next_tick(
+    workflow: Workflow,
+) -> None:
+    notes = _asks_the_owner(workflow)
+    notes.with_name("ticket-7.typed").write_text("1")
+    (workflow.state / "input-ticket-7").write_text("1")
+
+    _tick_at(workflow, _ASKED_AT + 900)
+
+    assert workflow.calls("tmux ticket-7 send-keys")[-1].endswith(" Enter")
+    assert (workflow.state / "input-ticket-7").read_text() == ""
+    assert len(_answered(workflow)) == 1
+
+
+@pytest.mark.parametrize("answered", ["question dropped", "another question"])
+def test_a_question_answered_or_changed_meanwhile_is_passed_over_quietly(
+    workflow: Workflow, answered: str
+) -> None:
+    """The owner's reply can come between the tick's reading and the session's typing."""
+    notes = _asks_the_owner(workflow)
+    asked = notes.with_name("ticket-7.asking").read_text().strip()
+    if answered == "question dropped":
+        notes.with_name("ticket-7.asking").unlink()
+    else:
+        notes.with_name("ticket-7.asking").write_text(f"{_ASKED_AT + 60} 42\n")
+
+    done = workflow.run("answer-for-owner", "ticket-7", asked)
+
+    assert done.returncode == 3, done.stderr
+    assert workflow.calls("tmux ticket-7 send-keys") == []

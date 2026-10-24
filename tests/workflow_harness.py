@@ -35,10 +35,14 @@ HANGING_CALL = (
     "/bin/sleep 600 & wait\n"
     "echo completed-$name >> '@STATE@/calls.log'\n"
 )
-# How the sentence a session is started with ends: where its rules are read from.
+# How the sentence a session is started with ends: where its rules are read from, and the line
+# a question to the owner carries.
 RULES_ON_MAIN = (
-    "by the rules of AGENTS.md as it is on main, not the copy in this worktree; "
-    "read them with: git fetch origin main && git show origin/main:AGENTS.md"
+    "by the rules of AGENTS.md as it is on main, not the copy in this worktree, any question to "
+    "the owner carrying the line Owner only: yes or Owner only: no just before its reply words, "
+    "the recommended one first (yes for money, privacy, legal text, text sent to a model and the product "
+    "decisions the rules keep for the owner); read the rules with: git fetch origin main && "
+    "git show origin/main:AGENTS.md"
 )
 
 

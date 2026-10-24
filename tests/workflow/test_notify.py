@@ -1219,7 +1219,7 @@ def test_the_recommended_reply_is_the_first_reply_word_after_the_line(
 
 
 @pytest.mark.parametrize(
-    "line", ["Owner only: yes", "**Owner only: yes**", "owner only: YES."], ids=str
+    "line", ["Owner only: yes", "**Owner only: yes**", "owner only: YES.", "`Owner only: yes`"], ids=str
 )
 def test_a_question_kept_for_the_owner_is_noted_as_his(session: Workflow, line: str) -> None:
     session.notify(_stop(_asked(None).replace("Reply 1", f"{line}\nReply 1")))
@@ -1230,6 +1230,14 @@ def test_a_question_kept_for_the_owner_is_noted_as_his(session: Workflow, line: 
     assert question.get("reply") is None
 
 
+def test_the_line_in_backticks_is_read(session: Workflow) -> None:
+    session.notify(_stop(_asked(None).replace("Reply 1", "`Owner only: no`\nReply 1")))
+
+    question = _question(session)
+    assert question is not None
+    assert (question["owner_only"], question["reply"]) == ("no", "1")
+
+
 def test_a_question_without_the_line_is_noted_as_missing_it(session: Workflow) -> None:
     session.notify(_stop(_asked(None)))
 
@@ -1238,8 +1246,21 @@ def test_a_question_without_the_line_is_noted_as_missing_it(session: Workflow) -
     assert question["owner_only"] == "missing"
 
 
-def test_a_question_marked_no_without_reply_words_has_no_reply(session: Workflow) -> None:
-    session.notify(_stop(_asked("no", "Which one do you prefer?")))
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Which one do you prefer?",
+        # Typed into Claude Code, these would run a command, not answer.
+        "Type `/clear` to start again. Reply 2 to go on.",
+        "Reply `!git push` to push, or 2.",
+        "Reply `#remember` or 2.",
+        "Reply 12a or 2.",
+    ],
+)
+def test_a_question_marked_no_without_a_plain_reply_word_has_no_reply(
+    session: Workflow, reply: str
+) -> None:
+    session.notify(_stop(_asked("no", reply)))
 
     question = _question(session)
     assert question is not None

@@ -335,6 +335,9 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"answer_for_owner_after_minutes": -1}', "answer_for_owner_after_minutes"),
         ('{"answer_for_owner_after_minutes": 1.5}', "answer_for_owner_after_minutes"),
         ('{"answer_for_owner_after_minutes": true}', "answer_for_owner_after_minutes"),
+        # Bash would wrap a number this large.
+        ('{"answer_for_owner_after_minutes": 2000000000000000000}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": 1441}', "answer_for_owner_after_minutes"),
     ],
 )
 def test_a_file_that_cannot_be_read_is_refused_by_name(
@@ -371,7 +374,7 @@ def test_no_repository_on_github_anywhere_is_refused(tmp_path: Path, origin: str
         config.repository
 
 
-@pytest.mark.parametrize("minutes", [0, 15, 90])
+@pytest.mark.parametrize("minutes", [0, 15, 90, 1440])
 def test_the_wait_before_answering_for_the_owner_is_read_and_reaches_bash(
     tmp_path: Path, minutes: int
 ) -> None:
