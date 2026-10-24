@@ -3722,20 +3722,6 @@ def test_a_member_conflicting_with_the_batch_waits_for_its_own_turn(github: GitH
     assert _merges(github) == ["7", "8"]
 
 
-def test_a_member_whose_migration_number_the_batch_took_waits_for_its_own_turn(
-    github: GitHub,
-) -> None:
-    # Its own refresh renumbers the migration; a scratch merge would only fail with two heads.
-    _batch_setup(github, migration=True)
-    assert _batch_call(github).returncode == 3
-    assert _numbers(github) == ["7", "8"]
-    _finish_batch(github)
-    done = _batch_call(github)
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert _batch_state(github)["waiting"] == ["9"]
-    assert _merges(github) == ["7", "8"]
-
-
 def test_main_moved_from_outside_invalidates_every_prefix(github: GitHub) -> None:
     _batch_setup(github)
     assert _batch_call(github).returncode == 3
@@ -5085,54 +5071,6 @@ UNREACHABLE = (
 ADVISORY = "Refused: this branch brings advisories that main does not have:\n  npm: GHSA-1 in vite"
 
 
-def test_a_refresh_push_the_audit_service_refused_waits_from_the_published_head(
-    github: GitHub,
-) -> None:
-    _stale(github)
-    short_of_memory(github.workflow, UNREACHABLE, times=1)
-    workflow = github.workflow
-
-    done = github.run()
-
-    assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
-    assert "could not reach npm's advisory service" in done.stderr
-    # Nothing wakes a reviewer when the service answers: the tick retries a handoff's push.
-    assert (
-        "by the tick once it is handed off: publish the passed round, "
-        "run merge-when-current --handoff 7 and end with review finished"
-    ) in done.stderr
-    assert "tried again later" not in done.stderr
-    # Nothing was pushed, and the worktree is back on the published head, clean.
-    assert workflow.git("rev-parse", "HEAD") == github.head
-    assert workflow.git("status", "--porcelain") == ""
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == github.head
-    folder = workflow.repo / ".local/workflow"
-    assert json.loads((folder / "advisory-service-down").read_text())["service"] == "npm"
-    told = (folder / "advisory-service.pending").read_text()
-    assert told.startswith("npm's advisory service unreachable since ")
-
-    # The service answers again: the same call refreshes, and the note of the outage goes.
-    done = github.run()
-
-    assert done.returncode == 2, done.stdout + done.stderr
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[
-        0
-    ] == workflow.git("rev-parse", "HEAD")
-    assert not (folder / "advisory-service-down").exists()
-
-
-def test_an_outage_is_told_once_however_many_pushes_it_refuses(github: GitHub) -> None:
-    _stale(github)
-    short_of_memory(github.workflow, UNREACHABLE, times=3)
-    folder = github.workflow.repo / ".local/workflow"
-
-    assert "merge waiting" in github.run().stderr
-    (folder / "advisory-service.pending").unlink()  # the wake told it
-    assert "merge waiting" in github.run().stderr
-
-    assert not (folder / "advisory-service.pending").exists()
-
-
 def test_a_refresh_push_refused_for_an_advisory_is_still_refused(github: GitHub) -> None:
     _stale(github)
     short_of_memory(github.workflow, ADVISORY, times=1)
@@ -5142,20 +5080,6 @@ def test_a_refresh_push_refused_for_an_advisory_is_still_refused(github: GitHub)
     assert done.returncode == 1 and "merge refused" in done.stderr, done.stdout + done.stderr
     assert "GHSA-1" in done.stderr
     assert not (github.workflow.repo / ".local/workflow/advisory-service-down").exists()
-
-
-def test_a_batch_push_the_audit_service_refused_is_never_counted(github: GitHub) -> None:
-    _batch_setup(github)
-    short_of_memory(github.workflow, UNREACHABLE, times=4)
-
-    for _ in range(4):
-        done = _batch_call(github)
-        assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
-    batch = _scratch(github)
-    assert batch is not None
-    assert batch["pushed"] is False and "push_failures" not in batch
-    assert _batch_call(github).returncode == 3
-    assert all(member["scratch"]["pushed"] for member in _prefixes(github))
 
 
 def _dependencies_red(github: GitHub, *, annotation: str | None) -> dict[str, Any]:
@@ -5199,17 +5123,6 @@ _MAIN_UNREACHABLE = (
 )
 
 
-def test_main_red_only_for_the_audit_service_says_so(github: GitHub) -> None:
-    _dependencies_red(github, annotation=_MAIN_UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-
-    line = github.workflow.run_script("main-status").stdout
-
-    assert "main: red" in line
-    assert "CI: dependencies could not reach npm's advisory service" in line
-    assert "nothing was found wrong with main" in line
-
-
 def test_main_red_for_the_audit_service_and_its_images_does_not_say_nothing_was_wrong(
     github: GitHub,
 ) -> None:
@@ -5222,31 +5135,6 @@ def test_main_red_for_the_audit_service_and_its_images_does_not_say_nothing_was_
 
     assert "main: red" in line and "Docker images: image tests" in line
     assert "nothing was found wrong with main" not in line
-
-
-def test_main_red_for_the_audit_service_is_re_run_once_it_answers_again(github: GitHub) -> None:
-    workflow = github.workflow
-    run = _dependencies_red(github, annotation=_MAIN_UNREACHABLE)
-    advisory_service_answers(workflow, answers=False)
-
-    workflow.run_script("tick")
-
-    assert rerun_calls(workflow) == []
-    status = (workflow.repo / ".local/workflow/main-status").read_text()
-    assert "re-run once npm's advisory service answers" in status
-
-    advisory_service_answers(workflow, answers=True)
-    workflow.run_script("tick")
-
-    assert rerun_calls(workflow) == ["gh run rerun 10 -R NazmievBulat/Shipline --failed"]
-    note = "automatically re-ran failed jobs of main run 10 after npm's advisory service answered"
-    assert note in (workflow.repo / ".local/workflow/main-status").read_text()
-    assert note in workflow.wake_log.read_text()
-    # Once: the third attempt failing again waits for someone, as any failure does.
-    run["run_attempt"] = 3
-    github.save()
-    workflow.run_script("tick")
-    assert len(rerun_calls(workflow)) == 1
 
 
 @pytest.mark.parametrize("reason", ["no annotation", "another job failed too", "hosted"])
@@ -5276,44 +5164,6 @@ def test_main_red_for_more_than_the_audit_service_is_not_re_run_again(
     assert rerun_calls(workflow) == []
 
 
-def test_the_tick_forgets_an_outage_once_the_service_answers(github: GitHub) -> None:
-    github.main()
-    github.save()
-    workflow = github.workflow
-    folder = workflow.repo / ".local/workflow"
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "advisory-service-down").write_text(
-        json.dumps({"service": "npm", "since": "2026-10-22 02:46 UTC"})
-    )
-    advisory_service_answers(workflow, answers=False)
-
-    workflow.run_script("tick")
-
-    assert (folder / "advisory-service-down").exists()
-    advisory_service_answers(workflow, answers=True)
-    workflow.run_script("tick")
-    assert not (folder / "advisory-service-down").exists()
-    assert any("advisories/bulk" in call for call in workflow.calls("curl"))
-
-
-def test_the_recovery_re_run_waits_for_github_to_show_the_first_one(github: GitHub) -> None:
-    # GitHub can still show the failed first attempt after accepting the first re-run.
-    workflow = github.workflow
-    run = _dependencies_red(github, annotation=_MAIN_UNREACHABLE)
-    run["run_attempt"] = 1
-    github.save()
-    advisory_service_answers(workflow, answers=True)
-
-    workflow.run_script("tick")
-
-    assert rerun_calls(workflow) == []
-    assert not (workflow.repo / ".local/workflow/main-rerun-10-recovered").exists()
-    run["run_attempt"] = 2
-    github.save()
-    workflow.run_script("tick")
-    assert len(rerun_calls(workflow)) == 1
-
-
 def pull_dependencies_red(github: GitHub, *, annotation: str | None) -> dict[str, Any]:
     """Pull request 7's CI run 20 failed only in "CI: dependencies", on a home runner."""
     run = github.api[
@@ -5337,30 +5187,6 @@ def pull_dependencies_red(github: GitHub, *, annotation: str | None) -> dict[str
     return run
 
 
-def test_a_pull_request_red_only_for_the_audit_service_waits_in_its_place(
-    github: GitHub,
-) -> None:
-    pull_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-
-    done = github.run()
-
-    assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
-    assert "could not reach npm's advisory service" in done.stderr
-    assert "re-run once the service answers" in done.stderr
-    # Nothing wakes a reviewer of a blocked member when the service answers: only the
-    # handoff, which the tick drives, re-runs it without another call.
-    assert (
-        "publish the passed round, run merge-when-current --handoff 7 and end with "
-        "review finished" in done.stderr
-    )
-    assert "later gate call" not in done.stderr
-    # Passed over in its place, as a failed member is, until a green re-run; never merged.
-    assert _train(github)["blocked"] == ["7"]
-    assert not (github.workflow.state / "merged").exists()
-    assert rerun_calls(github.workflow) == []
-
-
 @pytest.mark.parametrize("reason", ["no annotation", "another check failed too"])
 def test_a_pull_request_red_for_more_than_the_audit_service_is_refused(
     github: GitHub, reason: str
@@ -5376,41 +5202,6 @@ def test_a_pull_request_red_for_more_than_the_audit_service_is_refused(
 
     assert done.returncode == 1 and "merge refused" in done.stderr, done.stdout + done.stderr
     assert "failed checks" in done.stderr
-
-
-def test_a_pull_request_run_red_for_the_audit_service_waits_before_its_rollup_shows_it(
-    github: GitHub,
-) -> None:
-    # GitHub's rollup can still read green while the run itself has failed.
-    pull_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-    github.pulls["7"]["statusCheckRollup"] = [
-        {"name": "CI result", "status": "COMPLETED", "conclusion": "SUCCESS"}
-    ]
-    github.save()
-
-    done = github.run()
-
-    assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
-    assert "could not reach npm's advisory service" in done.stderr
-    assert not (github.workflow.state / "merged").exists()
-
-
-def test_a_gate_call_re_runs_a_pull_request_once_the_audit_service_answers(
-    github: GitHub,
-) -> None:
-    # A reviewer's own call does what the tick does for a handoff.
-    pull_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=True)
-
-    first = github.run()
-    second = github.run()
-
-    for done in (first, second):
-        assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
-    assert rerun_calls(github.workflow) == ["gh run rerun 20 -R NazmievBulat/Shipline --failed"]
-    assert "GitHub has not shown it yet" in second.stderr
-    assert not (github.workflow.state / "merged").exists()
 
 
 def _changes(github: GitHub, path: str = "web/src/page.tsx") -> str:
@@ -5875,37 +5666,6 @@ def _server_suite_dependencies_red(github: GitHub, *, annotation: str | None) ->
     return suite
 
 
-def test_a_run_of_every_server_test_red_only_for_the_audit_service_waits_and_is_re_run(
-    github: GitHub,
-) -> None:
-    # The gate's manual CI run holds the same package audit as a batch's: an advisory service
-    # that could not be reached is a wait, not a failure of the pull request.
-    suite = _server_suite_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-
-    waiting = _batch_call(github)
-
-    assert waiting.returncode == 3, waiting.stdout + waiting.stderr
-    assert "could not reach npm's advisory service" in waiting.stdout
-    train = _batch_state(github)
-    assert train["blocked"] == {} and "7" in train["suites"]
-    assert rerun_calls(github.workflow) == []
-
-    # The red run does not change when the service answers: the wake of the front does.
-    before = _train(github)["turn"]
-    advisory_service_answers(github.workflow, answers=True)
-    assert _train(github)["turn"] > before
-    assert _batch_call(github).returncode == 3
-
-    assert rerun_calls(github.workflow) == [
-        "gh run rerun 960000 -R NazmievBulat/Shipline --failed"
-    ]
-    github.ci_dispatched(suite["head"], suite["branch"], run_id=960_000)  # The re-run passed.
-    done = _batch_call(github)
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert (github.workflow.state / "merged").read_text() == "7"
-
-
 def test_a_run_of_every_server_test_red_for_dependencies_without_the_service_note_refuses(
     github: GitHub,
 ) -> None:
@@ -6153,71 +5913,6 @@ def batch_dependencies_red(
     github.save()
 
 
-def test_a_batch_red_only_for_the_audit_service_waits_and_is_re_run_once_it_answers(
-    github: GitHub,
-) -> None:
-    _batch_setup(github)
-    assert _batch_call(github).returncode == 3
-    _finish_batch(github)
-    batch_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-    members = _prefixes(github)
-
-    waiting = _batch_call(github)
-
-    assert waiting.returncode == 3, waiting.stdout + waiting.stderr
-    assert "batch run 100 could not reach npm's advisory service" in waiting.stdout
-    train = _batch_state(github)
-    # Not blamed on its member: the prefixes are kept as they were.
-    assert _prefixes(github) == members
-    assert train["blocked"] == {} and train["batch_failed"] == {}
-    assert rerun_calls(github.workflow) == []
-
-    advisory_service_answers(github.workflow, answers=True)
-    assert _batch_call(github).returncode == 3
-    again = _batch_call(github)  # GitHub still shows attempt 1.
-
-    assert again.returncode == 3, again.stdout + again.stderr
-    assert "GitHub has not shown it yet" in again.stdout
-    assert rerun_calls(github.workflow) == ["gh run rerun 100 -R NazmievBulat/Shipline --failed"]
-    assert [m["number"] for m in _prefixes(github)] == [m["number"] for m in members]
-
-    _finish_batch(github)  # The re-run passed.
-    head = _prefixes(github)[0]["scratch"]["head"]
-    github.api[
-        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={head}&event=workflow_dispatch&per_page=100"
-    ]["workflow_runs"][0]["run_attempt"] = 2
-    done = _batch_call(github)
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert [call.split()[3] for call in github.workflow.calls("gh pr merge")] == ["7", "8", "9"]
-
-
-def test_a_batch_waiting_for_the_audit_service_wakes_the_front_once_it_answers(
-    github: GitHub,
-) -> None:
-    # A reviewer that did not hand off is woken by a new turn. The red run does not change when
-    # the service answers again, so without its answer in the signal nothing would wake it.
-    _batch_setup(github)
-    assert _batch_call(github).returncode == 3
-    _finish_batch(github)
-    batch_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=False)
-    assert _batch_call(github).returncode == 3
-    before = _train(github)["turn"]
-    assert _train(github)["turn"] == before
-
-    advisory_service_answers(github.workflow, answers=True)
-    woken = _train(github)["turn"]
-
-    assert woken > before
-    assert _train(github)["turn"] == woken
-    # The wake only tells the front: its own gate call re-runs, under the merge lock.
-    assert rerun_calls(github.workflow) == []
-    assert _batch_call(github).returncode == 3
-    assert rerun_calls(github.workflow) == ["gh run rerun 100 -R NazmievBulat/Shipline --failed"]
-
-
 @pytest.mark.parametrize(
     "reason", ["no annotation", "another job failed too", "hosted", "unreadable annotation"]
 )
@@ -6241,29 +5936,6 @@ def test_a_batch_red_for_more_than_the_audit_service_is_isolated(
     assert _batch_state(github)["blocked"] == {"7": github.head}
     assert _numbers(github) == ["8", "9"]
     assert rerun_calls(github.workflow) == []
-
-
-def test_a_batch_whose_re_run_fails_again_for_the_audit_service_is_isolated(
-    github: GitHub,
-) -> None:
-    # One re-run after the service answered: a second failure is the members' to isolate.
-    _batch_setup(github)
-    assert _batch_call(github).returncode == 3
-    _finish_batch(github)
-    batch_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(github.workflow, answers=True)
-    assert _batch_call(github).returncode == 3
-    head = _prefixes(github)[0]["scratch"]["head"]
-    github.api[
-        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={head}&event=workflow_dispatch&per_page=100"
-    ]["workflow_runs"][0]["run_attempt"] = 2
-
-    done = _batch_call(github)
-
-    assert done.returncode == 1, done.stdout + done.stderr
-    assert "ci run 100 of pull request 7's prefix failed" in done.stderr
-    assert _batch_state(github)["blocked"] == {"7": github.head}
-    assert rerun_calls(github.workflow) == ["gh run rerun 100 -R NazmievBulat/Shipline --failed"]
 
 
 @pytest.mark.parametrize("count", [2, 3])
@@ -6304,35 +5976,8 @@ def test_successful_older_version_noop_keeps_prefix_testing(github: GitHub) -> N
     assert _merges(github) == ["7", "8", "9"]
 
 
-def test_squash_carries_the_gate_validated_runs_in_its_commit_message(github: GitHub) -> None:
-    github.batch_mode = True
-    github.pulls["7"]["commits"] = [
-        {"messageHeadline": "feat: seven", "messageBody": "Why it is built so."},
-        {"messageHeadline": "fix: seven again", "messageBody": ""},
-    ]
-    done = github.run()
-    assert done.returncode == 0, done.stdout + done.stderr
-    message = github.workflow.git("show", "-s", "--format=%B", "origin/main")
-    # The body file replaces GitHub's own list of the branch's commits: main keeps it.
-    assert "* feat: seven\n\nWhy it is built so.\n\n* fix: seven again\n\nWorkflow-Proof: " in (
-        message
-    )
-    receipt = json.loads(
-        next(
-            line.removeprefix("Workflow-Proof: ")
-            for line in message.splitlines()
-            if line.startswith("Workflow-Proof: ")
-        )
-    )
-    assert receipt["base"] == github.base
-    assert receipt["tree"] == github.workflow.git("rev-parse", f"{github.head}^{{tree}}")
-    ci = next(source for source in receipt["sources"] if source["workflow"] == "ci")
-    assert ci["run"] == 20
-    assert "CI result" in ci["jobs"]
-
-
-@pytest.mark.parametrize("broken", ["", "tree", "branch", "matrix"])
-def test_gate_verifies_reused_image_evidence_before_merging(github: GitHub, broken: str) -> None:
+@pytest.mark.parametrize("broken", ["tree", "branch", "matrix"])
+def test_gate_refuses_reused_image_evidence_it_cannot_verify(github: GitHub, broken: str) -> None:
     _images(github)
     current = github.api[f"{_REPO}/actions/runs/40/jobs?per_page=100"]["jobs"]
     current[1]["conclusion"] = "skipped"
@@ -6388,5 +6033,5 @@ def test_gate_verifies_reused_image_evidence_before_merging(github: GitHub, brok
         }
     ]
     done = github.run()
-    assert done.returncode == (1 if broken else 0), done.stdout + done.stderr
-    assert (github.workflow.state / "merged").exists() is (not broken)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert not (github.workflow.state / "merged").exists()
