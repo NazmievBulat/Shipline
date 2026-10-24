@@ -1,0 +1,202 @@
+[
+ {
+  "data": {
+   "search": {
+    "pageInfo": {
+     "hasNextPage": true,
+     "endCursor": "page-2"
+    },
+    "nodes": [
+     {
+      "number": 21,
+      "title": "feat: one",
+      "createdAt": "2026-10-22T07:00:00Z",
+      "mergedAt": "2026-10-22T18:00:00Z",
+      "body": "## Problem\n\nSomething.\n\n## Weaker tests\n\n- `tests/a.py::test_one`: an assertion removed\n- `tests/b.py`: deleted, moved to `tests/c.py`\n\n## Runs\n\n- passed\n",
+      "timelineItems": {
+       "nodes": [
+        {
+         "__typename": "LabeledEvent",
+         "createdAt": "2026-10-22T07:00:00Z",
+         "label": {
+          "name": "priority: high"
+         }
+        },
+        {
+         "__typename": "LabeledEvent",
+         "createdAt": "2026-10-22T08:00:00Z",
+         "label": {
+          "name": "workflow"
+         }
+        },
+        {
+         "__typename": "ReadyForReviewEvent",
+         "createdAt": "2026-10-22T10:00:00Z"
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "body": "A plain comment.",
+         "submittedAt": "2026-10-22T10:00:00Z"
+        },
+        {
+         "body": "<!-- workflow-review round=1 result=sent-back -->\nThe round's findings.",
+         "submittedAt": "2026-10-22T11:00:00Z"
+        },
+        {
+         "body": "<!-- workflow-review round=2 result=passed -->\nThe round's findings.",
+         "submittedAt": "2026-10-22T13:00:00Z"
+        }
+       ]
+      }
+     },
+     {
+      "number": 22,
+      "title": "fix: two",
+      "createdAt": "2026-10-23T08:00:00Z",
+      "mergedAt": "2026-10-23T20:00:00Z",
+      "body": "A ticket.",
+      "timelineItems": {
+       "nodes": [
+        {
+         "__typename": "LabeledEvent",
+         "createdAt": "2026-10-23T08:00:00Z",
+         "label": {
+          "name": "priority: high"
+         }
+        },
+        {
+         "__typename": "LabeledEvent",
+         "createdAt": "2026-10-23T09:00:00Z",
+         "label": {
+          "name": "workflow"
+         }
+        },
+        {
+         "__typename": "ReadyForReviewEvent",
+         "createdAt": "2026-10-23T10:00:00Z"
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "body": "A plain comment.",
+         "submittedAt": "2026-10-23T10:00:00Z"
+        },
+        {
+         "body": "<!-- workflow-review round=1 result=passed -->\nThe round's findings.",
+         "submittedAt": "2026-10-23T13:00:00Z"
+        },
+        {
+         "body": "",
+         "submittedAt": null
+        }
+       ]
+      }
+     }
+    ]
+   }
+  }
+ },
+ {
+  "data": {
+   "search": {
+    "pageInfo": {
+     "hasNextPage": false,
+     "endCursor": null
+    },
+    "nodes": [
+     {
+      "number": 23,
+      "title": "Revert \"feat: one\"",
+      "createdAt": "2026-10-23T11:00:00Z",
+      "mergedAt": "2026-10-24T06:30:00Z",
+      "body": "A ticket.",
+      "timelineItems": {
+       "nodes": [
+        {
+         "__typename": "LabeledEvent",
+         "createdAt": "2026-10-23T11:00:00Z",
+         "label": {
+          "name": "priority: high"
+         }
+        },
+        {
+         "__typename": "LabeledEvent",
+         "createdAt": "2026-10-23T12:00:00Z",
+         "label": {
+          "name": "workflow"
+         }
+        },
+        {
+         "__typename": "ReadyForReviewEvent",
+         "createdAt": "2026-10-23T12:30:00Z"
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "body": "A plain comment.",
+         "submittedAt": "2026-10-23T12:30:00Z"
+        },
+        {
+         "body": "<!-- workflow-review round=1 result=passed -->\nThe round's findings.",
+         "submittedAt": "2026-10-23T13:30:00Z"
+        },
+        {
+         "body": "<!-- workflow-review round=2 result=passed -->\nAgain after a conflict.",
+         "submittedAt": "2026-10-23T22:00:00Z"
+        }
+       ]
+      }
+     },
+     {
+      "number": 24,
+      "title": "feat: four",
+      "createdAt": "2026-10-24T05:00:00Z",
+      "mergedAt": "2026-10-24T07:50:00Z",
+      "body": "A ticket.",
+      "timelineItems": {
+       "nodes": [
+        {
+         "__typename": "LabeledEvent",
+         "createdAt": "2026-10-24T05:00:00Z",
+         "label": {
+          "name": "priority: high"
+         }
+        },
+        {
+         "__typename": "LabeledEvent",
+         "createdAt": "2026-10-24T05:10:00Z",
+         "label": {
+          "name": "workflow"
+         }
+        },
+        {
+         "__typename": "ReadyForReviewEvent",
+         "createdAt": "2026-10-24T06:00:00Z"
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "body": "A plain comment.",
+         "submittedAt": "2026-10-24T06:00:00Z"
+        },
+        {
+         "body": "<!-- workflow-review round=1 result=passed -->\nThe round's findings.",
+         "submittedAt": "2026-10-24T07:00:00Z"
+        }
+       ]
+      }
+     }
+    ]
+   }
+  }
+ }
+]
