@@ -38,7 +38,9 @@ def _shards() -> dict[int, list[str]]:
         if found := re.fullmatch(r"\s+- shard: (\d+)", line):
             shard = int(found[1])
             shards[shard] = []
-        elif shard is not None and (found := re.fullmatch(r"\s+(tests/workflow/\S+\.py)", line)):
+        elif shard is not None and (
+            found := re.fullmatch(r"\s+(tests/(?:workflow|tools)/\S+\.py)", line)
+        ):
             shards[shard].append(found[1])
     return shards
 
@@ -49,10 +51,11 @@ def test_ci_runs_four_shards() -> None:
 
 
 def _test_files(root: Path) -> list[str]:
-    """The files pytest collects tests from under `tests/workflow`: its default `python_files`,
-    in every folder below it too."""
-    folder = root / "tests/workflow"
-    found = {*folder.rglob("test_*.py"), *folder.rglob("*_test.py")}
+    """The files pytest collects tests from under `tests/workflow` and `tests/tools`: its default
+    `python_files`, in every folder below them too."""
+    found = set()
+    for folder in (root / "tests/workflow", root / "tests/tools"):
+        found |= {*folder.rglob("test_*.py"), *folder.rglob("*_test.py")}
     return sorted(str(path.relative_to(root)) for path in found)
 
 
