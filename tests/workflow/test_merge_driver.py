@@ -160,7 +160,7 @@ def test_cleanup_keeps_a_merged_worktree_until_the_handoff_finishes(handed: GitH
     assert "merge handoff" in done.stdout
 
 
-@pytest.mark.parametrize("blocked", [False, True])
+@pytest.mark.parametrize("blocked", [False, True], ids=["stale", "blocked and refreshable"])
 def test_a_stale_note_is_refreshed_then_merged_on_a_later_tick(
     handed: GitHub, blocked: bool
 ) -> None:
@@ -1875,7 +1875,7 @@ def test_a_blocked_handoff_that_is_not_refreshable_is_handed_back(handed: GitHub
     assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
 
 
-@pytest.mark.parametrize("refreshable", [False, True])
+@pytest.mark.parametrize("refreshable", [False, True], ids=["failed", "failed and refreshable"])
 def test_a_handoff_with_a_failed_check_is_handed_back(handed: GitHub, refreshable: bool) -> None:
     workflow = handed.workflow
     handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
