@@ -215,6 +215,40 @@ def test_a_repository_s_helpers_are_used_when_it_holds_them(workflow: Workflow) 
     assert workflow.calls("install ") == [f"install {workflow.repo}"]
 
 
+@pytest.mark.parametrize("named", [True, False])
+def test_the_named_dependency_audit_is_the_job_read_for_an_advisory_service_and_main_s_advisory(
+    workflow: Workflow, named: bool
+) -> None:
+    _helpers_beside_the_scripts(workflow)
+    if named:
+        config = json.loads((workflow.repo / "shipline.json").read_text())
+        config["checks"] = {
+            "dependency_audit": "CI: audit",
+            "advisory_annotation": "Dependency audit: advisories only",
+        }
+        (workflow.repo / "shipline.json").write_text(json.dumps(config))
+
+    done = _gate(
+        workflow,
+        f"""
+        g.api = lambda path, key=None, **given: (
+            [{{"title": "Advisory service unreachable", "message": {_UNREACHED!r}}}]
+            if "/12/" in path
+            else [{{"title": "Advisory on main", "message": "GHSA-1 in vite is on main too"}}]
+        )
+        failed = {{"status": "completed", "conclusion": "failure"}}
+        main = [{{"id": 11, "name": "CI result", **failed}}, {{"id": 12, "name": "CI: audit", **failed}}]
+        pull = [{{"id": 13, "name": "CI: audit", "status": "completed", "conclusion": "success"}}]
+        print(g.unreached_service(main), g.strict_jobs(pull)[0]["conclusion"])
+        """,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == (
+        "npm passed over an advisory on main\n" if named else "None success\n"
+    )
+
+
 def test_a_repository_s_refusal_of_a_failed_push_is_used_when_it_holds_it(
     workflow: Workflow,
 ) -> None:

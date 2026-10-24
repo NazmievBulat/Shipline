@@ -112,6 +112,10 @@ IMAGES = CONFIG.checks.images
 IMAGES_PLAN = CONFIG.checks.images_plan
 # The titles of the planners' annotations.
 NOTES = CONFIG.annotations
+# The job that audits the dependencies, and the title of the notice it writes on main when only
+# advisories failed it. With no notice named, an advisory on main makes main red as before.
+DEPENDENCIES = CONFIG.checks.dependency_audit or "CI: dependencies"
+ADVISORIES_ONLY = CONFIG.checks.advisory_annotation
 # The workflow files, by the gate's own names for them.
 WORKFLOW_FILES = {
     "ci": CONFIG.workflows.ci,
@@ -553,6 +557,11 @@ def workflow_verdict(
     )
 
 
+# The states of main in which the line merges: on an advisory main the audit alone failed, for
+# advisories only, and the update that fixes them is a pull request like any other.
+MERGING = ("green", "advisory")
+
+
 @dataclass
 class Health:
     state: str
@@ -590,13 +599,13 @@ def _failed_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def unreached_service(parts: list[dict[str, Any]]) -> str | None:
     """The advisory service whose absence alone failed a CI run, from the audit's annotation:
-    "CI: dependencies" is the only failed job besides "CI result", which follows it."""
+    the dependency audit is the only failed job besides "CI result", which follows it."""
     if advisory_service is None:
         return None
     failed = _failed_jobs(parts)
-    if {job["name"] for job in failed} - {CI_RESULT} != {"CI: dependencies"}:
+    if {job["name"] for job in failed} - {CI_RESULT} != {DEPENDENCIES}:
         return None
-    job = next(job for job in failed if job["name"] == "CI: dependencies")
+    job = next(job for job in failed if job["name"] == DEPENDENCIES)
     try:
         notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
     except Waiting:
@@ -608,6 +617,35 @@ def unreached_service(parts: list[dict[str, Any]]) -> str | None:
         if note.get("title") == advisory_service.ANNOTATION:
             return advisory_service.unreachable(note.get("message") or "")
     return None
+
+
+def advisories_only(parts: list[dict[str, Any]]) -> list[str]:
+    """The advisories that alone failed a run of main, from the audit's notice, or none.
+
+    The dependency audit is the only failed job besides "CI result", which follows it, and its
+    notice lists the advisories: the audit writes it only when it audited everything, every tool
+    answering, and found nothing wrong but advisories. Without the notice, a lock file it could
+    not audit or a tool that failed, the failure is main's as any other."""
+    if ADVISORIES_ONLY is None:
+        return []
+    failed = _failed_jobs(parts)
+    if {job["name"] for job in failed} - {CI_RESULT} != {DEPENDENCIES}:
+        return []
+    job = next(job for job in failed if job["name"] == DEPENDENCIES)
+    for note in api(f"{API}/check-runs/{job['id']}/annotations?per_page=100"):
+        if note.get("title") != ADVISORIES_ONLY:
+            continue
+        # A JSON list of "<advisory> in <package> (<summary>)", escaped as a workflow command.
+        message = note.get("message") or ""
+        message = message.replace("%0D", "\r").replace("%0A", "\n").replace("%25", "%")
+        try:
+            lines = json.loads(message)
+        except ValueError:
+            return []
+        if isinstance(lines, list) and all(isinstance(line, str) and line for line in lines):
+            return lines
+        return []
+    return []
 
 
 def _retry_failed_main(
@@ -752,17 +790,14 @@ def pull_service_wait(
 ) -> str | None:
     """Why a pull request whose checks failed only waits, or None when they failed for it.
 
-    Its latest CI run failed only in "CI: dependencies" (and "CI result", which follows it),
+    Its latest CI run failed only in the dependency audit (and "CI result", which follows it),
     because the package audit could not reach an advisory service: nothing was found wrong.
     With `retry` (the tick, or the gate under its lock), its failed jobs are re-run once that
     service answers again, under
     main's home-runner rules, once for each failed attempt. When the re-run shows a failure
     again, or nothing can re-run it, the failure is the pull request's, as any other.
     """
-    if {check.get("name") for check in _failed_rollup(pull)} - {
-        "CI: dependencies",
-        CI_RESULT,
-    }:
+    if {check.get("name") for check in _failed_rollup(pull)} - {DEPENDENCIES, CI_RESULT}:
         return None
     ci = runs("ci", pull["headRefOid"], pull=True)
     if not ci:
@@ -851,10 +886,16 @@ def push_health(
     assessments: list[tuple[str, list[str], dict[str, Any]]] = []
     retry_notes: list[str] = []
     unreached = ""
+    advisories: list[str] = []
     if ci:
         parts = jobs(ci[0])
         assessments.append((*verdict(ci[0], parts), ci[0]))
         if assessments[-1][0] == "red":
+            try:
+                advisories = advisories_only(parts)
+            except Refused:
+                # An unread notice is no advisory: main stays red.
+                advisories = []
             try:
                 service = unreached_service(parts)
             except Waiting:
@@ -862,10 +903,11 @@ def push_health(
                 service = None
             if service:
                 unreached = (
-                    f"; CI: dependencies could not reach {service}'s advisory service, "
+                    f"; {DEPENDENCIES} could not reach {service}'s advisory service, "
                     "and nothing was found wrong with main"
                 )
-            if retry_folder is not None:
+            # A re-run finds the same advisories again.
+            if retry_folder is not None and not advisories:
                 retry_notes.append(
                     _retry_failed_main(ci[0], parts, retry_folder, retry=retry, service=service)
                 )
@@ -899,6 +941,13 @@ def push_health(
     if failed:
         since = min(run.get("updated_at", "unknown time") for _, run in failed)
         names = ", ".join(name for checks, _ in failed for name in checks)
+        if advisories and len(failed) == 1:
+            return Health(
+                "advisory",
+                f"main: advisory since {since}, {names} ({head[:12]}): {', '.join(advisories)}; "
+                "merging goes on, the update that fixes it goes first",
+                tuple(failed[0][0]),
+            )
         # Main is named as faultless only when CI's dependencies job was all that failed.
         line = f"main: red since {since}, {names} ({head[:12]})"
         line += unreached if len(failed) == 1 else ""
@@ -1096,12 +1145,12 @@ def cancel_inherited(
 
 
 def strict_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """A pull request's "CI: dependencies" passes over an advisory that main has too, with an
+    """A pull request's dependency audit passes over an advisory that main has too, with an
     "Advisory on main" warning (scripts/audit-against-base.py). That pass is not main's check:
     it neither makes the pull request the fix of a red main nor stands in for main's own run."""
     strict: list[dict[str, Any]] = []
     for job in parts:
-        if job["name"] == "CI: dependencies" and job.get("conclusion") == "success":
+        if job["name"] == DEPENDENCIES and job.get("conclusion") == "success":
             notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
             if any(note.get("title") == "Advisory on main" for note in notes):
                 job = {**job, "conclusion": "passed over an advisory on main"}
@@ -1171,17 +1220,20 @@ def publish(folder: Path, health: Health) -> None:
         output.write(line)
         temporary = output.name
     os.replace(temporary, target)
-    # Every merge passes through pending to green; only a red or unreadable main, and the
-    # change out of it, is worth waking the orchestrator for.
-    before, after = (
-        re.split(r"[ ,]", text.removeprefix("main: "), maxsplit=1)[0] for text in (old, line)
-    )
+    # Every merge passes through pending to green; only a red, advisory or unreadable main, and
+    # the change out of it, is worth waking the orchestrator for.
+    before, after = (state_of(text) for text in (old, line))
     if (
-        (before != after and {"red", "unknown"} & {before, after})
+        (before != after and {"red", "advisory", "unknown"} & {before, after})
         or (health.scheduled and health.scheduled not in old)
         or (health.retry and line != old)
     ):
         (folder / "main-status.pending").write_text(line)
+
+
+def state_of(line: str) -> str:
+    """The state a published main line names: green, pending, red, advisory or unknown."""
+    return re.split(r"[ ,:]", line.removeprefix("main: "), maxsplit=1)[0]
 
 
 def refresh_health(folder: Path, *, retry: bool = False) -> tuple[str, Health]:
@@ -2169,11 +2221,12 @@ class Train:
         self.priorities = {number: priority.of(pulls[number].get("labels")) for number in remaining}
         self.fixes = []
         proofs: dict[str, list[Any]] = {}
-        if health.startswith("main: red"):
+        # The update that fixes an advisory on main goes first too, so main turns green.
+        if state_of(health) in ("red", "advisory"):
             try:
                 base = git("ls-remote", "origin", "refs/heads/main").split()[0]
                 current = main_health(base, self.path.parent)
-                if current.state == "red":
+                if current.state in ("red", "advisory"):
                     for number in remaining:
                         if number in self.unavailable or number in self.conflicts:
                             continue
@@ -3144,7 +3197,7 @@ def _refill(train: Train, base: str) -> None:
             _drop_line(train)
         if train.prefixes is None:
             current, health = refresh_health(train.path.parent)
-            if current != base or health.state != "green":
+            if current != base or health.state not in MERGING:
                 return
         _extend_line(train, base, False)
         _start_prefixes(train)
@@ -3239,7 +3292,9 @@ def _run_line(
             _drop_line(train)
         return None
     record = train.prefixes
-    if health.state != "green" and not (record and record["merged"] and health.state == "pending"):
+    if health.state not in MERGING and not (
+        record and record["merged"] and health.state == "pending"
+    ):
         if record is None:
             return None
         raise Waiting("merging stopped: " + health.line)
@@ -3365,7 +3420,7 @@ def _merge_prefixes(
                 "main moved during the merge train; the prefixes are tested again",
                 then="refuse",
             )
-        if current_health.state != "green" and (
+        if current_health.state not in MERGING and (
             not record["merged"] or current_health.state != "pending"
         ):
             if current_health.state == "red":
@@ -3626,9 +3681,12 @@ def train_status(folder: Path) -> int:
             train.reconcile()
             if train_reads.tick() is None:
                 _batch_signal(train)
+        published = folder / "main-status"
         print(
             json.dumps(
                 {
+                    # Main's state as last published: green, pending, red, advisory or unknown.
+                    "main": state_of(published.read_text()) if published.exists() else None,
                     "first": train.first,
                     # Keep failed entries' slots internally, but let the tick deliver their
                     # ordinary checks-finished wake instead of waiting for a train turn.
@@ -3910,7 +3968,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             return 3
         # A pending or red main still lets a stale pull request refresh, so its CI runs on the
         # current main; the merge itself waits for green, or for proof of a fix, below.
-        if health.state not in ("green", "pending", "red"):
+        if health.state not in (*MERGING, "pending", "red"):
             # An unreadable main stops merging until it can be read; it needs no judgment.
             raise Waiting("merging stopped: " + health.line)
         head = pull["headRefOid"]
@@ -4014,7 +4072,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
         # A red main merges only the fix: this pull request's CI on that same main ran and
         # passed every check failing there. A skipped check proves nothing.
         fixes = current_health.state == "red" and set(current_health.failing) <= passed_checks
-        if current_health.state != "green" and not fixes:
+        if current_health.state not in MERGING and not fixes:
             if current_health.state == "red":
                 # Sleep until main or this head changes; a later arrival may be the fix.
                 train.suspend(number, head, current_health.line)

@@ -47,6 +47,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `checks.ci_result` | the check that sums up CI | `CI result` |
 | `checks.ci_plan`, `checks.e2e_plan` | the planner checks of CI and of the browser suite | `CI: what to run`, `E2E: what to run` |
 | `checks.images` | the prefix of every image check; its planner is `<prefix>: what to run` | `Docker images` |
+| `checks.dependency_audit`, `checks.advisory_annotation` | the job that audits the dependencies against published advisories, and the title of the notice it writes on main when advisories alone failed it, a JSON list of `<advisory> in <package> (<summary>)`; named together, or neither. With both, main failing only on an advisory is `advisory`, not red, and the line keeps merging | none: the audit is `CI: dependencies` and an advisory makes main red |
 | `annotations.*` | the titles of the planners' annotations the merge gate reads: `merge_tested`, `files_tested`, `server_tests`, `web_suite`, `browser_suite` | `Merge tested`, `Files tested`, `Server tests`, `Web suite`, `Browser suite` |
 | `workflows.ci`, `workflows.e2e`, `workflows.images` | the workflow files under `.github/workflows/` | `ci.yml`, `e2e.yml`, `images.yml` |
 | `labels.workflow`, `labels.audited` | the label that starts a ticket, and an audit's | `workflow`, `audited` |
