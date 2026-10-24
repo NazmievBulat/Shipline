@@ -1,0 +1,12 @@
+❯ run the tests and fix what fails
+
+● Bash(pytest tests)
+  ⎿  Running… (46m 59s)
+
+✶ Pondering… (46m 59s · ↓ 2.1k tokens · esc to interrupt)
+
+[48;5;237m❯ what is going on here?[0m
+────────────────────────────────────────
+> 
+────────────────────────────────────────
+  ? for shortcuts

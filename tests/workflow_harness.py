@@ -427,6 +427,13 @@ BOX
         after="@STATE@/screen-after-enter-$name"
         [ ! -f "$after" ] || mv "$after" "@STATE@/screen/$name"
       fi
+    elif [ "$3" = Escape ]; then
+      # What Escape puts back into the box (a message queued while the session worked), and
+      # what the session draws once interrupted, when a test gives them.
+      queued="@STATE@/input-after-escape-$name"
+      [ ! -f "$queued" ] || mv "$queued" "@STATE@/input-$name"
+      after="@STATE@/screen-after-escape-$name"
+      [ ! -f "$after" ] || mv "$after" "@STATE@/screen/$name"
     fi
     ;;
   *) exit 1 ;;
@@ -999,6 +1006,11 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
     made.fake("systemd-run", _FAKE_SYSTEMD_RUN)
     made.fake("claude", _FAKE_CLAUDE)
     made.fake("codex", _FAKE_INSTALLER)
+    # The repository's commands the stand-in `shipline.json` names: the checks the merge gate
+    # runs before a pull request joins the train, its browser plan, a hunt's application and its
+    # Cursor hunter.
+    for command in ("pre-train-checks", "browser-plan", "hunt-app", "hunt-cursor"):
+        made.fake(command, (STAND_INS / command).read_text())
     made.fake(
         "df",
         "#!/bin/bash\necho 'Filesystem Inodes IUsed IFree IUse% Mounted on'\n"
@@ -1029,12 +1041,11 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
 def install_shipline(made: Workflow) -> Path:
     """Keeps Shipline apart from the repository: a checkout of its own, `shipline` in the test's
     folder, holding `bin/shipline` and the scripts the repository held, and a repository that
-    no longer holds a `scripts/workflow` (nor the gate's `pre-train-checks`, which were in it).
-    Its setup command and E2E planner stay in its `scripts`. Returns the checkout."""
+    no longer holds a `scripts/workflow`. Its setup command stays in its `scripts`, and the
+    commands its `shipline.json` names stay on the `PATH`. Returns the checkout."""
     home = made.root / "shipline"
     held = made.repo / "scripts" / "workflow"
     shutil.copytree(held, home / "scripts" / "workflow", symlinks=True)
-    (home / "scripts" / "workflow" / "pre-train-checks").unlink()
     (home / "bin").mkdir()
     shutil.copy2(LAUNCHER, home / "bin" / "shipline")
     # A git checkout of its own, so a script that took the repository from its own folder
@@ -1097,10 +1108,6 @@ def _template() -> Path:
     setup = scripts.parent / "setup-worktree"
     setup.write_text('#!/bin/bash\nexec worktree-setup "$@"\n')
     setup.chmod(0o755)
-    # The merge gate asks E2E's planner whether a merge needs browser tests.
-    shutil.copy2(STAND_INS / "e2e-plan.py", scripts.parent / "e2e-plan.py")
-    # The checks the merge gate runs before a pull request joins the train.
-    shutil.copy2(STAND_INS / "pre-train-checks", scripts / "pre-train-checks")
     # The prompt a Claude session is woken with when the Codex bridge's `await_turn` ends.
     (scripts / "tests").mkdir()
     shutil.copy2(STAND_INS / "await-turn-completed.json", scripts / "tests")
@@ -1120,7 +1127,8 @@ def _template() -> Path:
     runner_settings = repo / ".github" / "runner" / "settings.sh"
     runner_settings.parent.mkdir(parents=True)
     shutil.copy2(STAND_INS / "settings.sh", runner_settings)
-    # The runners the merge gate may re-run failed jobs on: every other value is its default.
+    # The runners the merge gate may re-run failed jobs on, and the repository's own commands
+    # Shipline calls (stand-ins on the `PATH`): every other value is its default.
     shutil.copy2(STAND_INS / "shipline.json", repo / "shipline.json")
     (repo / ".gitignore").write_text(".local/\n.claude/\n")
     git("add", "-A")

@@ -1,0 +1,9 @@
+● Bash(while pgrep -f "codex exec" >/dev/null; do sleep 30; done)
+  ⎿  Running… (3m 10s)
+
+✻ Waiting… (3m 10s · esc to interrupt)
+
+────────────────────────────────────────
+> 
+────────────────────────────────────────
+  ? for shortcuts
