@@ -337,6 +337,7 @@ def _restack_child(folder: Path, number: str, parent_branch: str) -> None:
             == 0
         ):
             git("commit", "-m", "chore: merge main after stacked base merged")
+        gate.clear_generated(worktree)
         try:
             pushed = gate.push("origin", f"HEAD:{pull['headRefName']}", where=worktree)
         except gate.PushWaiting:
