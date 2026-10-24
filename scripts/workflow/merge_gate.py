@@ -2024,7 +2024,8 @@ class Train:
         if delegated and previous.get("signature") == signature():
             self.suite_states = previous["suite_states"]
             return
-        queue = list(self.queue)
+        # The members the scan reads, blocked ones included.
+        queue = list(dict.fromkeys([*self.queue, *self.blocked]))
         seen = inputs(queue)
         reads = train_reads.Reads(self.path.parent, base)
         _planning_reads = reads
@@ -2035,13 +2036,15 @@ class Train:
         finally:
             _planning_reads = None
         # A note created or cleared while the scan ran may not be what it read: keep the
-        # result only for the inputs it saw, so the next reconcile computes it again.
+        # result only for the inputs it saw, so the next reconcile computes it again. The key
+        # is taken first: a note changed after it leaves the key on the old note, a miss.
+        key = signature()
         if inputs(queue) != seen:
             return
         train_reads.save(
             context / "reconciled.json",
             {
-                "signature": signature(),
+                "signature": key,
                 "at": time.time(),
                 "suite_states": self.suite_states,
             },

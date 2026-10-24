@@ -434,7 +434,7 @@ def test_an_owner_question_noted_during_the_scan_is_not_hidden_by_the_reconcile_
     if change == "cleared":
         note.touch()
     env = _context(github)
-    (Path(env["WORKFLOW_SESSION_SNAPSHOT"])).write_text(workflow.run("list").stdout)
+    Path(env["WORKFLOW_SESSION_SNAPSHOT"]).write_text(workflow.run("list").stdout)
     # The note changes after the scan read 7's availability, while it polls runs.
     armed = workflow.state / "change-note"
     armed.touch()
