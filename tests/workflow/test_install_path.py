@@ -3,6 +3,7 @@ calls it as `shipline <command>` and keeps none of its scripts. Every script fin
 beside itself; the repository is the main checkout `--repo` or `SHIPLINE_REPO` names, else the
 one the current directory is in."""
 
+import json
 import os
 import subprocess
 import sys
@@ -348,3 +349,74 @@ def test_a_link_runs_the_checkout_it_points_into_and_a_copy_runs_shipline_home(
         f"no Shipline checkout at {tmp_path}/nobody/.local/share/shipline: clone Shipline "
         "there, or name its checkout with SHIPLINE_HOME\n"
     )
+
+
+def test_install_hooks_and_install_timer_write_the_checkout_s_paths_and_the_repository_s(
+    workflow: Workflow,
+) -> None:
+    fake_home = Path(workflow.env["HOME"])
+    worktree = workflow.add_worktree(7)
+    launcher = workflow.home / "bin" / "shipline"
+
+    # From one of the repository's worktrees, and from outside it with the repository named.
+    hooks = workflow.shipline("install-hooks", cwd=worktree)
+    timer = workflow.shipline("--repo", str(workflow.repo), "install-timer", cwd=workflow.root)
+
+    assert hooks.returncode == 0, hooks.stderr
+    assert timer.returncode == 0, timer.stderr
+    settings = json.loads((fake_home / ".claude" / "settings.json").read_text())
+    command = f"bash {launcher} --repo {workflow.repo} notify 2>/dev/null || true"
+    assert {
+        event: [hook["command"] for entry in entries for hook in entry["hooks"]]
+        for event, entries in settings["hooks"].items()
+    } == {event: [command] for event in ("Stop", "UserPromptSubmit", "Notification", "PreToolUse")}
+    service = (fake_home / ".config" / "systemd" / "user" / "workflow-tick.service").read_text()
+    lines = service.splitlines()
+    assert f"WorkingDirectory={workflow.repo}" in lines
+    assert f'Environment="SHIPLINE_REPO={workflow.repo}"' in lines
+    assert f'ExecStart="{launcher}" tick' in lines
+    assert str(worktree) not in service
+    link = fake_home / ".local" / "bin" / "shipline"
+    assert link.is_symlink()
+    assert link.resolve() == launcher.resolve()
+
+    # The hook a session runs reaches the checkout's `notify`, on the repository named.
+    (workflow.script.parent / "notify").write_text(
+        f'printf "%s\\n" "$PWD" "$SHIPLINE_REPO" "$*" > "{workflow.state}/notified"\n'
+    )
+    done = subprocess.run(
+        ["bash", "-c", command],
+        cwd=worktree,
+        env=workflow.env,
+        input="{}\n",
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0
+    assert (workflow.state / "notified").read_text().splitlines() == [
+        str(worktree),
+        str(workflow.repo),
+        "",
+    ]
+
+
+def test_the_link_is_pointed_at_this_checkout_and_a_file_of_the_owner_is_left_alone(
+    workflow: Workflow,
+) -> None:
+    link = Path(workflow.env["HOME"]) / ".local" / "bin" / "shipline"
+    link.parent.mkdir(parents=True)
+    link.symlink_to("/where/shipline/was/bin/shipline")
+
+    done = workflow.shipline("install-hooks")
+
+    assert done.returncode == 0, done.stderr
+    assert link.resolve() == (workflow.home / "bin" / "shipline").resolve()
+
+    link.unlink()
+    link.write_text("#!/bin/sh\necho mine\n")
+
+    done = workflow.shipline("install-hooks")
+
+    assert done.returncode == 0, done.stderr
+    assert link.read_text() == "#!/bin/sh\necho mine\n"
+    assert f"{link} is not a link to Shipline; it was left as it is" in done.stderr
