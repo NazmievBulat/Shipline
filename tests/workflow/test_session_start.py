@@ -9,8 +9,8 @@ import pytest
 from workflow_harness import (
     SESSION_LINK,
     Workflow,
+    in_scope,
     instruction,
-    scope_words,
     session_arguments,
 )
 
@@ -586,11 +586,18 @@ def test_marks_left_by_an_earlier_session_of_the_same_name_are_removed(
         (notes / f"ticket-7.{mark}").touch()
     (notes / "audit-7.pushed").touch()
     (notes / "ticket-7.url").write_text("https://claude.ai/code/session_old\n")
+    (notes / "ticket-7.limits").write_text("memory.max max, memory.swap.max max\n")
 
     workflow.run("start", "worker", "7")
 
-    assert sorted(path.name for path in notes.iterdir()) == ["audit-7.pushed", "ticket-7.url"]
+    assert sorted(path.name for path in notes.iterdir()) == [
+        "audit-7.pushed",
+        "ticket-7.limits",
+        "ticket-7.url",
+    ]
     assert (notes / "ticket-7.url").read_text() == SESSION_LINK + "\n"
+    # Written again by this session's own scope as it started.
+    assert (notes / "ticket-7.limits").read_text() == "in place\n"
 
 
 def test_a_new_worktree_starts_at_the_head_of_the_pull_request_not_at_a_stale_local_branch(
@@ -767,9 +774,7 @@ def test_every_session_runs_in_a_scope_of_its_own_with_memory_limits(
     assert done.returncode == 0, done.stderr
     name = {"worker": "ticket-7", "audit": "audit-7", "review": "review-7"}[kind]
     arguments = (workflow.state / "args" / name).read_text().splitlines()
-    start = arguments.index("systemd-run")
-    assert arguments[start:-1] == scope_words(name, arguments[start + 5])
-    assert arguments[-1].startswith("claude --effort ")
+    assert in_scope(arguments, name)[-1].startswith("claude --effort ")
 
 
 def test_the_memory_limits_can_be_set_for_a_test(workflow: Workflow) -> None:
@@ -783,8 +788,7 @@ def test_the_memory_limits_can_be_set_for_a_test(workflow: Workflow) -> None:
     )
 
     arguments = (workflow.state / "args" / "ticket-7").read_text().splitlines()
-    start = arguments.index("systemd-run")
-    assert arguments[start:-1] == scope_words("ticket-7", arguments[start + 5], "64M", "0")
+    assert in_scope(arguments, "ticket-7", "64M", "0")[-1].startswith("claude --effort ")
 
 
 _ANALYST = "analyst-day-2026-10-24"
