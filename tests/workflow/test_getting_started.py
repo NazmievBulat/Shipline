@@ -326,8 +326,8 @@ def _guide() -> dict[str, list[tuple[str, str]]]:
 
 
 def _published_shipline(workflow: Workflow) -> Path:
-    """Shipline as GitHub serves it: a repository of the scripts, the launcher and the example
-    CI. The guide's clone of its address is answered from here."""
+    """Shipline as GitHub serves it: a repository of the scripts, the launcher, the example CI
+    and what git leaves out. The guide's clone of its address is answered from here."""
     published = workflow.root / "published-shipline"
     assert workflow.home, "install_shipline first"
     shutil.copytree(
@@ -337,6 +337,7 @@ def _published_shipline(workflow: Workflow) -> Path:
     )
     (published / "bin").mkdir()
     shutil.copy2(_SOURCE / "bin" / "shipline", published / "bin" / "shipline")
+    shutil.copy2(_SOURCE / ".gitignore", published / ".gitignore")
     (published / "examples").mkdir()
     shutil.copy2(_SOURCE / "examples" / "ci.yml", published / "examples" / "ci.yml")
     for args in (
