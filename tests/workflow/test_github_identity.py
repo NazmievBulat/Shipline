@@ -67,7 +67,7 @@ def host(programs_folder: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _identity(host: Path) -> Path:
-    return host / ".config/example-app-runner"
+    return host / ".config/shipline-runner"
 
 
 def _calls(host: Path) -> list[dict[str, Any]]:
