@@ -13,7 +13,7 @@ _NOW = 1_790_000_000
 _BOX = "─" * 40 + "\n> \n" + "─" * 40 + "\n  ? for shortcuts\n"
 _STATUS = (
     "Status check: if what you were waiting for is done, carry on; if not, run "
-    "`scripts/workflow/notify waiting` and end your turn."
+    "`shipline notify waiting` and end your turn."
 )
 _FINISH = "Pull request 7 is ready, but you have not finished."
 
