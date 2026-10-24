@@ -815,8 +815,8 @@ if ((answer_after > 0)); then
       answered=$main/$SHIPLINE_STATE_FOLDER/answered-for-owner.pending
       mkdir -p "$answered" &&
         jq -n --arg name "$name" --arg reply "$reply" --argjson at "$NOW" \
-          '{name: $name, reply: $reply, at: $at}' >"$answered/.$name-$asked_at.tmp" &&
-        mv -- "$answered/.$name-$asked_at.tmp" "$answered/$name-$asked_at.json" || failed=1
+          '{name: $name, reply: $reply, at: $at}' >"$answered/.$NOW-$name.tmp" &&
+        mv -- "$answered/.$NOW-$name.tmp" "$answered/$NOW-$name.json" || failed=1
     elif ((sent != 3)); then
       echo "$delivery" >&2
       wake_log "$name answer for the owner failed: $delivery"
