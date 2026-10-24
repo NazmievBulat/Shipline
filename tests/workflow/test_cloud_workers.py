@@ -1102,11 +1102,12 @@ def test_the_configured_wait_moves_or_turns_off_the_wake(
 
 
 def _alive(pid: int) -> bool:
+    """Whether the process runs: one ended but not yet reaped (a zombie) does not."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
         return False
-    return True
+    return state != "Z"
 
 
 def test_a_client_that_ignores_the_hang_up_does_not_outlive_its_pane(
