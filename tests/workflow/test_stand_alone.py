@@ -162,22 +162,28 @@ def test_nothing_is_installed_before_a_push(workflow: Workflow) -> None:
     assert workflow.calls() == []
 
 
-def test_no_proof_is_read_or_written(workflow: Workflow) -> None:
-    """A job skipped in a run counts only as passed when it passed there itself."""
+def test_without_a_proof_helper_the_proof_is_shipline_s_own(workflow: Workflow) -> None:
+    """ci_proof.py's, which its example CI reads: a job counts as passed only where it passed
+    itself, a job in parts once every part did."""
     done = _gate(
         workflow,
         """
         parts = [
-            {"name": "CI: server tests", "conclusion": "success"},
-            {"name": "CI: web", "conclusion": "skipped"},
+            {"name": "playwright", "conclusion": "success"},
+            {"name": "E2E: lint", "conclusion": "skipped"},
             {"name": "Docker images: browser tests (1 of 2)", "conclusion": "success"},
         ]
         run = {"id": 10}
-        print(sorted(g.passed_jobs(parts)), repr(g.squash_proof("base", "tree", {"ci": (run, parts)})))
+        print(sorted(g.passed_jobs(parts)))
+        print(g.squash_proof("base", "tree", {"e2e": (run, parts)}))
         """,
     )
 
-    assert done.stdout == "['CI: server tests'] ''\n", done.stderr
+    assert done.stdout.splitlines() == [
+        "['playwright']",
+        'Workflow-Proof: {"base":"base","tree":"tree","sources":'
+        '[{"workflow":"e2e","run":10,"jobs":["playwright"]}]}',
+    ], done.stderr
 
 
 @pytest.mark.parametrize("helper", [*_HELPERS, "mechanical_conflicts"])
@@ -191,7 +197,7 @@ def test_a_helper_that_cannot_start_stops_the_gate(workflow: Workflow, helper: s
     assert "No module named 'example_app_missing_package'" in done.stderr
 
 
-def test_a_squash_without_a_proof_carries_the_commits_alone(workflow: Workflow) -> None:
+def test_a_squash_carries_the_commits_then_the_proof(workflow: Workflow) -> None:
     done = _gate(
         workflow,
         """
@@ -201,7 +207,9 @@ def test_a_squash_without_a_proof_carries_the_commits_alone(workflow: Workflow) 
         """,
     )
 
-    assert done.stdout == "* feat: seven\n", done.stderr
+    assert done.stdout == (
+        '* feat: seven\n\nWorkflow-Proof: {"base":"base","tree":"tree","sources":[]}\n'
+    ), done.stderr
 
 
 def test_a_repository_s_helpers_are_used_when_it_holds_them(workflow: Workflow) -> None:

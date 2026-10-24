@@ -1,7 +1,6 @@
 """One machine-wide merge gate. Only the standard library and git/gh are needed."""
 
 import fcntl
-import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -44,8 +43,8 @@ from workflow_commands import (
 # wait; `pushing_checkout` installs the pushing checkout's packages before its hook and words a
 # hook's refusal; `run_proof` reads and writes the `Workflow-Proof` line with which main skips a
 # job its squash proved. Without them a failed push is refused with its last lines, nothing is
-# installed first, and no proof is read or written, so main never skips a job: a job counts as
-# passed only where it passed itself. A helper that is there but cannot start stops the gate.
+# installed first, and the proof is Shipline's own (`ci_proof`), the one its example CI reads. A
+# helper that is there but cannot start stops the gate.
 try:
     import advisory_service
 except ModuleNotFoundError as error:
@@ -64,22 +63,8 @@ try:
 except ModuleNotFoundError as error:
     if error.name != "run_proof":
         raise
-    RECEIPT = WHOLE_REQUEST = None
-
-    def passed_jobs(parts: list[dict[str, Any]]) -> set[str]:
-        """The jobs that passed in the run itself, a job run in parts once each of its parts
-        did; no proof line is read."""
-        grouped: dict[str, list[tuple[re.Match[str] | None, dict[str, Any]]]] = {}
-        for job in parts:
-            part = re.fullmatch(r"(.+) \((\d+) of (\d+)\)", job["name"])
-            grouped.setdefault(part[1] if part else job["name"], []).append((part, job))
-        return {
-            name
-            for name, group in grouped.items()
-            if all(job.get("conclusion") == "success" for _, job in group)
-            and sorted((int(part[2]), int(part[3])) for part, _ in group if part)
-            in ([], [(number, len(group)) for number in range(1, len(group) + 1)])
-        }
+    from ci_proof import RECEIPT, passed_jobs
+    from ci_proof import WHOLE as WHOLE_REQUEST
 
 
 def mechanical_conflicts() -> ModuleType | None:
@@ -1339,17 +1324,150 @@ def images_needed(
         return True
     # Use the actual workflow's path filter, without a second maintained list of image inputs.
     workflow = git("show", f"{workflow_ref or base}:.github/workflows/{WORKFLOW_FILES['images']}")
-    section = workflow.split("  pull_request:", 1)[1].split("  push:", 1)[0]
-    patterns = re.findall(r'^      - "([^"]+)"$', section, flags=re.MULTILINE)
-    if not patterns:
-        raise Refused("could not read the Images workflow path filter")
-    # NUL delimiters preserve filenames that Git would otherwise quote or split across lines.
+    matches = path_filter(pull_request_paths(workflow))
+    # NUL delimiters preserve filenames that Git would otherwise quote or split across lines;
+    # the last NUL ends the list, and the empty entry after it is no file.
     paths = (
         command("git", "ls-tree", "-r", "--name-only", "-z", head, errors="surrogateescape")
         if base == "0" * 40
         else command("git", "diff", "--name-only", "-z", f"{base}...{head}", errors="surrogateescape")
-    ).stdout.split("\0")
-    return any(fnmatch.fnmatchcase(path, pattern) for path in paths for pattern in patterns)
+    ).stdout.split("\0")[:-1]
+    return any(matches(path) for path in paths)
+
+
+def pull_request_paths(workflow: str) -> list[str]:
+    """The `paths:` of a workflow's `pull_request:` trigger, each entry as YAML reads it.
+
+    Each entry is a double-quoted string on a line of its own, a comment after it allowed.
+    Any other line in the list is refused, never skipped: a pattern the gate did not read
+    could start a run the gate never waits for.
+    """
+    patterns: list[str] = []
+    trigger = listed = False
+    for line in workflow.splitlines():
+        if re.fullmatch(r"\s*(?:#.*)?", line):
+            continue
+        if not line.startswith("   "):
+            trigger = re.fullmatch(r"  pull_request:\s*(?:#.*)?", line) is not None
+            listed = False
+        elif trigger and not line.startswith("     "):
+            # An anchor (`paths: &name`) lets the push trigger share the same list.
+            listed = re.fullmatch(r"    paths:\s*(?:&[^\s#]+\s*)?(?:#.*)?", line) is not None
+        elif listed:
+            entry = re.fullmatch(r'      - "((?:[^"\\]|\\.)+)"\s*(?:#.*)?', line)
+            try:
+                # Only the escapes YAML shares with JSON are read; any other is refused.
+                if entry:
+                    patterns.append(json.loads(f'"{entry[1]}"'))
+                    continue
+            except json.JSONDecodeError:
+                pass
+            raise Refused(f"could not read the Images workflow path filter: {line.strip()}")
+    if not patterns:
+        raise Refused("could not read the Images workflow path filter")
+    return patterns
+
+
+def path_filter(patterns: list[str]) -> Callable[[str], bool]:
+    """Whether a changed file starts the workflow, by GitHub's filter pattern rules.
+
+    The patterns are read in order and the last one that matches a file decides: a pattern
+    starting with `!` takes the file back, so negated patterns alone match nothing.
+    """
+    rules = [
+        (pattern.startswith("!"), _filter_pattern(pattern.removeprefix("!")))
+        for pattern in patterns
+    ]
+
+    def matches(path: str) -> bool:
+        started = False
+        for negated, rule in rules:
+            if rule.fullmatch(path):
+                started = not negated
+        return started
+
+    return matches
+
+
+def _filter_pattern(pattern: str) -> re.Pattern[str]:
+    """One filter pattern as a regular expression. `*` is any characters but `/`, `**` is any
+    characters, and `**/` where a folder's name starts is zero or more folders (inside a name,
+    `**` is any characters and the `/` stays). `?` and `+` make what stands before them
+    zero or one, or one or more, of it. `[...]` is one character of its set, with `-` ranges.
+    A backslash makes the next character itself, and every other character is itself.
+
+    GitHub does not document a `?` or `+` with nothing before it, or a `[` that no `]` closes
+    (nor an empty `[]`): each of those is read as the character itself.
+    """
+    # Each part is what one piece of the pattern matches and how often it may stand: at least
+    # `fewest` (0 or 1) times, and at most once or, with `many`, any number of times. Repeating
+    # a part only changes those two, so no repetition ever nests inside another.
+    parts: list[tuple[str, int, bool]] = []
+    at = 0
+    while at < len(pattern):
+        char = pattern[at]
+        if pattern.startswith("**/", at) and pattern[at - 1 : at] in ("", "/"):
+            # Zero or more folders: repeating it, however, is still that.
+            parts.append(("(?:.*/)?", 1, False))
+            at += 3
+            continue
+        if pattern.startswith("**", at):
+            parts.append((".", 0, True))
+            at += 2
+            continue
+        at += 1
+        if char == "*":
+            parts.append(("[^/]", 0, True))
+        elif char in "?+" and parts:
+            expression, fewest, many = parts[-1]
+            if expression != "(?:.*/)?":
+                parts[-1] = (expression, 0, many) if char == "?" else (expression, fewest, True)
+        elif char == "\\" and at < len(pattern):
+            parts.append((re.escape(pattern[at]), 1, False))
+            at += 1
+        elif char == "[" and (found := _filter_set(pattern, at)):
+            expression, at = found
+            parts.append((expression, 1, False))
+        else:
+            parts.append((re.escape(char), 1, False))
+    times = {(1, False): "", (0, False): "?", (1, True): "+", (0, True): "*"}
+    return re.compile(
+        "".join(expression + times[fewest, many] for expression, fewest, many in parts),
+        flags=re.DOTALL,
+    )
+
+
+def _filter_set(pattern: str, at: int) -> tuple[str, int] | None:
+    """The set that starts at `at`, just after a `[`, as one character of a regular expression,
+    and where the pattern goes on after its `]`; None when no `]` closes a set of at least one
+    character. A backslash makes the next character itself. A `-` between two characters of
+    a-z, of A-Z or of 0-9 is the range from the first to the second, as GitHub allows ranges
+    only there; any other `-`, and a range that runs backwards, is the characters themselves.
+    """
+    chars: list[tuple[str, bool]] = []
+    while at < len(pattern) and (pattern[at] != "]" or not chars):
+        if pattern[at] == "]":
+            return None
+        escaped = pattern[at] == "\\" and at + 1 < len(pattern)
+        if escaped:
+            at += 1
+        chars.append((pattern[at], escaped))
+        at += 1
+    if at == len(pattern):
+        return None
+    members: list[str] = []
+    index = 0
+    while index < len(chars):
+        char = chars[index][0]
+        last = chars[index + 2][0] if index + 2 < len(chars) else ""
+        ranged = any(first <= char <= last <= final for first, final in ("az", "AZ", "09"))
+        if chars[index + 1 : index + 2] == [("-", False)] and ranged:
+            members.append(f"{re.escape(char)}-{re.escape(last)}")
+            index += 3
+        else:
+            members.append(re.escape(char))
+            index += 1
+    return f"[{''.join(members)}]", at + 1
 
 
 def browser_needed(base: str, merge: str) -> bool:
@@ -1454,9 +1572,10 @@ def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
 
 
 def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: str) -> bool:
-    """A green CI run that ran every server test on exactly this commit."""
+    """A green CI run that ran every server test on exactly this commit, run in parts or not."""
     if verdict(run, parts)[0] != "green" or not any(
-        job["name"] == "CI: server tests" and job.get("conclusion") == "success" for job in parts
+        job["name"] == "CI: server tests" and job.get("conclusion") == "success"
+        for job in checks(parts)
     ):
         return False
     return {(NOTES.merge_tested, head), (NOTES.server_tests, "whole")} <= _planner_notes(
@@ -1627,17 +1746,21 @@ def _seconds(stamp: Any) -> float | None:
 
 
 def lost_check(
-    pull: dict[str, Any], known: list[dict[str, Any]] | None = None
+    pull: dict[str, Any],
+    known: list[dict[str, Any]] | None = None,
+    read: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """A check the rollup lists as queued or running whose workflow run completed at least
     LOST_AFTER_SECONDS ago, when every check not passing is lost so: a check still running for
     real may yet fail, and is waited for first. Each read run costs a request from the shared
     budget, so a check that started less than that ago ends the search: its run cannot have
-    completed so long ago.
+    completed so long ago. `read` reads a run by its id; the tick passes one that keeps each
+    answer for the rest of the tick.
     """
     now = float(os.environ.get("WORKFLOW_NOW") or time.time())
     seen = {str(run["id"]): run for run in known or []}
-    found = []
+    # Every check that cannot be lost is ruled out before any run is read.
+    waiting = []
     for check in pull["statusCheckRollup"]:
         if _passing_check(check):
             continue
@@ -1647,9 +1770,12 @@ def lost_check(
         started = _seconds(check.get("startedAt"))
         if not match or (started is not None and now - started < LOST_AFTER_SECONDS):
             return None
-        if match[1] not in seen:
-            seen[match[1]] = api(f"{API}/actions/runs/{match[1]}", paginate=False)
-        run = seen[match[1]]
+        waiting.append((check, match[1]))
+    found = []
+    for check, run_id in waiting:
+        if run_id not in seen:
+            seen[run_id] = (read or read_run)(run_id)
+        run = seen[run_id]
         finished = _seconds(run.get("updated_at"))
         if (
             run.get("status") != "completed"
@@ -1660,12 +1786,16 @@ def lost_check(
         found.append(
             {
                 "check": check.get("name", "unknown"),
-                "run": int(match[1]),
+                "run": int(run_id),
                 "conclusion": run.get("conclusion"),
             }
         )
     # A failed run's check is named first: it is a failure, never pushed for.
     return min(found, key=lambda lost: lost["conclusion"] == "success", default=None)
+
+
+def read_run(run: str) -> dict[str, Any]:
+    return api(f"{API}/actions/runs/{run}", paginate=False)
 
 
 def note_lost(folder: Path, number: str, head: str, lost: dict[str, Any]) -> None:
