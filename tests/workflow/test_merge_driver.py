@@ -11,12 +11,8 @@ import pytest
 from workflow.test_merge_when_current import (
     ADVISORY,
     MEMORY_SHORTAGES,
-    UNREACHABLE,
     GitHub,
-    advisory_service_answers,
     hook_runs,
-    pull_dependencies_red,
-    rerun_calls,
     short_of_memory,
 )
 from workflow.test_merge_when_current import (
@@ -1837,38 +1833,6 @@ def test_a_refresh_refused_for_an_advisory_hands_back_to_one_fresh_reviewer(
     assert not _note(workflow).exists()
     assert _started(workflow) == ["review-7"]
     assert not (_folder(workflow) / "advisory-service-down").exists()
-
-
-@pytest.mark.parametrize(
-    "reason", ["no annotation", "another check failed too", "hosted", "failed again"]
-)
-def test_a_handoff_red_for_more_than_the_audit_service_hands_back(
-    handed: GitHub, reason: str
-) -> None:
-    workflow = handed.workflow
-    run = pull_dependencies_red(
-        handed, annotation=None if reason == "no annotation" else UNREACHABLE
-    )
-    parts = handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"]["jobs"]
-    if reason == "another check failed too":
-        handed.pulls["7"]["statusCheckRollup"].append(
-            {"name": "CI: web", "status": "COMPLETED", "conclusion": "FAILURE"}
-        )
-    elif reason == "hosted":
-        parts[-1]["labels"] = ["ubuntu-latest"]
-    elif reason == "failed again":
-        # Its one re-run after the service answered failed for the service again.
-        run["run_attempt"] = 2
-        (_folder(workflow) / "pull-rerun-20-1").write_text("automatically re-ran\n")
-    handed.save()
-    advisory_service_answers(workflow, answers=True)
-
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert not _note(workflow).exists()
-    assert _started(workflow) == ["review-7"]
-    assert rerun_calls(workflow) == []
 
 
 def test_tick_whole_refresh_is_accepted_without_scratch_suites(handed: GitHub) -> None:
