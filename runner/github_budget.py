@@ -1,1 +1,1 @@
-../../scripts/workflow/github_budget.py
+../scripts/workflow/github_budget.py
