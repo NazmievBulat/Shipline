@@ -69,7 +69,6 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `repository` | `owner/name` on GitHub | `repository` as Bash reads it from `.github/runner/settings.sh` (sourced in a `bash` of its own, with only `PATH` and `HOME`, for at most 5 seconds), else the `origin` remote on GitHub; a script that needs it stops when neither names one |
 | `state_folder` | the folder of the workflow's notes, in the main checkout and in each worktree | `.local/workflow` |
 | `worktree_setup` | the command that prepares a new worktree, run only when present | `scripts/setup-worktree` |
-| `commands.*` | the repository's own commands Shipline calls (below) | none |
 | `checks.ci_result` | the check that sums up CI | `CI result` |
 | `checks.ci_plan`, `checks.e2e_plan` | the planner checks of CI and of the browser suite | `CI: what to run`, `E2E: what to run` |
 | `checks.images` | the prefix of every image check; its planner is `<prefix>: what to run` | `Docker images` |
@@ -81,6 +80,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `runner.prefix` | the prefix the runner pool names its services and containers by; `workflow-metrics` reads their CPU | none: no runner figures |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
 | `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
+| `commands.*`, the others | the repository's own commands Shipline calls, each split into words (below) | none |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the
@@ -116,8 +116,9 @@ machine, as is its GitHub budget, and is not part of the file.
 ## The repository's commands
 
 What only the repository knows (which tests a change reaches, how its application runs) it
-gives Shipline as commands, under `commands` in `shipline.json`. Each is a command line, split
-into words as the shell splits them, with nothing expanded. A first word with a `/` in it is a
+gives Shipline as commands, under `commands` in `shipline.json`. Each but `test` (run by `bash`
+from the root of the checkout, above) is a command line, split into words as the shell splits
+them, with nothing expanded. A first word with a `/` in it is a
 program in the repository's main checkout, whichever worktree runs it; a first word without
 one is found on the `PATH`, and then the first later word with a `/` in it that is no option
 is the script it runs, read from the main checkout too (`node tools/shipline/hunt-browser.mjs`):
