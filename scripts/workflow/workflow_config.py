@@ -623,13 +623,13 @@ def shell(config: Config, *, posix: bool = False) -> str:
         return f"{name}={shlex.quote(words)}" if posix else f"{name}=({words})"
 
     lines.append(listed("SHIPLINE_RUNNER_LABELS", config.runner.labels))
-    # The main checkout, exported: every program the script starts works on the same repository,
-    # whatever folder it starts in.
-    lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")
     # The hunt areas, and at the same place in the other array the screens of each, joined.
     areas = config.hunts.areas
     lines.append(listed("SHIPLINE_HUNT_AREAS", areas))
     lines.append(listed("SHIPLINE_HUNT_SCREENS", (", ".join(paths) for paths in areas.values())))
+    # The main checkout, exported: every program the script starts works on the same repository,
+    # whatever folder it starts in.
+    lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")
     return "\n".join(lines) + "\n"
 
 
