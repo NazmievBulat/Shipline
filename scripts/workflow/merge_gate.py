@@ -625,8 +625,13 @@ def _rerun(
             return f"automatic retry of {name} deferred: main moved"
     folder.mkdir(parents=True, exist_ok=True)
     note = f"automatic retry requested for failed jobs of {name} {when}"
-    # Claim before contacting GitHub: an interrupted or ambiguous request must not repeat.
-    marker.write_text(note + "\n")
+    # Claim before contacting GitHub: an interrupted or ambiguous request must not repeat. Of two
+    # calls at once (a handoff judges its own run outside the merge lock), only one sends it.
+    try:
+        with marker.open("x") as claim:
+            claim.write(note + "\n")
+    except FileExistsError:
+        return f"the re-run of {name} is requested; GitHub has not shown it yet"
     try:
         done = command(
             "gh", "run", "rerun", str(run["id"]), "-R", REPOSITORY, "--failed", check=False
@@ -2192,6 +2197,10 @@ class Train:
             self.queue = [entry for entry in self.queue if entry != number]
         if number in view.queue and number not in self.queue:
             self.queue.append(number)
+            # Whether its checks still run is the tick's to read with the others': until then
+            # it does not take the turn from a member whose run is green.
+            if number not in self.pending:
+                self.pending.append(number)
         for name in MEMBER_ENTRIES:
             entries, judged = getattr(self, name), getattr(view, name)
             entries.pop(number, None)
@@ -3497,7 +3506,13 @@ def handoff(number: str, folder: Path) -> int:
             raise Refused(f"conflict round needs full review: {error}") from error
     pre_train_checks(number, folder, locked=False)
     note = Handoff(head, max(r[0] for r in rounds), pull["headRefName"])
+    checked = pull
     for _ in range(HANDOFF_ATTEMPTS):
+        if pull is not checked:
+            # A check failed since the first read: judged as the first read was.
+            if failed_checks(pull) and not pull_service_wait(pull, folder, number):
+                raise Refused("only a ready, non-conflicting pull request can be handed off")
+            checked = pull
         view = OwnView(folder, number)
         before = view.member(number)
         outcome: Refused | None = None
@@ -3511,11 +3526,12 @@ def handoff(number: str, folder: Path) -> int:
             fresh = read_pull(number)
             if (fresh["headRefOid"], fresh["headRefName"]) != (head, pull["headRefName"]):
                 raise Refused("the pull request head changed during the handoff; review it again")
-            if not ready(fresh) or conflicting(fresh) or _failing(fresh) - _failing(pull):
+            if not ready(fresh) or conflicting(fresh):
                 raise Refused("only a ready, non-conflicting pull request can be handed off")
             train = Train(folder)
-            if train.member(number) != before:
-                # The tick or a gate changed its place meanwhile: judge it again.
+            if _failing(fresh) - _failing(pull) or train.member(number) != before:
+                # A check failed, or the tick or a gate changed its place, meanwhile: judge again.
+                pull = fresh
                 continue
             train.admit(view)
             # Queued and passed over in its place until the tick's re-run is green; a wait
