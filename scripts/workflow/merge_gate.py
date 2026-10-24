@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
+import check_repair
 import priority
 import train_reads
 import workflow_config
@@ -2440,6 +2441,24 @@ class Train:
         for number in dict.fromkeys([*self.queue, *self.blocked]):
             pull = known[number] if known and number in known else read_pull(number)
             pulls[number] = pull
+            try:
+                repair = check_repair.Repair.read(self.path.parent, number)
+            except ValueError:
+                repair = None
+            if (
+                repair is not None
+                and pull["state"] == "OPEN"
+                and pull["baseRefName"] == "main"
+                and (
+                    pull["isDraft"] or self.blocked.get(number) not in (None, pull["headRefOid"])
+                )
+            ):
+                # A failing test of its own went to a worker: as a draft, then on the fix's new
+                # head until its reviewer calls the gate, it keeps its place, passed over.
+                self.blocked.setdefault(number, repair.head)
+                self.unavailable.append(number)
+                remaining.append(number)
+                continue
             if not ready(pull):
                 self.blocked.pop(number, None)
                 continue
