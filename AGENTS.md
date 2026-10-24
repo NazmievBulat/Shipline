@@ -57,9 +57,8 @@ rules below.
 
 ## Review guidelines
 
-Every reviewer, Codex included, follows these.
+Every reviewer, Codex included, follows these. Besides correctness, check:
 
-- Correctness first.
 - Nothing in the diff, the commit messages or the pull request description exposes personal
   data, secrets or tokens, host or machine names, IP addresses, home paths, e-mail addresses
   other than a GitHub no-reply address, session or chat links, or details of any other project

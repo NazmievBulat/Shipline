@@ -1,4 +1,4 @@
-This file holds the rules for repositories that use Shipline; Shipline's own development follows `AGENTS.md` at the root of this repository.
+This file holds the rules for repositories that use Shipline; Shipline's own development follows `AGENTS.md` in the Shipline repository.
 
 # Workflow sessions
 
