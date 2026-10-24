@@ -118,7 +118,7 @@ def test_the_cloud_worker_is_told_to_push_as_one_so_its_push_runs_cis_tests(
         "and as that user."
     ) in sentence
     assert (
-        'Only after the server suite timed out in a push, export '
+        "Only after the server suite timed out in a push, export "
         'SHIPLINE_CLOUD_SERVER_PART="1 of 4" (or another part) to run that part as CI parts '
         "it, and unset it once it is not needed."
     ) in sentence
@@ -1135,7 +1135,7 @@ def _alive(pid: int) -> bool:
     """Whether the process runs: one ended but not yet reaped (a zombie) does not."""
     try:
         state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-    except (OSError, IndexError):
+    except OSError, IndexError:
         return False
     return state != "Z"
 
@@ -1613,3 +1613,98 @@ def test_an_answer_posted_but_not_confirmed_is_noted_once_at_the_next_tick(
     assert _answered_in_log(attachable) == [f'{_NOW + 1080} answered for the owner: cloud-7, "1"']
     [answer] = (attachable.repo / ".local/workflow").glob("answered-for-owner.*/*.json")
     assert json.loads(answer.read_text())["reply"] == "1"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Which order?\n\n1. Oldest first\n2. Newest first (Recommended)\n\nOwner only: no\n"
+        "Reply 1 or 2.",
+        "Which order?\n\n1. Oldest first\n2. Newest first\n\nI recommend 2.\n\nOwner only: no\n"
+        "Answer 1 or 2.",
+        "Which order?\n\nRecommended: 2\n1. Oldest first\n2. Newest first\n\nOwner only: no\n"
+        "Reply 1 or 2.",
+    ],
+    ids=["marked on a choice", "in a sentence", "above the list"],
+)
+def test_a_recommendation_other_than_the_first_reply_word_waits_and_is_named_once(
+    attachable: Workflow, text: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _comments(attachable, _question(attachable, text=text))
+
+    for minutes in (15, 30, 60):
+        _tick_at(attachable, minutes)
+
+    assert _answers(attachable) == []
+    told = [message for message in attachable.sent() if "owner question" in message]
+    assert len(told) == 1
+    assert (
+        "owner question with a recommendation other than its first reply word: cloud-7"
+        in told[0]
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Which order?\n\nRecommended: 1\n1. Oldest first\n2. Newest first\n\nOwner only: no\n"
+        "Reply 1 or 2.",
+        "Which order?\n\n1. Oldest first\n2. Newest first (not recommended)\n\nOwner only: no\n"
+        "Reply 1 or 2.",
+    ],
+    ids=["agrees", "a choice not recommended"],
+)
+def test_a_recommendation_that_agrees_with_the_first_reply_word_is_answered(
+    attachable: Workflow, text: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _comments(attachable, _question(attachable, text=text))
+
+    _tick_at(attachable, 15)
+
+    assert [answer.split("\n", 1)[0] for answer in _answers(attachable)] == [
+        f"{_ORCHESTRATOR} answered for the owner: 1"
+    ]
+
+
+@pytest.mark.parametrize("ending", ["Reply: 1 or 2", "Choose 1 or 2.", "Reply A or B."])
+def test_common_closing_lines_ask_the_owner(workflow: Workflow, ending: str) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    _keys(workflow)
+    _comments(
+        workflow, _comment(4, f"Which order?\n\n1. Oldest first\n2. Newest first\n\n{ending}")
+    )
+
+    done = workflow.run_script("tick", env=_ENV)
+
+    assert done.returncode == 0, done.stderr
+    assert (workflow.repo / ".local/workflow/cloud-7.asking").exists()
+    [push] = workflow.pushes()
+    assert push.title == "cloud-7 needs you"
+
+
+def test_the_same_question_asked_again_after_the_owner_answered_waits(
+    attachable: Workflow,
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    question = _question(attachable)
+    answer = {
+        "id": 5,
+        "body": "3",
+        "created_at": "2026-10-19T18:05:00Z",
+        "user": {"login": "example-owner"},
+    }
+    _comments(attachable, question, answer)
+    _tick_at(attachable, 6)
+    again = {**question, "id": 9, "created_at": "2026-10-19T18:20:00Z"}
+    _comments(attachable, question, answer, again)
+
+    for minutes in (21, 36, 60):
+        _tick_at(attachable, minutes)
+
+    assert _answers(attachable) == []

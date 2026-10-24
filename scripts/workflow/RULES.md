@@ -333,19 +333,21 @@ each beginning with its reply word, the line `Owner only: yes` or `Owner only: n
 reply words, the recommended one first. An answer it is given in its session it reports on the
 pull request before it carries on. It never ends its turn to wait for an answer; it polls the
 pull request's comments every three minutes instead. The tick relays the reports without a
-model: a final question rings the phone once through `notify` and appears in the wake as `asking
-the owner: cloud-N`; a `Blocked` report is told to the orchestrator once. A question marked
-`Owner only: no` with no answer after `answer_for_owner_after_minutes` gets its recommended
-reply as in "Asking the owner", once for the same words, in a comment of the tick,
-`<!-- shipline-orchestrator --> answered for the owner: <reply word>`, quoting that choice's line
-when it has one, and its worker is woken as after any answer. An answer from the owner or the
-orchestrator that comes first wins, and only a question from an account that may write to the
-repository is answered. One without the line, or without a reply word, waits for the owner and
-is named in the wake once; the morning check-in lists the answers. A final `worker finished`
-removes the record only once the pull request is ready, letting the normal independent review
-start. Reports and failed deliveries are remembered locally. The workflow does not read cloud
-transcripts or stop cloud sessions; the owner answers in the cloud session or on the pull
-request.
+model: a final question rings the phone once through `notify` and appears in the wake as
+`asking the owner: cloud-N`; a `Blocked` report is told to the orchestrator once. A question
+marked `Owner only: no` with no answer after `answer_for_owner_after_minutes` gets its
+recommended reply as in "Asking the owner", once, in a comment of the tick,
+`<!-- shipline-orchestrator --> answered for the owner: <reply word>`, quoting that choice's
+line when it has one, and its worker is woken as after any answer. An answer from the owner or
+the orchestrator that comes first wins, the same words asked again after any answer wait for the
+owner, and only a question from an account that may write to the repository is answered. One
+without the line, without a reply word, or with a recommendation other than its first reply word
+(a choice marked recommended, or a sentence above `Owner only:` that recommends another), waits
+for the owner and is named in the wake once; the morning check-in lists the answers. A final
+`worker finished` removes the record only once the pull request is ready, letting the normal
+independent review start. Reports and failed deliveries are remembered locally. The workflow
+does not read cloud transcripts or stop cloud sessions; the owner answers in the cloud session
+or on the pull request.
 
 A cloud worker's push also runs the tests CI will run for its change: its machine is its own,
 so the slower suites cost no local machine anything. It exports `SHIPLINE_CLOUD_WORKER=1` in

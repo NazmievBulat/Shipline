@@ -123,12 +123,18 @@ def test_an_explicit_recommendation_is_never_overruled_by_the_reply_words_order(
 
 
 @pytest.mark.parametrize(
-    "ending",
-    ["Reply: 1 or 2", "Recommended: A\nReply A or B.", "Choose 1 or 2."],
+    ("ending", "given"),
+    [
+        ("Reply: 1 or 2", []),
+        ("Recommended: A\nReply A or B.", []),
+        # The stop hook takes this shape (`notify`, `question_of`), and its reply agrees with the
+        # recommendation: answered as a local session's question would be.
+        ("Choose 1 or 2.", ["1"]),
+    ],
     ids=["Reply colon", "letters", "choose"],
 )
 def test_a_shape_the_reader_does_not_take_is_at_least_seen_as_a_question(
-    attachable: Workflow, ending: str
+    attachable: Workflow, ending: str, given: list[str]
 ) -> None:
     text = "Which order?\n\n1. Oldest first (recommended)\n2. Newest first\n\nOwner only: no\n"
     _ask(attachable, text + ending)
@@ -136,8 +142,14 @@ def test_a_shape_the_reader_does_not_take_is_at_least_seen_as_a_question(
     for minutes in (15, 30, 60):
         _tick_at(attachable, minutes)
 
-    # Never a wrong answer: no answer at all.
-    assert _answers(attachable) == []
+    # Never a wrong answer: the stop hook's reply, or no answer at all.
+    answers = [
+        answer.split("\n", 1)[0].removeprefix(f"{_ORCHESTRATOR} answered for the owner: ")
+        for answer in _answers(attachable)
+    ]
+    assert answers == given
+    if given:
+        return
     named = [m for m in attachable.sent() if "owner question" in m and "cloud-7" in m]
     asked = [m for m in attachable.sent() if "asking the owner: cloud-7" in m]
     # Each shape is named to the orchestrator once, or at least shown as asking the owner; the
@@ -290,7 +302,7 @@ def test_github_failing_on_the_second_read_answers_at_the_next_tick(attachable: 
         "gh",
         "#!/bin/bash\n"
         'if [[ "$*" == *"/comments?per_page=100"* ]]; then\n'
-        '  n=$(cat @STATE@/reads 2>/dev/null || echo 0); echo $((n + 1)) > @STATE@/reads\n'
+        "  n=$(cat @STATE@/reads 2>/dev/null || echo 0); echo $((n + 1)) > @STATE@/reads\n"
         '  [[ $n != 1 ]] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }\n'
         "fi\n"
         'exec "$(dirname "$0")/gh-real" "$@"\n',

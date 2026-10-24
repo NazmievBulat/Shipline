@@ -61,6 +61,10 @@ REPLY = re.compile(
     r"""(?:"([^"\n]+)"|“([^”\n]+)”|`([^`\n]+)`|([0-9]+)(?![^\W_]))""",
     re.IGNORECASE,
 )
+# Every reply word on a line: quoted words or a number.
+REPLY_WORDS = re.compile(r""""([^"\n]+)"|“([^”\n]+)”|`([^`\n]+)`|([0-9]+)""")
+# How many answered questions' words a record keeps.
+ANSWERED_KEPT = 100
 # How the tick's answer for the owner begins.
 ANSWERED_FOR_OWNER = f"{ORCHESTRATOR} answered for the owner: "
 
@@ -114,7 +118,10 @@ def _status(body: str) -> str:
     if re.fullmatch(r"[*_]*worker finished[.!]?[*_]*", last, re.IGNORECASE):
         return "finished"
     if re.search(
-        r"""\?[\s"”)]*$|\b(write|type|reply|say|answer)\s+("|'|“|`|[0-9])""", last, re.IGNORECASE
+        r"""\?[\s"”)]*$|\b(write|type|reply|say|answer|choose)\b\s*:?\s+"""
+        r"""("|'|“|`|[0-9]|(?-i:[A-Z])\b)""",
+        last,
+        re.IGNORECASE,
     ):
         return "asking"
     choice = r"""(?:"[^"\n]+"|'[^'\n]+'|“[^”\n]+”|`[^`\n]+`|[0-9]+|merge it)"""
@@ -300,10 +307,48 @@ def _question(body: str) -> tuple[str, str, str]:
     return value, reply, line
 
 
+def _recommends_other(body: str, reply: str) -> bool:
+    """Whether a line above the question's `Owner only:` line recommends another reply word than
+    `reply`: a choice marked recommended, or another line naming a reply word with its
+    recommendation. A choice marked "not recommended" recommends nothing."""
+    lines = _without_attribution(body).split("\n")
+    at = next(number for number, line in enumerate(lines) if OWNER_ONLY.fullmatch(line))
+    end = max(n for n, line in enumerate(lines) if re.search(rf"(?!{SPACE}).", line))
+    words = [
+        next(group for group in match.groups() if group)
+        for match in re.finditer(REPLY_WORDS, lines[end])
+    ]
+
+    def names(line: str, word: str) -> bool:
+        return bool(re.search(rf"""(?<![^\W_])["“`]?{re.escape(word)}["”`]?(?![^\W_])""", line))
+
+    def begins(line: str) -> list[str]:
+        bare = re.sub(rf"^(?:{SPACE}|[>*_•-])*", "", line)
+        return [w for w in words if re.match(rf"""[("'“`]?{re.escape(w)}(?![^\W_])""", bare)]
+
+    for line in lines[:at]:
+        if not re.search(r"recommend", line, re.IGNORECASE) or re.search(
+            r"\bnot\s+recommend", line, re.IGNORECASE
+        ):
+            continue
+        choice = begins(line)
+        marked = set(choice[:1]) if choice else {word for word in words if names(line, word)}
+        if marked - {reply}:
+            return True
+    return False
+
+
 def _words(body: str) -> str:
     """What a question says, as the mark of an answer given for the owner: the same words asked
     again after it wait for him, as a local session's do."""
     return hashlib.sha256(_without_attribution(body).strip().encode()).hexdigest()
+
+
+def _note_words(record: dict[str, object], words: str) -> None:
+    """Keeps the words of an answered question, so the same words asked again wait for the owner
+    rather than get another answer from the tick."""
+    answered = [str(old) for old in record.get("answered_words") or [] if old != words]
+    record["answered_words"] = [*answered, words][-ANSWERED_KEPT:]
 
 
 def _answered_for_owner(
@@ -311,7 +356,7 @@ def _answered_for_owner(
 ) -> None:
     """Notes an answer posted for the owner: in the record, for the wake's check-in, which lists
     them so the owner can overrule them, and in the wake's log."""
-    record["answered_for_owner"] = _words(str(record["message"]))
+    _note_words(record, _words(str(record["message"])))
     _write(path, record)
     (notes / f"{path.name}.asking").unlink(missing_ok=True)
     answered = notes / "answered-for-owner.pending"
@@ -335,16 +380,22 @@ def _answer_for_owner(
     an answer goes at once."""
     question = record["last_comment_id"]
     minutes = workflow_config.current().answer_for_owner_after_minutes
-    if record.get("answered_for_owner") == _words(str(record["message"])) or not minutes:
+    if _words(str(record["message"])) in (record.get("answered_words") or []) or not minutes:
         return
     asked = next((comment for comment in comments if comment["id"] == question), None)
     # Anyone can comment on a public pull request, the marker included.
     if not asked or not _writes(asked, writers):
         return
     owner, reply, line = _question(str(asked["body"]))
-    if owner == "missing" or (owner == "no" and not reply):
+    what = ""
+    if owner == "missing":
+        what = "without the Owner only line"
+    elif owner == "no" and not reply:
+        what = "without a reply word"
+    elif owner == "no" and _recommends_other(str(asked["body"]), reply):
+        what = "with a recommendation other than its first reply word"
+    if what:
         if record.get("owner_question_noted") != question:
-            what = "without the Owner only line" if owner == "missing" else "without a reply word"
             pending = notes / "stuck.pending"
             pending.mkdir(exist_ok=True)
             _write(
@@ -449,11 +500,15 @@ def _poll(notes: Path, scripts: Path) -> int:
                     print(f"{path.name}: question answered (comment {answer['id']})")
                     # The tick's own answer, posted by a tick that could not note it.
                     body = str(answer["body"])
-                    if body.startswith(ANSWERED_FOR_OWNER) and record.get(
-                        "answered_for_owner"
-                    ) != _words(str(record["message"])):
+                    words = _words(str(record["message"]))
+                    if body.startswith(ANSWERED_FOR_OWNER) and words not in (
+                        record.get("answered_words") or []
+                    ):
                         reply = body.removeprefix(ANSWERED_FOR_OWNER).split("\n", 1)[0]
                         _answered_for_owner(notes, path, record, reply, _time(answer))
+                    # Whoever answered, the same words asked again get no other answer.
+                    _note_words(record, words)
+                    _write(path, record)
             # Retry a failed phone push through notify's existing deduplication path.
             if record["status"] == "asking" and not record.get("answer_id") and not notified:
                 _notify(
