@@ -559,3 +559,17 @@ def test_the_log_and_state_are_for_the_owner_alone(machine: Machine) -> None:
     folder = machine.home / ".local/state/workflow"
     for name in ("runner-balance.log", "runner-balance.json"):
         assert (folder / name).stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["RUNNER_PREFIX=../x", "machine=box/other", "machine='box name'", "repository=../.."],
+)
+def test_settings_that_would_leave_their_names_change_nothing(machine: Machine, line: str) -> None:
+    machine.settings(ordinary=3, docker=1, bounds="balance_ordinary=2-5\n", extra=line + "\n")
+    machine.queue(ORDINARY, 10)
+
+    done = machine.run(code=1)
+
+    assert machine.calls("systemctl") == [] and machine.calls("gh") == []
+    assert "names no" in done.stderr

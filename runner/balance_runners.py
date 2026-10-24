@@ -79,6 +79,10 @@ FORECAST_FRESH_SECONDS = 10 * 60
 # Room to add: the load this far under the ceiling, and this much memory for the kind added.
 LOAD_MARGIN = 4
 MEMORY_GB = {"ordinary": 3, "docker": 8}
+# What a repository, the prefix and a machine's name may be: they go into GitHub's paths, the
+# labels and the unit names. `.` and `..` are no owner or name.
+REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 SETTINGS_SECONDS = 5
 GITHUB_SECONDS = 30
 PER_PAGE = 100
@@ -181,8 +185,12 @@ class Machine:
 
 def machine(path: Path) -> Machine:
     values = read_settings(path)
-    for needed in ("repository", "RUNNER_PREFIX", "machine"):
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?", values.get(needed, "")):
+    for needed, pattern in (
+        ("repository", REPOSITORY),
+        ("RUNNER_PREFIX", NAME),
+        ("machine", NAME),
+    ):
+        if not pattern.fullmatch(values.get(needed, "")):
             raise Refused(f"{path} names no {needed}")
     roles = set(values.get("roles", "").split())
     counts = {kind: _count(values, kind) for kind in KINDS}
