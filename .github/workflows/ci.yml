@@ -81,6 +81,7 @@ jobs:
               tests/runner/test_build_images.py
               tests/runner/test_install.py
               tests/runner/test_layout.py
+              tests/runner/test_ordinary_slots.py
               tests/runner/test_programs.py
               tests/runner/test_rendering.py
               tests/tools/test_parity.py

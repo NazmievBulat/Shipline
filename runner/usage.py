@@ -15,6 +15,11 @@ old the log is moved to `usage.log.1`, so the two files together always hold a m
 `python3 usage.py report [--days N]` reads both files and prints, for each of the last N days
 (UTC), the hour with the highest mean CPU pressure, that mean, and the least memory available in
 that hour; and whether every one of those hours had room (README.md, "A second machine").
+
+Before that last line it says how many more PR jobs that room holds: none unless every day had
+room, else the least memory available at a busiest hour, less the margin, in jobs of the cap one
+ordinary job of this machine gets (`--job-memory`, settings.sh's `memory` when it names none):
+no more PR slots than that move to this machine (README.md, "Moving a machine's PR slots").
 """
 
 import argparse
@@ -36,6 +41,8 @@ LISTING_SECONDS = 20
 # Room at the busiest hour, as a measured week of use set it.
 MOST_PRESSURE = 25.0
 LEAST_AVAILABLE_MB = 8 * 1024
+# The cap of one ordinary job when the machine names none: settings.sh's `memory`.
+JOB_MEMORY = "10g"
 
 
 def _meminfo(proc: Path) -> dict[str, int]:
@@ -159,10 +166,40 @@ def _lines(folder: Path) -> list[dict[str, str]]:
     return rows
 
 
+def _megabytes(size: str) -> int:
+    """A cap of whole gigabytes, as install.sh takes `job_memory` (`6g`), in MiB."""
+    if not (size.endswith("g") and size[:-1].isdigit() and int(size[:-1]) > 0):
+        raise ValueError(f"a job's memory is whole gigabytes, such as 6g, not {size!r}")
+    return int(size[:-1]) * 1024
+
+
+def _whole_gigabytes(size: str) -> str:
+    """The cap as the command line gives it, refused at once when it is no whole gigabytes."""
+    try:
+        _megabytes(size)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+    return size
+
+
+def jobs_with_room(room: bool, least_available_mb: int, job_memory: str) -> int:
+    """How many more ordinary jobs of `job_memory` each the measured room holds: what was least
+    available at a busiest hour, less the margin. None without room every day."""
+    job_mb = _megabytes(job_memory)
+    if not room:
+        return 0
+    return max(0, (least_available_mb - LEAST_AVAILABLE_MB) // job_mb)
+
+
 def report(
-    days: int, *, folder: Path = LOG_FOLDER, now: datetime | None = None
+    days: int,
+    *,
+    folder: Path = LOG_FOLDER,
+    now: datetime | None = None,
+    job_memory: str = JOB_MEMORY,
 ) -> tuple[str, bool]:
-    """The busiest hour of each of the last `days` days, and whether all of them had room.
+    """The busiest hour of each of the last `days` days, how many more ordinary jobs their room
+    holds, and whether all of them had room.
 
     A day with an hour without lines counts as no room, as does a day with no line at all: a
     week of room needs a week of lines, and the hours a machine was off may be its busiest.
@@ -179,6 +216,7 @@ def report(
             hours[row["time"][:13]].append(sampled)
     out = []
     room = True
+    least = None
     for day in [(now - timedelta(days=back)).strftime("%Y-%m-%d") for back in range(days, 0, -1)]:
         of_day = {hour: rows for hour, rows in hours.items() if hour.startswith(day)}
         if not of_day:
@@ -188,6 +226,7 @@ def report(
         hour, rows = max(of_day.items(), key=lambda item: sum(p for p, _ in item[1]) / len(item[1]))
         pressure = sum(p for p, _ in rows) / len(rows)
         available = min(a for _, a in rows)
+        least = available if least is None else min(least, available)
         fits = (
             pressure < MOST_PRESSURE and available > LEAST_AVAILABLE_MB and len(of_day) == 24
         )
@@ -199,6 +238,11 @@ def report(
             f"{day}  busiest hour {hour[11:]}:00 UTC  CPU pressure {pressure:.1f}%"
             f"  least available {available / 1024:.1f} GiB  {verdict}"
         )
+    jobs = jobs_with_room(room, least or 0, job_memory)
+    out.append(
+        f"Room for {jobs} more PR jobs of {job_memory} each (the least available at a busiest"
+        f" hour, less {LEAST_AVAILABLE_MB // 1024} GiB)"
+    )
     out.append(
         f"Room every day: {'yes' if room else 'no'} (CPU pressure under {MOST_PRESSURE:.0f}% and"
         f" more than {LEAST_AVAILABLE_MB // 1024} GiB available at the busiest hour)"
@@ -210,11 +254,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("sample").add_argument("machine")
-    commands.add_parser("report").add_argument("--days", type=int, default=7)
+    reported = commands.add_parser("report")
+    reported.add_argument("--days", type=int, default=7)
+    reported.add_argument("--job-memory", default=JOB_MEMORY, type=_whole_gigabytes)
     arguments = parser.parse_args()
     if arguments.command == "sample":
         sample(arguments.machine)
     else:
-        text, room = report(arguments.days)
+        text, room = report(arguments.days, job_memory=arguments.job_memory)
         print(text)
         sys.exit(0 if room else 1)
