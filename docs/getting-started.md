@@ -46,6 +46,24 @@ its tests. Every other key has a default; `scripts/workflow/README.md` in Shipli
 }
 ```
 
+The CI workflow runs two tools of your repository. `tools/ci-plan` prints, as JSON, what CI
+runs for a change; this one runs every test, always. `tools/fast-checks` runs your quick
+checks, such as a linter; this one runs none yet. Change them when you need to.
+
+```sh
+mkdir -p tools
+cat > tools/ci-plan <<'EOF'
+#!/bin/sh
+# What CI runs for a change: here, every server test, always.
+echo '{"needed": ["server_whole"], "server_files": [], "server_total": 0}'
+EOF
+cat > tools/fast-checks <<'EOF'
+#!/bin/sh
+# The repository's quick checks, such as a linter: none yet.
+EOF
+chmod +x tools/ci-plan tools/fast-checks
+```
+
 Then add the CI workflow, the rules the sessions follow, and the folders Shipline keeps its
 notes and worktrees in, and push them to `main`:
 
@@ -54,7 +72,7 @@ mkdir -p .github/workflows
 cp ~/.local/share/shipline/examples/ci.yml .github/workflows/ci.yml
 cat ~/.local/share/shipline/scripts/workflow/RULES.md >> AGENTS.md
 printf '.local/\n.claude/\n' >> .gitignore
-git add shipline.json .github/workflows/ci.yml AGENTS.md .gitignore
+git add shipline.json tools .github/workflows/ci.yml AGENTS.md .gitignore
 git commit -m "ci: work through Shipline"
 git push origin main
 ```

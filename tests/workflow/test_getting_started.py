@@ -512,49 +512,172 @@ def _tick(workflow: Workflow) -> str:
     return done.stdout + done.stderr
 
 
-def _step(workflow_file: Path, job: str, name: str) -> str:
-    """The command of one step of a job of the repository's CI workflow."""
-    found = re.search(
-        rf"- name: {re.escape(name)}\n(?:\s+#.*\n|\s+\w[\w-]*:.*\n)*?\s+run: (.+)\n",
-        _job(workflow_file, job),
+def _job_parts(job_text: str) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """A job of the workflow as GitHub reads it, held only as far as the example uses YAML:
+    its own keys (`name`, a folded `if`, its `outputs`) and its steps, each with its keys, its
+    `env` and its `run`, a block (`|`) read whole."""
+    lines = job_text.splitlines()
+    job: dict[str, str] = {}
+    steps: list[dict[str, str]] = []
+    index = 1
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        if line.startswith("    ") and not line.startswith("     "):
+            key, _, value = line.strip().partition(":")
+            value = value.strip()
+            nested = []
+            while index < len(lines) and (
+                lines[index].startswith("      ") or not lines[index].strip()
+            ):
+                if key != "steps":
+                    nested.append(lines[index].strip())
+                    index += 1
+                    continue
+                step_line = lines[index]
+                index += 1
+                if step_line.startswith("      - "):
+                    steps.append({})
+                    step_line = "        " + step_line[8:]
+                if not step_line.startswith("        ") or step_line.startswith("         "):
+                    continue
+                if step_line.strip().startswith("#"):
+                    continue
+                step_key, _, step_value = step_line.strip().partition(":")
+                step_value = step_value.strip()
+                body = []
+                while index < len(lines) and (
+                    lines[index].startswith("          ") or not lines[index].strip()
+                ):
+                    body.append(lines[index][10:])
+                    index += 1
+                if step_value == "|":
+                    steps[-1][step_key] = "\n".join(body).strip("\n") + "\n"
+                elif step_key == "env":
+                    for entry in body:
+                        if entry.strip():
+                            name, _, given = entry.partition(":")
+                            steps[-1]["env." + name.strip()] = given.strip()
+                elif step_key != "with":
+                    steps[-1][step_key] = step_value
+            if key == "outputs":
+                for entry in nested:
+                    name, _, given = entry.partition(":")
+                    job["outputs." + name.strip()] = given.strip()
+            elif key != "steps":
+                job[key] = " ".join([value.removeprefix(">-").strip(), *nested]).strip()
+    return job, steps
+
+
+def _evaluate(text: str, outputs: dict[str, dict[str, str]]) -> object:
+    """A GitHub Actions expression of a pull request's run, as far as the example writes them."""
+    text = text.strip().strip('"')
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2]
+    code = re.sub(
+        r"\b(steps|needs)\.([\w-]+)\.outputs\.(\w+)",
+        lambda found: f"_out({found[1]!r}, {found[2]!r}, {found[3]!r})",
+        text,
     )
-    assert found, (job, name)
-    return found[1]
+    for given, meant in [
+        ("github.event_name", "'pull_request'"),
+        ("github.event.pull_request.draft", "False"),
+        ("always()", "True"),
+        ("fromJSON(", "_json("),
+        ("contains(", "_contains("),
+        ("&&", " and "),
+        ("||", " or "),
+    ]:
+        code = code.replace(given, meant)
+    code = re.sub(r"!(?!=)", " not ", code)
+    code = re.sub(r"\bfalse\b", "False", re.sub(r"\btrue\b", "True", code))
+    names = {
+        "_out": lambda kind, name, key: outputs.get(f"{kind}.{name}", {}).get(key, ""),
+        "_json": json.loads,
+        "_contains": lambda found, item: item in found,
+    }
+    return eval(code, {"__builtins__": {}}, names)  # noqa: S307 - the test's own workflow
+
+
+def _substituted(text: str, outputs: dict[str, dict[str, str]]) -> str:
+    return re.sub(r"\$\{\{(.*?)\}\}", lambda found: str(_evaluate(found[1], outputs)), text)
+
+
+def _run_job(
+    workflow: Workflow, checkout: Path, temp: Path, job: str, outputs: dict[str, dict[str, str]]
+) -> str:
+    """Runs a job's steps as GitHub does: each `run` with bash, its `env` and GITHUB_OUTPUT,
+    skipping a step whose `if` does not hold and the actions it uses."""
+    _, steps = _job_parts(_job(checkout / ".github" / "workflows" / "ci.yml", job))
+    printed = ""
+    for number, step in enumerate(steps):
+        if "run" not in step or ("if" in step and not _evaluate(step["if"], outputs)):
+            continue
+        handed = temp / f"output-{number}"
+        handed.touch()
+        env = {
+            **workflow.env,
+            "RUNNER_TEMP": str(temp),
+            "GITHUB_OUTPUT": str(handed),
+            "GITHUB_EVENT_NAME": "pull_request",
+            **{
+                key.removeprefix("env."): _substituted(value, outputs)
+                for key, value in step.items()
+                if key.startswith("env.")
+            },
+        }
+        done = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
+            cwd=checkout,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert done.returncode == 0, f"{job}: {step['run']}\n{done.stdout}{done.stderr}"
+        printed += done.stdout + done.stderr
+        if "id" in step:
+            outputs[f"steps.{step['id']}"] = dict(
+                line.split("=", 1) for line in handed.read_text().splitlines() if "=" in line
+            )
+    return printed
 
 
 def _ci(github: GitHub, head: str, run_id: int) -> None:
     """The pull request's CI, as GitHub runs the repository's own workflow on its merge into
-    main: the planner's steps and the test job's, each in a checkout of that merge of its own;
-    GitHub keeps what the planner noted as its annotations."""
+    main: the planner's steps, then each job whose condition holds, each in a checkout of that
+    merge of its own; GitHub keeps what the planner noted as its annotations."""
     workflow = github.workflow
     tree = workflow.git("merge-tree", "--write-tree", github.base, head).splitlines()[0]
     merge = workflow.git(
         "commit-tree", tree, "-p", github.base, "-p", head, "-m", "Merge head into main"
     )
-    printed = {}
-    for job, steps in {
-        "plan": ["Shipline", "The notes the merge gate reads"],
-        "tests": ["Shipline", "Tests"],
-    }.items():
+    printed: dict[str, str] = {}
+    conclusions: dict[str, str] = {}
+    planned: dict[str, dict[str, str]] = {}
+    for job in ("plan", "tests", "selected", "fast"):
         checkout = workflow.root / f"ci-{run_id}-{job}"
         temp = workflow.root / f"ci-{run_id}-{job}-temp"
         temp.mkdir()
         workflow.git("worktree", "add", "--quiet", "--detach", str(checkout), merge)
-        printed[job] = ""
-        for name in steps:
-            command = _step(checkout / ".github" / "workflows" / "ci.yml", job, name)
-            done = subprocess.run(
-                ["bash", "-euo", "pipefail", "-c", command],
-                cwd=checkout,
-                env={**workflow.env, "RUNNER_TEMP": str(temp)},
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-            assert done.returncode == 0, f"{job}: {command}\n{done.stdout}{done.stderr}"
-            printed[job] += done.stdout + done.stderr
-    jobs = ["CI: what to run", "CI: server tests", "CI result"]
+        parts, _ = _job_parts(_job(checkout / ".github" / "workflows" / "ci.yml", job))
+        name = parts["name"].strip('"')
+        if "if" in parts and not _evaluate(parts["if"], planned):
+            conclusions[name] = "skipped"
+            continue
+        outputs: dict[str, dict[str, str]] = {}
+        printed[job] = _run_job(workflow, checkout, temp, job, outputs)
+        conclusions[name] = "success"
+        if job == "plan":
+            planned["needs.plan"] = {
+                key.removeprefix("outputs."): str(_evaluate(value, outputs))
+                for key, value in parts.items()
+                if key.startswith("outputs.")
+            }
+    conclusions["CI result"] = "success"
     github.api[
         f"{_API}/actions/workflows/ci.yml/runs?head_sha={head}&event=pull_request&per_page=100"
     ] = {
@@ -570,8 +693,8 @@ def _ci(github: GitHub, head: str, run_id: int) -> None:
     }
     github.api[f"{_API}/actions/runs/{run_id}/jobs?per_page=100"] = {
         "jobs": [
-            {"id": run_id + 1 + index, "name": name, "status": "completed", "conclusion": "success"}
-            for index, name in enumerate(jobs)
+            {"id": run_id + 1 + index, "name": name, "status": "completed", "conclusion": ended}
+            for index, (name, ended) in enumerate(conclusions.items())
         ]
     }
     github.api[f"{_API}/check-runs/{run_id + 1}/annotations?per_page=100"] = annotations(
@@ -582,9 +705,18 @@ def _ci(github: GitHub, head: str, run_id: int) -> None:
         "tree": {"sha": tree},
     }
     github.pulls["7"]["statusCheckRollup"] = [
-        {"name": name, "status": "COMPLETED", "conclusion": "SUCCESS"} for name in jobs
+        {"name": name, "status": "COMPLETED", "conclusion": ended.upper()}
+        for name, ended in conclusions.items()
     ]
-    # The repository's own tests ran, through its configured command.
+    # The repository's own tools and tests ran: its plan chose every server test, which ran
+    # through its configured command, and its fast checks ran.
+    assert conclusions == {
+        "CI: what to run": "success",
+        "CI: server tests": "success",
+        "CI: selected server tests": "skipped",
+        "CI: fast checks": "success",
+        "CI result": "success",
+    }
     assert "Ran 1 test" in printed["tests"]
 
 
