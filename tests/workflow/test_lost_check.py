@@ -18,7 +18,7 @@ from workflow.test_merge_when_current import (
 
 github = github_fixture
 
-_REPO = "repos/NazmievBulat/Shipline"
+_REPO = "repos/example-org/example-app"
 
 
 def _stamp(seconds_ago: float) -> str:
@@ -177,7 +177,7 @@ def test_a_lost_check_beside_one_still_running_is_waited_for(github: GitHub) -> 
             "status": "IN_PROGRESS",
             "conclusion": None,
             "startedAt": _stamp(3000),
-            "detailsUrl": "https://github.com/NazmievBulat/Shipline/actions/runs/40/job/41",
+            "detailsUrl": "https://github.com/example-org/example-app/actions/runs/40/job/41",
         }
     )
     github.api[f"{_REPO}/actions/runs/40"] = {"id": 40, "status": "in_progress", "conclusion": None}

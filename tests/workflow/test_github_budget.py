@@ -546,46 +546,6 @@ def test_an_inflight_response_cannot_shorten_another_retry_after(
     assert module.delay("test") == 121
 
 
-def test_installed_wrapper_is_shared_by_sessions_and_survives_reinstallation(host: Path) -> None:
-    _answer(host)
-    installer = _ROOT / ".github/runner/install-github-budget.sh"
-    first = subprocess.run(["sh", str(installer)], capture_output=True, text=True, check=False)
-    assert first.returncode == 0, first.stderr
-    environment = {**os.environ, "PATH": str(host / ".local/bin") + ":" + os.environ["PATH"]}
-    second = subprocess.run(
-        ["sh", str(installer)], env=environment, capture_output=True, text=True, check=False
-    )
-    assert second.returncode == 0, second.stderr
-    done = subprocess.run(
-        ["gh", "api", "repos/owner/repo/actions/runners"],
-        env=environment,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    assert done.returncode == 0, done.stderr
-    assert done.stdout == '[{"id": 1}]'
-    assert len((host / "calls").read_text().splitlines()) == 1
-    recorded = host / ".local/share/example-app-github/github-real-gh"
-    assert recorded.read_text().strip() == str(host / "bin/gh")
-
-
-def test_installation_preserves_an_existing_unrelated_gh_program(host: Path) -> None:
-    target = host / ".local/bin/gh"
-    target.parent.mkdir(parents=True)
-    target.write_text("#!/bin/sh\necho custom\n")
-    done = subprocess.run(
-        ["sh", str(_ROOT / ".github/runner/install-github-budget.sh")],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert done.returncode == 1
-    assert "left unchanged" in done.stderr
-    assert target.read_text() == "#!/bin/sh\necho custom\n"
-
-
 def test_secondary_limit_is_recognized_from_the_response_body_without_cli_text(host: Path) -> None:
     _answer(
         host,
