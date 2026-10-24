@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 from stand_in_server import StandInServer
+from workflow.test_ci_proof import annotations
 from workflow_harness import Workflow
 
 _GH = r"""import builtins
@@ -1294,6 +1295,63 @@ def test_a_fresh_pull_request_merges_with_its_head_pinned(github: GitHub) -> Non
         f"--squash --match-head-commit {github.head}" in call
         for call in github.workflow.calls("gh pr merge")
     )
+
+
+def _notes_by_ci_proof(github: GitHub, checked_out: str, *suites: str) -> None:
+    """The pull request's CI as the example CI runs it (examples/ci.yml): its planner checked
+    out `checked_out`, GitHub's merge of the pull request into main unless a test says
+    otherwise, and wrote its notes with ci_proof.py; GitHub holds them as the planner's
+    annotations."""
+    workflow = github.workflow
+    merge = workflow.git(
+        "commit-tree", f"{github.head}^{{tree}}", "-p", github.base, "-p", github.head,
+        "-m", "Merge seven into main",
+    )
+    github.api[f"{_REPO}/git/commits/{merge}"] = {
+        "parents": [{"sha": github.base}, {"sha": github.head}],
+        "tree": {"sha": workflow.git("rev-parse", f"{github.head}^{{tree}}")},
+    }
+    # The head itself, on main as it was when the branch began.
+    github.api[f"{_REPO}/git/commits/{github.head}"] = {
+        "parents": [{"sha": workflow.git("rev-parse", f"{github.head}^")}],
+        "tree": {"sha": workflow.git("rev-parse", f"{github.head}^{{tree}}")},
+    }
+    checkout = workflow.root / "ci-checkout"
+    workflow.git("worktree", "add", "--quiet", "--detach", str(checkout),
+                 merge if checked_out == "merge" else github.head)
+    written = subprocess.run(
+        ["python3", "-B", str(workflow.script.parent / "ci_proof.py"), "notes", *suites],
+        cwd=checkout, env=workflow.env, capture_output=True, text=True, timeout=60, check=True,
+    )
+    github.api[f"{_REPO}/check-runs/21/annotations?per_page=100"] = annotations(written.stdout)
+
+
+def test_a_pull_request_whose_ci_noted_its_tested_merge_with_ci_proof_merges(
+    github: GitHub,
+) -> None:
+    _notes_by_ci_proof(github, "merge", "--whole", "server_tests")
+
+    done = github.run()
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (github.workflow.state / "merged").read_text() == "7"
+
+
+@pytest.mark.parametrize("checked_out", ["head", "nothing"])
+def test_a_pull_request_whose_ci_did_not_note_its_tested_merge_is_never_merged(
+    github: GitHub, checked_out: str
+) -> None:
+    if checked_out == "nothing":
+        # The planner never ran ci_proof.py: the run holds no notes.
+        github.api[f"{_REPO}/check-runs/21/annotations?per_page=100"] = []
+    else:
+        _notes_by_ci_proof(github, checked_out, "--whole", "server_tests")
+
+    done = github.run()
+
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "CI requested" in done.stdout
+    assert not (github.workflow.state / "merged").exists()
 
 
 @pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out"])

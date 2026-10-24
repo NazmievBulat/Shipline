@@ -96,18 +96,22 @@ fi
 before=$(kills)
 # Without `--foreground`, `timeout` stops the command's whole process group: the workers of
 # pytest, Vitest and Playwright and the browsers they started go with it. It runs in the
-# background, so a stop sent to this script can be passed on, with this script's input; `wait`
-# is kept quiet so the shell prints no line of its own ("Killed timeout ...") when it was killed.
+# background, so a stop sent to this script can be passed on, with this script's input and
+# error output. The shell's own error output goes to /dev/null until the command has ended: it
+# tells of a background job killed by a signal ("Killed ( trap - INT QUIT; ...") before the
+# first command after it reaped the job, which can be any command here, not only a `wait`, and
+# before that command's redirections, so the one that gives the shell its output back is safe.
 # The command moves itself into the run's group before it starts, so all it starts is there too.
 # A background job starts with SIGINT and SIGQUIT ignored, and Python then never raises
 # `KeyboardInterrupt`: the command gets them back as this script had them (still ignored when
 # its caller ignored them, which a shell cannot undo). GNU `timeout` handles both itself, so its
 # command never had them ignored; the `timeout` of uutils passes on what it was given.
+exec {errors}>&2 2>/dev/null
 (
   trap - INT QUIT
   [[ -z $own ]] || echo "$BASHPID" >"$own/cgroup.procs" 2>/dev/null || true
   exec timeout --kill-after="$GRACE_SECONDS" "$LIMIT_SECONDS" "$@"
-) <&0 &
+) <&0 2>&"$errors" {errors}>&- &
 runner=$!
 stopped=false
 trap 'stopped=true; kill -TERM "$runner" 2>/dev/null' TERM INT HUP
@@ -118,6 +122,7 @@ while kill -0 "$runner" 2>/dev/null; do
   wait "$runner" 2>/dev/null
   status=$?
 done
+exec 2>&"$errors" {errors}>&-
 ((SECONDS < LIMIT_SECONDS)) || ((status != 124 && status != 137)) || stopped=true
 # The kernel kills only the largest process at the memory limit: the rest of the run is told to
 # stop, as at the time limit.
