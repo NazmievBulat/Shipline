@@ -821,6 +821,9 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
         "WORKFLOW_SWAPS_FILE": str(tmp_path / "proc" / "swaps"),
         "WORKFLOW_LOADAVG_FILE": str(tmp_path / "proc" / "loadavg"),
         "WORKFLOW_CLAUDE_TMP_ROOT": str(tmp_path / "claude-tmp"),
+        # The tick's daily metrics run reads GitHub in the background; a test that wants it names
+        # its time.
+        "WORKFLOW_METRICS_DAILY_AT": "",
     }
     made = Workflow(root=tmp_path, repo=tmp_path / "repo", state=state, bin=bin_folder, env=env)
     made.fake("gh", _FAKE_GH)
