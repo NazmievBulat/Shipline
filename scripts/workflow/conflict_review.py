@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import workflow_config
 from merge_handoff import write_json
 from workflow_commands import GIT_READ_TIMEOUT, run
 
@@ -164,7 +165,7 @@ def prepare(
 
 def _holds(folder: Path, number: str, scope: Scope) -> bool:
     """The kept worktree is still at this merge: unresolved, or committed as that one merge."""
-    root = folder.parent.parent / ".claude" / "worktrees" / f"ticket-{number}"
+    root = workflow_config.current().checkout_of(folder) / ".claude/worktrees" / f"ticket-{number}"
     head = _git(root, "rev-parse", "HEAD", check=False).strip()
     if head == scope.head:
         return _git(root, "rev-parse", "--verify", "MERGE_HEAD", check=False).strip() == scope.main

@@ -50,12 +50,16 @@ reviewers=("$@")
 for who in "${reviewers[@]}"; do
   [[ $who =~ ^(cursor|codex)$ ]] || exit 2
 done
-main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)") || exit 1
+config=$(python3 "$here/workflow_config.py" shell) || exit 1
+eval "$config"
+# The repository's main checkout, never the checkout these scripts are in.
+main=$SHIPLINE_REPO
+[[ -n $SHIPLINE_REPOSITORY ]] || { echo "cannot tell which repository to review in" >&2; exit 1; }
 cd "$main" || exit 1
 task=$(gh pr view "$number" --json title,body,baseRefName,headRefOid) || exit 1
 head=$(jq -er .headRefOid <<<"$task") || exit 1
 base=$(jq -er .baseRefName <<<"$task") || exit 1
-root=$main/.local/workflow/reviews/$number/$head
+root=$main/$SHIPLINE_STATE_FOLDER/reviews/$number/$head
 [[ $full_review == false ]] || root=$root/full-review
 mkdir -p "$root" || exit 1
 exec 9>"$root/panel.lock"
@@ -68,22 +72,23 @@ if ! bash "$here/weaker-tests" --base "origin/$base" --head "$head" >"$root/weak
 fi
 mv "$root/weaker-tests.md.pending" "$root/weaker-tests.md"
 python3 "$here/task_history.py" "$number" "$root" <<<"$task" || exit 1
-prompt=$(sed "s/{N}/$number/g" "$here/review-prompt.txt")
+prompt=$(sed -e "s/{N}/$number/g" -e "s|{REPOSITORY}|$SHIPLINE_REPOSITORY|g" "$here/review-prompt.txt")
 # Prepare evidence once, even when completed tool reports can be reused.
 git diff "origin/$base...$head" >"$root/diff.patch" || exit 1
 scope_key=full
-if [[ $full_review == false && -f $main/.local/workflow/review-$number.conflict.json ]]; then
-  raw_reviews=$(gh api --paginate "repos/NazmievBulat/Shipline/pulls/$number/reviews") || exit 1
+if [[ $full_review == false && -f $main/$SHIPLINE_STATE_FOLDER/review-$number.conflict.json ]]; then
+  raw_reviews=$(gh api --paginate "repos/$SHIPLINE_REPOSITORY/pulls/$number/reviews") || exit 1
   reviews=$(jq -s 'add' <<<"$raw_reviews") || exit 1
   inputs=$(mktemp -d "$root/inputs.XXXXXX") || exit 1
   git worktree add --quiet --detach "$inputs" "$head" || exit 1
   mkdir -p "$inputs/.review"
   cp "$root/"{diff.patch,task.md,weaker-tests.md} "$inputs/.review/"
-  python3 -B "$here/conflict_review.py" panel "$main/.local/workflow" "$number" "$inputs" "$head" <<<"$reviews"
+  python3 -B "$here/conflict_review.py" panel "$main/$SHIPLINE_STATE_FOLDER" "$number" "$inputs" "$head" <<<"$reviews"
   scope_result=$?
   if ((scope_result == 0)); then
-    if ! (cd "$inputs" && python3 -B "$here/server_tests_for_changes.py" "$head^1" --files-from .review/conflict-files.txt > .review/server-tests.json &&
-        python3 -B "$here/browser_tests_for_changes.py" "$head^1" --files-from .review/conflict-files.txt > .review/browser-tests.txt); then
+    # The repository's own test selectors, in its main checkout's `scripts/workflow`.
+    if ! (cd "$inputs" && python3 -B "$main/scripts/workflow/server_tests_for_changes.py" "$head^1" --files-from .review/conflict-files.txt > .review/server-tests.json &&
+        python3 -B "$main/scripts/workflow/browser_tests_for_changes.py" "$head^1" --files-from .review/conflict-files.txt > .review/browser-tests.txt); then
       git worktree remove --force "$inputs" >/dev/null 2>&1
       echo "could not select tests for the conflict resolution" >&2
       exit 1
@@ -124,7 +129,7 @@ for who in "${reviewers[@]}"; do
     cursor) command -v agent >/dev/null && installed=true ;;
     codex) command -v codex >/dev/null && installed=true ;;
   esac
-  if [[ $who == codex && -e $main/.local/workflow/codex-built-$number ]]; then
+  if [[ $who == codex && -e $main/$SHIPLINE_STATE_FOLDER/codex-built-$number ]]; then
     echo 'skipped: Codex built this pull request' >"$report"
     continue
   fi

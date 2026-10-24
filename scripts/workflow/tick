@@ -69,13 +69,29 @@ FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 gh() { python3 "$here/github_budget.py" call tick "$@"; }
 source "$here/bridge-failed"
-# Use the same repository as the runner registration and the worker gh shim.
-source "$here/../../.github/runner/settings.sh"
-main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)") || exit 1
+# The repository, its check names, labels and state folder (`workflow_config.py`), read once.
+config=$(python3 "$here/workflow_config.py" shell) || exit 1
+eval "$config"
+if [[ -z $SHIPLINE_REPOSITORY ]]; then
+  echo "cannot tell which repository the workflow works on: shipline.json names none," \
+    ".github/runner/settings.sh is missing or names none, and origin names no GitHub" \
+    "repository" >&2
+  exit 1
+fi
+# priority.jq reads the label names from it.
+export SHIPLINE_CONFIG
+# The repository's main checkout (`SHIPLINE_REPO`, else the one of the current folder), never
+# the checkout these scripts are in.
+main=$SHIPLINE_REPO
+common=$(git -C "$main" rev-parse --path-format=absolute --git-common-dir) || exit 1
+# What the tick and the gate ask git, they ask of the repository, whichever folder ran it.
+cd "$main" || exit 1
 
-# A second tick exits while the first still runs.
-mkdir -p "$main/.local/workflow"
-exec 9>"$main/.local/workflow/tick.lock"
+# A second tick exits while the first still runs. The lock is in the git common directory, where
+# no change of shipline.json moves it: a tick that reads a new state folder still waits for one
+# that read the old.
+mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
+exec 9>"$common/shipline-tick.lock"
 if ! flock --nonblock 9; then
   echo "the tick before this one is still running"
   exit 0
@@ -118,7 +134,7 @@ said_finished() {
   [[ $1 != ticket-* ]] || words="worker finished"
   [[ $1 != hunt-* ]] || words="hunt finished"
   words=${2:-$words}
-  notes=$main/.claude/worktrees/$1/.local/workflow/$1
+  notes=$main/.claude/worktrees/$1/$SHIPLINE_STATE_FOLDER/$1
   if [[ $1 == ticket-* && -e $notes.codex ]]; then
     # An answered turn is no longer the current work, even before its successor ends.
     [[ ! -e $notes.owner-reply ]] || return 1
@@ -164,7 +180,7 @@ asks_owner() {
 
 # The open pull requests labelled `workflow`: number, true for a draft, and base branch.
 list_pull_requests() {
-  gh pr list --label workflow --state open --limit 1000 --json number,isDraft,baseRefName \
+  gh pr list --label "$SHIPLINE_LABEL_WORKFLOW" --state open --limit 1000 --json number,isDraft,baseRefName \
     --jq '.[] | "\(.number) \(.isDraft) \(.baseRefName)"' 9>&-
 }
 
@@ -174,7 +190,7 @@ list_pull_requests() {
 # for each session and head. GitHub is asked again, as the reviewer may have merged since the
 # snapshot.
 note_rule_break() {
-  local number=$1 folder=$main/.local/workflow state head event
+  local number=$1 folder=$main/$SHIPLINE_STATE_FOLDER state head event
   [[ ! -e $folder/merge-wanted-$number && ! -e $folder/merge-review-$number &&
      ! -e $folder/batch-merged-$number ]] || return 0
   read -r state _ head < <(gh pr view "$number" --json state,headRefName,headRefOid \
@@ -191,7 +207,7 @@ note_rule_break() {
 
 # Read from the time written on the note `session start hunt` leaves.
 is_over_its_time() {
-  local started=$main/.claude/worktrees/$1/.local/workflow/$1.started
+  local started=$main/.claude/worktrees/$1/$SHIPLINE_STATE_FOLDER/$1.started
   [[ -n $(find "$started" -mmin "+$HUNT_STOPPED_AFTER_MINUTES" 2>/dev/null) ]]
 }
 
@@ -254,7 +270,7 @@ reset_has_passed() {
 # The note of the reset after which a session was last sent its instruction. It holds the
 # moment and not the words of the line: the same hour on another day is another reset.
 resent_mark() {
-  echo "$main/.claude/worktrees/ticket-${1#*-}/.local/workflow/$1.resent"
+  echo "$main/.claude/worktrees/ticket-${1#*-}/$SHIPLINE_STATE_FOLDER/$1.resent"
 }
 
 failed=0
@@ -306,8 +322,8 @@ local_duties() {
 # Set in the timer environment, or persistently in this file. Claude stays the default until
 # the owner has compared the three Codex trial tickets.
 program=${WORKFLOW_WORKER_PROGRAM:-}
-if [[ -z $program && -r $main/.local/workflow/worker-program ]]; then
-  read -r program <"$main/.local/workflow/worker-program"
+if [[ -z $program && -r $main/$SHIPLINE_STATE_FOLDER/worker-program ]]; then
+  read -r program <"$main/$SHIPLINE_STATE_FOLDER/worker-program"
 fi
 program=${program:-claude}
 [[ $program =~ ^(claude|codex|cloud)$ ]] || { echo "invalid worker program: $program" >&2; exit 1; }
@@ -336,7 +352,7 @@ snapshot=$WORKFLOW_TRAIN_TICK/pulls.json
 # train serves: by priority, then the older ticket.
 labelled_pulls() {
   jq -r -L "$here" 'include "priority";
-    [.[] | select(any(.labels[]; .name == "workflow"))] | sort_by(priority_rank, .number) |
+    [.[] | select(any(.labels[]; .name == workflow_label))] | sort_by(priority_rank, .number) |
     .[] | "\(.number) \(.isDraft) \(.baseRefName)"' "$snapshot"
 }
 if ! python3 "$here/tick_snapshot.py" create "$snapshot" 9>&- || ! pulls=$(labelled_pulls); then
@@ -349,7 +365,7 @@ fi
 
 while read -r name state _; do
   # Codex's latest turn is authoritative even if its bridge never ran the Stop hook.
-  if [[ $name == ticket-* && -e $main/.claude/worktrees/$name/.local/workflow/$name.codex ]]; then
+  if [[ $name == ticket-* && -e $main/.claude/worktrees/$name/$SHIPLINE_STATE_FOLDER/$name.codex ]]; then
     if ! grep -qE "^${name#ticket-} true " <<<"$pulls" && said_finished "$name"; then
       session stop "$name" || failed=1
       continue
@@ -362,7 +378,7 @@ while read -r name state _; do
   [[ $state == idle ]] || continue
   # A Codex worker whose bridge ended is listed idle, and nobody would read its end or relay
   # its question. Its bridge is started again; it shows Codex's last turn.
-  if [[ $name == ticket-* && -e $main/.claude/worktrees/$name/.local/workflow/$name.codex ]] &&
+  if [[ $name == ticket-* && -e $main/.claude/worktrees/$name/$SHIPLINE_STATE_FOLDER/$name.codex ]] &&
       ! tmux -L "$name" has-session -t "=$name" 2>/dev/null 9>&- &&
       { grep -qE "^${name#ticket-} true " <<<"$pulls" || ! said_finished "$name"; }; then
     session bridge "$name" || failed=1
@@ -381,7 +397,7 @@ while read -r name state _; do
       # A reviewed stack member waits for its base; do not start it every three minutes.
       head=$(git -C "$main/.claude/worktrees/ticket-${name#review-}" rev-parse HEAD 9>&-) ||
         { failed=1; continue; }
-      echo "$head" >"$main/.local/workflow/$name.head" || { failed=1; continue; }
+      echo "$head" >"$main/$SHIPLINE_STATE_FOLDER/$name.head" || { failed=1; continue; }
     fi
     if [[ $name == review-* ]] && grep -qxF "${name#review-} false main" <<<"$pulls"; then
       # Unread, the break would be lost with the session: it waits for the next tick.
@@ -418,7 +434,7 @@ while read -r name state _; do
   number=${BASH_REMATCH[2]}
   # Another member's gate call merged this one in a batch: it is no longer open or in the
   # train, and its own session still owes the after-merge duties.
-  batch_merged=$main/.local/workflow/batch-merged-$number
+  batch_merged=$main/$SHIPLINE_STATE_FOLDER/batch-merged-$number
   if [[ -e $batch_merged ]]; then
     :
   elif [[ $name == review-* ]]; then
@@ -429,7 +445,7 @@ while read -r name state _; do
       <<<"$train" >/dev/null || continue
   fi
   worktree=$main/.claude/worktrees/ticket-$number
-  notes=$worktree/.local/workflow/$name
+  notes=$worktree/$SHIPLINE_STATE_FOLDER/$name
   # `.pushed` also protects questions left by hooks from before owner-blocked existed.
   [[ $name == audit-* || -e $notes.started ]] || continue
   [[ -e $notes.checks-wait || ($name == review-* && $state == idle) ]] || continue
@@ -438,7 +454,7 @@ while read -r name state _; do
   said_finished "$name" "review sent back" && continue
   asks_owner "$name" && continue
   if [[ -e $batch_merged ]]; then
-    mark=$main/.local/workflow/$name.batch-merged-nudged
+    mark=$main/$SHIPLINE_STATE_FOLDER/$name.batch-merged-nudged
     [[ ! -e $mark ]] || continue
     # The squash commit, or the merged head when the gate could not read main after it.
     squash=$(jq -er '(.squash // .head) | select(type == "string" and test("^[0-9a-f]{40}$"))' \
@@ -468,7 +484,7 @@ while read -r name state _; do
   # and train-turn gates, using the same owner/input protections as a checks wake.
   if jq -e '.baseRefName == "main" and
     (.mergeable == "CONFLICTING" or .mergeStateStatus == "DIRTY")' <<<"$pull" >/dev/null; then
-    mark=$main/.local/workflow/$name.conflict-nudged-$head
+    mark=$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-$head
     [[ ! -e $mark ]] || continue
     if delivery=$(session conflict-found "$name" "$head" 2>&1); then
       nudged+="$name "
@@ -482,14 +498,14 @@ while read -r name state _; do
     fi
     continue
   fi
-  mark=$main/.local/workflow/$name.checks-nudged-$head
+  mark=$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-$head
   if jq -e --arg number "$number" '.waiting | index($number) != null' <<<"$train" >/dev/null; then
     [[ $(jq -r '.first' <<<"$train") == "$number" ]] || continue
     # A turn can arrive after this head's checks already woke the reviewer. Persist a
     # separate token so restarting the tick neither loses the turn nor repeats it.
     turn=$(jq -r '.turn' <<<"$train")
-    health=$(sha256sum "$main/.local/workflow/main-status") || { failed=1; continue; }
-    mark=$main/.local/workflow/$name.train-nudged-$turn-${health%% *}-$head
+    health=$(sha256sum "$main/$SHIPLINE_STATE_FOLDER/main-status") || { failed=1; continue; }
+    mark=$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-$turn-${health%% *}-$head
   fi
   # A check GitHub lost after its run finished never completes: the gate runs CI again for it.
   # In the line, the wake still comes again for a new turn or state of main.
@@ -500,23 +516,24 @@ while read -r name state _; do
     if [[ $mark == */$name.train-nudged-* ]]; then
       mark=$mark-lost
     else
-      mark=$main/.local/workflow/$name.lost-nudged-$head
+      mark=$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head
     fi
   fi
   [[ ! -e $mark ]] || continue
   # CI result is always scheduled, so a partial rollup before it exists is not done.
   # Only skipped image planners means the draft run; ready must get its new run first.
   # GitHub keeps skipped draft checks beside the ready run on the same head.
-  [[ $lost == true ]] || jq -e '.statusCheckRollup | type == "array" and
-    any(.[]; .name == "CI result") and
-    (all(.[]; .name != "Docker images: what to run") or
-      any(.[]; .name == "Docker images: what to run" and .conclusion != "SKIPPED")) and all(.[];
+  [[ $lost == true ]] || jq -e --arg result "$SHIPLINE_CI_RESULT" \
+    --arg images "$SHIPLINE_IMAGES_PLAN" '.statusCheckRollup | type == "array" and
+    any(.[]; .name == $result) and
+    (all(.[]; .name != $images) or
+      any(.[]; .name == $images and .conclusion != "SKIPPED")) and all(.[];
     if .__typename == "CheckRun" then .status == "COMPLETED"
     elif .__typename == "StatusContext" then (.state | IN("SUCCESS", "FAILURE", "ERROR"))
     else false end)' <<<"$pull" >/dev/null || continue
   if [[ ! -e $notes.checks-wait ]]; then
     started=$(stat -c %Y "$notes.started" 9>&-) || continue
-    if ! reviews=$(gh api --paginate "repos/$repository/pulls/$number/reviews" 9>&-); then
+    if ! reviews=$(gh api --paginate "repos/$SHIPLINE_REPOSITORY/pulls/$number/reviews" 9>&-); then
       failed=1
       continue
     fi
@@ -587,7 +604,7 @@ screen_sum() {
 
 # A line for the wake, kept until the orchestrator was told it. `key` names it once.
 note_for_wake() {
-  local key=$1 line=$2 folder=$main/.local/workflow/stuck.pending
+  local key=$1 line=$2 folder=$main/$SHIPLINE_STATE_FOLDER/stuck.pending
   mkdir -p "$folder" && jq -n --arg line "$line" '{line: $line}' >"$folder/$key.json"
 }
 
@@ -599,7 +616,7 @@ quiet() {
   [[ $nudged != *" $1 "* ]] && ! said_finished "$1" && ! said_finished "$1" "review sent back" &&
     ! asks_owner "$1" && {
       bash "$here/bridge-empty" "$1" 9>&- ||
-        [[ -e $main/.claude/worktrees/ticket-${1#*-}/.local/workflow/$1.typed ]]
+        [[ -e $main/.claude/worktrees/ticket-${1#*-}/$SHIPLINE_STATE_FOLDER/$1.typed ]]
     }
 }
 
@@ -615,7 +632,7 @@ running=$(session list) || failed=1
 while read -r name state _; do
   [[ $state != limit && $name =~ ^(ticket|review)-([0-9]+)$ ]] || continue
   number=${BASH_REMATCH[2]}
-  notes=$main/.claude/worktrees/ticket-$number/.local/workflow/$name
+  notes=$main/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER/$name
   [[ ! -e $notes.codex ]] || continue
   [[ ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked ]] || continue
 
@@ -630,7 +647,7 @@ while read -r name state _; do
       jq -e --arg number "$number" '.waiting | index($number) != null' <<<"$train" >/dev/null 2>&1; then
     since=$(written_at "$notes.idle")
   fi
-  mark=$main/.local/workflow/$name.kept-alive
+  mark=$main/$SHIPLINE_STATE_FOLDER/$name.kept-alive
   if [[ $since =~ ^[0-9]+$ && ! -e $notes.asking ]] && ((NOW - since >= KEEP_ALIVE_AFTER_SECONDS)) &&
       [[ ! -r $mark || $(<"$mark") != "$since" ]] && quiet "$name"; then
     delivery=$(session status-check "$name" 2>&1)
@@ -648,14 +665,14 @@ while read -r name state _; do
 
   # A worker whose pull request is ready, idle without "worker finished": the tick stopped it
   # above if it had said so. Ready is counted from when the tick first saw it ready.
-  ready=$main/.local/workflow/$name.ready-seen
+  ready=$main/$SHIPLINE_STATE_FOLDER/$name.ready-seen
   if [[ $name == ticket-* ]] && grep -qE "^$number false " <<<"$pulls"; then
     [[ -r $ready ]] || echo "$NOW" >"$ready" || failed=1
     ready_at=""
     [[ ! -r $ready ]] || read -r ready_at <"$ready"
     idle_at=""
     [[ ! -e $notes.idle ]] || idle_at=$(written_at "$notes.idle")
-    mark=$main/.local/workflow/$name.ready-nudged
+    mark=$main/$SHIPLINE_STATE_FOLDER/$name.ready-nudged
     if [[ $ready_at =~ ^[0-9]+$ && $idle_at =~ ^[0-9]+$ ]] &&
         ((NOW - (ready_at > idle_at ? ready_at : idle_at) >= READY_UNFINISHED_SECONDS)) &&
         [[ ! -r $mark || $(<"$mark") != "$ready_at" ]] && quiet "$name"; then
@@ -679,7 +696,7 @@ while read -r name state _; do
   if activity=$(session running "$name" 2>/dev/null); then
     loop=$(jq -r '.finds_itself // ""' <<<"$activity")
     if [[ -n $loop ]]; then
-      mark=$main/.local/workflow/$name.loop-noted
+      mark=$main/$SHIPLINE_STATE_FOLDER/$name.loop-noted
       if [[ ! -r $mark || $(<"$mark") != "$loop" ]]; then
         if note_for_wake "$name-loop-$NOW" "wait loop finds itself? $name (running: $loop)"; then
           printf '%s\n' "$loop" >"$mark" || failed=1
@@ -694,7 +711,7 @@ while read -r name state _; do
   fi
 
   # Busy, and not a session that ended its turn to wait for its own job.
-  seen=$main/.local/workflow/$name.screen-seen
+  seen=$main/$SHIPLINE_STATE_FOLDER/$name.screen-seen
   if [[ $state != busy || -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]]; then
     rm -f "$seen"
     continue
@@ -710,7 +727,7 @@ while read -r name state _; do
     continue
   fi
   ((NOW - last_since >= STUCK_AFTER_SECONDS)) || continue
-  mark=$main/.local/workflow/$name.stuck-noted
+  mark=$main/$SHIPLINE_STATE_FOLDER/$name.stuck-noted
   [[ ! -r $mark || $(<"$mark") != "$last_since" ]] || continue
   what=$(jq -r '.running // ""' <<<"$activity")
   line="stuck? $name ($(((NOW - last_since) / 60)) min, running: ${what:-no command})"
@@ -729,7 +746,7 @@ running=$(session list) || failed=1
 # A draft goes to the cloud, if its screen check allows, by the cloud default (a Codex fix
 # round stays on Codex), or by a reservation or a cloud-built marker of its own.
 cloud_candidate() {
-  local notes=$main/.local/workflow
+  local notes=$main/$SHIPLINE_STATE_FOLDER
   [[ ( $program == cloud && ! -e $notes/codex-built-$1 ) ||
      -e $notes/cloud-built-$1 || -e $notes/cloud-$1 ]]
 }
@@ -744,10 +761,10 @@ while read -r number draft base; do
   if ((local_starts_held)); then
     [[ $draft == true ]] && cloud_candidate "$number" || continue
   fi
-  if [[ -e $main/.local/workflow/cloud-$number ]]; then
+  if [[ -e $main/$SHIPLINE_STATE_FOLDER/cloud-$number ]]; then
     [[ $draft == true ]] && python3 -B "$here/cloud_workers.py" retryable "$main" "$number" || continue
   fi
-  if [[ -e $main/.local/workflow/merge-review-$number ]]; then
+  if [[ -e $main/$SHIPLINE_STATE_FOLDER/merge-review-$number ]]; then
     ((local_starts_held == 0)) || continue
     # A hand-back's fresh reviewer, at its pull request's place in the order.
     python3 -B "$here/merge_driver.py" --start-hand-back "$number" 9>&-
@@ -755,8 +772,8 @@ while read -r number draft base; do
     ((started == 0 || started == 75)) || failed=1
     continue
   fi
-  [[ ! -e $main/.local/workflow/merge-wanted-$number &&
-     ! -e $main/.local/workflow/merge-review-$number ]] || continue
+  [[ ! -e $main/$SHIPLINE_STATE_FOLDER/merge-wanted-$number &&
+     ! -e $main/$SHIPLINE_STATE_FOLDER/merge-review-$number ]] || continue
   grep -qE "^(ticket|audit|review)-$number " <<<"$running" && continue
   # The start before this one may have taken minutes. Asked again, so that a pull request
   # marked ready in that time gets no worker: its own worker finished it.
@@ -767,7 +784,7 @@ while read -r number draft base; do
     break
   fi
   grep -qxF "$number $draft $base" <<<"$now" || continue
-  if [[ -e $main/.local/workflow/cloud-$number ]]; then
+  if [[ -e $main/$SHIPLINE_STATE_FOLDER/cloud-$number ]]; then
     [[ $draft == true ]] && python3 -B "$here/cloud_workers.py" retryable "$main" "$number" || continue
   fi
   if [[ $draft == true ]]; then
@@ -776,13 +793,13 @@ while read -r number draft base; do
     if cloud_candidate "$number" && node "$here/codex-eligible.mjs" "$number" 9>&-; then
       python3 -B "$here/cloud_workers.py" allowed "$main" || continue
       session start worker "$number" medium cloud
-    elif [[ ! -e $main/.local/workflow/cloud-$number &&
-          ( $program == codex || -e $main/.local/workflow/codex-built-$number ) ]] &&
+    elif [[ ! -e $main/$SHIPLINE_STATE_FOLDER/cloud-$number &&
+          ( $program == codex || -e $main/$SHIPLINE_STATE_FOLDER/codex-built-$number ) ]] &&
       node "$here/codex-eligible.mjs" "$number" 9>&-; then
       ((local_starts_held == 0)) || continue
       session start worker "$number" medium codex
     else
-      [[ ! -e $main/.local/workflow/cloud-$number ]] || continue
+      [[ ! -e $main/$SHIPLINE_STATE_FOLDER/cloud-$number ]] || continue
       ((local_starts_held == 0)) || continue
       session start worker "$number"
     fi
@@ -792,7 +809,7 @@ while read -r number draft base; do
     ((local_starts_held == 0)) || continue
     head=$(gh pr view "$number" --json state,headRefName,headRefOid \
       --jq '"\(.state) \(.headRefName) \(.headRefOid)"' 9>&-) || { failed=1; continue; }
-    mark=$main/.local/workflow/review-$number.head
+    mark=$main/$SHIPLINE_STATE_FOLDER/review-$number.head
     if [[ $base == main ]]; then
       rm -f "$mark" || { failed=1; continue; }
     else
@@ -800,7 +817,7 @@ while read -r number draft base; do
     fi
     # Published independent rounds survive session restarts. Only the owner's allowance
     # for the exact next round may exceed the two-round limit.
-    if ! reviews=$(gh api --paginate "repos/$repository/pulls/$number/reviews" 9>&-); then
+    if ! reviews=$(gh api --paginate "repos/$SHIPLINE_REPOSITORY/pulls/$number/reviews" 9>&-); then
       echo "cannot read reviews for pull request $number; the next tick tries again" >&2
       failed=1
       continue
@@ -814,17 +831,17 @@ while read -r number draft base; do
     fi
     read -r round sent_back <<<"$history"
     branch=${head#* }
-    python3 -B "$here/reviewer_start.py" "$main/.local/workflow" "$number" "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&-
+    python3 -B "$here/reviewer_start.py" "$main/$SHIPLINE_STATE_FOLDER" "$number" "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&-
     started=$?
     ((started == 0 || started == 2)) || failed=1
   fi
 done <<<"$pulls"
 
-python3 -B "$here/reviewer_start.py" --reconcile "$main/.local/workflow" 9>&- || failed=1
+python3 -B "$here/reviewer_start.py" --reconcile "$main/$SHIPLINE_STATE_FOLDER" 9>&- || failed=1
 
 # After this tick's own starts, which count as starts too: the next draft ticket gets the label
 # when one may start, and the next tick starts its worker.
-WORKFLOW_REPOSITORY=$repository python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
+python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
   failed=1
 
 wake_done=1
