@@ -54,7 +54,7 @@ _CONFLICTS = """
     import subprocess
 
 
-    class MechanicalConflict(Exception):
+    class CannotResolve(Exception):
         pass
 
 
@@ -68,7 +68,7 @@ _CONFLICTS = """
         files = _git("diff", "--name-only", "--diff-filter=U").split()
         for path in files:
             if not path.startswith("db/"):
-                raise MechanicalConflict(f"{path} is not a numbered file")
+                raise CannotResolve(f"{path} is not a numbered file")
             _git("checkout", "--theirs", "--", path)
             _git("add", "--", path)
         return files
@@ -81,7 +81,7 @@ _CONFLICTS = """
     def renumber_migrations(head: str, main: str) -> dict[str, str]:
         taken = taken_migrations(head, main)
         if "db/0002_seven.py" in taken:
-            raise MechanicalConflict("db/0002_seven.py: its number is used twice")
+            raise CannotResolve("db/0002_seven.py: its number is used twice")
         return {}
 """
 
@@ -194,8 +194,6 @@ def _advisories(workflow: Workflow) -> None:
         "scripts/workflow/merge_handoff.py",
         """
         SERVICES = {"npm": "registry.example.org", "PyPI": "pypi.example.org"}
-        def note_down(folder):
-            raise AssertionError("Shipline notes the outage itself")
     """,
     )
     _write(
@@ -211,7 +209,6 @@ def _advisories(workflow: Workflow) -> None:
         """
         import re
         import merge_handoff
-        from merge_handoff import note_down
 
 
         def unreachable(output: str) -> str | None:
@@ -223,10 +220,6 @@ def _advisories(workflow: Workflow) -> None:
 
         def answers(service: str) -> bool:
             return service in merge_handoff.SERVICES and service != "PyPI"
-
-
-        def note_up(folder):
-            raise AssertionError("Shipline notes the outage itself")
     """,
     )
     _configure(
@@ -334,7 +327,7 @@ _CHECKOUT = """
         ).stdout.strip())
 
 
-    def install_if_changed(checkout: Path) -> str | None:
+    def install_changed(checkout: Path) -> str | None:
         if (checkout / "lock-broken").exists():
             return "the lockfile does not match package.json"
         return None
@@ -354,7 +347,7 @@ def _checkout(workflow: Workflow, source: str = _CHECKOUT) -> None:
         push_checkout={
             "run": "scripts/workflow/pushing_checkout.py",
             "form": "functions",
-            "functions": {"install": "install_if_changed", "refusal": "refusal"},
+            "functions": {"install": "install_changed", "refusal": "refusal"},
         },
     )
 
@@ -491,7 +484,7 @@ def test_server_selector_through_an_interpreter_reads_the_main_checkout(
     _configure(
         workflow,
         server_tests_for_changes=(
-            "uv run --project backend python scripts/workflow/server_tests_for_changes.py"
+            "uv run --project server python scripts/workflow/server_tests_for_changes.py"
         ),
     )
     worktree = workflow.add_worktree(7)
@@ -500,7 +493,7 @@ def test_server_selector_through_an_interpreter_reads_the_main_checkout(
     assert json.loads(done.stdout) == answer
     script = workflow.repo / "scripts/workflow/server_tests_for_changes.py"
     assert workflow.calls("uv") == [
-        f"uv run --project backend python {script} origin/main (in {worktree})"
+        f"uv run --project server python {script} origin/main (in {worktree})"
     ]
 
 
@@ -520,7 +513,7 @@ def _browser_wrapper(workflow: Workflow) -> None:
     _write(
         workflow,
         "scripts/workflow/browser-tests-for-changes",
-        '#!/bin/bash\nexec uv run --project backend python browser_tests_for_changes.py "$@"\n',
+        '#!/bin/bash\nexec uv run --project server python browser_tests_for_changes.py "$@"\n',
     )
     (workflow.repo / "scripts/workflow/browser-tests-for-changes").chmod(0o755)
 
@@ -556,7 +549,7 @@ def test_browser_wrapper_in_lines_and_json_forms_selects_the_same_specs(
         answers.append(done.stdout)
     assert answers == ["e2e/example.spec.ts\n"] * 3
     assert workflow.calls("uv")[-1] == (
-        "uv run --project backend python browser_tests_for_changes.py --ci origin/main "
+        "uv run --project server python browser_tests_for_changes.py --ci origin/main "
         f"--files-from {files} (in {worktree})"
     )
 
