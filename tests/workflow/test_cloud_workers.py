@@ -95,6 +95,35 @@ def test_cloud_start_records_the_printed_address_without_preparing_a_local_workt
     )
 
 
+def test_the_cloud_worker_is_told_to_push_as_one_so_its_push_runs_cis_tests(
+    workflow: Workflow,
+) -> None:
+    workflow.add_pull_request(7)
+    _comments(workflow, _comment(8, "worker finished"))
+
+    done = workflow.run("start", "worker", "7", "cloud", env=_ENV)
+
+    assert done.returncode == 0, done.stderr
+    sentence = (workflow.state / "cloud-args").read_bytes().decode().split("\0")[3]
+    assert (
+        "Export SHIPLINE_CLOUD_WORKER=1 in every shell before pushing: the pre-push hook then "
+        "also runs the tests CI will run for this change, as "
+        "shipline ci-tests-for-changes shows them; run each push in the background and wait "
+        "for it, since each suite may take up to 25 minutes."
+    ) in sentence
+    assert (
+        "When this container runs as root, also export SHIPLINE_CLOUD_TEST_USER naming the "
+        "unprivileged user the tests run as, give that user the checkout with chown -R, and "
+        "mark the checkout safe for git with git config --global --add safe.directory, as root "
+        "and as that user."
+    ) in sentence
+    assert (
+        'Only after the server suite timed out in a push, export '
+        'SHIPLINE_CLOUD_SERVER_PART="1 of 4" (or another part) to run that part as CI parts '
+        "it, and unset it once it is not needed."
+    ) in sentence
+
+
 def test_start_and_list_use_the_same_per_ticket_lock_as_local_workers(workflow: Workflow) -> None:
     workflow.add_pull_request(7)
     notes = workflow.repo / ".local/workflow"

@@ -115,6 +115,21 @@ def test_daily_prefix_savings_from_merged_proof_counts_only_avoided_runs(night: 
     assert line in night.sent()[-1]
 
 
+def test_a_shadow_wake_keeps_no_savings_report_and_the_real_wake_still_sends_it(
+    night: Workflow,
+) -> None:
+    _savings_day(night)
+    night.orchestrator("idle")
+    shadow = night.root / "shadow.log"
+    done = night.run_script("wake", env={**_at(3, 0), "SHIPLINE_SHADOW": str(shadow)})
+    assert done.returncode == 0, done.stderr
+    state = night.repo / ".local/workflow"
+    assert not list(state.glob("prefix-savings*"))
+    assert "Prefix-only runner minutes saved" not in shadow.read_text()
+    assert _wake(night, at=_at(3, 0)).returncode == 0
+    assert "saved (2026-10-12 UTC): images 24.00" in night.sent()[-1]
+
+
 def test_daily_prefix_savings_retries_delivery_then_sends_once(night: Workflow) -> None:
     _savings_day(night)
     night.orchestrator("idle")

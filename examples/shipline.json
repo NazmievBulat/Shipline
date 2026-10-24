@@ -16,7 +16,8 @@
     "hunt_browser": "node tools/shipline/hunt-browser.mjs",
     "hunt_cursor": "tools/shipline/hunt-cursor",
     "advisory_watch": "tools/shipline/advisory-watch",
-    "push_checkout": "tools/shipline/push-checkout"
+    "push_checkout": "tools/shipline/push-checkout",
+    "push_checks": "tools/shipline/push-checks"
   },
   "checks": {
     "ci_result": "Build result",
@@ -90,5 +91,21 @@
       "^app/auth/", "^app/permissions/", "^config/secrets"
     ]
   },
-  "answer_for_owner_after_minutes": 15
+  "answer_for_owner_after_minutes": 15,
+  "cloud_pre_push": {
+    "suites": {
+      "server": {
+        "select": "tools/shipline/server-tests-for-changes",
+        "run": "tools/shipline/server-tests --workers {workers}",
+        "workers": 4,
+        "part": "--shard {shard}/{shards}"
+      },
+      "browser": {
+        "select": "tools/shipline/browser-tests-for-changes --ci",
+        "run": "tools/shipline/browser-tests --workers {workers}",
+        "workers": 2,
+        "probe": "tools/shipline/browser-starts"
+      }
+    }
+  }
 }
