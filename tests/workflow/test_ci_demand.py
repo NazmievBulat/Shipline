@@ -164,7 +164,9 @@ def test_only_working_cloud_workers_busy_sessions_and_unchecked_ready_pulls_coun
     demand.pull(13, runs=[_ci(130)])
     # Ready and unchecked, but no ticket of the workflow: no push of it is on its way.
     demand.pull(14, draft=False, runs=[_ci(140)], labels=())
-    sessions = "ticket-11  idle  100 MB held\nreview-13  limit  0 MB held  session limit  resets 4pm\n"
+    sessions = (
+        "ticket-11  idle  100 MB held\nreview-13  limit  0 MB held  session limit  resets 4pm\n"
+    )
 
     forecast = demand.write(sessions + "hunt-x  busy  0 MB held\naudit-11  busy  0 MB held\n")
 
@@ -344,7 +346,9 @@ def test_the_forecast_is_written_whole_for_its_owner_alone(demand: Demand) -> No
 
     mode = stat.S_IMODE(demand.forecast.stat().st_mode)
     assert mode == 0o600
-    assert [path.name for path in demand.forecast.parent.iterdir() if path.name.startswith(".")] == []
+    assert [
+        path.name for path in demand.forecast.parent.iterdir() if path.name.startswith(".")
+    ] == []
 
 
 def test_the_tick_counts_a_session_busy_before_it(workflow: Workflow) -> None:

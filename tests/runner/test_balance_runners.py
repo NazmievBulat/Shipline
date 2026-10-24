@@ -27,6 +27,7 @@ MINUTE = 60
 ORDINARY = "example-app-home"
 DOCKER = "example-app-home-docker"
 STANDBY = "example-app-home-standby"
+API = "repos/example-owner/example-app/actions"
 
 # Answers the queued and running runs, each run's jobs and the runners from `github.json`, deletes
 # a runner's registration unless it runs a job (or `busy-on-delete` names it, a job it took since
@@ -45,7 +46,18 @@ with open(state / "calls.log", "a") as log:
 if (state / "fail-gh").exists():
     sys.exit(1)
 github = json.loads((state / "github.json").read_text())
-path = arguments[-1]
+path = next(argument for argument in arguments if argument.startswith("repos/"))
+
+
+def answer(key, items):
+    # With --jq the caller asked for one item a line, from every page.
+    if "--jq" in arguments:
+        for item in items:
+            print(json.dumps(item))
+    else:
+        print(json.dumps({"total_count": len(items), key: items}))
+
+
 api = "repos/example-owner/example-app/actions"
 if arguments[:3] == ["api", "-X", "DELETE"]:
     found = re.fullmatch(api + r"/runners/(\\d+)", path)
@@ -57,13 +69,13 @@ if arguments[:3] == ["api", "-X", "DELETE"]:
     github["runners"].remove(runner)
     (state / "github.json").write_text(json.dumps(github))
 elif found := re.fullmatch(api + r"/runs/(\\d+)/jobs\\?per_page=100", path):
-    print(json.dumps({"jobs": github["jobs"].get(found[1], [])}))
+    answer("jobs", github["jobs"].get(found[1], []))
 elif urlsplit(path).path == api + "/runs":
     status = parse_qs(urlsplit(path).query)["status"][0]
-    runs = [run for run in github["runs"] if run["status"] == status]
-    print(json.dumps({"total_count": len(runs), "workflow_runs": runs}))
+    # A run that moved from queued to running between the two reads is in both.
+    answer("workflow_runs", [run for run in github["runs"] if run["status"] in (status, "both")])
 elif path == api + "/runners?per_page=100":
-    print(json.dumps({"total_count": len(github["runners"]), "runners": github["runners"]}))
+    answer("runners", github["runners"])
 else:
     print(f"gh: could not answer {arguments}", file=sys.stderr)
     sys.exit(1)
@@ -157,10 +169,22 @@ class Machine:
             f"MemTotal:       65536000 kB\nMemFree:         1000000 kB\nMemAvailable:   {kb} kB\n"
         )
 
-    def registered(self, *, ordinary: int, docker: int, busy: tuple[str, ...] = ()) -> None:
+    def registered(
+        self,
+        *,
+        ordinary: int,
+        docker: int,
+        busy: tuple[str, ...] = (),
+        unlabelled: tuple[str, ...] = (),
+        lent: bool = False,
+    ) -> None:
         """The runners GitHub lists: this machine's slots and its spare, its Docker runners, its
-        main runner, the planner and another machine's two slots."""
-        names = [(f"box-{k}", ORDINARY) for k in range(1, ordinary + 1)]
+        main runner (`lent`: with the pool's label beside its own), the planner and another
+        machine's two slots. A slot named in `unlabelled` waits for keep-spare.sh's label."""
+        names = [
+            (f"box-{k}", STANDBY if f"box-{k}" in unlabelled else ORDINARY)
+            for k in range(1, ordinary + 1)
+        ]
         names += [(f"box-{ordinary + 1}", STANDBY)]
         names += [(f"box-docker-{k}", DOCKER) for k in range(1, docker + 1)]
         names += [
@@ -175,7 +199,8 @@ class Machine:
                 "name": name,
                 "status": "online",
                 "busy": name in busy,
-                "labels": [{"name": "self-hosted"}, {"name": label}],
+                "labels": [{"name": "self-hosted"}, {"name": label}]
+                + ([{"name": ORDINARY}] if lent and name == "box-main" else []),
             }
             for number, (name, label) in enumerate(names, start=1)
         ]
@@ -526,7 +551,10 @@ def test_one_change_every_five_minutes(machine: Machine) -> None:
     assert machine.count("ordinary_jobs") == 4
     machine.run(after_minutes=1)
     assert machine.count("ordinary_jobs") == 5
-    assert machine.changes() == ["added an ordinary slot (3 to 4)", "added an ordinary slot (4 to 5)"]
+    assert machine.changes() == [
+        "added an ordinary slot (3 to 4)",
+        "added an ordinary slot (4 to 5)",
+    ]
 
 
 def test_moving_a_docker_runner_to_an_ordinary_slot_drains_it_first(machine: Machine) -> None:
@@ -762,7 +790,10 @@ def test_no_docker_runner_starts_without_kvm(machine: Machine) -> None:
 def test_the_runners_never_take_more_places_than_the_firewalls_range(machine: Machine) -> None:
     # Three slots, the spare and one Docker runner take five places: there are five.
     machine.settings(
-        ordinary=3, docker=1, bounds="balance_ordinary=2-5\nbalance_docker=1-2\n", extra="most_runners=5\n"
+        ordinary=3,
+        docker=1,
+        bounds="balance_ordinary=2-5\nbalance_docker=1-2\n",
+        extra="most_runners=5\n",
     )
     machine.queue(ORDINARY, 10)
 
@@ -789,7 +820,7 @@ def test_a_runners_registration_goes_before_its_unit(machine: Machine) -> None:
 
     calls = [call for call in machine.calls("") if call.startswith(("gh api -X", "systemctl"))]
     assert calls == [
-        f"gh api -X DELETE repos/example-owner/example-app/actions/runners/{_id(machine, 'box-docker-1')}",
+        f"gh api -X DELETE {API}/runners/{_id(machine, 'box-docker-1')}",
         "systemctl --user disable --now example-app-runner-docker@1.service",
     ]
 
@@ -842,8 +873,14 @@ def test_every_pool_script_reads_a_pool_settings_that_says_balance_off(machine: 
 
     # As keep-spare.sh and keep-runner.sh read them: in `sh`, stopping at any failed command.
     done = subprocess.run(
-        ["sh", "-eu", "-c", '. "$1/settings.sh"; . "$1/pool-settings.sh"; echo "$ordinary_jobs"',
-         "sh", str(machine.installed)],
+        [
+            "sh",
+            "-eu",
+            "-c",
+            '. "$1/settings.sh"; . "$1/pool-settings.sh"; echo "$ordinary_jobs"',
+            "sh",
+            str(machine.installed),
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -893,9 +930,7 @@ def test_the_spare_supervisor_reads_the_slots_the_balancer_wrote(machine: Machin
     state = str(machine.state)
     (machine.installed / "github_budget.py").write_text(_SPARE_BUDGET.replace("@STATE@", state))
     (machine.installed / "ordinary_slots.py").write_text("import sys\nprint(sys.argv[1])\n")
-    machine.fake(
-        "sleep", _SPARE_SLEEP.replace("@INSTALLED@", str(machine.installed))
-    )
+    machine.fake("sleep", _SPARE_SLEEP.replace("@INSTALLED@", str(machine.installed)))
     machine.settings(ordinary=1, docker=0)
     (machine.state / "listing.tsv").write_text(
         "".join(f"{k}\tbox-{k}\tonline\tfalse\tself-hosted,{STANDBY}\n" for k in (1, 2, 3))
@@ -941,8 +976,12 @@ if __name__ == "__main__":
 
 def test_a_reinstall_keeps_the_bounds_and_writes_the_docker_count(machine: Machine) -> None:
     source = machine.root / "source"
-    shutil.copytree(_ROOT / "runner", source, symlinks=False, ignore=shutil.ignore_patterns(
-        "github_budget.py", "github_identity.py", "__pycache__"))
+    shutil.copytree(
+        _ROOT / "runner",
+        source,
+        symlinks=False,
+        ignore=shutil.ignore_patterns("github_budget.py", "github_identity.py", "__pycache__"),
+    )
     (source / "github_budget.py").write_text(_INSTALL_BUDGET.replace("@STATE@", str(machine.state)))
     for name in ("Dockerfile", "vm.Dockerfile"):
         (source / name).write_text("FROM scratch\n")
@@ -950,8 +989,12 @@ def test_a_reinstall_keeps_the_bounds_and_writes_the_docker_count(machine: Machi
         (source / name).write_text("#!/bin/sh\n")
         (source / name).chmod(0o755)
     (source / "machines").mkdir()
-    (source / "machines/box.sh").write_text("roles='ordinary docker'\nordinary_jobs=2\ndocker_runners=1\n")
-    (source / "machines/other.sh").write_text("roles='ordinary'\nordinary_jobs=1\ndocker_runners=0\n")
+    (source / "machines/box.sh").write_text(
+        "roles='ordinary docker'\nordinary_jobs=2\ndocker_runners=1\n"
+    )
+    (source / "machines/other.sh").write_text(
+        "roles='ordinary'\nordinary_jobs=1\ndocker_runners=0\n"
+    )
     for tool in ("docker", "loginctl"):
         machine.fake(tool, f'#!/bin/bash\necho "{tool} $*" >> "@STATE@/calls.log"\n')
     # The machine as the balancer left it: other counts, and its own lines.
@@ -979,4 +1022,69 @@ def test_a_reinstall_keeps_the_bounds_and_writes_the_docker_count(machine: Machi
     units = machine.home / ".config/systemd/user"
     assert (units / "example-app-runner-balance.timer").is_file()
     assert (units / "example-app-runner-balance.service").is_file()
-    assert "systemctl --user enable --now example-app-runner-balance.timer" in machine.calls("systemctl")
+    assert "systemctl --user enable --now example-app-runner-balance.timer" in machine.calls(
+        "systemctl"
+    )
+
+
+def test_no_slot_is_added_while_one_waits_for_its_label(machine: Machine) -> None:
+    # keep-spare.sh gives the label to as many registrations as the slots: one has not got it
+    # (the Blacksmith slot count, say), so another slot would not take a job either.
+    machine.registered(ordinary=3, docker=1, unlabelled=("box-3",))
+    machine.settings(ordinary=3, docker=1, bounds="balance_ordinary=2-5\nbalance_docker=1-2\n")
+    machine.queue(ORDINARY, 10)
+
+    machine.run()
+
+    assert machine.calls("systemctl") == []
+
+
+def test_a_unit_that_does_not_start_is_switched_off_again(machine: Machine) -> None:
+    machine.queue(ORDINARY, 10)
+    (machine.state / "fail-systemctl-example-app-runner@5.service").touch()
+
+    machine.run(code=1)
+
+    assert machine.calls("systemctl") == [
+        "systemctl --user enable --now example-app-runner@5.service",
+        "systemctl --user disable --now example-app-runner@5.service",
+    ]
+    assert machine.count("ordinary_jobs") == 3
+
+
+def test_the_merge_lines_first_jobs_queue_for_the_ordinary_slots(machine: Machine) -> None:
+    machine.queue("example-app-home-first", 10)
+
+    machine.run()
+
+    assert machine.changes() == ["added an ordinary slot (3 to 4)"]
+
+
+def test_a_lent_main_runner_is_no_slot_of_the_pool(machine: Machine) -> None:
+    machine.registered(ordinary=3, docker=1, lent=True)
+    machine.forecast(ordinary=10, docker=0)
+
+    machine.run()
+
+    assert "forecast ordinary 6.0 of 10" in machine.log_lines()[0]
+
+
+def test_a_run_read_twice_counts_once(machine: Machine) -> None:
+    machine.queue(ORDINARY, 10)
+    machine.runs[0]["status"] = "both"
+
+    machine.run()
+
+    assert "queued ordinary 1 (oldest 10 min)" in machine.log_lines()[0]
+
+
+def test_a_queue_not_watched_for_fifteen_minutes_is_watched_again(machine: Machine) -> None:
+    machine.load(6.5)
+    machine.run()
+    machine.forget_calls()
+
+    # The balancer did not run for 16 minutes (a reboot, a budget pause): nothing says the queue
+    # stayed empty all that time.
+    machine.run(after_minutes=16)
+
+    assert machine.calls("systemctl") == []

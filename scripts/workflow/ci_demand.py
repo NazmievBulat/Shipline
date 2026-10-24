@@ -15,11 +15,11 @@ The pushes coming within half an hour are those of:
 A pull request counted by more than one of the first three pushes once. Each push starts the
 jobs its pull request's last runs started: for each of the CI, E2E and image workflows, the
 newest run of its branch that ran a job, the jobs of its first attempt (the one a push starts)
-counted by the runner label they asked for
-(the labels of `runner.labels` in `shipline.json`: one ending `-docker` is a Docker runner's,
-one ending `-main`, `-planner` or `-standby` is neither, any other an ordinary slot's). A skipped job
-counts for nothing, so Docker jobs count only when the pull request changes the images. A pull
-request with no such run counts as the others do on average, rounded up.
+counted by the runner label they asked for (the labels of `runner.labels` in `shipline.json`:
+one ending `-docker` is a Docker runner's, one ending `-main`, `-planner` or `-standby` is
+neither, any other an ordinary slot's). A skipped job counts for nothing, so Docker jobs count
+only when the pull request changes the images. A pull request with no such run counts as the
+others do on average, rounded up.
 
 The forecast goes to `~/.local/state/workflow/ci-demand.json`, written whole, mode 600:
 
@@ -236,12 +236,8 @@ def prefixes_to_build(notes: Path) -> list[int]:
         for member in (train.get("prefixes") or {}).get("members") or []
         if isinstance(member, dict)
     ]
-    start = (
-        line.index(running[-1]) + 1 if running and running[-1] in line else line.index(front)
-    )
-    eligible = [
-        number for number in line[start:] if number not in members and number not in held
-    ]
+    start = line.index(running[-1]) + 1 if running and running[-1] in line else line.index(front)
+    eligible = [number for number in line[start:] if number not in members and number not in held]
     return [int(number) for number in eligible[: max(window - len(members), 0)]]
 
 

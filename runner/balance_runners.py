@@ -123,6 +123,8 @@ SETTINGS_READ = (
     "machine",
     "label",
     "docker_label",
+    "first_label",
+    "main_label",
     "roles",
     "ordinary_jobs",
     "ordinary_spares",
@@ -153,7 +155,7 @@ def read_settings() -> dict[str, str]:
     SETTINGS_SECONDS."""
     script = (
         '. "$1" >/dev/null 2>&1 || exit 1; '
-        'balance() { [[ ${1-} == off ]] && balance_off=1; return 0; }; '
+        "balance() { [[ ${1-} == off ]] && balance_off=1; return 0; }; "
         '. "$2" >/dev/null 2>&1; shift 2; '
         'for name in "$@"; do printf "%s=%s\\0" "$name" "${!name-}"; done'
     )
@@ -198,6 +200,10 @@ class Machine:
     prefix: str
     name: str
     labels: dict[str, str]
+    # The jobs of the merge train's first member ask for its own label, which every slot carries
+    # beside the pool's (keep-spare.sh), and so does one of main's runners while it is lent.
+    first_label: str
+    main_label: str
     counts: dict[str, int]
     bounds: dict[str, tuple[int, int]]
     # The registered ordinary runners beyond the slots, and the most runners of all kinds.
@@ -245,8 +251,15 @@ def machine() -> Machine:
         "ordinary": values["label"],
         "docker": values.get("docker_label") or values["label"] + "-docker",
     }
-    if not LABEL.fullmatch(labels["docker"]):
-        raise Refused("the settings name no docker_label")
+    first_label = values.get("first_label") or values["label"] + "-first"
+    main_label = values.get("main_label") or values["label"] + "-main"
+    for name, label in (
+        ("docker_label", labels["docker"]),
+        ("first_label", first_label),
+        ("main_label", main_label),
+    ):
+        if not LABEL.fullmatch(label):
+            raise Refused(f"the settings name no {name}")
     roles = set(values.get("roles", "").split())
     ordinary = _number(values, "ordinary_jobs")
     if ordinary is None:
@@ -262,6 +275,8 @@ def machine() -> Machine:
         prefix=values["RUNNER_PREFIX"],
         name=values["machine"],
         labels=labels,
+        first_label=first_label,
+        main_label=main_label,
         counts=counts,
         bounds=bounds,
         spares=(_number(values, "ordinary_spares", 0) or 0) if "ordinary" in roles else 0,
@@ -282,9 +297,11 @@ def load_and_ceiling() -> tuple[float | None, float | None]:
     """The 5-minute load and the session start ceiling, each None when it cannot be read."""
     try:
         per = float(os.environ.get("WORKFLOW_LOAD_PER_PROCESSOR") or 1.5)
-        processors = int(subprocess.run(["nproc"], capture_output=True, text=True).stdout)
+        processors = int(
+            subprocess.run(["nproc"], capture_output=True, text=True, timeout=5).stdout
+        )
         ceiling = processors * per if processors > 0 and per > 0 else None
-    except OSError, ValueError:
+    except OSError, ValueError, subprocess.SubprocessError:
         ceiling = None
     try:
         path = os.environ.get("WORKFLOW_LOADAVG_FILE") or "/proc/loadavg"
@@ -322,13 +339,24 @@ def read_forecast(path: Path, moment: int) -> dict[str, float] | None:
 # What GitHub says.
 
 
-def _api(repository: str, path: str) -> Any:
+def _items(repository: str, path: str, key: str) -> list[dict[str, Any]]:
+    """Every item of a listing, from all its pages, one JSON object a line."""
     done = call(
-        "balancer", "api", f"repos/{repository}/{path}", timeout=GITHUB_SECONDS, identity=RUNNER
+        "balancer",
+        "api",
+        "--paginate",
+        f"repos/{repository}/{path}",
+        "--jq",
+        f".{key}[] | @json",
+        timeout=GITHUB_SECONDS,
+        identity=RUNNER,
     )
     if done.returncode:
         raise Refused(f"GitHub did not answer {path}: {done.stderr.strip()}")
-    return json.loads(done.stdout)
+    items = [json.loads(line) for line in done.stdout.splitlines() if line.strip()]
+    if not all(isinstance(item, dict) for item in items):
+        raise Refused(f"GitHub answered {path} with something that is not a list of objects")
+    return items
 
 
 def _seconds(text: str | None) -> float | None:
@@ -349,13 +377,24 @@ class Queue:
 def queues(box: Machine) -> dict[str, Queue]:
     """The queued and running jobs of the pool's two labels, every machine's."""
     found = {kind: Queue() for kind in KINDS}
-    labels = {box.label(kind): kind for kind in KINDS}
+    labels = {box.label(kind): kind for kind in KINDS} | {box.first_label: "ordinary"}
+    # A run that moved from queued to running between the two reads is in both.
+    read: set[int] = set()
     for status in ("queued", "in_progress"):
-        runs = _api(box.repository, f"actions/runs?status={status}&per_page={PER_PAGE}")
-        for run in runs["workflow_runs"]:
-            jobs = _api(box.repository, f"actions/runs/{int(run['id'])}/jobs?per_page={PER_PAGE}")
-            for job in jobs["jobs"]:
-                kind = next((labels[label] for label in job.get("labels") or [] if label in labels), None)
+        runs = _items(
+            box.repository, f"actions/runs?status={status}&per_page={PER_PAGE}", "workflow_runs"
+        )
+        for run in runs:
+            if int(run["id"]) in read:
+                continue
+            read.add(int(run["id"]))
+            jobs = _items(
+                box.repository, f"actions/runs/{int(run['id'])}/jobs?per_page={PER_PAGE}", "jobs"
+            )
+            for job in jobs:
+                kind = next(
+                    (labels[label] for label in job.get("labels") or [] if label in labels), None
+                )
                 if kind is None:
                     continue
                 queue = found[kind]
@@ -370,17 +409,18 @@ def queues(box: Machine) -> dict[str, Queue]:
 
 
 def runners(box: Machine) -> list[dict[str, Any]]:
-    return _api(box.repository, f"actions/runners?per_page={PER_PAGE}")["runners"]
+    return _items(box.repository, f"actions/runners?per_page={PER_PAGE}", "runners")
 
 
 def pool_slots(box: Machine, listed: list[dict[str, Any]]) -> dict[str, int]:
     """The pool's online runners of each kind, every machine's: those with the pool's ordinary
-    label and those with its Docker label. A main runner, a spare and the planner are neither."""
+    label and those with its Docker label. A main runner (also one lent to pull request jobs), a
+    spare and the planner are neither."""
     found = dict.fromkeys(KINDS, 0)
     for runner in listed:
-        if runner.get("status") != "online":
-            continue
         labels = {_label(label) for label in runner.get("labels") or []}
+        if runner.get("status") != "online" or box.main_label in labels:
+            continue
         for kind in KINDS:
             found[kind] += box.label(kind) in labels
     return found
@@ -388,6 +428,17 @@ def pool_slots(box: Machine, listed: list[dict[str, Any]]) -> dict[str, int]:
 
 def _label(label: Any) -> str:
     return str(label.get("name", "")) if isinstance(label, dict) else ""
+
+
+def labelled_slots(box: Machine, listed: list[dict[str, Any]]) -> int:
+    """This machine's registrations that carry the pool's label (keep-spare.sh gives it to as
+    many as the slots), busy or offline ones too."""
+    own = re.compile(rf"{re.escape(box.name)}-[0-9]+")
+    return sum(
+        bool(own.fullmatch(str(runner.get("name"))))
+        and box.label("ordinary") in {_label(label) for label in runner.get("labels") or []}
+        for runner in listed
+    )
 
 
 def idle(listed: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
@@ -581,11 +632,16 @@ def _start(box: Machine, kind: str) -> None:
     """Start the next runner of the kind, then write its count; a count that cannot be written
     stops the runner again."""
     unit = box.unit(kind, box.highest(kind) + 1)
-    systemctl("enable", "--now", unit)
     try:
+        systemctl("enable", "--now", unit)
         write_count(kind, box.counts[kind] + 1)
-    except OSError:
-        systemctl("disable", "--now", unit)
+    except (Refused, OSError):
+        # A unit enabled that did not start would come up at the next boot, at a place of the
+        # firewall's range no count holds.
+        try:
+            systemctl("disable", "--now", unit)
+        except Refused as error:
+            print(f"runner balance: {error}", file=sys.stderr)
         raise
     box.counts[kind] += 1
 
@@ -644,12 +700,14 @@ def apply(change: tuple[str, ...], box: Machine, view: View, listed: list[dict[s
     return True
 
 
-def _fits(box: Machine, kind: str, *, freed: int = 0) -> bool:
-    """One more of the kind fits its bounds, the firewall's places and the machine."""
+def _fits(box: Machine, kind: str, listed: list[dict[str, Any]], *, freed: int = 0) -> bool:
+    """One more of the kind fits its bounds, the firewall's places and the machine, and, for an
+    ordinary slot, would take a job: every slot there is has its label already."""
     return (
         box.counts[kind] < box.bounds[kind][1]
         and box.places() - freed + 1 <= box.most
         and (kind != "docker" or has_kvm())
+        and (kind != "ordinary" or labelled_slots(box, listed) >= box.counts[kind])
     )
 
 
@@ -672,10 +730,14 @@ def balance() -> int:
         state = {}
     if not isinstance(state.get("last_change"), (int, float)):
         state.pop("last_change", None)
+    # A queue not watched for longer than the time it must stay empty (the balancer stopped, a
+    # budget pause) is watched again from now.
+    seen = state.get("seen_at")
+    watched = isinstance(seen, (int, float)) and moment - seen <= EMPTY_FOR_SECONDS
     empty_since: dict[str, int | None] = {}
     for kind in KINDS:
         before = (state.get("empty_since") or {}).get(kind)
-        before = before if isinstance(before, (int, float)) else None
+        before = before if watched and isinstance(before, (int, float)) else None
         empty_since[kind] = None if found[kind].queued else before if before is not None else moment
     forecast = read_forecast(box.forecast_path, moment)
     slots = pool_slots(box, listed)
@@ -697,8 +759,8 @@ def balance() -> int:
         share=share,
         empty_since=empty_since,
         last_change=state.get("last_change"),
-        can_add={kind: _fits(box, kind) for kind in KINDS},
-        can_move_into={kind: _fits(box, kind, freed=1) for kind in KINDS},
+        can_add={kind: _fits(box, kind, listed) for kind in KINDS},
+        can_move_into={kind: _fits(box, kind, listed, freed=1) for kind in KINDS},
         forecast=forecast,
         first_share=first_share,
     )
@@ -713,6 +775,7 @@ def balance() -> int:
         state = {
             "empty_since": empty_since,
             "last_change": moment if changed else state.get("last_change"),
+            "seen_at": moment,
         }
         _save(STATE_FILE, json.dumps(state) + "\n")
     if change is None:
