@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# The workflow's daily numbers and its gap detectors (`workflow_metrics.py`); read-only.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec python3 -B "$here/workflow_metrics.py" "$@"

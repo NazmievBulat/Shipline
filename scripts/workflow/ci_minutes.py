@@ -56,7 +56,8 @@ def summarize(runs: list[dict[str, Any]], since: str, until: str) -> dict[str, A
         0.0,
     )
     for run in runs:
-        branch = run.get("head_branch", "")
+        # A run of no branch (some scheduled and dynamic runs) has a null head branch.
+        branch = run.get("head_branch") or ""
         kind = (
             "scratch"
             if branch.startswith("workflow/merge-batch-")
@@ -104,6 +105,34 @@ def summarize(runs: list[dict[str, Any]], since: str, until: str) -> dict[str, A
     }
 
 
+def discover(path: str, first: str, last: str) -> list[dict[str, Any]]:
+    """The runs of `path` (one workflow's, or the repository's) created from `first` to `last`.
+
+    One API read per page: a large --paginate call can exceed the gate reader's timeout even
+    while every individual request succeeds. The search cap is checked on page one, before
+    fetching hundreds of runs only to split the interval again; an interval at the cap is split
+    instead of losing runs.
+    """
+    filters: dict[str, str | int] = {"created": f"{first}..{last}", "per_page": 100}
+    found = api(f"{path}?{urlencode(filters)}", paginate=False)
+    total = found.get("total_count", len(found["workflow_runs"]))
+    if total < 1000:
+        runs = found["workflow_runs"]
+        for page in range(2, (total + 99) // 100 + 1):
+            runs.extend(
+                api(f"{path}?{urlencode({**filters, 'page': page})}", paginate=False)[
+                    "workflow_runs"
+                ]
+            )
+        return runs
+    left, right = instant(first), instant(last)
+    if (right - left).total_seconds() < 2:
+        raise ValueError("too many runs in a second for GitHub to report")
+    middle = (left + (right - left) / 2).isoformat(timespec="seconds")
+    found = discover(path, first, middle) + discover(path, middle, last)
+    return list({run["id"]: run for run in found}.values())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("since")
@@ -121,29 +150,10 @@ def main() -> None:
     # not updated in this window. Split at GitHub's cap instead of losing old reruns.
     created = instant(api(API)["created_at"])
 
-    def discover(workflow: str, first: str, last: str) -> list[dict[str, Any]]:
-        filters: dict[str, str | int] = {"created": f"{first}..{last}", "per_page": 100}
-        path = f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
-        # One API read per page: a large --paginate call can exceed the gate reader's
-        # timeout even while every individual request succeeds. Check the search cap on
-        # page one, before fetching hundreds of runs only to split the interval again.
-        found = api(f"{path}?{urlencode(filters)}", paginate=False)
-        total = found.get("total_count", len(found["workflow_runs"]))
-        if total < 1000:
-            runs = found["workflow_runs"]
-            for page in range(2, (total + 99) // 100 + 1):
-                runs.extend(api(f"{path}?{urlencode({**filters, 'page': page})}", paginate=False)["workflow_runs"])
-            return runs
-        left, right = instant(first), instant(last)
-        if (right - left).total_seconds() < 2:
-            raise ValueError("too many runs in a second for GitHub to report")
-        middle = (left + (right - left) / 2).isoformat(timespec="seconds")
-        found = discover(workflow, first, middle) + discover(workflow, middle, last)
-        return list({run["id"]: run for run in found}.values())
-
     dispositions: dict[str, str] = {}
     for workflow in ("ci", "e2e", "images"):
-        runs = discover(workflow, created.isoformat(), args.until)
+        path = f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
+        runs = discover(path, created.isoformat(), args.until)
         for run in runs:
             if instant(run["updated_at"]) < start:
                 continue
