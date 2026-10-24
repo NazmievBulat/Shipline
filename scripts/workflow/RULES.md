@@ -197,6 +197,8 @@ worker, reviewer and audit alike:
 - Run the repository's fast pre-train checks from the pull request's worktree before marking
   ready. They also run before a handoff or gate call admits it to the merge train; a failure
   refuses admission. They supplement CI, which still runs its normal checks.
+- A draft pull request runs no CI: its run starts when it is marked ready, on the head it then
+  has, and each later push runs again. So run the tests in the session before marking ready.
 - Run `scripts/workflow/weaker-tests --base <base> --working-tree` before marking ready.
   Explain each item in the description: why the change is correct and how the test still
   catches its original bug, ideally with a failing run on a deliberately broken version.
