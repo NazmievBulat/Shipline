@@ -1,0 +1,60 @@
+"""CI runs every test file in exactly one of its shards, on GitHub's own runners, and its last job,
+`CI`, passes only when every shard passed."""
+
+import re
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[2]
+_CI = _ROOT / ".github/workflows/ci.yml"
+
+
+def _shards() -> dict[int, list[str]]:
+    """The test files of each shard, as the matrix of ci.yml lists them."""
+    shards: dict[int, list[str]] = {}
+    shard = None
+    for line in _CI.read_text().splitlines():
+        if found := re.fullmatch(r"\s+- shard: (\d+)", line):
+            shard = int(found[1])
+            shards[shard] = []
+        elif shard is not None and (found := re.fullmatch(r"\s+(tests/workflow/\S+\.py)", line)):
+            shards[shard].append(found[1])
+    return shards
+
+
+def test_ci_runs_four_shards() -> None:
+    assert sorted(_shards()) == [1, 2, 3, 4]
+    assert all(_shards().values())
+
+
+def test_every_test_file_runs_in_exactly_one_shard() -> None:
+    listed = [path for files in _shards().values() for path in files]
+    tests = sorted(str(path.relative_to(_ROOT)) for path in (_ROOT / "tests/workflow").glob("test_*.py"))
+
+    assert sorted(listed) == tests
+
+
+def test_ci_runs_only_on_github_s_own_runners() -> None:
+    runners = re.findall(r"^\s+runs-on: (.+)$", _CI.read_text(), re.M)
+
+    assert runners and set(runners) == {"ubuntu-latest"}
+    assert "self-hosted" not in _CI.read_text()
+
+
+def test_the_check_the_merge_queue_requires_needs_every_shard() -> None:
+    text = _CI.read_text()
+    job = text[text.index("\n  ci:\n") :]
+
+    assert re.search(r"^    name: CI$", job, re.M)
+    assert re.search(r"^    needs: tests$", job, re.M)
+    assert re.search(r"^    if: always\(\)$", job, re.M)
+    assert 'test "${{ needs.tests.result }}" = success' in job
+
+
+def test_ci_runs_for_pull_requests_main_and_the_merge_queue() -> None:
+    triggers = _CI.read_text().split("\njobs:")[0]
+
+    assert re.search(r"^  pull_request:$", triggers, re.M)
+    assert re.search(r"^  push:\n    branches: \[main\]$", triggers, re.M)
+    assert re.search(r"^  merge_group:$", triggers, re.M)
+    assert "pull_request_target" not in triggers
+    assert re.search(r"^permissions:\n  contents: read$", _CI.read_text(), re.M)
