@@ -2,6 +2,9 @@
   "repository": "example-owner/example-app",
   "state_folder": ".local/shipline",
   "worktree_setup": "tools/prepare-worktree",
+  "refresh": {
+    "clear_generated": []
+  },
   "commands": {
     "test": "tools/run-tests",
     "browser_tests_for_changes": "tools/shipline/browser-tests-for-changes",
@@ -20,6 +23,8 @@
     "ci_plan": "Build: what to run",
     "e2e_plan": "Browser: what to run",
     "images": "Images",
+    "dependency_audit": "Build: dependencies",
+    "advisory_annotation": "Advisory",
     "prefix_only": ["images", "browser_whole", "server_whole"]
   },
   "annotations": {
@@ -60,6 +65,7 @@
     "image_build": "tools/shipline/build-runner-images",
     "hub_cache": "tools/shipline/hub-cache"
   },
+  "cloud_wake_after_minutes": 45,
   "parity": {
     "workflow_tests": "tools/shipline/tests",
     "runner_tests": "tools/runner/tests",
