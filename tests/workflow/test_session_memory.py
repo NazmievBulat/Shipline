@@ -1,5 +1,6 @@
 """`session list`, `squeeze`, `protect` and `unprotect` read and move a session's memory."""
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -271,3 +272,166 @@ def test_the_scope_of_another_session_is_refused(workflow: Workflow, other: str)
     assert done.returncode != 0
     assert done.stderr.splitlines() == ["ticket-7 has no control group of its own"]
     assert (group / "memory.reclaim").read_text() == ""
+
+
+def _spawned(name: str) -> str:
+    return f"user.slice/user@1000.service/app.slice/app-tmux.slice/tmux-spawn-{name}.scope"
+
+
+def test_list_reads_the_scope_the_pane_s_child_made(workflow: Workflow) -> None:
+    """A tmux with systemd support moves the pane's own process into a scope of its own; the
+    session's command runs in the scope that process's child made."""
+    group = workflow.running(
+        "ticket-7", held=139 * _MB, scope=_own_scope("ticket-7"), pane_scope=_spawned("ticket-7")
+    )
+    (group / "memory.max").write_text(f"{8 * 1024 * _MB}\n")
+    pane = workflow.cgroup_root / _spawned("ticket-7")
+    pane.mkdir(parents=True)
+    (pane / "memory.max").write_text("max\n")
+
+    done = workflow.run("list")
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.splitlines() == ["ticket-7  busy  139 MB held (limit 8 GB)  0 MB in swap"]
+
+
+def test_squeeze_reclaims_the_scope_the_pane_s_child_made(workflow: Workflow) -> None:
+    group = workflow.running(
+        "ticket-7", held=900 * _MB, scope=_own_scope("ticket-7"), pane_scope="user.slice"
+    )
+
+    done = workflow.run("squeeze", "ticket-7")
+
+    assert done.returncode == 0, done.stderr
+    assert (group / "memory.reclaim").read_text().strip() == str(900 * _MB)
+
+
+def test_a_child_in_the_scope_of_another_session_is_refused(workflow: Workflow) -> None:
+    group = workflow.running(
+        "ticket-7", held=900 * _MB, scope=_own_scope("ticket-71"), pane_scope="user.slice"
+    )
+
+    done = workflow.run("squeeze", "ticket-7")
+
+    assert done.returncode != 0
+    assert done.stderr.splitlines() == ["ticket-7 has no control group of its own"]
+    assert (group / "memory.reclaim").read_text() == ""
+
+
+def _scope_check(workflow: Workflow, name: str) -> list[str]:
+    """The words the session's scope runs first, its command last, as `tmux` was given them."""
+    arguments = (workflow.state / "args" / name).read_text().splitlines()
+    return arguments[arguments.index("--") + 1 :]
+
+
+@pytest.mark.parametrize(
+    ("memory", "swap", "note", "ran"),
+    [
+        (f"{8 * 1024 * _MB}", f"{4 * 1024 * _MB}", "in place", True),
+        ("max", f"{4 * 1024 * _MB}", f"memory.max max, memory.swap.max {4 * 1024 * _MB}", False),
+        (f"{8 * 1024 * _MB}", "max", f"memory.max {8 * 1024 * _MB}, memory.swap.max max", False),
+        (None, None, "memory.max missing, memory.swap.max missing", False),
+    ],
+    ids=["in-place", "no-memory-limit", "no-swap-limit", "no-memory-controller"],
+)
+def test_the_scope_runs_the_command_only_once_it_holds_the_limits(
+    workflow: Workflow, memory: str | None, swap: str | None, note: str, ran: bool
+) -> None:
+    """The command never runs without its limits, whatever placed the pane."""
+    workflow.add_pull_request(7)
+    workflow.run("start", "worker", "7")
+    check = _scope_check(workflow, "ticket-7")
+    own = Path(Path("/proc/self/cgroup").read_text().split("::", 1)[1].strip())
+    group = workflow.cgroup_root / own.relative_to("/")
+    group.mkdir(parents=True, exist_ok=True)
+    for file, value in (("memory.max", memory), ("memory.swap.max", swap)):
+        (group / file).unlink(missing_ok=True)
+        if value is not None:
+            (group / file).write_text(f"{value}\n")
+    marker = workflow.state / "command-ran"
+    note_file = Path(check[4])
+    note_file.unlink()
+
+    done = subprocess.run([*check[:-1], f"touch {marker}"], capture_output=True, text=True)
+
+    assert note_file.read_text() == f"{note}\n"
+    assert marker.exists() == ran
+    assert done.returncode == (0 if ran else 1)
+    assert done.stderr == ""
+
+
+def test_a_start_whose_scope_does_not_hold_the_limits_is_refused(workflow: Workflow) -> None:
+    workflow.add_pull_request(7)
+    (workflow.state / "limits-not-set-ticket-7").write_text("memory.max max, memory.swap.max max\n")
+
+    done = workflow.run("start", "worker", "7")
+
+    assert done.returncode == 1
+    assert done.stderr.splitlines()[-1] == (
+        "ticket-7 was not started: its scope does not hold its memory limits of 8 GB and 4 GB of "
+        "swap (memory.max max, memory.swap.max max)"
+    )
+    assert done.stdout == ""
+    assert not workflow.is_running("ticket-7")
+    assert not (workflow.notes(7) / "ticket-7.url").exists()
+    assert workflow.calls("sleep") == []
+
+
+def test_a_start_whose_scope_never_starts_is_stopped_and_refused(workflow: Workflow) -> None:
+    workflow.add_pull_request(7)
+    (workflow.state / "scope-not-checked-ticket-7").touch()
+
+    done = workflow.run("start", "worker", "7")
+
+    assert done.returncode == 1
+    assert done.stderr.splitlines()[-1] == (
+        "ticket-7 was not started: its scope with its memory limits of 8 GB and 4 GB of swap "
+        "did not start within 30 seconds"
+    )
+    assert not workflow.is_running("ticket-7")
+    assert workflow.calls("sleep") == ["sleep 0.1"] * 300
+    assert not (workflow.notes(7) / "ticket-7.url").exists()
+
+
+def test_a_start_whose_session_ends_before_its_scope_started_is_refused_at_once(
+    workflow: Workflow,
+) -> None:
+    workflow.add_pull_request(7)
+    (workflow.state / "scope-not-checked-ticket-7").touch()
+    (workflow.state / "dies-at-once").touch()
+
+    done = workflow.run("start", "worker", "7")
+
+    assert done.returncode == 1
+    assert done.stderr.splitlines()[-1] == (
+        "ticket-7 was not started: its scope with its memory limits of 8 GB and 4 GB of swap "
+        "did not start"
+    )
+    assert workflow.calls("sleep") == []
+
+
+def test_the_limits_are_checked_in_bytes_as_the_kernel_holds_them(workflow: Workflow) -> None:
+    workflow.add_pull_request(7)
+
+    workflow.run(
+        "start",
+        "worker",
+        "7",
+        env={"WORKFLOW_SESSION_MEMORY_MAX": "96M", "WORKFLOW_SESSION_SWAP_MAX": "0"},
+    )
+
+    assert _scope_check(workflow, "ticket-7")[6:8] == [str(96 * _MB), "0"]
+
+
+@pytest.mark.parametrize("variable", ["WORKFLOW_SESSION_MEMORY_MAX", "WORKFLOW_SESSION_SWAP_MAX"])
+@pytest.mark.parametrize("value", ["lots", "infinity", "-1", "8 G"])
+def test_a_limit_that_is_not_a_size_is_refused_before_anything_starts(
+    workflow: Workflow, variable: str, value: str
+) -> None:
+    workflow.add_pull_request(7)
+
+    done = workflow.run("start", "worker", "7", env={variable: value})
+
+    assert done.returncode == 1
+    assert done.stderr.splitlines()[-1] == f"{variable} is '{value}', not a size such as 8G"
+    assert workflow.calls("tmux ticket-7 new-session") == []
