@@ -188,7 +188,7 @@ def answer(args, cwd, env, out, err):
             for number, patch in data.get("after_merge", {}).pop(args[2], {}).items():
                 data["pulls"][number].update(patch)
             for workflow in ("ci", "images"):
-                prefix = "repos/NazmievBulat/Shipline/actions/workflows/"
+                prefix = "repos/example-org/example-app/actions/workflows/"
                 data["api"][prefix + f"{workflow}.yml/runs?head_sha={actual}&per_page=100"] = {
                     "workflow_runs": []}
             if after_main == "red":
@@ -196,7 +196,7 @@ def answer(args, cwd, env, out, err):
                     "workflow_runs": [{"id": 60, "head_sha": actual, "event": "push",
                         "head_branch": "main", "status": "completed", "conclusion": "failure",
                         "updated_at": "2026-10-16T10:00:00Z"}]}
-                data["api"]["repos/NazmievBulat/Shipline/actions/runs/60/jobs?per_page=100"] = {
+                data["api"]["repos/example-org/example-app/actions/runs/60/jobs?per_page=100"] = {
                     "jobs": [{"id": 61, "name": "CI result", "status": "completed",
                         "conclusion": "failure"}, {"id": 62, "name": "CI: web",
                         "status": "completed", "conclusion": "failure"}]}
@@ -239,7 +239,7 @@ def answer(args, cwd, env, out, err):
         return "delegate"
 """
 
-_REPO = "repos/NazmievBulat/Shipline"
+_REPO = "repos/example-org/example-app"
 _MAIN_IMAGES = f"{_REPO}/actions/workflows/images.yml/runs?branch=main&per_page=100&page=1"
 
 
@@ -1993,7 +1993,7 @@ def test_only_superseded_image_cancellations_are_pending_and_never_retried(
         assert not rerun_calls
         assert not (github.workflow.repo / ".local/workflow/main-rerun-50").exists()
     else:
-        assert rerun_calls == ["gh run rerun 50 -R NazmievBulat/Shipline --failed"]
+        assert rerun_calls == ["gh run rerun 50 -R example-org/example-app --failed"]
 
 
 def test_an_earlier_green_image_run_does_not_stand_in_for_the_heads_own(github: GitHub) -> None:
@@ -3024,7 +3024,7 @@ def test_tick_reruns_failed_home_jobs_once_and_reports_it(github: GitHub, conclu
     done = workflow.run_script("tick")
 
     rerun_calls = [call for call in workflow.calls("gh") if "run rerun" in call]
-    assert rerun_calls == ["gh run rerun 10 -R NazmievBulat/Shipline --failed"], done.stderr
+    assert rerun_calls == ["gh run rerun 10 -R example-org/example-app --failed"], done.stderr
     note = "automatically re-ran failed jobs of main run 10 once"
     assert note in workflow.wake_log.read_text()
     assert note in (workflow.repo / ".local/workflow/main-status").read_text()
@@ -3063,7 +3063,7 @@ def test_tick_reruns_a_failed_part_only_when_every_part_ran_at_home(
     done = workflow.run_script("tick")
 
     reruns = [call for call in workflow.calls("gh") if "run rerun" in call]
-    expected = ["gh run rerun 10 -R NazmievBulat/Shipline --failed"]
+    expected = ["gh run rerun 10 -R example-org/example-app --failed"]
     assert reruns == (expected if first == "example-app-home-main" else []), done.stderr
     assert "main: red" in (workflow.repo / ".local/workflow/main-status").read_text()
 
@@ -4825,7 +4825,7 @@ def test_git_reads_of_github_retry_server_errors_only(
     workflow = github.workflow
     real = subprocess.check_output(["bash", "-c", "command -v git"], text=True).strip()
     counter = workflow.state / "git-read-attempts"
-    url = "https://github.com/NazmievBulat/Shipline.git/"
+    url = "https://github.com/example-org/example-app.git/"
     workflow.fake(
         "git",
         f"""#!/bin/bash

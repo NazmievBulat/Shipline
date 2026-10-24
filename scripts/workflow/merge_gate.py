@@ -22,6 +22,7 @@ from typing import Any, NoReturn
 
 import priority
 import train_reads
+import workflow_config
 from merge_handoff import Handoff, authorized
 from workflow_commands import (
     COMMAND_TIMEOUT,
@@ -97,13 +98,26 @@ def mechanical_conflicts() -> ModuleType | None:
 # How many of its last lines a failed push is refused with, when the repository words no refusal.
 REFUSAL_LINES = 10
 
-REPOSITORY = "NazmievBulat/Shipline"
-API = f"repos/{REPOSITORY}"
+CONFIG = workflow_config.current()
+REPOSITORY = CONFIG.repository
+API = CONFIG.api
 HERE = Path(__file__).resolve().parent
 # The gate owns these branches: each holds one batch's test merge, never a pull request.
 SCRATCH_PREFIX = "workflow/merge-batch-"
-E2E_PLAN = "E2E: what to run"
-CI_PLAN = "CI: what to run"
+E2E_PLAN = CONFIG.checks.e2e_plan
+CI_PLAN = CONFIG.checks.ci_plan
+CI_RESULT = CONFIG.checks.ci_result
+# Every check of the image workflow begins with this; its planner is IMAGES_PLAN.
+IMAGES = CONFIG.checks.images
+IMAGES_PLAN = CONFIG.checks.images_plan
+# The titles of the planners' annotations.
+NOTES = CONFIG.annotations
+# The workflow files, by the gate's own names for them.
+WORKFLOW_FILES = {
+    "ci": CONFIG.workflows.ci,
+    "e2e": CONFIG.workflows.e2e,
+    "images": CONFIG.workflows.images,
+}
 # What a dispatched whole-suite run is called in the gate's words, by its workflow.
 WHOLE = {"e2e": "the whole browser suite", "ci": "every server test"}
 SQUASH_ATTEMPTS = 3
@@ -268,7 +282,7 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     )
     if advisory_service is None:
         return pushed
-    folder = main_checkout() / ".local" / "workflow"
+    folder = main_checkout() / CONFIG.state_folder
     service = advisory_service.unreachable(output) if pushed.returncode else None
     if service:
         folder.mkdir(parents=True, exist_ok=True)
@@ -343,7 +357,8 @@ def runs(
     # unchanged head is kept apart: it may report a failure, never hold or close the gate.
     event = "&event=pull_request" if pull else ""
     found = api(
-        f"{API}/actions/workflows/{workflow}.yml/runs?head_sha={head}{event}&per_page=100",
+        f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
+        f"?head_sha={head}{event}&per_page=100",
         "workflow_runs",
     )
     return sorted(
@@ -387,7 +402,8 @@ class MainImages:
             # Nightly runs fill pages too: a missing page must never forget an older failure.
             self.page += 1
             runs_page = api(
-                f"{API}/actions/workflows/images.yml/runs?branch=main&per_page=100&page={self.page}",
+                f"{API}/actions/workflows/{WORKFLOW_FILES['images']}/runs"
+                f"?branch=main&per_page=100&page={self.page}",
                 "workflow_runs",
                 paginate=False,
             )
@@ -486,8 +502,8 @@ def verdict(
     images: bool = False,
     plan: str | None = None,
 ) -> tuple[str, list[str]]:
-    label = plan or ("Images" if images else "CI result")
-    plan = plan or ("Docker images: what to run" if images else "CI result")
+    label = plan or ("Images" if images else CI_RESULT)
+    plan = plan or (IMAGES_PLAN if images else CI_RESULT)
     required = [job for job in parts if job["name"] == plan]
     failed = [
         job["name"] for job in parts if job.get("conclusion") not in (None, "success", "skipped")
@@ -538,7 +554,7 @@ def scheduled_failure(head: str) -> str:
     for run in latest:
         state, names = verdict(run, jobs(run), images=True)
         if state == "red":
-            return f"scheduled Docker images run {run['id']} failed: {', '.join(names)}"
+            return f"scheduled {IMAGES} run {run['id']} failed: {', '.join(names)}"
     return ""
 
 
@@ -563,7 +579,7 @@ def unreached_service(parts: list[dict[str, Any]]) -> str | None:
     if advisory_service is None:
         return None
     failed = _failed_jobs(parts)
-    if {job["name"] for job in failed} - {"CI result"} != {"CI: dependencies"}:
+    if {job["name"] for job in failed} - {CI_RESULT} != {"CI: dependencies"}:
         return None
     job = next(job for job in failed if job["name"] == "CI: dependencies")
     try:
@@ -623,19 +639,14 @@ def _rerunnable(run: dict[str, Any], parts: list[dict[str, Any]], *, first: bool
     failed = _failed_jobs(parts)
     # Missing runner/attempt evidence never authorizes spending hosted minutes. The tick
     # holds its machine-wide lock; the marker also covers GitHub's delay updating attempts.
-    home = {
-        "example-app-home",
-        "example-app-home-main",
-        "example-app-home-docker",
-        "home-planner",
-    }
+    home = set(CONFIG.runner.labels)
     attempt = run.get("run_attempt")
     return not (
         run.get("status") != "completed"
         or (attempt != 1 if first else not isinstance(attempt, int))
         or not failed
         # Retrying the CI planner can choose hosted destinations for skipped dependents.
-        or any(job.get("name") == "CI: what to run" for job in failed)
+        or any(job.get("name") == CI_PLAN for job in failed)
         or any(job.get("status") != "completed" for job in parts)
         or any(not home.intersection(job.get("labels") or []) for job in failed)
     )
@@ -698,7 +709,7 @@ def pull_service_wait(
     """
     if {check.get("name") for check in _failed_rollup(pull)} - {
         "CI: dependencies",
-        "CI result",
+        CI_RESULT,
     }:
         return None
     ci = runs("ci", pull["headRefOid"], pull=True)
@@ -807,7 +818,7 @@ def push_health(
                     _retry_failed_main(ci[0], parts, retry_folder, retry=retry, service=service)
                 )
     else:
-        assessments.append(("pending", ["CI result has not started"], {}))
+        assessments.append(("pending", [f"{CI_RESULT} has not started"], {}))
     for run in images:
         parts = jobs(run)
         # Main image pushes share a cancelling concurrency group. A newer run replaces
@@ -818,7 +829,7 @@ def push_health(
         if superseded and all(
             job.get("conclusion") in (None, "success", "skipped", "cancelled") for job in parts
         ):
-            assessments.append(("pending", ["Docker images: what to run"], run))
+            assessments.append(("pending", [IMAGES_PLAN], run))
         else:
             assessments.append((*verdict(run, parts, images=True), run))
         # Even with a failed job, re-running a superseded cancellation could cancel
@@ -831,7 +842,7 @@ def push_health(
         and assessments[0][0] == "green"
         and main_images_needed(head, ci)
     ):
-        assessments.append(("pending", ["Docker images have not started"], {}))
+        assessments.append(("pending", [f"{IMAGES} have not started"], {}))
     failed = [(names, run) for state, names, run in assessments if state == "red"]
     if failed:
         since = min(run.get("updated_at", "unknown time") for _, run in failed)
@@ -840,7 +851,7 @@ def push_health(
         line = f"main: red since {since}, {names} ({head[:12]})"
         line += unreached if len(failed) == 1 else ""
         earlier = [
-            f"Docker images run {run['id']} of {run['head_sha'][:12]}"
+            f"{IMAGES} run {run['id']} of {run['head_sha'][:12]}"
             for _, run in failed
             if run.get("head_sha", head) != head
         ]
@@ -850,7 +861,8 @@ def push_health(
         # This is diagnostic only: failure to read the history must keep the red gate closed.
         try:
             history = api(
-                f"{API}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100",
+                f"{API}/actions/workflows/{WORKFLOW_FILES['ci']}/runs"
+                "?branch=main&event=push&status=success&per_page=100",
                 "workflow_runs",
             )
             green = None
@@ -931,11 +943,11 @@ def push_health(
                         for state, names, run in assessments[1:]
                     ),
                 ]
-                sources.append(f"Docker images run {inherited['images_run']}")
+                sources.append(f"{IMAGES} run {inherited['images_run']}")
         elif ci_inherited and not own_images and main_images_needed(head, ci):
             # Main asks this after its own green CI above; an inherited CI asks it here. An
             # earlier push's image run in the list does not stand in for the head's own.
-            assessments.append(("pending", ["Docker images have not started"], {}))
+            assessments.append(("pending", [f"{IMAGES} have not started"], {}))
     pending = [name for state, names, _ in assessments if state != "green" for name in names]
     if pending:
         return Health("pending", f"main: pending, {', '.join(pending)} ({head[:12]})")
@@ -955,7 +967,7 @@ def main_checkout() -> Path:
 
 def inherited_green(head: str) -> dict[str, Any] | None:
     """The gate alone writes this receipt, after observing the actual squash on main."""
-    path = main_checkout() / ".local" / "workflow" / "main-tree-green.json"
+    path = main_checkout() / CONFIG.state_folder / "main-tree-green.json"
     try:
         receipt = json.loads(path.read_text())
         if (
@@ -1029,7 +1041,7 @@ def record_green(
     os.replace(temporary, folder / "main-tree-green.json")
     source = (
         f"CI run {ci['id']}"
-        + (f" and Docker images run {images[0]['id']}" if images_complete else "")
+        + (f" and {IMAGES} run {images[0]['id']}" if images_complete else "")
         + (f"; main must pass {', '.join(unproven)} itself" if unproven else "")
     )
     print(
@@ -1102,7 +1114,7 @@ def main_images_needed(head: str, ci: list[dict[str, Any]]) -> bool:
     before = None
     if push:
         for job in jobs(push):
-            if job["name"] != "CI: what to run":
+            if job["name"] != CI_PLAN:
                 continue
             notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
             before = next(
@@ -1121,10 +1133,10 @@ def main_images_needed(head: str, ci: list[dict[str, Any]]) -> bool:
 def images_needed(
     head: str, base: str, rollup: list[dict[str, Any]], *, workflow_ref: str | None = None
 ) -> bool:
-    if any(check.get("name", "").startswith("Docker images") for check in rollup):
+    if any(check.get("name", "").startswith(IMAGES) for check in rollup):
         return True
     # Use the actual workflow's path filter, without a second maintained list of image inputs.
-    workflow = git("show", f"{workflow_ref or base}:.github/workflows/images.yml")
+    workflow = git("show", f"{workflow_ref or base}:.github/workflows/{WORKFLOW_FILES['images']}")
     section = workflow.split("  pull_request:", 1)[1].split("  push:", 1)[0]
     patterns = re.findall(r'^      - "([^"]+)"$', section, flags=re.MULTILINE)
     if not patterns:
@@ -1177,13 +1189,13 @@ def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> 
         (note.get("title"), note["message"].strip())
         for note in api(f"{API}/check-runs/{planner['id']}/annotations?per_page=100")
     }
-    return {("Files tested", tree), ("Browser suite", "whole")} <= notes
+    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= notes
 
 
 def inherited_image_jobs(
     parts: list[dict[str, Any]], tree: str, branch: str
 ) -> list[dict[str, Any]]:
-    notes = _planner_notes(parts, "Docker images: what to run")
+    notes = _planner_notes(parts, IMAGES_PLAN)
     sources = [message for title, message in notes if title == "Inherited image run"]
     if not sources:
         return parts
@@ -1193,13 +1205,13 @@ def inherited_image_jobs(
     if (
         run.get("event") != "pull_request"
         or run.get("head_branch") != branch
-        or run.get("path") != ".github/workflows/images.yml"
+        or run.get("path") != f".github/workflows/{WORKFLOW_FILES['images']}"
         or run.get("status") != "completed"
         or run.get("conclusion") != "success"
     ):
         raise Refused("inherited image run did not pass on this branch")
     original = jobs(run)
-    if ("Files tested", tree) not in _planner_notes(original, "Docker images: what to run"):
+    if (NOTES.files_tested, tree) not in _planner_notes(original, IMAGES_PLAN):
         raise Refused("inherited image run tested other files")
     proven = passed_jobs(original)
     effective = []
@@ -1213,7 +1225,7 @@ def inherited_image_jobs(
             if group and job["name"] in proven:
                 effective.extend(group)
                 continue
-            if job["name"] in ("Docker images: browser tests", "Docker images: image tests"):
+            if job["name"] in (f"{IMAGES}: browser tests", f"{IMAGES}: image tests"):
                 raise Refused("inherited image run did not pass every required part")
         effective.append(job)
     return effective
@@ -1236,7 +1248,7 @@ def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
     before the note existed says nothing, which proves nothing either.
     """
     notes = _planner_notes(parts, CI_PLAN)
-    return not {("Server tests", "whole"), ("Server tests", "none")} & notes
+    return not {(NOTES.server_tests, "whole"), (NOTES.server_tests, "none")} & notes
 
 
 def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: str) -> bool:
@@ -1245,7 +1257,9 @@ def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: s
         job["name"] == "CI: server tests" and job.get("conclusion") == "success" for job in parts
     ):
         return False
-    return {("Merge tested", head), ("Server tests", "whole")} <= _planner_notes(parts, CI_PLAN)
+    return {(NOTES.merge_tested, head), (NOTES.server_tests, "whole")} <= _planner_notes(
+        parts, CI_PLAN
+    )
 
 
 def _proves_whole(
@@ -1258,11 +1272,11 @@ def _proves_whole(
 
 def tested_merge(parts: list[dict[str, Any]], base: str, head: str) -> str | None:
     for job in parts:
-        if job["name"] != "CI: what to run":
+        if job["name"] != CI_PLAN:
             continue
         notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
         for note in notes:
-            if note.get("title") != "Merge tested":
+            if note.get("title") != NOTES.merge_tested:
                 continue
             merge = note["message"].strip()
             if not re.fullmatch(r"[0-9a-f]{40}", merge):
@@ -1593,7 +1607,7 @@ def fix_evidence(pull: dict[str, Any], base: str, health: Health) -> str | None:
     the budget every session shares, so a judgment is kept until this evidence changes.
     """
     if not any(
-        check.get("name") == "CI result" and check.get("conclusion") == "SUCCESS"
+        check.get("name") == CI_RESULT and check.get("conclusion") == "SUCCESS"
         for check in pull["statusCheckRollup"]
     ):
         return None
@@ -1632,10 +1646,10 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
         if verdict(images[0], image_jobs, images=True)[0] != "green":
             return False
         tree = api(f"{API}/git/commits/{merge}")["tree"]["sha"]
-        plan = next(job for job in image_jobs if job["name"] == "Docker images: what to run")
+        plan = next(job for job in image_jobs if job["name"] == IMAGES_PLAN)
         notes = api(f"{API}/check-runs/{plan['id']}/annotations?per_page=100")
         if not any(
-            note.get("title") == "Files tested" and note["message"].strip() == tree
+            note.get("title") == NOTES.files_tested and note["message"].strip() == tree
             for note in notes
         ):
             return False
@@ -1826,10 +1840,8 @@ class Train:
             # Local authorizations and owner questions can change while the tick runs.
             notes = []
             for number in self.queue:
-                root = (
-                    self.path.parent.parent.parent
-                    / ".claude/worktrees"
-                    / f"ticket-{number}/.local/workflow"
+                root = CONFIG.state(
+                    CONFIG.checkout_of(self.path.parent) / ".claude/worktrees" / f"ticket-{number}"
                 )
                 paths = [
                     *root.glob("*.owner-blocked"),
@@ -1903,13 +1915,8 @@ class Train:
                 continue
             if self.conflicts.get(number) != pull["headRefOid"]:
                 self.conflicts.pop(number, None)
-            notes = (
-                self.path.parent.parent.parent
-                / ".claude"
-                / "worktrees"
-                / f"ticket-{number}"
-                / ".local"
-                / "workflow"
+            notes = CONFIG.state(
+                CONFIG.checkout_of(self.path.parent) / ".claude" / "worktrees" / f"ticket-{number}"
             )
             # The session running the gate is acting now, whatever note an answered permission
             # dialog or a wake by its own job left behind.
@@ -2374,7 +2381,7 @@ def _batch_runs(batch: dict[str, Any], workflow: str) -> list[dict[str, Any]]:
         (
             run
             for run in api(
-                f"{API}/actions/workflows/{workflow}.yml/runs?head_sha={batch['head']}"
+                f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs?head_sha={batch['head']}"
                 "&event=workflow_dispatch&per_page=100",
                 "workflow_runs",
             )
@@ -2512,7 +2519,7 @@ def squash_proof(
         passed = sorted(passed_jobs(parts))
         if workflow == "ci":
             # The web job can pass with only lint, or without its story tests. Main needs both.
-            if ("Web suite", "whole") not in _planner_notes(parts, CI_PLAN):
+            if (NOTES.web_suite, "whole") not in _planner_notes(parts, CI_PLAN):
                 passed = [name for name in passed if name != "CI: web"]
         sources.append({"workflow": workflow, "run": run["id"], "jobs": passed})
     return RECEIPT + json.dumps(
@@ -2679,7 +2686,7 @@ def _dispatch_scratch(train: Train, record: dict[str, Any], workflow: str) -> No
         "gh",
         "workflow",
         "run",
-        f"{workflow}.yml",
+        WORKFLOW_FILES[workflow],
         "-R",
         REPOSITORY,
         "--ref",
@@ -2960,7 +2967,7 @@ def _prefix_state(member: dict[str, Any], folder: Path) -> Prefix:
             if workflow == "ci"
             else whole_suite(found[0], parts, tree)
             if workflow == "e2e"
-            else ("Files tested", tree) in _planner_notes(parts, "Docker images: what to run")
+            else (NOTES.files_tested, tree) in _planner_notes(parts, IMAGES_PLAN)
         ):
             short.append(
                 f"{whose} e2e did not prove the whole browser suite on its tested files"
@@ -3676,7 +3683,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             raise Waiting("GitHub has not determined whether this pull request is mergeable")
         ci = runs("ci", head, pull=True)
         if not ci:
-            raise Waiting("CI result has not started for the current pull request head")
+            raise Waiting(f"{CI_RESULT} has not started for the current pull request head")
         parts = jobs(ci[0])
         ci_state = verdict(ci[0], parts)[0]
         if ci_state != "green":
@@ -3721,7 +3728,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
         passed_checks = {job["name"] for job in strict if job.get("conclusion") == "success"}
         images = runs("images", head, pull=True)
         if images_needed(head, base, pull["statusCheckRollup"]) and not images:
-            raise Waiting("Docker images checks have not started for this pull request head")
+            raise Waiting(f"{IMAGES} checks have not started for this pull request head")
         image_jobs: list[dict[str, Any]] = []
         if images:
             image_jobs = jobs(images[0])
@@ -3729,19 +3736,19 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             if image_state != "green":
                 if image_state == "red":
                     train.fail(number, head)
-                    raise Refused("the latest Docker images run for this pull request failed")
-                raise Waiting("the latest Docker images run for this pull request is not green")
+                    raise Refused(f"the latest {IMAGES} run for this pull request failed")
+                raise Waiting(f"the latest {IMAGES} run for this pull request is not green")
             image_jobs = inherited_image_jobs(image_jobs, tree, pull["headRefName"])
             # Images record the checked-out tree already. Match it to the tested CI merge.
             passed_checks |= {
                 job["name"] for job in image_jobs if job.get("conclusion") == "success"
             }
             image_plan = next(
-                job for job in image_jobs if job["name"] == "Docker images: what to run"
+                job for job in image_jobs if job["name"] == IMAGES_PLAN
             )
             image_notes = api(f"{API}/check-runs/{image_plan['id']}/annotations?per_page=100")
             if not any(
-                note.get("title") == "Files tested" and note["message"].strip() == tree
+                note.get("title") == NOTES.files_tested and note["message"].strip() == tree
                 for note in image_notes
             ):
                 return refresh_pull(pull, base, train, number)
@@ -3840,7 +3847,7 @@ def main() -> int:
         )
         return 1
     try:
-        folder = main_checkout() / ".local" / "workflow"
+        folder = main_checkout() / CONFIG.state_folder
         if handing_off:
             return handoff(sys.argv[2], folder)
         if delegated:

@@ -36,7 +36,7 @@ def _started(workflow: Workflow) -> list[str]:
 
 
 def _publish(github: GitHub, result: str = "passed", head: str | None = None) -> None:
-    github.api["repos/NazmievBulat/Shipline/pulls/7/reviews"] = [
+    github.api["repos/example-org/example-app/pulls/7/reviews"] = [
         {
             "body": f"<!-- workflow-review round=1 result={result} -->\nReviewed.",
             "commit_id": head or github.head,
@@ -91,7 +91,7 @@ def test_the_tick_drives_a_red_main_fix_handed_off_behind_another_pull(handed: G
     workflow.running("review-8")
     (workflow.state / "tmux/review-7").unlink()
     handed.main("failure")
-    handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"]["jobs"].append(
+    handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"].append(
         {"id": 29, "name": "CI: web", "status": "completed", "conclusion": "success"}
     )
     handed.save()
@@ -195,7 +195,7 @@ def test_a_lost_check_is_run_again_then_merged_on_a_later_tick(handed: GitHub) -
     workflow = handed.workflow
     lost = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
     runs = (
-        "repos/NazmievBulat/Shipline/actions/workflows/ci.yml/runs"
+        "repos/example-org/example-app/actions/workflows/ci.yml/runs"
         f"?head_sha={handed.head}&event=pull_request&per_page=100"
     )
     handed.api[runs]["workflow_runs"][0]["updated_at"] = lost
@@ -206,7 +206,7 @@ def test_a_lost_check_is_run_again_then_merged_on_a_later_tick(handed: GitHub) -
             "status": "IN_PROGRESS",
             "conclusion": None,
             "startedAt": lost,
-            "detailsUrl": "https://github.com/NazmievBulat/Shipline/actions/runs/20/job/22",
+            "detailsUrl": "https://github.com/example-org/example-app/actions/runs/20/job/22",
         }
     )
     handed.save()
@@ -473,7 +473,7 @@ def test_judgment_drops_the_note_and_starts_exactly_one_fresh_reviewer(
         handed.pulls["7"]["headRefOid"] = handed.head
         (workflow.state / "pr" / "7").write_text(f"OPEN ticket/seven {handed.head}\n")
     elif problem == "refusal":
-        handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"] = None
+        handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"] = None
     else:
         (workflow.worktree(7) / "uncommitted").write_text("unfinished")
     handed.save()
@@ -503,7 +503,7 @@ def test_red_or_pending_main_keeps_the_note_without_merging_or_starting_a_model(
     if main_state == "red":
         handed.main("failure")
     else:
-        handed.api["repos/NazmievBulat/Shipline/actions/runs/10/jobs?per_page=100"]["jobs"][
+        handed.api["repos/example-org/example-app/actions/runs/10/jobs?per_page=100"]["jobs"][
             0
         ].update(
             status="in_progress",
@@ -526,7 +526,7 @@ def test_unreadable_github_keeps_the_note_and_merges_once_it_can_be_read(
     unreadable: str,
 ) -> None:
     workflow = handed.workflow
-    jobs = "repos/NazmievBulat/Shipline/actions/runs/10/jobs?per_page=100"
+    jobs = "repos/example-org/example-app/actions/runs/10/jobs?per_page=100"
     main_jobs = handed.api[jobs]
     if unreadable == "main":
         handed.api[jobs] = None
@@ -580,7 +580,7 @@ exec "$(dirname "$0")/gh-stand-in" "$@"
 
 def test_a_pending_pr_run_is_retried_without_another_reviewer(handed: GitHub) -> None:
     workflow = handed.workflow
-    handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"]["jobs"][0].update(
+    handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"][0].update(
         status="in_progress",
         conclusion=None,
     )
@@ -597,7 +597,7 @@ def test_a_reviewer_that_handed_off_is_stopped_while_its_checks_still_run(
 ) -> None:
     """A passed round and the handoff are the reviewer's last work: it never waits in line."""
     workflow = handed.workflow
-    handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"]["jobs"][0].update(
+    handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"][0].update(
         status="in_progress",
         conclusion=None,
     )
@@ -685,7 +685,7 @@ def test_hand_back_reviewers_start_by_priority(handed: GitHub) -> None:
         "headRefOid": head,
         "labels": [{"name": "workflow"}, {"name": "priority: high"}],
     }
-    handed.api["repos/NazmievBulat/Shipline/pulls/8/reviews"] = []
+    handed.api["repos/example-org/example-app/pulls/8/reviews"] = []
     handed.save()
     (_folder(workflow) / "merge-review-8").write_text(
         json.dumps({"reason": "pull request checks failed", "event": "b" * 32})
@@ -761,7 +761,7 @@ def test_an_interrupted_hand_back_cannot_merge_with_its_old_authorization(handed
 
 def test_a_hand_back_preserves_the_owners_two_send_back_limit(handed: GitHub) -> None:
     workflow = handed.workflow
-    handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"] = [
+    handed.api["repos/example-org/example-app/pulls/7/reviews"] = [
         {"body": f"<!-- workflow-review round={n} result={outcome} -->", "commit_id": handed.head}
         for n, outcome in [(1, "sent-back"), (2, "sent-back"), (3, "passed")]
     ]
@@ -866,7 +866,7 @@ def _child(github: GitHub, *, conflict: bool = False) -> tuple[Path, str]:
         "headRefOid": head,
         "baseRefName": "ticket/seven",
     }
-    github.api["repos/NazmievBulat/Shipline/pulls/8/reviews"] = []
+    github.api["repos/example-org/example-app/pulls/8/reviews"] = []
     workflow.list_pull_request(8, draft=False)
     (workflow.state / "pr" / "8").write_text(f"OPEN ticket/eight {head}\n")
     if conflict:
@@ -1031,7 +1031,7 @@ def _handed_batch(github: GitHub) -> None:
         (workflow.state / "pr" / number).write_text(
             f"OPEN {pull['headRefName']} {pull['headRefOid']}\n"
         )
-        github.api[f"repos/NazmievBulat/Shipline/pulls/{number}/reviews"] = [
+        github.api[f"repos/example-org/example-app/pulls/{number}/reviews"] = [
             {
                 "body": "<!-- workflow-review round=1 result=passed -->",
                 "commit_id": pull["headRefOid"],
@@ -1112,7 +1112,7 @@ def test_the_same_retest_twice_in_a_row_on_one_tree_hands_back(github: GitHub) -
 
 
 def _pending_front(github: GitHub, kind: str) -> None:
-    prefix = "repos/NazmievBulat/Shipline/actions"
+    prefix = "repos/example-org/example-app/actions"
     if kind == "rollup":
         github.pulls["7"]["statusCheckRollup"][0].update(status="QUEUED", conclusion=None)
     elif kind == "ci-job":
@@ -1219,7 +1219,7 @@ def test_pending_front_waits_when_nobody_behind_has_fresh_green_checks(
         for number in (8, 9):
             head = github.pulls[str(number)]["headRefOid"]
             github.api[
-                f"repos/NazmievBulat/Shipline/actions/workflows/ci.yml/runs?head_sha={head}"
+                f"repos/example-org/example-app/actions/workflows/ci.yml/runs?head_sha={head}"
                 "&event=pull_request&per_page=100"
             ] = None
     github.save()
@@ -1459,13 +1459,13 @@ def test_lender_cancellation_keeps_handoff_and_train_position(handed: GitHub, st
     )
     handed.pulls["7"]["statusCheckRollup"][0].update(
         conclusion="CANCELLED",
-        detailsUrl="https://github.com/NazmievBulat/Shipline/actions/runs/20/job/22",
+        detailsUrl="https://github.com/example-org/example-app/actions/runs/20/job/22",
     )
     run = handed.api[
-        f"repos/NazmievBulat/Shipline/actions/workflows/ci.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
+        f"repos/example-org/example-app/actions/workflows/ci.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
     ]["workflow_runs"][0]
     run.update(conclusion="cancelled", run_attempt=1)
-    for job in handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"][
+    for job in handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"][
         "jobs"
     ]:
         job["conclusion"] = "cancelled"
@@ -1498,15 +1498,15 @@ def test_other_failures_still_revoke_a_handoff(handed: GitHub, problem: str) -> 
     handed.pulls["7"]["statusCheckRollup"][0].update(
         conclusion="FAILURE" if problem == "failure" else "CANCELLED",
         detailsUrl=(
-            "https://github.com/NazmievBulat/Shipline/actions/runs/20/job/"
+            "https://github.com/example-org/example-app/actions/runs/20/job/"
             + ("23" if problem == "attempt" else "22")
         ),
     )
     run = handed.api[
-        f"repos/NazmievBulat/Shipline/actions/workflows/ci.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
+        f"repos/example-org/example-app/actions/workflows/ci.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
     ]["workflow_runs"][0]
     run.update(conclusion="cancelled", run_attempt=2 if problem == "attempt" else 1)
-    for job in handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"][
+    for job in handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"][
         "jobs"
     ]:
         job["conclusion"] = "cancelled"
@@ -1601,14 +1601,14 @@ def test_a_main_retry_prevented_by_the_reserve_remains_eligible_after_reset(hand
     workflow = handed.workflow
     handed.main(conclusion="failure")
     handed.api[
-        f"repos/NazmievBulat/Shipline/actions/workflows/ci.yml/runs?head_sha={handed.base}&per_page=100"
+        f"repos/example-org/example-app/actions/workflows/ci.yml/runs?head_sha={handed.base}&per_page=100"
     ]["workflow_runs"][0]["run_attempt"] = 1
-    for job in handed.api["repos/NazmievBulat/Shipline/actions/runs/10/jobs?per_page=100"][
+    for job in handed.api["repos/example-org/example-app/actions/runs/10/jobs?per_page=100"][
         "jobs"
     ]:
         job["labels"] = ["example-app-home-main"]
     handed.save()
-    _low_budget_after(workflow, "api --paginate repos/NazmievBulat/Shipline/actions/runs/10/jobs")
+    _low_budget_after(workflow, "api --paginate repos/example-org/example-app/actions/runs/10/jobs")
     first = workflow.run_script("tick")
     assert first.returncode == 0, first.stdout + first.stderr
     assert not (_folder(workflow) / "main-rerun-10").exists()
@@ -1846,7 +1846,7 @@ def test_tick_whole_refresh_is_accepted_without_scratch_suites(handed: GitHub) -
     handed.pulls["7"]["headRefOid"] = refreshed
     (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {refreshed}\n")
     handed.ci(handed.base, refreshed, run_id=50, server="whole")
-    handed.api["repos/NazmievBulat/Shipline/actions/runs/50/jobs?per_page=100"]["jobs"].append(
+    handed.api["repos/example-org/example-app/actions/runs/50/jobs?per_page=100"]["jobs"].append(
         {"id": 53, "name": "CI: server tests", "status": "completed", "conclusion": "success"}
     )
     handed.save()
