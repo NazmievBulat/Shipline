@@ -101,6 +101,7 @@ def test_without_paths_named_an_ordinary_change_gives_medium(workflow: Workflow)
         "merge_gate.py",
         "github_budget.py",
         "push_slots.py",
+        "workflow_commands.py",
         "browser_test_slots.py",
         "review-panel",
     ],
@@ -179,6 +180,43 @@ def test_a_quoted_path_is_read_as_git_wrote_it(workflow: Workflow) -> None:
     )
 
     assert _effort(workflow)[0] == "high\n"
+
+
+def test_a_quoted_path_with_a_space_is_read(workflow: Workflow) -> None:
+    # Git ends a name that holds a space with a tab, after its closing quote too.
+    _configure(workflow, {"high_effort_paths": ["^docs/"]})
+    _pull_request(
+        workflow,
+        'diff --git "a/app/caf\\303\\251 menu.html" "b/app/caf\\303\\251 menu.html"\n'
+        "index 1111111..2222222 100644\n"
+        '--- "a/app/caf\\303\\251 menu.html"\t\n'
+        '+++ "b/app/caf\\303\\251 menu.html"\t\n'
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+after\n",
+    )
+
+    assert _effort(workflow) == ("medium\n", "")
+
+
+def test_a_path_is_cut_only_at_a_line_feed(workflow: Workflow) -> None:
+    # Cut at the line separator, the path would be `app/x`, which the pattern misses.
+    _configure(workflow, {"high_effort_paths": [r"locks\.py$"]})
+    path = "app/x\u2028locks.py"
+    _pull_request(workflow, _change(path))
+
+    assert _effort(workflow)[0] == "high\n"
+
+
+def test_a_diff_that_is_not_utf_8_gives_high(workflow: Workflow) -> None:
+    _configure(workflow)
+    _pull_request(workflow, "")
+    (workflow.state / "diff-7").write_bytes(_change("app/strings.po").encode() + b"+caf\xe9\n")
+
+    level, reason = _effort(workflow)
+
+    assert level == "high\n"
+    assert reason
 
 
 @pytest.mark.parametrize(
@@ -303,6 +341,33 @@ def test_a_start_that_cannot_tell_runs_at_high(workflow: Workflow) -> None:
 
     assert done.returncode == 0, done.stderr
     assert _started_effort(workflow) == "high"
+
+
+@pytest.mark.parametrize("said", ["exit 1", "echo low", "echo"])
+def test_a_start_whose_review_effort_fails_or_says_another_word_runs_at_high(
+    workflow: Workflow, said: str
+) -> None:
+    _pull_request(workflow, _change(_ORDINARY))
+    (workflow.script.parent / "review-effort").write_text(f"#!/bin/bash\n{said}\n")
+
+    done = workflow.run("start", "review", "7")
+
+    assert done.returncode == 0, done.stderr
+    assert _started_effort(workflow) == "high"
+
+
+def test_a_start_that_waits_for_memory_reads_github_once_it_goes_ahead(
+    workflow: Workflow,
+) -> None:
+    _pull_request(workflow, _change(_ORDINARY))
+    workflow.pressure_file.write_text(
+        "some avg10=0.00 avg60=50.00 avg300=0.04 total=1\nfull avg10=0.00 avg60=0.05 avg300=0.04 total=1\n"
+    )
+
+    done = workflow.run("start", "review", "7", env={"WORKFLOW_DEFER_START": "1"})
+
+    assert done.returncode == 75, done.stderr
+    assert not workflow.calls("gh pr diff")
 
 
 @pytest.mark.parametrize("level", [None, "medium"])

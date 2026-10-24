@@ -18,7 +18,8 @@ from workflow_commands import CommandTimeout, github_read
 MARK = "Review: high"
 # Shipline's own scripts that hold locks, slots or queues, beside this file.
 OWN_SCRIPTS = re.compile(
-    r"(session|tick|review-panel|merge[-_][^/]*|github_budget\.py|[a-z_]+_slots\.py)"
+    r"(session|tick|review-panel|merge[-_][^/]*|github_budget\.py|[a-z_]+_slots\.py"
+    r"|workflow_commands\.py)"
 )
 _HEADER = "diff --git"
 _ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
@@ -53,11 +54,10 @@ def _unquote(text: str) -> str:
 
 def _path(text: str, prefix: str = "") -> str | None:
     """One side of a change as a line names it: None for `/dev/null`."""
+    # Git ends the name with a tab when it holds a space, after its closing quote too.
+    text = text.removesuffix("\t")
     if text.startswith('"'):
         text = _unquote(text)
-    else:
-        # Git ends the name with a tab when it holds a space.
-        text = text.removesuffix("\t")
     if text == "/dev/null":
         return None
     if not text.startswith(prefix) or len(text) == len(prefix):
@@ -92,7 +92,8 @@ def changed_paths(diff: str) -> list[str]:
     """Every path a pull request's diff names, both sides of a rename or a deletion."""
     if not diff.strip():
         raise Unknown("the diff is empty")
-    lines = diff.splitlines()
+    # Git ends a line only at a line feed; `splitlines` would cut a path at other characters.
+    lines = diff.removesuffix("\n").split("\n")
     if not lines[0].startswith(_HEADER):
         raise Unknown(f"the diff does not start with a file: {lines[0][:200]!r}")
     paths: list[str] = []
@@ -177,7 +178,14 @@ def main() -> int:
         return 2
     try:
         found, reason = level(sys.argv[1])
-    except (Unknown, workflow_config.ConfigError, OSError, subprocess.SubprocessError) as error:
+    # A ValueError: a diff that is not UTF-8, which `gh`'s output is read as.
+    except (
+        Unknown,
+        workflow_config.ConfigError,
+        OSError,
+        subprocess.SubprocessError,
+        ValueError,
+    ) as error:
         found, reason = "high", f"cannot tell: {error}"
     if reason:
         print(f"review-effort {sys.argv[1]}: high, as {reason}", file=sys.stderr)
