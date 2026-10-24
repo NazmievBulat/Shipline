@@ -12,8 +12,14 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-sh "$here/../../.github/runner/install-github-budget.sh"
+# The runner's installer of the shared GitHub budget's `gh`, where the repository holds one.
+budget_installer=$here/../../.github/runner/install-github-budget.sh
+if [[ -f $budget_installer ]]; then
+  sh "$budget_installer"
+fi
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+config=$(python3 "$here/workflow_config.py" shell)
+eval "$config"
 units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 
 create_label() {
@@ -26,8 +32,8 @@ labels=$(gh label list --limit 1000 --json name --jq '.[].name') || {
   echo "cannot read the labels from GitHub; nothing was installed" >&2
   exit 1
 }
-create_label workflow 1D76DB "Picked up by the workflow: gets a worker, a review and a merge"
-create_label audited 0E8A16 "Its audit left nothing open"
+create_label "$SHIPLINE_LABEL_WORKFLOW" 1D76DB "Picked up by the workflow: gets a worker, a review and a merge"
+create_label "$SHIPLINE_LABEL_AUDITED" 0E8A16 "Its audit left nothing open"
 
 mkdir -p "$units"
 

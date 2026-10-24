@@ -13,22 +13,29 @@ from typing import Any
 
 import pytest
 from workflow.test_merge_driver import handed as handed_fixture
-from workflow.test_merge_when_current import GitHub
+from workflow.test_merge_when_current import GitHub, _hand_off, _handing_off, _waiting
 from workflow.test_merge_when_current import github as github_fixture
 from workflow_harness import Workflow
 
 github = github_fixture
 handed = handed_fixture
-_API = "repos/NazmievBulat/Shipline"
+_API = "repos/example-org/example-app"
+
+
+def _load(name: str) -> ModuleType:
+    path = Path(__file__).resolve().parents[2] / f"scripts/workflow/{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture
 def reads_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    path = Path(__file__).resolve().parents[2] / "scripts/workflow/train_reads.py"
-    spec = importlib.util.spec_from_file_location("train_reads", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # What train_reads reads this checkout's repository and workflow files with.
+    monkeypatch.setitem(sys.modules, "workflow_config", _load("workflow_config"))
+    module = _load("train_reads")
     monkeypatch.setenv("WORKFLOW_TRAIN_TICK", str(tmp_path))
     (tmp_path / "context.json").write_text(json.dumps({"started": time.time()}))
     return module
@@ -210,10 +217,12 @@ def test_run_jobs_and_annotations_share_the_member_cache_across_ticks(
     tmp_path: Path,
 ) -> None:
     _snapshot(tmp_path)
+    # Loaded from this checkout, the cache knows its jobs by this checkout's repository.
+    api = reads_module.workflow_config.current().api
     paths = [
-        f"{_API}/actions/workflows/ci.yml/runs?head_sha=abc&event=pull_request&per_page=100",
-        f"{_API}/actions/runs/20/jobs?per_page=100",
-        f"{_API}/check-runs/21/annotations?per_page=100",
+        f"{api}/actions/workflows/ci.yml/runs?head_sha=abc&event=pull_request&per_page=100",
+        f"{api}/actions/runs/20/jobs?per_page=100",
+        f"{api}/check-runs/21/annotations?per_page=100",
     ]
     replies = [
         [{"id": 20, "status": "completed", "conclusion": "success"}],
@@ -366,3 +375,37 @@ def test_a_large_pending_train_reads_each_member_once_in_a_no_merge_tick(handed:
         assert len(job_calls) == (2 if number == 7 else 1)
     assert time.monotonic() - started < 180
     assert json.loads((folder / "merge-train.json").read_text())["waiting"] == list(handed.pulls)
+
+
+def test_the_tick_reads_the_members_a_handoff_left_unread(github: GitHub) -> None:
+    workflow = github.workflow
+    _handing_off(github)
+    # 8 waits ahead of it, though its pull request went back to draft.
+    github.pulls["8"] = {
+        **deepcopy(github.pulls["7"]),
+        "headRefOid": f"{8:040x}",
+        "headRefName": "ticket/eight",
+        "isDraft": True,
+    }
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["8"]}))
+
+    handed_off = _hand_off(github)
+
+    assert handed_off.returncode == 0, handed_off.stdout + handed_off.stderr
+    assert _waiting(workflow) == ["8", "7"]
+    assert not workflow.calls("gh pr view 8")
+    # At the turn of the line the tick reads 8, lets it go, and merges 7.
+    workflow.list_pull_request(7, draft=False)
+    (workflow.state / "pr" / "7").write_text(f"OPEN ticket/seven {github.head}\n")
+    workflow.run("stop", "review-7")
+    github.batch_mode = True
+    github.driver_mode = True
+    github.save()
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "merged").read_text() == "7"
+    assert _waiting(workflow) == []

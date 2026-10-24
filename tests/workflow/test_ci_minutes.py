@@ -73,7 +73,7 @@ import sys
 path = sys.argv[-1]
 if sys.argv[1:3] == ["pr", "list"]:
     print(json.dumps([{"number": 7, "mergedAt": "2026-10-23T01:05:00Z"}]))
-elif path == "repos/NazmievBulat/Shipline":
+elif path == "repos/example-org/example-app":
     print('{"created_at": "2026-01-01T00:00:00Z"}')
 elif "workflows/ci.yml/runs" in path:
     assert "2026-01-01" in path  # Old reruns remain discoverable.
