@@ -69,7 +69,9 @@ jobs:
           - shard: 2
             files: >-
               tests/runner/test_build_images.py
+              tests/runner/test_install.py
               tests/runner/test_layout.py
+              tests/runner/test_programs.py
               tests/runner/test_rendering.py
               tests/workflow/test_browser_test_slots.py
               tests/workflow/test_github_identity.py

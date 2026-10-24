@@ -26,6 +26,8 @@ _FILES = [
     "sample-usage.sh",
     "render-units.sh",
     "build-images.sh",
+    "hub-cache.sh",
+    "main-command.sh",
     "README.md",
 ]
 
@@ -38,6 +40,19 @@ def test_the_pool_holds_each_of_its_programs(name: str) -> None:
 def test_the_pool_holds_its_keepers_and_its_machine_files() -> None:
     assert sorted(_RUNNER.glob("keep-*.sh"))
     assert (_RUNNER / "vm").is_dir() and any((_RUNNER / "vm").iterdir())
+
+
+def test_no_program_of_the_pool_names_a_repository_or_a_prefix_of_its_own() -> None:
+    """Every name comes from the repository's shipline.json and the machine's own settings; only
+    the usage of render-units.sh and the README show the example prefix."""
+    for path in sorted(_RUNNER.rglob("*")):
+        if not path.is_file() or path.name in ("README.md", "render-units.sh"):
+            continue
+        if "__pycache__" in path.parts:
+            continue
+        text = path.read_text()
+        for name in ("example-app", "example-owner", "home-planner", "home-main"):
+            assert name not in text, f"{path.relative_to(_RUNNER)} names {name}"
 
 
 def test_shipline_s_own_ci_registers_and_uses_no_runner_of_its_own() -> None:
@@ -60,6 +75,8 @@ def _words(text: str) -> str:
         "`runner.prefix`",
         "`runner.image_build`",
         "`runner.label`",
+        "`runner.planner_label`",
+        "`runner.hub_cache`",
         "`runner.labels`",
         "`<label>-standby`",
         "`<label>-first`",
@@ -69,8 +86,18 @@ def _words(text: str) -> str:
         "`~/.config/shipline/runner.sh`",
         "`SHIPLINE_RUNNER_SETTINGS`",
         "machine=home",
-        "runner_count=",
+        "other_machines=office",
+        "roles='main ordinary planner'",
+        "ordinary_jobs=2",
+        "docker_runners=",
         "`origin/main`",
+        # What the repository's own commands are given and must do.
+        "`RUNNER_FILES`",
+        "`/usr/local/share/shipline-runner/work-as-shipped`",
+        "`HUB_CACHE_CONTAINER`",
+        # How a machine installs it.
+        "sh <shipline>/runner/install.sh",
+        "install-firewall.sh",
         # Never Shipline's own.
         "never registers a runner to Shipline itself",
     ],
@@ -84,6 +111,6 @@ def test_the_readme_says_how_a_repository_sets_the_prefix_and_a_machine_its_sett
 def test_the_readme_names_every_unit_the_templates_hold() -> None:
     text = (_RUNNER / "README.md").read_text()
 
-    for template in sorted((_RUNNER / "units").iterdir()):
+    for template in sorted((_RUNNER / "systemd").iterdir()):
         name = template.name.replace("@PREFIX@", "<prefix>")
         assert f"`{name}`" in text, name
