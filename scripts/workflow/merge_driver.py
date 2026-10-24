@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -12,6 +13,7 @@ from typing import Any
 
 import check_repair
 import merge_gate as gate
+import self_update
 import train_reads
 from conflict_review import prepare as prepare_conflict_review
 from merge_handoff import Handoff, write_json
@@ -368,6 +370,11 @@ def _drive_gate(folder: Path, number: str) -> bool:
     finally:
         os.chdir(previous)
     print(done.stdout + done.stderr, end="", flush=True)
+    # A crash of the gate counts against a new version of Shipline (`self_update.py`).
+    try:
+        self_update.gate_ran(done.returncode, done.stderr)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"could not count the gate run for the self-update: {error}", flush=True)
     # A squash can succeed before a later batch/receipt check refuses.
     if done.returncode not in (0, 2, 3):
         if gate.read_pull(number)["state"] == "MERGED":
