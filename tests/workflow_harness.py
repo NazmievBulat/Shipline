@@ -20,11 +20,9 @@ from functools import cache
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "workflow"
+# What the scripts read from the rest of a repository, held only as far as the tests read it.
+STAND_INS = Path(__file__).resolve().parent / "workflow" / "stand-ins"
 SESSION_LINK = "https://claude.ai/code/session_01TestLinkForWorkflow"
-# What `origin` is called in each test's repository, as in a real checkout, so the scripts take
-# the repository's owner and name from it (workflow_config.py); git is sent to the test's own
-# origin in its place.
-ORIGIN_URL = "https://github.com/NazmievBulat/Shipline.git"
 
 # A fake outside call whose cancellation is observable independently of runner speed. Its trap
 # first ignores TERM: GNU timeout sends a second one to the process group, and bash would run
@@ -857,8 +855,7 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
     template = _template()
     shutil.copytree(template / "origin.git", origin, symlinks=True)
     shutil.copytree(template / "repo", made.repo, symlinks=True)
-    made.git("remote", "set-url", "origin", ORIGIN_URL)
-    made.git("config", f"url.{origin}.insteadOf", ORIGIN_URL)
+    made.git("remote", "set-url", "origin", str(origin))
     return made
 
 
@@ -906,7 +903,12 @@ def _template() -> Path:
     setup.write_text('#!/bin/bash\nexec worktree-setup "$@"\n')
     setup.chmod(0o755)
     # The merge gate asks E2E's planner whether a merge needs browser tests.
-    shutil.copy2(SCRIPTS.parent / "e2e-plan.py", scripts.parent / "e2e-plan.py")
+    shutil.copy2(STAND_INS / "e2e-plan.py", scripts.parent / "e2e-plan.py")
+    # The checks the merge gate runs before a pull request joins the train.
+    shutil.copy2(STAND_INS / "pre-train-checks", scripts / "pre-train-checks")
+    # The prompt a Claude session is woken with when the Codex bridge's `await_turn` ends.
+    (scripts / "tests").mkdir()
+    shutil.copy2(STAND_INS / "await-turn-completed.json", scripts / "tests")
     # These tests drive merge/tick state machines through hundreds of fake reads and hundreds
     # of fake merges, reruns and dispatches. Mock the pacing of both: the mutations' 1 to 1.5 s
     # apart were 486 s of these tests' 4,000 in one measurement. Dedicated helper subprocess tests
@@ -919,14 +921,12 @@ def _template() -> Path:
         assert wait in helper, f"github_budget.py no longer says {wait}"
         helper = helper.replace(wait, wait.split("= ")[0] + "= 0.0" if "=" in wait else "0.0")
     budget_helper.write_text(helper)
+    # The repository `tick` and the Codex worker's `gh` work on.
     runner_settings = repo / ".github" / "runner" / "settings.sh"
     runner_settings.parent.mkdir(parents=True)
-    shutil.copy2(SCRIPTS.parents[1] / ".github" / "runner" / "settings.sh", runner_settings)
-    for name in ("install-github-budget.sh", "github-gh.sh", "github_budget.py"):
-        shutil.copy2(SCRIPTS.parents[1] / ".github/runner" / name, runner_settings.with_name(name))
-    ci_workflow = repo / ".github/workflows/ci.yml"
-    ci_workflow.parent.mkdir(parents=True)
-    shutil.copy2(SCRIPTS.parents[1] / ".github/workflows/ci.yml", ci_workflow)
+    shutil.copy2(STAND_INS / "settings.sh", runner_settings)
+    # The runners the merge gate may re-run failed jobs on: every other value is its default.
+    shutil.copy2(STAND_INS / "shipline.json", repo / "shipline.json")
     (repo / ".gitignore").write_text(".local/\n.claude/\n")
     git("add", "-A")
     git("commit", "--quiet", "-m", "chore: start")

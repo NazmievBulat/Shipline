@@ -17,7 +17,7 @@ from reviewer_start import start as start_reviewer
 
 
 def _worktree(folder: Path, number: str) -> Path:
-    return folder.parent.parent / ".claude" / "worktrees" / f"ticket-{number}"
+    return gate.CONFIG.checkout_of(folder) / ".claude" / "worktrees" / f"ticket-{number}"
 
 
 def _sessions() -> set[str]:

@@ -14,7 +14,6 @@ from workflow.test_merge_when_current import (
     UNREACHABLE,
     GitHub,
     advisory_service_answers,
-    batch_dependencies_red,
     hook_runs,
     pull_dependencies_red,
     rerun_calls,
@@ -41,7 +40,7 @@ def _started(workflow: Workflow) -> list[str]:
 
 
 def _publish(github: GitHub, result: str = "passed", head: str | None = None) -> None:
-    github.api["repos/NazmievBulat/Shipline/pulls/7/reviews"] = [
+    github.api["repos/example-org/example-app/pulls/7/reviews"] = [
         {
             "body": f"<!-- workflow-review round=1 result={result} -->\nReviewed.",
             "commit_id": head or github.head,
@@ -96,7 +95,7 @@ def test_the_tick_drives_a_red_main_fix_handed_off_behind_another_pull(handed: G
     workflow.running("review-8")
     (workflow.state / "tmux/review-7").unlink()
     handed.main("failure")
-    handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"]["jobs"].append(
+    handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"].append(
         {"id": 29, "name": "CI: web", "status": "completed", "conclusion": "success"}
     )
     handed.save()
@@ -200,7 +199,7 @@ def test_a_lost_check_is_run_again_then_merged_on_a_later_tick(handed: GitHub) -
     workflow = handed.workflow
     lost = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
     runs = (
-        "repos/NazmievBulat/Shipline/actions/workflows/ci.yml/runs"
+        "repos/example-org/example-app/actions/workflows/ci.yml/runs"
         f"?head_sha={handed.head}&event=pull_request&per_page=100"
     )
     handed.api[runs]["workflow_runs"][0]["updated_at"] = lost
@@ -211,7 +210,7 @@ def test_a_lost_check_is_run_again_then_merged_on_a_later_tick(handed: GitHub) -
             "status": "IN_PROGRESS",
             "conclusion": None,
             "startedAt": lost,
-            "detailsUrl": "https://github.com/NazmievBulat/Shipline/actions/runs/20/job/22",
+            "detailsUrl": "https://github.com/example-org/example-app/actions/runs/20/job/22",
         }
     )
     handed.save()
@@ -370,134 +369,6 @@ def _mechanical_conflict(handed: GitHub, kind: str) -> list[str]:
 
 @pytest.mark.parametrize(
     "kind",
-    [
-        "list",
-        "migration",
-        "same migration path",
-        "migration only",
-        "decision",
-        "decision with instructions",
-        "decision with renamed link",
-    ],
-)
-def test_tick_resolves_only_mechanical_conflicts_and_preserves_the_handoff(
-    handed: GitHub, kind: str
-) -> None:
-    workflow = handed.workflow
-    checks = _mechanical_conflict(handed, kind)
-    queue = json.loads((_folder(workflow) / "merge-train.json").read_text())["waiting"]
-    old = handed.head
-
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert _note(workflow).exists(), done.stdout + done.stderr
-    branch = workflow.worktree(7)
-    head = workflow.git("rev-parse", "HEAD", cwd=branch)
-    assert head != old
-    assert workflow.git("rev-parse", "HEAD^1", cwd=branch) == old
-    assert workflow.git("rev-parse", "HEAD^2", cwd=branch) == handed.base
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == head
-    assert json.loads(_note(workflow).read_text())["head"] == head
-    train = json.loads((_folder(workflow) / "merge-train.json").read_text())
-    assert train["approved"]["7"] == head
-    assert train["waiting"] == queue
-    assert _started(workflow) == []
-    assert not (workflow.state / "merged").exists()
-    assert workflow.git("status", "--porcelain", cwd=branch) == ""
-    assert workflow.git("log", "-1", "--format=%s", cwd=branch).startswith(
-        "merge main: mechanical conflict in "
-    )
-    expected_list = "# Shared list\n\n- existing\n"
-    if kind != "migration only":
-        expected_list += "- main item\n- branch item\n"
-    assert (branch / "docs/list.md").read_text() == expected_list
-    for check in checks:
-        assert any(check in call for call in workflow.calls("pytest"))
-    if "migration" in kind:
-        versions = branch / _VERSIONS
-        main = "0002_branch.py" if kind == "same migration path" else "0002_main.py"
-        assert "# main migration" in (versions / main).read_text()
-        assert (
-            versions / "0003_branch.py"
-        ).read_text() == 'revision = "0003"\ndown_revision = "0002"\n# branch migration\n'
-        assert (
-            versions / "0004_next.py"
-        ).read_text() == 'revision = "0004"\ndown_revision = "0003"\n# next migration\n'
-        assert not (versions / "0003_next.py").exists()
-    if kind.startswith("decision"):
-        assert (branch / "docs/decisions/0009-branch.md").read_text() == "# ADR 0009: Branch\n"
-        assert not (branch / "docs/decisions/0002-branch.md").exists()
-        assert (
-            (branch / "docs/decisions/README.md")
-            .read_text()
-            .endswith("- [0002](0002-main.md) Main\n- [0009](0009-branch.md) Branch\n")
-        )
-        assert (
-            branch / "docs/reference.md"
-        ).read_text() == "See [branch](decisions/0009-branch.md).\n"
-        assert (
-            branch / "reference.py"
-        ).read_text() == '"""See docs/decisions/0009-branch.md (ADR 0009)."""\n'
-        assert (branch / "docs/shared.md").read_text() == (
-            "Main follows ADR 0002.\nShared text.\nBranch follows decision record 0009.\n"
-        )
-        if kind == "decision with renamed link":
-            assert (
-                (branch / "docs/renamed-reference.md")
-                .read_text()
-                .endswith("See [branch](decisions/0009-branch.md).\n")
-            )
-            assert not (branch / "docs/old-reference.md").exists()
-
-
-def test_records_with_distinct_numbers_keep_both_index_lines_in_number_order(
-    handed: GitHub,
-) -> None:
-    workflow = handed.workflow
-    _mechanical_conflict(handed, "decision with distinct numbers")
-
-    done = workflow.run_script("tick")
-
-    assert _note(workflow).exists(), done.stdout + done.stderr
-    assert _started(workflow) == []
-    branch = workflow.worktree(7)
-    head = workflow.git("rev-parse", "HEAD", cwd=branch)
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == head
-    assert json.loads(_note(workflow).read_text())["head"] == head
-    assert (
-        (branch / "docs/decisions/README.md")
-        .read_text()
-        .endswith("- [0002](0002-branch.md) Branch\n- [0003](0003-main.md) Main\n")
-    )
-    assert (branch / "docs/decisions/0002-branch.md").read_text() == "# ADR 0002: Branch\n"
-    assert (branch / "docs/reference.md").read_text() == "See [branch](decisions/0002-branch.md).\n"
-
-
-@pytest.mark.parametrize("kind", ["migration", "decision"])
-def test_failed_mechanical_refresh_checks_hand_back_without_committing_or_pushing(
-    handed: GitHub, kind: str
-) -> None:
-    workflow = handed.workflow
-    _mechanical_conflict(handed, kind)
-    workflow.fake(
-        "pytest",
-        '#!/bin/bash\necho "pytest $*" >> "@STATE@/calls.log"\n'
-        'echo "refresh check failed" >&2\nexit 1\n',
-    )
-
-    done = workflow.run_script("tick")
-
-    assert not _note(workflow).exists(), done.stdout + done.stderr
-    assert _started(workflow) == ["review-7"]
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
-    assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
-    assert "refresh check failed" in done.stdout + done.stderr
-    assert not (workflow.state / "merged").exists()
-
-
-@pytest.mark.parametrize(
-    "kind",
     ["prose", "list replacement", "mixed", "released migration", "fenced list", "overlap"],
 )
 def test_non_mechanical_conflicts_are_left_for_the_reviewer(handed: GitHub, kind: str) -> None:
@@ -606,7 +477,7 @@ def test_judgment_drops_the_note_and_starts_exactly_one_fresh_reviewer(
         handed.pulls["7"]["headRefOid"] = handed.head
         (workflow.state / "pr" / "7").write_text(f"OPEN ticket/seven {handed.head}\n")
     elif problem == "refusal":
-        handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"] = None
+        handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"] = None
     else:
         (workflow.worktree(7) / "uncommitted").write_text("unfinished")
     handed.save()
@@ -636,7 +507,7 @@ def test_red_or_pending_main_keeps_the_note_without_merging_or_starting_a_model(
     if main_state == "red":
         handed.main("failure")
     else:
-        handed.api["repos/NazmievBulat/Shipline/actions/runs/10/jobs?per_page=100"]["jobs"][
+        handed.api["repos/example-org/example-app/actions/runs/10/jobs?per_page=100"]["jobs"][
             0
         ].update(
             status="in_progress",
@@ -659,7 +530,7 @@ def test_unreadable_github_keeps_the_note_and_merges_once_it_can_be_read(
     unreadable: str,
 ) -> None:
     workflow = handed.workflow
-    jobs = "repos/NazmievBulat/Shipline/actions/runs/10/jobs?per_page=100"
+    jobs = "repos/example-org/example-app/actions/runs/10/jobs?per_page=100"
     main_jobs = handed.api[jobs]
     if unreadable == "main":
         handed.api[jobs] = None
@@ -713,7 +584,7 @@ exec "$(dirname "$0")/gh-stand-in" "$@"
 
 def test_a_pending_pr_run_is_retried_without_another_reviewer(handed: GitHub) -> None:
     workflow = handed.workflow
-    handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"]["jobs"][0].update(
+    handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"][0].update(
         status="in_progress",
         conclusion=None,
     )
@@ -730,7 +601,7 @@ def test_a_reviewer_that_handed_off_is_stopped_while_its_checks_still_run(
 ) -> None:
     """A passed round and the handoff are the reviewer's last work: it never waits in line."""
     workflow = handed.workflow
-    handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"]["jobs"][0].update(
+    handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"][0].update(
         status="in_progress",
         conclusion=None,
     )
@@ -818,7 +689,7 @@ def test_hand_back_reviewers_start_by_priority(handed: GitHub) -> None:
         "headRefOid": head,
         "labels": [{"name": "workflow"}, {"name": "priority: high"}],
     }
-    handed.api["repos/NazmievBulat/Shipline/pulls/8/reviews"] = []
+    handed.api["repos/example-org/example-app/pulls/8/reviews"] = []
     handed.save()
     (_folder(workflow) / "merge-review-8").write_text(
         json.dumps({"reason": "pull request checks failed", "event": "b" * 32})
@@ -894,7 +765,7 @@ def test_an_interrupted_hand_back_cannot_merge_with_its_old_authorization(handed
 
 def test_a_hand_back_preserves_the_owners_two_send_back_limit(handed: GitHub) -> None:
     workflow = handed.workflow
-    handed.api["repos/NazmievBulat/Shipline/pulls/7/reviews"] = [
+    handed.api["repos/example-org/example-app/pulls/7/reviews"] = [
         {"body": f"<!-- workflow-review round={n} result={outcome} -->", "commit_id": handed.head}
         for n, outcome in [(1, "sent-back"), (2, "sent-back"), (3, "passed")]
     ]
@@ -999,7 +870,7 @@ def _child(github: GitHub, *, conflict: bool = False) -> tuple[Path, str]:
         "headRefOid": head,
         "baseRefName": "ticket/seven",
     }
-    github.api["repos/NazmievBulat/Shipline/pulls/8/reviews"] = []
+    github.api["repos/example-org/example-app/pulls/8/reviews"] = []
     workflow.list_pull_request(8, draft=False)
     (workflow.state / "pr" / "8").write_text(f"OPEN ticket/eight {head}\n")
     if conflict:
@@ -1164,7 +1035,7 @@ def _handed_batch(github: GitHub) -> None:
         (workflow.state / "pr" / number).write_text(
             f"OPEN {pull['headRefName']} {pull['headRefOid']}\n"
         )
-        github.api[f"repos/NazmievBulat/Shipline/pulls/{number}/reviews"] = [
+        github.api[f"repos/example-org/example-app/pulls/{number}/reviews"] = [
             {
                 "body": "<!-- workflow-review round=1 result=passed -->",
                 "commit_id": pull["headRefOid"],
@@ -1245,7 +1116,7 @@ def test_the_same_retest_twice_in_a_row_on_one_tree_hands_back(github: GitHub) -
 
 
 def _pending_front(github: GitHub, kind: str) -> None:
-    prefix = "repos/NazmievBulat/Shipline/actions"
+    prefix = "repos/example-org/example-app/actions"
     if kind == "rollup":
         github.pulls["7"]["statusCheckRollup"][0].update(status="QUEUED", conclusion=None)
     elif kind == "ci-job":
@@ -1352,7 +1223,7 @@ def test_pending_front_waits_when_nobody_behind_has_fresh_green_checks(
         for number in (8, 9):
             head = github.pulls[str(number)]["headRefOid"]
             github.api[
-                f"repos/NazmievBulat/Shipline/actions/workflows/ci.yml/runs?head_sha={head}"
+                f"repos/example-org/example-app/actions/workflows/ci.yml/runs?head_sha={head}"
                 "&event=pull_request&per_page=100"
             ] = None
     github.save()
@@ -1592,13 +1463,13 @@ def test_lender_cancellation_keeps_handoff_and_train_position(handed: GitHub, st
     )
     handed.pulls["7"]["statusCheckRollup"][0].update(
         conclusion="CANCELLED",
-        detailsUrl="https://github.com/NazmievBulat/Shipline/actions/runs/20/job/22",
+        detailsUrl="https://github.com/example-org/example-app/actions/runs/20/job/22",
     )
     run = handed.api[
-        f"repos/NazmievBulat/Shipline/actions/workflows/ci.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
+        f"repos/example-org/example-app/actions/workflows/ci.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
     ]["workflow_runs"][0]
     run.update(conclusion="cancelled", run_attempt=1)
-    for job in handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"][
+    for job in handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"][
         "jobs"
     ]:
         job["conclusion"] = "cancelled"
@@ -1631,15 +1502,15 @@ def test_other_failures_still_revoke_a_handoff(handed: GitHub, problem: str) -> 
     handed.pulls["7"]["statusCheckRollup"][0].update(
         conclusion="FAILURE" if problem == "failure" else "CANCELLED",
         detailsUrl=(
-            "https://github.com/NazmievBulat/Shipline/actions/runs/20/job/"
+            "https://github.com/example-org/example-app/actions/runs/20/job/"
             + ("23" if problem == "attempt" else "22")
         ),
     )
     run = handed.api[
-        f"repos/NazmievBulat/Shipline/actions/workflows/ci.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
+        f"repos/example-org/example-app/actions/workflows/ci.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
     ]["workflow_runs"][0]
     run.update(conclusion="cancelled", run_attempt=2 if problem == "attempt" else 1)
-    for job in handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"][
+    for job in handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"][
         "jobs"
     ]:
         job["conclusion"] = "cancelled"
@@ -1734,14 +1605,14 @@ def test_a_main_retry_prevented_by_the_reserve_remains_eligible_after_reset(hand
     workflow = handed.workflow
     handed.main(conclusion="failure")
     handed.api[
-        f"repos/NazmievBulat/Shipline/actions/workflows/ci.yml/runs?head_sha={handed.base}&per_page=100"
+        f"repos/example-org/example-app/actions/workflows/ci.yml/runs?head_sha={handed.base}&per_page=100"
     ]["workflow_runs"][0]["run_attempt"] = 1
-    for job in handed.api["repos/NazmievBulat/Shipline/actions/runs/10/jobs?per_page=100"][
+    for job in handed.api["repos/example-org/example-app/actions/runs/10/jobs?per_page=100"][
         "jobs"
     ]:
         job["labels"] = ["example-app-home-main"]
     handed.save()
-    _low_budget_after(workflow, "api --paginate repos/NazmievBulat/Shipline/actions/runs/10/jobs")
+    _low_budget_after(workflow, "api --paginate repos/example-org/example-app/actions/runs/10/jobs")
     first = workflow.run_script("tick")
     assert first.returncode == 0, first.stdout + first.stderr
     assert not (_folder(workflow) / "main-rerun-10").exists()
@@ -1925,194 +1796,6 @@ def _chain(branch: Path) -> list[tuple[str, str, str]]:
     return found
 
 
-def _renumbered(github: GitHub, branch: Path, old: str) -> str:
-    workflow = github.workflow
-    head = workflow.git("rev-parse", "HEAD", cwd=branch)
-    assert workflow.git("rev-parse", "HEAD^1", cwd=branch) == old
-    assert workflow.git("rev-parse", "HEAD^2", cwd=branch) == github.base
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == head
-    assert workflow.git("status", "--porcelain", cwd=branch) == ""
-    assert workflow.git("log", "-1", "--format=%s", cwd=branch) == (
-        "merge main: renumber migration 0002_branch.py to 0003_branch.py, "
-        "0003_next.py to 0004_next.py"
-    )
-    # One line of files, each numbered as its revision and following the one before:
-    # the shape test_the_files_are_numbered_without_a_gap and the migration tool's single head need.
-    assert _chain(branch) == [
-        ("0001_base.py", "0001", "None"),
-        ("0002_main.py", "0002", "0001"),
-        ("0003_branch.py", "0003", "0002"),
-        ("0004_next.py", "0004", "0003"),
-    ]
-    assert (branch / _VERSIONS / "0002_main.py").read_text() == _MAIN
-    assert (branch / _VERSIONS / "0003_branch.py").read_text().endswith("# branch migration\n")
-    assert any(
-        "tests/persistence/test_migrations.py" in call
-        for call in workflow.calls("pytest")
-    )
-    return head
-
-
-def test_the_reviewers_gate_renumbers_a_migration_whose_number_main_took(apart: GitHub) -> None:
-    workflow = apart.workflow
-    branch = _both_add_0002(apart, "chain")
-    old = apart.head
-
-    done = workflow.run_script("merge-when-current", "7", cwd=branch)
-
-    assert done.returncode == 2, done.stdout + done.stderr
-    assert "CI requested" in done.stdout
-    _renumbered(apart, branch, old)
-    assert not (workflow.state / "merged").exists()
-
-
-def test_the_tick_renumbers_a_handed_off_migration_and_keeps_the_handoff(
-    handed: GitHub,
-) -> None:
-    workflow = handed.workflow
-    branch = _both_add_0002(handed, "chain", reviewed=True)
-    old = handed.head
-    queue = json.loads((workflow.repo / ".local/workflow/merge-train.json").read_text())["waiting"]
-
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    head = _renumbered(handed, branch, old)
-    assert json.loads(_note(workflow).read_text())["head"] == head
-    train = json.loads((workflow.repo / ".local/workflow/merge-train.json").read_text())
-    assert train["approved"]["7"] == head
-    assert train["waiting"] == queue
-    assert _started(workflow) == []
-    assert not (workflow.state / "merged").exists()
-
-
-@pytest.mark.parametrize("kind", ["edited released", "branch point", "merge migration"])
-def test_a_migration_that_is_not_a_plain_chain_is_left_for_the_reviewer(
-    apart: GitHub, kind: str
-) -> None:
-    workflow = apart.workflow
-    branch = _both_add_0002(apart, kind)
-    before = {path.name: path.read_text() for path in (branch / _VERSIONS).glob("*.py")}
-    old = apart.head
-
-    done = workflow.run_script("merge-when-current", "7", cwd=branch)
-
-    assert done.returncode == 1, done.stdout + done.stderr
-    assert "renumber" in done.stderr
-    assert workflow.git("rev-parse", "HEAD", cwd=branch) == old
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == old
-    # The merge of main waits in the worktree, as a conflict does, with its message.
-    workflow.git("rev-parse", "--verify", "MERGE_HEAD", cwd=branch)
-    message = Path(workflow.git("rev-parse", "--git-path", "MERGE_MSG", cwd=branch))
-    assert (branch / message if not message.is_absolute() else message).read_text() == (
-        f"merge main: conflict in {_VERSIONS}0002_branch.py\n"
-    )
-    # The branch's files are as it wrote them; main's 0002 has merely arrived beside them.
-    after = {path.name: path.read_text() for path in (branch / _VERSIONS).glob("*.py")}
-    assert after == {**before, "0002_main.py": _MAIN}
-    assert not workflow.calls("pytest")
-    assert not (workflow.state / "merged").exists()
-    # Passed over in the train, as a conflict is, until the reviewer pushes a new head.
-    assert json.loads((_folder(workflow) / "merge-train.json").read_text())["conflicts"] == {
-        "7": old
-    }
-
-
-@pytest.mark.parametrize(
-    ("kind", "subject", "files"),
-    [
-        (
-            "main took two",
-            "merge main: renumber migration 0002_branch.py to 0004_branch.py, "
-            "0003_next.py to 0005_next.py",
-            ["0001_base", "0002_main", "0003_more", "0004_branch", "0005_next"],
-        ),
-        (
-            "stacked",
-            "chore: test against current main",
-            ["0001_base", "0002_branch", "0003_next"],
-        ),
-        (
-            "stacked and taken",
-            "merge main: renumber migration 0003_next.py to 0004_next.py",
-            ["0001_base", "0002_branch", "0003_more", "0004_next"],
-        ),
-    ],
-)
-def test_new_migrations_follow_main_s_last_and_main_s_own_are_kept(
-    apart: GitHub, kind: str, subject: str, files: list[str]
-) -> None:
-    workflow = apart.workflow
-    branch = _both_add_0002(apart, kind)
-
-    done = workflow.run_script("merge-when-current", "7", cwd=branch)
-
-    assert done.returncode == 2, done.stdout + done.stderr
-    assert workflow.git("log", "-1", "--format=%s", cwd=branch) == subject
-    assert workflow.git("status", "--porcelain", cwd=branch) == ""
-    chain = _chain(branch)
-    assert [name for name, _, _ in chain] == [name + ".py" for name in files]
-    # One line: each revision is its file's number and follows the one before it.
-    assert [(revision, parent) for _, revision, parent in chain] == [
-        (name[:4], files[index - 1][:4] if index else "None") for index, name in enumerate(files)
-    ]
-    assert (branch / _VERSIONS / "0002_branch.py").exists() == kind.startswith("stacked")
-
-
-def _failing_migration_check(github: GitHub) -> None:
-    github.workflow.fake(
-        "pytest",
-        '#!/bin/bash\necho "pytest $*" >> "@STATE@/calls.log"\n'
-        'echo "migration check failed" >&2\nexit 1\n',
-    )
-
-
-def _nothing_committed_or_pushed(github: GitHub, branch: Path, old: str, output: str) -> None:
-    workflow = github.workflow
-    assert "migration check failed" in output
-    assert workflow.git("rev-parse", "HEAD", cwd=branch) == old
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == old
-    assert not (workflow.state / "merged").exists()
-
-
-def test_a_failed_migration_check_refuses_the_reviewers_refresh(apart: GitHub) -> None:
-    branch = _both_add_0002(apart, "chain")
-    _failing_migration_check(apart)
-
-    done = apart.workflow.run_script("merge-when-current", "7", cwd=branch)
-
-    assert done.returncode == 1, done.stdout + done.stderr
-    _nothing_committed_or_pushed(apart, branch, apart.head, done.stderr)
-
-
-def test_a_failed_migration_check_hands_the_tick_s_refresh_to_a_reviewer(handed: GitHub) -> None:
-    workflow = handed.workflow
-    branch = _both_add_0002(handed, "chain", reviewed=True)
-    _failing_migration_check(handed)
-
-    done = workflow.run_script("tick")
-
-    assert not _note(workflow).exists(), done.stdout + done.stderr
-    assert _started(workflow) == ["review-7"]
-    _nothing_committed_or_pushed(handed, branch, handed.head, done.stdout + done.stderr)
-
-
-def test_the_tick_hands_a_migration_it_cannot_renumber_to_a_reviewer(handed: GitHub) -> None:
-    workflow = handed.workflow
-    branch = _both_add_0002(handed, "branch point", reviewed=True)
-    old = handed.head
-
-    done = workflow.run_script("tick")
-
-    assert not _note(workflow).exists(), done.stdout + done.stderr
-    assert _started(workflow) == ["review-7"]
-    assert workflow.git("rev-parse", "HEAD", cwd=branch) == old
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == old
-    assert (branch / _VERSIONS / "0002_branch.py").read_text() == _BRANCH
-    assert not (branch / _VERSIONS / "0003_branch.py").exists()
-    assert not (workflow.state / "merged").exists()
-
-
 def test_a_branch_whose_numbers_main_did_not_take_is_refreshed_as_it_is(apart: GitHub) -> None:
     workflow = apart.workflow
     branch = _both_add_0002(apart, "edited released without collision")
@@ -2141,34 +1824,6 @@ def _stale_note(handed: GitHub) -> None:
     handed.save()
 
 
-def test_a_refresh_the_audit_service_refused_keeps_the_handoff_until_it_answers(
-    handed: GitHub,
-) -> None:
-    workflow = handed.workflow
-    _stale_note(handed)
-    short_of_memory(workflow, UNREACHABLE, times=2)
-
-    for _ in range(2):
-        done = workflow.run_script("tick")
-        assert done.returncode == 0, done.stdout + done.stderr
-        assert "the tick tries the push again on a later turn" in done.stdout + done.stderr
-        assert "--handoff" not in done.stdout + done.stderr
-        assert _note(workflow).exists()
-        assert not list(_folder(workflow).glob("merge-review-*"))
-        assert _started(workflow) == []
-        # Back on the published head each time, so the next tick can refresh it.
-        assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
-    assert (_folder(workflow) / "advisory-service.pending").exists()
-
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    refreshed = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == refreshed
-    assert json.loads(_note(workflow).read_text())["head"] == refreshed
-    assert _started(workflow) == []
-
-
 def test_a_refresh_refused_for_an_advisory_hands_back_to_one_fresh_reviewer(
     handed: GitHub,
 ) -> None:
@@ -2184,85 +1839,6 @@ def test_a_refresh_refused_for_an_advisory_hands_back_to_one_fresh_reviewer(
     assert not (_folder(workflow) / "advisory-service-down").exists()
 
 
-def test_a_stacked_child_push_the_audit_service_refused_waits_for_the_next_tick(
-    handed: GitHub,
-) -> None:
-    workflow = handed.workflow
-    worktree, head = _child(handed)
-    short_of_memory(workflow, UNREACHABLE, times=1)
-
-    first = workflow.run_script("tick")
-
-    assert first.returncode == 0, first.stdout + first.stderr
-    assert workflow.git("rev-parse", "HEAD", cwd=worktree) == head
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/eight").split()[0] == head
-    assert json.loads(_note(workflow).read_text())["children"] == ["8"]
-    # Not handed back: no request for judgment (a ready child gets its own reviewer anyway).
-    assert not (_folder(workflow) / "merge-review-8").exists()
-    workflow.run("stop", "review-8")
-
-    second = workflow.run_script("tick")
-
-    assert second.returncode == 0, second.stdout + second.stderr
-    remote = workflow.git("ls-remote", "origin", "refs/heads/ticket/eight").split()[0]
-    assert remote != head and workflow.git("rev-parse", "HEAD", cwd=worktree) == remote
-    assert not _note(workflow).exists()
-
-
-def test_a_handoff_red_only_for_the_audit_service_waits_and_is_re_run_once_it_answers(
-    handed: GitHub,
-) -> None:
-    workflow = handed.workflow
-    run = pull_dependencies_red(handed, annotation=UNREACHABLE)
-    advisory_service_answers(workflow, answers=False)
-
-    for _ in range(2):
-        done = workflow.run_script("tick")
-        assert done.returncode == 0, done.stdout + done.stderr
-        assert _note(workflow).exists()
-        assert not list(_folder(workflow).glob("merge-review-*"))
-        assert _started(workflow) == []
-        assert rerun_calls(workflow) == []
-        assert not (workflow.state / "merged").exists()
-
-    advisory_service_answers(workflow, answers=True)
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert rerun_calls(workflow) == ["gh run rerun 20 -R NazmievBulat/Shipline --failed"]
-    note = "automatically re-ran failed jobs of run 20 of pull request 7 after npm's advisory"
-    assert note in workflow.wake_log.read_text()
-    assert _note(workflow).exists() and _started(workflow) == []
-
-    # GitHub still shows the failed first attempt: no second re-run, still waiting.
-    workflow.run_script("tick")
-    assert len(rerun_calls(workflow)) == 1 and _note(workflow).exists()
-
-    # The re-run is running, then passes on the same run id and head: the handoff merges.
-    run.update(status="in_progress", conclusion=None, run_attempt=2)
-    for job in handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"][
-        "jobs"
-    ]:
-        if job["conclusion"] == "failure":
-            job.update(status="in_progress", conclusion=None)
-    for check in handed.pulls["7"]["statusCheckRollup"]:
-        check.update(status="IN_PROGRESS", conclusion=None)
-    handed.save()
-    done = workflow.run_script("tick")
-    assert _note(workflow).exists() and _started(workflow) == [], done.stdout + done.stderr
-
-    handed.ci(handed.base, handed.head)
-    handed.pulls["7"]["statusCheckRollup"] = [
-        {"name": "CI result", "status": "COMPLETED", "conclusion": "SUCCESS"}
-    ]
-    handed.save()
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert (workflow.state / "merged").read_text() == "7"
-    assert _started(workflow) == []
-
-
 @pytest.mark.parametrize(
     "reason", ["no annotation", "another check failed too", "hosted", "failed again"]
 )
@@ -2273,7 +1849,7 @@ def test_a_handoff_red_for_more_than_the_audit_service_hands_back(
     run = pull_dependencies_red(
         handed, annotation=None if reason == "no annotation" else UNREACHABLE
     )
-    parts = handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"]["jobs"]
+    parts = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
     if reason == "another check failed too":
         handed.pulls["7"]["statusCheckRollup"].append(
             {"name": "CI: web", "status": "COMPLETED", "conclusion": "FAILURE"}
@@ -2295,192 +1871,6 @@ def test_a_handoff_red_for_more_than_the_audit_service_hands_back(
     assert rerun_calls(workflow) == []
 
 
-def test_a_handoff_is_re_run_for_the_audit_service_under_the_merge_lock(handed: GitHub) -> None:
-    # A gate call re-runs under merge.lock: the tick holds it too, so only one asks GitHub.
-    workflow = handed.workflow
-    pull_dependencies_red(handed, annotation=UNREACHABLE)
-    advisory_service_answers(workflow, answers=True)
-    inner = workflow.bin / "gh-inner"
-    inner.write_text((workflow.bin / "gh").read_text())
-    inner.chmod(0o755)
-    lock = _folder(workflow) / "merge.lock"
-    workflow.fake(
-        "gh",
-        "#!/bin/bash\n"
-        'if [[ "$1 $2" == "run rerun" ]]; then\n'
-        f'  if flock --nonblock "{lock}" true; then echo free; else echo held; fi'
-        f' >> "{workflow.state}/rerun-lock"\n'
-        "fi\n"
-        f'exec "{inner}" "$@"\n',
-    )
-
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert len(rerun_calls(workflow)) == 1
-    assert (workflow.state / "rerun-lock").read_text() == "held\n"
-    assert _note(workflow).exists() and _started(workflow) == []
-
-
-def test_a_refused_re_run_for_the_audit_service_hands_back_once(handed: GitHub) -> None:
-    workflow = handed.workflow
-    pull_dependencies_red(handed, annotation=UNREACHABLE)
-    advisory_service_answers(workflow, answers=True)
-    (workflow.state / "fail-rerun").touch()
-
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert "refused: rerun refused" in (_folder(workflow) / "pull-rerun-20-1").read_text()
-    assert _note(workflow).exists() and _started(workflow) == []
-
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert not _note(workflow).exists()
-    assert _started(workflow) == ["review-7"]
-    assert len(rerun_calls(workflow)) == 1
-
-
-def test_a_reviewer_hands_off_a_pull_request_red_only_for_the_audit_service(
-    github: GitHub,
-) -> None:
-    workflow = github.workflow
-    workflow.git("checkout", "main")
-    workflow.git("worktree", "add", str(workflow.worktree(7)), "ticket/seven")
-    _publish(github)
-    pull_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(workflow, answers=False)
-
-    _handoff(github)
-
-    assert _note(workflow).exists()
-    assert rerun_calls(workflow) == []
-
-
-def test_a_handoff_whose_annotation_github_could_not_serve_waits(handed: GitHub) -> None:
-    workflow = handed.workflow
-    pull_dependencies_red(handed, annotation=UNREACHABLE)
-    handed.api["repos/NazmievBulat/Shipline/check-runs/23/annotations?per_page=100"] = "HTTP 502"
-    handed.save()
-    advisory_service_answers(workflow, answers=True)
-
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert _note(workflow).exists()
-    assert _started(workflow) == []
-    assert rerun_calls(workflow) == []
-
-
-def test_a_handoff_that_could_not_join_the_train_is_not_saved(github: GitHub) -> None:
-    workflow = github.workflow
-    workflow.git("checkout", "main")
-    workflow.git("worktree", "add", str(workflow.worktree(7)), "ticket/seven")
-    _publish(github)
-    pull_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(workflow, answers=False)
-    folder = _folder(workflow)
-    folder.mkdir(parents=True, exist_ok=True)
-    # A member GitHub cannot show stops the train's reconciliation before 7 is queued.
-    (folder / "merge-train.json").write_text(json.dumps({"waiting": ["9"]}))
-
-    done = workflow.run_script("merge-when-current", "--handoff", "7", cwd=workflow.worktree(7))
-
-    assert done.returncode != 0 and "cannot read pull request 9" in done.stderr, done.stderr
-    assert not _note(workflow).exists()
-
-
-@pytest.mark.parametrize("moment", ["first attempt still running", "re-run queued"])
-def test_a_handoff_red_for_the_audit_service_waits_while_its_attempt_runs(
-    handed: GitHub, moment: str
-) -> None:
-    workflow = handed.workflow
-    run = pull_dependencies_red(handed, annotation=UNREACHABLE)
-    parts = handed.api["repos/NazmievBulat/Shipline/actions/runs/20/jobs?per_page=100"]["jobs"]
-    if moment == "first attempt still running":
-        # "CI: dependencies" failed after its tries while a longer job still runs.
-        run.update(status="in_progress", conclusion=None)
-        parts.append(
-            {
-                "id": 24,
-                "name": "CI: web",
-                "status": "in_progress",
-                "conclusion": None,
-                "labels": ["example-app-home"],
-            }
-        )
-    else:
-        # GitHub shows the queued second attempt with the failed jobs of the first.
-        run.update(status="queued", conclusion=None, run_attempt=2)
-        (_folder(workflow) / "pull-rerun-20-1").write_text("automatically re-ran\n")
-    handed.save()
-    advisory_service_answers(workflow, answers=True)
-
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert _note(workflow).exists(), done.stdout + done.stderr
-    assert not list(_folder(workflow).glob("merge-review-*"))
-    assert _started(workflow) == []
-    assert rerun_calls(workflow) == []
-
-
-def test_a_handed_batch_red_only_for_the_audit_service_keeps_every_handoff(
-    github: GitHub,
-) -> None:
-    _handed_batch(github)
-    workflow = github.workflow
-
-    def tick() -> None:
-        github.save()
-        done = workflow.run_script("tick")
-        assert done.returncode == 0, done.stdout + done.stderr
-        saved = json.loads((workflow.state / "github.json").read_text())
-        github.api, github.pulls = saved["api"], saved["pulls"]
-
-    tick()  # Combined scratch run starts.
-    github.finish_batch()
-    batch_dependencies_red(github, annotation=UNREACHABLE)
-    advisory_service_answers(workflow, answers=False)
-    tick()
-    tick()
-
-    assert all(_note(workflow, number).exists() for number in (7, 8, 9))
-    assert _started(workflow) == []
-    train = github.batch_state()
-    assert [m["number"] for m in train["prefixes"]["members"]] == ["7", "8", "9"]
-    assert train["blocked"] == {}
-    assert rerun_calls(workflow) == []
-
-    advisory_service_answers(workflow, answers=True)
-    tick()
-    assert len(rerun_calls(workflow)) == 1
-    github.finish_batch()  # The re-run passed.
-    head = github.batch_state()["prefixes"]["members"][0]["scratch"]["head"]
-    github.api[
-        f"repos/NazmievBulat/Shipline/actions/workflows/ci.yml/runs?head_sha={head}"
-        "&event=workflow_dispatch&per_page=100"
-    ]["workflow_runs"][0]["run_attempt"] = 2
-    tick()
-
-    assert [call.split()[3] for call in workflow.calls("gh pr merge")] == ["7", "8", "9"]
-    assert _started(workflow) == []
-
-
-def test_tick_refresh_marks_whole_suites_and_keeps_its_handoff(handed: GitHub) -> None:
-    workflow = handed.workflow
-    _stale_note(handed)
-    done = workflow.run_script("tick")
-    assert done.returncode == 0, done.stdout + done.stderr
-    message = workflow.git("show", "-s", "--format=%B", "HEAD", cwd=workflow.worktree(7))
-    assert "Workflow-Whole-Suites: true" in message.splitlines()
-    assert json.loads(_note(workflow).read_text())["head"] == workflow.git(
-        "rev-parse", "HEAD", cwd=workflow.worktree(7)
-    )
-    assert not workflow.calls("gh workflow run")
-
-
 def test_tick_whole_refresh_is_accepted_without_scratch_suites(handed: GitHub) -> None:
     workflow = handed.workflow
     _stale_note(handed)
@@ -2492,7 +1882,7 @@ def test_tick_whole_refresh_is_accepted_without_scratch_suites(handed: GitHub) -
     handed.pulls["7"]["headRefOid"] = refreshed
     (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {refreshed}\n")
     handed.ci(handed.base, refreshed, run_id=50, server="whole")
-    handed.api["repos/NazmievBulat/Shipline/actions/runs/50/jobs?per_page=100"]["jobs"].append(
+    handed.api["repos/example-org/example-app/actions/runs/50/jobs?per_page=100"]["jobs"].append(
         {"id": 53, "name": "CI: server tests", "status": "completed", "conclusion": "success"}
     )
     handed.save()

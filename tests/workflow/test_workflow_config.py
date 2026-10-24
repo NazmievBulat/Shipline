@@ -166,6 +166,20 @@ def test_the_repository_named_in_the_file_wins_over_the_runner_settings_and_orig
     assert workflow_config.load(repo).repository == "named-owner/named-app"
 
 
+@pytest.mark.parametrize("folder", ["state", ".local/workflow", "a/b/c"])
+def test_a_state_folder_of_any_depth_leads_back_to_its_checkout(
+    tmp_path: Path, folder: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"state_folder": folder})
+    config = workflow_config.load(repo)
+
+    assert config.state() == repo / folder
+    assert config.checkout_of(config.state()) == repo
+    worktree = repo / ".claude/worktrees/ticket-7"
+    assert config.checkout_of(config.state(worktree)) == worktree
+
+
 def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
     _write(repo, {"state_folder": ".shipline/state"})
@@ -214,11 +228,18 @@ def test_a_file_that_cannot_be_read_is_refused_by_name(
     assert "shipline.json" in done.stderr and named in done.stderr
 
 
-def test_no_repository_anywhere_is_refused(tmp_path: Path) -> None:
-    repo = _repository(tmp_path, origin=None)
+@pytest.mark.parametrize(
+    "origin", [None, "/srv/git/example-app.git", "https://git.example.com/example-owner/app.git"]
+)
+def test_no_repository_on_github_anywhere_is_refused(tmp_path: Path, origin: str | None) -> None:
+    repo = _repository(tmp_path, origin=origin)
 
-    with pytest.raises(workflow_config.ConfigError, match="repository"):
-        workflow_config.load(repo)
+    config = workflow_config.load(repo)
+
+    # What needs no repository is still read.
+    assert config.state_folder == ".local/workflow"
+    with pytest.raises(workflow_config.ConfigError, match="cannot tell which repository"):
+        config.repository
 
 
 _ODD = {
@@ -319,7 +340,9 @@ def _jq(config: str | None, labels: list[str], program: str = "priority_name") -
     return done.stdout.strip()
 
 
-@pytest.mark.parametrize("config", [None, "{}", '{"labels": {}}', '{"labels": {"priority": {}}}'])
+@pytest.mark.parametrize(
+    "config", [None, "", "{}", '{"labels": {}}', '{"labels": {"priority": {}}}']
+)
 def test_jq_falls_back_to_the_default_labels(config: str | None) -> None:
     assert _jq(config, ["priority: blocker"]) == "blocker"
     assert _jq(config, ["priority: low"]) == "low"
@@ -376,7 +399,8 @@ os.execv("@HARNESS_GH@", ["gh", *args])
 
 _OTHER = {
     "repository": "example-owner/example-app",
-    "state_folder": ".shipline/state",
+    # One folder deep, where the default is two.
+    "state_folder": ".shipline",
     "worktree_setup": "tools/prepare-worktree",
     "checks": {
         "ci_result": "Build result",
@@ -483,14 +507,19 @@ def test_another_repository_state_folder_and_check_names_reach_the_gate_the_tick
     )
     assert (workflow.repo / state / "tick.lock").exists()
     # Nothing of the defaults: no other repository asked, no default state folder made.
-    assert not [call for call in workflow.calls("gh") if "NazmievBulat" in call]
+    assert not [call for call in workflow.calls("gh") if "example-org" in call]
     for checkout in (workflow.repo, workflow.worktree(7), workflow.worktree(8)):
         assert not (checkout / ".local" / "workflow").exists(), checkout
 
 
 def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> dict[str, str]:
     """The worker's sentence, the cloud worker's, the wake's message and the review prompt, as
-    the scripts write them in a repository without `shipline.json`."""
+    the scripts write them for Shipline's own repository: no runner settings, and `origin` is
+    Shipline on GitHub."""
+    (workflow.repo / ".github/runner/settings.sh").unlink()
+    local = workflow.git("remote", "get-url", "origin")
+    workflow.git("remote", "set-url", "origin", "https://github.com/NazmievBulat/Shipline.git")
+    workflow.git("config", f"url.{local}.insteadOf", "https://github.com/NazmievBulat/Shipline.git")
     (workflow.repo / "AGENTS.md").write_text("Rules from main\n")
     workflow.git("add", "AGENTS.md")
     workflow.git("commit", "--quiet", "-m", "docs: main rules")
@@ -699,7 +728,8 @@ def test_the_identity_folder_and_repository_of_the_runners_come_from_the_file(
         return workflow.calls("gh api repos/")[-1]
 
     assert folder() == str(workflow.root / "home/.config/shipline-runner")
-    assert install().startswith("gh api repos/NazmievBulat/Shipline/")
+    # The runner settings' repository, as the harness holds them.
+    assert install().startswith("gh api repos/example-org/example-app/")
 
     _commit_on_main(
         workflow,
@@ -717,3 +747,86 @@ def test_the_identity_folder_and_repository_of_the_runners_come_from_the_file(
     assert install().startswith("gh api repos/example-owner/example-app/")
     flagged = install("--repository", "flag-owner/flag-app")
     assert flagged.startswith("gh api repos/flag-owner/flag-app/")
+
+
+_GATE_READS = """
+import json, sys
+sys.path.insert(0, "scripts/workflow")
+import merge_gate as g
+
+head, tree = "1" * 40, "2" * 40
+names = json.loads(sys.argv[1])
+g.api = lambda path, key=None, **given: [
+    {"title": names["merge_tested"], "message": head},
+    {"title": names["server_tests"], "message": "whole"},
+    {"title": names["files_tested"], "message": tree},
+    {"title": names["browser_suite"], "message": "whole"},
+]
+run = {"id": 5, "status": "completed", "conclusion": "success", "run_attempt": 1}
+done = {"status": "completed", "conclusion": "success", "labels": []}
+ci = [
+    {"id": 1, "name": g.CI_PLAN, **done},
+    {"id": 2, "name": g.CI_RESULT, **done},
+    {"id": 3, "name": "CI: server tests", **done},
+]
+e2e = [{"id": 4, "name": g.E2E_PLAN, **done}, {"id": 6, "name": "playwright", **done}]
+failed = [{"id": 7, "name": "CI: lint", "status": "completed", "conclusion": "failure",
+           "labels": ["self-hosted", "example-app-home"]}]
+print(json.dumps({
+    "every server test": g.whole_server_tests(run, ci, head),
+    "fewer server tests": g.server_tests_selected(ci),
+    "whole browser suite": g.whole_suite(run, e2e, tree),
+    "re-run at home": g._rerunnable(run, failed, first=True),
+}))
+"""
+
+
+def _gate_reads(workflow: Workflow, titles: dict[str, str]) -> dict[str, bool]:
+    done = subprocess.run(
+        ["python3", "-B", "-c", _GATE_READS, json.dumps(titles)],
+        cwd=workflow.repo,
+        env=workflow.env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(done.stdout)
+
+
+def test_the_gate_reads_the_named_annotation_titles_and_runner_labels(
+    workflow: Workflow,
+) -> None:
+    default = dict(_DEFAULTS["annotations"])
+    named = {
+        "merge_tested": "Merge built",
+        "files_tested": "Tree tested",
+        "server_tests": "Server suite",
+        "web_suite": "Web unit suite",
+        "browser_suite": "Browser specs",
+    }
+    proven = {
+        "every server test": True,
+        "fewer server tests": False,
+        "whole browser suite": True,
+        "re-run at home": True,
+    }
+    unproven = {
+        "every server test": False,
+        "fewer server tests": True,
+        "whole browser suite": False,
+        "re-run at home": False,
+    }
+    # The harness's repository names its home runners and no titles: the defaults count.
+    assert _gate_reads(workflow, default) == proven
+
+    _commit_on_main(
+        workflow,
+        {
+            "shipline.json": json.dumps(
+                {"annotations": named, "runner": {"labels": ["example-app-elsewhere"]}}
+            )
+        },
+    )
+
+    assert _gate_reads(workflow, named) == {**proven, "re-run at home": False}
+    assert _gate_reads(workflow, default) == unproven

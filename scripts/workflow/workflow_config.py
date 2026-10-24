@@ -7,10 +7,10 @@ file names that Shipline does not know, or a value of the wrong kind, is refused
 error never passes as a default.
 
 The defaults are neutral. The repository is the `repository` of `.github/runner/settings.sh`
-when the runner pool names one, else the `origin` remote's owner and name; the check names,
-annotation titles, workflow files and labels are the ones Shipline's own CI and labels use;
-the state folder is `.local/workflow`; the worktree set-up command, run only when present, is
-`scripts/setup-worktree`; no runner labels.
+when the runner pool names one, else the owner and name of the `origin` remote on GitHub; the
+check names, annotation titles, workflow files and labels are the ones Shipline's own CI and
+labels use; the state folder is `.local/workflow`; the worktree set-up command, run only when
+present, is `scripts/setup-worktree`; no runner labels.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -130,7 +130,8 @@ class Runner:
 
 @dataclass(frozen=True)
 class Config:
-    repository: str
+    # None when nothing names it: an error only for a script that needs it.
+    found_repository: str | None
     state_folder: str
     worktree_setup: str
     checks: Checks
@@ -143,12 +144,26 @@ class Config:
     main: Path
 
     @property
+    def repository(self) -> str:
+        if self.found_repository is None:
+            raise ConfigError(
+                f"cannot tell which repository the workflow works on: {FILE} names none, "
+                f"{RUNNER_SETTINGS} is missing or names none, and origin names no GitHub "
+                "repository"
+            )
+        return self.found_repository
+
+    @property
     def api(self) -> str:
         return f"repos/{self.repository}"
 
     def state(self, checkout: Path | None = None) -> Path:
         """The state folder of a checkout: the main checkout's when none is named."""
         return (checkout or self.main) / self.state_folder
+
+    def checkout_of(self, state: Path) -> Path:
+        """The checkout a state folder is in, however many folders deep it is named."""
+        return state.parents[len(PurePosixPath(self.state_folder).parts) - 1]
 
 
 def main_checkout(start: Path = HERE) -> Path:
@@ -218,9 +233,9 @@ def _from_origin(main: Path) -> str | None:
         text=True,
         check=False,
     )
-    url = done.stdout.strip().rstrip("/").removesuffix(".git")
-    found = re.search(r"([^/:]+)/([^/:]+)$", url)
-    return f"{found[1]}/{found[2]}" if done.returncode == 0 and found else None
+    url = done.stdout.strip().removesuffix("/").removesuffix(".git")
+    found = re.fullmatch(r"(?:https://|ssh://git@|git@)github\.com[:/]([^/]+/[^/]+)", url)
+    return found[1] if done.returncode == 0 and found else None
 
 
 def load(start: Path = HERE) -> Config:
@@ -238,16 +253,12 @@ def load(start: Path = HERE) -> Config:
         raise ConfigError(f"{FILE} is not JSON: {error}") from error
     values = _merged(DEFAULTS, given, "")
     repository = values["repository"] or _from_runner_settings(main) or _from_origin(main)
-    if not repository:
-        raise ConfigError(
-            f"{FILE} names no repository, and neither {RUNNER_SETTINGS} nor the origin remote does"
-        )
     if len(set(values["labels"]["priority"].values())) != 4:
         raise ConfigError(f"{FILE}: labels.priority must name four different labels")
-    if not _REPOSITORY.fullmatch(repository):
+    if repository is not None and not _REPOSITORY.fullmatch(repository):
         raise ConfigError(f"{FILE}: repository must be owner/name, not {repository}")
     return Config(
-        repository=repository,
+        found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),
         worktree_setup=_relative(values["worktree_setup"], "worktree_setup"),
         checks=Checks(**values["checks"]),

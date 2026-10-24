@@ -4,7 +4,8 @@
 # The label names are those of `shipline.json`, which the caller passes whole in the
 # environment as SHIPLINE_CONFIG (`workflow_config.py shell` prints it); a name it leaves out
 # keeps its default, as in `workflow_config.py`.
-def shipline_labels: $ENV.SHIPLINE_CONFIG // "{}" | fromjson | .labels // {};
+def shipline_labels:
+  $ENV.SHIPLINE_CONFIG // "" | if . == "" then {} else fromjson end | .labels // {};
 def workflow_label: shipline_labels.workflow // "workflow";
 def priority_rank:
   (shipline_labels.priority // {}) as $named
