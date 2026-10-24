@@ -1,0 +1,10 @@
+[Unit]
+Description=Balance this CI machine's runners every minute (balance_runners.py)
+
+[Timer]
+OnCalendar=*-*-* *:*:30
+AccuracySec=1s
+RandomizedDelaySec=15
+
+[Install]
+WantedBy=timers.target
