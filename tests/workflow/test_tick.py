@@ -1,6 +1,10 @@
 """`tick` does, every few minutes, the part of the workflow that has one right answer."""
 
 import fcntl
+import json
+import os
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -948,3 +952,226 @@ def test_words_that_an_instruction_follows_do_not_count(
     workflow.run_script("tick")
 
     assert workflow.is_running(name)
+
+
+# Saturday 24 October 2026, 08:00 UTC; the day after is a Sunday.
+_EIGHT = 1_792_828_800
+_DAILY = {"WORKFLOW_ANALYST_DAILY_AT": "08:00", "TZ": "UTC"}
+_REPORT = (
+    "# Workflow analysis\n\nWhat the week showed.\n\n## Proposals\n\n"
+    "1. The tick starts tickets by itself: one start a day was by hand.\n"
+    "   Evidence: wake.log, 14 starts.\n"
+    "2. A lost check is re-run by the gate.\n\n## Evidence\n\n1. Not a proposal.\n"
+)
+
+
+def _at(seconds: int) -> dict[str, str]:
+    return {**_DAILY, "WORKFLOW_NOW": str(seconds)}
+
+
+def _metrics_report(workflow: Workflow, day: str) -> None:
+    report = workflow.repo / ".local" / "analyses" / f"metrics-{day}.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("# Workflow metrics\n")
+
+
+def _usage(workflow: Workflow, five: int, resets_in: int, now: int = _EIGHT) -> None:
+    """The figures the status line keeps, written as fresh at the tick's time."""
+    from datetime import UTC, datetime
+
+    workflow.usage(five, datetime.fromtimestamp(now + resets_in, UTC).isoformat())
+    cache = workflow.root / "home" / ".claude" / "MEMORY" / "STATE" / "usage-cache.json"
+    os.utime(cache, (now, now))
+
+
+def _analyst_words(workflow: Workflow, name: str) -> list[str]:
+    command = (workflow.state / "args" / name).read_text().splitlines()[-1]
+    read = subprocess.run(
+        ["bash", "-c", f'claude() {{ printf "%s\\n" "$@"; }}\n{command}'],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return read.stdout.splitlines()
+
+
+def test_the_tick_starts_one_analyst_a_day_from_0800_utc_after_the_metrics_run(
+    workflow: Workflow,
+) -> None:
+    _metrics_report(workflow, "2026-10-24")
+    _usage(workflow, 40, 3 * 3600)
+
+    before = workflow.run_script("tick", env=_at(_EIGHT - 60))
+    done = workflow.run_script("tick", env=_at(_EIGHT + 60))
+    again = workflow.run_script("tick", env=_at(_EIGHT + 240))
+
+    assert before.returncode == done.returncode == again.returncode == 0, done.stderr
+    assert _started(workflow) == ["analyst-day-2026-10-24"]
+    assert _analyst_words(workflow, "analyst-day-2026-10-24")[-1] == (
+        "Analyse the workflow over the last day, as analyst-day-2026-10-24, "
+        "by the section Analyse the workflow of AGENTS.md in this worktree"
+    )
+    assert workflow.analysis_report("day-2026-10-24").is_dir()
+
+
+def test_the_tick_starts_no_analyst_before_the_days_metrics_report(workflow: Workflow) -> None:
+    _metrics_report(workflow, "2026-10-23")
+    _usage(workflow, 40, 3 * 3600)
+
+    done = workflow.run_script("tick", env=_at(_EIGHT + 60))
+
+    assert done.returncode == 0, done.stderr
+    assert _started(workflow) == []
+
+
+def test_on_sunday_the_analyst_reads_seven_days(workflow: Workflow) -> None:
+    sunday = _EIGHT + 86400
+    _metrics_report(workflow, "2026-10-25")
+    _usage(workflow, 40, 3 * 3600, now=sunday)
+
+    done = workflow.run_script("tick", env=_at(sunday + 60))
+
+    assert done.returncode == 0, done.stderr
+    assert _started(workflow) == ["analyst-week-2026-10-25"]
+    assert _analyst_words(workflow, "analyst-week-2026-10-25")[-1].startswith(
+        "Analyse the workflow over the last 7 days, as analyst-week-2026-10-25, "
+    )
+
+
+@pytest.mark.parametrize(
+    ("five", "resets_in", "starts"),
+    [(86, 2 * 3600, False), (90, 3000, True), (85, 4 * 3600, True)],
+    ids=["above 85% for over an hour", "above 85% but resets within the hour", "at 85%"],
+)
+def test_the_analyst_waits_while_the_usage_window_holds_starts(
+    workflow: Workflow, five: int, resets_in: int, starts: bool
+) -> None:
+    _metrics_report(workflow, "2026-10-24")
+    _usage(workflow, five, resets_in)
+
+    done = workflow.run_script("tick", env=_at(_EIGHT + 60))
+
+    assert done.returncode == 0, done.stderr
+    assert _started(workflow) == (["analyst-day-2026-10-24"] if starts else [])
+    if not starts:
+        assert "the daily analyst waits: the 5-hour usage window is 86% used" in done.stdout
+        assert not workflow.analysis_report("day-2026-10-24").exists()
+
+
+def test_the_analyst_waits_while_the_usage_cannot_be_read(workflow: Workflow) -> None:
+    _metrics_report(workflow, "2026-10-24")
+
+    done = workflow.run_script("tick", env=_at(_EIGHT + 60))
+
+    assert done.returncode == 0, done.stderr
+    assert _started(workflow) == []
+    assert "the daily analyst waits: the 5-hour usage window could not be read" in done.stdout
+
+
+def test_an_analyst_held_by_the_usage_starts_at_a_later_tick(workflow: Workflow) -> None:
+    _metrics_report(workflow, "2026-10-24")
+    _usage(workflow, 95, 2 * 3600)
+    workflow.run_script("tick", env=_at(_EIGHT + 60))
+    _usage(workflow, 10, 4 * 3600, now=_EIGHT + 2 * 3600)
+
+    done = workflow.run_script("tick", env=_at(_EIGHT + 2 * 3600))
+
+    assert done.returncode == 0, done.stderr
+    assert _started(workflow) == ["analyst-day-2026-10-24"]
+
+
+_ANALYST_SAID_FINISHED = "● Report published.\n\n  analysis finished\n\n> \n"
+
+
+@pytest.mark.parametrize("idle", [True, False], ids=["idle", "listed busy"])
+def test_an_analyst_that_said_analysis_finished_is_stopped_and_its_report_told(
+    workflow: Workflow, idle: bool
+) -> None:
+    worktree = workflow.add_analyst("day-2026-10-24")
+    workflow.running("analyst-day-2026-10-24")
+    if idle:
+        (worktree / ".local" / "workflow" / "analyst-day-2026-10-24.idle").touch()
+    workflow.screen(_ANALYST_SAID_FINISHED, "analyst-day-2026-10-24")
+    report = workflow.analysis_report("day-2026-10-24")
+    (report / "report.md").write_text(_REPORT)
+    (report / "report.url").write_text("https://docs.example.com/analysis-1\n")
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stderr
+    assert not workflow.is_running("analyst-day-2026-10-24")
+    assert not worktree.exists()
+    assert (report / "report.md").read_text() == _REPORT
+    pending = workflow.repo / ".local" / "workflow" / "analyses.pending"
+    assert json.loads((pending / "day-2026-10-24.json").read_text()) == {
+        "name": "day-2026-10-24",
+        "report": ".local/analyses/day-2026-10-24/report.md",
+        "url": "https://docs.example.com/analysis-1",
+        "proposals": [
+            "1. The tick starts tickets by itself: one start a day was by hand.",
+            "2. A lost check is re-run by the gate.",
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "screen",
+    [
+        "● Writing the report; I end with analysis finished when it is published.\n\n> \n",
+        "● analysis finished\n\n● Bash(ls .local/analyses)\n\n> \n",
+    ],
+    ids=["in a sentence", "followed by more work"],
+)
+def test_an_analyst_that_has_not_finished_is_left_running(workflow: Workflow, screen: str) -> None:
+    workflow.add_analyst("day-2026-10-24")
+    workflow.running("analyst-day-2026-10-24")
+    workflow.screen(screen, "analyst-day-2026-10-24")
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stderr
+    assert workflow.is_running("analyst-day-2026-10-24")
+    assert not (workflow.repo / ".local" / "workflow" / "analyses.pending").exists()
+
+
+@pytest.mark.parametrize(("minutes", "stopped"), [(39, False), (41, True)])
+def test_an_analyst_is_stopped_40_minutes_after_its_start(
+    workflow: Workflow, minutes: int, stopped: bool
+) -> None:
+    worktree = workflow.add_analyst("day-2026-10-24")
+    workflow.running("analyst-day-2026-10-24")
+    started = worktree / ".local" / "workflow" / "analyst-day-2026-10-24.started"
+    then = time.time() - minutes * 60
+    os.utime(started, (then, then))
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stderr
+    assert workflow.is_running("analyst-day-2026-10-24") is not stopped
+    pending = workflow.repo / ".local" / "workflow" / "analyses.pending" / "day-2026-10-24.json"
+    if stopped:
+        assert "analyst-day-2026-10-24 is over its time" in done.stdout
+        # It ended without its report: the wake says so.
+        assert json.loads(pending.read_text()) == {
+            "name": "day-2026-10-24",
+            "report": ".local/analyses/day-2026-10-24/report.md",
+            "url": "",
+            "proposals": [],
+        }
+    else:
+        assert not pending.exists()
+
+
+def test_an_analyst_is_stopped_on_its_time_while_github_cannot_be_asked(
+    workflow: Workflow,
+) -> None:
+    worktree = workflow.add_analyst("day-2026-10-24")
+    workflow.running("analyst-day-2026-10-24")
+    started = worktree / ".local" / "workflow" / "analyst-day-2026-10-24.started"
+    then = time.time() - 41 * 60
+    os.utime(started, (then, then))
+    (workflow.state / "fail-gh-list").touch()
+
+    workflow.run_script("tick")
+
+    assert not workflow.is_running("analyst-day-2026-10-24")
