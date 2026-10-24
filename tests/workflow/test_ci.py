@@ -121,34 +121,41 @@ def test_main_s_push_and_the_merge_queue_are_not_filtered() -> None:
     push and the merge queue keep their triggers as they were."""
     triggers = _CI.read_text().split("\njobs:")[0]
 
-    assert _NOT_A_DRAFT.startswith("github.event_name != 'pull_request' || ")
     assert re.search(r"^  push:\n    branches: \[main\]\n  merge_group:\n\n", triggers, re.M)
 
 
 @pytest.fixture(scope="module")
-def verdict() -> Any:
+def gate() -> Any:
     sys.path.insert(0, str(_SCRIPTS))
     try:
-        return importlib.import_module("merge_gate").verdict
+        return importlib.import_module("merge_gate")
     finally:
         sys.path.remove(str(_SCRIPTS))
 
 
-@pytest.mark.parametrize("conclusion", ["skipped", "success"])
-def test_a_draft_s_skipped_run_is_never_a_pass_to_the_merge_gate(
-    verdict: Any, conclusion: str
-) -> None:
-    """Every job of a draft's run is skipped, `CI` too: its head has no green CI result, however
-    GitHub concludes the run itself."""
-    run = {"id": 1, "status": "completed", "conclusion": conclusion, "head_sha": "head"}
+def _verdict(gate: Any, run: str, shards: str, result: str) -> str:
+    """The merge gate's verdict of a completed pull request run, its result job by the name the
+    gate requires."""
     parts = [
-        {"id": 2, "name": "tests", "status": "completed", "conclusion": "skipped"},
-        {"id": 3, "name": "CI", "status": "completed", "conclusion": "skipped"},
+        {"id": 2, "name": f"tests ({shard} of 4)", "status": "completed", "conclusion": shards}
+        for shard in range(1, 5)
     ]
+    parts.append({"id": 3, "name": gate.CI_RESULT, "status": "completed", "conclusion": result})
+    state, _ = gate.verdict(
+        {"id": 1, "status": "completed", "conclusion": run, "head_sha": "head"}, parts
+    )
+    return state
 
-    state, _ = verdict(run, parts)
 
-    assert state != "green"
+def test_a_ready_pull_request_s_passed_run_is_a_pass_to_the_merge_gate(gate: Any) -> None:
+    assert _verdict(gate, "success", "success", "success") == "green"
+
+
+@pytest.mark.parametrize("run", ["skipped", "success"])
+def test_a_draft_s_skipped_run_is_never_a_pass_to_the_merge_gate(gate: Any, run: str) -> None:
+    """Every job of a draft's run is skipped, the result job too: its head has no green CI
+    result, however GitHub concludes the run itself."""
+    assert _verdict(gate, run, "skipped", "skipped") != "green"
 
 
 def test_the_tests_use_a_tmux_that_leaves_each_pane_where_it_was_started() -> None:

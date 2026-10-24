@@ -147,7 +147,7 @@ jobs:
   ci:
     # The check the merge queue requires, by this name.
     name: CI
-    # Skipped with the shards on a draft, never a success: a draft's head has no green CI.
+    # Skipped with the shards on a draft: a skipped result is no pass to the merge gate.
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     needs: tests
     runs-on: ubuntu-latest
