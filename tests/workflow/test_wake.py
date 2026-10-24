@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from workflow_harness import Workflow
-from workflow.test_ci_proof import _github, _receipt, _API, _SQUASH, _TREE
+from workflow.test_ci_proof import _github, _python, _receipt, _API, _SQUASH, _TREE
 
 _NEW_YORK = ZoneInfo("America/New_York")
 
@@ -152,6 +152,114 @@ def test_an_unsent_daily_savings_report_survives_utc_midnight(night: Workflow) -
     assert sent.read_text().strip() == "2026-10-13"
     assert _wake(night, at=_at(20, 47)).returncode == 0
     assert len(night.sent()) == 3
+
+
+def test_daily_savings_resumes_completed_pulls_after_a_read_failure(night: Workflow) -> None:
+    _savings_day(night)
+    progress = night.state / "prefix-savings.progress"
+    fixture = night.state / "savings.json"
+    code = '''
+        from pathlib import Path
+        import json
+        import prefix_savings as savings
+        progress, fixture = map(Path, sys.argv[2:])
+        data = json.loads(fixture.read_text())
+        api = "repos/example-org/example-app"
+        paths = []
+        def read(path, key=None, **kwargs):
+            paths.append(path)
+            if path.startswith("search/issues?"):
+                return {"total_count": 2, "items": [{"number": 7}, {"number": 8}]}
+            if path == api + "/pulls/8":
+                if not progress.exists() or "7" not in json.loads(progress.read_text())["done"]:
+                    raise AssertionError("first PR was not checkpointed")
+                if sys.argv[0] != "retry":
+                    raise p.Unreadable("temporary read failure")
+                return data[api + "/pulls/7"]
+            if "/actions/workflows/ci.yml/runs?" in path:
+                value = data["pr-runs"]
+                # The same branch/run fixture, attributed to the current PR.
+                value = json.loads(json.dumps(value))
+                number = 8 if api + "/pulls/8" in paths else 7
+                for run in value["workflow_runs"]:
+                    run["pull_requests"] = [{"number": number}]
+            else:
+                value = data[path]
+            return value[key] if key else value
+        try:
+            savings.report("2026-10-12", read, progress=progress)
+        except p.Unreadable:
+            pass
+        assert json.loads(progress.read_text())["done"]["7"]["images"] == 24
+        assert progress.stat().st_mode & 0o777 == 0o600
+        sys.argv[0] = "retry"
+        paths.clear()
+        line = savings.report("2026-10-12", read, progress=progress)
+        assert "images 48.00" in line and "total 136.00" in line
+        assert not any(path.startswith("search/issues?") or path == api + "/pulls/7" for path in paths)
+    '''
+    done = _python(night, code, str(progress), str(fixture))
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_failed_savings_reads_back_off_and_keep_their_day_across_midnight(night: Workflow) -> None:
+    _savings_day(night)
+    night.orchestrator("idle")
+    fixture = night.state / "savings.json"
+    data = json.loads(fixture.read_text())
+    complete = fixture.read_text()
+    del data[f"{_API}/git/commits/{_SQUASH}"]
+    fixture.write_text(json.dumps(data))
+    reads = night.state / "savings-reads.log"
+    fake = night.bin / "gh"
+    fake.write_text(fake.read_text().replace('    path = args[-1]\n',
+        f'    path = args[-1]\n    with open({str(reads)!r}, "a") as log: log.write(path + "\\n")\n'))
+    assert _wake(night, "ticket-7", at=_at(19, 50)).returncode == 0
+    progress = night.repo / ".local/workflow/prefix-savings-2026-10-12.progress"
+    assert progress.exists()
+    assert json.loads(progress.read_text())["date"] == "2026-10-12"
+    count = len(reads.read_text().splitlines())
+    assert _wake(night, "ticket-7", at=_at(19, 53)).returncode == 0
+    assert len(reads.read_text().splitlines()) == count
+    fixture.write_text(complete)
+    assert _wake(night, at=_at(20, 11)).returncode == 0
+    assert "saved (2026-10-12 UTC): images 24.00" in night.sent()[-1]
+    assert not progress.exists()
+    assert not progress.with_suffix(".progress.retry").exists()
+
+
+def test_savings_resumes_inside_one_pull_request_without_recounting_runs(night: Workflow) -> None:
+    _savings_day(night)
+    done = _python(night, '''
+        import json
+        from pathlib import Path
+        import prefix_savings as savings
+        progress, fixture = map(Path, sys.argv[2:])
+        data = json.loads(fixture.read_text())
+        api = "repos/example-org/example-app"
+        paths, failing = [], True
+        def read(path, key=None, **kwargs):
+            paths.append(path)
+            if path.startswith("search/issues?"):
+                return {"total_count": 1, "items": [{"number": 7}]}
+            if path == api + "/check-runs/201/annotations?per_page=100" and failing:
+                raise p.Unreadable("temporary read failure")
+            value = data["pr-runs"] if "/actions/workflows/ci.yml/runs?" in path else data[path]
+            return value[key] if key else value
+        try:
+            savings.report("2026-10-12", read, progress=progress)
+        except p.Unreadable:
+            pass
+        current = json.loads(progress.read_text())["current"]
+        assert current["next"] == 1 and current["totals"]["images"] == 12
+        failing = False
+        paths.clear()
+        line = savings.report("2026-10-12", read, progress=progress)
+        assert "images 24.00" in line and "total 68.00" in line
+        assert all("/actions/runs/100/" not in path for path in paths)
+        assert all("/git/commits/" not in path and "/pulls/" not in path for path in paths)
+    ''', str(night.state / "prefix-savings.progress"), str(night.state / "savings.json"))
+    assert done.returncode == 0, done.stdout + done.stderr
 
 
 def test_at_night_an_idle_orchestrator_gets_a_check_in(night: Workflow) -> None:
