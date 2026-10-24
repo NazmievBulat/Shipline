@@ -27,17 +27,22 @@ def runner_name(machine: str, kind: str, number: int = 1) -> str:
     """The name a machine's runner registers with GitHub by."""
     return f"{PREFIX}-{machine}-{kind}-{number}"
 
+
 _LOGGING = """#!/bin/bash
 printf '%s\\n' "${0##*/} $*" >> "@STATE@/calls.log"
 """
-# Answers the runner list from runners.json; a label added or removed is written down only.
-_GH = _LOGGING + """\
+# Answers the runner list from runners.json, and fails as GitHub does when it is gone; a label
+# added or removed is written down only.
+_GH = (
+    _LOGGING
+    + """\
 case "$*" in
   *"actions/runners/"*"/labels"*) exit 0 ;;
-  *"actions/runners"*) cat "@STATE@/runners.json"; exit 0 ;;
+  *"actions/runners"*) cat "@STATE@/runners.json" 2>/dev/null || exit 1; exit 0 ;;
 esac
 exit 1
 """
+)
 
 
 @dataclass
@@ -81,6 +86,10 @@ class Machine:
         (self.state / "runners.json").write_text(
             json.dumps({"total_count": len(runners), "runners": runners})
         )
+
+    def lose_github(self) -> None:
+        """GitHub's runner list cannot be read."""
+        (self.state / "runners.json").unlink()
 
     def run(self, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

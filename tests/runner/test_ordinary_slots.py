@@ -98,6 +98,17 @@ def test_the_spare_gives_the_slot_back_once_another_machines_ordinary_runner_is_
     assert ORDINARY in removed
 
 
+def test_the_spare_keeps_what_it_holds_when_the_runner_list_cannot_be_read(
+    machine: Machine,
+) -> None:
+    """No list is no proof that the other machine is gone, nor that it is back."""
+    machine.lose_github()
+
+    machine.keep_spare()
+
+    assert _label_calls(machine) == []
+
+
 def test_the_spare_takes_no_slot_while_another_machines_ordinary_runner_is_online(
     machine: Machine,
 ) -> None:
