@@ -11,7 +11,7 @@ if [[ -f $settings ]]; then
   source "$settings"
 else
   repository=$({ git -C "$here" config --get remote.origin.url || true; } | sed -nE 's#/$##;
-    s#\.git$##; s#^(https://|ssh://git@|git@)github\.com[:/]([^/]+/[^/]+)$#\2#p')
+    s#\.git$##; s#^(https://([^/@]+@)?|ssh://git@|git@)github\.com[:/]([^/]+/[^/]+)$#\3#p')
 fi
 repository=${repository:-}
 
