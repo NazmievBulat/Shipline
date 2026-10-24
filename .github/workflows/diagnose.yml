@@ -11,41 +11,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: The test's own shell under ps
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: python -m pip install --require-hashes -r requirements-test.txt
+      - name: What ps sees from inside pytest
         run: |
           set +e
-          python3 - <<'PY'
-          import shlex, subprocess, time
-          command = "while ps aux | grep -q 'codex exec'; do sleep 0.2; done"
-          shell = [
-              "/bin/bash", "-c",
-              "source /home/tester/.claude/shell-snapshots/snapshot-bash-1-abc.sh 2>/dev/null || true"
-              " && export CLAUDE_PLUGIN_DATA='/home/tester/.claude/plugins/data/codex-openai-codex'\n"
-              f": && eval {shlex.quote(command)} < /dev/null && pwd -P >| /tmp/claude-a589-cwd",
-          ]
-          started = subprocess.Popen(shell)
-          time.sleep(1.5)
-          print("loop still running:", started.poll() is None)
-          listed = subprocess.run(["ps", "aux"], capture_output=True, text=True).stdout
-          for line in listed.splitlines():
-              if "snapshot-bash" in line:
-                  print(len(line), repr(line))
-          print("own cmdline:", open(f"/proc/{started.pid}/cmdline", "rb").read())
-          started.kill()
+          mkdir -p "$RUNNER_TEMP/look"
+          cat > "$RUNNER_TEMP/look/test_look.py" <<'PY'
+          import os, shlex, subprocess, sys, time
+          def test_look():
+              command = "while ps aux | grep -q 'codex exec'; do sleep 0.2; done"
+              shell = ["/bin/bash", "-c", f": codex exec && eval {shlex.quote(command)} < /dev/null"]
+              started = subprocess.Popen(shell)
+              time.sleep(1.5)
+              print("loop still running:", started.poll() is None, file=sys.__stderr__)
+              for name in ("COLUMNS", "LINES", "TERM", "PATH"):
+                  print(name, os.environ.get(name), file=sys.__stderr__)
+              print("ps:", subprocess.run(["sh", "-c", "command -v ps; ls -l /proc/self/fd/0 /proc/self/fd/1 /proc/self/fd/2"], capture_output=True, text=True).stdout, file=sys.__stderr__)
+              listed = subprocess.run(["bash", "-c", "ps aux | grep 'codex exec'"], capture_output=True, text=True)
+              print("ps aux | grep:", repr(listed.stdout), repr(listed.stderr), listed.returncode, file=sys.__stderr__)
+              started.kill()
           PY
-      - name: tmux and scopes
-        run: |
-          set +e
-          tmux -V
-          ldd "$(command -v tmux)" | grep -i systemd || echo "tmux links no libsystemd"
-          for name in first second third; do
-            tmux -L "$name" new-session -d -s "$name" \
-              systemd-run --user --scope --quiet --collect -p MemoryMax=96M -- bash -c "sleep 60"
-          done
-          sleep 3
-          for name in first second third; do
-            pid=$(tmux -L "$name" list-panes -t "=$name" -F '#{pane_pid}')
-            path=$(sed -n 's/^0:://p' "/proc/$pid/cgroup")
-            echo "$name: $(tr '\0' ' ' < "/proc/$pid/cmdline") in $path, memory.max $(cat "/sys/fs/cgroup$path/memory.max" 2>&1)"
-          done
-          systemctl --user list-units --type=scope --no-pager | head -20
+          python -m pytest -p no:cacheprovider -p no:xdist -c /dev/null -q -s "$RUNNER_TEMP/look/test_look.py"
+          python -m pytest -p no:cacheprovider -p no:xdist -q -rA "tests/workflow/test_running_command.py::test_a_real_wait_loop_finds_its_own_shell_and_is_named" 2>&1 | tail -15
