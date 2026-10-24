@@ -181,8 +181,9 @@ worker, reviewer and audit alike:
   asked in text, recommendation first.
   Any other choice is made and written into the pull request description.
 - Run the repository's fast pre-train checks, `shipline pre-train-checks`, from the pull
-  request's worktree before marking ready. They also run before a handoff or gate call admits it to the merge train; a failure
-  refuses admission. They supplement CI, which still runs its normal checks.
+  request's worktree before marking ready. They also run before a handoff or gate call
+  admits it to the merge train; a failure refuses admission. They supplement CI, which still
+  runs its normal checks.
 - Run `scripts/workflow/weaker-tests --base <base> --working-tree` before marking ready.
   Explain each item in the description: why the change is correct and how the test still
   catches its original bug, ideally with a failing run on a deliberately broken version.
@@ -407,7 +408,8 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
   `DIRTY`), when the pull request below it merged (the next point), or when `main` changed a
   file the branch changes or depends on, or the merge gate requires fresh CI on current main.
   Each such merge is a push, and on a pull request that
-  changes the images each push sends the image check to the back of its runners' queue. A ready pull request that merges `main` in because of a conflict says so in the
+  changes the images each push sends the image check to the back of its runners' queue. A
+  ready pull request that merges `main` in because of a conflict says so in the
   commit message (`merge main: conflict in <files>`).
 - After the merge, for each pull request built on this one: set its base to `main` and merge
   `main` into its branch. Ask about a conflict that is not mechanical. A ready one labelled
