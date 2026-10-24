@@ -3112,6 +3112,10 @@ def _ci_runs(head: str, *, pull: bool = True) -> str:
     return f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={head}{event}&per_page=100"
 
 
+# The runs of check suite 5000, which holds every check run `_check_runs` shows.
+_SUITE_RUNS = f"{_REPO}/actions/runs?check_suite_id=5000&per_page=100"
+
+
 def _check_runs(github: GitHub, head: str, *checks: tuple[str, str]) -> None:
     """The check runs GitHub shows on `head`, by name and status, all in check suite 5000."""
     github.api[f"{_REPO}/commits/{head}/check-runs?per_page=100"] = {
@@ -3146,9 +3150,11 @@ def test_an_empty_runs_answer_keeps_a_green_rerun_on_old_main_in_the_line(
 ) -> None:
     _green_rerun_on_old_main(github)
     listed = github.api[_ci_runs(github.head)]
-    # Asked for the runs of the head, GitHub answers none and then the run, in turns.
+    # Asked for the runs of the head, GitHub answers none and then the run, in turns; the check
+    # suite of its jobs lists none either.
     github.api[_ci_runs(github.head)] = {"_alternate": [{"workflow_runs": []}, listed]}
     _check_runs(github, github.head, ("CI: what to run", "completed"), ("CI result", "completed"))
+    github.api[_SUITE_RUNS] = {"workflow_runs": []}
     github.save()
     env = _tick_context(github) if tick else None
     for _ in range(3):
@@ -3162,28 +3168,9 @@ def test_an_empty_runs_answer_keeps_a_green_rerun_on_old_main_in_the_line(
     assert done.returncode == 2, done.stdout + done.stderr
     assert "failed checks" not in done.stderr
     assert github.workflow.git("rev-parse", "HEAD^2") == github.base
-    # It asked again half a minute after the empty answer, and needed no check suite.
-    assert "sleep 30" in github.workflow.calls("sleep")
-    assert not github.workflow.calls("gh api repos/example-org/example-app/actions/runs?")
-
-
-def test_a_green_rerun_github_stops_listing_keeps_its_place(github: GitHub) -> None:
-    _green_rerun_on_old_main(github)
-    assert _train(github)["waiting"] == ["7", "8"]
-    # Then GitHub lists the run neither by its head nor by its check suite.
-    github.api[_ci_runs(github.head)] = {"workflow_runs": []}
-    _check_runs(github, github.head, ("CI: what to run", "completed"), ("CI result", "completed"))
-    github.api[f"{_REPO}/actions/runs?check_suite_id=5000&per_page=100"] = {"workflow_runs": []}
-    github.save()
-    for _ in range(2):
-        train = _train(github)
-        assert train["blocked"] == ["7"]
-        assert train["waiting"] == ["7", "8"]
-        assert train["first"] == "7"
-    refused = github.run()
-    assert refused.returncode == 1
-    assert "failed checks" not in refused.stderr
-    assert "has not started" in refused.stderr
+    # A call that read the head asked again half a minute after the empty answers, once.
+    sleeps = github.workflow.calls("sleep")
+    assert sleeps and set(sleeps) == {"sleep 30"} and len(sleeps) <= 4
 
 
 def test_a_run_github_does_not_list_is_found_through_its_check_suite(github: GitHub) -> None:
@@ -3191,8 +3178,12 @@ def test_a_run_github_does_not_list_is_found_through_its_check_suite(github: Git
     [run] = github.api[_ci_runs(github.head)]["workflow_runs"]
     github.api[_ci_runs(github.head)] = {"workflow_runs": []}
     _check_runs(github, github.head, ("CI: what to run", "completed"), ("CI result", "completed"))
-    github.api[f"{_REPO}/actions/runs?check_suite_id=5000&per_page=100"] = {
-        "workflow_runs": [{**run, "path": ".github/workflows/ci.yml"}]
+    # A newer run of another workflow in the same check suite is not the CI run.
+    github.api[_SUITE_RUNS] = {
+        "workflow_runs": [
+            {**run, "id": 70, "path": ".github/workflows/images.yml"},
+            {**run, "path": ".github/workflows/ci.yml"},
+        ]
     }
     github.save()
     for _ in range(2):
@@ -3202,18 +3193,74 @@ def test_a_run_github_does_not_list_is_found_through_its_check_suite(github: Git
     done = github.run()
     assert done.returncode == 2, done.stdout + done.stderr
     assert "failed checks" not in done.stderr
+    assert not github.workflow.calls("sleep 30")
 
 
-@pytest.mark.parametrize("checks", ["none", "running", "other workflow"])
+def test_a_green_rerun_github_stops_listing_keeps_its_place(github: GitHub) -> None:
+    _green_rerun_on_old_main(github)
+    assert _train(github)["waiting"] == ["7", "8"]
+    # Then GitHub lists the run neither by its head nor by its check suite.
+    github.api[_ci_runs(github.head)] = {"workflow_runs": []}
+    _check_runs(github, github.head, ("CI: what to run", "completed"), ("CI result", "completed"))
+    github.api[_SUITE_RUNS] = {"workflow_runs": []}
+    github.save()
+    for _ in range(2):
+        train = _train(github)
+        assert train["blocked"] == ["7"]
+        assert train["waiting"] == ["7", "8"]
+        assert train["first"] == "7"
+    waits = github.run()
+    assert waits.returncode == 1
+    assert "failed checks" not in waits.stderr
+    assert "has not started" in waits.stderr
+
+
+@pytest.mark.parametrize("answer", [None, "HTTP 502"])
+def test_a_green_rerun_whose_check_runs_cannot_be_read_keeps_its_place(
+    github: GitHub, answer: str | None
+) -> None:
+    _green_rerun_on_old_main(github)
+    assert _train(github)["waiting"] == ["7", "8"]
+    github.api[_ci_runs(github.head)] = {"workflow_runs": []}
+    # GitHub fails the read of the head's check runs: unavailable, or with a server error.
+    github.api[f"{_REPO}/commits/{github.head}/check-runs?per_page=100"] = answer
+    github.save()
+    for _ in range(2):
+        train = _train(github)
+        assert train["blocked"] == ["7"]
+        assert train["waiting"] == ["7", "8"]
+        assert train["first"] == "7"
+
+
+def test_a_green_rerun_whose_ci_check_runs_are_gone_is_pending_again(github: GitHub) -> None:
+    _green_rerun_on_old_main(github)
+    assert _train(github)["waiting"] == ["7", "8"]
+    # Neither the run nor any CI check run is shown on the head any more.
+    github.api[_ci_runs(github.head)] = {"workflow_runs": []}
+    github.save()
+    train = _train(github)
+    assert train["blocked"] == ["7"]
+    assert train["waiting"] == ["8"]
+    assert train["first"] == "8"
+
+
+@pytest.mark.parametrize(
+    "checks",
+    [
+        (),
+        (("CI: what to run", "in_progress"),),
+        (("Docker images: what to run", "completed"),),
+        (("CIFuzz", "completed"),),
+    ],
+    ids=["none", "running", "other workflow", "other prefix"],
+)
 def test_a_head_without_a_finished_ci_check_run_stays_pending(
-    github: GitHub, checks: str
+    github: GitHub, checks: tuple[tuple[str, str], ...]
 ) -> None:
     _green_rerun_on_old_main(github)
     github.api[_ci_runs(github.head)] = {"workflow_runs": []}
-    if checks == "running":
-        _check_runs(github, github.head, ("CI: what to run", "in_progress"))
-    elif checks == "other workflow":
-        _check_runs(github, github.head, ("Docker images: what to run", "completed"))
+    if checks:
+        _check_runs(github, github.head, *checks)
     github.save()
     train = _train(github)
     assert train["blocked"] == ["7"]
@@ -3221,7 +3268,7 @@ def test_a_head_without_a_finished_ci_check_run_stays_pending(
     refused = github.run()
     assert refused.returncode == 1
     assert "once a re-run is green" in refused.stderr
-    assert not github.workflow.calls("gh api repos/example-org/example-app/actions/runs?")
+    assert not [call for call in github.workflow.calls("gh") if "check_suite_id=" in call]
     assert not github.workflow.calls("sleep 30")
 
 
@@ -3234,11 +3281,10 @@ def test_an_empty_runs_answer_for_main_is_not_read_as_ci_not_started(
         github.api[_ci_runs(github.base, pull=False)] = {
             "_alternate": [{"workflow_runs": []}, {"workflow_runs": [run]}]
         }
+        github.api[_SUITE_RUNS] = {"workflow_runs": []}
     else:
         github.api[_ci_runs(github.base, pull=False)] = {"workflow_runs": []}
-        github.api[f"{_REPO}/actions/runs?check_suite_id=5000&per_page=100"] = {
-            "workflow_runs": [{**run, "path": ".github/workflows/ci.yml"}]
-        }
+        github.api[_SUITE_RUNS] = {"workflow_runs": [{**run, "path": ".github/workflows/ci.yml"}]}
     _check_runs(github, github.base, ("CI result", "completed"))
     github.save()
 

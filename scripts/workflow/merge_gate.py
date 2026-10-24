@@ -107,9 +107,12 @@ SCRATCH_PREFIX = "workflow/merge-batch-"
 E2E_PLAN = CONFIG.checks.e2e_plan
 CI_PLAN = CONFIG.checks.ci_plan
 CI_RESULT = CONFIG.checks.ci_result
-# What the name of every check of the CI workflow begins with: the words its planner and its
-# result share, "CI" by default.
-CI_PREFIX = os.path.commonprefix([CI_PLAN, CI_RESULT]).rstrip(": ") or CI_RESULT
+# The word or words the name of every check of the CI workflow begins with: those its planner
+# and its result begin with both, "CI" by default.
+CI_PREFIX = (
+    " ".join(os.path.commonprefix([CI_PLAN.replace(":", " ").split(), CI_RESULT.split()]))
+    or CI_RESULT
+)
 # How long after GitHub listed no CI run for a head whose CI jobs finished it is asked again.
 UNLISTED_RETRY_SECONDS = 30
 # Every check of the image workflow begins with this; its planner is IMAGES_PLAN.
@@ -167,6 +170,10 @@ MEMBER_MARKS = ("unavailable", "fixes", "refreshable")
 
 # Set only while computing train order, never while verifying a merge.
 _planning_reads: train_reads.Reads | None = None
+# The heads GitHub listed no CI run for although their CI jobs finished, in this process; and
+# those it was asked again for after the pause, which it is once.
+_unlisted: set[str] = set()
+_asked_again: set[str] = set()
 
 
 class Refused(Exception):
@@ -371,17 +378,32 @@ def runs(
         f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
         f"?head_sha={head}{event}&per_page=100"
     )
-    found = _own_runs(api(path, "workflow_runs"), head, pull=pull, scheduled=scheduled)
-    if found or workflow != "ci" or not (suites := _ci_suites(head)):
+    listed = api(path, "workflow_runs")
+    found = _own_runs(listed, head, pull=pull, scheduled=scheduled)
+    if listed or workflow != "ci":
         return found
-    # GitHub sometimes lists no CI run for a head whose CI jobs finished, and lists it when
-    # asked again a little later; a run it still does not list is found by its check suite.
-    command("sleep", str(UNLISTED_RETRY_SECONDS))
-    found = _own_runs(api(path, "workflow_runs", fresh=True), head, pull=pull, scheduled=scheduled)
-    if found:
-        return found
+    try:
+        return _unlisted_runs(path, head, pull=pull, scheduled=scheduled)
+    except Waiting:
+        raise
+    except Refused, KeyError, TypeError, ValueError:
+        # Unread is not absent: the head has no CI result yet, and the line keeps its judgment.
+        _unlisted.add(head)
+        return []
+
+
+def _unlisted_runs(path: str, head: str, *, pull: bool, scheduled: bool) -> list[dict[str, Any]]:
+    """The CI runs of `head` that GitHub did not list, when its check runs show CI jobs finished.
+
+    GitHub sometimes lists no CI run for such a head and lists it when asked again a little
+    later. The run is found by the check suite of its jobs; when that lists none either, GitHub
+    is asked again after a pause, once in a process. A run still not found is no CI result yet,
+    a wait: the line keeps what it judged of the head before (`_unlisted`)."""
+    suites = _ci_suites(head)
+    if not suites:
+        return []
     ci_path = f".github/workflows/{WORKFLOW_FILES['ci']}"
-    return _own_runs(
+    found = _own_runs(
         [
             run
             for suite in suites
@@ -394,6 +416,19 @@ def runs(
         pull=pull,
         scheduled=scheduled,
     )
+    if found:
+        return found
+    if head not in _asked_again:
+        _asked_again.add(head)
+        command("sleep", str(UNLISTED_RETRY_SECONDS))
+    found = _own_runs(api(path, "workflow_runs", fresh=True), head, pull=pull, scheduled=scheduled)
+    if not found:
+        _unlisted.add(head)
+    return found
+
+
+def _ci_check(name: str) -> bool:
+    return re.match(rf"{re.escape(CI_PREFIX)}(?:$|[\s:(])", name) is not None
 
 
 def _ci_suites(head: str) -> list[int]:
@@ -402,7 +437,7 @@ def _ci_suites(head: str) -> list[int]:
         {
             check["check_suite"]["id"]
             for check in api(f"{API}/commits/{head}/check-runs?per_page=100", "check_runs")
-            if check.get("name", "").startswith(CI_PREFIX)
+            if _ci_check(check.get("name", ""))
             and check.get("status") == "completed"
             and check.get("check_suite")
         }
@@ -2092,7 +2127,8 @@ class Train:
         pulls: dict[str, Any] = {}
         suite_states: dict[str, str | None] = {}
         lost: dict[str, dict[str, Any]] = {}
-        # A blocked head's CI run that GitHub lists no more is no new evidence: its mark stays.
+        # A blocked head's CI run that cannot be read, or that GitHub lists no more though its
+        # jobs finished, is no new evidence: its mark stays.
         refreshable, self.refreshable = self.refreshable, set()
         # Use the same session state and owner-question notes as the tick. A background
         # job leaves its session running and must not lose its turn merely for waiting.
@@ -2179,7 +2215,12 @@ class Train:
                             note_lost(self.path.parent, number, pull["headRefOid"], found)
                     if state == "red":
                         self.blocked[number] = pull["headRefOid"]
-                    elif not ci and number in refreshable and number in self.blocked:
+                    elif (
+                        not ci
+                        and pull["headRefOid"] in _unlisted
+                        and number in refreshable
+                        and number in self.blocked
+                    ):
                         self.refreshable.add(number)
                     elif state == "green" and number in self.blocked:
                         # Its own green run cannot clear a failure its prefix run found. A
@@ -2212,7 +2253,9 @@ class Train:
                             # Still blocked, but its turn may refresh the stale green run.
                             self.refreshable.add(number)
                 except Refused, KeyError, TypeError, ValueError, IndexError:
-                    pass
+                    # Unreadable evidence keeps what the line judged of this head before.
+                    if number in refreshable and number in self.blocked:
+                        self.refreshable.add(number)
             remaining.append(number)
         self.queue = remaining
         # A label changed while waiting moves its pull request at this turn.
