@@ -916,3 +916,67 @@ def test_the_spare_supervisor_reads_the_slots_the_balancer_wrote(machine: Machin
         "repos/example-owner/example-app/actions/runners/1/labels",
         "repos/example-owner/example-app/actions/runners/2/labels",
     ]
+
+
+# What install.sh calls that is not the balancer's: GitHub (through the budget), the images, Docker
+# and the login manager, answered so that only the install's own steps run.
+_INSTALL_BUDGET = """import sys
+
+RUNNER = "runner"
+
+
+class Limited(Exception):
+    pass
+
+
+def call(*arguments, **options):
+    raise Limited()
+
+
+if __name__ == "__main__":
+    with open("@STATE@/calls.log", "a") as log:
+        log.write("budget " + " ".join(sys.argv[1:]) + "\\n")
+"""
+
+
+def test_a_reinstall_keeps_the_bounds_and_writes_the_docker_count(machine: Machine) -> None:
+    source = machine.root / "source"
+    shutil.copytree(_ROOT / "runner", source, symlinks=False, ignore=shutil.ignore_patterns(
+        "github_budget.py", "github_identity.py", "__pycache__"))
+    (source / "github_budget.py").write_text(_INSTALL_BUDGET.replace("@STATE@", str(machine.state)))
+    for name in ("Dockerfile", "vm.Dockerfile"):
+        (source / name).write_text("FROM scratch\n")
+    for name in ("install-github-budget.sh", "build-images.sh"):
+        (source / name).write_text("#!/bin/sh\n")
+        (source / name).chmod(0o755)
+    (source / "machines").mkdir()
+    (source / "machines/box.sh").write_text("roles='ordinary docker'\nordinary_jobs=2\ndocker_runners=1\n")
+    (source / "machines/other.sh").write_text("roles='ordinary'\nordinary_jobs=1\ndocker_runners=0\n")
+    for tool in ("docker", "loginctl"):
+        machine.fake(tool, f'#!/bin/bash\necho "{tool} $*" >> "@STATE@/calls.log"\n')
+    # The machine as the balancer left it: other counts, and its own lines.
+    machine.settings(
+        ordinary=4,
+        docker=2,
+        bounds="balance_ordinary=2-5\nbalance_docker=0-2\n",
+        extra="balance off\n",
+    )
+
+    done = subprocess.run(
+        ["sh", str(source / "install.sh")],
+        env=machine._env(),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    settings = machine.settings_file.read_text()
+    # The counts are the machine's from machines/box.sh again; the balancer's lines stay.
+    assert "ordinary_jobs=2\n" in settings and "docker_runners=1\n" in settings
+    assert settings.endswith("balance_ordinary=2-5\nbalance_docker=0-2\nbalance off\n")
+    units = machine.home / ".config/systemd/user"
+    assert (units / "example-app-runner-balance.timer").is_file()
+    assert (units / "example-app-runner-balance.service").is_file()
+    assert "systemctl --user enable --now example-app-runner-balance.timer" in machine.calls("systemctl")

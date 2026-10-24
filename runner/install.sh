@@ -155,7 +155,8 @@ cp "$here"/systemd/example-app-runner-planner.service \
 cp "$here"/systemd/example-app-runner@.service "$here"/systemd/example-app-runner-docker@.service \
   "$here"/systemd/example-app-hub-cache.service "$here"/systemd/example-app-hub-cache-watch.* \
   "$here"/systemd/example-app-runner-spare.service "$here"/systemd/example-app-runner-lend.service \
-  "$here"/systemd/example-app-runner-image.* "$here"/systemd/example-app-runner-usage.* "$units/"
+  "$here"/systemd/example-app-runner-image.* "$here"/systemd/example-app-runner-usage.* \
+  "$here"/systemd/example-app-runner-balance.* "$units/"
 
 "$installed/build-images.sh"
 
@@ -200,6 +201,9 @@ recover_runners() {
 trap recover_runners EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# The runner balancer's own lines (its bounds, `balance off`) outlast a reinstall; the counts are
+# the ones this install was given.
+balance_lines=$(python3 "$here/balance_runners.py" kept "$installed/pool-settings.sh")
 systemctl --user stop example-app-runner-main.service example-app-runner-main-2.service example-app-runner-planner.service example-app-runner-spare.service example-app-runner-lend.service 'example-app-runner@*.service' 'example-app-runner-docker@*.service'
 # What every script of this machine reads after settings.sh: which machine it is and its counts.
 {
@@ -208,6 +212,8 @@ systemctl --user stop example-app-runner-main.service example-app-runner-main-2.
   printf "other_machines='%s'\n" "$other_machines"
   printf 'ordinary_jobs=%s\n' "$runners"
   printf 'ordinary_blacksmith_jobs=%s\n' "$ordinary_blacksmith_jobs"
+  printf 'docker_runners=%s\n' "$docker_runners"
+  [ -z "$balance_lines" ] || printf '%s\n' "$balance_lines"
 } >"$installed/pool-settings.sh"
 # The planner's network goes too: it starts again on one made from the current `subnet`.
 for old_network in $(docker network ls --quiet --filter "name=^$network"); do
@@ -267,6 +273,8 @@ has_role main || rm -f "$units"/default.target.wants/example-app-runner-main.ser
   "$units"/default.target.wants/example-app-runner-main-2.service \
   "$units"/default.target.wants/example-app-runner-lend.service
 has_role ordinary || rm -f "$units"/default.target.wants/example-app-runner-spare.service
+has_role ordinary || has_role docker ||
+  rm -f "$units"/timers.target.wants/example-app-runner-balance.timer
 systemctl --user daemon-reload
 
 # The mirror is an optimization, never a runner dependency. Its service retries if Docker Hub
@@ -303,6 +311,11 @@ while [ "$number" -le "$docker_runners" ]; do
   systemctl --user enable --now "example-app-runner-docker@$number.service"
   number=$((number + 1))
 done
+# After the runners it counts: it moves them between the kinds within the bounds of
+# pool-settings.sh, and changes nothing without them (balance_runners.py).
+if has_role ordinary || has_role docker; then
+  systemctl --user enable --now example-app-runner-balance.timer
+fi
 
 main_runners=0
 ! has_role main || main_runners=2
