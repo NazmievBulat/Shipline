@@ -27,6 +27,7 @@ COMMANDS=(
   merge-train-metrics
   merge-when-current
   notify
+  review-effort
   review-panel
   session
   test-run

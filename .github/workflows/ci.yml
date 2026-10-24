@@ -90,6 +90,7 @@ jobs:
               tests/workflow/test_merge_driver.py
               tests/workflow/test_notify.py
               tests/workflow/test_priority.py
+              tests/workflow/test_review_effort.py
               tests/workflow/test_session_memory.py
               tests/workflow/test_session_stop_and_cleanup.py
               tests/workflow/test_shadow_run.py
