@@ -1261,16 +1261,32 @@ def images_needed(
 
 
 def pull_request_paths(workflow: str) -> list[str]:
-    """The `paths:` of a workflow's `pull_request:` trigger, each entry as YAML reads it."""
-    if "  pull_request:" not in workflow:
-        raise Refused("could not read the Images workflow path filter")
-    section = workflow.split("  pull_request:", 1)[1].split("  push:", 1)[0]
-    entries = re.findall(r'^      - "((?:[^"\\]|\\.)+)"$', section, flags=re.MULTILINE)
-    try:
-        # A double-quoted YAML entry escapes as JSON does: "\\" is one backslash.
-        patterns = [json.loads(f'"{entry}"') for entry in entries]
-    except json.JSONDecodeError as error:
-        raise Refused(f"could not read the Images workflow path filter: {error}") from error
+    """The `paths:` of a workflow's `pull_request:` trigger, each entry as YAML reads it.
+
+    Each entry is a double-quoted string on a line of its own, a comment after it allowed.
+    Any other line in the list is refused, never skipped: a pattern the gate did not read
+    could start a run the gate never waits for.
+    """
+    patterns: list[str] = []
+    trigger = listed = False
+    for line in workflow.splitlines():
+        if re.fullmatch(r"\s*(?:#.*)?", line):
+            continue
+        if not line.startswith("   "):
+            trigger = re.fullmatch(r"  pull_request:\s*(?:#.*)?", line) is not None
+            listed = False
+        elif trigger and not line.startswith("     "):
+            listed = re.fullmatch(r"    paths:\s*(?:#.*)?", line) is not None
+        elif listed:
+            entry = re.fullmatch(r'      - "((?:[^"\\]|\\.)+)"\s*(?:#.*)?', line)
+            try:
+                # Only the escapes YAML shares with JSON are read; any other is refused.
+                if entry:
+                    patterns.append(json.loads(f'"{entry[1]}"'))
+                    continue
+            except json.JSONDecodeError:
+                pass
+            raise Refused(f"could not read the Images workflow path filter: {line.strip()}")
     if not patterns:
         raise Refused("could not read the Images workflow path filter")
     return patterns
@@ -1299,7 +1315,8 @@ def path_filter(patterns: list[str]) -> Callable[[str], bool]:
 
 def _filter_pattern(pattern: str) -> re.Pattern[str]:
     """One filter pattern as a regular expression. `*` is any characters but `/`, `**` is any
-    characters, and `**/` is zero or more folders. `?` and `+` make what stands before them
+    characters, and `**/` where a folder's name starts is zero or more folders (inside a name,
+    `**` is any characters and the `/` stays). `?` and `+` make what stands before them
     zero or one, or one or more, of it. `[...]` is one character of its set, with `-` ranges.
     A backslash makes the next character itself, and every other character is itself.
 
@@ -1313,7 +1330,7 @@ def _filter_pattern(pattern: str) -> re.Pattern[str]:
     at = 0
     while at < len(pattern):
         char = pattern[at]
-        if pattern.startswith("**/", at):
+        if pattern.startswith("**/", at) and pattern[at - 1 : at] in ("", "/"):
             # Zero or more folders: repeating it, however, is still that.
             parts.append(("(?:.*/)?", 1, False))
             at += 3
@@ -1347,15 +1364,17 @@ def _filter_pattern(pattern: str) -> re.Pattern[str]:
 def _filter_set(pattern: str, at: int) -> tuple[str, int] | None:
     """The set that starts at `at`, just after a `[`, as one character of a regular expression,
     and where the pattern goes on after its `]`; None when no `]` closes a set of at least one
-    character. A backslash makes the next character itself. A `-` between two characters is
-    the range from the first to the second; any other `-`, and a range that runs backwards,
-    is the characters themselves."""
+    character. A backslash makes the next character itself. A `-` between two characters of
+    a-z, of A-Z or of 0-9 is the range from the first to the second, as GitHub allows ranges
+    only there; any other `-`, and a range that runs backwards, is the characters themselves.
+    """
     chars: list[tuple[str, bool]] = []
     while at < len(pattern) and (pattern[at] != "]" or not chars):
         if pattern[at] == "]":
             return None
         escaped = pattern[at] == "\\" and at + 1 < len(pattern)
-        at += escaped
+        if escaped:
+            at += 1
         chars.append((pattern[at], escaped))
         at += 1
     if at == len(pattern):
@@ -1365,7 +1384,8 @@ def _filter_set(pattern: str, at: int) -> tuple[str, int] | None:
     while index < len(chars):
         char = chars[index][0]
         last = chars[index + 2][0] if index + 2 < len(chars) else ""
-        if chars[index + 1 : index + 2] == [("-", False)] and char <= last:
+        ranged = any(first <= char <= last <= final for first, final in ("az", "AZ", "09"))
+        if chars[index + 1 : index + 2] == [("-", False)] and ranged:
             members.append(f"{re.escape(char)}-{re.escape(last)}")
             index += 3
         else:

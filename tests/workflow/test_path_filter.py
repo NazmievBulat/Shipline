@@ -88,6 +88,14 @@ def test_a_star_stays_in_its_folder(gate: Any) -> None:
         ("[].txt", ["[].txt"], [".txt"]),
         ("[z-a].txt", ["z.txt", "-.txt", "a.txt"], ["m.txt"]),
         ("end\\", ["end\\"], ["end"]),
+        # A range is within a-z, A-Z or 0-9; any other is the characters themselves, so a
+        # range never reaches `/`.
+        ("a[.-0]b", ["a.b", "a-b", "a0b"], ["a/b", "a1b"]),
+        ("[0-z].txt", ["0.txt", "-.txt", "z.txt"], ["5.txt", "a.txt"]),
+        # `**/` is zero or more folders only where a folder's name starts; inside a name,
+        # `**` is any characters and the `/` stays.
+        ("docs**/*.md", ["docs/a.md", "docsx/y/a.md"], ["docsREADME.md", "docs.md"]),
+        ("src/a**/b.go", ["src/a/b.go", "src/ax/y/b.go"], ["src/ab.go"]),
     ],
 )
 def test_each_pattern_kind(
@@ -125,6 +133,41 @@ def test_the_pull_request_filter_is_read_as_written(gate: Any) -> None:
         gate.pull_request_paths("name: Images\non:\n  pull_request:\n  push:\n")
     with pytest.raises(gate.Refused):
         gate.pull_request_paths("name: Images\non:\n  push:\n")
+
+
+def test_only_the_pull_request_paths_list_is_read(gate: Any) -> None:
+    text = (
+        "name: Images\n"
+        "on:\n"
+        "  pull_request:\n"
+        "    branches:\n"
+        '      - "main"\n'
+        "    paths:  # what the images are built from\n"
+        "\n"
+        '      - "docker/**"  # the Dockerfiles\n'
+        "      # a note between entries\n"
+        '      - "src/*.go"\n'
+        "    types: [opened]\n"
+        "jobs:\n"
+        "  build:\n"
+        "    needs:\n"
+        '      - "lint"\n'
+    )
+    assert gate.pull_request_paths(text) == ["docker/**", "src/*.go"]
+    # Without a `paths:` list, `paths-ignore:` is never read as one.
+    ignored = 'on:\n  pull_request:\n    paths-ignore:\n      - "docs/**"\n'
+    with pytest.raises(gate.Refused):
+        gate.pull_request_paths(ignored)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["'src/**'", "src/**", r'"src/\x41"', '"src/**" extra', '  - "src/**"'],
+)
+def test_an_entry_the_gate_cannot_read_is_refused_not_skipped(gate: Any, entry: str) -> None:
+    text = f'on:\n  pull_request:\n    paths:\n      - "docker/**"\n      - {entry}\n'
+    with pytest.raises(gate.Refused):
+        gate.pull_request_paths(text)
 
 
 def _git(repo: Path, *args: str) -> str:
