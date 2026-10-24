@@ -117,3 +117,22 @@ def test_the_planner_counts_the_ordinary_runners_by_their_container_names(
 
     assert (state["free"], state["busy"]) == (1, 1)
     assert "example-app-runner@*.service" in asked[0]
+
+
+def test_the_planner_reads_the_slots_the_balancer_wrote_each_round(tmp_path: Path) -> None:
+    (tmp_path / "settings.sh").write_text((_RUNNER / "settings.sh").read_text())
+    pool = tmp_path / "pool-settings.sh"
+    pool.write_text("ordinary_jobs=2\nordinary_blacksmith_jobs=1\n")
+    assert planner_state.counts(2, 1, tmp_path) == (2, 1)
+
+    # The balancer added a slot (balance_runners.py), and wrote its own lines beside the counts.
+    pool.write_text("ordinary_jobs=3\nordinary_blacksmith_jobs=1\nbalance off\n")
+
+    assert planner_state.counts(2, 1, tmp_path) == (3, 1)
+
+
+def test_the_planner_keeps_its_counts_when_the_settings_cannot_be_read(tmp_path: Path) -> None:
+    (tmp_path / "settings.sh").write_text((_RUNNER / "settings.sh").read_text())
+    (tmp_path / "pool-settings.sh").write_text("ordinary_jobs=many\n")
+
+    assert planner_state.counts(2, 1, tmp_path) == (2, 1)
