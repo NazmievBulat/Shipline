@@ -319,6 +319,11 @@ def _state(claim: Path) -> str:
         return "claim"
 
 
+def repeated(folder: Path, run_id: int) -> bool:
+    """A scratch failure's hand-back must tell the wake that its runner retry failed too."""
+    return _state(marker(folder, run_id)) == "repeated"
+
+
 def rerun_running(folder: Path, pull: dict[str, Any]) -> str | None:
     """Why a handoff whose checks no longer show a failure waits: a re-run the tick asked for
     still runs, or passed and is the line's to judge. None when no such re-run is known."""

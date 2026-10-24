@@ -8410,6 +8410,7 @@ def test_prefix_transport_retry_keeps_the_prefix_until_the_second_result(
     assert done.returncode == 3, done.stdout + done.stderr
     assert rerun_calls(github.workflow) == []
     assert _scratch(github)["branch"] == scratch["branch"]
+    run = github.api[path]["workflow_runs"][0]
     run.update(status="completed", conclusion="failure")
     github.save()
     for _ in range(2):
@@ -8420,6 +8421,10 @@ def test_prefix_transport_retry_keeps_the_prefix_until_the_second_result(
         assert _scratch(github)["branch"] == scratch["branch"]
         assert _batch_state(github)["waiting"] == ["7", "8", "9"]
         assert "7" not in _batch_state(github)["blocked"]
+    run = github.api[path]["workflow_runs"][0]
+    jobs = github.api[f"{_REPO}/actions/runs/{run['id']}/jobs?per_page=100"]["jobs"]
+    failed_job_id = job["id"]
+    job = next(j for j in jobs if j["id"] == failed_job_id)
     run.update(run_attempt=2, conclusion="success" if second == "passes" else "failure")
     if second == "passes":
         job["conclusion"] = "success"
@@ -8429,6 +8434,7 @@ def test_prefix_transport_retry_keeps_the_prefix_until_the_second_result(
     assert len(rerun_calls(github.workflow)) == 1
     assert ("7" in _batch_state(github)["blocked"]) == (second != "passes")
     if second != "passes":
+        assert "failed again after its runner retry" in done.stderr
         assert f"its runners failed it again in run {run['id']}" in github.workflow.wake_log.read_text()
 
 
@@ -8468,6 +8474,8 @@ def test_whole_suite_transport_retry_keeps_the_scratch_run(
         assert "7" not in _batch_state(github)["blocked"]
         assert rerun_calls(github.workflow) == [
             "gh run rerun 950000 -R example-org/example-app --failed"]
+    run = github.api[path]["workflow_runs"][0]
+    jobs = github.api[f"{_REPO}/actions/runs/950000/jobs?per_page=100"]["jobs"]
     run.update(run_attempt=2, conclusion="success" if second == "passes" else "failure")
     for job in jobs[1:]:
         job["conclusion"] = run["conclusion"]
@@ -8476,4 +8484,5 @@ def test_whole_suite_transport_retry_keeps_the_scratch_run(
     assert done.returncode == (0 if second == "passes" else 1), done.stdout + done.stderr
     assert len(rerun_calls(github.workflow)) == 1
     if second != "passes":
+        assert "failed again after its runner retry" in done.stderr
         assert "its runners failed it again in run 950000" in github.workflow.wake_log.read_text()
