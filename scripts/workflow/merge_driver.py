@@ -17,7 +17,7 @@ from reviewer_start import start as start_reviewer
 
 
 def _worktree(folder: Path, number: str) -> Path:
-    return folder.parent.parent / ".claude" / "worktrees" / f"ticket-{number}"
+    return gate.CONFIG.checkout_of(folder) / ".claude" / "worktrees" / f"ticket-{number}"
 
 
 def _sessions() -> set[str]:
@@ -88,7 +88,8 @@ def _hand_back_pull(folder: Path, path: Path, running: set[str]) -> dict[str, An
         # Drafts already have their worker path; closed pulls need no reviewer.
         path.unlink()
         return None
-    if not any(label.get("name") == "workflow" for label in pull.get("labels", [])):
+    labelled = gate.CONFIG.labels.workflow
+    if not any(label.get("name") == labelled for label in pull.get("labels", [])):
         # Unlabelled children belong to the orchestrator's audit path. The wake
         # reports their hand-back; the tick never invents an audit or review for them.
         return None
@@ -383,7 +384,7 @@ def drive(folder: Path) -> None:
 if __name__ == "__main__":
     gate.install_signal_handlers()
     try:
-        folder = gate.main_checkout() / ".local" / "workflow"
+        folder = gate.main_checkout() / gate.CONFIG.state_folder
         if sys.argv[1:] == ["--hand-backs"]:
             _tidy_hand_backs(folder)
         elif len(sys.argv) == 3 and sys.argv[1] == "--start-hand-back" and sys.argv[2].isdigit():
