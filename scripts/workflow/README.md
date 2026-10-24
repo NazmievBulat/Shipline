@@ -52,7 +52,8 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `labels.workflow`, `labels.audited` | the label that starts a ticket, and an audit's | `workflow`, `audited` |
 | `labels.priority.blocker` … `.low` | the four priority labels | `priority: blocker` … `priority: low` |
 | `runner.labels` | the runner labels the merge gate may re-run failed jobs on | none: the gate re-runs nothing |
-| `runner.prefix` | the prefix the runner pool names its services and containers by; `workflow-metrics` reads their CPU | none: no runner figures |
+| `runner.prefix` | the one word the runner pool (`runner/`) names everything by: its images, network, services and containers, `<prefix>-runner…`, and its labels; `workflow-metrics` reads the CPU of the `<prefix>-runner…` services and containers | none: no runner figures |
+| `runner.image_build` | the command line, run from the main checkout, that builds the runner images | none: the pool builds its own Dockerfile |
 | `runner.main_machine` | the one machine of the pool whose runners take main's jobs, labelled `<runner.prefix>-<runner.main_machine>-main`; the example workflows name that label | `home` |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
 | `merge.scratch_prefix` | the beginning of the merge gate's scratch branches, ended by `-` or `/`: the gate tests each prefix on one and deletes every branch that begins with it; the example workflows run the gate's dispatches on them on main's runners | `workflow/merge-batch-` |

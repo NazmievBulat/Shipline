@@ -9,7 +9,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from workflow_harness import Workflow
+from workflow_harness import Workflow, install_shipline
 
 _HELPERS = ("advisory_service", "pushing_checkout", "run_proof")
 # What a scan that could not reach an advisory service says, as an outage would read it.
@@ -387,6 +387,9 @@ def test_the_codex_gh_without_a_repository_allows_reads_and_refuses_the_body(
 
 
 def _installer(workflow: Workflow) -> Path:
+    """The repository's installer; `install-timer` runs from a Shipline checkout of its own."""
+    if workflow.home is None:
+        install_shipline(workflow)
     return workflow.repo / ".github/runner/install-github-budget.sh"
 
 

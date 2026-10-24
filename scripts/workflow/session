@@ -156,17 +156,22 @@ is_session_name() {
   [[ $1 =~ ^(ticket|audit|review)-[0-9]+$ ]] || { [[ $1 == hunt-* ]] && is_hunt_name "${1#hunt-}"; }
 }
 
-# The main checkout, whichever worktree this script was called from.
+# The repository's main checkout, whichever of its worktrees this script was called from
+# (`SHIPLINE_REPO`, else the one of the current folder), and Shipline's own checkout, which this
+# script is in.
 find_main_checkout() {
   local here
   here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   script_dir=$here
-  main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
-  # The repository's state folder and set-up command (`workflow_config.py`), read once a call:
-  # one Python start, which `list` below otherwise avoids.
+  # Its `bin`, for `shipline` in what a session runs, when this checkout has the launcher.
+  shipline_bin=$(cd "$here/../.." && pwd)/bin
+  [[ -f $shipline_bin/shipline ]] && shipline_bin+=: || shipline_bin=""
+  # The repository, its state folder and set-up command (`workflow_config.py`), read once a
+  # call: one Python start, which `list` below otherwise avoids.
   local config
   config=$(python3 "$here/workflow_config.py" shell) || exit 1
   eval "$config"
+  main=$SHIPLINE_REPO
   cd "$main"
 }
 
@@ -666,7 +671,8 @@ launch() {
     HOME="$HOME" \
     USER="${USER:-$(id -un)}" \
     SHELL="${SHELL:-/bin/bash}" \
-    PATH="$script_dir/gh-bin:$PATH" \
+    PATH="$shipline_bin$script_dir/gh-bin:$PATH" \
+    SHIPLINE_REPO="$main" \
     LANG="${LANG:-C.UTF-8}" \
     TERM="${TERM:-xterm-256color}" \
     XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
