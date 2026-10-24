@@ -1,6 +1,6 @@
 #!/bin/sh
 # Appends this minute's line of what the machine has free to ~/.local/state/ci-runner/usage.log
-# (usage.py says what each field is). Run every minute by example-app-runner-usage.timer.
+# (usage.py says what each field is). Run every minute by <prefix>-runner-usage.timer.
 set -eu
 here=$(dirname "$0")
 . "$here/settings.sh"

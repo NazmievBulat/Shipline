@@ -1,0 +1,9 @@
+[Unit]
+Description=Look at the size of the Docker Hub cache for CI virtual machines every 10 minutes
+
+[Timer]
+OnActiveSec=10min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

@@ -1,9 +1,9 @@
 """Moves this machine's runners between CI and Docker, and adds or removes them, by the queues,
 its load and the demand on its way.
 
-A systemd user timer runs it every minute (`systemd/example-app-runner-balance.timer`), installed
-beside the spare supervisor (`keep-spare.sh`) and read like it: `settings.sh`, then the machine's
-own `pool-settings.sh` that `install.sh` writes beside it. It changes only this machine's own
+A systemd user timer runs it every minute (`systemd/@PREFIX@-runner-balance.timer`), installed
+beside the spare supervisor (`keep-spare.sh`) and reading what it reads: `settings.sh`, the
+machine's own `pool-settings.sh` that `install.sh` writes beside it, then `names.sh`. It changes only this machine's own
 ordinary slots and Docker runners, never another machine's, never a main runner or the planner,
 and only within the bounds of `pool-settings.sh`:
 
@@ -23,7 +23,7 @@ higher; removing one writes it one lower and stops the highest unit. A Docker ru
 
 Each minute it reads, from GitHub under the runners' own identity and within the shared budget
 (`github_budget.py`), the queued and running jobs for the pool's labels, which every machine's
-runners share (`label` and `docker_label` of `settings.sh`), and the runners of the pool; and
+runners share (`label` and `docker_label` of `names.sh`), and the runners of the pool; and
 from the machine, its 5-minute load against the session start ceiling of
 `scripts/workflow/session` (the processors times WORKFLOW_LOAD_PER_PROCESSOR, 1.5) and its
 available memory.
@@ -115,11 +115,12 @@ LOCK = STATE / "runner-balance.lock"
 DEFAULT_FORECAST = STATE / "ci-demand.json"
 SETTINGS = HERE / "settings.sh"
 POOL_SETTINGS = HERE / "pool-settings.sh"
+NAMES_FILE = HERE / "names.sh"
 # The balancer's own lines of pool-settings.sh: a reinstall keeps them.
 OWN_LINE = re.compile(r"[ \t]*(balance_(ordinary|docker|forecast)=.*|balance[ \t]+off)[ \t]*")
 SETTINGS_READ = (
     "repository",
-    "RUNNER_PREFIX",
+    "prefix",
     "machine",
     "label",
     "docker_label",
@@ -151,19 +152,29 @@ def now() -> int:
 
 def read_settings() -> dict[str, str]:
     """The values the balancer reads, as the pool's scripts read them (settings.sh, then
-    pool-settings.sh), `balance off` among them, with only PATH and HOME, for at most
-    SETTINGS_SECONDS."""
+    pool-settings.sh, then names.sh, which makes the labels), `balance off` among them, with only
+    PATH and HOME, for at most SETTINGS_SECONDS."""
     script = (
         '. "$1" >/dev/null 2>&1 || exit 1; '
         "balance() { [[ ${1-} == off ]] && balance_off=1; return 0; }; "
-        '. "$2" >/dev/null 2>&1; shift 2; '
+        '. "$2" >/dev/null 2>&1; '
+        '. "$3" >/dev/null 2>&1 || exit 1; shift 3; '
         'for name in "$@"; do printf "%s=%s\\0" "$name" "${!name-}"; done'
     )
     if not POOL_SETTINGS.is_file():
         raise Refused(f"{POOL_SETTINGS} is missing: install.sh writes it")
     try:
         done = subprocess.run(
-            ["bash", "-c", script, "settings", str(SETTINGS), str(POOL_SETTINGS), *SETTINGS_READ],
+            [
+                "bash",
+                "-c",
+                script,
+                "settings",
+                str(SETTINGS),
+                str(POOL_SETTINGS),
+                str(NAMES_FILE),
+                *SETTINGS_READ,
+            ],
             env={key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ},
             capture_output=True,
             text=True,
@@ -173,7 +184,7 @@ def read_settings() -> dict[str, str]:
     except subprocess.TimeoutExpired:
         raise Refused(f"the settings ran for more than {SETTINGS_SECONDS} seconds") from None
     if done.returncode:
-        raise Refused(f"{SETTINGS} cannot be read")
+        raise Refused("the settings cannot be read (settings.sh, pool-settings.sh, names.sh)")
     return dict(item.split("=", 1) for item in done.stdout.split("\0") if item)
 
 
@@ -232,16 +243,11 @@ class Machine:
 
 def machine() -> Machine:
     values = read_settings()
-    # The pool's units are named from its prefix: the environment's, the settings', or that of
-    # the folder the pool is installed in, `<prefix>-runner`.
-    values["RUNNER_PREFIX"] = (
-        os.environ.get("RUNNER_PREFIX")
-        or values.get("RUNNER_PREFIX")
-        or HERE.name.removesuffix("-runner")
-    )
+    # The pool's units are named from its prefix: the environment's, or the one install.sh wrote.
+    values["prefix"] = os.environ.get("RUNNER_PREFIX") or values.get("prefix", "")
     for needed, pattern in (
         ("repository", REPOSITORY),
-        ("RUNNER_PREFIX", PREFIX),
+        ("prefix", PREFIX),
         ("machine", MACHINE),
         ("label", LABEL),
     ):
@@ -272,7 +278,7 @@ def machine() -> Machine:
         bounds["docker"] = (0, 0)
     return Machine(
         repository=values["repository"],
-        prefix=values["RUNNER_PREFIX"],
+        prefix=values["prefix"],
         name=values["machine"],
         labels=labels,
         first_label=first_label,

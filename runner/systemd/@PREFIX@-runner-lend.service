@@ -1,0 +1,10 @@
+[Unit]
+Description=Lend an idle runner of main to @PREFIX@ PR jobs, the merge train's first member first
+
+[Service]
+ExecStart=/bin/sh %h/.local/share/@PREFIX@-runner/keep-lending.sh
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

@@ -57,7 +57,7 @@ def others(
 
 
 def snapshot(
-    ordinary_jobs: int, machines: list[str] | None = None, label: str = "example-app-home"
+    ordinary_jobs: int, machines: list[str], label: str, container: str
 ) -> dict[str, int | str]:
     """Free means a job slot the workflow label can still use, not merely an idle container.
 
@@ -71,15 +71,15 @@ def snapshot(
         "--state=active",
         "--plain",
         "--no-legend",
-        "example-app-runner@*.service",
+        f"{container}@*.service",
     )
     containers = set(_read("docker", "ps", "--format", "{{.Names}}").splitlines())
     idle = busy = 0
     for line in services.splitlines():
-        match = re.fullmatch(r"example-app-runner@([1-9][0-9]*)\.service", line.split()[0])
+        match = re.fullmatch(rf"{re.escape(container)}@([1-9][0-9]*)\.service", line.split()[0])
         if not match:
             continue
-        name = f"example-app-runner-{match[1]}"
+        name = f"{container}-{match[1]}"
         if name not in containers:
             continue
         processes = {
@@ -93,7 +93,7 @@ def snapshot(
             else:
                 idle += 1
     free = max(0, min(idle, ordinary_jobs - busy))
-    elsewhere_free, elsewhere_busy = others(machines or [], label)
+    elsewhere_free, elsewhere_busy = others(machines, label)
     return {
         "updated_at": datetime.now(UTC).isoformat(),
         "free": free + elsewhere_free,
@@ -103,8 +103,8 @@ def snapshot(
 
 def main() -> None:
     maximum, reduced, repository = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
-    machines = sys.argv[4].split() if len(sys.argv) > 4 else []
-    label = sys.argv[5] if len(sys.argv) > 5 else "example-app-home"
+    # The other machines, the pool's label and its runners' container names (keep-planner.sh).
+    machines, label, container = sys.argv[4].split(), sys.argv[5], sys.argv[6]
     folder = Path.home() / ".local/state/ci-overflow/home"
     folder.mkdir(parents=True, exist_ok=True)
     while True:
@@ -116,9 +116,10 @@ def main() -> None:
                     str(maximum),
                     str(reduced),
                     repository,
+                    label,
                 )
             )
-            state = snapshot(slots, machines, label)
+            state = snapshot(slots, machines, label, container)
             temporary = folder / "state.tmp"
             temporary.write_text(json.dumps(state))
             temporary.replace(folder / "state.json")

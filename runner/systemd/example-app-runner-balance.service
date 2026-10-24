@@ -1,6 +1,0 @@
-[Unit]
-Description=Move this CI machine's runners between the kinds by the queues, its load and the demand (balance_runners.py)
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/python3 %h/.local/share/example-app-runner/balance_runners.py

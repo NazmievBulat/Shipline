@@ -7,6 +7,7 @@ here=$(dirname "$0")
 if [ -f "$here/pool-settings.sh" ]; then
   . "$here/pool-settings.sh"
 fi
+. "$here/names.sh"
 state=$HOME/.local/state/ci-overflow
 mkdir -p "$state/home" "$state/ledger"
 # The image's runner user must be able to commit reservations to the bind mount.
@@ -14,7 +15,7 @@ mkdir -p "$state/home" "$state/ledger"
 chmod 777 "$state/ledger"
 # The other machines' PR runners count too: a run waits for a free one there as for one here.
 python3 "$here/planner-state.py" "$ordinary_jobs" "$ordinary_blacksmith_jobs" "$repository" \
-  "$other_machines" "$label" &
+  "$other_machines" "$label" "$container" &
 publisher=$!
 "$here/keep-runner.sh" 0 planner &
 runner=$!

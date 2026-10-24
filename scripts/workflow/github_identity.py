@@ -298,7 +298,7 @@ def _github(method: str, path: str, signed: str) -> dict[str, Any]:
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {signed}",
             "Content-Type": "application/json",
-            "User-Agent": "example-app-runner",
+            "User-Agent": "shipline-runner",
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )

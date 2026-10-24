@@ -1,6 +1,6 @@
 """What a machine's CI load leaves free, one line a minute, and the busiest hour of each day.
 
-`sample-usage.sh`, run every minute by `example-app-runner-usage.timer` on every machine with
+`sample-usage.sh`, run every minute by `<prefix>-runner-usage.timer` on every machine with
 runners, appends one line to `~/.local/state/ci-runner/usage.log`:
 
     2026-10-23T02:31:00Z free_mb=10240 available_mb=22630 swap_in_mb_s=0.0 swap_out_mb_s=0.0 \

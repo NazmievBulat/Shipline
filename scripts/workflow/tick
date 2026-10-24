@@ -30,7 +30,9 @@
 #      even before publishing its round. Without a wait note, an idle reviewer needs a round
 #      it published on the head or an earlier commit of it. Owner questions are left alone.
 #      A reviewer or audit whose pull request another member's gate call merged in a batch
-#      is told so once, to do its after-merge duties.
+#      is told so once, to do its after-merge duties. One that waits for its checks before it
+#      joined the merge line is woken once per head for a check GitHub lost, as the gate defines
+#      it (`tick_lost_check.py`); an audit's pull request needs no label for that.
 #   8. Waits that ended or stalled, for Claude workers and reviewers (never Codex bridges, hunts
 #      or audits): a session idle 50 minutes waiting for its own job or its turn in the train
 #      is asked once per idle stretch whether the wait is over; a worker idle 15 minutes on a
@@ -546,17 +548,25 @@ while read -r name state _; do
   # Another member's gate call merged this one in a batch: it is no longer open or in the
   # train, and its own session still owes the after-merge duties.
   batch_merged=$main/$SHIPLINE_STATE_FOLDER/batch-merged-$number
+  worktree=$main/.claude/worktrees/ticket-$number
+  notes=$worktree/$SHIPLINE_STATE_FOLDER/$name
+  in_line=false
+  if jq -e --arg number "$number" '(.waiting + .blocked) | index($number) != null' \
+      <<<"$train" >/dev/null; then
+    in_line=true
+  fi
+  # An audit waiting for its checks before it joined the line is woken for a lost check only.
+  only_lost=false
   if [[ -e $batch_merged ]]; then
     :
   elif [[ $name == review-* ]]; then
     grep -qE "^$number false " <<<"$pulls" || continue
-  else
-    # Audits do not carry the workflow label. Only a known train entry may wake one.
-    jq -e --arg number "$number" '(.waiting + .blocked) | index($number) != null' \
-      <<<"$train" >/dev/null || continue
+  elif [[ $in_line == false ]]; then
+    # Audits do not carry the workflow label. Only a known train entry may wake one, but for a
+    # lost check while it waits.
+    [[ -e $notes.checks-wait ]] || continue
+    only_lost=true
   fi
-  worktree=$main/.claude/worktrees/ticket-$number
-  notes=$worktree/$SHIPLINE_STATE_FOLDER/$name
   # `.pushed` also protects questions left by hooks from before owner-blocked existed.
   [[ $name == audit-* || -e $notes.started ]] || continue
   [[ -e $notes.checks-wait || ($name == review-* && $state == idle) ]] || continue
@@ -593,7 +603,7 @@ while read -r name state _; do
   fi
   # A conflict can prevent CI from starting. Wake once per head, before the checks
   # and train-turn gates, using the same owner/input protections as a checks wake.
-  if jq -e '.baseRefName == "main" and
+  if [[ $only_lost == false ]] && jq -e '.baseRefName == "main" and
     (.mergeable == "CONFLICTING" or .mergeStateStatus == "DIRTY")' <<<"$pull" >/dev/null; then
     mark=$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-$head
     [[ ! -e $mark ]] || continue
@@ -634,14 +644,26 @@ while read -r name state _; do
   # CI result is always scheduled, so a partial rollup before it exists is not done.
   # Only skipped image planners means the draft run; ready must get its new run first.
   # GitHub keeps skipped draft checks beside the ready run on the same head.
-  [[ $lost == true ]] || jq -e --arg result "$SHIPLINE_CI_RESULT" \
+  if [[ $lost == false ]] && { [[ $only_lost == true ]] || ! jq -e --arg result "$SHIPLINE_CI_RESULT" \
     --arg images "$SHIPLINE_IMAGES_PLAN" '.statusCheckRollup | type == "array" and
     any(.[]; .name == $result) and
     (all(.[]; .name != $images) or
       any(.[]; .name == $images and .conclusion != "SKIPPED")) and all(.[];
     if .__typename == "CheckRun" then .status == "COMPLETED"
     elif .__typename == "StatusContext" then (.state | IN("SUCCESS", "FAILURE", "ERROR"))
-    else false end)' <<<"$pull" >/dev/null || continue
+    else false end)' <<<"$pull" >/dev/null; }; then
+    # Before the line, a lost check is seen by no gate: the tick looks for one itself, as the
+    # gate would, and tells the session once per head. Each run is read once in this tick.
+    [[ $in_line == false && -e $notes.checks-wait ]] || continue
+    mark=$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head
+    [[ ! -e $mark ]] || continue
+    WORKFLOW_BACKGROUND_GITHUB=1 python3 -B "$here/tick_lost_check.py" \
+      "$main/$SHIPLINE_STATE_FOLDER" "$number" <<<"$pull" 9>&-
+    found=$?
+    ((found != 3)) || continue
+    ((found == 0)) || { failed=1; continue; }
+    lost=true
+  fi
   if [[ ! -e $notes.checks-wait ]]; then
     started=$(stat -c %Y "$notes.started" 9>&-) || continue
     if ! reviews=$(gh api --paginate "repos/$SHIPLINE_REPOSITORY/pulls/$number/reviews" 9>&-); then
@@ -854,12 +876,60 @@ done <<<"$running"
 python3 -B "$here/merge_driver.py" --hand-backs 9>&- || failed=1
 running=$(session list) || failed=1
 
-# A draft goes to the cloud, if its screen check allows, by the cloud default (a Codex fix
-# round stays on Codex), or by a reservation or a cloud-built marker of its own.
+# The program the orchestrator recorded for ticket N in `worker-program-N`, in `recorded`, or
+# nothing. A record that names no program is read as none, and named in the wake once for
+# what it holds.
+recorded_program() {
+  local record=$main/$SHIPLINE_STATE_FOLDER/worker-program-$1 text sum line
+  recorded=""
+  if [[ ! -e $record ]]; then
+    rm -f "$record.noted"
+    return 0
+  fi
+  if { text=$(<"$record"); } 2>/dev/null &&
+      [[ $text =~ ^[[:space:]]*(cloud|claude|codex)[[:space:]]*$ ]]; then
+    recorded=${BASH_REMATCH[1]}
+    rm -f "$record.noted"
+    return 0
+  fi
+  sum=$(cksum <"$record" 2>/dev/null) && sum=${sum%% *} || sum=unreadable
+  [[ ! -r $record.noted || $(<"$record.noted") != "$sum" ]] || return 0
+  line="worker-program-$1 names no worker program (cloud, claude or codex); read as no record"
+  if note_for_wake "worker-program-$1-$sum" "$line"; then
+    echo "$sum" >"$record.noted" || failed=1
+    wake_log "$line" || failed=1
+  else
+    failed=1
+  fi
+}
+
+# Whether a draft goes to the cloud, if its screen check allows: always by a reservation of
+# its own; else by the program recorded for it; else by the cloud default (a Codex fix round
+# stays on Codex) or a cloud-built marker of its own. The starts held for memory and the
+# worker start both ask this, so they never disagree.
 cloud_candidate() {
   local notes=$main/$SHIPLINE_STATE_FOLDER
-  [[ ( $program == cloud && ! -e $notes/codex-built-$1 ) ||
-     -e $notes/cloud-built-$1 || -e $notes/cloud-$1 ]]
+  [[ ! -e $notes/cloud-$1 ]] || return 0
+  recorded_program "$1"
+  if [[ -n $recorded ]]; then
+    [[ $recorded == cloud ]]
+    return
+  fi
+  [[ ( $program == cloud && ! -e $notes/codex-built-$1 ) || -e $notes/cloud-built-$1 ]]
+}
+
+# Whether a draft not started in the cloud goes to Codex, if its screen check allows: never
+# with a reservation; else by the program recorded for it; else by the Codex default
+# or a Codex-built marker of its own.
+codex_candidate() {
+  local notes=$main/$SHIPLINE_STATE_FOLDER
+  [[ ! -e $notes/cloud-$1 ]] || return 1
+  recorded_program "$1"
+  if [[ -n $recorded ]]; then
+    [[ $recorded == codex ]]
+    return
+  fi
+  [[ $program == codex || -e $notes/codex-built-$1 ]]
 }
 
 # A start that waits for memory (75) holds later local starts. Cloud starts use no
@@ -899,14 +969,12 @@ while read -r number draft base; do
     [[ $draft == true ]] && python3 -B "$here/cloud_workers.py" retryable "$main" "$number" || continue
   fi
   if [[ $draft == true ]]; then
-    # A reservation or a cloud-built marker keeps fix rounds in the cloud even after
-    # the default changes. Both alternative programs share the conservative screen routing.
+    # A reservation, a recorded program or a fix-round marker holds even after the default
+    # changes. Both alternative programs share the conservative screen routing.
     if cloud_candidate "$number" && node "$here/codex-eligible.mjs" "$number" 9>&-; then
       python3 -B "$here/cloud_workers.py" allowed "$main" || continue
       session start worker "$number" medium cloud
-    elif [[ ! -e $main/$SHIPLINE_STATE_FOLDER/cloud-$number &&
-          ( $program == codex || -e $main/$SHIPLINE_STATE_FOLDER/codex-built-$number ) ]] &&
-      node "$here/codex-eligible.mjs" "$number" 9>&-; then
+    elif codex_candidate "$number" && node "$here/codex-eligible.mjs" "$number" 9>&-; then
       ((local_starts_held == 0)) || continue
       session start worker "$number" medium codex
     else
