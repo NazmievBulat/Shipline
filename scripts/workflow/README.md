@@ -54,6 +54,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `runner.labels` | the runner labels the merge gate may re-run failed jobs on | none: the gate re-runs nothing |
 | `runner.prefix` | the prefix the runner pool names its services and containers by; `workflow-metrics` reads their CPU | none: no runner figures |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
+| `review.high_effort_paths` | regular expressions searched for in every path a pull request changes, both sides of a rename or deletion; a match runs its independent reviewer at high effort, not medium (`review-effort N`): stored data, text sent to a model, background work, locks and queues, account boundaries and security | none: only Shipline's own concurrent scripts and a description with the line `Review: high` |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the

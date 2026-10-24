@@ -34,5 +34,13 @@
     "labels": ["example-app-home", "example-app-home-main", "example-app-home-docker", "example-app-planner"],
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app-runner"
+  },
+  "review": {
+    "high_effort_paths": [
+      "^db/migrations/", "^db/schema\\.sql$", "^app/models/",
+      "^prompts/", "(^|/)AGENTS\\.md$", "\\.prompt\\.md$",
+      "^app/jobs/", "^app/queues/", "(^|/)locks?\\.py$",
+      "^app/auth/", "^app/permissions/", "^config/secrets"
+    ]
   }
 }

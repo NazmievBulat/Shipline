@@ -11,7 +11,12 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix.
+runner prefix; no paths that call for a closer review.
+
+`review.high_effort_paths` are regular expressions, each searched for in every path a pull
+request changes: a match runs its independent reviewer at high effort, not medium
+(`review-effort`). A repository names there what it stores, what its models read, its
+background work, locks and queues, and its account boundaries and security.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -80,6 +85,7 @@ DEFAULTS: dict[str, Any] = {
         # no runner figures (`workflow_metrics.py`).
         "prefix": None,
     },
+    "review": {"high_effort_paths": []},
 }
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
@@ -138,6 +144,11 @@ class Runner:
 
 
 @dataclass(frozen=True)
+class Review:
+    high_effort_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Config:
     # None when nothing names it: an error only for a script that needs it.
     found_repository: str | None
@@ -148,6 +159,7 @@ class Config:
     workflows: Workflows
     labels: Labels
     runner: Runner
+    review: Review
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -220,6 +232,17 @@ def _relative(value: str, name: str) -> str:
     if path.is_absolute() or ".." in path.parts or str(path) == ".":
         raise ConfigError(f"{FILE}: {name} must be a path inside the checkout, not {value}")
     return value
+
+
+def _patterns(values: list[str], name: str) -> tuple[str, ...]:
+    for value in values:
+        try:
+            re.compile(value)
+        except re.error as error:
+            raise ConfigError(
+                f"{FILE}: {name} must be regular expressions, not {json.dumps(value)}: {error}"
+            ) from None
+    return tuple(values)
 
 
 def _from_runner_settings(main: Path) -> str | None:
@@ -310,6 +333,11 @@ def load(start: Path = HERE) -> Config:
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
         ),
+        review=Review(
+            high_effort_paths=_patterns(
+                values["review"]["high_effort_paths"], "review.high_effort_paths"
+            )
+        ),
         given=given,
         main=main,
     )
@@ -340,6 +368,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
         },
+        "review": {"high_effort_paths": list(config.review.high_effort_paths)},
     }
 
 

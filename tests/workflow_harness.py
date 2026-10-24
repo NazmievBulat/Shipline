@@ -184,7 +184,14 @@ if [ "$1 $2 $4 $5" = "pr view --json title,body,baseRefName,headRefOid" ]; then
     '{title: $title, body: $body, baseRefName: "main", headRefOid: $head}'
   exit 0
 fi
+if [ "$1 $2 $4 $5 $6 $7" = "pr view --json body --jq .body" ]; then
+  [ ! -f "@STATE@/fail-view-$3" ] || exit 1
+  [ -f "@STATE@/pr/$3" ] || exit 1
+  if [ -f "@STATE@/body-$3" ]; then cat "@STATE@/body-$3"; else echo "Backend workflow maintenance."; fi
+  exit 0
+fi
 if [ "$1 $2" = "pr diff" ]; then
+  [ ! -f "@STATE@/fail-diff-$3" ] || { echo "HTTP 406: the diff is too large" >&2; exit 1; }
   if [ -f "@STATE@/diff-$3" ]; then cat "@STATE@/diff-$3"; else
     read -r _ _ head < "@STATE@/pr/$3"
     git diff "main...$head"
