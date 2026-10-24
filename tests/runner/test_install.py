@@ -827,3 +827,63 @@ def test_a_move_below_the_installed_count_is_checked_whatever_the_balancer_wrote
 
     assert done.returncode != 0
     assert "would give up 2 PR slots (4 to 2)" in done.stderr
+
+
+@pytest.mark.parametrize("source", ["home", "xdg", "explicit"])
+def test_a_pool_installs_from_an_external_file(machine: Path, source: str) -> None:
+    """No checkout config is needed; a stale checkout file cannot veto an external one."""
+    checkout = machine / "checkout"
+    (checkout / ".github/runner").mkdir(parents=True)
+    (checkout / ".github/runner/settings.sh").write_text("repository=example-app/example-app\n")
+    _git(machine, "add", "--all")
+    _git(machine, "commit", "--quiet", "-m", "main")
+    _git(machine, "update-ref", "refs/remotes/origin/main", "HEAD")
+    env = _env(machine)
+    if source == "explicit":
+        path = machine / "named config/shipline.json"
+        env["SHIPLINE_CONFIG"] = str(path)
+    else:
+        base = machine / ("config home" if source == "xdg" else "home/.config")
+        if source == "xdg":
+            env["XDG_CONFIG_HOME"] = str(base)
+        path = base / "shipline/example-app-example-app/shipline.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"runner": _RUNNER}))
+    _settings(machine)
+
+    def install() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["sh", str(_INSTALL)], cwd=checkout, env=env,
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+
+    done = install()
+    assert done.returncode == 0, done.stderr
+    assert str(path) in done.stdout
+    assert "repository='example-app/example-app'" in (_installed(machine) / "pool-settings.sh").read_text()
+    assert (machine / "built").read_text() == "built\n"
+    # Even when the checkout file is uncommitted, the selected external file wins.
+    (checkout / "shipline.json").write_text('{"runner": {"prefix": "other-app"}}')
+    done = install()
+    assert done.returncode == 0, done.stderr
+    # A refusal identifies the selected file, rather than the unused checkout config.
+    path.write_text("{}")
+    (machine / "calls.log").unlink()
+    done = install()
+    assert done.returncode != 0
+    assert f"{path} must name" in done.stderr
+    assert not _calls(machine, "systemctl")
+
+
+def test_an_explicit_checkout_file_still_has_to_match_main(machine: Path) -> None:
+    _repository(machine, _RUNNER)
+    path = machine / "checkout/shipline.json"
+    path.write_text(json.dumps({"repository": "example-app/example-app", "runner": _RUNNER}))
+    env = {**_env(machine), "SHIPLINE_CONFIG": str(path)}
+    done = subprocess.run(
+        ["sh", str(_INSTALL)], cwd=machine / "checkout", env=env,
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert done.returncode != 0
+    assert f"{path} is not the one of origin/main" in done.stderr
+    assert not _calls(machine, "systemctl")

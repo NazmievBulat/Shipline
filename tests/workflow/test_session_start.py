@@ -1,6 +1,7 @@
 """`session start` puts one Claude session, in its own worktree, behind one pull request."""
 
 import fcntl
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -11,6 +12,7 @@ from workflow_harness import (
     Workflow,
     in_scope,
     instruction,
+    install_shipline,
     session_arguments,
 )
 
@@ -198,6 +200,59 @@ def test_the_session_sees_only_the_listed_variables(workflow: Workflow) -> None:
     assert seen["SHIPLINE_REPO"] == str(workflow.repo)
     gh_bin = workflow.script.parent / "gh-bin"
     assert seen["PATH"] == f"{gh_bin}:{workflow.env['PATH']}"
+
+
+
+@pytest.mark.parametrize("named", ["SHIPLINE_CONFIG", "XDG_CONFIG_HOME", "both"])
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+def test_a_session_keeps_a_named_config(
+    workflow: Workflow, named: str, relative: bool,
+) -> None:
+    """A session's own launcher must select the same config after changing to its worktree."""
+    install_shipline(workflow)
+    (workflow.repo / ".github/runner/settings.sh").write_text("repository=example-app/example-app\n")
+    folder = workflow.repo / "named config"
+    xdg = folder / "config home"
+    home_file = xdg / "shipline/example-app-example-app/shipline.json"
+    home_file.parent.mkdir(parents=True)
+    home_file.write_text(json.dumps({"state_folder": ".local/xdg-state"}))
+    explicit = folder / "explicit config.json"
+    explicit.write_text(json.dumps({"state_folder": ".local/named-state"}))
+    expected = explicit if named != "XDG_CONFIG_HOME" else home_file
+    variables = {}
+    if named != "XDG_CONFIG_HOME":
+        variables["SHIPLINE_CONFIG"] = str(explicit.relative_to(workflow.repo) if relative else explicit)
+    if named != "SHIPLINE_CONFIG":
+        variables["XDG_CONFIG_HOME"] = str(xdg.relative_to(workflow.repo) if relative else xdg)
+    workflow.add_pull_request(7)
+
+    done = workflow.run("start", "worker", "7", env=variables)
+
+    assert done.returncode == 0, done.stderr
+    worktree = workflow.worktree(7)
+    state = ".local/named-state" if named != "XDG_CONFIG_HOME" else ".local/xdg-state"
+    assert (worktree / state).is_dir()
+    env = _session_environment(workflow, "ticket-7")
+    if "SHIPLINE_CONFIG" in variables:
+        assert env.get("SHIPLINE_CONFIG") == str(explicit)
+    else:
+        assert "SHIPLINE_CONFIG" not in env
+    if "XDG_CONFIG_HOME" in variables:
+        assert env.get("XDG_CONFIG_HOME") == str(xdg)
+    else:
+        assert "XDG_CONFIG_HOME" not in env
+    # Replay a session's launcher call using only the environment tmux received.
+    read = subprocess.run(
+        ["bash", str(workflow.home / "bin/shipline"), "pre-train-checks"],
+        cwd=worktree, env=env, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert read.returncode == 0, read.stderr
+    read = subprocess.run(
+        ["python3", str(workflow.script.parent / "workflow_config.py"), "shell"],
+        cwd=worktree, env=env, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert read.returncode == 0, read.stderr
+    assert f"SHIPLINE_CONFIG='{expected}'\n" in read.stdout
 
 
 def test_a_audit_session_is_told_it_is_a_audit(workflow: Workflow) -> None:
