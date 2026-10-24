@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,15 @@ CONFIG = workflow_config.current()
 REPOSITORY = CONFIG.repository
 API = CONFIG.api
 HERE = Path(__file__).resolve().parent
+# How a line names `notify waiting`: by the launcher's absolute path, which a session started
+# before the switch, with neither on its PATH, runs as well; a copy of the scripts in a
+# repository's tree, which has no launcher, by its path there.
+LAUNCHER = HERE.parents[1] / "bin" / "shipline"
+NOTIFY_WAITING = (
+    f"{shlex.quote(str(LAUNCHER))} notify waiting"
+    if LAUNCHER.is_file()
+    else "scripts/workflow/notify waiting"
+)
 # The gate owns these branches: each holds one batch's test merge, never a pull request.
 SCRATCH_PREFIX = "workflow/merge-batch-"
 E2E_PLAN = CONFIG.checks.e2e_plan
@@ -2136,10 +2146,10 @@ class Train:
             base = git("ls-remote", "origin", "refs/heads/main").split()[0]
             train_reads.save(context / "main.json", {"head": base})
 
-        def signature() -> str:
+        def inputs(queue: list[str]) -> list[Any]:
             # Local authorizations and owner questions can change while the tick runs.
             notes = []
-            for number in self.queue:
+            for number in queue:
                 root = CONFIG.state(
                     CONFIG.checkout_of(self.path.parent) / ".claude/worktrees" / f"ticket-{number}"
                 )
@@ -2153,15 +2163,16 @@ class Train:
                     self.path.parent / f"merge-review-{number}",
                 ]
                 notes += [(str(path), path.stat().st_mtime_ns) for path in paths if path.exists()]
+            return [
+                health.read_text() if health.exists() else "",
+                sorted(notes),
+                (context / "sessions").read_text(),
+            ]
+
+        def signature() -> str:
             return train_reads.digest(
-                [
-                    self.path.read_text() if self.path.exists() else "",
-                    base,
-                    health.read_text() if health.exists() else "",
-                    pulls,
-                    sorted(notes),
-                    (context / "sessions").read_text(),
-                ]
+                [self.path.read_text() if self.path.exists() else "", base, pulls]
+                + inputs(self.queue)
             )
 
         previous = train_reads.load(context / "reconciled.json")
@@ -2169,6 +2180,9 @@ class Train:
         if delegated and previous.get("signature") == signature():
             self.suite_states = previous["suite_states"]
             return
+        # The members the scan reads, blocked ones included.
+        queue = list(dict.fromkeys([*self.queue, *self.blocked]))
+        seen = inputs(queue)
         reads = train_reads.Reads(self.path.parent, base)
         _planning_reads = reads
         try:
@@ -2177,10 +2191,16 @@ class Train:
             reads.finish()
         finally:
             _planning_reads = None
+        # A note created or cleared while the scan ran may not be what it read: keep the
+        # result only for the inputs it saw, so the next reconcile computes it again. The key
+        # is taken first: a note changed after it leaves the key on the old note, a miss.
+        key = signature()
+        if inputs(queue) != seen:
+            return
         train_reads.save(
             context / "reconciled.json",
             {
-                "signature": signature(),
+                "signature": key,
                 "at": time.time(),
                 "suite_states": self.suite_states,
             },
@@ -4049,7 +4069,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             reason = f"behind {train.first}" if train.first else "for main to change"
             print(
                 f"merge train: pull request {number} waits {reason}; "
-                "run shipline notify waiting and end the turn; the tick wakes you",
+                f"run {NOTIFY_WAITING} and end the turn; the tick wakes you",
                 flush=True,
             )
             command("bash", str(HERE / "notify"), "waiting")
