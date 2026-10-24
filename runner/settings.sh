@@ -44,9 +44,9 @@ job_memory=
 # which is how keep-runner.sh can tell, without being root, that the firewall is in place.
 firewall_marker=192.0.2.1
 
-# The Docker-capable runner. A workflow asks for it by a label of its own (names.sh), so it never
-# takes a job that does not need Docker and no other job waits for it.
-# What the virtual machine of one job gets. The memory is taken as the job uses it, not at once.
+# The Docker-capable runner, which a workflow asks for by a label of its own (names.sh), so it
+# never takes a job that does not need Docker and no other job waits for it. Its virtual machine,
+# one for each job, gets this much; the memory is taken as the job uses it, not at once.
 vm_memory=4
 vm_processors=8
 # The most one job may write to its disk: the images it builds, its containers and its checkout.

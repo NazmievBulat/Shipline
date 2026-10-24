@@ -55,10 +55,15 @@ if [ -n "$github_token" ] && [ -n "$github_app_id" ]; then
   exit 1
 fi
 
-# The repository's own values, from its shipline.json (workflow_config.py). Only the lines a sh
-# can read: the values are quoted for it.
-config=$(python3 "$here/../scripts/workflow/workflow_config.py" shell) || exit 1
-eval "$(printf '%s\n' "$config" | grep -E '^(SHIPLINE_(REPOSITORY|RUNNER_PREFIX|RUNNER_LABEL|RUNNER_PLANNER_LABEL|RUNNER_IMAGE_BUILD|RUNNER_HUB_CACHE)=|export SHIPLINE_REPO=)')"
+# The repository's own values, from its shipline.json (workflow_config.py), each quoted for sh.
+config=$(python3 "$here/../scripts/workflow/workflow_config.py" sh) || exit 1
+eval "$config"
+# The pool runs main's commands (main-command.sh), so it is named by main's file too.
+if ! git -C "$SHIPLINE_REPO" show refs/remotes/origin/main:shipline.json 2>/dev/null |
+  cmp -s - "$SHIPLINE_REPO/shipline.json"; then
+  echo "$SHIPLINE_REPO/shipline.json is not the one of origin/main: run this from main, as last fetched." >&2
+  exit 1
+fi
 if [ -z "$SHIPLINE_REPOSITORY" ] || [ -z "$SHIPLINE_RUNNER_PREFIX" ] ||
   [ -z "$SHIPLINE_RUNNER_IMAGE_BUILD" ]; then
   echo "$SHIPLINE_REPO/shipline.json must name the repository, runner.prefix and runner.image_build (runner/README.md)." >&2
@@ -160,6 +165,15 @@ fi
 ordinary_total=$((runners + spares))
 # A machine that gives up no PR slot while Blacksmith has budget keeps all of them.
 [ -n "${ordinary_blacksmith_jobs:-}" ] || ordinary_blacksmith_jobs=$runners
+# Every count is a number, nothing more: pool-settings.sh holds them as they are.
+for count in "$runners" "$docker_runners" "$spares" "$ordinary_blacksmith_jobs"; do
+  case "$count" in
+    '' | *[!0-9]*)
+      echo "$machine_settings: '$count' is no count." >&2
+      exit 1
+      ;;
+  esac
+done
 [ "$ordinary_blacksmith_jobs" -le "$runners" ] || ordinary_blacksmith_jobs=$runners
 # The job of a Docker-capable runner is inside a virtual machine, which needs this device.
 # RUNNER_KVM_DEVICE names another path for it, for the tests of this script.
@@ -178,6 +192,8 @@ fi
 # beside it, so they keep their identity where those read it (github_identity.py). Gone at the end.
 tools=$(mktemp -d)
 trap 'rm -rf "$tools"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 cp -L "$here/github_identity.py" "$here/github_budget.py" "$tools/"
 # The units for this prefix, rendered from systemd/.
 RUNNER_PREFIX=$prefix bash "$here/render-units.sh" "$tools/units"
@@ -197,7 +213,7 @@ gh() {
 }
 
 mkdir -p "$installed" "$units"
-sh "$here/install-github-budget.sh"
+prefix=$prefix sh "$here/install-github-budget.sh"
 cp -L "$here"/*.sh "$here"/*.py "$installed/"
 rm -rf "$installed/vm" "$installed/systemd"
 cp -R "$here/vm" "$installed/vm"
@@ -338,6 +354,12 @@ if [ -n "$hub_cache" ]; then
   systemctl --user enable --now "$hub_cache_container.service" ||
     echo "The Docker Hub cache could not start; jobs will pull directly from Docker Hub." >&2
   systemctl --user enable --now "$hub_cache_container-watch.timer"
+elif [ -e "$units/$hub_cache_container.service" ]; then
+  # A cache the repository no longer runs, or a machine no longer docker: its units go.
+  systemctl --user disable --now "$hub_cache_container.service" "$hub_cache_container-watch.timer" ||
+    true
+  rm -f "$units/$hub_cache_container.service" "$units/$hub_cache_container"-watch.*
+  systemctl --user daemon-reload
 fi
 systemctl --user enable --now $container-image.timer
 # One line a minute of what the machine has free (usage.py), on every machine.

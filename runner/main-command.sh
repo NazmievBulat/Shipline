@@ -7,8 +7,10 @@
 #
 # The command line runs in that folder with the arguments after it, RUNNER_PREFIX set and
 # RUNNER_FILES naming this folder of runner files, which the repository's images take
-# `start-runner.sh` and `vm/` from. The main checkout is the one install.sh recorded
-# (`checkout`), else RUNNER_CHECKOUT, else the current folder.
+# `start-runner.sh` and `vm/` from. Each key, and each first argument (`hub-cache.sh watch`), has
+# a folder of its own, taken again only when main has moved: the watch never takes away the
+# files of the cache that runs. The main checkout is RUNNER_CHECKOUT (install.sh names it before
+# it records it), else the one install.sh recorded (`checkout`), else the current folder.
 on_main() {
   key=$1
   shift
@@ -23,10 +25,20 @@ on_main() {
     echo "$from has no origin/main: run this from the repository's main checkout" >&2
     return 1
   fi
-  files=$HOME/.local/state/$prefix-runner/main/$key
-  rm -rf "$files"
-  mkdir -p "$files"
-  git -C "$from" archive --format=tar refs/remotes/origin/main | tar -x -C "$files"
+  case "${1:-}" in
+    *[!a-z0-9-]*)
+      echo "'$1' is no word a folder may be named by" >&2
+      return 1
+      ;;
+  esac
+  files=$HOME/.local/state/$prefix-runner/main/$key${1:+-$1}
+  commit=$(git -C "$from" rev-parse refs/remotes/origin/main)
+  if [ "$(cat "$files.commit" 2>/dev/null)" != "$commit" ]; then
+    rm -rf "$files" "$files.commit"
+    mkdir -p "$files"
+    git -C "$from" archive --format=tar "$commit" | tar -x -C "$files"
+    printf '%s\n' "$commit" >"$files.commit"
+  fi
   command=
   if [ -f "$files/shipline.json" ]; then
     command=$(jq -r --arg key "$key" '.runner[$key] // empty' "$files/shipline.json")

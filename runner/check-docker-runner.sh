@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run on the home machine, as yourself, after install.sh and install-firewall.sh:
+# Run on a machine with the role `docker`, as yourself, after install.sh and install-firewall.sh:
 #
 #   sh check-docker-runner.sh
 #
