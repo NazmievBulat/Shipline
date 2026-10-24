@@ -119,6 +119,8 @@ WINDOW_CEILING = 4
 LOST_AFTER_SECONDS = 10 * 60
 # How many times a handoff judges its own place again when the line changed it meanwhile.
 HANDOFF_ATTEMPTS = 3
+# How long a handoff's one check of its head, under the merge lock, may take.
+HEAD_CHECK_TIMEOUT = 10
 # Each member's own entries in the saved line, by the Train attribute that holds them.
 MEMBER_ENTRIES = (
     "blocked",
@@ -3459,6 +3461,21 @@ def handoff_lock(folder: Path, number: str) -> Iterator[None]:
                 print(f"could not log the handoff's hold of the merge lock: {error}", flush=True)
 
 
+def _confirm_head(branch: str, head: str) -> None:
+    """Under the merge lock: the branch's head on GitHub is still `head`. One try of git, bounded
+    by HEAD_CHECK_TIMEOUT, with no gh call: it waits for neither GitHub's budget nor a call slot."""
+    try:
+        done = run_command(
+            "git", "ls-remote", "origin", f"refs/heads/{branch}", timeout=HEAD_CHECK_TIMEOUT
+        )
+    except CommandTimeout:
+        raise Refused("could not confirm the head; try again") from None
+    if done.returncode:
+        raise Refused("could not confirm the head; try again")
+    if done.stdout.split()[:1] != [head]:
+        raise Refused("the pull request head changed during the handoff; review it again")
+
+
 def _failing(pull: dict[str, Any]) -> set[str]:
     return {check.get("name", check.get("context", "unknown")) for check in _failed_rollup(pull)}
 
@@ -3467,8 +3484,8 @@ def handoff(number: str, folder: Path) -> int:
     """A published passed round is required before the reviewer can leave.
 
     Its own pull request is checked, and its place in the line judged, before the merge lock is
-    taken. Under the lock the handoff reads only its own pull request again, joins the line and
-    saves its note: the other members' order is the tick's to read, at the turn of the line.
+    taken. Under the lock the handoff only confirms its head with git, joins the line and saves
+    its note: the other members' order is the tick's to read, at the turn of the line.
     """
     folder.mkdir(parents=True, exist_ok=True)
     pull = read_pull(number)
@@ -3543,16 +3560,22 @@ def handoff(number: str, folder: Path) -> int:
             if not view.judged:
                 raise
             outcome = error
+        # Read again just before the lock: GitHub's budget, its call slots and its retries are
+        # waited for here, never while the lock is held.
+        fresh = read_pull(number)
+        if (fresh["headRefOid"], fresh["headRefName"]) != (head, pull["headRefName"]):
+            raise Refused("the pull request head changed during the handoff; review it again")
+        if not ready(fresh) or conflicting(fresh):
+            raise Refused("only a ready, non-conflicting pull request can be handed off")
+        if _failing(fresh) - _failing(pull):
+            # A check failed meanwhile: judged again, as the first read was.
+            pull = fresh
+            continue
         with handoff_lock(folder, number):
-            fresh = read_pull(number)
-            if (fresh["headRefOid"], fresh["headRefName"]) != (head, pull["headRefName"]):
-                raise Refused("the pull request head changed during the handoff; review it again")
-            if not ready(fresh) or conflicting(fresh):
-                raise Refused("only a ready, non-conflicting pull request can be handed off")
+            _confirm_head(pull["headRefName"], head)
             train = Train(folder)
-            if _failing(fresh) - _failing(pull) or train.member(number) != before:
-                # A check failed, or the tick or a gate changed its place, meanwhile: judge again.
-                pull = fresh
+            if train.member(number) != before:
+                # The tick or a gate changed its place meanwhile: judge it again.
                 continue
             train.admit(view)
             # Queued and passed over in its place until the tick's re-run is green; a wait
