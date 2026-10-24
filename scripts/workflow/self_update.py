@@ -1,9 +1,10 @@
 """The tick keeps the Shipline checkout these scripts are in current, and moves it back by itself
 when a new version fails.
 
-    self_update.py start <pid>               at the start of a tick: roll back, or update; exits
+    self_update.py start <pid> [moved]       at the start of a tick: roll back, or update; exits
                                              10 when the checkout moved, so the tick runs again
-                                             as the version now checked out
+                                             as the version now checked out, which moves nothing
+                                             more in that tick (`moved`)
     self_update.py end <pid> <exit> [skipped]
                                              at its end: the tick's exit, counted on the version
                                              it started on; a skipped tick counts neither way
@@ -18,13 +19,16 @@ A version is good once it ran 5 ticks in a row without failing; the last three g
 kept in `.local/shipline/versions`, newest first. A version that is not good yet and fails 3
 times in a row, as a tick (a non-zero exit, or a tick that ended without its end) or as a crash
 of the merge gate (a traceback, a timeout or an exit the driver does not define; a refusal and
-a wait are answers), is moved back to the last good commit at the next tick. It is noted as bad
+a wait are answers), is moved back to the last good commit, or to the commit it was taken from
+when none is good yet, at the next tick. It is noted as bad
 and not taken again until `main` moves past it, and the wake tells the orchestrator once:
 `shipline rolled back: <bad sha> -> <good sha>, <reason>`.
 
+Nothing moves while another tick runs from the checkout: the next tick does it.
 `SHIPLINE_PIN=<sha>`, or a file `.local/shipline/pin`, stops updates and roll-backs; the wake
-names the pin once. A checkout without a GitHub `origin`, without `bin/shipline`, or that is the
-repository the tick works on is left alone, and no note is written in it.
+names the pin once. A checkout without a GitHub `origin`, without `bin/shipline`, that is not a
+git checkout of its own, or that is the repository the tick works on is left alone, and no note
+is written in it.
 
 Everything is kept in `.local/shipline` of the Shipline checkout, which its `.gitignore` leaves
 out; the lines for the wake in `wake.pending`.
@@ -57,6 +61,21 @@ FETCH_SECONDS = 120
 CI_SECONDS = 30
 # How many bad commits are remembered; `main` has long moved past the older ones.
 KEEP_BAD = 20
+# A tick still running after this long holds back no move: it hangs, or its pid was reused.
+RUN_HOLDS_SECONDS = 60 * 60
+# How much of the gate's last line a roll-back's reason carries.
+REASON_CHARACTERS = 200
+# What git is told by the caller's environment about another repository.
+GIT_PLACES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+)
 # The gate's exits under `--drive` that are answers: merged, wait for a new run, wait.
 GATE_ANSWERS = (0, 2, 3)
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -69,13 +88,16 @@ def now() -> int:
     return int(os.environ.get("WORKFLOW_NOW") or time.time())
 
 
-def git(*args: str, timeout: float = GIT_SECONDS) -> subprocess.CompletedProcess[str]:
+def git(
+    *args: str, timeout: float = GIT_SECONDS, folder: Path = HOME
+) -> subprocess.CompletedProcess[str]:
+    environment = {key: value for key, value in os.environ.items() if key not in GIT_PLACES}
     return subprocess.run(
-        ["git", "-C", str(HOME), *args],
+        ["git", "-C", str(folder), *args],
         capture_output=True,
         text=True,
         timeout=timeout,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        env={**environment, "GIT_TERMINAL_PROMPT": "0"},
         check=False,
     )
 
@@ -93,6 +115,10 @@ def github_repository() -> str | None:
     to update."""
     if not (HOME / "bin" / "shipline").is_file():
         return None
+    # A copy inside another repository would move that repository.
+    top = git("rev-parse", "--show-toplevel").stdout.strip()
+    if not top or Path(top).resolve() != HOME:
+        return None
     url = git("config", "--get", "remote.origin.url").stdout.strip()
     found = GITHUB.fullmatch(url)
     if not found:
@@ -101,13 +127,7 @@ def github_repository() -> str | None:
     repository = Path(os.environ.get("SHIPLINE_REPO") or Path.cwd())
     common = ["rev-parse", "--path-format=absolute", "--git-common-dir"]
     own = git(*common).stdout.strip()
-    worked_on = subprocess.run(
-        ["git", "-C", str(repository), *common],
-        capture_output=True,
-        text=True,
-        timeout=GIT_SECONDS,
-        check=False,
-    ).stdout.strip()
+    worked_on = git(*common, folder=repository).stdout.strip()
     if own and Path(own).resolve() == Path(worked_on or "/nonexistent").resolve():
         return None
     return found[1]
@@ -148,7 +168,15 @@ def read_trial() -> dict[str, Any] | None:
         trial = json.loads((NOTES / "trial.json").read_text())
     except FileNotFoundError, ValueError:
         return None
-    return trial if isinstance(trial, dict) and SHA.fullmatch(str(trial.get("sha"))) else None
+    if not isinstance(trial, dict) or not SHA.fullmatch(str(trial.get("sha"))):
+        return None
+    # A trial an older version wrote may lack a count.
+    for count in ("ticks", "tick_failures", "gate_failures"):
+        if not isinstance(trial.get(count), int):
+            trial[count] = 0
+    if not SHA.fullmatch(str(trial.get("good"))):
+        trial["good"] = None
+    return trial
 
 
 def write_trial(trial: dict[str, Any] | None) -> None:
@@ -158,8 +186,10 @@ def write_trial(trial: dict[str, Any] | None) -> None:
         write(NOTES / "trial.json", json.dumps(trial) + "\n")
 
 
-def new_trial(sha: str) -> dict[str, Any]:
-    good = next((version for version in read_lines("versions") if version != sha), None)
+def new_trial(sha: str, came_from: str | None = None) -> dict[str, Any]:
+    """`sha` on trial. It goes back to the last good commit, or to the one it came from when
+    none is good yet."""
+    good = next((version for version in read_lines("versions") if version != sha), came_from)
     return {"sha": sha, "good": good, "ticks": 0, "tick_failures": 0, "gate_failures": 0}
 
 
@@ -186,7 +216,7 @@ def pin() -> tuple[str, str] | None:
     if named:
         return "SHIPLINE_PIN", named
     try:
-        return str(NOTES / "pin"), (NOTES / "pin").read_text().strip()
+        return ".local/shipline/pin", (NOTES / "pin").read_text().strip()
     except FileNotFoundError:
         return None
 
@@ -208,14 +238,31 @@ def note_pin() -> bool:
     return True
 
 
-def alive(pid: int) -> bool:
+def started_at(pid: int) -> str:
+    """When the process started, in clock ticks since boot; empty when it is gone or cannot
+    be read."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as stat:
+            # The name can hold spaces and brackets; the fields after it cannot.
+            return stat.read().rpartition(")")[2].split()[19]
+    except OSError, IndexError:
+        return ""
+
+
+def runs() -> Iterator[tuple[Path, int, str, bool]]:
+    """Each tick that noted its start: its note, pid, commit, and whether that tick still
+    runs (its pid is alive and started when the note says)."""
+    folder = NOTES / "runs"
+    if not folder.is_dir():
+        return
+    for run in folder.iterdir():
+        if not run.name.isdigit():
+            continue
+        try:
+            sha, started = (run.read_text().split() + ["", ""])[:2]
+        except FileNotFoundError:
+            continue
+        yield run, int(run.name), sha, bool(started) and started_at(int(run.name)) == started
 
 
 def record_tick(sha: str, passed: bool, reason: str) -> None:
@@ -238,16 +285,19 @@ def record_tick(sha: str, passed: bool, reason: str) -> None:
     write_trial(trial)
 
 
-def reap(own: int) -> None:
-    """A tick that ended without its end (killed, or its end never ran) failed."""
-    runs = NOTES / "runs"
-    if not runs.is_dir():
-        return
-    for run in runs.iterdir():
-        if not run.name.isdigit() or int(run.name) == own or alive(int(run.name)):
+def reap(own: int) -> bool:
+    """A tick that ended without its end (killed, or its end never ran) failed. True when
+    another tick still runs from the checkout, and started within the hour."""
+    others = False
+    for run, pid, sha, running in runs():
+        if pid == own:
             continue
-        record_tick(run.read_text().strip(), False, "it ended without its end")
+        if running:
+            others = others or now() - int(run.stat().st_mtime) < RUN_HOLDS_SECONDS
+            continue
+        record_tick(sha, False, "it ended without its end")
         run.unlink(missing_ok=True)
+    return others
 
 
 def clean() -> bool:
@@ -262,7 +312,7 @@ def local_changes() -> None:
         "local-changes-noted",
         "noted",
         "local-changes",
-        f"shipline not updated: its checkout {HOME} has local changes",
+        "shipline not updated: its checkout has local changes",
     )
 
 
@@ -358,31 +408,33 @@ def update(repository: str, current: str) -> bool:
             print(f"cannot move Shipline to {target}: {moved.stderr.strip()}", file=sys.stderr)
             local_changes()
             return False
-        write_trial(new_trial(target))
+        write_trial(new_trial(target, current))
     print(f"shipline updated: {current} -> {target}", flush=True)
     return True
 
 
-def start(pid: int) -> int:
+def start(pid: int, moved_already: bool) -> int:
     repository = github_repository()
     if repository is None:
         return 0
     moved = False
     with locked():
-        reap(pid)
+        # A tick that runs from the checkout would run the rest of its steps from another
+        # version.
+        held = reap(pid) or moved_already
         current = head()
         pinned = note_pin()
-        if not pinned:
+        if not pinned and not held:
             moved = roll_back(current)
             current = head()
         trial = read_trial()
         if current not in read_lines("versions") and (trial is None or trial["sha"] != current):
             write_trial(new_trial(current))
-    if not pinned and not moved:
+    if not pinned and not held and not moved:
         with locked("update.lock", wait=False) as mine:
             moved = mine and update(repository, current)
     with locked():
-        write(NOTES / "runs" / str(pid), head() + "\n")
+        write(NOTES / "runs" / str(pid), f"{head()} {started_at(pid)}\n")
     return MOVED if moved else 0
 
 
@@ -391,22 +443,27 @@ def end(pid: int, code: int, skipped: bool) -> None:
     if not run.is_file():
         return
     with locked():
-        sha = run.read_text().strip()
+        sha = (run.read_text().split() or [""])[0]
         run.unlink(missing_ok=True)
         if not skipped:
             record_tick(sha, code == 0, f"exit {code}")
 
 
 def gate_crash(code: int, stderr: str) -> str | None:
-    """Why a run of the gate under `--drive` is a crash, or None when it gave an answer."""
-    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    """Why a run of the gate under `--drive` is a crash, or None when it gave an answer.
+
+    Exit 1 is a refusal when the gate said so; what a pull request's own checks printed rides
+    on that line's message, and is not read. A refusal is a crash only when one of the gate's
+    own commands timed out, which the line ends with. Exit 1 without a refusal is an exception
+    the gate did not catch."""
     if code in GATE_ANSWERS:
         return None
-    if code == 1 and "Traceback (most recent call last):" in stderr:
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    answer = next((line for line in lines if line.startswith(("merge refused: ", "merge waiting: "))), None)
+    if code == 1 and answer is not None:
+        return answer if re.search(r" timed out after [0-9.]+s$", answer) else None
+    if code == 1 and lines:
         return lines[-1]
-    if code == 1:
-        timed_out = [line for line in lines if re.search(r" timed out after [0-9.]+s$", line)]
-        return timed_out[-1] if timed_out else None
     return f"exit {code}"
 
 
@@ -423,6 +480,10 @@ def gate_ran(code: int, stderr: str) -> None:
             trial["gate_failures"] = 0
         else:
             trial["gate_failures"] += 1
+            # One short line of printable characters reaches the wake.
+            crash = "".join(character for character in crash if character.isprintable())
+            if len(crash) > REASON_CHARACTERS:
+                crash = crash[: REASON_CHARACTERS - 3] + "..."
             trial["last_gate"] = crash
         write_trial(trial)
 
@@ -430,8 +491,13 @@ def gate_ran(code: int, stderr: str) -> None:
 def main() -> int:
     arguments = sys.argv[1:]
     try:
-        if len(arguments) == 2 and arguments[0] == "start" and arguments[1].isdigit():
-            return start(int(arguments[1]))
+        if (
+            len(arguments) in (2, 3)
+            and arguments[0] == "start"
+            and arguments[1].isdigit()
+            and arguments[2:] in ([], ["moved"])
+        ):
+            return start(int(arguments[1]), arguments[2:] == ["moved"])
         if (
             len(arguments) in (3, 4)
             and arguments[0] == "end"
@@ -448,7 +514,7 @@ def main() -> int:
         print(f"shipline self-update: {error}", file=sys.stderr)
         return 1
     print(
-        "usage: self_update.py start <pid> | end <pid> <exit> [skipped] | gate <exit> <stderr>",
+        "usage: self_update.py start <pid> [moved] | end <pid> <exit> [skipped] | gate <exit> <stderr>",
         file=sys.stderr,
     )
     return 2
