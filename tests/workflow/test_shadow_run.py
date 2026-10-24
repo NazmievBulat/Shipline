@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -273,6 +274,45 @@ def test_a_shadow_tick_logs_the_decisions_the_real_tick_takes(workflow: Workflow
     assert compared.stdout.splitlines()[-1] == (
         "11 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 17:00:00: none differs"
     )
+
+
+@pytest.mark.parametrize(("five", "starts"), [(40, True), (90, False)], ids=["room", "held"])
+def test_the_daily_analyst_starts_in_a_shadow_tick_as_in_the_real_one(
+    workflow: Workflow, five: int, starts: bool
+) -> None:
+    eight = 1_792_828_800  # 2026-10-24 08:00 UTC
+    clock = {"WORKFLOW_ANALYST_DAILY_AT": "08:00", "TZ": "UTC", "WORKFLOW_NOW": str(eight + 60)}
+    report = workflow.repo / ".local" / "analyses" / "metrics-2026-10-24.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("# Workflow metrics\n")
+    workflow.usage(five, datetime.fromtimestamp(eight + 3 * 3600, UTC).isoformat())
+    cache = workflow.root / "home" / ".claude" / "MEMORY" / "STATE" / "usage-cache.json"
+    os.utime(cache, (eight, eight))
+    # Main's report as the tick before left it: unchanged, it wakes nobody at this hour.
+    folder = workflow.repo / ".local" / "workflow"
+    folder.mkdir(parents=True)
+    (folder / "main-status").write_text(
+        "main: unknown, list indices must be integers or slices, not str\n"
+    )
+
+    shadow = workflow.run_script("tick", "--shadow", env=clock)
+    assert not (workflow.repo / ".local" / "analyses" / "day-2026-10-24").exists()
+    real = workflow.run_script("tick", env=clock)
+
+    assert shadow.returncode == real.returncode == 0, shadow.stderr + real.stderr
+    assert workflow.is_running("analyst-day-2026-10-24") is starts
+    assert _decisions(_shadow_log(workflow)) == [
+        "analyst-day-2026-10-24 started"
+        if starts
+        else "the daily analyst waits: the 5-hour usage window is 90% used"
+    ]
+    journal = workflow.root / "journal"
+    journal.write_text(_journal(real.stdout, real.stderr, at=eight + 60))
+    compared = _compare(
+        *("--shadow", str(_shadow_log(workflow)), "--wake", str(workflow.wake_log)),
+        *("--journal", str(journal)),
+    )
+    assert compared.returncode == 0, compared.stdout
 
 
 def test_a_start_that_would_wait_for_memory_is_logged_and_holds_the_later_ones(
