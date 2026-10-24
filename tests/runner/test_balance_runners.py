@@ -850,3 +850,69 @@ def test_every_pool_script_reads_a_pool_settings_that_says_balance_off(machine: 
     )
 
     assert (done.returncode, done.stdout) == (0, "3\n"), done.stderr
+
+
+# keep-spare.sh's GitHub calls and its slot count, beside it as install.sh installs them: the
+# listing comes from `listing.tsv`, a label granted joins it there, and each call goes to the log.
+_SPARE_BUDGET = """import sys
+from pathlib import Path
+
+state = Path("@STATE@")
+operation, *rest = sys.argv[1:]
+if operation == "jitter":
+    print(0)
+elif operation == "call":
+    arguments = rest[3:]
+    with open(state / "calls.log", "a") as log:
+        log.write("gh " + " ".join(arguments) + "\\n")
+    listing = state / "listing.tsv"
+    if "--paginate" in arguments:
+        print(listing.read_text(), end="")
+    elif arguments[:3] == ["api", "-X", "POST"]:
+        number = arguments[3].split("/")[-2]
+        rows = [line.split("\\t") for line in listing.read_text().splitlines()]
+        for row in rows:
+            if row[0] == number:
+                row[4] += ",example-app-home,example-app-home-first"
+        listing.write_text("".join("\\t".join(row) + "\\n" for row in rows))
+"""
+
+# The first sleep is the balancer adding a slot; the second ends the supervisor.
+_SPARE_SLEEP = """#!/bin/bash
+echo sleep >> "@STATE@/sleeps"
+case $(wc -l < "@STATE@/sleeps") in
+  1) sed -i 's/^ordinary_jobs=1$/ordinary_jobs=2/' "@INSTALLED@/pool-settings.sh" ;;
+  *) kill -TERM "$PPID" ;;
+esac
+"""
+
+
+def test_the_spare_supervisor_reads_the_slots_the_balancer_wrote(machine: Machine) -> None:
+    for name in ("keep-spare.sh", "names.sh"):
+        shutil.copy2(_ROOT / "runner" / name, machine.installed / name)
+    state = str(machine.state)
+    (machine.installed / "github_budget.py").write_text(_SPARE_BUDGET.replace("@STATE@", state))
+    (machine.installed / "ordinary_slots.py").write_text("import sys\nprint(sys.argv[1])\n")
+    machine.fake(
+        "sleep", _SPARE_SLEEP.replace("@INSTALLED@", str(machine.installed))
+    )
+    machine.settings(ordinary=1, docker=0)
+    (machine.state / "listing.tsv").write_text(
+        "".join(f"{k}\tbox-{k}\tonline\tfalse\tself-hosted,{STANDBY}\n" for k in (1, 2, 3))
+    )
+
+    done = subprocess.run(
+        ["sh", str(machine.installed / "keep-spare.sh")],
+        env=machine._env(),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.returncode == 130, done.stderr
+    granted = [call for call in machine.calls("gh api -X POST")]
+    assert [call.split()[4] for call in granted] == [
+        "repos/example-owner/example-app/actions/runners/1/labels",
+        "repos/example-owner/example-app/actions/runners/2/labels",
+    ]
