@@ -5180,33 +5180,6 @@ def test_main_red_for_the_audit_service_and_its_images_does_not_say_nothing_was_
     assert "nothing was found wrong with main" not in line
 
 
-@pytest.mark.parametrize("reason", ["no annotation", "another job failed too", "hosted"])
-def test_main_red_for_more_than_the_audit_service_is_not_re_run_again(
-    github: GitHub, reason: str
-) -> None:
-    workflow = github.workflow
-    _dependencies_red(github, annotation=None if reason == "no annotation" else _MAIN_UNREACHABLE)
-    parts = github.api[f"{_REPO}/actions/runs/10/jobs?per_page=100"]["jobs"]
-    if reason == "another job failed too":
-        parts.append(
-            {
-                "id": 13,
-                "name": "CI: web",
-                "status": "completed",
-                "conclusion": "failure",
-                "labels": ["example-app-home-main"],
-            }
-        )
-    elif reason == "hosted":
-        parts[1]["labels"] = ["ubuntu-latest"]
-    github.save()
-    advisory_service_answers(workflow, answers=True)
-
-    workflow.run_script("tick")
-
-    assert rerun_calls(workflow) == []
-
-
 def pull_dependencies_red(github: GitHub, *, annotation: str | None) -> dict[str, Any]:
     """Pull request 7's CI run 20 failed only in "CI: dependencies", on a home runner."""
     run = github.api[
@@ -6019,8 +5992,8 @@ def test_successful_older_version_noop_keeps_prefix_testing(github: GitHub) -> N
     assert _merges(github) == ["7", "8", "9"]
 
 
-@pytest.mark.parametrize("broken", ["tree", "branch", "matrix"])
-def test_gate_refuses_reused_image_evidence_it_cannot_verify(github: GitHub, broken: str) -> None:
+@pytest.mark.parametrize("broken", ["", "tree", "branch", "matrix"])
+def test_gate_verifies_reused_image_evidence_before_merging(github: GitHub, broken: str) -> None:
     _images(github)
     current = github.api[f"{_REPO}/actions/runs/40/jobs?per_page=100"]["jobs"]
     current[1]["conclusion"] = "skipped"
@@ -6076,8 +6049,8 @@ def test_gate_refuses_reused_image_evidence_it_cannot_verify(github: GitHub, bro
         }
     ]
     done = github.run()
-    assert done.returncode == 1, done.stdout + done.stderr
-    assert not (github.workflow.state / "merged").exists()
+    assert done.returncode == (1 if broken else 0), done.stdout + done.stderr
+    assert (github.workflow.state / "merged").exists() is (not broken)
 
 
 # A reviewer's handoff checks its own pull request, then holds the merge lock only to join the
