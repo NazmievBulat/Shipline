@@ -156,6 +156,25 @@ session() {
   bash "$here/session" "$@" 9>&- 8>&-
 }
 
+# A cached list can outlive a stop or cleanup. Such a session is no longer busy and
+# needs no note; a missing state folder must not be made again by these passes.
+session_current() {
+  [[ -d $main/$SHIPLINE_STATE_FOLDER ]] || return 1
+  tmux -L "$1" has-session -t "=$1" 2>/dev/null 9>&- || {
+    [[ $1 == ticket-* ]] &&
+      tmux -L "codex-${1#ticket-}" has-session -t "=codex-${1#ticket-}" 2>/dev/null 9>&-
+  }
+}
+
+# Check again at the write, including after a failed write: cleanup may have run since
+# the screen or message was read. Other write errors still fail the tick.
+write_session_note() {
+  local name=$1 note=$2 text=$3
+  session_current "$name" && [[ -d ${note%/*} ]] || return 0
+  printf '%s\n' "$text" >"$note" ||
+    [[ ! -d ${note%/*} ]] || ! session_current "$name"
+}
+
 # An audit ends with "audit finished", a worker with "worker finished", a hunt with "hunt
 # finished", an analyst with "analysis finished". The words count only
 # on a line of their own: after the bullet Claude draws, in bold or not, with a full stop or
@@ -404,13 +423,14 @@ local_duties() {
   # down after the instruction is sent, so a failed send is retried on the next tick.
   while read -r name state rest; do
     [[ $state == limit && $name =~ ^(ticket|audit|review)- && $rest == *"  resets "* ]] || continue
+    session_current "$name" || continue
     limit=${rest%%  resets *}
     reset_has_passed "${limit##*  }" "${rest##*  resets }" || continue
     mark=$(resent_mark "$name")
     [[ ! -r $mark || $(<"$mark") != "$reset_at" ]] || continue
     mkdir -p "${mark%/*}" || { failed=1; continue; }
     if session resend "$name"; then
-      echo "$reset_at" >"$mark" || { failed=1; continue; }
+      write_session_note "$name" "$mark" "$reset_at" || { failed=1; continue; }
       woken+=("$name")
     else
       failed=1
@@ -527,7 +547,8 @@ while read -r name state _; do
       # A reviewed stack member waits for its base; do not start it every three minutes.
       head=$(git -C "$main/.claude/worktrees/ticket-${name#review-}" rev-parse HEAD 9>&-) ||
         { failed=1; continue; }
-      echo "$head" >"$main/$SHIPLINE_STATE_FOLDER/$name.head" || { failed=1; continue; }
+      write_session_note "$name" "$main/$SHIPLINE_STATE_FOLDER/$name.head" "$head" ||
+        { failed=1; continue; }
     fi
     if [[ $name == review-* ]] && grep -qxF "${name#review-} false main" <<<"$pulls"; then
       # Unread, the break would be lost with the session: it waits for the next tick.
@@ -564,6 +585,7 @@ if train=$(WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/merge-when-current" --train-
 while read -r name state _; do
   [[ $state != limit && $name =~ ^(review|audit)-([0-9]+)$ ]] || continue
   number=${BASH_REMATCH[2]}
+  session_current "$name" || continue
   # Another member's gate call merged this one in a batch: it is no longer open or in the
   # train, and its own session still owes the after-merge duties.
   batch_merged=$main/$SHIPLINE_STATE_FOLDER/batch-merged-$number
@@ -602,7 +624,7 @@ while read -r name state _; do
     log=$HOME/.local/state/workflow/wake.log
     if delivery=$(session batch-merged "$name" "$squash" 2>&1); then
       nudged+="$name "
-      echo "$squash" >"$mark" || { failed=1; continue; }
+      write_session_note "$name" "$mark" "$squash" || { failed=1; continue; }
       mkdir -p "${log%/*}" &&
         printf '%s %s merged in a batch as %s; session nudged\n' "$NOW" "$name" "$squash" >>"$log" ||
         failed=1
@@ -628,7 +650,7 @@ while read -r name state _; do
     [[ ! -e $mark ]] || continue
     if delivery=$(session conflict-found "$name" "$head" 2>&1); then
       nudged+="$name "
-      echo "$head" >"$mark" || { failed=1; continue; }
+      write_session_note "$name" "$mark" "$head" || { failed=1; continue; }
       log=$HOME/.local/state/workflow/wake.log
       mkdir -p "${log%/*}" &&
         printf '%s %s merge conflict on %s; reviewer nudged\n' "$NOW" "$name" "$head" >>"$log" || failed=1
@@ -721,7 +743,7 @@ while read -r name state _; do
   [[ $lost != true ]] || wake=lost-check
   if delivery=$(session "$wake" "$name" "$head" 2>&1); then
     nudged+="$name "
-    echo "$head" >"$mark" || { failed=1; continue; }
+    write_session_note "$name" "$mark" "$head" || { failed=1; continue; }
     log=$HOME/.local/state/workflow/wake.log
     mkdir -p "${log%/*}" &&
       printf '%s %s %s on %s; reviewer nudged\n' "$NOW" "$name" "${wake//-/ }" "$head" >>"$log" || failed=1
@@ -828,7 +850,7 @@ nudge_busy() {
     echo "$delivery" >&2
     wake_log "$name $3 nudge failed: $delivery"
     outcome="; nudge failed"
-    echo "$kind 0" >"$main/$SHIPLINE_STATE_FOLDER/$name.nudge-retry" || true
+    write_session_note "$name" "$main/$SHIPLINE_STATE_FOLDER/$name.nudge-retry" "$kind 0" || true
     failed=1
   fi
 }
@@ -862,7 +884,7 @@ retry_nudge() {
     rm -f "$note"
   else
     nudged+="$name "
-    echo "$kind $((tries + 1))" >"$note" || failed=1
+    write_session_note "$name" "$note" "$kind $((tries + 1))" || failed=1
     echo "$delivery" >&2
     wake_log "$name $kind nudge failed again: $delivery"
     failed=1
@@ -881,16 +903,19 @@ running=$(session list) || failed=1
 # it, and `session list` shows it. A session's first look is a change.
 while read -r name state _; do
   [[ $name =~ ^(ticket|review|audit)-[0-9]+$ || $name == hunt-* || $name == analyst-* ]] || continue
+  session_current "$name" || continue
   # The state goes with the sum: a session that turns busy starts its 45 minutes then.
   sum=$(screen_sum "$name")/$state || continue
   seen=$main/$SHIPLINE_STATE_FOLDER/$name.screen-seen
   { read -r last_sum last_since <"$seen"; } 2>/dev/null || last_sum=""
-  [[ $last_sum == "$sum" && $last_since =~ ^[0-9]+$ ]] || echo "$sum $NOW" >"$seen" || failed=1
+  [[ $last_sum == "$sum" && $last_since =~ ^[0-9]+$ ]] ||
+    write_session_note "$name" "$seen" "$sum $NOW" || failed=1
 done <<<"$running"
 
 while read -r name state _; do
   [[ $state != limit && $name =~ ^(ticket|review)-([0-9]+)$ ]] || continue
   number=${BASH_REMATCH[2]}
+  session_current "$name" || continue
   notes=$main/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER/$name
   [[ ! -e $notes.codex ]] || continue
   [[ ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked ]] || continue
@@ -912,7 +937,7 @@ while read -r name state _; do
     delivery=$(session status-check "$name" 2>&1)
     sent=$?
     if ((sent == 0)); then
-      echo "$since" >"$mark" || failed=1
+      write_session_note "$name" "$mark" "$since" || failed=1
       wake_log "$name idle $(((NOW - since) / 60)) min waiting for its own job or turn; status check sent" ||
         failed=1
     elif ((sent != 3)); then
@@ -926,7 +951,7 @@ while read -r name state _; do
   # above if it had said so. Ready is counted from when the tick first saw it ready.
   ready=$main/$SHIPLINE_STATE_FOLDER/$name.ready-seen
   if [[ $name == ticket-* ]] && grep -qE "^$number false " <<<"$pulls"; then
-    [[ -r $ready ]] || echo "$NOW" >"$ready" || failed=1
+    [[ -r $ready ]] || write_session_note "$name" "$ready" "$NOW" || failed=1
     ready_at=""
     [[ ! -r $ready ]] || read -r ready_at <"$ready"
     idle_at=""
@@ -938,7 +963,7 @@ while read -r name state _; do
       delivery=$(session finish-ready "$name" 2>&1)
       sent=$?
       if ((sent == 0)); then
-        echo "$ready_at" >"$mark" || failed=1
+        write_session_note "$name" "$mark" "$ready_at" || failed=1
         wake_log "$name idle on ready pull request $number without worker finished; told to finish" ||
           failed=1
       elif ((sent != 3)); then
@@ -980,7 +1005,7 @@ while read -r name state _; do
         { read -r first_at first_loop <"$first"; } 2>/dev/null || first_loop=""
         if [[ $first_loop != "$loop" || ! $first_at =~ ^[0-9]+$ ]]; then
           first_at=$NOW
-          printf '%s %s\n' "$NOW" "$loop" >"$first" || failed=1
+          write_session_note "$name" "$first" "$NOW $loop" || failed=1
         fi
         if [[ $busy == true && $(jq -r '.running // ""' <<<"$activity") == "$loop" &&
               $nudged != *" $name "* ]] && ! asks_permission "$name" && quiet "$name"; then
@@ -994,7 +1019,7 @@ while read -r name state _; do
         if [[ $later == true ]]; then
           :
         elif note_for_wake "$name-loop-$NOW" "$line"; then
-          printf '%s\n' "$loop" >"$mark" || failed=1
+          write_session_note "$name" "$mark" "$loop" || failed=1
           wake_log "$line" || failed=1
         else
           failed=1
@@ -1016,7 +1041,7 @@ while read -r name state _; do
     if [[ ! -r $mark || $(<"$mark") != "$head" ]] && quiet "$name"; then
       line="idle, no rule: $name ($(((NOW - idle_at) / 60)) min, last line: $(last_line "$name"))"
       if note_for_wake "$name-idle-$NOW" "$line"; then
-        printf '%s\n' "$head" >"$mark" || failed=1
+        write_session_note "$name" "$mark" "$head" || failed=1
         wake_log "$line" || failed=1
       else
         failed=1
@@ -1034,7 +1059,7 @@ while read -r name state _; do
   nudge_busy "$name" still stuck
   line="stuck? $name ($(((NOW - last_since) / 60)) min, running: ${what:-no command})$outcome"
   if note_for_wake "$name-stuck-$last_since-$NOW" "$line"; then
-    echo "$last_since $head" >"$mark" || failed=1
+    write_session_note "$name" "$mark" "$last_since $head" || failed=1
     wake_log "$line" || failed=1
   else
     failed=1
@@ -1054,6 +1079,7 @@ if ((answer_after > 0)); then
   while read -r name state _; do
     [[ $state == idle && $name =~ ^(ticket|review|audit)-([0-9]+)$ ]] || continue
     notes=$main/.claude/worktrees/ticket-${BASH_REMATCH[2]}/$SHIPLINE_STATE_FOLDER/$name
+    session_current "$name" || continue
     [[ ! -e $notes.codex && -e $notes.idle && -r $notes.asking && -r $notes.question ]] || continue
     IFS= read -r asked <"$notes.asking" && [[ $asked =~ ^([0-9]+)\ [0-9]+$ ]] || continue
     asked_at=${BASH_REMATCH[1]}
@@ -1068,7 +1094,7 @@ if ((answer_after > 0)); then
       what="without a reply word"
       [[ $owner_only != missing ]] || what="without the Owner only line"
       if note_for_wake "$name-owner-question-$asked_at" "owner question $what: $name"; then
-        echo "$asked" >"$mark" || failed=1
+        write_session_note "$name" "$mark" "$asked" || failed=1
         wake_log "$name asks the owner $what; it waits for him" || failed=1
       else
         failed=1
@@ -1083,7 +1109,7 @@ if ((answer_after > 0)); then
     delivery=$(session answer-for-owner "$name" "$asked" 2>&1)
     sent=$?
     if ((sent == 0)); then
-      echo "${asked#* }" >"$mark" || failed=1
+      write_session_note "$name" "$mark" "${asked#* }" || failed=1
       wake_log "answered for the owner: $name, \"$reply\"" || failed=1
       # For the wake's check-in, which lists them so the owner can overrule them.
       answered=$main/$SHIPLINE_STATE_FOLDER/answered-for-owner.pending
