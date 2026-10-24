@@ -16,7 +16,9 @@ def _shards() -> dict[int, list[str]]:
         if found := re.fullmatch(r"\s+- shard: (\d+)", line):
             shard = int(found[1])
             shards[shard] = []
-        elif shard is not None and (found := re.fullmatch(r"\s+(tests/workflow/\S+\.py)", line)):
+        elif shard is not None and (
+            found := re.fullmatch(r"\s+(tests/(?:workflow|runner)/\S+\.py)", line)
+        ):
             shards[shard].append(found[1])
     return shards
 
@@ -27,10 +29,14 @@ def test_ci_runs_four_shards() -> None:
 
 
 def _test_files(root: Path) -> list[str]:
-    """The files pytest collects tests from under `tests/workflow`: its default `python_files`,
-    in every folder below it too."""
-    folder = root / "tests/workflow"
-    found = {*folder.rglob("test_*.py"), *folder.rglob("*_test.py")}
+    """The files pytest collects tests from under `tests/workflow` and `tests/runner`: its
+    default `python_files`, in every folder below them too."""
+    found = {
+        path
+        for folder in (root / "tests/workflow", root / "tests/runner")
+        for pattern in ("test_*.py", "*_test.py")
+        for path in folder.rglob(pattern)
+    }
     return sorted(str(path.relative_to(root)) for path in found)
 
 
@@ -50,6 +56,22 @@ def test_a_test_file_in_a_folder_below_is_counted(tmp_path: Path) -> None:
         "tests/workflow/below/nested_test.py",
         "tests/workflow/below/test_nested.py",
     ]
+
+
+def test_a_test_file_of_the_runner_pool_is_counted(tmp_path: Path) -> None:
+    runner = tmp_path / "tests/runner"
+    runner.mkdir(parents=True)
+    (runner / "test_names.py").touch()
+    (tmp_path / "tests/workflow").mkdir()
+    (tmp_path / "tests/workflow/test_tick.py").touch()
+
+    assert _test_files(tmp_path) == ["tests/runner/test_names.py", "tests/workflow/test_tick.py"]
+
+
+def test_pytest_collects_the_runner_pool_s_tests() -> None:
+    text = (_ROOT / "pyproject.toml").read_text()
+
+    assert re.search(r'^testpaths = \["tests/workflow", "tests/runner"\]$', text, re.M)
 
 
 def test_ci_runs_only_on_github_s_own_runners() -> None:
