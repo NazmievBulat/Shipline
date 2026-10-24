@@ -254,6 +254,16 @@ def _restack_child(folder: Path, number: str, parent_branch: str) -> None:
         _hand_back(folder, number, "stacked base merged; review the branch against main")
 
 
+def _failed_in_line(folder: Path, number: str) -> bool:
+    """Whether the line holds a member as failed, judged from one read of it.
+
+    A member blocked on its head whose green re-run tested an older main is refreshable: its
+    turn refreshes that run, as any stale green run, so its handoff stays.
+    """
+    line = gate.Train(folder)
+    return number in line.blocked and number not in line.refreshable
+
+
 def _drive_gate(folder: Path, number: str) -> bool:
     worktree = _worktree(folder, number)
     if not worktree.is_dir():
@@ -323,7 +333,7 @@ def drive(folder: Path) -> None:
                 _hand_back(folder, number, "unfinished stack follow-up on an open pull request")
             elif pull["headRefOid"] != note.head or pull["headRefName"] != note.branch:
                 _hand_back(folder, number, "head changed since the passed review handoff")
-            elif gate.failed_checks(pull) or number in gate.Train(folder).blocked:
+            elif gate.failed_checks(pull) or _failed_in_line(folder, number):
                 # An advisory service the audit could not reach found nothing wrong: the
                 # handoff waits, and its CI is re-run once the service answers. Under the
                 # lock a gate call re-runs under, so only one of them asks GitHub.
