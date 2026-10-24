@@ -254,6 +254,28 @@ def test_a_session_keeps_a_named_config(
     assert f"SHIPLINE_CONFIG='{expected}'\n" in read.stdout
 
 
+def test_a_session_leaves_a_config_home_under_home_to_the_loader(workflow: Workflow) -> None:
+    """A leading `~` is the loader's to expand, not a folder under the current one."""
+    path = Path(workflow.env["HOME"]) / ".config/shipline/example-org-example-app/shipline.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"state_folder": ".local/named-state"}))
+    workflow.add_pull_request(7)
+
+    done = workflow.run("start", "worker", "7", env={"XDG_CONFIG_HOME": "~/.config"})
+
+    assert done.returncode == 0, done.stderr
+    worktree = workflow.worktree(7)
+    assert (worktree / ".local/named-state").is_dir()
+    env = _session_environment(workflow, "ticket-7")
+    assert env["XDG_CONFIG_HOME"] == "~/.config"
+    read = subprocess.run(
+        ["python3", str(workflow.script.parent / "workflow_config.py"), "shell"],
+        cwd=worktree, env=env, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert read.returncode == 0, read.stderr
+    assert "SHIPLINE_STATE_FOLDER=.local/named-state\n" in read.stdout
+
+
 def test_a_audit_session_is_told_it_is_a_audit(workflow: Workflow) -> None:
     workflow.add_pull_request(7)
 

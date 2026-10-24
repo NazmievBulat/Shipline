@@ -60,8 +60,9 @@ config=$(python3 "$here/../scripts/workflow/workflow_config.py" sh) || exit 1
 eval "$config"
 config_file=${SHIPLINE_CONFIG:-$SHIPLINE_REPO/shipline.json}
 # A checkout config names a pool that runs main's commands, so it must be main's file too.
-# An external installation config has no counterpart on origin/main.
-if [ "$SHIPLINE_CONFIG" = "$SHIPLINE_REPO/shipline.json" ]; then
+# An external installation config has no counterpart on origin/main. The checkout's file is
+# the same file however it is named (`-ef`), a linked folder or a link to it among them.
+if [ "$SHIPLINE_CONFIG" -ef "$SHIPLINE_REPO/shipline.json" ]; then
   if ! git -C "$SHIPLINE_REPO" show refs/remotes/origin/main:shipline.json 2>/dev/null |
     cmp -s - "$SHIPLINE_CONFIG"; then
     echo "$SHIPLINE_CONFIG is not the one of origin/main: run this from main, as last fetched." >&2
@@ -290,7 +291,7 @@ quoted() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
   printf 'planner_label=%s\n' "$(quoted "$planner_label")"
   printf 'checkout=%s\n' "$(quoted "$checkout")"
   # Installed image/cache commands must keep the external file too, without unit changes.
-  if [ "$SHIPLINE_CONFIG" != "$SHIPLINE_REPO/shipline.json" ]; then
+  if ! [ "$SHIPLINE_CONFIG" -ef "$SHIPLINE_REPO/shipline.json" ]; then
     printf 'installation_config=%s\n' "$(quoted "$SHIPLINE_CONFIG")"
   fi
   printf 'machine=%s\n' "$(quoted "$machine")"

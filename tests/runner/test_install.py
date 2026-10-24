@@ -884,10 +884,17 @@ def test_a_pool_installs_from_an_external_file(machine: Path, source: str) -> No
     assert not _calls(machine, "systemctl")
 
 
-def test_an_explicit_checkout_file_still_has_to_match_main(machine: Path) -> None:
+@pytest.mark.parametrize("named", ["directly", "through a linked folder"])
+def test_an_explicit_checkout_file_still_has_to_match_main(machine: Path, named: str) -> None:
+    """However it is named, the checkout's file is a branch's file unless it is main's."""
     _repository(machine, _RUNNER)
-    path = machine / "checkout/shipline.json"
-    path.write_text(json.dumps({"repository": "example-app/example-app", "runner": _RUNNER}))
+    (machine / "checkout/shipline.json").write_text(
+        json.dumps({"repository": "example-app/example-app", "runner": _RUNNER}))
+    folder = machine / "checkout"
+    if named != "directly":
+        folder = machine / "linked"
+        folder.symlink_to(machine / "checkout")
+    path = folder / "shipline.json"
     env = {**_env(machine), "SHIPLINE_CONFIG": str(path)}
     done = subprocess.run(
         ["sh", str(_INSTALL)], cwd=machine / "checkout", env=env,

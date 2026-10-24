@@ -522,7 +522,6 @@ def test_a_tick_can_be_run_from_a_worktree(workflow: Workflow) -> None:
     assert not list(worktree.rglob("*tick.lock"))
 
 
-
 def test_a_tick_keeps_a_relative_config_home_when_starting_from_a_worktree(
     workflow: Workflow,
 ) -> None:
@@ -549,6 +548,32 @@ def test_a_tick_keeps_a_relative_config_home_when_starting_from_a_worktree(
     )
     assert read.returncode == 0, read.stderr
     assert f"SHIPLINE_CONFIG='{path}'\n" in read.stdout
+
+
+def test_a_tick_leaves_a_config_home_under_home_to_the_loader(workflow: Workflow) -> None:
+    """A leading `~` is the loader's to expand, not a folder under the current one."""
+    worktree = workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    workflow.add_pull_request(8)
+    path = Path(workflow.env["HOME"]) / ".config/shipline/example-org-example-app/shipline.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"state_folder": ".local/named-state"}))
+
+    done = workflow.run_script("tick", cwd=worktree, env={"XDG_CONFIG_HOME": "~/.config"})
+
+    assert done.returncode == 0, done.stderr
+    assert workflow.is_running("ticket-8")
+    session_worktree = workflow.worktree(8)
+    assert (session_worktree / ".local/named-state").is_dir()
+    lines = (workflow.state / "env/ticket-8").read_text().splitlines()
+    env = dict(line.split("=", 1) for line in lines)
+    assert env["XDG_CONFIG_HOME"] == "~/.config"
+    read = subprocess.run(
+        ["python3", str(workflow.script.parent / "workflow_config.py"), "shell"],
+        cwd=session_worktree, env=env, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert read.returncode == 0, read.stderr
+    assert "SHIPLINE_STATE_FOLDER=.local/named-state\n" in read.stdout
 
 
 _MARKS_8_READY_DURING_SETUP = """#!/bin/bash

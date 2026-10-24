@@ -234,7 +234,8 @@ find_main_checkout() {
   # Remember explicit lookup settings before the loader sets SHIPLINE_CONFIG to the
   # selected path. A discovered checkout file must not become an installation config.
   local config named_config=${SHIPLINE_CONFIG:-} config_home=${XDG_CONFIG_HOME:-}
-  if [[ -n $config_home && $config_home != /* ]]; then
+  # A leading `~` is the loader's to expand.
+  if [[ -n $config_home && $config_home != [/~]* ]]; then
     config_home=$PWD/$config_home
   fi
   config=$(python3 "$here/workflow_config.py" shell) || exit 1
