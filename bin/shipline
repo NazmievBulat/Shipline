@@ -22,6 +22,7 @@ COMMANDS=(
   ci-tests-for-changes
   decide
   flow-page
+  install
   install-flow-page-timer
   install-hooks
   install-timer

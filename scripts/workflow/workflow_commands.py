@@ -1,14 +1,18 @@
 """Bound workflow subprocesses and retry only explicitly identified GitHub reads."""
 
 import contextlib
+import importlib.machinery
+import importlib.util
+import json
 import os
 import re
 import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from pathlib import Path
 from types import FrameType
 from typing import NoReturn
 
@@ -340,8 +344,143 @@ def github_read(
     return read_with_retries("gh", *args, timeout=timeout, delays=delays)
 
 
+def _function_answer(name: str, entry: dict, words: list[str]) -> int:
+    path = Path(words[0])
+    arguments = words[1:]
+    # A separate interpreter has no application modules cached. Its own siblings must win
+    # over Shipline's modules, even when both provide the same module name.
+    sys.path.insert(0, str(path.parent))
+    spec = importlib.util.spec_from_file_location(
+        path.stem, path, loader=importlib.machinery.SourceFileLoader(path.stem, str(path))
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("cannot load Python module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    subcommand = "browser_plan" if name == "browser_plan" else arguments.pop(0)
+    reads_input = (
+        name == "browser_plan"
+        or (name == "advisory_watch" and subcommand == "unreachable")
+        or (name == "push_checkout" and subcommand == "refusal")
+    )
+    text = sys.stdin.buffer.read().decode("utf-8", "surrogateescape") if reads_input else ""
+    if name == "browser_plan":
+        if arguments:
+            raise ValueError("browser_plan takes changed paths on standard input")
+        call_args = [[
+            path.encode("utf-8", "surrogateescape") for path in text.split("\0") if path
+        ]]
+    elif name == "advisory_watch" and subcommand == "unreachable":
+        if arguments:
+            raise ValueError("unreachable takes text on standard input")
+        call_args = [text]
+    elif name == "push_checkout":
+        if len(arguments) != 1:
+            raise ValueError(f"{subcommand} takes one checkout path")
+        checkout = Path(arguments[0])
+        call_args = [checkout] if subcommand == "install" else [text, checkout]
+    else:
+        call_args = arguments
+    # Diagnostics printed by a module are not part of its returned answer.
+    with contextlib.redirect_stdout(sys.stderr):
+        spec.loader.exec_module(module)
+        try:
+            result = getattr(module, entry["functions"][subcommand])(*call_args)
+        except Exception as error:
+            # A renumber that cannot move some files raises with them in `paths`: they are
+            # named on standard output and left as a conflict, as the documented form does.
+            paths = getattr(error, "paths", None)
+            if (
+                name != "mechanical_conflicts"
+                or subcommand != "renumber"
+                or isinstance(paths, (str, bytes))
+                or not isinstance(paths, (list, tuple, set, frozenset))
+                or not paths
+                or not all(isinstance(path, str) and path.strip() for path in paths)
+            ):
+                raise
+            for path in paths:
+                print(path, file=sys.__stdout__)
+            print(error, file=sys.stderr)
+            return 1
+    if name == "browser_plan":
+        if type(result) is not bool:
+            raise ValueError("browser_plan must return a bool")
+        print("needed" if result else "none")
+    elif result is None or result is False:
+        return 1 if name == "advisory_watch" and subcommand == "answers" else 0
+    elif result is True:
+        return 0
+    elif isinstance(result, str):
+        print(result)
+        if name == "push_checkout" and subcommand == "install":
+            # The gate reads a failure's standard error first, where diagnostics went.
+            print(result, file=sys.stderr)
+            return 1
+    elif isinstance(result, Mapping):
+        for old, new in result.items():
+            print(f"{old} {new}")
+    elif isinstance(result, list):
+        for item in result:
+            print(item)
+    else:
+        raise ValueError("function must return a list, mapping, string, bool or None")
+    return 0
+
+
+def _json_answer(name: str, entry: dict, words: list[str]) -> int:
+    done = _run(*words, errors="surrogateescape", timeout=COMMAND_TIMEOUT)
+    sys.stderr.write(done.stderr)
+    if done.returncode:
+        sys.stdout.write(done.stdout)
+        return done.returncode
+    answer = json.loads(done.stdout)
+    if not isinstance(answer, dict):
+        raise ValueError("selector must print a JSON object")
+    if name == "browser_tests_for_changes":
+        specs = answer[entry["field"]]
+        if not isinstance(specs, list) or not all(isinstance(spec, str) for spec in specs):
+            raise ValueError("specs field must be a list of paths")
+        for spec in specs:
+            print(spec)
+    else:
+        mapped = {key: answer[field] for key, field in entry["fields"].items()}
+        if (
+            type(mapped["whole"]) is not bool
+            or type(mapped["total"]) is not int
+            or mapped["total"] < 0
+            or not all(
+                isinstance(mapped[key], list)
+                and all(isinstance(item, str) for item in mapped[key])
+                for key in ("tests", "reasons")
+            )
+        ):
+            raise ValueError(
+                "selector fields must be whole: bool, tests/reasons: lists, total: nonnegative int"
+            )
+        print(json.dumps(mapped))
+    return 0
+
+
+def repository_answer(args: list[str]) -> int:
+    name = args[0] if args else "unknown"
+    entry = {}
+    try:
+        entry = json.loads(args[1])
+        if entry["form"] == "functions":
+            return _function_answer(name, entry, args[2:])
+        return _json_answer(name, entry, args[2:])
+    except Exception as error:
+        # Module errors are a failed answer, not a traceback or an implicit fallback.
+        prefix = "" if entry.get("form") == "functions" else f"commands.{name}: "
+        print(f"{prefix}{error}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
     install_signal_handlers()
+    if sys.argv[1:2] == ["--repository-command"]:
+        sys.exit(repository_answer(sys.argv[2:]))
     try:
         result = github_read(*sys.argv[1:])
         sys.stdout.write(result.stdout)

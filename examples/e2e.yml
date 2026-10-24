@@ -82,6 +82,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+      # Shipline's own scripts, which the repository does not hold: its main as it is now.
+      - name: Shipline
+        run: git clone --quiet --depth 1 https://github.com/NazmievBulat/Shipline.git "$RUNNER_TEMP/shipline"
       - name: The existing browser selection
         id: selection
         run: |
@@ -91,7 +94,7 @@ jobs:
       - name: Defer the whole suite only for a pull request
         id: deferred
         if: steps.selection.outputs.needed == 'true'
-        run: python3 scripts/workflow/ci_proof.py prefix-only --needed browser_whole
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" prefix-only --needed browser_whole
       # The gate takes a prefix's browser run only when it was whole.
       - name: The notes the gate reads
         env:
@@ -99,13 +102,13 @@ jobs:
           NEEDED: ${{ steps.selection.outputs.needed }}
         run: |
           if [[ $NEEDED != true ]]; then
-            python3 scripts/workflow/ci_proof.py notes --none browser_suite
+            python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes --none browser_suite
           elif jq -e 'index("browser_whole") != null' <<< "$DEFERRED" >/dev/null; then
             ran=$(jq '.browser_files | length' "$RUNNER_TEMP/selection.json")
             total=$(jq '.browser_total' "$RUNNER_TEMP/selection.json")
-            python3 scripts/workflow/ci_proof.py notes --selected browser_suite "$ran" "$total" files
+            python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes --selected browser_suite "$ran" "$total" files
           else
-            python3 scripts/workflow/ci_proof.py notes --whole browser_suite
+            python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" notes --whole browser_suite
           fi
       # The merge gate's first run of a prefix takes the merge line's lane on main's runners only
       # when the pool's lender notes one of them online and idle with it (`ci_proof.py
@@ -116,7 +119,7 @@ jobs:
         if: >-
           vars.CI_MAIN_RUNNER == 'on' && github.event_name == 'workflow_dispatch'
           && github.run_attempt == '1' && startsWith(github.ref, 'refs/heads/workflow/merge-batch-')
-        run: python3 scripts/workflow/ci_proof.py main-lane
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" main-lane
       # A squash the gate made carries its proof: main skips the browser job when it passed,
       # whole, on the identical tree, and names the run it inherited. Any other push runs it.
       - name: Browser tests main inherits on the identical tree
@@ -124,7 +127,7 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/workflow/ci_proof.py inherited e2e
+        run: python3 "$RUNNER_TEMP/shipline/scripts/workflow/ci_proof.py" inherited e2e
 
   browser:
     # The gate's name for the job that runs the browser suite.
@@ -151,6 +154,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+      # Shipline's own scripts, which the repository does not hold: its main as it is now.
+      - name: Shipline
+        run: git clone --quiet --depth 1 https://github.com/NazmievBulat/Shipline.git "$RUNNER_TEMP/shipline"
       # Whatever the browser tests need installed, the browsers among them, comes before this.
       # The repository's browser command (`commands.browser`), whole on scratch and main, and
       # on the selected files on a deferred pull request.
@@ -163,7 +169,7 @@ jobs:
           import json, os, subprocess
           selected = 'browser_whole' in json.loads(os.environ['DEFERRED'])
           files = json.loads(os.environ['FILES'])
-          command = ['python3', 'scripts/workflow/ci_proof.py', 'browser']
+          command = ['python3', os.environ['RUNNER_TEMP'] + '/shipline/scripts/workflow/ci_proof.py', 'browser']
           if not selected or files:
               subprocess.run([*command, *files] if selected else command, check=True)
           PY

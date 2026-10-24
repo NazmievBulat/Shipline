@@ -327,7 +327,11 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
 
     def keys(value: Any, prefix: str = "") -> set[str]:
         # The hunt areas and the suites are named by the repository, not by Shipline.
-        if not isinstance(value, dict) or prefix in (".hunts.areas", ".cloud_pre_push.suites"):
+        if (
+            not isinstance(value, dict)
+            or prefix in (".hunts.areas", ".cloud_pre_push.suites")
+            or prefix.startswith(".commands.")
+        ):
             return {prefix}
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 

@@ -468,6 +468,19 @@ def _api(path: str, key: str | None = None, *, paginate: bool = True) -> Any:
     return pages[0]
 
 
+def workflow_runs(workflow: str, path: str, *, paginate: bool = True) -> list[dict[str, Any]]:
+    """The runs of one workflow that GitHub lists at `path`. A repository may hold no image or
+    browser workflow, as one set up with only its CI holds neither; GitHub answers HTTP 404 for
+    it, and it has no runs. Whether their checks are needed is read from the repository itself
+    (`images_needed`, `browser_needed`). A repository without its CI workflow stays an error."""
+    try:
+        return api(path, "workflow_runs", paginate=paginate)
+    except Refused as error:
+        if workflow in ("e2e", "images") and re.search(r"\bHTTP 404\b", str(error)):
+            return []
+        raise
+
+
 def runs(
     workflow: str, head: str, *, pull: bool = False, scheduled: bool = False
 ) -> list[dict[str, Any]]:
@@ -478,7 +491,7 @@ def runs(
         f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
         f"?head_sha={head}{event}&per_page=100"
     )
-    listed = api(path, "workflow_runs")
+    listed = workflow_runs(workflow, path)
     found = _own_runs(listed, head, pull=pull, scheduled=scheduled)
     if listed or workflow != "ci":
         return found
@@ -585,10 +598,10 @@ class MainImages:
                 return
             # Nightly runs fill pages too: a missing page must never forget an older failure.
             self.page += 1
-            runs_page = api(
+            runs_page = workflow_runs(
+                "images",
                 f"{API}/actions/workflows/{WORKFLOW_FILES['images']}/runs"
                 f"?branch=main&per_page=100&page={self.page}",
-                "workflow_runs",
                 paginate=False,
             )
             self.last = len(runs_page) < 100
@@ -1612,7 +1625,11 @@ def images_needed(
     if any(check.get("name", "").startswith(IMAGES) for check in rollup):
         return True
     # Use the actual workflow's path filter, without a second maintained list of image inputs.
-    workflow = git("show", f"{workflow_ref or base}:.github/workflows/{WORKFLOW_FILES['images']}")
+    # A repository that holds no image workflow has no image checks, so no change needs them.
+    path = f".github/workflows/{WORKFLOW_FILES['images']}"
+    if not git("ls-tree", "--name-only", workflow_ref or base, "--", path):
+        return False
+    workflow = git("show", f"{workflow_ref or base}:{path}")
     matches = path_filter(pull_request_paths(workflow))
     # NUL delimiters preserve filenames that Git would otherwise quote or split across lines;
     # the last NUL ends the list, and the empty entry after it is no file.

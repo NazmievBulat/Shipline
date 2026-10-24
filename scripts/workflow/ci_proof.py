@@ -366,8 +366,8 @@ _TESTS = {"test": "tests", "browser": "browser tests"}
 
 def _run_command(name: str, args: list[str]) -> int:
     config = workflow_config.current()
-    line = getattr(config.commands, name)
-    if line is None:
+    entry = getattr(config.commands, name)
+    if entry is None:
         print(
             f"{config.path} names no commands.{name}, "
             f"the command that runs this repository's {_TESTS[name]}",
@@ -376,8 +376,10 @@ def _run_command(name: str, args: list[str]) -> int:
         return 1
     # The command line is the repository's own, as its file names it; the job's arguments
     # follow it as words of their own, so it must end where arguments may follow.
+    line = entry["run"] if isinstance(entry, dict) else entry
+    leading = entry.get("args", []) if isinstance(entry, dict) else []
     return subprocess.run(
-        ["bash", "-c", line + ' "$@"', name, *args],
+        ["bash", "-c", line + ' "$@"', name, *leading, *args],
         cwd=_git("rev-parse", "--show-toplevel"),
         check=False,
     ).returncode

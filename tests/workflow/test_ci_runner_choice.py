@@ -60,7 +60,7 @@ def _lane_step(path: Path) -> str:
     step = re.search(
         r"^      - name: [^\n]*\n(?:        (?!run:).*\n)*?"
         r"        if: (>-\n(?:          .*\n)+|.*\n)"
-        r"(?:        (?!run:).*\n)*        run: python3 scripts/workflow/ci_proof.py main-lane\n",
+        r'(?:        (?!run:).*\n)*        run: python3 "?\S*scripts/workflow/ci_proof\.py"? main-lane\n',
         plan,
         re.M,
     )
