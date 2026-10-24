@@ -17,7 +17,8 @@ image build or hub cache command, and the runner label `<prefix>-home` and plann
 runner tests `tools/parity` compares are in `tests/workflow` and `tests/runner`, and it knows of
 no differences; no machines named, so `flow-page` samples only the machine it runs on; no hunt
 areas, so one hunt runs at a time, and no hunt plans file; no test command, which a repository
-names for its CI's test job (`ci_proof.py test`).
+names for its CI's test job (`ci_proof.py test`); a question to the owner marked `Owner only: no`
+gets its recommended reply after 15 minutes.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -132,7 +133,12 @@ DEFAULTS: dict[str, Any] = {
         # The repository's file of hunt plans, which a hunt with a plan is told of.
         "plans": None,
     },
+    # Minutes a question to the owner marked `Owner only: no` waits before the tick types its
+    # recommended reply; 0 turns that off.
+    "answer_for_owner_after_minutes": 15,
 }
+# The most such a wait may be: a day. Bash would wrap a number far larger.
+MOST_MINUTES = 24 * 60
 # The keys of one machine.
 MACHINE_KEYS = ("name", "address")
 
@@ -260,6 +266,7 @@ class Config:
     machines: tuple[Machine, ...]
     hunts: Hunts
     commands: Commands
+    answer_for_owner_after_minutes: int
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -358,6 +365,15 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
                 isinstance(item, str) and item for item in value
             ):
                 raise ConfigError(f"{FILE}: {name} must be a list of names")
+            merged[key] = value
+        elif isinstance(default, int):
+            value = given[key]
+            # `true` is an int to Python, and no number of minutes.
+            if type(value) is not int or not 0 <= value <= MOST_MINUTES:
+                raise ConfigError(
+                    f"{FILE}: {name} must be a whole number from 0 to {MOST_MINUTES}, "
+                    f"not {json.dumps(value)}"
+                )
             merged[key] = value
         else:
             value = given[key]
@@ -594,6 +610,7 @@ def load(start: Path | None = None) -> Config:
         machines=tuple(Machine(**machine) for machine in values["machines"]),
         hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
         commands=Commands(**values["commands"]),
+        answer_for_owner_after_minutes=values["answer_for_owner_after_minutes"],
         given=given,
         main=main,
     )
@@ -653,6 +670,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "plans": config.hunts.plans,
         },
         "commands": vars(config.commands).copy(),
+        "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
     }
 
 
@@ -683,6 +701,7 @@ def shell(config: Config, *, posix: bool = False) -> str:
         "RUNNER_IMAGE_BUILD": config.runner.image_build or "",
         "RUNNER_HUB_CACHE": config.runner.hub_cache or "",
         "HUNT_PLANS": config.hunts.plans or "",
+        "ANSWER_FOR_OWNER_AFTER_MINUTES": str(config.answer_for_owner_after_minutes),
         "CONFIG": json.dumps(config.given, separators=(",", ":")),
     }
     lines = [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]

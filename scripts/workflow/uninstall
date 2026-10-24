@@ -7,7 +7,7 @@
 # in `settings.json.shipline-replaced`, are put back where they were, one an event; every other
 # setting and hook is left as it is. The timer's units that `install-timer` replaced, kept as
 # `*.before-shipline`, are put back and switched on again; without them Shipline's timer is
-# switched off and its units removed. The link `~/.local/bin/shipline` goes when it is this
+# switched off and its units removed, as are the flow page's (`install-flow-page-timer`). The link `~/.local/bin/shipline` goes when it is this
 # checkout's. Running the repository's own `install-hooks` afterwards adds nothing twice.
 set -euo pipefail
 
@@ -88,6 +88,26 @@ elif [[ -e $service ]] && grep -q '/bin/shipline" tick$' "$service"; then
   rm -f "$service" "$units/workflow-tick.timer"
   systemctl --user daemon-reload
   echo "workflow-tick is switched off"
+fi
+
+# The flow page's units run Shipline too (`install-flow-page-timer`): they go with it. Units of
+# that name that run something else are the owner's own and stay.
+flow_page=$units/flow-page.service
+flow_page_serve=$units/flow-page-serve.service
+runs_shipline='/bin/shipline" --repo ".*" flow-page'
+if [[ -e $flow_page ]] && grep -q "^ExecStart=.*$runs_shipline\$" "$flow_page"; then
+  systemctl --user disable --now flow-page.timer
+  rm -f "$flow_page" "$units/flow-page.timer"
+  removed=1
+fi
+if [[ -e $flow_page_serve ]] && grep -q "^ExecStart=.*$runs_shipline --serve [0-9]*\$" "$flow_page_serve"; then
+  systemctl --user disable --now flow-page-serve.service
+  rm -f "$flow_page_serve"
+  removed=1
+fi
+if [[ -n ${removed:-} ]]; then
+  systemctl --user daemon-reload
+  echo "the flow page is switched off"
 fi
 
 link=$HOME/.local/bin/shipline
