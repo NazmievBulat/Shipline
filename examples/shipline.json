@@ -41,5 +41,8 @@
       "billing": ["/invoices", "/settings/billing"]
     },
     "plans": "docs/hunt-plans.md"
+  },
+  "commands": {
+    "test": "tools/run-tests"
   }
 }

@@ -11,7 +11,8 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix; no hunt areas, so one hunt runs at a time, and no hunt plans file.
+runner prefix; no hunt areas, so one hunt runs at a time, and no hunt plans file; no test
+command, which a repository names for its CI's test job (`ci_proof.py test`).
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -87,6 +88,10 @@ DEFAULTS: dict[str, Any] = {
         # The repository's file of hunt plans, which a hunt with a plan is told of.
         "plans": None,
     },
+    "commands": {
+        # The command line that runs the repository's tests, from the root of its checkout.
+        "test": None,
+    },
 }
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
@@ -158,6 +163,12 @@ class Hunts:
 
 
 @dataclass(frozen=True)
+class Commands:
+    # None when the file names none.
+    test: str | None
+
+
+@dataclass(frozen=True)
 class Config:
     # None when nothing names it: an error only for a script that needs it.
     found_repository: str | None
@@ -169,6 +180,7 @@ class Config:
     labels: Labels
     runner: Runner
     hunts: Hunts
+    commands: Commands
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -368,6 +380,7 @@ def load(start: Path = HERE) -> Config:
             prefix=values["runner"]["prefix"],
         ),
         hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
+        commands=Commands(**values["commands"]),
         given=given,
         main=main,
     )
@@ -402,6 +415,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "areas": {area: list(screens) for area, screens in config.hunts.areas.items()},
             "plans": config.hunts.plans,
         },
+        "commands": vars(config.commands).copy(),
     }
 
 
