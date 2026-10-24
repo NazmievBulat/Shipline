@@ -172,14 +172,15 @@ if [[ -d $handbacks ]]; then
   done < <(find "$handbacks" -type f -print0 | sort -z)
 fi
 
-if [[ -d $lost ]]; then
+for folder in "$lost" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/lost-checks.pending"}; do
+  [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '"lost check: \(.check) of run \(.run) on pull request \(.number)"' "$event"); then
       lost_files+=("$event")
       lost_lines+=("$line")
     fi
-  done < <(find "$lost" -type f -name '*.json' -print0 | sort -z)
-fi
+  done < <(find "$folder" -type f -name '*.json' -print0 | sort -z)
+done
 # Rule breaks travel with the lost checks: told at any hour, on a line of their own.
 for folder in "$breaks" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/rule-breaks.pending"}; do
   [[ -d $folder ]] || continue

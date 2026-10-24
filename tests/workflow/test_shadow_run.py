@@ -12,7 +12,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from workflow.test_lost_check import _lose, _run, _waiting_reviewer
+from workflow.test_merge_when_current import GitHub
+from workflow.test_merge_when_current import github as github_fixture
 from workflow_harness import Workflow, install_shipline
+
+github = github_fixture
 
 _ROOT = Path(__file__).resolve().parents[2]
 _COMPARE = _ROOT / "tools" / "compare-shadow"
@@ -276,6 +281,44 @@ def test_a_shadow_tick_logs_the_decisions_the_real_tick_takes(workflow: Workflow
     )
 
 
+def test_a_lost_check_is_noted_for_the_shadow_s_wake_and_not_in_the_live_state(
+    github: GitHub,
+) -> None:
+    # A reviewer waits for its checks before it joined the line, and GitHub still lists one as
+    # running an hour after its run ended: the tick notes it for the wake, once per head.
+    workflow = github.workflow
+    _lose(github)
+    _run(github)
+    _waiting_reviewer(github)
+    workflow.orchestrator()
+    state = workflow.repo / ".local" / "workflow"
+    told = "lost check: CI: server tests of run 20 on pull request 7"
+    before = _digest(state)
+
+    shadow = workflow.run_script("tick", "--shadow")
+
+    assert shadow.returncode == 0, shadow.stdout + shadow.stderr
+    assert _digest(state) == before
+    log = _shadow_log(workflow).read_text()
+    assert "review-7 lost check on " in log
+    assert f"\n  {told}\n" in log
+    once = log.count(told)
+
+    real = workflow.run_script("tick")
+
+    assert real.returncode == 0, real.stdout + real.stderr
+    assert told in workflow.wake_log.read_text()
+    # A nudge to try again: the real tick nudges, and its wake tells no lost check it told.
+    for mark in state.glob("review-7.lost-nudged-*"):
+        mark.unlink()
+    again = workflow.run_script("tick", "--shadow")
+
+    assert again.returncode == 0, again.stdout + again.stderr
+    log = _shadow_log(workflow).read_text()
+    assert log.count("review-7 lost check on ") == 2
+    assert log.count(told) == once
+
+
 @pytest.mark.parametrize(("five", "starts"), [(40, True), (90, False)], ids=["room", "held"])
 def test_the_daily_analyst_starts_in_a_shadow_tick_as_in_the_real_one(
     workflow: Workflow, five: int, starts: bool
@@ -535,6 +578,7 @@ def test_a_shadow_run_reads_a_limit_s_day_as_the_real_tick_does_and_keeps_no_not
         ["api", "-X", "POST", "repos/example-org/example-app/issues/7/labels"],
         ["api", "repos/example-org/example-app/issues/7/comments", "-f", "body=hello"],
         ["api", "graphql", "-f", "query=mutation { closePullRequest }"],
+        ["api", "graphql", "--input", "body.json"],
         ["label", "create", "workflow"],
     ],
 )

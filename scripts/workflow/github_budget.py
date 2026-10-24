@@ -442,8 +442,11 @@ def writes(arguments: tuple[str, ...]) -> bool:
     if arguments[0] != "api":
         return tuple(arguments[:2]) not in READS
     if "graphql" in arguments[1:]:
-        # A query read from a file (`-F query=@file`) cannot be told from a mutation.
-        return any("mutation" in argument or "=@" in argument for argument in arguments)
+        # A query read from a file (`-F query=@file`, `--input`) cannot be told from a mutation.
+        return any(
+            "mutation" in argument or "=@" in argument or argument.startswith("--input")
+            for argument in arguments
+        )
     method, fields, after = None, False, None
     for argument in arguments[1:]:
         if after:

@@ -5,11 +5,14 @@ the merge line, by the gate's own definition (`merge_gate.lost_check`). The tick
 
 It exits 0 when a check was lost, noted for the wake once per head (`merge_gate.note_lost`), 3
 when none was, and 2 when a run could not be read; any other end is a failure too, never "none".
+A shadow tick (`tick --shadow`) notes it for its own wake, in SHIPLINE_SHADOW_NOTES, unless the
+installation's own notes hold it; the installation's notes are read, never written.
 Each workflow run is read at most once per tick: its answer, an unreadable one too, is kept in
 the tick's own folder, which the tick removes when it exits. Outside a tick every run is read.
 """
 
 import json
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -55,6 +58,14 @@ def main(folder: Path, number: str) -> int:
         return 2
     if not found:
         return NONE
+    if os.environ.get("SHIPLINE_SHADOW"):
+        name = f"{number}-{pull['headRefOid']}.json"
+        if any((folder / f"lost-checks.{kind}" / name).exists() for kind in ("pending", "sent")):
+            return 0
+        notes = os.environ.get("SHIPLINE_SHADOW_NOTES")
+        if not notes:
+            return 0
+        folder = Path(notes)
     merge_gate.note_lost(folder, number, pull["headRefOid"], found)
     return 0
 
