@@ -22,12 +22,13 @@ record=$settings.shipline-replaced
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$here/launcher-link"
 find_launcher
+remember_config
 # The repository (`workflow_config.py`): SHIPLINE_REPO, else the one of the current folder.
 config=$(python3 "$here/workflow_config.py" shell)
 eval "$config"
 # Through `bash`, quiet and never failing: a session is not disturbed when the checkout no
 # longer has the launcher or the script.
-command="bash $(printf '%q' "$launcher") --repo $(printf '%q' "$SHIPLINE_REPO") notify 2>/dev/null || true"
+command="$(config_command_prefix)bash $(printf '%q' "$launcher") --repo $(printf '%q' "$SHIPLINE_REPO") notify 2>/dev/null || true"
 
 before='{}'
 indent=2
@@ -53,7 +54,7 @@ after=$(jq --indent "$indent" --arg command "$command" '
   # in the repository: the one path of its `notify`.
   def is_ours:
     (.command // "")
-    | test("^bash ([^;&|\\\\ ]|\\\\.)+/bin/shipline --repo ([^;&|\\\\ ]|\\\\.)+ notify 2>/dev/null \\|\\| true$")
+    | test("^((SHIPLINE_CONFIG|XDG_CONFIG_HOME)=([^;&|\\\\ ]|\\\\.)+ )*bash ([^;&|\\\\ ]|\\\\.)+/bin/shipline --repo ([^;&|\\\\ ]|\\\\.)+ notify 2>/dev/null \\|\\| true$")
       or test("^bash ([^;&|\\\\]|\\\\.)*/scripts/workflow/notify 2>/dev/null \\|\\| true$");
   def calls_notify($matcher):
     any(.[]?; (.matcher // "") == $matcher and any(.hooks[]?; is_ours));

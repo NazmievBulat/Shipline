@@ -348,10 +348,22 @@ subagent when
 `codex review` would run locally. It pushes only to its pull request's branch, never
 force-pushes and never skips or weakens the pre-push hook. It reports the start, first push,
 blockers with their exact errors, owner questions and ready by pull request comments beginning with
-`<!-- cloud-worker -->`. It never ends its turn to wait for an answer; it polls the pull
-request's comments every three minutes instead. The tick relays the reports without a model:
-a final question rings the phone once through `notify` and appears in the wake as `asking the
-owner: cloud-N`; a `Blocked` report is told to the orchestrator once. A final `worker finished`
+`<!-- cloud-worker -->`. A question ends as "Asking the owner" says: the choices one line each,
+each beginning with its reply word, the line `Owner only: yes` or `Owner only: no`, and the
+reply words, the recommended one first. An answer it is given in its session it reports on the
+pull request before it carries on. It never ends its turn to wait for an answer; it polls the
+pull request's comments every three minutes instead. The tick relays the reports without a
+model: a final question rings the phone once through `notify` and appears in the wake as
+`asking the owner: cloud-N`; a `Blocked` report is told to the orchestrator once. A question
+marked `Owner only: no` with no answer after `answer_for_owner_after_minutes` gets its
+recommended reply as in "Asking the owner", once, in a comment of the tick,
+`<!-- shipline-orchestrator --> answered for the owner: <reply word>`, quoting that choice's
+line when it has one, and its worker is woken as after any answer. An answer from the owner or
+the orchestrator that comes first wins, the same words asked again after any answer wait for the
+owner, and only a question from an account that may write to the repository is answered. One
+without the line, without a reply word, or with a recommendation other than its first reply word
+(a choice marked recommended, or a sentence that recommends another), waits for the owner and
+is named in the wake once; the morning check-in lists the answers. A final `worker finished`
 removes the record only once the pull request is ready, letting the normal independent review
 start. Reports and failed deliveries are remembered locally. The workflow does not read cloud
 transcripts or stop cloud sessions; the owner answers in the cloud session or on the pull

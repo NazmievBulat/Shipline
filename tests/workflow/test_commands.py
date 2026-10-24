@@ -24,6 +24,7 @@ from workflow.test_merge_driver import (  # pyright: ignore[reportPrivateUsage]
 from workflow.test_merge_driver import handed as handed_fixture
 from workflow.test_merge_when_current import GitHub
 from workflow.test_merge_when_current import github as github_fixture
+from workflow.test_workflow_config import _installation  # pyright: ignore[reportPrivateUsage]
 from workflow_harness import Workflow, install_shipline, session_arguments
 
 github = github_fixture
@@ -1082,7 +1083,7 @@ def test_without_a_hunt_app_a_hunt_is_refused_in_a_sentence(workflow: Workflow) 
 
     assert done.returncode == 1
     assert done.stderr.strip() == (
-        "this repository names no hunt_app command in shipline.json, so a hunt has no app to use"
+        f"this repository names no hunt_app command in {workflow.repo / 'shipline.json'}, so a hunt has no app to use"
     )
     assert not workflow.hunt_worktree("phone-1").exists()
     assert not workflow.calls("tmux")
@@ -1098,7 +1099,7 @@ def test_without_a_cursor_hunter_a_cursor_hunt_is_refused_in_a_sentence(
 
     assert done.returncode == 1
     assert done.stderr.strip() == (
-        "this repository names no hunt_cursor command in shipline.json, so it has no Cursor hunter"
+        f"this repository names no hunt_cursor command in {workflow.repo / 'shipline.json'}, so it has no Cursor hunter"
     )
     assert not workflow.calls("tmux")
 
@@ -1215,7 +1216,7 @@ def test_without_a_selection_shipline_selects_nothing_and_says_the_whole_suite_r
     assert done.returncode == 0
     assert done.stdout == ""
     assert done.stderr == (
-        f"this repository names no {key} command in shipline.json: "
+        f"this repository names no {key} command in {workflow.repo / 'shipline.json'}: "
         "no test is selected, and CI runs the whole suite\n"
     )
 
@@ -1226,7 +1227,7 @@ def test_without_a_command_shipline_says_the_repository_has_none(workflow: Workf
     done = workflow.shipline("hunt-browser", "open", "/")
 
     assert done.returncode == 1
-    assert done.stderr == "this repository names no hunt_browser command in shipline.json\n"
+    assert done.stderr == f"this repository names no hunt_browser command in {workflow.repo / 'shipline.json'}\n"
 
 
 def test_shipline_knows_every_command_a_repository_may_name() -> None:
@@ -1244,7 +1245,7 @@ def test_without_pre_train_checks_shipline_has_none_to_fail(workflow: Workflow) 
 
     assert done.returncode == 0
     assert done.stderr == (
-        "this repository names no pre_train_checks command in shipline.json: "
+        f"this repository names no pre_train_checks command in {workflow.repo / 'shipline.json'}: "
         "there is no check to fail\n"
     )
 
@@ -1323,6 +1324,43 @@ def test_function_advisories_import_their_own_sibling_first(workflow: Workflow) 
     ''')
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout) == ["example-service", None, True, False]
+
+
+@pytest.mark.parametrize("home", [False, True])
+@pytest.mark.parametrize("qualified", [False, True])
+def test_function_module_is_found_in_the_installation_folder(
+    workflow: Workflow, qualified: bool, home: bool
+) -> None:
+    """A module is found as a program is: main first, then the installation folder, which is
+    a config's own folder when it is kept outside the repository."""
+    entry = {
+        "run": ("@install/" if qualified else "") + "tools/advisories.py", "form": "functions",
+        "functions": {"unreachable": "unreachable", "answers": "answers"},
+    }
+    if home:
+        path = _installation(workflow)
+        installed = path.parent
+        path.write_text(json.dumps({"commands": {"advisory_watch": entry}}))
+    else:
+        installed = workflow.root / "installation"
+        _configure(workflow, advisory_watch=entry)
+        path = workflow.repo / "shipline.json"
+        path.write_text(
+            json.dumps({**json.loads(path.read_text()), "install_folder": str(installed)})
+        )
+    (installed / "tools").mkdir(parents=True)
+    (installed / "tools" / "advisories.py").write_text(textwrap.dedent('''
+        def unreachable(output):
+            return "example-service" if output == "down\\n" else None
+        def answers(service):
+            return service == "example-service"
+    '''))
+    done = _gate(workflow, '''
+        import json
+        print(json.dumps([g.unreachable_service("down\\n"), g.service_answers("example-service")]))
+    ''')
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == ["example-service", True]
 
 
 def test_function_checkout_converts_paths_and_orders_refusal_arguments(workflow: Workflow) -> None:

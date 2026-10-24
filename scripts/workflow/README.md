@@ -71,14 +71,32 @@ those measurements require real workers after rollout and must not be estimated.
 
 # The configuration file
 
-What differs between the repositories that use Shipline is in one file, `shipline.json`,
-at the root of the repository's main checkout. JSON, so Python, Node and jq read it with
-nothing to install. `examples/shipline.json` names every key, for a repository
-`example-app` with a server suite, a browser suite and an image check.
+Shipline reads one JSON file, using the first available source in this order:
+
+1. `SHIPLINE_CONFIG`, a file path. A relative path is relative to the caller's current folder;
+   an explicit file that is missing or unreadable is refused.
+2. `$XDG_CONFIG_HOME/shipline/<owner>-<name>/shipline.json`, with `~/.config` as the config home
+   when `XDG_CONFIG_HOME` is unset or empty. The repository identity for this lookup is the
+   runner settings' `repository`, else the GitHub `origin`, before any config is read.
+3. `shipline.json` in the repository's main checkout, as before.
+
+Only that file is read; files are never merged. Without any file the defaults apply. An invalid
+installation file is refused with its own path, without falling through to the checkout file.
+Worktrees use their main checkout's identity and config, never a worktree's config copy.
+`examples/shipline.json` names every key for `example-app` with a server suite, a browser suite
+and an image check. A repository needs no config or adapter scripts of its own.
+
+The installation folder is the parent folder of a file selected by `SHIPLINE_CONFIG` or from
+the home config folder. The optional `install_folder` key overrides it: an absolute path, or a
+path relative to the selected config file. A checkout config has no installation folder unless
+it names one. Programs and a `parity.known` file can live there. Relative program paths still
+use the main checkout first, then the installation folder; an `@install/` prefix uses only the
+installation folder, even if the checkout has a file of the same name.
 
 | Key | What it names | Default |
 | --- | --- | --- |
 | `repository` | `owner/name` on GitHub | `repository` as Bash reads it from `.github/runner/settings.sh` (sourced in a `bash` of its own, with only `PATH` and `HOME`, for at most 5 seconds), else the `origin` remote on GitHub; a script that needs it stops when neither names one |
+| `install_folder` | the folder of installation programs; absolute, or relative to the selected config file | the parent of an external config; none for a checkout config |
 | `state_folder` | the folder of the workflow's notes, in the main checkout and in each worktree | `.local/workflow` |
 | `worktree_setup` | the command that prepares a new worktree, run only when present | `scripts/setup-worktree` |
 | `refresh.clear_generated` | generated output a refresh clears in the pull request's worktree after it merges main and before it pushes: paths or globs (`*`, `?`, `[…]`, `**`) from the top of the checkout; only the ignored, untracked files under them are removed, and a path that is tracked, not ignored, outside the checkout or through a symbolic link is refused when the file is read | none: nothing is cleared |
@@ -130,12 +148,19 @@ How a script reads it:
 
   which sets `SHIPLINE_REPOSITORY`, `SHIPLINE_STATE_FOLDER`, `SHIPLINE_CI_RESULT`,
   `SHIPLINE_LABEL_WORKFLOW`, `SHIPLINE_PRIORITY_HIGH` and the rest, `SHIPLINE_CONFIG`, the
-  file itself, each command as an array of its words, `SHIPLINE_COMMAND_HUNT_APP` and the
+  selected file's absolute path (empty when no file exists), `SHIPLINE_INSTALL_FOLDER`, the
+  absolute installation folder (empty without one), `SHIPLINE_CONFIG_JSON`, the file's JSON
+  contents, each command as an array of its words, `SHIPLINE_COMMAND_HUNT_APP` and the
   others, empty when the repository names none, and exports `SHIPLINE_REPO`, the repository's
   main checkout, to every program the script starts.
-- jq includes `priority.jq`, which reads the label names from `SHIPLINE_CONFIG` in the
-  environment (export it first) with the same defaults.
-- Node (`codex-bridge.mjs`) reads the state folder from the file with the same default.
+  The installation folder and JSON payload are exported too. An explicit `SHIPLINE_CONFIG`
+  is exported as an absolute path so child processes keep it after changing folders; otherwise
+  each child uses the same lookup order. Installed hooks and timers preserve an explicit config
+  path and `XDG_CONFIG_HOME` for their future runs.
+- jq includes `priority.jq`, which reads labels from the exported `SHIPLINE_CONFIG_JSON`
+  payload with the same defaults; `SHIPLINE_CONFIG` always means a path.
+- Node (`codex-bridge.mjs`) calls `workflow_config.py json` to use the same lookup and validation,
+  then reads the state folder with the same default.
 
 The machine-wide state, `~/.local/state/workflow`, is shared by every repository on one
 machine, as is its GitHub budget, and is not part of the file.
@@ -146,10 +171,13 @@ What only the repository knows (which tests a change reaches, how its applicatio
 gives Shipline as commands, under `commands` in `shipline.json`. Each but `test` (run by `bash`
 from the root of the checkout, above) is a command line, split into words as the shell splits
 them, with nothing expanded. A first word with a `/` in it is a
-program in the repository's main checkout, whichever worktree runs it; a first word without
-one is found on the `PATH`, and then the first later word with a `/` in it that is no option
-is the script it runs, read from the main checkout too (`node tools/shipline/hunt-browser.mjs`):
-a pull request's worktree never supplies the program. The command runs in the folder its caller is in, with the
+program resolved from the repository's main checkout first, then the installation folder,
+whichever worktree runs it. A first word without one is found on the `PATH`, and then the first
+later word with a `/` in it that is no option is the script it runs, resolved the same way
+(`node tools/shipline/hunt-browser.mjs`). Use `python3 @install/tools/check.py` to require an
+installed script, or `@install/tools/check` for an installed executable; neither falls back to
+the checkout. With no installation folder, `@install/` is refused. A pull request's worktree
+never supplies the program. The command runs in the folder its caller is in, with the
 arguments below after its own words. A command the file leaves out is one the repository does
 not have, and Shipline does without it; a command it names but that cannot start stops the
 call. A session runs one as `shipline <command>`, the name with dashes
@@ -244,9 +272,10 @@ The complete function maps and their arguments are:
 
 Shipline imports the module in a separate Python process in the caller's worktree, with the
 module's own folder first on `sys.path` so its sibling imports work. `run` names only the file,
-without an interpreter or arguments. Mapped functions must be synchronous functions defined at
-the module's top level; configuration loading parses the file without executing it, refusing a
-missing function or unsupported form with the command's name.
+without an interpreter or arguments, found as a program is (`@install/` included). Mapped
+functions must be synchronous functions defined at the module's top level; configuration loading
+parses the file without executing it, refusing a missing function or unsupported form with the
+command's name.
 
 A list return prints one entry a line; a mapping prints `<old> <new>` lines; a string prints
 itself; `None` and booleans print nothing. `answers` exits 0 for a true answer and non-zero for
@@ -260,8 +289,9 @@ prints go to standard error, leaving the return value as the answer. Invalid sel
 fields fail the call rather than selecting no tests.
 
 A command reads nothing but what is given on its standard input. Programs and modules live in
-the main checkout whichever worktree runs them, so one that reads the change finds the checkout
-from the folder it runs in (`git rev-parse --show-toplevel`), not from its own path.
+the main checkout or installation folder whichever worktree runs them, so one that reads the
+change finds the checkout from the folder it runs in (`git rev-parse --show-toplevel`), not from
+its own path.
 
 # A shadow run
 

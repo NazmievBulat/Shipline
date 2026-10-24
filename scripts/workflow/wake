@@ -113,10 +113,10 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 github_ready=1
 python3 "$here/github_budget.py" ready wake || github_ready=0
 # The state folder and the labels (`workflow_config.py`), read once; priority.jq reads the
-# label names from SHIPLINE_CONFIG.
+# label names from SHIPLINE_CONFIG_JSON.
 config=$(python3 "$here/workflow_config.py" shell) || exit 1
 eval "$config"
-export SHIPLINE_CONFIG
+export SHIPLINE_CONFIG_JSON
 # The repository's main checkout, never the checkout these scripts are in.
 main=$SHIPLINE_REPO
 saved_line=""
@@ -126,7 +126,7 @@ saved_sent=$main/$SHIPLINE_STATE_FOLDER/prefix-savings.sent
 # with the other daily findings; unchanged check-ins must not send it twice.
 # A shadow run writes no note of its own, so it neither reads nor keeps a savings report.
 if [[ -z $shadow ]] && ((github_ready)) &&
-    jq -e '.checks.prefix_only // [] | length > 0' <<<"$SHIPLINE_CONFIG" >/dev/null &&
+    jq -e '.checks.prefix_only // [] | length > 0' <<<"$SHIPLINE_CONFIG_JSON" >/dev/null &&
     [[ ! -r $saved_sent || $(<"$saved_sent") != "$saved_day" ]]; then
   mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
   (umask 077; touch "$main/$SHIPLINE_STATE_FOLDER/prefix-savings.lock")
