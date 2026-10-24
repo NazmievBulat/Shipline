@@ -1538,17 +1538,21 @@ def _seconds(stamp: Any) -> float | None:
 
 
 def lost_check(
-    pull: dict[str, Any], known: list[dict[str, Any]] | None = None
+    pull: dict[str, Any],
+    known: list[dict[str, Any]] | None = None,
+    read: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """A check the rollup lists as queued or running whose workflow run completed at least
     LOST_AFTER_SECONDS ago, when every check not passing is lost so: a check still running for
     real may yet fail, and is waited for first. Each read run costs a request from the shared
     budget, so a check that started less than that ago ends the search: its run cannot have
-    completed so long ago.
+    completed so long ago. `read` reads a run by its id; the tick passes one that keeps each
+    answer for the rest of the tick.
     """
     now = float(os.environ.get("WORKFLOW_NOW") or time.time())
     seen = {str(run["id"]): run for run in known or []}
-    found = []
+    # Every check that cannot be lost is ruled out before any run is read.
+    waiting = []
     for check in pull["statusCheckRollup"]:
         if _passing_check(check):
             continue
@@ -1558,9 +1562,12 @@ def lost_check(
         started = _seconds(check.get("startedAt"))
         if not match or (started is not None and now - started < LOST_AFTER_SECONDS):
             return None
-        if match[1] not in seen:
-            seen[match[1]] = api(f"{API}/actions/runs/{match[1]}", paginate=False)
-        run = seen[match[1]]
+        waiting.append((check, match[1]))
+    found = []
+    for check, run_id in waiting:
+        if run_id not in seen:
+            seen[run_id] = (read or read_run)(run_id)
+        run = seen[run_id]
         finished = _seconds(run.get("updated_at"))
         if (
             run.get("status") != "completed"
@@ -1571,12 +1578,16 @@ def lost_check(
         found.append(
             {
                 "check": check.get("name", "unknown"),
-                "run": int(match[1]),
+                "run": int(run_id),
                 "conclusion": run.get("conclusion"),
             }
         )
     # A failed run's check is named first: it is a failure, never pushed for.
     return min(found, key=lambda lost: lost["conclusion"] == "success", default=None)
+
+
+def read_run(run: str) -> dict[str, Any]:
+    return api(f"{API}/actions/runs/{run}", paginate=False)
 
 
 def note_lost(folder: Path, number: str, head: str, lost: dict[str, Any]) -> None:
