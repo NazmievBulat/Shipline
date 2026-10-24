@@ -38,7 +38,7 @@ while true; do
     # From this listing too: a machine with no PR slot of its own takes one while no other machine
     # has an online ordinary runner (ordinary_slots.py).
     slots=$(python3 "$here/ordinary_slots.py" "$ordinary_jobs" "$ordinary_blacksmith_jobs" \
-      "$repository" "$other_machines" "$label" "$listing")
+      "$repository" "$label" "${other_machines:-}" "$listing")
     occupied=$(awk -F '\t' -v label="$label" -v main="$main_label" -v first="$first_label" \
       -v total="$((ordinary_jobs + ordinary_spares))" \
       -v own="$own_runner" -v at="$own_number_at" -v others="$others" '

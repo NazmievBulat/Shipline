@@ -24,10 +24,15 @@ BLACKSMITH_LIMIT = 3000
 BLACKSMITH_RESERVE = 140
 _RESERVE = {"blacksmith": BLACKSMITH_RESERVE, "github": 90}
 _LEGACY_RESERVE = {"blacksmith": 115, "github": 70}
-_LABELS = {
-    "blacksmith": [("blacksmith-2vcpu-ubuntu-2404", "blacksmith-4vcpu-ubuntu-2404")],
-    "github": [("ubuntu-latest", "ubuntu-latest"), ("ubuntu-latest", "example-app-home")],
-}
+
+
+def _labels(label: str) -> dict[str, list[tuple[str, str]]]:
+    """The (small, large) runner labels the planner may record a run of each destination with;
+    the pool's own label is one of them."""
+    return {
+        "blacksmith": [("blacksmith-2vcpu-ubuntu-2404", "blacksmith-4vcpu-ubuntu-2404")],
+        "github": [("ubuntu-latest", "ubuntu-latest"), ("ubuntu-latest", label)],
+    }
 
 
 def _blacksmith_on(root: Path, repository: str, now: datetime) -> bool:
@@ -76,7 +81,7 @@ def _blacksmith_on(root: Path, repository: str, now: datetime) -> bool:
     return on
 
 
-def _used(root: Path, now: datetime) -> int:
+def _used(root: Path, now: datetime, label: str) -> int:
     month = now.strftime("%Y-%m")
     folder = root / "ledger"
     paths = sorted(folder.glob("*.json"))
@@ -101,7 +106,7 @@ def _used(root: Path, now: datetime) -> int:
                 or type(row["attempt"]) is not int
                 or row["attempt"] < 1
                 or key != f"{row['run_id']}:{row['attempt']}"
-                or (row["small"], row["large"]) not in _LABELS[target]
+                or (row["small"], row["large"]) not in _labels(label)[target]
                 or reserved not in (_RESERVE[target], _LEGACY_RESERVE[target])
                 or (cost is not None and (type(cost) is not int or cost < 0))
             ):
@@ -145,9 +150,9 @@ def slots(
     maximum: int,
     reduced: int,
     repository: str,
+    label: str,
     *,
     machines: list[str] | None = None,
-    label: str | None = None,
     listing: Path | None = None,
     root: Path | None = None,
     now: datetime | None = None,
@@ -157,14 +162,14 @@ def slots(
     # No slot of its own: one while the listing shows no other machine's ordinary runner online.
     # Without a listing to show it, none.
     if maximum == 0:
-        if machines and label and listing and others_online(machines, label, listing) is False:
+        if machines and listing and others_online(machines, label, listing) is False:
             return 1
         return 0
     try:
         if (
             reduced < maximum
             and _blacksmith_on(root, repository, now)
-            and _used(root, now) + BLACKSMITH_RESERVE < BLACKSMITH_LIMIT
+            and _used(root, now, label) + BLACKSMITH_RESERVE < BLACKSMITH_LIMIT
         ):
             return reduced
     except Exception as error:
@@ -173,16 +178,15 @@ def slots(
 
 
 if __name__ == "__main__":
-    # ordinary_slots.py <slots> <slots while Blacksmith overflows> <repository>
-    #   [<other machines> <workflow label> <runner listing>]
-    given = sys.argv[4:7]
+    # ordinary_slots.py <slots> <slots while Blacksmith overflows> <repository> <workflow label>
+    #   [<other machines> <runner listing>]
     print(
         slots(
             int(sys.argv[1]),
             int(sys.argv[2]),
             sys.argv[3],
-            machines=given[0].split() if given else None,
-            label=given[1] if len(given) > 1 else None,
-            listing=Path(given[2]) if len(given) > 2 else None,
+            sys.argv[4],
+            machines=sys.argv[5].split() if len(sys.argv) > 5 else None,
+            listing=Path(sys.argv[6]) if len(sys.argv) > 6 else None,
         )
     )

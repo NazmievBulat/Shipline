@@ -31,10 +31,27 @@
     }
   },
   "runner": {
-    "labels": ["example-app-home", "example-app-home-main", "example-app-home-docker", "example-app-planner"],
+    "labels": [
+      "example-app-home",
+      "example-app-home-standby",
+      "example-app-home-first",
+      "example-app-home-main",
+      "example-app-home-docker",
+      "example-app-home-planner"
+    ],
     "identity_folder": "~/.config/example-app-runner",
     "prefix": "example-app",
-    "image_build": "tools/shipline/build-runner-images"
+    "label": "example-app-home",
+    "planner_label": "example-app-home-planner",
+    "image_build": "tools/shipline/build-runner-images",
+    "hub_cache": "tools/shipline/hub-cache"
+  },
+  "hunts": {
+    "areas": {
+      "phone": ["/calls", "/contacts"],
+      "billing": ["/invoices", "/settings/billing"]
+    },
+    "plans": "docs/hunt-plans.md"
   },
   "commands": {
     "test": "tools/run-tests"

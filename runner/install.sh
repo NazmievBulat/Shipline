@@ -1,40 +1,38 @@
 #!/bin/sh
-# Run once on each machine that runs runners, as yourself (not root):
+# Run once on each machine that runs runners, as yourself (not root), in the main checkout of the
+# repository whose runners they are (or with that checkout named in SHIPLINE_REPO):
 #
-#   sh install.sh [--machine <name>] [--github-token <file> | --github-app <app id> <key file>]
+#   sh install.sh [--github-token <file> | --github-app <app id> <key file>]
 #                 [how many PR job slots] [how many with Docker]
 #
-# The name is one of machines/: the first install on a machine must give it, a later one may leave
-# it out and takes the recorded one. machines/<name>.sh says what the machine runs (its roles) and
-# how many runners of each kind it gets when no count is given. On a machine with the role `main`
+# The repository's shipline.json names the pool (`repository`, `runner.prefix`, `runner.label`,
+# `runner.planner_label`) and its own commands that build the images and run the Docker Hub cache
+# (`runner.image_build`, `runner.hub_cache`). What is the machine's own is in
+# ~/.config/shipline/runner.sh, or the file SHIPLINE_RUNNER_SETTINGS names, outside any
+# repository: its name, the other machines' names, what it runs (its roles) and how many runners
+# of each kind it gets when no count is given here (README.md). On a machine with the role `main`
 # two main runners are added, and with the role `ordinary` one PR spare.
 #
 # --github-token and --github-app give the runner programs a GitHub identity of their own
-# (github_identity.py, README.md "The runners' own GitHub identity"): the file is checked against
-# GitHub and copied to ~/.config/example-app-runner, for this user alone, and never printed. Once
-# given, a later install keeps it. Without one they use your gh login.
+# (github_identity.py): the file is checked against GitHub and copied to
+# ~/.config/shipline-runner, for this user alone, and never printed. Once given, a later install
+# keeps it. Without one they use your gh login.
 #
-# It copies these files out of the repository, builds the images and starts the runners as services
-# of your user. The copy matters: what runs on this machine with your GitHub login must not change
-# because a pull request changed a file. To take a newer version, run this again from main.
+# It copies these files out of the checkout, renders the units for the prefix (render-units.sh),
+# builds the images and starts the runners as services of your user. The copy matters: what runs
+# on this machine with your GitHub login must not change because a pull request changed a file.
+# To take a newer version, run this again from main.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-installed=$HOME/.local/share/example-app-runner
 units=$HOME/.config/systemd/user
 . "$here/settings.sh"
 
-asked=
 github_token=
 github_app_id=
 github_app_key=
 while [ $# -gt 0 ]; do
   case "$1" in
-    --machine)
-      [ $# -ge 2 ] || { echo "--machine needs a name." >&2; exit 1; }
-      asked=$2
-      shift 2
-      ;;
     --github-token)
       [ $# -ge 2 ] || { echo "--github-token needs the file that holds the token." >&2; exit 1; }
       github_token=$2
@@ -56,41 +54,64 @@ if [ -n "$github_token" ] && [ -n "$github_app_id" ]; then
   echo "Give either --github-token or --github-app, not both." >&2
   exit 1
 fi
-known=$(cd "$here/machines" && ls -- *.sh | sed 's/\.sh$//' | tr '\n' ' ')
-# A machine installed before machines had names is the home machine (settings.sh).
+
+# The repository's own values, from its shipline.json (workflow_config.py). Only the lines a sh
+# can read: the values are quoted for it.
+config=$(python3 "$here/../scripts/workflow/workflow_config.py" shell) || exit 1
+eval "$(printf '%s\n' "$config" | grep -E '^(SHIPLINE_(REPOSITORY|RUNNER_PREFIX|RUNNER_LABEL|RUNNER_PLANNER_LABEL|RUNNER_IMAGE_BUILD|RUNNER_HUB_CACHE)=|export SHIPLINE_REPO=)')"
+if [ -z "$SHIPLINE_REPOSITORY" ] || [ -z "$SHIPLINE_RUNNER_PREFIX" ] ||
+  [ -z "$SHIPLINE_RUNNER_IMAGE_BUILD" ]; then
+  echo "$SHIPLINE_REPO/shipline.json must name the repository, runner.prefix and runner.image_build (runner/README.md)." >&2
+  exit 1
+fi
+
+# The machine's own: its name, the other machines', its roles and counts.
+machine=
+roles=
+other_machines=
+docker_runners=0
+machine_settings=${SHIPLINE_RUNNER_SETTINGS:-$HOME/.config/shipline/runner.sh}
+if [ ! -f "$machine_settings" ]; then
+  echo "This machine has no runner settings: write $machine_settings (runner/README.md)." >&2
+  exit 1
+fi
+. "$machine_settings"
+# The repository's names are its file's, whatever the machine's file says.
+repository=$SHIPLINE_REPOSITORY
+prefix=$SHIPLINE_RUNNER_PREFIX
+label=$SHIPLINE_RUNNER_LABEL
+planner_label=$SHIPLINE_RUNNER_PLANNER_LABEL
+checkout=$SHIPLINE_REPO
+installed=$HOME/.local/share/$prefix-runner
+# A name is one word of small letters and digits: it starts the runners' names (names.sh), and
+# the other machines' names go into a pattern.
+for name in "$machine" $other_machines; do
+  case "$name" in
+    '' | *[!a-z0-9]*)
+      echo "$machine_settings: '$name' is no machine name: one word of small letters and digits." >&2
+      exit 1
+      ;;
+  esac
+done
+if [ -z "$roles" ]; then
+  echo "$machine_settings names no roles: what this machine runs (runner/README.md)." >&2
+  exit 1
+fi
 recorded=
 if [ -f "$installed/pool-settings.sh" ]; then
   recorded=$(
-    machine=home
+    machine=
     . "$installed/pool-settings.sh"
     printf '%s' "$machine"
   )
 fi
 # Two machines with the same name would take each other's runner registrations (`--replace`) and
 # retire each other's runners, so a machine is never taken to be one it was not named.
-if [ -z "$asked$recorded" ]; then
-  echo "Say which machine this is: sh install.sh --machine <name>, one of: $known" >&2
+if [ -n "$recorded" ] && [ "$machine" != "$recorded" ]; then
+  echo "This machine's runners were installed as $recorded, not $machine. To rename it, stop its runners and remove $installed first." >&2
   exit 1
 fi
-if [ -n "$asked" ] && [ -n "$recorded" ] && [ "$asked" != "$recorded" ]; then
-  echo "This machine's runners were installed as $recorded, not $asked. To rename it, stop its runners and remove $installed first." >&2
-  exit 1
-fi
-machine=${asked:-$recorded}
-# A name is one word of small letters and digits: it starts the runners' names (names.sh).
-case "$machine" in
-  '' | *[!a-z0-9]*) known_machine=no ;;
-  *) case " $known" in *" $machine "*) known_machine=yes ;; *) known_machine=no ;; esac ;;
-esac
-if [ "$known_machine" = no ]; then
-  echo "There is no machine '$machine'; the machines are: $known" >&2
-  exit 1
-fi
-other_machines=$(printf '%s\n' $known | grep -vx -- "$machine" | tr '\n' ' ' | sed 's/ $//')
-# The machine's own roles and counts, in place of the defaults of settings.sh, and the memory cap
-# of one of its ordinary jobs when it names one.
-job_memory=
-. "$here/machines/$machine.sh"
+. "$here/names.sh"
 has_role() {
   case " $roles " in
     *" $1 "*) return 0 ;;
@@ -123,14 +144,14 @@ if ! [ "$runners" -ge 0 ] 2>/dev/null || ! [ "$docker_runners" -ge 0 ] 2>/dev/nu
   echo "There must be at least 1 ordinary runner, and at most $most_runners runners of both kinds together (including the spare)." >&2
   exit 1
 fi
-# Docker reads the cap as a whole number with its unit (runner-container.sh); pool-settings.sh is
-# read as shell, so nothing else is written into it.
+# The machine's own cap of one ordinary job, in place of settings.sh's `memory`. Docker reads it
+# as a whole number with its unit (runner-container.sh).
 size=
 case "$job_memory" in
   [1-9]*[kmg]) size=${job_memory%?} ;;
 esac
 if [ -n "$job_memory" ] && case "$size" in '' | *[!0-9]*) true ;; *) false ;; esac; then
-  echo "job_memory must be a size Docker reads, a whole number and k, m or g (6g), not '$job_memory'." >&2
+  echo "$machine_settings: job_memory must be a size Docker reads, a whole number and k, m or g (6g), not '$job_memory'." >&2
   exit 1
 fi
 ordinary_total=$((runners + spares))
@@ -144,36 +165,51 @@ if [ "$docker_runners" -gt 0 ] && ! [ -e "$kvm" ]; then
   echo "This machine cannot run virtual machines (no /dev/kvm), so it gets no runner with Docker." >&2
   docker_runners=0
 fi
+# The Docker Hub cache is the repository's (`runner.hub_cache`), and only for Docker runners.
+hub_cache=
+if [ -n "$SHIPLINE_RUNNER_HUB_CACHE" ] && has_role docker; then
+  hub_cache=yes
+fi
+
+# The GitHub programs as the installed runner programs run them: a copy with no config reader
+# beside it, so they keep their identity where those read it (github_identity.py). Gone at the end.
+tools=$(mktemp -d)
+trap 'rm -rf "$tools"' EXIT
+cp -L "$here/github_identity.py" "$here/github_budget.py" "$tools/"
+# The units for this prefix, rendered from systemd/.
+RUNNER_PREFIX=$prefix bash "$here/render-units.sh" "$tools/units"
 
 # Before anything is stopped or copied: a refused identity leaves the machine as it was. The
 # services running now take the new one at their next call.
 if [ -n "$github_token" ]; then
-  python3 "$here/github_identity.py" install --repository "$repository" --token "$github_token"
+  python3 "$tools/github_identity.py" install --repository "$repository" --token "$github_token"
 elif [ -n "$github_app_id" ]; then
-  python3 "$here/github_identity.py" install --repository "$repository" \
+  python3 "$tools/github_identity.py" install --repository "$repository" \
     --app "$github_app_id" "$github_app_key"
 fi
 # This script's own calls are the runner programs' too.
 gh() {
-  python3 "$here/github_budget.py" wait --identity runner runner-install &&
-    python3 "$here/github_budget.py" call --identity runner runner-install "$@"
+  python3 "$tools/github_budget.py" wait --identity runner runner-install &&
+    python3 "$tools/github_budget.py" call --identity runner runner-install "$@"
 }
 
 mkdir -p "$installed" "$units"
 sh "$here/install-github-budget.sh"
-cp "$here/Dockerfile" "$here/vm.Dockerfile" "$here"/*.sh "$here"/*.py "$installed/"
-rm -rf "$installed/vm"
+cp -L "$here"/*.sh "$here"/*.py "$installed/"
+rm -rf "$installed/vm" "$installed/systemd"
 cp -R "$here/vm" "$installed/vm"
-mkdir -p "$installed/systemd"
-cp "$here"/systemd/example-app-runner-firewall.service "$installed/systemd/"
-cp "$here"/systemd/example-app-runner-planner.service \
-  "$here"/systemd/example-app-runner-main*.service "$units/"
-cp "$here"/systemd/example-app-runner@.service "$here"/systemd/example-app-runner-docker@.service \
-  "$here"/systemd/example-app-hub-cache.service "$here"/systemd/example-app-hub-cache-watch.* \
-  "$here"/systemd/example-app-runner-spare.service "$here"/systemd/example-app-runner-lend.service \
-  "$here"/systemd/example-app-runner-image.* "$here"/systemd/example-app-runner-usage.* "$units/"
+cp -R "$here/systemd" "$installed/systemd"
+rendered=$tools/units
+cp "$rendered/$container-firewall.service" "$installed/systemd/"
+cp "$rendered/$container-planner.service" "$rendered/$container"-main*.service "$units/"
+cp "$rendered/$container@.service" "$rendered/$container-docker@.service" \
+  "$rendered/$container-spare.service" "$rendered/$container-lend.service" \
+  "$rendered/$container"-image.* "$rendered/$container"-usage.* "$units/"
+if [ -n "$hub_cache" ]; then
+  cp "$rendered/$hub_cache_container.service" "$rendered/$hub_cache_container"-watch.* "$units/"
+fi
 
-"$installed/build-images.sh"
+RUNNER_PREFIX=$prefix RUNNER_CHECKOUT=$checkout "$installed/build-images.sh"
 
 # Runners of an earlier install stop first: they hold containers of the old image, and their
 # networks may sit on addresses the new ones need. Each runner makes its own network again when it
@@ -182,22 +218,23 @@ systemctl --user daemon-reload
 # Save the concrete names before stopping anything, including services still starting up. Read
 # separately from awk so a failed systemctl call cannot silently leave recovery with no names.
 running=$(systemctl --user list-units --type=service --state=active,activating,reloading \
-  --no-legend --plain example-app-runner-main.service example-app-runner-main-2.service example-app-runner-planner.service \
-  example-app-runner-spare.service example-app-runner-lend.service \
-  'example-app-runner@*.service' 'example-app-runner-docker@*.service')
+  --no-legend --plain $container-main.service $container-main-2.service $container-planner.service \
+  $container-spare.service $container-lend.service \
+  "$container@*.service" "$container-docker@*.service")
 stopped=$(printf '%s\n' "$running" | awk '{print $1}')
 starting_pool=0
 recover_runners() {
   result=$?
   trap - EXIT INT TERM
+  rm -rf "$tools"
   if [ "$result" -ne 0 ]; then
     echo "Install failed; restarting the runner services that were running before it." >&2
     # A resize can put a new ordinary runner on an old Docker runner's address. Remove the
     # partial new pool before restoring old services, so two jobs never share that network.
-    if [ "$starting_pool" -eq 1 ] && ! systemctl --user stop example-app-runner-spare.service \
-      'example-app-runner@*.service' 'example-app-runner-docker@*.service' example-app-runner-main.service example-app-runner-main-2.service; then
+    if [ "$starting_pool" -eq 1 ] && ! systemctl --user stop $container-spare.service \
+      "$container@*.service" "$container-docker@*.service" $container-main.service $container-main-2.service; then
       echo "Could not stop the partial new pool; restoring old services could share job networks. To recover, run:" >&2
-      printf '%s' "systemctl --user stop example-app-runner-spare.service 'example-app-runner@*.service' 'example-app-runner-docker@*.service' example-app-runner-main.service example-app-runner-main-2.service" >&2
+      printf '%s' "systemctl --user stop $container-spare.service '$container@*.service' '$container-docker@*.service' $container-main.service $container-main-2.service" >&2
       if [ -n "$stopped" ]; then
         printf '%s' ' && systemctl --user start' >&2
         printf ' %s' $stopped >&2
@@ -216,12 +253,19 @@ recover_runners() {
 trap recover_runners EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-systemctl --user stop example-app-runner-main.service example-app-runner-main-2.service example-app-runner-planner.service example-app-runner-spare.service example-app-runner-lend.service 'example-app-runner@*.service' 'example-app-runner-docker@*.service'
-# What every script of this machine reads after settings.sh: which machine it is and its counts.
+systemctl --user stop $container-main.service $container-main-2.service $container-planner.service $container-spare.service $container-lend.service "$container@*.service" "$container-docker@*.service"
+# What every script of this machine reads after settings.sh: the repository's names, its main
+# checkout, which machine this is and its counts. Each value is quoted for sh.
+quoted() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 {
-  printf 'machine=%s\n' "$machine"
-  printf "roles='%s'\n" "$roles"
-  printf "other_machines='%s'\n" "$other_machines"
+  printf 'repository=%s\n' "$(quoted "$repository")"
+  printf 'prefix=%s\n' "$(quoted "$prefix")"
+  printf 'label=%s\n' "$(quoted "$label")"
+  printf 'planner_label=%s\n' "$(quoted "$planner_label")"
+  printf 'checkout=%s\n' "$(quoted "$checkout")"
+  printf 'machine=%s\n' "$(quoted "$machine")"
+  printf 'roles=%s\n' "$(quoted "$roles")"
+  printf 'other_machines=%s\n' "$(quoted "$other_machines")"
   printf 'ordinary_jobs=%s\n' "$runners"
   printf 'ordinary_blacksmith_jobs=%s\n' "$ordinary_blacksmith_jobs"
   [ -z "$job_memory" ] || printf 'job_memory=%s\n' "$job_memory"
@@ -233,7 +277,7 @@ done
 # Restore CI routing before registration retries and cache startup. Image builds happened before
 # stopping any runners, so an existing planner stayed available during them.
 if has_role planner; then
-  systemctl --user enable --now example-app-runner-planner.service
+  systemctl --user enable --now $container-planner.service
 fi
 
 delete_retired_runner() {
@@ -265,7 +309,6 @@ delete_retired_runner() {
 # outside the new ordinary range are definitively retired. Do not touch Docker or foreign names,
 # nor the runners of another machine (names.sh), whose numbers are counted by that machine.
 # Read separately from the filtering pipeline so a failed/partial API read aborts installation.
-. "$here/names.sh"
 registered=$(gh api --paginate "repos/$repository/actions/runners" --jq '.runners[] | [.id, .name] | @tsv')
 retired=$(printf '%s\n' "$registered" | awk -F '\t' -v total="$ordinary_total" \
   -v own="$own_runner" -v at="$own_number_at" \
@@ -277,47 +320,47 @@ done
 # a Docker-capable runner left enabled could take the place in the address range of an ordinary
 # one, and the two jobs would share a network. Every runner is switched off here; the ones asked
 # for are switched on below.
-rm -f "$units"/default.target.wants/example-app-runner@*.service \
-  "$units"/default.target.wants/example-app-runner-docker@*.service
-has_role planner || rm -f "$units"/default.target.wants/example-app-runner-planner.service
-has_role main || rm -f "$units"/default.target.wants/example-app-runner-main.service \
-  "$units"/default.target.wants/example-app-runner-main-2.service \
-  "$units"/default.target.wants/example-app-runner-lend.service
-has_role ordinary || rm -f "$units"/default.target.wants/example-app-runner-spare.service
+rm -f "$units"/default.target.wants/$container@*.service \
+  "$units"/default.target.wants/$container-docker@*.service
+has_role planner || rm -f "$units"/default.target.wants/$container-planner.service
+has_role main || rm -f "$units"/default.target.wants/$container-main.service \
+  "$units"/default.target.wants/$container-main-2.service \
+  "$units"/default.target.wants/$container-lend.service
+has_role ordinary || rm -f "$units"/default.target.wants/$container-spare.service
 systemctl --user daemon-reload
 
 # The mirror is an optimization, never a runner dependency. Its service retries if Docker Hub
 # is temporarily unavailable even for the registry image; Docker in a VM falls back to Hub.
-if has_role docker; then
-  systemctl --user enable --now example-app-hub-cache.service ||
+if [ -n "$hub_cache" ]; then
+  systemctl --user enable --now "$hub_cache_container.service" ||
     echo "The Docker Hub cache could not start; jobs will pull directly from Docker Hub." >&2
-  systemctl --user enable --now example-app-hub-cache-watch.timer
+  systemctl --user enable --now "$hub_cache_container-watch.timer"
 fi
-systemctl --user enable --now example-app-runner-image.timer
+systemctl --user enable --now $container-image.timer
 # One line a minute of what the machine has free (usage.py), on every machine.
-systemctl --user enable --now example-app-runner-usage.timer
+systemctl --user enable --now $container-usage.timer
 starting_pool=1
 # Main's runner takes place 14, where an older install's Docker runner may be: it is part of the
 # new pool that a failed install stops before restoring the old services.
 if has_role main; then
-  systemctl --user enable --now example-app-runner-main.service
-  systemctl --user enable --now example-app-runner-main-2.service
+  systemctl --user enable --now $container-main.service
+  systemctl --user enable --now $container-main-2.service
 fi
 number=1
 while [ "$number" -le "$ordinary_total" ]; do
-  systemctl --user enable --now "example-app-runner@$number.service"
+  systemctl --user enable --now "$container@$number.service"
   number=$((number + 1))
 done
 if has_role ordinary; then
-  systemctl --user enable --now example-app-runner-spare.service
+  systemctl --user enable --now $container-spare.service
 fi
 # After main's runners and the PR pool: it lends one of main's idle runners to PR jobs.
 if has_role main; then
-  systemctl --user enable --now example-app-runner-lend.service
+  systemctl --user enable --now $container-lend.service
 fi
 number=1
 while [ "$number" -le "$docker_runners" ]; do
-  systemctl --user enable --now "example-app-runner-docker@$number.service"
+  systemctl --user enable --now "$container-docker@$number.service"
   number=$((number + 1))
 done
 
@@ -325,12 +368,12 @@ main_runners=0
 ! has_role main || main_runners=2
 echo "Installed on $machine: $runners PR job slots, $spares spare, $main_runners reserved for main, and $docker_runners with Docker."
 ! has_role planner || echo "This machine also runs the CI planner."
-identity=$HOME/.config/example-app-runner
+identity=$HOME/.config/shipline-runner
 if [ -e "$identity/token" ] || [ -e "$identity/app-id" ]; then
   echo "GitHub: the runner programs use their own GitHub identity, from $identity."
 else
   echo "GitHub: the runner programs use your gh login and its hourly budget. To give them their own"
-  echo "  identity, see \"The runners' own GitHub identity\" in .github/runner/README.md."
+  echo "  identity, run this again with --github-token or --github-app."
 fi
 echo "VM idle memory: virtio-balloon-pci,free-page-reporting=on (the job memory cap is unchanged)."
 echo "They wait until the firewall is in place:"

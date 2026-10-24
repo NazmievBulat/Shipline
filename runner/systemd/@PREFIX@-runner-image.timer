@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly rebuild of the @PREFIX@ CI runner images (GitHub refuses runners that fall far behind)
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

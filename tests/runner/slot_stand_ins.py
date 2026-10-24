@@ -1,5 +1,5 @@
-"""A machine of the runner pool, installed by `runner/install.sh` from a copy of `runner/`, with
-stand-ins for what its scripts touch.
+"""A machine of the runner pool, installed by `runner/install.sh` from a repository's main checkout,
+with stand-ins for what its scripts touch.
 
 `systemctl`, `docker`, `loginctl`, `sleep` and `gh` are small scripts placed first on the `PATH`;
 they write what they were asked to a log. `gh` keeps GitHub's runner list in a file the test
@@ -130,9 +130,9 @@ class Machine:
         return self.root / "state"
 
     @property
-    def source(self) -> Path:
-        """The copy of `runner/` that is installed from."""
-        return self.root / "source"
+    def checkout(self) -> Path:
+        """The repository's main checkout, which install.sh runs in."""
+        return self.root / "checkout"
 
     @property
     def installed(self) -> Path:
@@ -151,19 +151,19 @@ class Machine:
     ) -> None:
         """Write the machine's local settings: its ordinary pull request slots, whether it is
         the only machine of the pool, the memory cap of one ordinary job, and its spares."""
-        machines = self.source / "machines"
-        shutil.rmtree(machines, ignore_errors=True)
-        machines.mkdir()
-        if not alone:
-            (machines / f"{OTHER}.sh").write_text(
-                "roles='ordinary'\nordinary_jobs=2\ndocker_runners=0\n"
-            )
-        lines = ["roles='ordinary'", f"ordinary_jobs={slots}", "docker_runners=0"]
+        settings = self.root / "home" / ".config" / "shipline" / "runner.sh"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            f"machine={self.name}",
+            f"other_machines={'' if alone else OTHER}",
+            "roles='ordinary'",
+            f"ordinary_jobs={slots}",
+        ]
         if job_memory is not None:
             lines.append(f"job_memory={job_memory}")
         if spares is not None:
             lines.append(f"ordinary_spares={spares}")
-        (machines / f"{self.name}.sh").write_text("\n".join(lines) + "\n")
+        settings.write_text("\n".join(lines) + "\n")
 
     def runners(self, *listed: tuple[str, str, list[str]]) -> None:
         """What GitHub lists: (name, status, labels) of each runner."""
@@ -204,7 +204,7 @@ class Machine:
         )
 
     def install(self) -> subprocess.CompletedProcess[str]:
-        return self._run("sh", str(self.source / "install.sh"), "--machine", self.name)
+        return self._run("sh", str(RUNNER / "install.sh"), cwd=self.checkout)
 
     def installed_as(self, slots: int, **settings: str | int) -> None:
         """Install the machine with its settings, then forget what the install called."""
@@ -240,9 +240,9 @@ class Machine:
         done = self._run(
             "sh",
             "-c",
-            ". ./settings.sh && . ./pool-settings.sh && python3 ./ordinary_slots.py "
-            '"$ordinary_jobs" "$ordinary_blacksmith_jobs" "$repository" '
-            '"$other_machines" "$label" "$1"',
+            ". ./settings.sh && . ./pool-settings.sh && . ./names.sh && python3 ./ordinary_slots.py "
+            '"$ordinary_jobs" "$ordinary_blacksmith_jobs" "$repository" "$label" '
+            '"$other_machines" "$1"',
             "ordinary-slots",
             str(listing),
             cwd=self.installed,
@@ -255,7 +255,7 @@ class Machine:
         return self._run(
             "sh",
             "-c",
-            ". ./settings.sh && . ./pool-settings.sh && . ./runner-container.sh && "
+            ". ./settings.sh && . ./pool-settings.sh && . ./names.sh && . ./runner-container.sh && "
             f"start_container ordinary {PREFIX}-runner-1 {PREFIX}-runner-1 </dev/null",
             cwd=self.installed,
         )
@@ -266,13 +266,15 @@ class Machine:
         return [line for line in lines if line.split(" ", 1)[0] == program]
 
 
+def _git(machine: Machine, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments], cwd=machine.checkout, env=machine.env, capture_output=True, check=True
+    )
+
+
 def make_machine(root: Path) -> Machine:
     machine = Machine(root)
     machine.state.mkdir(parents=True)
-    shutil.copytree(RUNNER, machine.source)
-    # The images are built by a stand-in docker; install.sh copies their Dockerfiles.
-    (machine.source / "Dockerfile").touch()
-    (machine.source / "vm.Dockerfile").touch()
     stand_ins = root / "bin"
     stand_ins.mkdir()
     for program, text in {**_STAND_INS, "gh": _GH}.items():
@@ -282,12 +284,28 @@ def make_machine(root: Path) -> Machine:
     machine.runners()
     home = root / "home"
     home.mkdir()
-    real = {os.path.dirname(shutil.which(tool) or "/usr/bin/x") for tool in ("python3", "jq")}
+    real = {
+        os.path.dirname(shutil.which(tool) or "/usr/bin/x") for tool in ("python3", "jq", "git")
+    }
     machine.env = {
         "PATH": ":".join([str(stand_ins), *sorted(real), "/usr/bin", "/bin"]),
         "HOME": str(home),
-        "RUNNER_PREFIX": PREFIX,
+        "LANG": "C.UTF-8",
         "RUNNER_KVM_DEVICE": str(root / "no-kvm"),
         "WORKFLOW_GITHUB_RAW_GH": str(stand_ins / "gh"),
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_AUTHOR_NAME": "Tester",
+        "GIT_AUTHOR_EMAIL": "tester@example.com",
+        "GIT_COMMITTER_NAME": "Tester",
+        "GIT_COMMITTER_EMAIL": "tester@example.com",
     }
+    # The repository's shipline.json on main, as last fetched: it names the pool.
+    machine.checkout.mkdir()
+    _git(machine, "init", "--quiet", "--initial-branch=main")
+    config = {"repository": REPOSITORY, "runner": {"prefix": PREFIX, "image_build": "true"}}
+    (machine.checkout / "shipline.json").write_text(json.dumps(config))
+    _git(machine, "add", "--all")
+    _git(machine, "commit", "--quiet", "-m", "main")
+    _git(machine, "update-ref", "refs/remotes/origin/main", "HEAD")
     return machine

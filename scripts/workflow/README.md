@@ -12,7 +12,12 @@ inside Shipline. The first time, the launcher is run by its path:
 ```
 
 Each of the two writes the launcher of this checkout and the repository's main checkout, and
-points the link `~/.local/bin/shipline` at that launcher. The repository is the main checkout
+points the link `~/.local/bin/shipline` at that launcher. `shipline uninstall` takes it all off
+in one step: it puts back exactly the hooks and the timer the two replaced (kept in
+`~/.claude/settings.json.shipline-replaced` and as `workflow-tick.*.before-shipline`), or
+switches Shipline's timer off when there was none. A sentence that tells a session to run a
+command names the launcher by its absolute path, so a session started before the switch runs
+it too. The repository is the main checkout
 `--repo` names, else `SHIPLINE_REPO`, else the one the current folder is in; outside any
 repository, with none named, a command stops and says how to name one. A command started
 outside the repository runs in its main checkout. Every session gets `SHIPLINE_REPO` and the
@@ -37,6 +42,11 @@ Cloud uses the same screen exclusions as Codex: screen changes and unclear tasks
 with no diff stay with local Claude. Test IDs and data-only route lists retain the
 existing exceptions. A cloud-built ticket returns to the cloud for a fix round,
 even after the default changes, subject to the same screen exclusions.
+A ticket's own record, the single word `cloud`, `claude` or `codex` in
+`.local/workflow/worker-program-N`, overrides the default and these fix-round
+markers for that ticket, under the same screen exclusions; only a cloud
+reservation outranks it. A record holding anything else is read as no record,
+and the wake names it once.
 Independent reviewers always stay local.
 
 Cloud starts bypass the local memory and load checks. The tick waits when the
@@ -76,10 +86,15 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `workflows.ci`, `workflows.e2e`, `workflows.images` | the workflow files under `.github/workflows/` | `ci.yml`, `e2e.yml`, `images.yml` |
 | `labels.workflow`, `labels.audited` | the label that starts a ticket, and an audit's | `workflow`, `audited` |
 | `labels.priority.blocker` … `.low` | the four priority labels | `priority: blocker` … `priority: low` |
-| `runner.labels` | the runner labels the merge gate may re-run failed jobs on | built from `runner.prefix` and the machines in `~/.config/shipline/runner.sh` (`runner/README.md`); without a prefix, none: the gate re-runs nothing |
+| `runner.labels` | the runner labels the merge gate may re-run failed jobs on | the ones built from `runner.label`: `<label>`, `<label>-standby`, `<label>-first`, `<label>-main`, `<label>-docker`, and `runner.planner_label`; without a label, none: the gate re-runs nothing |
+| `runner.label` | the base label every machine's runners carry, so GitHub gives a job to whichever machine has one free (`runner/README.md`) | `<prefix>-home`; none without a prefix |
+| `runner.planner_label` | the label the CI planner's runner carries | `<label>-planner` |
 | `runner.prefix` | the one word the runner pool (`runner/`) names everything by: its images, network, services and containers, `<prefix>-runner…`, and its labels; `workflow-metrics` reads the CPU of the `<prefix>-runner…` services and containers | none: no runner figures |
-| `runner.image_build` | the command line, run from the main checkout, that builds the runner images | none: the pool builds its own Dockerfile |
+| `runner.image_build` | the command line, run on main's files, that builds the runner images `<prefix>-runner` and `<prefix>-runner-docker` | none: the runner pool cannot be installed |
+| `runner.hub_cache` | the command line, run on main's files, that runs the Docker Hub cache of the Docker-capable runners | none: no cache, and their virtual machines pull from Docker Hub |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
+| `hunts.areas` | the areas of the application two hunts may keep to at once: an object of each area's name (small letters, digits and dashes) to its screens, paths starting with `/` without a space, comma, quotation mark, dollar, backtick or backslash | none: one hunt runs at a time, on every screen |
+| `hunts.plans` | the repository's file of hunt plans, which the sentence of a hunt with a plan names | none: the sentence names no file |
 | `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs on the home machine, as the runner programs' own GitHub identity (github_identity.py), or
+# Runs on a machine of the pool, as the runner programs' own GitHub identity (github_identity.py), or
 # without one as the person who is logged in to GitHub with `gh`. It keeps one runner
 # waiting for work: each time round it asks GitHub for a registration token (good for one hour),
 # starts a fresh container that takes one job, and starts another when that container is gone. So
@@ -13,19 +13,20 @@ number=$1
 kind=${2:-ordinary}
 here=$(dirname "$0")
 . "$here/settings.sh"
-# The machine's name, which starts the runner's: install.sh writes it.
+# The repository's names and the machine's, which starts the runner's: install.sh writes them.
 if [ -f "$here/pool-settings.sh" ]; then
   . "$here/pool-settings.sh"
 fi
+. "$here/names.sh"
 . "$here/runner-container.sh"
 
 if [ "$kind" = planner ]; then
-  name=example-app-runner-planner
+  name=$container-planner
   runner_name=$machine-planner
   runner_label=$planner_label
   place=$planner_place
 elif [ "$kind" = main ]; then
-  name=example-app-runner-main
+  name=$container-main
   runner_name=$machine-main
   runner_label=$main_label
   place=$((main_place - (number > 1 ? number - 1 : 0)))
@@ -34,12 +35,12 @@ elif [ "$kind" = main ]; then
     runner_name="$runner_name-$number"
   fi
 elif [ "$kind" = docker ]; then
-  name="example-app-runner-docker-$number"
+  name="$container-docker-$number"
   runner_name="$machine-docker-$number"
   runner_label=$docker_label
   place=$((most_runners + 1 - number))
 else
-  name="example-app-runner-$number"
+  name="$container-$number"
   runner_name="$machine-$number"
   runner_label=$standby_label
   place=$number
@@ -65,7 +66,7 @@ while true; do
   python3 "$here/github_budget.py" wait --identity runner keep-runner
   started=$(date +%s)
   succeeded=0
-  # No firewall, no runner: a job must not be able to reach this machine or the home network.
+  # No firewall, no runner: a job must not be able to reach this machine or its local network.
   # RUNNER_WITHOUT_FIREWALL=1 skips both checks, for a first trial.
   if ! network_at "$place"; then
     echo "Could not make the network $network-$place. Not starting a runner."

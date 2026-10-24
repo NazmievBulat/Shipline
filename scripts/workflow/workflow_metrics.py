@@ -244,7 +244,9 @@ def _groups(prefix: str | None) -> dict[str, int]:
     `<prefix>-runner…`. A group's time holds its children's: nothing below a matched group is
     read again."""
     found: dict[str, int] = {}
-    pool = prefix and re.compile(rf"{re.escape(prefix)}-runner(?:-.+)?\.(?:service|scope)")
+    # `<prefix>-runner@1.service` is an ordinary runner, `<prefix>-runner-lend.service` another
+    # of the pool's units.
+    pool = prefix and re.compile(rf"{re.escape(prefix)}-runner(?:[-@].+)?\.(?:service|scope)")
     for folder, children, _files in os.walk(CGROUP_ROOT):
         name = os.path.basename(folder)
         key = None

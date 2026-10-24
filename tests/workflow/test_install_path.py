@@ -442,13 +442,14 @@ _SENTENCES_BEFORE = {
     "status check": "3e8d5f12c6bdb570b59ceddfe8f2125e3fdade3efa60145fdfab708ddd9aa3e7",
     "train wait": "f0a253050d62873459e22be5ac48a72322b68bf89e4b5a1d1463e5d0c480e8c9",
 }
-# What changed in them: the command's path became `shipline <command>`.
-_COMMAND_PATHS = {"shipline notify waiting": "scripts/workflow/notify waiting"}
+# What changed in them: the command's path became the launcher's absolute path, which a session
+# started before the switch runs without Shipline's `bin` on its PATH.
+_COMMANDS = {"notify waiting"}
 
 
-def _as_before(sentence: str) -> str:
-    for now, before in _COMMAND_PATHS.items():
-        sentence = sentence.replace(now, before)
+def _as_before(sentence: str, launcher: Path) -> str:
+    for command in _COMMANDS:
+        sentence = sentence.replace(f"{launcher} {command}", f"scripts/workflow/{command}")
     return sentence
 
 
@@ -482,11 +483,12 @@ def test_each_sentence_is_as_before_with_only_the_command_paths_changed(
 ) -> None:
     sentences = {"status check": _status_check(github.workflow), "train wait": _train_wait(github)}
 
+    launcher = github.workflow.home / "bin" / "shipline"
     for name, sentence in sentences.items():
-        assert "shipline notify waiting" in sentence, name
+        assert f"{launcher} notify waiting" in sentence, name
         assert "scripts/workflow" not in sentence, name
     assert {
-        name: hashlib.sha256(_as_before(sentence).encode()).hexdigest()
+        name: hashlib.sha256(_as_before(sentence, launcher).encode()).hexdigest()
         for name, sentence in sentences.items()
     } == _SENTENCES_BEFORE
 

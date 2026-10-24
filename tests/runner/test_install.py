@@ -1,7 +1,11 @@
-"""`install.sh` installs a machine with no ordinary slot of its own while the pool has another
-machine to take its pull request jobs, keeping its spare, and writes the machine's own memory cap
-of one ordinary job, which its job containers get."""
+"""`runner/install.sh` installs a machine's runners: the repository's names from its shipline.json,
+the machine's own name, roles and counts from `~/.config/shipline/runner.sh`, the units rendered
+for the prefix. `systemctl`, `docker`, `loginctl` and `gh` are stand-ins that write down what
+they were asked: nothing is installed on the machine the tests run on."""
 
+import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -13,9 +17,255 @@ from slot_stand_ins import (
     ordinary_unit,
 )
 
+_ROOT = Path(__file__).resolve().parents[2]
+_INSTALL = _ROOT / "runner/install.sh"
+_EXPECTED = Path(__file__).resolve().parent / "expected/units"
+
+_LOGGED = '#!/bin/sh\necho "{name} $*" >> "$CALLS"\n'
+
 
 @pytest.fixture
-def machine(tmp_path: Path) -> Machine:
+def machine(tmp_path: Path) -> Path:
+    """A home folder, stand-ins first on the PATH, and the repository's main checkout."""
+    home = tmp_path / "home"
+    home.mkdir()
+    bin_folder = tmp_path / "bin"
+    bin_folder.mkdir()
+    for name in ("systemctl", "docker", "gh"):
+        (bin_folder / name).write_text(_LOGGED.format(name=name))
+    (bin_folder / "loginctl").write_text("#!/bin/sh\necho yes\n")
+    for program in bin_folder.iterdir():
+        program.chmod(0o755)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _git(tmp_path, "init", "--quiet", "--initial-branch=main")
+    return tmp_path
+
+
+def _env(machine: Path) -> dict[str, str]:
+    return {
+        "PATH": f"{machine / 'bin'}:{os.environ['PATH']}",
+        "HOME": str(machine / "home"),
+        "LANG": "C.UTF-8",
+        "CALLS": str(machine / "calls.log"),
+        "BUILT": str(machine / "built"),
+        "WORKFLOW_GITHUB_RAW_GH": str(machine / "bin/gh"),
+        "RUNNER_KVM_DEVICE": str(machine / "kvm"),
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_AUTHOR_NAME": "Tester",
+        "GIT_AUTHOR_EMAIL": "tester@example.com",
+        "GIT_COMMITTER_NAME": "Tester",
+        "GIT_COMMITTER_EMAIL": "tester@example.com",
+    }
+
+
+def _git(machine: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args], cwd=machine / "checkout", env=_env(machine), capture_output=True, check=True
+    )
+
+
+def _repository(machine: Path, runner: dict[str, str]) -> None:
+    """The repository's shipline.json on main, as last fetched."""
+    config = {"repository": "example-owner/example-app", "runner": runner}
+    (machine / "checkout/shipline.json").write_text(json.dumps(config))
+    _git(machine, "add", "--all")
+    _git(machine, "commit", "--quiet", "-m", "main")
+    _git(machine, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+
+_RUNNER = {"prefix": "example-app", "image_build": 'echo built >> "$BUILT"'}
+_SETTINGS = "machine=home\nroles='main ordinary planner'\nother_machines=office\nordinary_jobs=2\n"
+
+
+def _settings(machine: Path, text: str = _SETTINGS) -> Path:
+    path = machine / "home/.config/shipline/runner.sh"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def _install(machine: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["sh", str(_INSTALL), *args],
+        cwd=machine / "checkout",
+        env=_env(machine),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def _calls(machine: Path, program: str) -> list[str]:
+    log = machine / "calls.log"
+    lines = log.read_text().splitlines() if log.exists() else []
+    return [line.removeprefix(f"{program} ") for line in lines if line.startswith(f"{program} ")]
+
+
+def _installed(machine: Path) -> Path:
+    return machine / "home/.local/share/example-app-runner"
+
+
+def test_a_machine_s_runners_are_installed_by_the_prefix_and_its_own_settings(
+    machine: Path,
+) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine)
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert "Installed on home: 2 PR job slots, 1 spare, 2 reserved for main" in done.stdout
+    settings = (_installed(machine) / "pool-settings.sh").read_text().splitlines()
+    assert settings == [
+        "repository='example-owner/example-app'",
+        "prefix='example-app'",
+        "label='example-app-home'",
+        "planner_label='example-app-home-planner'",
+        f"checkout='{machine / 'checkout'}'",
+        "machine='home'",
+        "roles='main ordinary planner'",
+        "other_machines='office'",
+        "ordinary_jobs=2",
+        "ordinary_blacksmith_jobs=1",
+    ]
+    # The repository's own command built the images, on main's files.
+    assert (machine / "built").read_text() == "built\n"
+    # The units are the ones rendered for the prefix; without a cache command, no cache units.
+    units = machine / "home/.config/systemd/user"
+    installed = sorted(path.name for path in units.iterdir() if path.is_file())
+    assert installed == sorted(
+        name for name in os.listdir(_EXPECTED) if "hub-cache" not in name and "firewall" not in name
+    )
+    for name in installed:
+        assert (units / name).read_text() == (_EXPECTED / name).read_text(), name
+    firewall = _installed(machine) / "systemd/example-app-runner-firewall.service"
+    assert firewall.read_text() == (_EXPECTED / firewall.name).read_text()
+    started = [call for call in _calls(machine, "systemctl") if call.startswith("--user enable")]
+    assert started == [
+        "--user enable --now example-app-runner-planner.service",
+        "--user enable --now example-app-runner-image.timer",
+        "--user enable --now example-app-runner-usage.timer",
+        "--user enable --now example-app-runner-main.service",
+        "--user enable --now example-app-runner-main-2.service",
+        "--user enable --now example-app-runner@1.service",
+        "--user enable --now example-app-runner@2.service",
+        "--user enable --now example-app-runner@3.service",
+        "--user enable --now example-app-runner-spare.service",
+        "--user enable --now example-app-runner-lend.service",
+    ]
+    # The programs that use GitHub are copies, not links into the checkout.
+    assert not (_installed(machine) / "github_budget.py").is_symlink()
+    assert (_installed(machine) / "github_budget.py").is_file()
+
+
+def test_a_docker_machine_gets_the_cache_only_when_the_repository_runs_one(machine: Path) -> None:
+    (machine / "kvm").touch()
+    _settings(machine, "machine=office\nroles='docker'\ndocker_runners=1\n")
+    _repository(machine, {**_RUNNER, "hub_cache": "tools/hub-cache"})
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    units = machine / "home/.config/systemd/user"
+    assert (units / "example-app-hub-cache.service").is_file()
+    assert (units / "example-app-hub-cache-watch.timer").is_file()
+    started = [call for call in _calls(machine, "systemctl") if call.startswith("--user enable")]
+    assert "--user enable --now example-app-hub-cache.service" in started
+    assert "--user enable --now example-app-runner-docker@1.service" in started
+
+
+def test_without_a_cache_command_a_docker_machine_gets_no_cache(machine: Path) -> None:
+    (machine / "kvm").touch()
+    _settings(machine, "machine=office\nroles='docker'\ndocker_runners=1\n")
+    _repository(machine, _RUNNER)
+
+    done = _install(machine)
+
+    assert done.returncode == 0, done.stderr
+    assert not (machine / "home/.config/systemd/user/example-app-hub-cache.service").exists()
+    assert not [call for call in _calls(machine, "systemctl") if "hub-cache" in call]
+
+
+def test_the_machine_settings_file_may_be_named(machine: Path) -> None:
+    _repository(machine, _RUNNER)
+    elsewhere = machine / "elsewhere.sh"
+    elsewhere.write_text(_SETTINGS.replace("machine=home", "machine=desk"))
+
+    done = subprocess.run(
+        ["sh", str(_INSTALL)],
+        cwd=machine / "checkout",
+        env={**_env(machine), "SHIPLINE_RUNNER_SETTINGS": str(elsewhere)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert "machine='desk'" in (_installed(machine) / "pool-settings.sh").read_text()
+
+
+@pytest.mark.parametrize(
+    "settings,said",
+    [
+        (None, "write"),
+        ("roles='ordinary'\n", "no machine name"),
+        ("machine=Home\nroles='ordinary'\n", "no machine name"),
+        ("machine=home\nother_machines='office x|y'\nroles='ordinary'\n", "no machine name"),
+        ("machine=home\n", "names no roles"),
+    ],
+    ids=["no file", "no machine", "capital", "a pattern", "no roles"],
+)
+def test_a_machine_without_usable_settings_is_refused_before_anything_is_installed(
+    machine: Path, settings: str | None, said: str
+) -> None:
+    _repository(machine, _RUNNER)
+    if settings is not None:
+        _settings(machine, settings)
+
+    done = _install(machine)
+
+    assert done.returncode != 0
+    assert said in done.stderr
+    assert not _installed(machine).exists()
+    assert not _calls(machine, "systemctl")
+
+
+@pytest.mark.parametrize("runner", [{"image_build": "true"}, {"prefix": "example-app"}])
+def test_a_repository_that_names_no_prefix_or_no_image_build_is_refused(
+    machine: Path, runner: dict[str, str]
+) -> None:
+    _repository(machine, runner)
+    _settings(machine)
+
+    done = _install(machine)
+
+    assert done.returncode != 0
+    assert "runner.prefix and runner.image_build" in done.stderr
+    assert not _calls(machine, "systemctl")
+
+
+def test_a_machine_is_never_taken_to_be_one_it_was_not_named(machine: Path) -> None:
+    _repository(machine, _RUNNER)
+    _settings(machine)
+    assert _install(machine).returncode == 0
+    _settings(machine, _SETTINGS.replace("machine=home", "machine=desk"))
+
+    done = _install(machine)
+
+    assert done.returncode != 0
+    assert "installed as home, not desk" in done.stderr
+
+
+# A machine that gives all its PR slots to the other machines of its pool, and a machine's own
+# memory cap of one ordinary job (README.md, "Moving a machine's PR slots").
+
+
+@pytest.fixture
+def pool_machine(tmp_path: Path) -> Machine:
     return make_machine(tmp_path)
 
 
@@ -23,77 +273,85 @@ def _enabled(machine: Machine) -> list[str]:
     return [call.split()[-1] for call in machine.calls("systemctl") if " enable --now " in call]
 
 
-def test_a_machine_of_a_pool_of_several_installs_with_no_ordinary_slot(machine: Machine) -> None:
-    machine.settle(slots=0)
+def test_a_machine_of_a_pool_of_several_installs_with_no_ordinary_slot(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.settle(slots=0)
 
-    done = machine.install()
+    done = pool_machine.install()
 
     assert done.returncode == 0, done.stderr
     assert "0 PR job slots, 1 spare" in done.stdout
-    assert "ordinary_jobs=0" in machine.pool_settings.read_text().splitlines()
+    assert "ordinary_jobs=0" in pool_machine.pool_settings.read_text().splitlines()
 
 
 def test_a_machine_with_no_ordinary_slot_keeps_its_spare_runner_and_supervisor(
-    machine: Machine,
+    pool_machine: Machine,
 ) -> None:
-    machine.settle(slots=0)
+    pool_machine.settle(slots=0)
 
-    machine.install()
+    pool_machine.install()
 
-    enabled = _enabled(machine)
+    enabled = _enabled(pool_machine)
     assert ordinary_unit(1) in enabled
     assert ordinary_unit(2) not in enabled
     assert SPARE_UNIT in enabled
 
 
-def test_the_only_machine_of_the_pool_is_refused_with_no_ordinary_slot(machine: Machine) -> None:
-    machine.settle(slots=0, alone=True)
+def test_the_only_machine_of_the_pool_is_refused_with_no_ordinary_slot(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.settle(slots=0, alone=True)
 
-    done = machine.install()
+    done = pool_machine.install()
 
     assert done.returncode != 0
     assert "There must be at least 1 ordinary runner" in done.stderr
-    assert machine.calls("systemctl") == []
+    assert pool_machine.calls("systemctl") == []
 
 
-def test_a_machine_with_no_ordinary_slot_and_no_spare_is_refused(machine: Machine) -> None:
+def test_a_machine_with_no_ordinary_slot_and_no_spare_is_refused(pool_machine: Machine) -> None:
     """Its spare is what keeps pull request jobs running while no other machine is up."""
-    machine.settle(slots=0, spares=0)
+    pool_machine.settle(slots=0, spares=0)
 
-    done = machine.install()
+    done = pool_machine.install()
 
     assert done.returncode != 0
     assert "There must be at least 1 ordinary runner" in done.stderr
-    assert machine.calls("systemctl") == []
+    assert pool_machine.calls("systemctl") == []
 
 
-def test_the_machines_own_job_memory_is_written_into_its_pool_settings(machine: Machine) -> None:
-    machine.settle(slots=3, job_memory="6g")
+def test_the_machines_own_job_memory_is_written_into_its_pool_settings(
+    pool_machine: Machine,
+) -> None:
+    pool_machine.settle(slots=3, job_memory="6g")
 
-    done = machine.install()
-
-    assert done.returncode == 0, done.stderr
-    assert "job_memory=6g" in machine.pool_settings.read_text().splitlines()
-
-
-def test_a_machine_without_a_job_memory_of_its_own_writes_none(machine: Machine) -> None:
-    machine.settle(slots=3)
-
-    done = machine.install()
+    done = pool_machine.install()
 
     assert done.returncode == 0, done.stderr
-    assert "job_memory" not in machine.pool_settings.read_text()
+    assert "job_memory=6g" in pool_machine.pool_settings.read_text().splitlines()
+
+
+def test_a_machine_without_a_job_memory_of_its_own_writes_none(pool_machine: Machine) -> None:
+    pool_machine.settle(slots=3)
+
+    done = pool_machine.install()
+
+    assert done.returncode == 0, done.stderr
+    assert "job_memory" not in pool_machine.pool_settings.read_text()
 
 
 @pytest.mark.parametrize("given", ["6", "6 g", "6g; reboot", "$(id)", "0g", "6G", "6g\n7g"])
-def test_a_job_memory_docker_cannot_read_as_a_size_is_refused(machine: Machine, given: str) -> None:
-    machine.settle(slots=3, job_memory=f"'{given}'")
+def test_a_job_memory_docker_cannot_read_as_a_size_is_refused(
+    pool_machine: Machine, given: str
+) -> None:
+    pool_machine.settle(slots=3, job_memory=f"'{given}'")
 
-    done = machine.install()
+    done = pool_machine.install()
 
     assert done.returncode != 0
     assert "job_memory" in done.stderr
-    assert machine.calls("systemctl") == []
+    assert pool_machine.calls("systemctl") == []
 
 
 def _memory_of_the_job_container(machine: Machine) -> str:
@@ -103,15 +361,15 @@ def _memory_of_the_job_container(machine: Machine) -> str:
     return run[run.index("--memory") + 1]
 
 
-def test_a_job_container_is_capped_at_the_machines_own_job_memory(machine: Machine) -> None:
-    machine.installed_as(slots=3, job_memory="6g")
+def test_a_job_container_is_capped_at_the_machines_own_job_memory(pool_machine: Machine) -> None:
+    pool_machine.installed_as(slots=3, job_memory="6g")
 
-    assert _memory_of_the_job_container(machine) == "6g"
+    assert _memory_of_the_job_container(pool_machine) == "6g"
 
 
 def test_a_job_container_is_capped_at_the_shared_value_when_the_machine_names_none(
-    machine: Machine,
+    pool_machine: Machine,
 ) -> None:
-    machine.installed_as(slots=3)
+    pool_machine.installed_as(slots=3)
 
-    assert _memory_of_the_job_container(machine) == SHARED_JOB_MEMORY
+    assert _memory_of_the_job_container(pool_machine) == SHARED_JOB_MEMORY
