@@ -569,9 +569,10 @@ while read -r name state _; do
     [[ $in_line == false && -e $notes.checks-wait ]] || continue
     mark=$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head
     [[ ! -e $mark ]] || continue
-    python3 -B "$here/tick_lost_check.py" "$main/$SHIPLINE_STATE_FOLDER" "$number" <<<"$pull" 9>&-
+    WORKFLOW_BACKGROUND_GITHUB=1 python3 -B "$here/tick_lost_check.py" \
+      "$main/$SHIPLINE_STATE_FOLDER" "$number" <<<"$pull" 9>&-
     found=$?
-    ((found != 1)) || continue
+    ((found != 3)) || continue
     ((found == 0)) || { failed=1; continue; }
     lost=true
   fi

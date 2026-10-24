@@ -1,11 +1,13 @@
 """A check GitHub still lists as running after its run completed: the gate runs CI again."""
 
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+from workflow_harness import Workflow
 from workflow.test_merge_when_current import (
     GitHub,
     line_up,
@@ -553,3 +555,56 @@ def test_a_run_is_read_once_per_tick_before_the_gate(github: GitHub, readable: b
         # The cache lived for that tick only: the next tick asks again, once.
         workflow.run_script("tick")
         assert _run_reads(github) == 2
+
+
+
+def test_the_runs_are_read_as_the_ticks_background_work(github: GitHub) -> None:
+    """Not as a session's: a read never waits out the reserve while the tick holds its lock."""
+    workflow = github.workflow
+    _lose(github)
+    _run(github)
+    _waiting_reviewer(github)
+
+    assert workflow.run_script("tick").returncode == 0
+    assert _run_reads(github) == 1
+    log = Path(workflow.env["HOME"]) / ".local/state/workflow/github-budget/requests.jsonl"
+    programs = {json.loads(line)["program"] for line in log.read_text().splitlines()}
+    assert "sessions" not in programs, programs
+
+
+@pytest.mark.parametrize("kind", ["review", "audit"])
+def test_a_new_session_on_the_same_head_is_woken_for_a_lost_check_again(
+    workflow: Workflow, kind: str
+) -> None:
+    """The mark of an earlier session's wake is not this one's."""
+    workflow.add_worktree(7, draft=False)
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    mark = folder / f"{kind}-7.lost-nudged-{'a' * 40}"
+    mark.touch()
+
+    done = workflow.run("start", kind, "7")
+
+    assert done.returncode == 0, done.stderr
+    assert not mark.exists()
+
+
+def test_a_helper_that_fails_fails_the_tick(github: GitHub) -> None:
+    """Only its own answer says no check was lost; a crash is a failure, never "none"."""
+    workflow = github.workflow
+    _lose(github)
+    _run(github)
+    _waiting_reviewer(github)
+    # The helper crashes, as on an error it does not expect.
+    workflow.fake(
+        "python3",
+        "#!/usr/bin/env bash\n"
+        'if [[ $2 == */tick_lost_check.py ]]; then echo "Traceback: broken" >&2; exit 1; fi\n'
+        f'exec {sys.executable} "$@"\n',
+    )
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "Traceback: broken" in done.stderr
+    assert workflow.calls("tmux review-7 send-keys") == []

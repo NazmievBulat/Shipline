@@ -3,10 +3,10 @@ the merge line, by the gate's own definition (`merge_gate.lost_check`). The tick
 
     tick_lost_check.py <state folder> <number> < pull.json
 
-It exits 0 when a check was lost, noted for the wake once per head (`merge_gate.note_lost`), 1
-when none was, and 2 when a run could not be read. Each workflow run is read at most once per
-tick: its answer, an unreadable one too, is kept in the tick's own folder, which the tick removes
-when it exits. Outside a tick every run is read.
+It exits 0 when a check was lost, noted for the wake once per head (`merge_gate.note_lost`), 3
+when none was, and 2 when a run could not be read; any other end is a failure too, never "none".
+Each workflow run is read at most once per tick: its answer, an unreadable one too, is kept in
+the tick's own folder, which the tick removes when it exits. Outside a tick every run is read.
 """
 
 import json
@@ -19,6 +19,7 @@ import merge_gate
 import train_reads
 
 CACHE = "lost-check-runs.json"
+NONE = 3
 
 
 class Unreadable(Exception):
@@ -53,7 +54,7 @@ def main(folder: Path, number: str) -> int:
         print(f"cannot read a run of pull request {number}'s checks: {error}", file=sys.stderr)
         return 2
     if not found:
-        return 1
+        return NONE
     merge_gate.note_lost(folder, number, pull["headRefOid"], found)
     return 0
 
