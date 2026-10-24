@@ -131,7 +131,7 @@ def _checks_failed(folder: Path, number: str, pull: dict[str, Any]) -> None:
             # Its line's run failed, not its own checks: a reviewer judges it, as before.
             _hand_back(folder, number, "pull request checks failed")
         return
-    diagnosis = check_repair.diagnose(pull)
+    diagnosis = check_repair.diagnose(pull, folder=folder)
     if diagnosis.kind == "infrastructure":
         waits = check_repair.rerun(folder, diagnosis)
         if waits:

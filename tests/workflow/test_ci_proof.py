@@ -2,11 +2,14 @@
 command, and reads the `Workflow-Proof` line of a squash on main the way the gate writes it."""
 
 import json
+import os
 import re
 import subprocess
 import sys
 import textwrap
 import urllib.parse
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -702,11 +705,26 @@ def test_main_s_planner_inherits_nothing_when_github_answers_too_deep_to_read(
     assert "every job runs" in done.stderr
 
 
+# The test job's command and the browser job's: each runs the command of its own name.
+_COMMANDS = ["test", "browser"]
+
+
+@pytest.mark.parametrize("command", _COMMANDS)
 @pytest.mark.parametrize("checkout", ["main", "worktree"])
-def test_the_test_command_is_the_one_the_config_names(workflow: Workflow, checkout: str) -> None:
+def test_the_test_command_is_the_one_the_config_names(
+    workflow: Workflow, checkout: str, command: str
+) -> None:
     """It runs from the root of the checkout it is called in."""
+    other = next(name for name in _COMMANDS if name != command)
     (workflow.repo / "shipline.json").write_text(
-        json.dumps({"commands": {"test": "echo \"ran in $PWD\" > ran.txt; sh -c 'exit 3'"}})
+        json.dumps(
+            {
+                "commands": {
+                    command: "echo \"ran in $PWD\" > ran.txt; sh -c 'exit 3'",
+                    other: "echo other > ran.txt",
+                }
+            }
+        )
     )
     root = workflow.repo
     if checkout == "worktree":
@@ -714,7 +732,7 @@ def test_the_test_command_is_the_one_the_config_names(workflow: Workflow, checko
         workflow.git("worktree", "add", "--quiet", "--detach", str(root))
 
     done = subprocess.run(
-        [sys.executable, "-B", str(root / "scripts/workflow/ci_proof.py"), "test"],
+        [sys.executable, "-B", str(root / "scripts/workflow/ci_proof.py"), command],
         cwd=root / "scripts",
         env=workflow.env,
         capture_output=True,
@@ -727,23 +745,149 @@ def test_the_test_command_is_the_one_the_config_names(workflow: Workflow, checko
     assert (root / "ran.txt").read_text() == f"ran in {root}\n"
 
 
-def test_the_test_command_is_given_the_job_s_own_arguments(workflow: Workflow) -> None:
+@pytest.mark.parametrize("command", _COMMANDS)
+def test_the_test_command_is_given_the_job_s_own_arguments(
+    workflow: Workflow, command: str
+) -> None:
     (workflow.repo / "shipline.json").write_text(
-        json.dumps({"commands": {"test": "printf '[%s]' run"}})
+        json.dumps({"commands": {command: "printf '[%s]' run"}})
     )
 
-    done = _proof(workflow, "test", "--fast", "tests/a test.py")
+    done = _proof(workflow, command, "--fast", "tests/a test.py")
 
     assert done.returncode == 0, done.stderr
     assert done.stdout == "[run][--fast][tests/a test.py]"
 
 
+@pytest.mark.parametrize(
+    "command,tests", [("test", "tests"), ("browser", "browser tests")], ids=_COMMANDS
+)
 def test_a_repository_without_a_test_command_fails_its_test_job_saying_so(
-    workflow: Workflow,
+    workflow: Workflow, command: str, tests: str
 ) -> None:
-    done = _proof(workflow, "test")
+    done = _proof(workflow, command)
 
     assert done.returncode == 1
     assert done.stderr == (
-        "shipline.json names no commands.test, the command that runs this repository's tests\n"
+        f"{workflow.repo / 'shipline.json'} names no commands.{command}, "
+        f"the command that runs this repository's {tests}\n"
     )
+
+
+def _lane(workflow: Workflow, home: Path, note: str | None) -> subprocess.CompletedProcess[str]:
+    """`main-lane` with the lender's note in `home`, as the pool's planner sees it."""
+    if note is not None:
+        path = home / ".local/state/ci-overflow/home/first.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(note)
+    return _proof(workflow, "main-lane", env={"HOME": str(home), "GITHUB_OUTPUT": ""})
+
+
+def _note(free: object, seconds_ago: float = 5) -> str:
+    at = datetime.now(UTC) - timedelta(seconds=seconds_ago)
+    return json.dumps(
+        {"number": None, "batch": None, "batch_free": free, "updated_at": at.isoformat()}
+    )
+
+
+@pytest.mark.parametrize(
+    "note,lane",
+    [
+        # The lender saw one of main's runners online and idle with the merge line's lane.
+        (lambda: _note(1), "true"),
+        (lambda: _note(2), "true"),
+        # None free: the prefix takes the ordinary choice and never waits on main's runners.
+        (lambda: _note(0), "false"),
+        # An old note: nobody labels main's runners now.
+        (lambda: _note(1, seconds_ago=300), "false"),
+        # On GitHub's own runners there is no note; nor is a broken one read as free.
+        (lambda: None, "false"),
+        (lambda: "{", "false"),
+        (lambda: _note("1"), "false"),
+        (lambda: _note(True), "false"),
+        (lambda: json.dumps({"batch_free": 1}), "false"),
+        (lambda: json.dumps({"batch_free": 1, "updated_at": "yesterday"}), "false"),
+        (lambda: json.dumps([1]), "false"),
+    ],
+    ids=[
+        "one free",
+        "two free",
+        "none free",
+        "an old note",
+        "no note",
+        "a broken note",
+        "a count as text",
+        "a count as true",
+        "no time",
+        "a time that is none",
+        "not an object",
+    ],
+)
+def test_the_planner_takes_main_s_lane_only_when_the_lender_saw_it_free(
+    workflow: Workflow, tmp_path: Path, note: Callable[[], str | None], lane: str
+) -> None:
+    # Written when the test runs: a note is fresh for a minute only.
+    done = _lane(workflow, tmp_path / "home", note())
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == f"main_lane={lane}\n"
+
+
+def test_planners_reading_one_note_take_no_more_lane_than_it_names_free(
+    workflow: Workflow, tmp_path: Path
+) -> None:
+    """The gate dispatches several prefixes at once: their planners read the same note, and
+    only as many as it names free take main's lane; a later note admits again."""
+    home = tmp_path / "home"
+
+    note = _note(2)
+
+    taken = [_lane(workflow, home, note).stdout for _ in range(3)]
+
+    assert taken == ["main_lane=true\n", "main_lane=true\n", "main_lane=false\n"]
+
+    assert _lane(workflow, home, _note(1, seconds_ago=1)).stdout == "main_lane=true\n"
+
+
+def test_a_planner_that_cannot_claim_the_lane_does_not_take_it(
+    workflow: Workflow, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    (home / ".local/state/ci-overflow").mkdir(parents=True)
+    # The ledger is a file, not a folder: nothing can be claimed there.
+    (home / ".local/state/ci-overflow/ledger").write_text("")
+
+    assert _lane(workflow, home, _note(2)).stdout == "main_lane=false\n"
+
+
+def test_old_claims_are_cleared(workflow: Workflow, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    ledger = home / ".local/state/ci-overflow/ledger"
+    ledger.mkdir(parents=True)
+    old = ledger / "main-lane-old-0"
+    old.write_text("")
+    os.utime(old, (0, 0))
+    other = ledger / "another-planner-file"
+    other.write_text("")
+    os.utime(other, (0, 0))
+
+    assert _lane(workflow, home, _note(1)).stdout == "main_lane=true\n"
+    assert not old.exists() and other.exists()
+
+
+@pytest.mark.parametrize(
+    "updated_at",
+    [
+        # A note from the future, as a clock set wrong would write it.
+        (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        # A time without its zone.
+        datetime.now(UTC).replace(tzinfo=None).isoformat(),
+    ],
+    ids=["from the future", "without its zone"],
+)
+def test_a_note_of_a_time_that_cannot_be_now_is_not_taken(
+    workflow: Workflow, tmp_path: Path, updated_at: str
+) -> None:
+    note = json.dumps({"batch_free": 1, "updated_at": updated_at})
+
+    assert _lane(workflow, tmp_path / "home", note).stdout == "main_lane=false\n"

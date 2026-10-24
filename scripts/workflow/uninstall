@@ -34,7 +34,7 @@ if [[ -e $settings ]]; then
     def command: if type == "object" and (.command | type) == "string" then .command else "" end;
     # A hook of exactly the shape `install-hooks` writes, whatever checkouts it names.
     def is_shipline:
-      command | test("^bash ([^;&|\\\\ ]|\\\\.)+/bin/shipline --repo ([^;&|\\\\ ]|\\\\.)+ notify 2>/dev/null \\|\\| true$");
+      command | test("^((SHIPLINE_CONFIG|XDG_CONFIG_HOME)=([^;&|\\\\ ]|\\\\.)+ )*bash ([^;&|\\\\ ]|\\\\.)+/bin/shipline --repo ([^;&|\\\\ ]|\\\\.)+ notify 2>/dev/null \\|\\| true$");
     # A hook of the shape written when the scripts were in the repository.
     def held:
       command | test("^bash ([^;&|\\\\]|\\\\.)*/scripts/workflow/notify 2>/dev/null \\|\\| true$");

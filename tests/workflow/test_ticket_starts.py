@@ -801,3 +801,134 @@ def test_a_start_line_alone_is_a_change_for_the_check_in(workflow: Workflow) -> 
     assert done.returncode == 0, done.stderr
     assert len(workflow.sent()) == 2
     assert "Ticket starts by the tick: started 9 (priority high)." in workflow.sent()[-1]
+
+
+def _hot(workflow: Workflow, *paths: str) -> None:
+    """The repository's `shipline.json` names these hot paths, beside what it named."""
+    config = workflow.repo / "shipline.json"
+    config.write_text(json.dumps({**json.loads(config.read_text()), "hot_paths": list(paths)}))
+
+
+def _pick(workflow: Workflow, moment: int) -> None:
+    """One pick, as the tick runs it, without the tick's other starts."""
+    snapshot = workflow.root / "snapshot.json"
+    scripts = workflow.script.parent
+    for arguments in (
+        ["tick_snapshot.py", "create", str(snapshot)],
+        ["ticket_starts.py", "pick", str(workflow.repo), str(snapshot)],
+    ):
+        done = subprocess.run(
+            [sys.executable, "-B", str(scripts / arguments[0]), *arguments[1:]],
+            cwd=workflow.repo,
+            env={**workflow.env, "WORKFLOW_NOW": str(moment)},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        assert done.returncode == 0, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("hot", [True, False], ids=["hot path", "no hot paths"])
+def test_two_tickets_on_one_hot_path_never_run_at_once(workflow: Workflow, hot: bool) -> None:
+    _model(workflow)
+    if hot:
+        _hot(workflow, "docs/*.md", "web/src/pages/**")
+    _draft(workflow, 6, "web/src/pages/menu/a.tsx", labels=("workflow",))
+    workflow.running("ticket-6")
+    # Another file than 6's: only the hot path holds it.
+    _draft(workflow, 7, "web/src/pages/settings/b.tsx")
+    moment = _start_now()
+    _room_since(workflow, moment)
+
+    _pick(workflow, moment)
+
+    assert _labelled(workflow) == ([] if hot else ["7"])
+    assert _told(workflow) == (
+        ["7 waits: hot path web/src/pages/** with 6"] if hot else ["started 7 (priority medium)"]
+    )
+
+
+@pytest.mark.parametrize("hot", [True, False], ids=["hot path", "no hot paths"])
+def test_a_pull_request_only_waiting_in_the_merge_line_holds_its_hot_path(
+    workflow: Workflow, hot: bool
+) -> None:
+    """A ready member without a session still runs for a hot path: its squash is to come."""
+    _model(workflow)
+    if hot:
+        _hot(workflow, "web/src/pages/**")
+    workflow.add_pull_request(6, draft=False, labels=())
+    _push_change(workflow, 6, "web/src/pages/menu/a.tsx")
+    (_notes(workflow) / "merge-train.json").write_text(json.dumps({"waiting": ["6"]}))
+    _draft(workflow, 7, "web/src/pages/settings/b.tsx")
+    _draft(workflow, 8, "src/app.py")
+    moment = _start_now()
+    _room_since(workflow, moment)
+
+    _pick(workflow, moment)
+
+    # A draft outside the hot path starts beside it, as before.
+    assert _labelled(workflow) == (["8"] if hot else ["7"])
+    assert _told(workflow) == (
+        ["started 8 (priority medium)", "7 waits: hot path web/src/pages/** with 6"]
+        if hot
+        else ["started 7 (priority medium)"]
+    )
+
+
+def test_a_folder_a_ticket_names_holds_the_hot_paths_of_the_files_in_it(
+    workflow: Workflow,
+) -> None:
+    _model(workflow)
+    _hot(workflow, "web/src/pages/*.tsx")
+    (workflow.repo / "web/src/pages").mkdir(parents=True)
+    (workflow.repo / "web/src/pages/menu.tsx").write_text("menu\n")
+    workflow.git("add", "web")
+    workflow.git("commit", "--quiet", "-m", "feat: the menu")
+    workflow.git("push", "--quiet", "origin", "main")
+    workflow.add_pull_request(6, draft=False, labels=())
+    _push_change(workflow, 6, "web/src/pages/menu.tsx")
+    (_notes(workflow) / "merge-train.json").write_text(json.dumps({"waiting": ["6"]}))
+    _draft(workflow, 7, "web")
+    moment = _start_now()
+    _room_since(workflow, moment)
+
+    _pick(workflow, moment)
+
+    assert _labelled(workflow) == []
+    assert _told(workflow) == ["7 waits: hot path web/src/pages/*.tsx with 6"]
+
+
+def test_the_files_of_a_merge_line_member_must_be_known_for_a_hot_path_only(
+    workflow: Workflow,
+) -> None:
+    _model(workflow)
+    _hot(workflow, "web/src/pages/**")
+    # A ready member whose branch was never pushed: its files cannot be read.
+    workflow.add_pull_request(6, draft=False, labels=())
+    (workflow.state / "pr/6").write_text(f"OPEN ticket/gone {'0' * 40}\n")
+    (_notes(workflow) / "merge-train.json").write_text(json.dumps({"waiting": ["6"]}))
+    _draft(workflow, 7, "web/src/pages/settings/b.tsx")
+    _draft(workflow, 8, "src/app.py")
+    moment = _start_now()
+    _room_since(workflow, moment)
+
+    _pick(workflow, moment)
+
+    assert _labelled(workflow) == ["8"]
+    assert "7 waits: the files of 6 are not known yet" in _told(workflow)
+
+
+def test_a_hot_path_wait_is_told_once_until_it_changes(workflow: Workflow) -> None:
+    _model(workflow)
+    _hot(workflow, "web/src/pages/**")
+    _draft(workflow, 6, "web/src/pages/a.tsx", labels=("workflow",))
+    workflow.running("ticket-6")
+    _draft(workflow, 7, "web/src/pages/b.tsx")
+    moment = _start_now()
+    _room_since(workflow, moment)
+
+    for later in (moment, moment + 180, moment + 360):
+        _pick(workflow, later)
+
+    assert _told(workflow) == ["7 waits: hot path web/src/pages/** with 6"]

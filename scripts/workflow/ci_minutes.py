@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from merge_gate import API, REPOSITORY, WORKFLOW_FILES, api, command
+from merge_gate import API, REPOSITORY, SCRATCH_PREFIX, WORKFLOW_FILES, api, command
 from merge_train_metrics import instant
 
 
@@ -60,7 +60,7 @@ def summarize(runs: list[dict[str, Any]], since: str, until: str) -> dict[str, A
         branch = run.get("head_branch") or ""
         kind = (
             "scratch"
-            if branch.startswith("workflow/merge-batch-")
+            if branch.startswith(SCRATCH_PREFIX)
             else "main"
             if branch == "main" and run["event"] != "pull_request"
             else "pr"
@@ -157,7 +157,7 @@ def main() -> None:
         for run in runs:
             if instant(run["updated_at"]) < start:
                 continue
-            if run.get("head_branch", "").startswith("workflow/merge-batch-"):
+            if run.get("head_branch", "").startswith(SCRATCH_PREFIX):
                 head = run["head_sha"]
                 if head not in dispositions:
                     dispositions[head] = prefix_disposition(run, args.until)
