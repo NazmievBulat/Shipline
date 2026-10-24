@@ -48,6 +48,10 @@
 #      gets its recommended reply once it has waited `answer_for_owner_after_minutes` (15),
 #      once for the same words, and the wake is told; one without that line, or without a
 #      reply word, waits for the owner and is named in the wake once.
+#      A cloud worker whose draft had no push and no report for `cloud_wake_after_minutes`,
+#      with no open question, is woken once through `claude --cloud` and named in the wake if
+#      still quiet that long after; one whose question was answered is woken at once
+#      (`cloud_workers.py wake`).
 #   9. After the starts of step 6, the next draft without the label gets it when one may start
 #      (`ticket_starts.py`: by priority, then the older ticket, when its files overlap no running
 #      ticket's, nothing in `start-plan` holds it back, the machine has had room for 10
@@ -1040,6 +1044,10 @@ while read -r name state _; do
     failed=1
   fi
 done <<<"$running"
+
+# A cloud worker whose draft had no push and no report for `cloud_wake_after_minutes`, with no
+# open question, is woken once per quiet stretch, and one whose question was answered at once.
+python3 -B "$here/cloud_workers.py" wake "$main" "$snapshot" 9>&- || failed=1
 
 # A question to the owner marked `Owner only: no` gets its recommended reply once it has waited,
 # from the notes the stop hook wrote (`notify`): the time it was asked and the reply. Once for
