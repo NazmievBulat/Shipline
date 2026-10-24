@@ -672,6 +672,7 @@ def test_the_rules_name_each_command_as_shipline_command() -> None:
     assert set(re.findall(r"`shipline ([a-z-]+)", rules)) == {
         "browser-tests-for-changes",
         "ci-tests-for-changes",
+        "decide",
         "install-hooks",
         "install-timer",
         "merge-when-current",
