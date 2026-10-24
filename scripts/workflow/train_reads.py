@@ -97,6 +97,7 @@ class Reads:
                 "main": self.base,
                 "head": head,
                 "checks": member.get("statusCheckRollup"),
+                "prefix_only": workflow_config.current().checks.prefix_only,
             }
         )
         rollup = member.get("statusCheckRollup") or []

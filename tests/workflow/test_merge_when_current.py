@@ -7077,6 +7077,145 @@ def _suite(github: GitHub) -> dict[str, Any]:
     return _batch_state(github)["suites"]["7"]
 
 
+def _prefix_only(github: GitHub, groups: list[str]) -> None:
+    # Keep the repository's commands: its browser plan decides whether a change needs E2E.
+    config = github.workflow.repo / "shipline.json"
+    data = json.loads(config.read_text()) if config.exists() else {}
+    data.setdefault("checks", {})["prefix_only"] = groups
+    config.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize("group,workflow_name,path", [
+    ("images", "images", "docker/change.txt"),
+    ("browser_whole", "e2e", "web/src/example.ts"),
+    ("server_whole", "ci", "src/example_app/reader.py"),
+])
+@pytest.mark.parametrize("listed", [False, True])
+def test_prefix_only_first_member_uses_scratch_proof_and_main_inherits(
+    github: GitHub, group: str, workflow_name: str, path: str, listed: bool,
+) -> None:
+    tree = _changes(github, path)
+    _prefix_only(github, [group] if listed else [])
+    if group == "images" and not listed:
+        _images(github)
+    # Even an own whole-suite result cannot replace a configured group's scratch run.
+    done = _batch_call(github)
+    if not listed:
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert not github.workflow.calls("gh workflow run")
+        return
+    assert done.returncode == 3, done.stdout + done.stderr
+    scratch = _suite(github)
+    assert scratch["workflows"] == [workflow_name]
+    _finish_prefix(github, "7", scratch=scratch, tree=tree, run_id=800)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    squash = github.workflow.git("rev-parse", "origin/main")
+    message = github.workflow.git("show", "-s", "--format=%B", squash)
+    proof = json.loads(next(line.removeprefix("Workflow-Proof: ")
+                            for line in message.splitlines() if line.startswith("Workflow-Proof: ")))
+    assert {"workflow": workflow_name, "run": 800} in [
+        {"workflow": source["workflow"], "run": source["run"]} for source in proof["sources"]
+    ]
+    assert proof["tree"] == tree
+    receipt = json.loads((github.workflow.repo / ".local/workflow/main-tree-green.json").read_text())
+    if group == "images":
+        assert receipt["images_run"] == 800 and receipt["images_complete"]
+        assert not github.workflow.calls(f"gh api --paginate {_REPO}/actions/workflows/images.yml/runs?head_sha={github.head}&event=pull_request")
+    if group == "server_whole":
+        assert "CI: server tests" in receipt["ci_passed"]
+
+
+@pytest.mark.parametrize("groups", [[], ["images"], ["browser_whole"], ["server_whole"]])
+def test_prefix_only_path_filters_need_no_group_run(github: GitHub, groups: list[str]) -> None:
+    _prefix_only(github, groups)
+    github.ci(github.base, github.head, server="none")
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not github.workflow.calls("gh workflow run")
+
+
+@pytest.mark.parametrize("group", ["images", "browser_whole", "server_whole"])
+def test_prefix_only_line_waits_on_its_prefix_and_records_its_groups(github: GitHub, group: str) -> None:
+    _batch_setup(github, count=2, images=group == "images", selected=True)
+    _prefix_only(github, [group])
+    done = _batch_call(github)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert _numbers(github) == ["7", "8"]
+    assert all(member["scratch"] for member in _prefixes(github))
+    status = github.workflow.run_script("merge-when-current", "--train-status")
+    assert json.loads(status.stdout)["prefix_only"] == [group]
+    _finish_batch(github)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert all(pull["state"] == "MERGED" for pull in github.pulls.values())
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "in_progress", "wrong tree"])
+def test_deferred_images_require_passing_proof_on_the_tested_tree(
+    github: GitHub, conclusion: str,
+) -> None:
+    tree = _changes(github, "docker/change.txt")
+    _prefix_only(github, ["images"])
+    assert _batch_call(github).returncode == 3
+    scratch = _suite(github)
+    _finish_prefix(github, "7", scratch=scratch, tree=tree, run_id=800)
+    if conclusion == "wrong tree":
+        github.api[f"{_REPO}/check-runs/801/annotations?per_page=100"][0]["message"] = "0" * 40
+    elif conclusion == "in_progress":
+        github.api[f"{_REPO}/actions/workflows/images.yml/runs?head_sha={scratch['head']}&event=workflow_dispatch&per_page=100"]["workflow_runs"][0].update(status="in_progress", conclusion=None)
+    else:
+        github.api[f"{_REPO}/actions/runs/800/jobs?per_page=100"]["jobs"][1]["conclusion"] = "failure"
+    done = _batch_call(github)
+    assert done.returncode != 0
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_a_deferred_image_prefix_cannot_pass_with_only_its_planner(github: GitHub) -> None:
+    _batch_setup(github, count=2, images=True, selected=True)
+    _prefix_only(github, ["images"])
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+    scratch = _scratch(github)
+    assert scratch is not None
+    image_run = github.api[
+        f"{_REPO}/actions/workflows/images.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0]
+    for job in github.api[f"{_REPO}/actions/runs/{image_run['id']}/jobs?per_page=100"]["jobs"]:
+        if job["name"] != "Docker images: what to run":
+            job["conclusion"] = "skipped"
+    done = _batch_call(github)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_a_scratch_run_finishing_or_rerunning_rejudges_red_main_fix_priority(github: GitHub) -> None:
+    tree = _changes(github, "docker/change.txt")
+    _prefix_only(github, ["images"])
+    _images(github, pull=False, conclusion="failure", release_conclusion="success")
+    assert _batch_call(github).returncode == 3
+    scratch = _suite(github)
+    assert _batch_state(github)["proofs"]["7"][1] is False
+    _finish_prefix(github, "7", scratch=scratch, tree=tree, run_id=800)
+    github.save()
+    assert _train(github)["priorities"]["7"] == "blocker"
+    assert _batch_state(github)["proofs"]["7"][1] is True
+    run = github.api[
+        f"{_REPO}/actions/workflows/images.yml/runs?head_sha={scratch['head']}"
+        "&event=workflow_dispatch&per_page=100"
+    ]["workflow_runs"][0]
+    run.update(run_attempt=2, status="in_progress", conclusion=None)
+    github.save()
+    assert _train(github)["priorities"]["7"] == "medium"
+    assert _batch_state(github)["proofs"]["7"][1] is False
+    run.update(status="completed", conclusion="success")
+    github.save()
+    assert _train(github)["priorities"]["7"] == "blocker"
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
 @pytest.mark.parametrize(
     "own",
     [

@@ -48,7 +48,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -98,6 +98,7 @@ DEFAULTS: dict[str, Any] = {
         # as any other failure.
         "dependency_audit": None,
         "advisory_annotation": None,
+        "prefix_only": [],
     },
     # The titles of the annotations the CI planners write and the merge gate reads.
     "annotations": {
@@ -190,6 +191,18 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class CheckGroup:
+    workflow: str
+    jobs: tuple[str, ...]
+    suite: str | None = None
+
+    def contains(self, name: str) -> bool:
+        # Images is a whole workflow; its repository chooses the build and test job names.
+        return any(name == job or name.startswith(job + " (") or
+                   (job.endswith(":") and name.startswith(job + " ")) for job in self.jobs)
+
+
+@dataclass(frozen=True)
 class Checks:
     ci_result: str
     ci_plan: str
@@ -197,6 +210,14 @@ class Checks:
     images: str
     dependency_audit: str | None = None
     advisory_annotation: str | None = None
+    prefix_only: list[str] = field(default_factory=list)
+
+    def groups(self) -> dict[str, CheckGroup]:
+        return {
+            "images": CheckGroup("images", (f"{self.images}:",)),
+            "browser_whole": CheckGroup("e2e", ("playwright",), "browser_suite"),
+            "server_whole": CheckGroup("ci", ("CI: server tests",), "server_tests"),
+        }
 
     @property
     def images_plan(self) -> str:
@@ -864,6 +885,11 @@ def load(start: Path | None = None) -> Config:
     except ValueError as error:
         raise ConfigError(f"{FILE} is not JSON: {error}") from error
     values = _merged(DEFAULTS, given, "")
+    groups = values["checks"]["prefix_only"]
+    if len(set(groups)) != len(groups) or set(groups) - set(Checks("", "", "", "").groups()):
+        raise ConfigError(
+            f"{FILE}: checks.prefix_only must name distinct groups: images, browser_whole, server_whole"
+        )
     # Where the repository was read, so a refusal names that place.
     repository, source = values["repository"], FILE
     if not repository:

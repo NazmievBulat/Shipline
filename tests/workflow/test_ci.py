@@ -127,7 +127,8 @@ def test_the_summing_up_check_needs_every_job(path: Path, job: str, name: str) -
     text = _job(path, job)
 
     assert re.search(rf"^    name: {name}$", text, re.M)
-    assert re.search(r"^    needs: \[plan, tests\]$", text, re.M)
+    needs = re.search(r"^    needs: \[([^\]]+)\]$", text, re.M)
+    assert needs and needs[1].split(", ") == [other for other in _jobs(path) if other != job]
     assert _condition(text) == f"always() && ({_NOT_A_DRAFT})"
     assert _EVERY_JOB_PASSED in text
 
@@ -183,7 +184,9 @@ def test_the_test_job_runs_the_config_s_command_unless_main_inherited_it(path: P
 
     assert re.search(r'^    name: "CI: server tests[" (]', tests, re.M)
     assert re.search(r"^    needs: plan$", tests, re.M)
-    assert _condition(tests) == f"${{{{ ({_NOT_A_DRAFT}) && {_NOT_INHERITED} }}}}"
+    selection = ("&& contains(fromJSON(needs.plan.outputs.needed), 'server_whole') "
+                 "&& !contains(fromJSON(needs.plan.outputs.prefix_only), 'server_whole') ") if path == _EXAMPLE else ""
+    assert _condition(tests) == f"${{{{ ({_NOT_A_DRAFT}) {selection}&& {_NOT_INHERITED} }}}}"
     assert f"python3 {_PROOF[path]} test" in tests
 
 
@@ -193,20 +196,39 @@ def test_shipline_names_its_own_test_command() -> None:
     assert config["commands"]["test"] == "python -m pytest -rs"
 
 
-@pytest.mark.parametrize("job", ["plan", "tests"])
+# How the example's Python steps name the same clone.
+_PROOF_IN_PYTHON = "os.environ['RUNNER_TEMP'] + '/shipline/scripts/workflow/ci_proof.py'"
+
+
+@pytest.mark.parametrize("job", ["plan", "tests", "selected"])
 def test_the_example_s_jobs_fetch_shipline_before_they_run_its_scripts(job: str) -> None:
     text = _job(_EXAMPLE, job)
+    calls = [text.find(_PROOF[_EXAMPLE]), text.find(_PROOF_IN_PYTHON)]
 
     assert text.count(_CLONE) == 1
-    assert text.index(_CLONE) < text.index(_PROOF[_EXAMPLE])
-    assert "scripts/workflow" not in text.replace(_PROOF[_EXAMPLE], "")
+    assert text.index(_CLONE) < min(call for call in calls if call >= 0)
+    assert "scripts/workflow" not in text.replace(_PROOF[_EXAMPLE], "").replace(
+        _PROOF_IN_PYTHON, ""
+    )
+
+
+def test_the_example_runs_each_of_ci_proof_s_commands_from_the_clone() -> None:
+    plan, selected = _job(_EXAMPLE, "plan"), _job(_EXAMPLE, "selected")
+
+    assert f"subprocess.run(['python3', {_PROOF_IN_PYTHON}, 'prefix-only', *args]" in plan
+    assert f'python3 {_PROOF[_EXAMPLE]} notes --selected server_tests "$ran" "$TOTAL" files' in plan
+    assert f"run: python3 {_PROOF[_EXAMPLE]} notes --none server_tests\n" in plan
+    assert f"subprocess.run(['python3', {_PROOF_IN_PYTHON}, 'test', *files]" in selected
+    # The fast checks are the repository's own tool: no Shipline there.
+    assert "shipline" not in _job(_EXAMPLE, "fast").lower()
 
 
 def test_the_example_s_jobs_carry_the_config_s_default_names() -> None:
     text = _EXAMPLE.read_text()
     names = re.findall(r"^    name: (.+)$", text, re.M)
 
-    assert names == ['"CI: what to run"', '"CI: server tests"', "CI result"]
+    assert names == ['"CI: what to run"', '"CI: server tests"',
+                     '"CI: selected server tests"', '"CI: fast checks"', "CI result"]
     assert re.search(
         r"^  pull_request:\n    types: \[opened, synchronize, reopened, ready_for_review\]\n"
         r"  push:\n    branches: \[main\]\n",
@@ -261,7 +283,7 @@ def test_every_job_is_skipped_while_the_pull_request_is_a_draft(path: Path, resu
     ready (`ready_for_review`) starts its run on the current head."""
     jobs = {job: _condition(_job(path, job)) for job in _jobs(path)}
 
-    assert sorted(jobs) == sorted(["plan", "tests", result])
+    assert sorted(jobs) == sorted(["plan", "tests", result] + (["selected", "fast"] if path == _EXAMPLE else []))
     assert jobs["plan"] == _NOT_A_DRAFT
     assert all(condition and f"({_NOT_A_DRAFT})" in condition for job, condition in jobs.items()
                if job != "plan")
