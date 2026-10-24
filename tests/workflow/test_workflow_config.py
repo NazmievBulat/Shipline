@@ -223,8 +223,12 @@ def test_refresh_cannot_reach_into_a_nested_worktree(tmp_path: Path, named: str)
     (worktree / "types").write_text("keep\n")
     _write(repo, {"refresh": {"clear_generated": [named]}})
 
-    with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
-        workflow_config.load(repo)
+    if "**" in named:
+        # Recursive discovery excludes another checkout from the matching namespace.
+        workflow_config.load(repo).refresh.clear(repo)
+    else:
+        with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
+            workflow_config.load(repo)
 
     assert (worktree / "types").read_text() == "keep\n"
 

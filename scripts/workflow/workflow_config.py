@@ -337,12 +337,25 @@ def _generated_matches(
     ):
         raise ConfigError(f"{FILE}: refresh.clear_generated cannot enter a nested checkout")
     if not parts:
-        yield root
+        if root.exists():
+            yield root
     elif parts[0] == "**":
         yield from _generated_matches(root, parts[1:], top=top)
         if root.is_dir():
             for child in root.iterdir():
-                if child.is_symlink() or child.is_dir():
+                # Recursive discovery stays inside this checkout and never follows a link.
+                # A link or nested checkout selected explicitly is still refused above.
+                if child.name == ".git":
+                    continue
+                if child.is_symlink():
+                    if len(parts) == 1:
+                        raise ConfigError(
+                            f"{FILE}: refresh.clear_generated cannot traverse a symbolic link"
+                        )
+                    continue
+                if child.is_dir():
+                    if (child / ".git").is_symlink() or (child / ".git").exists():
+                        continue
                     yield from _generated_matches(child, parts, top=False)
                 elif len(parts) == 1:
                     yield child

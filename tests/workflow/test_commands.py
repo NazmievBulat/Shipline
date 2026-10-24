@@ -417,7 +417,8 @@ def _main_moved(github: GitHub) -> None:
 
 @pytest.mark.parametrize("subdirectory", [False, True])
 @pytest.mark.parametrize(
-    "paths", [None, [], ["generated/types"], ["generated/ty*"], ["generated/**/st*"]]
+    "paths", [None, [], ["generated/types"], ["generated/ty*"], ["generated/**/st*"],
+              ["**/types"]]
 )
 def test_refresh_clears_only_configured_ignored_output_before_the_push(
     github: GitHub, paths: list[str] | None, subdirectory: bool
