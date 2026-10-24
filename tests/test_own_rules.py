@@ -145,6 +145,17 @@ def test_readme_says_how_it_is_built_and_points_to_agents_md() -> None:
     assert "[`AGENTS.md`](AGENTS.md)" in _section(_read("README.md"), "How it is built")
 
 
+def test_readme_says_what_shipline_is_and_its_license() -> None:
+    text = _read("README.md")
+
+    assert text.startswith("# Shipline\n")
+    assert (
+        "Shipline runs a software team of AI coding sessions: workers build tickets, independent "
+        "reviewers check them, and a merge line lands each change on a green main."
+    ) in _words(text)
+    assert "Apache-2.0 (see [`LICENSE`](LICENSE))" in _words(text)
+
+
 def test_rules_md_says_at_its_top_whose_rules_it_holds() -> None:
     first = _read("scripts/workflow/RULES.md").splitlines()[0]
 
