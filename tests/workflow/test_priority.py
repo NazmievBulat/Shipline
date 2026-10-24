@@ -4,16 +4,28 @@ and the wake (`priority.jq`)."""
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 _WORKFLOW = Path(__file__).resolve().parents[2] / "scripts/workflow"
-# Loaded from its file, so the scripts' folder is not put on the path of every other test.
-_SPEC = importlib.util.spec_from_file_location("priority", _WORKFLOW / "priority.py")
-assert _SPEC and _SPEC.loader
-priority = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(priority)
+
+
+def _load(name: str) -> Any:
+    # Loaded from its file, so the scripts' folder is not put on the path of every other test.
+    spec = importlib.util.spec_from_file_location(name, _WORKFLOW / f"{name}.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault(name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+# What priority.py reads its label names with.
+_load("workflow_config")
+priority = _load("priority")
 
 
 def _jq(labels: list[str]) -> str:

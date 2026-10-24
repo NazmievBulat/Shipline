@@ -13,19 +13,17 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Generator, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any, NoReturn
 
-import advisory_service
 import priority
-import pushing_checkout
 import train_reads
+import workflow_config
 from merge_handoff import Handoff, authorized
-from run_proof import RECEIPT, passed_jobs
-from run_proof import WHOLE as WHOLE_REQUEST
 from workflow_commands import (
     COMMAND_TIMEOUT,
     GIT_READ_TIMEOUT,
@@ -41,13 +39,85 @@ from workflow_commands import (
     run as run_command,
 )
 
-REPOSITORY = "NazmievBulat/Shipline"
-API = f"repos/{REPOSITORY}"
+# A repository may hold three helpers beside these scripts, and the gate uses them when it does:
+# `advisory_service` tells a scan that could not reach a package advisory service, which is a
+# wait; `pushing_checkout` installs the pushing checkout's packages before its hook and words a
+# hook's refusal; `run_proof` reads and writes the `Workflow-Proof` line with which main skips a
+# job its squash proved. Without them a failed push is refused with its last lines, nothing is
+# installed first, and no proof is read or written, so main never skips a job: a job counts as
+# passed only where it passed itself. A helper that is there but cannot start stops the gate.
+try:
+    import advisory_service
+except ModuleNotFoundError as error:
+    if error.name != "advisory_service":
+        raise
+    advisory_service = None
+try:
+    import pushing_checkout
+except ModuleNotFoundError as error:
+    if error.name != "pushing_checkout":
+        raise
+    pushing_checkout = None
+try:
+    from run_proof import RECEIPT, passed_jobs
+    from run_proof import WHOLE as WHOLE_REQUEST
+except ModuleNotFoundError as error:
+    if error.name != "run_proof":
+        raise
+    RECEIPT = WHOLE_REQUEST = None
+
+    def passed_jobs(parts: list[dict[str, Any]]) -> set[str]:
+        """The jobs that passed in the run itself, a job run in parts once each of its parts
+        did; no proof line is read."""
+        grouped: dict[str, list[tuple[re.Match[str] | None, dict[str, Any]]]] = {}
+        for job in parts:
+            part = re.fullmatch(r"(.+) \((\d+) of (\d+)\)", job["name"])
+            grouped.setdefault(part[1] if part else job["name"], []).append((part, job))
+        return {
+            name
+            for name, group in grouped.items()
+            if all(job.get("conclusion") == "success" for _, job in group)
+            and sorted((int(part[2]), int(part[3])) for part, _ in group if part)
+            in ([], [(number, len(group)) for number in range(1, len(group) + 1)])
+        }
+
+
+def mechanical_conflicts() -> ModuleType | None:
+    """The repository's rules for the conflicts and migration numbers a refresh settles itself,
+    `mechanical_conflicts` beside the scripts, read only when a refresh needs them. Without
+    them no conflict is mechanical and there are no migrations to renumber."""
+    try:
+        import mechanical_conflicts as rules
+    except ModuleNotFoundError as error:
+        if error.name != "mechanical_conflicts":
+            raise
+        return None
+    return rules
+
+
+# How many of its last lines a failed push is refused with, when the repository words no refusal.
+REFUSAL_LINES = 10
+
+CONFIG = workflow_config.current()
+REPOSITORY = CONFIG.repository
+API = CONFIG.api
 HERE = Path(__file__).resolve().parent
 # The gate owns these branches: each holds one batch's test merge, never a pull request.
 SCRATCH_PREFIX = "workflow/merge-batch-"
-E2E_PLAN = "E2E: what to run"
-CI_PLAN = "CI: what to run"
+E2E_PLAN = CONFIG.checks.e2e_plan
+CI_PLAN = CONFIG.checks.ci_plan
+CI_RESULT = CONFIG.checks.ci_result
+# Every check of the image workflow begins with this; its planner is IMAGES_PLAN.
+IMAGES = CONFIG.checks.images
+IMAGES_PLAN = CONFIG.checks.images_plan
+# The titles of the planners' annotations.
+NOTES = CONFIG.annotations
+# The workflow files, by the gate's own names for them.
+WORKFLOW_FILES = {
+    "ci": CONFIG.workflows.ci,
+    "e2e": CONFIG.workflows.e2e,
+    "images": CONFIG.workflows.images,
+}
 # What a dispatched whole-suite run is called in the gate's words, by its workflow.
 WHOLE = {"e2e": "the whole browser suite", "ci": "every server test"}
 SQUASH_ATTEMPTS = 3
@@ -61,6 +131,34 @@ WINDOW_CEILING = 4
 # A check GitHub still lists as queued or running this long after its run completed was lost:
 # GitHub missed its end, and no wait brings it.
 LOST_AFTER_SECONDS = 10 * 60
+# How long the gate remembers that it asked GitHub to cancel a run.
+CANCEL_CLAIM_SECONDS = 24 * 60 * 60
+# How long after a scratch branch was dropped the sweep still looks for the runs dispatched on
+# it that GitHub has not listed yet: GitHub accepts a dispatch before it lists the run.
+DROPPED_RUNS_SECONDS = 30 * 60
+# How many times a handoff judges its own place again when the line changed it meanwhile.
+HANDOFF_ATTEMPTS = 3
+# How long a handoff's one check of its head, under the merge lock, may take.
+HEAD_CHECK_TIMEOUT = 10
+# A handoff's last read of its pull request still stands this long after it; a longer wait for
+# the merge lock reads it again, at most LOCK_WAITS times.
+FRESH_READ_SECONDS = 5
+LOCK_WAITS = 10
+# Each member's own entries in the saved line, by the Train attribute that holds them.
+MEMBER_ENTRIES = (
+    "blocked",
+    "suspended",
+    "conflicts",
+    "approved",
+    "proven",
+    "batch_failed",
+    "suites",
+    "proofs",
+    "priorities",
+    "reruns",
+    "lost",
+)
+MEMBER_MARKS = ("unavailable", "fixes", "refreshable")
 
 # Set only while computing train order, never while verifying a merge.
 _planning_reads: train_reads.Reads | None = None
@@ -171,8 +269,8 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     gate sets it for every push it makes. The hook runs with the pushing checkout's packages,
     installed first when its lockfiles changed since their last install. A failed install, or
     a scan that could not reach an advisory service after its own tries, is a wait."""
-    checkout = pushing_checkout.top(where)
-    failed = pushing_checkout.install_if_changed(checkout)
+    checkout = pushing_checkout.top(where) if pushing_checkout else where or Path.cwd()
+    failed = pushing_checkout.install_if_changed(checkout) if pushing_checkout else ""
     if failed:
         raise PackagesWaiting(failed)
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
@@ -187,7 +285,9 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         output,
         push_failure(output, checkout) if done.returncode else "",
     )
-    folder = main_checkout() / ".local" / "workflow"
+    if advisory_service is None:
+        return pushed
+    folder = main_checkout() / CONFIG.state_folder
     service = advisory_service.unreachable(output) if pushed.returncode else None
     if service:
         folder.mkdir(parents=True, exist_ok=True)
@@ -206,7 +306,10 @@ def push_failure(output: str, checkout: Path) -> str:
 
     The first line is all the wake and a hand-back show, so a shortage is named there, before
     the hook's step that failed and its last lines."""
-    refusal = pushing_checkout.refusal(output, checkout)
+    if pushing_checkout:
+        refusal = pushing_checkout.refusal(output, checkout)
+    else:
+        refusal = "\n".join([line for line in output.splitlines() if line.strip()][-REFUSAL_LINES:])
     shortage = next(
         (line.strip() for line in output.splitlines() if short_of_memory(line)),
         None,
@@ -259,7 +362,8 @@ def runs(
     # unchanged head is kept apart: it may report a failure, never hold or close the gate.
     event = "&event=pull_request" if pull else ""
     found = api(
-        f"{API}/actions/workflows/{workflow}.yml/runs?head_sha={head}{event}&per_page=100",
+        f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs"
+        f"?head_sha={head}{event}&per_page=100",
         "workflow_runs",
     )
     return sorted(
@@ -303,7 +407,8 @@ class MainImages:
             # Nightly runs fill pages too: a missing page must never forget an older failure.
             self.page += 1
             runs_page = api(
-                f"{API}/actions/workflows/images.yml/runs?branch=main&per_page=100&page={self.page}",
+                f"{API}/actions/workflows/{WORKFLOW_FILES['images']}/runs"
+                f"?branch=main&per_page=100&page={self.page}",
                 "workflow_runs",
                 paginate=False,
             )
@@ -402,19 +507,29 @@ def verdict(
     images: bool = False,
     plan: str | None = None,
 ) -> tuple[str, list[str]]:
-    label = plan or ("Images" if images else "CI result")
-    plan = plan or ("Docker images: what to run" if images else "CI result")
+    label = plan or ("Images" if images else CI_RESULT)
+    plan = plan or (IMAGES_PLAN if images else CI_RESULT)
     required = [job for job in parts if job["name"] == plan]
     failed = [
         job["name"] for job in parts if job.get("conclusion") not in (None, "success", "skipped")
     ]
+    settled = (None, "success", "skipped", "cancelled")
     if (
         run.get("conclusion") == "cancelled"
-        and all(job.get("conclusion") in (None, "success", "skipped", "cancelled") for job in parts)
+        and all(job.get("conclusion") in settled for job in parts)
         and lender_replanning(
             str(run["id"]), head=run.get("head_sha"), attempt=run.get("run_attempt", 1)
         )
     ):
+        return "pending", [plan]
+    if (
+        run.get("conclusion") == "cancelled"
+        # The summary job runs even in a cancelled run, and fails for the jobs cancelled under it.
+        and all(job.get("conclusion") in settled or job["name"] == plan for job in parts)
+        and cancelled_inherited(run)
+    ):
+        # The gate cancelled it, still running, once main inherited its result: that result
+        # stands for it.
         return "pending", [plan]
     if failed or run.get("conclusion") not in (None, "success"):
         return "red", failed or [label]
@@ -454,7 +569,7 @@ def scheduled_failure(head: str) -> str:
     for run in latest:
         state, names = verdict(run, jobs(run), images=True)
         if state == "red":
-            return f"scheduled Docker images run {run['id']} failed: {', '.join(names)}"
+            return f"scheduled {IMAGES} run {run['id']} failed: {', '.join(names)}"
     return ""
 
 
@@ -476,8 +591,10 @@ def _failed_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def unreached_service(parts: list[dict[str, Any]]) -> str | None:
     """The advisory service whose absence alone failed a CI run, from the audit's annotation:
     "CI: dependencies" is the only failed job besides "CI result", which follows it."""
+    if advisory_service is None:
+        return None
     failed = _failed_jobs(parts)
-    if {job["name"] for job in failed} - {"CI result"} != {"CI: dependencies"}:
+    if {job["name"] for job in failed} - {CI_RESULT} != {"CI: dependencies"}:
         return None
     job = next(job for job in failed if job["name"] == "CI: dependencies")
     try:
@@ -537,19 +654,14 @@ def _rerunnable(run: dict[str, Any], parts: list[dict[str, Any]], *, first: bool
     failed = _failed_jobs(parts)
     # Missing runner/attempt evidence never authorizes spending hosted minutes. The tick
     # holds its machine-wide lock; the marker also covers GitHub's delay updating attempts.
-    home = {
-        "example-app-home",
-        "example-app-home-main",
-        "example-app-home-docker",
-        "home-planner",
-    }
+    home = set(CONFIG.runner.labels)
     attempt = run.get("run_attempt")
     return not (
         run.get("status") != "completed"
         or (attempt != 1 if first else not isinstance(attempt, int))
         or not failed
         # Retrying the CI planner can choose hosted destinations for skipped dependents.
-        or any(job.get("name") == "CI: what to run" for job in failed)
+        or any(job.get("name") == CI_PLAN for job in failed)
         or any(job.get("status") != "completed" for job in parts)
         or any(not home.intersection(job.get("labels") or []) for job in failed)
     )
@@ -566,8 +678,13 @@ def _rerun(
             return f"automatic retry of {name} deferred: main moved"
     folder.mkdir(parents=True, exist_ok=True)
     note = f"automatic retry requested for failed jobs of {name} {when}"
-    # Claim before contacting GitHub: an interrupted or ambiguous request must not repeat.
-    marker.write_text(note + "\n")
+    # Claim before contacting GitHub: an interrupted or ambiguous request must not repeat. Of two
+    # calls at once (a handoff judges its own run outside the merge lock), only one sends it.
+    try:
+        with marker.open("x") as claim:
+            claim.write(note + "\n")
+    except FileExistsError:
+        return f"the re-run of {name} is requested; GitHub has not shown it yet"
     try:
         done = command(
             "gh", "run", "rerun", str(run["id"]), "-R", REPOSITORY, "--failed", check=False
@@ -582,11 +699,52 @@ def _rerun(
     else:
         note = f"automatically re-ran failed jobs of {name} {when}"
     marker.write_text(note + "\n")
+    wake_log(note)
+    return note
+
+
+def wake_log(line: str) -> None:
     log = Path.home() / ".local/state/workflow/wake.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a") as output:
-        output.write(f"{int(time.time())} {note}\n")
-    return note
+        output.write(f"{int(time.time())} {line}\n")
+
+
+def _cancel(found: list[dict[str, Any]], folder: Path, whose: str) -> None:
+    """Cancel each run of `found` still queued or running, so that it holds no runner ahead of
+    live work, each once. A cancel GitHub refuses (the run already finishing) goes to the wake
+    log once and stops nothing. One held back by the shared budget, or lost to a GitHub outage
+    or a stall, is a wait: the caller stops, and it is tried again at the next call."""
+    for old in folder.glob("cancel-*"):
+        # A cancelled run has long ended by then.
+        if time.time() - old.stat().st_mtime > CANCEL_CLAIM_SECONDS:
+            old.unlink(missing_ok=True)
+    for run in found:
+        if run.get("status") == "completed":
+            continue
+        claim = folder / f"cancel-{run['id']}"
+        # Claim before contacting GitHub: a run still finishing after its cancel, which GitHub
+        # lists as running for a while, is not cancelled again.
+        try:
+            with claim.open("x") as output:
+                output.write(f"cancel requested for run {run['id']} of {whose}\n")
+        except FileExistsError:
+            continue
+        try:
+            done = command("gh", "run", "cancel", str(run["id"]), "-R", REPOSITORY, check=False)
+            error = (done.stderr.strip() or done.stdout.strip()) if done.returncode else ""
+        except BudgetWaiting:
+            claim.unlink()
+            raise
+        except Refused as failure:
+            error = str(failure)
+        if error and transient(error):
+            claim.unlink()
+            raise Waiting(f"could not cancel run {run['id']} of {whose} yet: {error}")
+        if error:
+            note = f"could not cancel run {run['id']} of {whose}: {error}"
+            claim.write_text(note + "\n")
+            wake_log(note)
 
 
 def pull_service_wait(
@@ -603,7 +761,7 @@ def pull_service_wait(
     """
     if {check.get("name") for check in _failed_rollup(pull)} - {
         "CI: dependencies",
-        "CI result",
+        CI_RESULT,
     }:
         return None
     ci = runs("ci", pull["headRefOid"], pull=True)
@@ -712,7 +870,7 @@ def push_health(
                     _retry_failed_main(ci[0], parts, retry_folder, retry=retry, service=service)
                 )
     else:
-        assessments.append(("pending", ["CI result has not started"], {}))
+        assessments.append(("pending", [f"{CI_RESULT} has not started"], {}))
     for run in images:
         parts = jobs(run)
         # Main image pushes share a cancelling concurrency group. A newer run replaces
@@ -723,7 +881,7 @@ def push_health(
         if superseded and all(
             job.get("conclusion") in (None, "success", "skipped", "cancelled") for job in parts
         ):
-            assessments.append(("pending", ["Docker images: what to run"], run))
+            assessments.append(("pending", [IMAGES_PLAN], run))
         else:
             assessments.append((*verdict(run, parts, images=True), run))
         # Even with a failed job, re-running a superseded cancellation could cancel
@@ -736,7 +894,7 @@ def push_health(
         and assessments[0][0] == "green"
         and main_images_needed(head, ci)
     ):
-        assessments.append(("pending", ["Docker images have not started"], {}))
+        assessments.append(("pending", [f"{IMAGES} have not started"], {}))
     failed = [(names, run) for state, names, run in assessments if state == "red"]
     if failed:
         since = min(run.get("updated_at", "unknown time") for _, run in failed)
@@ -745,7 +903,7 @@ def push_health(
         line = f"main: red since {since}, {names} ({head[:12]})"
         line += unreached if len(failed) == 1 else ""
         earlier = [
-            f"Docker images run {run['id']} of {run['head_sha'][:12]}"
+            f"{IMAGES} run {run['id']} of {run['head_sha'][:12]}"
             for _, run in failed
             if run.get("head_sha", head) != head
         ]
@@ -755,7 +913,8 @@ def push_health(
         # This is diagnostic only: failure to read the history must keep the red gate closed.
         try:
             history = api(
-                f"{API}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100",
+                f"{API}/actions/workflows/{WORKFLOW_FILES['ci']}/runs"
+                "?branch=main&event=push&status=success&per_page=100",
                 "workflow_runs",
             )
             green = None
@@ -801,6 +960,8 @@ def push_health(
     # Only pending checks may borrow a result. Main's own failures above always win.
     inherited = inherited_green(head)
     sources: list[str] = []
+    # Main's own CI runs whose result it inherited: under the lock they are cancelled, below.
+    redundant: list[dict[str, Any]] = []
     if inherited:
         ci_inherited = False
         unproven = inherited.get("ci_unproven")
@@ -824,6 +985,7 @@ def push_health(
                 assessments[0] = ("green", [], assessments[0][2])
                 sources.append(f"CI run {inherited['ci_run']}")
                 ci_inherited = True
+                redundant += ci
         own_images = any(run["head_sha"] == head for run in images)
         if inherited.get("images_run") and inherited.get("images_complete") is True:
             # Every image job passed on this very tree, which holds every earlier push of main
@@ -836,11 +998,19 @@ def push_health(
                         for state, names, run in assessments[1:]
                     ),
                 ]
-                sources.append(f"Docker images run {inherited['images_run']}")
+                sources.append(f"{IMAGES} run {inherited['images_run']}")
         elif ci_inherited and not own_images and main_images_needed(head, ci):
             # Main asks this after its own green CI above; an inherited CI asks it here. An
             # earlier push's image run in the list does not stand in for the head's own.
-            assessments.append(("pending", ["Docker images have not started"], {}))
+            assessments.append(("pending", [f"{IMAGES} have not started"], {}))
+        if retry and retry_folder is not None and redundant:
+            try:
+                cancel_inherited(head, inherited, redundant, retry_folder)
+            except Waiting:
+                # Never sent, or lost to an outage: the next tick under the lock cancels them.
+                pass
+            except (Refused, OSError) as error:
+                wake_log(f"could not cancel main's inherited runs of {head[:12]}: {error}")
     pending = [name for state, names, _ in assessments if state != "green" for name in names]
     if pending:
         return Health("pending", f"main: pending, {', '.join(pending)} ({head[:12]})")
@@ -860,7 +1030,7 @@ def main_checkout() -> Path:
 
 def inherited_green(head: str) -> dict[str, Any] | None:
     """The gate alone writes this receipt, after observing the actual squash on main."""
-    path = main_checkout() / ".local" / "workflow" / "main-tree-green.json"
+    path = main_checkout() / CONFIG.state_folder / "main-tree-green.json"
     try:
         receipt = json.loads(path.read_text())
         if (
@@ -873,6 +1043,56 @@ def inherited_green(head: str) -> dict[str, Any] | None:
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return None
+
+
+def _cancel_entry(run: dict[str, Any], tree: str) -> dict[str, Any]:
+    # A re-run is another attempt: only the attempt the gate cancelled reads as inherited.
+    return {"run": run["id"], "attempt": run.get("run_attempt", 1), "tree": tree}
+
+
+def cancelled_inherited(run: dict[str, Any]) -> bool:
+    """Whether the gate cancelled this attempt of a run of main because main inherited its
+    result on this very tree. Any other cancelled run of main is red."""
+    if run.get("head_branch") != "main" or not run.get("head_sha"):
+        return False
+    receipt = inherited_green(run["head_sha"])
+    listed = receipt.get("cancelled_inherited") if receipt else None
+    return isinstance(listed, list) and _cancel_entry(run, receipt["tree"]) in listed
+
+
+def cancel_inherited(
+    head: str, receipt: dict[str, Any], ci: list[dict[str, Any]], folder: Path
+) -> None:
+    """Cancel main's CI runs of `head` still queued or running whose result main inherited. Each
+    is listed in the receipt first, with the tree it belongs to, so its cancellation never
+    turns main red; the runs of another tree leave the list.
+
+    Only CI: main is judged by the CI runs of its head alone, but by its latest image run on any
+    earlier push too, where a cancelled one would decide main once a later receipt replaced its
+    entry. A re-run, the gate's own retry of a failed main included, is never cancelled: its
+    result decides main."""
+    found = [
+        run
+        for run in ci
+        if run["head_sha"] == head
+        and run.get("status") != "completed"
+        and run.get("run_attempt", 1) == 1
+    ]
+    if not found:
+        return
+    tree = receipt["tree"]
+    listed = [
+        entry
+        for entry in receipt.get("cancelled_inherited") or []
+        if isinstance(entry, dict) and entry.get("tree") == tree
+    ]
+    listed += [_cancel_entry(run, tree) for run in found if _cancel_entry(run, tree) not in listed]
+    if listed != receipt.get("cancelled_inherited"):
+        with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as output:
+            json.dump({**receipt, "cancelled_inherited": listed}, output)
+            temporary = output.name
+        os.replace(temporary, folder / "main-tree-green.json")
+    _cancel(found, folder, f"main {head[:12]}, inherited on identical tree {tree}")
 
 
 def strict_jobs(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -934,7 +1154,7 @@ def record_green(
     os.replace(temporary, folder / "main-tree-green.json")
     source = (
         f"CI run {ci['id']}"
-        + (f" and Docker images run {images[0]['id']}" if images_complete else "")
+        + (f" and {IMAGES} run {images[0]['id']}" if images_complete else "")
         + (f"; main must pass {', '.join(unproven)} itself" if unproven else "")
     )
     print(
@@ -982,6 +1202,7 @@ def _refresh_health(folder: Path, *, retry: bool = False) -> tuple[str, Health]:
     # The tick asks a service a push found unreachable, so that its next outage is told too.
     if (
         retry
+        and advisory_service
         and (note := advisory_service.down(folder))
         and advisory_service.answers(note["service"])
     ):
@@ -1006,7 +1227,7 @@ def main_images_needed(head: str, ci: list[dict[str, Any]]) -> bool:
     before = None
     if push:
         for job in jobs(push):
-            if job["name"] != "CI: what to run":
+            if job["name"] != CI_PLAN:
                 continue
             notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
             before = next(
@@ -1025,10 +1246,10 @@ def main_images_needed(head: str, ci: list[dict[str, Any]]) -> bool:
 def images_needed(
     head: str, base: str, rollup: list[dict[str, Any]], *, workflow_ref: str | None = None
 ) -> bool:
-    if any(check.get("name", "").startswith("Docker images") for check in rollup):
+    if any(check.get("name", "").startswith(IMAGES) for check in rollup):
         return True
     # Use the actual workflow's path filter, without a second maintained list of image inputs.
-    workflow = git("show", f"{workflow_ref or base}:.github/workflows/images.yml")
+    workflow = git("show", f"{workflow_ref or base}:.github/workflows/{WORKFLOW_FILES['images']}")
     section = workflow.split("  pull_request:", 1)[1].split("  push:", 1)[0]
     patterns = re.findall(r'^      - "([^"]+)"$', section, flags=re.MULTILINE)
     if not patterns:
@@ -1047,13 +1268,17 @@ def browser_needed(base: str, merge: str) -> bool:
 
     The gate reads the exact difference from main, so a merge that changes nothing needs
     none; the planner runs on an empty diff only because it cannot tell one from a misread.
+    A repository that holds no planner has no browser suite, so no change needs one.
     """
+    planner = HERE.parent / "e2e-plan.py"
+    if not planner.exists():
+        return False
     changed = command(
         "git", "diff", "--no-renames", "--name-only", "-z", base, merge, errors="surrogateescape"
     ).stdout.split("\0")[:-1]
     if not changed:
         return False
-    found = importlib.util.spec_from_file_location("e2e_plan", HERE.parent / "e2e-plan.py")
+    found = importlib.util.spec_from_file_location("e2e_plan", planner)
     if found is None or found.loader is None:
         raise Refused("could not read the E2E planner")
     plan = importlib.util.module_from_spec(found)
@@ -1077,13 +1302,13 @@ def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> 
         (note.get("title"), note["message"].strip())
         for note in api(f"{API}/check-runs/{planner['id']}/annotations?per_page=100")
     }
-    return {("Files tested", tree), ("Browser suite", "whole")} <= notes
+    return {(NOTES.files_tested, tree), (NOTES.browser_suite, "whole")} <= notes
 
 
 def inherited_image_jobs(
     parts: list[dict[str, Any]], tree: str, branch: str
 ) -> list[dict[str, Any]]:
-    notes = _planner_notes(parts, "Docker images: what to run")
+    notes = _planner_notes(parts, IMAGES_PLAN)
     sources = [message for title, message in notes if title == "Inherited image run"]
     if not sources:
         return parts
@@ -1093,13 +1318,13 @@ def inherited_image_jobs(
     if (
         run.get("event") != "pull_request"
         or run.get("head_branch") != branch
-        or run.get("path") != ".github/workflows/images.yml"
+        or run.get("path") != f".github/workflows/{WORKFLOW_FILES['images']}"
         or run.get("status") != "completed"
         or run.get("conclusion") != "success"
     ):
         raise Refused("inherited image run did not pass on this branch")
     original = jobs(run)
-    if ("Files tested", tree) not in _planner_notes(original, "Docker images: what to run"):
+    if (NOTES.files_tested, tree) not in _planner_notes(original, IMAGES_PLAN):
         raise Refused("inherited image run tested other files")
     proven = passed_jobs(original)
     effective = []
@@ -1113,7 +1338,7 @@ def inherited_image_jobs(
             if group and job["name"] in proven:
                 effective.extend(group)
                 continue
-            if job["name"] in ("Docker images: browser tests", "Docker images: image tests"):
+            if job["name"] in (f"{IMAGES}: browser tests", f"{IMAGES}: image tests"):
                 raise Refused("inherited image run did not pass every required part")
         effective.append(job)
     return effective
@@ -1136,7 +1361,7 @@ def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
     before the note existed says nothing, which proves nothing either.
     """
     notes = _planner_notes(parts, CI_PLAN)
-    return not {("Server tests", "whole"), ("Server tests", "none")} & notes
+    return not {(NOTES.server_tests, "whole"), (NOTES.server_tests, "none")} & notes
 
 
 def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: str) -> bool:
@@ -1145,7 +1370,9 @@ def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: s
         job["name"] == "CI: server tests" and job.get("conclusion") == "success" for job in parts
     ):
         return False
-    return {("Merge tested", head), ("Server tests", "whole")} <= _planner_notes(parts, CI_PLAN)
+    return {(NOTES.merge_tested, head), (NOTES.server_tests, "whole")} <= _planner_notes(
+        parts, CI_PLAN
+    )
 
 
 def _proves_whole(
@@ -1158,11 +1385,11 @@ def _proves_whole(
 
 def tested_merge(parts: list[dict[str, Any]], base: str, head: str) -> str | None:
     for job in parts:
-        if job["name"] != "CI: what to run":
+        if job["name"] != CI_PLAN:
             continue
         notes = api(f"{API}/check-runs/{job['id']}/annotations?per_page=100")
         for note in notes:
-            if note.get("title") != "Merge tested":
+            if note.get("title") != NOTES.merge_tested:
                 continue
             merge = note["message"].strip()
             if not re.fullmatch(r"[0-9a-f]{40}", merge):
@@ -1194,9 +1421,8 @@ def refresh_pull(
     train.refreshable.discard(number)
     merged = command("git", "merge", "--no-ff", "--no-commit", base, check=False)
     message = "chore: test against current main"
+    rules = mechanical_conflicts()
     if mechanical:
-        from mechanical_conflicts import MechanicalConflict, resolve
-
         conflicts = git("diff", "--name-only", "--diff-filter=U").splitlines()
         if conflicts:
             Path(git("rev-parse", "--git-path", "MERGE_MSG")).write_text(
@@ -1208,9 +1434,17 @@ def refresh_pull(
             and command("git", "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode
         ):
             raise Refused(merged.stderr.strip() or merged.stdout.strip())
+    if mechanical and rules is None and (conflicts or conflicting(pull)):
+        # Without the repository's rules no conflict is mechanical, whether git or only GitHub
+        # sees it: the reviewer resolves it.
+        where = f" in {', '.join(conflicts)}" if conflicts else ""
+        raise Refused(
+            f"non-mechanical conflict{where}: the repository resolves no conflict mechanically"
+        )
+    if mechanical and rules is not None:
         try:
-            resolved = resolve(head, base)
-        except MechanicalConflict as error:
+            resolved = rules.resolve(head, base)
+        except rules.MechanicalConflict as error:
             if conflicts:
                 raise Refused(f"non-mechanical conflict in {', '.join(conflicts)}: {error}") from error
             raise Refused(str(error)) from error
@@ -1230,20 +1464,15 @@ def refresh_pull(
         raise Refused(merged.stderr.strip() or merged.stdout.strip())
     if (
         not mechanical
+        and rules is not None
         and not command("git", "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode
     ):
         # Git merges two migrations numbered alike in different files cleanly; the migration
         # tool then has two heads. The branch's new ones move past main's last, or wait as a
         # conflict.
-        from mechanical_conflicts import (
-            MechanicalConflict,
-            MigrationCollision,
-            renumber_migrations,
-        )
-
         try:
-            moved = renumber_migrations(head, base)
-        except MigrationCollision as error:
+            moved = rules.renumber_migrations(head, base)
+        except rules.MigrationCollision as error:
             message = "merge main: conflict in " + ", ".join(error.paths)
             Path(git("rev-parse", "--git-path", "MERGE_MSG")).write_text(message + "\n")
             train.conflicts[number] = head
@@ -1253,7 +1482,7 @@ def refresh_pull(
                 f"mechanically ({error}); renumber the branch's migrations after main's last, "
                 f"commit with '{message}', push, then wait for CI"
             ) from error
-        except MechanicalConflict as error:
+        except rules.MechanicalConflict as error:
             raise Refused(str(error)) from error
         if moved:
             message = "merge main: renumber migration " + ", ".join(
@@ -1261,7 +1490,7 @@ def refresh_pull(
             )
     # An older run without provenance cannot prove freshness. If main is already contained,
     # an empty commit requests a new pull_request event rather than replaying the old event.
-    if Handoff.read(train.path.parent, number) is not None:
+    if WHOLE_REQUEST and Handoff.read(train.path.parent, number) is not None:
         message += "\n\n" + WHOLE_REQUEST
     _commit_and_push(pull, train, number, message, save=unblocked)
     print(
@@ -1491,7 +1720,7 @@ def fix_evidence(pull: dict[str, Any], base: str, health: Health) -> str | None:
     the budget every session shares, so a judgment is kept until this evidence changes.
     """
     if not any(
-        check.get("name") == "CI result" and check.get("conclusion") == "SUCCESS"
+        check.get("name") == CI_RESULT and check.get("conclusion") == "SUCCESS"
         for check in pull["statusCheckRollup"]
     ):
         return None
@@ -1530,10 +1759,10 @@ def proves_main_fix(pull: dict[str, Any], base: str, health: Health) -> bool:
         if verdict(images[0], image_jobs, images=True)[0] != "green":
             return False
         tree = api(f"{API}/git/commits/{merge}")["tree"]["sha"]
-        plan = next(job for job in image_jobs if job["name"] == "Docker images: what to run")
+        plan = next(job for job in image_jobs if job["name"] == IMAGES_PLAN)
         notes = api(f"{API}/check-runs/{plan['id']}/annotations?per_page=100")
         if not any(
-            note.get("title") == "Files tested" and note["message"].strip() == tree
+            note.get("title") == NOTES.files_tested and note["message"].strip() == tree
             for note in notes
         ):
             return False
@@ -1625,7 +1854,36 @@ class Train:
         # The last scratch run that fell short in a way a new scratch branch retests: its tested
         # tree and why (_retest). Cleared once a scratch run proves its tree.
         self.retest: dict[str, str] | None = data.get("retest")
+        # Scratch branches whose records left the line, with the workflows dispatched on them and
+        # when: the sweep cancels their runs until it has seen one of each (_sweep_scratch).
+        self.dropped: list[dict[str, Any]] = [
+            entry
+            for entry in data.get("dropped") or []
+            if isinstance(entry, dict)
+            and isinstance(entry.get("branch"), str)
+            and isinstance(entry.get("requested"), list)
+            and isinstance(entry.get("dropped"), (int, float))
+        ]
+        self.scratch = self.scratch_records()
         self.first = self.front()
+
+    def scratch_records(self) -> dict[str, dict[str, Any]]:
+        """Every scratch branch the line still names, with its record."""
+        records = [
+            *(
+                member["scratch"]
+                for member in (self.prefixes["members"] if self.prefixes else [])
+                if member["scratch"]
+            ),
+            *(failure["batch"] for failure in self.batch_failed.values()),
+            *self.proven.values(),
+            *self.suites.values(),
+        ]
+        return {
+            record["branch"]: record
+            for record in records
+            if isinstance(record, dict) and isinstance(record.get("branch"), str)
+        }
 
     def line(self) -> list[str]:
         """The waiting members in the order they are served: the fix of a red main first,
@@ -1658,6 +1916,17 @@ class Train:
         if first != self.first:
             self.turn += 1
             self.first = first
+        # A record that left the line may have runs GitHub does not list yet.
+        current = self.scratch_records()
+        watched = {entry["branch"] for entry in self.dropped}
+        for branch, record in self.scratch.items():
+            # A dispatch sent but never answered may have reached GitHub too.
+            sent = sorted({*record.get("requested", []), *record.get("dispatching", [])})
+            if branch not in current and branch not in watched and sent:
+                self.dropped.append(
+                    {"branch": branch, "requested": sent, "dropped": int(time.time())}
+                )
+        self.scratch = current
         with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False) as output:
             json.dump(
                 {
@@ -1682,6 +1951,7 @@ class Train:
                     "reruns": self.reruns,
                     "lost": self.lost,
                     "retest": self.retest,
+                    "dropped": self.dropped,
                 },
                 output,
             )
@@ -1724,10 +1994,8 @@ class Train:
             # Local authorizations and owner questions can change while the tick runs.
             notes = []
             for number in self.queue:
-                root = (
-                    self.path.parent.parent.parent
-                    / ".claude/worktrees"
-                    / f"ticket-{number}/.local/workflow"
+                root = CONFIG.state(
+                    CONFIG.checkout_of(self.path.parent) / ".claude/worktrees" / f"ticket-{number}"
                 )
                 paths = [
                     *root.glob("*.owner-blocked"),
@@ -1801,13 +2069,8 @@ class Train:
                 continue
             if self.conflicts.get(number) != pull["headRefOid"]:
                 self.conflicts.pop(number, None)
-            notes = (
-                self.path.parent.parent.parent
-                / ".claude"
-                / "worktrees"
-                / f"ticket-{number}"
-                / ".local"
-                / "workflow"
+            notes = CONFIG.state(
+                CONFIG.checkout_of(self.path.parent) / ".claude" / "worktrees" / f"ticket-{number}"
             )
             # The session running the gate is acting now, whatever note an answered permission
             # dialog or a wake by its own job left behind.
@@ -2111,6 +2374,76 @@ class Train:
         self.save()
         return self.first == number
 
+    def member(self, number: str) -> dict[str, Any]:
+        """What the line holds of one member alone."""
+        return {
+            "queued": number in self.queue,
+            **{name: getattr(self, name).get(number) for name in MEMBER_ENTRIES},
+            **{name: number in getattr(self, name) for name in MEMBER_MARKS},
+        }
+
+    def admit(self, view: "OwnView") -> None:
+        """Take a member's own part from its view, keeping every other member as saved."""
+        number = view.number
+        if view.left:
+            self.queue = [entry for entry in self.queue if entry != number]
+        if number in view.queue and number not in self.queue:
+            self.queue.append(number)
+            # Whether its checks still run is the tick's to read with the others': until then
+            # it does not take the turn from a member whose run is green.
+            if number not in self.pending:
+                self.pending.append(number)
+        for name in MEMBER_ENTRIES:
+            entries, judged = getattr(self, name), getattr(view, name)
+            entries.pop(number, None)
+            if number in judged:
+                entries[number] = judged[number]
+        self.unavailable = [entry for entry in self.unavailable if entry != number]
+        self.fixes = [entry for entry in self.fixes if entry != number]
+        self.refreshable.discard(number)
+        self.unavailable += [number] if number in view.unavailable else []
+        self.fixes += [number] if number in view.fixes else []
+        self.refreshable |= {number} & view.refreshable
+        self.save()
+
+
+class OwnView(Train):
+    """One member's part of the line, judged as `claim` judges it, apart from the other members.
+
+    A handoff judges its own pull request with it before it takes the merge lock: it reads the
+    saved line without the lock, reads GitHub only about this member and main, and saves
+    nothing. The line takes its result under the lock (Train.admit); the other members' order is
+    left to the turn of the line, whose merge driver reads them.
+    """
+
+    def __init__(self, folder: Path, number: str) -> None:
+        super().__init__(folder)
+        self.number = number
+        # Whether the member left the queue while judged: it joins again at the back.
+        self.left = False
+        # Whether the line's judgment of the member finished, so its result can be taken.
+        self.judged = False
+        self.queue = [entry for entry in self.queue if entry == number]
+        for name in MEMBER_ENTRIES:
+            entries = getattr(self, name)
+            setattr(self, name, {number: entries[number]} if number in entries else {})
+        self.unavailable = [entry for entry in self.unavailable if entry == number]
+        self.fixes = [entry for entry in self.fixes if entry == number]
+        self.refreshable &= {number}
+        self.pending = []
+        self.passing = []
+        self.first = self.front()
+
+    def reconcile(self, known: dict[str, Any] | None = None, acting: str | None = None) -> None:
+        self.judged = False
+        self._reconcile(known, acting)
+        if self.number not in self.queue:
+            self.left = True
+        self.judged = True
+
+    def save(self) -> None:
+        self.first = self.front()
+
 
 def _run_token(run: dict[str, Any]) -> str:
     return f"{run['id']}:{run.get('run_attempt', 1)}"
@@ -2188,11 +2521,12 @@ def _merge_tree(base: str, head: str) -> str | None:
 
 
 def _taken_migrations(head: str, base: str) -> list[str]:
-    from mechanical_conflicts import MechanicalConflict, taken_migrations
-
+    rules = mechanical_conflicts()
+    if rules is None:
+        return []
     try:
-        return taken_migrations(head, base)
-    except MechanicalConflict as error:
+        return rules.taken_migrations(head, base)
+    except rules.MechanicalConflict as error:
         raise Refused(f"could not compare migration numbers: {error}") from error
 
 
@@ -2201,7 +2535,7 @@ def _batch_runs(batch: dict[str, Any], workflow: str) -> list[dict[str, Any]]:
         (
             run
             for run in api(
-                f"{API}/actions/workflows/{workflow}.yml/runs?head_sha={batch['head']}"
+                f"{API}/actions/workflows/{WORKFLOW_FILES[workflow]}/runs?head_sha={batch['head']}"
                 "&event=workflow_dispatch&per_page=100",
                 "workflow_runs",
             )
@@ -2328,6 +2662,9 @@ def squash_proof(
     tree: str,
     evidence: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]],
 ) -> str:
+    """The `Workflow-Proof` line of a squash, or none where the repository writes no proof."""
+    if RECEIPT is None:
+        return ""
     sources = []
     for key, (run, parts) in evidence.items():
         workflow = key.split("_", 1)[0]
@@ -2336,7 +2673,7 @@ def squash_proof(
         passed = sorted(passed_jobs(parts))
         if workflow == "ci":
             # The web job can pass with only lint, or without its story tests. Main needs both.
-            if ("Web suite", "whole") not in _planner_notes(parts, CI_PLAN):
+            if (NOTES.web_suite, "whole") not in _planner_notes(parts, CI_PLAN):
                 passed = [name for name in passed if name != "CI: web"]
         sources.append({"workflow": workflow, "run": run["id"], "jobs": passed})
     return RECEIPT + json.dumps(
@@ -2364,7 +2701,7 @@ def commit_list(number: str) -> str:
 def squash_body(number: str, proof: str) -> Iterator[str]:
     listed = commit_list(number)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt") as body:
-        body.write((listed + "\n\n" if listed else "") + proof + "\n")
+        body.write("\n\n".join(part for part in (listed, proof) if part) + "\n")
         body.flush()
         yield body.name
 
@@ -2426,26 +2763,105 @@ def _batch_report(train: Train, merged: list[str], acting: str, message: str) ->
 
 def _sweep_scratch(folder: Path) -> None:
     """Delete scratch branches that no saved batch, isolated failure awaiting a rerun or whole
-    browser suite run names."""
+    browser suite run names, each once its runs still queued or running are cancelled. A branch
+    whose runs cannot be read for now, or whose cancel is lost to an outage, stops the sweep and
+    is kept, with those after it, for the next; one that keeps failing is kept and passed over.
+
+    GitHub lists a dispatched run only some time after it accepted the dispatch: the runs of a
+    dropped branch are looked for, and cancelled, until one of each workflow dispatched on it
+    has been seen, or DROPPED_RUNS_SECONDS after the drop, when the gate gives up and says so."""
     try:
         train = Train(folder)
-        kept = {
-            member["scratch"]["branch"]
-            for member in (train.prefixes["members"] if train.prefixes else [])
-            if member["scratch"]
-        }
-        kept |= {failure["batch"]["branch"] for failure in train.batch_failed.values()}
-        kept |= {scratch["branch"] for scratch in train.proven.values()}
-        kept |= {suite["branch"] for suite in train.suites.values()}
+        before = json.dumps(train.dropped, sort_keys=True)
+        kept = set(train.scratch_records())
         listed = git("ls-remote", "origin", f"refs/heads/{SCRATCH_PREFIX}*")
-        for line in listed.splitlines():
-            ref = line.split()[1]
-            if ref.removeprefix("refs/heads/") not in kept:
-                deleted = push("origin", "--delete", ref)
+        branches = [line.split()[1].removeprefix("refs/heads/") for line in listed.splitlines()]
+    except (Refused, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+        print(f"could not delete old batch branches: {error}", flush=True)
+        return
+    watched = {entry["branch"]: entry for entry in train.dropped}
+    try:
+        for branch in branches:
+            if branch in kept:
+                continue
+            try:
+                # A dropped prefix's runs would hold runners ahead of the live prefixes' runs.
+                found = _scratch_runs(branch)
+                _cancel(found, folder, f"scratch branch {branch}")
+                if branch in watched:
+                    _seen(watched[branch], found)
+                deleted = push("origin", "--delete", f"refs/heads/{branch}")
                 if deleted.returncode:
                     raise Refused(deleted.refusal)
-    except (Refused, OSError, KeyError, IndexError, ValueError) as error:
+            except Waiting:
+                raise
+            except Refused as error:
+                print(f"could not delete old batch branch {branch}: {error}", flush=True)
+        for entry in list(train.dropped):
+            branch = entry["branch"]
+            try:
+                if branch in kept:
+                    train.dropped.remove(entry)
+                    continue
+                if branch not in branches:
+                    # Past the deadline too: one last look before giving up.
+                    found = _scratch_runs(branch)
+                    _cancel(found, folder, f"scratch branch {branch}")
+                    _seen(entry, found)
+                missing = sorted(set(entry["requested"]) - set(entry.get("seen", [])))
+                if not missing:
+                    train.dropped.remove(entry)
+                elif time.time() - entry["dropped"] > DROPPED_RUNS_SECONDS:
+                    wake_log(
+                        f"gave up looking for the {', '.join(missing)} run of dropped scratch "
+                        f"branch {branch}: GitHub listed none within "
+                        f"{DROPPED_RUNS_SECONDS // 60} minutes"
+                    )
+                    train.dropped.remove(entry)
+            except Waiting:
+                raise
+            except Refused as error:
+                print(f"could not look for the runs of {branch}: {error}", flush=True)
+    except (Refused, OSError, KeyError, IndexError, TypeError, ValueError) as error:
         print(f"could not delete old batch branches: {error}", flush=True)
+    finally:
+        if json.dumps(train.dropped, sort_keys=True) != before:
+            try:
+                train.save()
+            except OSError as error:
+                print(f"could not save the dropped scratch branches: {error}", flush=True)
+
+
+def _seen(entry: dict[str, Any], found: list[dict[str, Any]]) -> None:
+    """Note in a dropped branch's entry each dispatched workflow a run of which GitHub listed:
+    each was cancelled, or had finished."""
+    files = {
+        WORKFLOW_FILES[workflow]: workflow
+        for workflow in entry["requested"]
+        if workflow in WORKFLOW_FILES
+    }
+    seen = set(entry.get("seen", []))
+    seen |= {
+        files[name]
+        for run in found
+        if run.get("event") == "workflow_dispatch"
+        and (name := str(run.get("path", "")).rsplit("/", 1)[-1]) in files
+    }
+    entry["seen"] = sorted(seen)
+
+
+def _scratch_runs(branch: str) -> list[dict[str, Any]]:
+    """Every run of a scratch branch the gate made, across every workflow, read fresh from GitHub.
+
+    A branch of another name in the gate's namespace, and a pull request's own run, are never
+    the gate's to cancel."""
+    if not re.fullmatch(rf"{re.escape(SCRATCH_PREFIX)}[0-9a-f]{{32}}", branch):
+        return []
+    return [
+        run
+        for run in _api(f"{API}/actions/runs?branch={branch}&per_page=100", "workflow_runs")
+        if run.get("head_branch") == branch and run.get("event") != "pull_request"
+    ]
 
 
 @contextmanager
@@ -2499,18 +2915,24 @@ def _dispatch_scratch(train: Train, record: dict[str, Any], workflow: str) -> No
         return
     # Save only an accepted dispatch. If interrupted around the request, the
     # lookup above recovers an observable run; a never-sent request can retry.
+    # Until GitHub answers, the workflow is noted as being dispatched: dropped meanwhile, the
+    # record's branch is still watched for its run (_sweep_scratch).
+    record["dispatching"] = sorted({*record.get("dispatching", []), workflow})
+    train.save()
     dispatched = command(
         "gh",
         "workflow",
         "run",
-        f"{workflow}.yml",
+        WORKFLOW_FILES[workflow],
         "-R",
         REPOSITORY,
         "--ref",
         record["branch"],
         check=False,
     )
+    record["dispatching"].remove(workflow)
     if dispatched.returncode:
+        train.save()
         raise Refused(f"batch {workflow} dispatch failed: {dispatched.stderr.strip()}")
     record["requested"].append(workflow)
     train.save()
@@ -2784,7 +3206,7 @@ def _prefix_state(member: dict[str, Any], folder: Path) -> Prefix:
             if workflow == "ci"
             else whole_suite(found[0], parts, tree)
             if workflow == "e2e"
-            else ("Files tested", tree) in _planner_notes(parts, "Docker images: what to run")
+            else (NOTES.files_tested, tree) in _planner_notes(parts, IMAGES_PLAN)
         ):
             short.append(
                 f"{whose} e2e did not prove the whole browser suite on its tested files"
@@ -3253,95 +3675,189 @@ def train_status(folder: Path) -> int:
     return 0
 
 
-def pre_train_checks(number: str, folder: Path) -> None:
-    """A failed local inventory must neither join nor stay approved for a prefix."""
-    done = command("bash", str(HERE / "pre-train-checks"), check=False)
+def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> None:
+    """A failed local inventory must neither join nor stay approved for a prefix.
+
+    A repository that holds no `pre-train-checks` beside the gate has none to fail. A caller
+    that does not hold the merge lock (a handoff) takes it only to leave the line."""
+    checks = HERE / "pre-train-checks"
+    if not checks.exists():
+        return
+    done = command("bash", str(checks), check=False)
     print(done.stdout, end="", flush=True)
     print(done.stderr, end="", file=sys.stderr, flush=True)
     if done.returncode:
-        train = Train(folder)
-        members = train.prefixes["members"] if train.prefixes else []
-        for index, member in enumerate(members):
-            if member["number"] == number:
-                _drop_line(train, index)
-                break
-        train.remove(number)
-        Handoff.path(folder, number).unlink(missing_ok=True)
+        with nullcontext() if locked else handoff_lock(folder, number):
+            train = Train(folder)
+            members = train.prefixes["members"] if train.prefixes else []
+            for index, member in enumerate(members):
+                if member["number"] == number:
+                    _drop_line(train, index)
+                    break
+            train.remove(number)
+            Handoff.path(folder, number).unlink(missing_ok=True)
         raise Refused("pre-train checks failed; fix the inventory before joining the merge train")
 
 
-def handoff(number: str, folder: Path) -> int:
-    """A published passed round is required before the reviewer can leave."""
-    folder.mkdir(parents=True, exist_ok=True)
+@contextmanager
+def handoff_lock(folder: Path, number: str) -> Iterator[None]:
+    """The merge lock, held by a handoff: how long it held it goes to the wake log."""
     with (folder / "merge.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        pull = read_pull(number)
-        head = pull["headRefOid"]
-        # Checks failed only for an unreachable advisory service: the tick waits and re-runs.
-        if (
-            not ready(pull)
-            or conflicting(pull)
-            or (failed_checks(pull) and not pull_service_wait(pull, folder, number))
-        ):
-            raise Refused("only a ready, non-conflicting pull request can be handed off")
-        if git("rev-parse", "HEAD") != head or git("status", "--porcelain"):
-            raise Refused("handoff requires the clean published pull request worktree")
-        if git("branch", "--show-current") != pull["headRefName"]:
-            raise Refused("handoff requires the pull request branch")
-        reviews = api(f"{API}/pulls/{number}/reviews")
-        rounds = []
-        for review in reviews:
-            match = re.match(
-                r"^<!-- workflow-review round=([0-9]+)(?: result=(sent-back|passed))? -->",
-                review.get("body") or "",
-            )
-            if match:
-                rounds.append((int(match[1]), match[2], review.get("commit_id")))
-        latest = max(enumerate(rounds), key=lambda r: (r[1][0], r[0]))[1] if rounds else None
-        if latest is None or latest[1:] != ("passed", head):
-            raise Refused("the latest independent round must have passed on the current head")
-        from conflict_review import Scope, passed
-
-        current = next(
-            review
-            for review in reversed(reviews)
-            if review.get("commit_id") == head
-            and (review.get("body") or "").startswith(
-                f"<!-- workflow-review round={latest[0]} result=passed -->"
-            )
-        )
-        conflict = re.search(
-            r"^<!-- workflow-conflict extends=([0-9a-f]{40}) -->$",
-            current["body"],
-            re.MULTILINE,
-        )
-        if "<!-- workflow-conflict" in current["body"] and conflict is None:
-            raise Refused("conflict round needs full review: invalid conflict marker")
-        if conflict:
-            try:
-                scope = Scope.read(folder, number)
-                if (
-                    scope is None
-                    or scope.head != conflict[1]
-                    or passed(reviews, scope.head) is None
-                ):
-                    raise ValueError("conflict round lacks its scope or earlier passed round")
-                scope.validate(Path.cwd(), head)
-            except (ValueError, OSError, TypeError) as error:
-                raise Refused(f"conflict round needs full review: {error}") from error
-        pre_train_checks(number, folder)
-        note = Handoff(head, max(r[0] for r in rounds), pull["headRefName"])
-        train = Train(folder)
+        taken = time.monotonic()
         try:
-            train.claim(number, pull)
-        except Waiting:
+            yield
+        finally:
+            held = time.monotonic() - taken
+            try:
+                wake_log(f"handoff {number} held the merge lock for {held:.1f} s")
+            except OSError as error:
+                print(f"could not log the handoff's hold of the merge lock: {error}", flush=True)
+
+
+def _confirm_head(branch: str, head: str) -> None:
+    """Under the merge lock: the branch's head on GitHub is still `head`. One try of git, bounded
+    by HEAD_CHECK_TIMEOUT, with no gh call: it waits for neither GitHub's budget nor a call slot."""
+    ref = f"refs/heads/{branch}"
+    try:
+        done = run_command("git", "ls-remote", "--heads", "origin", ref, timeout=HEAD_CHECK_TIMEOUT)
+    except CommandTimeout:
+        raise Refused("could not confirm the head; try again") from None
+    if done.returncode:
+        raise Refused("could not confirm the head; try again")
+    # A pattern matches the end of a ref's name: only the branch's own line counts.
+    if [line.split() for line in done.stdout.splitlines() if line.endswith(f"\t{ref}")] != [
+        [head, ref]
+    ]:
+        raise Refused("the pull request head changed during the handoff; review it again")
+
+
+def _failing(pull: dict[str, Any]) -> set[str]:
+    return {check.get("name", check.get("context", "unknown")) for check in _failed_rollup(pull)}
+
+
+def handoff(number: str, folder: Path) -> int:
+    """A published passed round is required before the reviewer can leave.
+
+    Its own pull request is checked, and its place in the line judged, before the merge lock is
+    taken. Under the lock the handoff only confirms its head with git, joins the line and saves
+    its note: the other members' order is the tick's to read, at the turn of the line.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    pull = read_pull(number)
+    head = pull["headRefOid"]
+    # Checks failed only for an unreachable advisory service: the tick waits and re-runs.
+    if (
+        not ready(pull)
+        or conflicting(pull)
+        or (failed_checks(pull) and not pull_service_wait(pull, folder, number))
+    ):
+        raise Refused("only a ready, non-conflicting pull request can be handed off")
+    if git("rev-parse", "HEAD") != head or git("status", "--porcelain"):
+        raise Refused("handoff requires the clean published pull request worktree")
+    if git("branch", "--show-current") != pull["headRefName"]:
+        raise Refused("handoff requires the pull request branch")
+    reviews = api(f"{API}/pulls/{number}/reviews")
+    rounds = []
+    for review in reviews:
+        match = re.match(
+            r"^<!-- workflow-review round=([0-9]+)(?: result=(sent-back|passed))? -->",
+            review.get("body") or "",
+        )
+        if match:
+            rounds.append((int(match[1]), match[2], review.get("commit_id")))
+    latest = max(enumerate(rounds), key=lambda r: (r[1][0], r[0]))[1] if rounds else None
+    if latest is None or latest[1:] != ("passed", head):
+        raise Refused("the latest independent round must have passed on the current head")
+    from conflict_review import Scope, passed
+
+    current = next(
+        review
+        for review in reversed(reviews)
+        if review.get("commit_id") == head
+        and (review.get("body") or "").startswith(
+            f"<!-- workflow-review round={latest[0]} result=passed -->"
+        )
+    )
+    conflict = re.search(
+        r"^<!-- workflow-conflict extends=([0-9a-f]{40}) -->$",
+        current["body"],
+        re.MULTILINE,
+    )
+    if "<!-- workflow-conflict" in current["body"] and conflict is None:
+        raise Refused("conflict round needs full review: invalid conflict marker")
+    if conflict:
+        try:
+            scope = Scope.read(folder, number)
+            if (
+                scope is None
+                or scope.head != conflict[1]
+                or passed(reviews, scope.head) is None
+            ):
+                raise ValueError("conflict round lacks its scope or earlier passed round")
+            scope.validate(Path.cwd(), head)
+        except (ValueError, OSError, TypeError) as error:
+            raise Refused(f"conflict round needs full review: {error}") from error
+    pre_train_checks(number, folder, locked=False)
+    note = Handoff(head, max(r[0] for r in rounds), pull["headRefName"])
+    checked = pull
+    attempts = waits = 0
+    view: OwnView | None = None
+    while True:
+        if view is None:
+            if attempts == HANDOFF_ATTEMPTS:
+                raise Waiting(
+                    "the merge line kept changing this pull request's place; run the handoff again"
+                )
+            attempts += 1
+            if pull is not checked:
+                # A check failed since the first read: judged as the first read was.
+                if failed_checks(pull) and not pull_service_wait(pull, folder, number):
+                    raise Refused("only a ready, non-conflicting pull request can be handed off")
+                checked = pull
+            view = OwnView(folder, number)
+            before = view.member(number)
+            outcome: Refused | None = None
+            try:
+                view.claim(number, pull)
+            except Refused as error:
+                if not view.judged:
+                    raise
+                outcome = error
+        # Read again just before the lock: GitHub's budget, its call slots and its retries are
+        # waited for here, never while the lock is held.
+        fresh = read_pull(number)
+        if (fresh["headRefOid"], fresh["headRefName"]) != (head, pull["headRefName"]):
+            raise Refused("the pull request head changed during the handoff; review it again")
+        if not ready(fresh) or conflicting(fresh):
+            raise Refused("only a ready, non-conflicting pull request can be handed off")
+        if _failing(fresh) - _failing(pull):
+            # A check failed meanwhile: judged again, as the first read was.
+            pull, view = fresh, None
+            continue
+        read = time.monotonic()
+        with handoff_lock(folder, number):
+            if time.monotonic() - read > FRESH_READ_SECONDS:
+                # Another holder kept the lock long enough for that read to be old: let it go
+                # and read again.
+                waits += 1
+                if waits > LOCK_WAITS:
+                    raise Waiting("the merge lock stayed busy; run the handoff again")
+                continue
+            _confirm_head(pull["headRefName"], head)
+            train = Train(folder)
+            if train.member(number) != before:
+                # The tick or a gate changed its place meanwhile: judge it again.
+                pull, view = fresh, None
+                continue
+            train.admit(view)
             # Queued and passed over in its place until the tick's re-run is green; a wait
-            # before it was queued (an unreadable member) is no handoff.
-            if number not in Train(folder).queue:
-                raise
-        note.save(folder, number)
+            # before it was queued is no handoff.
+            if outcome is not None and not (isinstance(outcome, Waiting) and number in train.queue):
+                raise outcome
+            note.save(folder, number)
         print(f"pull request {number} handed to the tick after round {note.round}")
-    return 0
+        return 0
 
 
 def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
@@ -3406,7 +3922,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             raise Waiting("GitHub has not determined whether this pull request is mergeable")
         ci = runs("ci", head, pull=True)
         if not ci:
-            raise Waiting("CI result has not started for the current pull request head")
+            raise Waiting(f"{CI_RESULT} has not started for the current pull request head")
         parts = jobs(ci[0])
         ci_state = verdict(ci[0], parts)[0]
         if ci_state != "green":
@@ -3451,7 +3967,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
         passed_checks = {job["name"] for job in strict if job.get("conclusion") == "success"}
         images = runs("images", head, pull=True)
         if images_needed(head, base, pull["statusCheckRollup"]) and not images:
-            raise Waiting("Docker images checks have not started for this pull request head")
+            raise Waiting(f"{IMAGES} checks have not started for this pull request head")
         image_jobs: list[dict[str, Any]] = []
         if images:
             image_jobs = jobs(images[0])
@@ -3459,19 +3975,19 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             if image_state != "green":
                 if image_state == "red":
                     train.fail(number, head)
-                    raise Refused("the latest Docker images run for this pull request failed")
-                raise Waiting("the latest Docker images run for this pull request is not green")
+                    raise Refused(f"the latest {IMAGES} run for this pull request failed")
+                raise Waiting(f"the latest {IMAGES} run for this pull request is not green")
             image_jobs = inherited_image_jobs(image_jobs, tree, pull["headRefName"])
             # Images record the checked-out tree already. Match it to the tested CI merge.
             passed_checks |= {
                 job["name"] for job in image_jobs if job.get("conclusion") == "success"
             }
             image_plan = next(
-                job for job in image_jobs if job["name"] == "Docker images: what to run"
+                job for job in image_jobs if job["name"] == IMAGES_PLAN
             )
             image_notes = api(f"{API}/check-runs/{image_plan['id']}/annotations?per_page=100")
             if not any(
-                note.get("title") == "Files tested" and note["message"].strip() == tree
+                note.get("title") == NOTES.files_tested and note["message"].strip() == tree
                 for note in image_notes
             ):
                 return refresh_pull(pull, base, train, number)
@@ -3570,7 +4086,7 @@ def main() -> int:
         )
         return 1
     try:
-        folder = main_checkout() / ".local" / "workflow"
+        folder = main_checkout() / CONFIG.state_folder
         if handing_off:
             return handoff(sys.argv[2], folder)
         if delegated:

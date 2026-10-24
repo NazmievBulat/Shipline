@@ -63,10 +63,12 @@ exec >/dev/null 2>&1
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$here/limit-reset"
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+config=$(python3 "$here/workflow_config.py" shell) || exit 1
+eval "$config"
 worktree=$main/.claude/worktrees/ticket-$number
 [[ $name != hunt-* ]] || worktree=$main/.claude/worktrees/$name
 [[ $name != cloud-* ]] || worktree=$main
-notes=$worktree/.local/workflow
+notes=$worktree/$SHIPLINE_STATE_FOLDER
 idle=$notes/$name.idle
 waiting=$notes/$name.waiting
 checks_wait=$notes/$name.checks-wait

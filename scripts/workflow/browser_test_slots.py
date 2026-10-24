@@ -8,6 +8,8 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
+import workflow_config
+
 
 def run(command: list[str], root: Path, env: dict[str, str]) -> int:
     count = int(env.get("WORKFLOW_BROWSER_SLOTS", "3"))
@@ -16,7 +18,7 @@ def run(command: list[str], root: Path, env: dict[str, str]) -> int:
     state = Path(env.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
     queue = state / "workflow/browser-tests"
     queue.mkdir(parents=True, exist_ok=True)
-    notes = root / ".local/workflow"
+    notes = root / workflow_config.current().state_folder
     notes.mkdir(parents=True, exist_ok=True)
     with ExitStack() as stack:
         activity = stack.enter_context((notes / "browser-tests.lock").open("a+"))
