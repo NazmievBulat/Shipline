@@ -27,12 +27,15 @@ which prints `SHIPLINE_<KEY>=value` lines quoted for `eval`, the file itself amo
 the same defaults.
 """
 
+import fnmatch
+import glob
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path, PurePosixPath
@@ -49,6 +52,7 @@ DEFAULTS: dict[str, Any] = {
     "repository": None,
     "state_folder": ".local/workflow",
     "worktree_setup": "scripts/setup-worktree",
+    "refresh": {"clear_generated": []},
     "commands": {
         # The command line that runs the repository's tests, from the root of its checkout, by
         # `bash -c` (`ci_proof.py test`).
@@ -202,6 +206,102 @@ class Hunts:
 
 
 @dataclass(frozen=True)
+class Refresh:
+    clear_generated: tuple[str, ...]
+
+    def targets(self, checkout: Path) -> list[str]:
+        """Validate everything before deleting anything, without following symbolic links.
+
+        Check again in the refreshed worktree: its index and ignore rules may have changed
+        when main was merged. Git itself performs the deletion, restricted to ignored files.
+        """
+        root = checkout.resolve()
+        targets: set[str] = set()
+        for pattern in self.clear_generated:
+            _relative(pattern, "refresh.clear_generated")
+            parts = PurePosixPath(pattern).parts
+            if ".git" in parts or "\\" in pattern or any(ord(char) < 32 for char in pattern):
+                raise ConfigError(f"{FILE}: refresh.clear_generated contains an unsafe path")
+            matches = list(_generated_matches(root, parts))
+            # A missing literal or an unmatched glob must still be covered by ignore rules.
+            for path in matches or [root / pattern]:
+                relative = path.relative_to(root).as_posix()
+                if relative == "." or ".git" in path.relative_to(root).parts:
+                    raise ConfigError(
+                        f"{FILE}: refresh.clear_generated cannot name git metadata or the checkout"
+                    )
+                _generated_no_links(root, path)
+                ignored = _generated_git(root, "check-ignore", "--no-index", "-q", "--", relative)
+                if ignored.returncode != 0:
+                    raise ConfigError(f"{FILE}: refresh.clear_generated path is not ignored: {relative}")
+                files = _generated_git(
+                    root, "ls-files", "--cached", "--others", "--exclude-standard", "-z",
+                    "--", f":(literal){relative}",
+                )
+                if files.returncode or files.stdout:
+                    raise ConfigError(
+                        f"{FILE}: refresh.clear_generated path contains tracked or "
+                        f"non-ignored files: {relative}"
+                    )
+                targets.add(relative)
+        return sorted(targets)
+
+    def clear(self, checkout: Path) -> None:
+        for relative in self.targets(checkout):
+            done = _generated_git(checkout, "clean", "-fdX", "--", f":(literal){relative}")
+            if done.returncode:
+                raise ConfigError(f"{FILE}: refresh.clear_generated could not clear {relative}")
+
+
+def _generated_git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(checkout), *args], capture_output=True, text=True,
+            timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise ConfigError(f"{FILE}: refresh.clear_generated could not inspect the worktree") from None
+
+
+def _generated_matches(root: Path, parts: tuple[str, ...]) -> Iterator[Path]:
+    """Shell-style segments, including **, with no traversal through a symbolic link."""
+    if root.is_symlink():
+        raise ConfigError(f"{FILE}: refresh.clear_generated cannot traverse a symbolic link")
+    if not parts:
+        yield root
+    elif parts[0] == "**":
+        yield from _generated_matches(root, parts[1:])
+        if root.is_dir():
+            for child in root.iterdir():
+                if child.is_symlink() or child.is_dir():
+                    yield from _generated_matches(child, parts)
+                elif len(parts) == 1:
+                    yield child
+    elif glob.has_magic(parts[0]):
+        if root.is_dir():
+            for child in root.iterdir():
+                if fnmatch.fnmatchcase(child.name, parts[0]):
+                    yield from _generated_matches(child, parts[1:])
+    else:
+        yield from _generated_matches(root / parts[0], parts[1:])
+
+
+def _generated_no_links(root: Path, path: Path) -> None:
+    current = root
+    for part in path.relative_to(root).parts:
+        current /= part
+        if current.is_symlink():
+            raise ConfigError(f"{FILE}: refresh.clear_generated cannot traverse a symbolic link")
+    if path.is_dir():
+        for folder, directories, files in os.walk(path, followlinks=False):
+            for name in directories + files:
+                if name == ".git" or (Path(folder) / name).is_symlink():
+                    raise ConfigError(
+                        f"{FILE}: refresh.clear_generated contains git metadata or a symbolic link"
+                    )
+
+
+@dataclass(frozen=True)
 class Commands:
     # Each None when the file names none.
     test: str | None
@@ -227,6 +327,7 @@ class Config:
     found_repository: str | None
     state_folder: str
     worktree_setup: str
+    refresh: Refresh
     checks: Checks
     annotations: Annotations
     workflows: Workflows
@@ -517,10 +618,24 @@ def load(start: Path | None = None) -> Config:
     for name in RUN_AS_WORDS:
         if values["commands"][name] is not None:
             _words(values["commands"][name], name)
+    refresh = Refresh(tuple(values["refresh"]["clear_generated"]))
+    if refresh.clear_generated:
+        refresh.targets(main)
+        working = start or Path.cwd()
+        try:
+            if main_checkout(working) != main:
+                working = main
+        except ConfigError:
+            working = main
+        active = _generated_git(working, "rev-parse", "--show-toplevel")
+        if active.returncode:
+            raise ConfigError(f"{FILE}: refresh.clear_generated cannot find the worktree")
+        refresh.targets(Path(active.stdout.strip()))
     return Config(
         found_repository=repository,
         state_folder=_relative(values["state_folder"], "state_folder"),
         worktree_setup=_relative(values["worktree_setup"], "worktree_setup"),
+        refresh=refresh,
         checks=Checks(**values["checks"]),
         annotations=Annotations(**values["annotations"]),
         workflows=Workflows(**values["workflows"]),
@@ -566,6 +681,7 @@ def as_dict(config: Config) -> dict[str, Any]:
         "repository": config.repository,
         "state_folder": config.state_folder,
         "worktree_setup": config.worktree_setup,
+        "refresh": {"clear_generated": list(config.refresh.clear_generated)},
         "checks": vars(config.checks).copy(),
         "annotations": vars(config.annotations).copy(),
         "workflows": vars(config.workflows).copy(),

@@ -2,6 +2,9 @@
   "repository": "example-owner/example-app",
   "state_folder": ".local/shipline",
   "worktree_setup": "tools/prepare-worktree",
+  "refresh": {
+    "clear_generated": []
+  },
   "commands": {
     "test": "tools/run-tests",
     "browser_tests_for_changes": "tools/shipline/browser-tests-for-changes",

@@ -1860,6 +1860,7 @@ def _commit_and_push(
 ) -> None:
     head = pull["headRefOid"]
     git("commit", "--allow-empty", "-m", message)
+    clear_generated(Path.cwd())
     try:
         pushed = push("origin", f"HEAD:{pull['headRefName']}")
     except PushWaiting:
@@ -1880,6 +1881,13 @@ def _commit_and_push(
         note.save(train.path.parent, number)
         train.approved[number] = note.head
         train.save()
+
+
+def clear_generated(worktree: Path) -> None:
+    try:
+        CONFIG.refresh.clear(worktree)
+    except (workflow_config.ConfigError, OSError) as error:
+        raise Refused(str(error)) from error
 
 
 def _seconds(stamp: Any) -> float | None:

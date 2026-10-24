@@ -169,6 +169,49 @@ def test_refresh_refuses_unsafe_targets_when_config_is_read(tmp_path: Path, kind
     assert (target / ("link/keep" if kind == "symlink" else "types")).read_text() == "keep\n"
 
 
+@pytest.mark.parametrize("changed", ["tracked", "ignore removed", "symlink"])
+def test_refresh_rechecks_every_target_before_clearing_any(tmp_path: Path, changed: str) -> None:
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("generated/\n")
+    generated = repo / "generated"
+    generated.mkdir()
+    (generated / "first").write_text("keep until validation passes\n")
+    _write(repo, {"refresh": {"clear_generated": ["generated/first", "generated/second"]}})
+    config = workflow_config.load(repo)
+    if changed == "symlink":
+        outside = tmp_path / "outside"
+        outside.write_text("keep\n")
+        (generated / "second").symlink_to(outside)
+    else:
+        (generated / "second").write_text("keep\n")
+        if changed == "tracked":
+            _git(repo, "add", "-f", "generated/second")
+        else:
+            (repo / ".gitignore").write_text("")
+
+    with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
+        config.refresh.clear(repo)
+
+    assert (generated / "first").exists()
+    assert (generated / "second").read_text() == "keep\n"
+
+
+def test_refresh_checks_the_active_worktree_at_config_time(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("generated/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "chore: ignore generated output")
+    _write(repo, {"refresh": {"clear_generated": ["generated/types"]}})
+    worktree = tmp_path / "worktree"
+    _git(repo, "worktree", "add", "--detach", str(worktree))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (worktree / "generated").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(workflow_config.ConfigError, match="refresh.clear_generated"):
+        workflow_config.load(worktree)
+
+
 @pytest.mark.parametrize(
     "origin",
     [
