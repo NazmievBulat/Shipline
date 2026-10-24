@@ -240,9 +240,11 @@ def _processors() -> int | None:
 
 def _groups(prefix: str | None) -> dict[str, int]:
     """The CPU time, in microseconds, of each session's scope, of the tick's service and, when
-    the runner pool names its prefix, of each of its services and containers. A group's time
-    holds its children's: nothing below a matched group is read again."""
+    the runner pool names its prefix, of each of its services and containers, all named
+    `<prefix>-runner…`. A group's time holds its children's: nothing below a matched group is
+    read again."""
     found: dict[str, int] = {}
+    pool = prefix and re.compile(rf"{re.escape(prefix)}-runner(?:-.+)?\.(?:service|scope)")
     for folder, children, _files in os.walk(CGROUP_ROOT):
         name = os.path.basename(folder)
         key = None
@@ -250,7 +252,7 @@ def _groups(prefix: str | None) -> dict[str, int]:
             key = session["name"]
         elif name == TICK_SERVICE:
             key = name.removesuffix(".service")
-        elif prefix and name.startswith(prefix) and name.endswith((".service", ".scope")):
+        elif pool and pool.fullmatch(name):
             key = name.rsplit(".", 1)[0]
         if key is None:
             continue

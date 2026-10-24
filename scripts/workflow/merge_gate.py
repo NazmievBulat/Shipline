@@ -39,7 +39,13 @@ from workflow_commands import (
     run as run_command,
 )
 
-# A repository may hold three helpers beside these scripts, and the gate uses them when it does:
+# The files a repository keeps for the gate are in its own `scripts/workflow`, in its main
+# checkout: the repository Shipline works on, not the checkout these scripts are in. Searched after
+# the scripts' own folder, so none of them stands in for one of the scripts.
+REPOSITORY_FILES = workflow_config.current().main / "scripts" / "workflow"
+sys.path.insert(1, str(REPOSITORY_FILES))
+
+# A repository may hold three helpers there, and the gate uses them when it does:
 # `advisory_service` tells a scan that could not reach a package advisory service, which is a
 # wait; `pushing_checkout` installs the pushing checkout's packages before its hook and words a
 # hook's refusal; `run_proof` reads and writes the `Workflow-Proof` line with which main skips a
@@ -84,7 +90,7 @@ except ModuleNotFoundError as error:
 
 def mechanical_conflicts() -> ModuleType | None:
     """The repository's rules for the conflicts and migration numbers a refresh settles itself,
-    `mechanical_conflicts` beside the scripts, read only when a refresh needs them. Without
+    `mechanical_conflicts` among its files, read only when a refresh needs them. Without
     them no conflict is mechanical and there are no migrations to renumber."""
     try:
         import mechanical_conflicts as rules
@@ -1023,9 +1029,8 @@ def push_health(
 
 
 def main_checkout() -> Path:
-    return Path(
-        git("-C", str(HERE), "rev-parse", "--path-format=absolute", "--git-common-dir")
-    ).parent
+    """The main checkout of the repository the gate works on."""
+    return CONFIG.main
 
 
 def inherited_green(head: str) -> dict[str, Any] | None:
@@ -1270,7 +1275,7 @@ def browser_needed(base: str, merge: str) -> bool:
     none; the planner runs on an empty diff only because it cannot tell one from a misread.
     A repository that holds no planner has no browser suite, so no change needs one.
     """
-    planner = HERE.parent / "e2e-plan.py"
+    planner = CONFIG.main / "scripts" / "e2e-plan.py"
     if not planner.exists():
         return False
     changed = command(
@@ -3678,9 +3683,9 @@ def train_status(folder: Path) -> int:
 def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> None:
     """A failed local inventory must neither join nor stay approved for a prefix.
 
-    A repository that holds no `pre-train-checks` beside the gate has none to fail. A caller
+    A repository that holds no `pre-train-checks` among its files has none to fail. A caller
     that does not hold the merge lock (a handoff) takes it only to leave the line."""
-    checks = HERE / "pre-train-checks"
+    checks = REPOSITORY_FILES / "pre-train-checks"
     if not checks.exists():
         return
     done = command("bash", str(checks), check=False)

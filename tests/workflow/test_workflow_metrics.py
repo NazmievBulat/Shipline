@@ -489,6 +489,35 @@ def test_a_sample_reads_proc_the_control_groups_and_the_sessions(workflow: Workf
     assert not [call for call in workflow.calls("gh ")]
 
 
+def test_a_sample_reads_the_runner_pool_s_services_and_containers_by_its_prefix(
+    workflow: Workflow,
+) -> None:
+    (workflow.repo / "shipline.json").write_text(json.dumps({"runner": {"prefix": "example-app"}}))
+    app = workflow.cgroup_root / "user.slice/user@1000.service/app.slice"
+    system = workflow.cgroup_root / "system.slice"
+    for folder, used in (
+        (app / "example-app-runner-keep-slots.service", 10),
+        (system / "example-app-runner-1.service", 20),
+        (system / "docker-1.scope/example-app-runner-docker-2.scope", 30),
+        # The repository's own services share the prefix, but are not the pool's.
+        (app / "example-app-web.service", 40),
+        (app / "example-app.service", 50),
+    ):
+        folder.mkdir(parents=True)
+        (folder / "cpu.stat").write_text(f"usage_usec {used}\n")
+
+    done = workflow.run_script("workflow-metrics", "--sample", env=AT)
+
+    assert done.returncode == 0, done.stderr
+    machine = workflow.root / "home" / ".local" / "state" / "workflow" / "machine.jsonl"
+    [sample] = [json.loads(line) for line in machine.read_text().splitlines()]
+    assert sample["groups"] == {
+        "example-app-runner-keep-slots": 10,
+        "example-app-runner-1": 20,
+        "example-app-runner-docker-2": 30,
+    }
+
+
 def test_a_sample_without_proc_figures_still_records_the_sessions(workflow: Workflow) -> None:
     done = workflow.run_script("workflow-metrics", "--sample", env=AT)
 

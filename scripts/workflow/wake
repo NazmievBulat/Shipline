@@ -78,12 +78,13 @@ ASKED=$STATE/wake.asked
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 github_ready=1
 python3 "$here/github_budget.py" ready wake || github_ready=0
-main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)") || exit 1
 # The state folder and the labels (`workflow_config.py`), read once; priority.jq reads the
 # label names from SHIPLINE_CONFIG.
 config=$(python3 "$here/workflow_config.py" shell) || exit 1
 eval "$config"
 export SHIPLINE_CONFIG
+# The repository's main checkout, never the checkout these scripts are in.
+main=$SHIPLINE_REPO
 resent=("$@")
 mkdir -p "$STATE"
 main_report=$main/$SHIPLINE_STATE_FOLDER/main-status

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from workflow_harness import Workflow
+from workflow_harness import Workflow, install_shipline
 
 _WORKFLOW = Path(__file__).resolve().parents[2] / "scripts/workflow"
 # Loaded from its file, so the scripts' folder is not put on the path of every other test.
@@ -60,7 +60,12 @@ _DEFAULTS = {
             "low": "priority: low",
         },
     },
-    "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
+    "runner": {
+        "labels": [],
+        "identity_folder": "~/.config/shipline-runner",
+        "prefix": None,
+        "image_build": None,
+    },
 }
 
 
@@ -153,6 +158,9 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     assert keys(example) == keys(_DEFAULTS)
     assert example["repository"].endswith("/example-app")
     assert example["runner"]["labels"]
+    # One prefix names the runner pool, its labels among its names.
+    assert example["runner"]["prefix"] == "example-app"
+    assert all(label.startswith("example-app-") for label in example["runner"]["labels"])
 
 
 def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
@@ -164,6 +172,25 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
     _write(repo, {"runner": {"prefix": ""}})
     with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be a name"):
         workflow_config.load(repo)
+
+
+def test_the_image_build_command_is_read_and_must_be_a_command_line(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    command = "tools/shipline/build-runner-image --pull"
+    _write(repo, {"runner": {"image_build": command}})
+
+    assert workflow_config.load(repo).runner.image_build == command
+
+    _write(repo, {"runner": {"image_build": " "}})
+    with pytest.raises(workflow_config.ConfigError, match="runner.image_build must be a name"):
+        workflow_config.load(repo)
+
+
+def test_without_an_image_build_command_there_is_none(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app"}})
+
+    assert workflow_config.load(repo).runner.image_build is None
 
 
 def test_the_repository_named_in_the_file_wins_over_the_runner_settings_and_origin(
@@ -372,7 +399,11 @@ _ODD = {
     "worktree_setup": "tools/set up 'it'",
     "checks": {"ci_result": 'Build "result" $(touch nope)'},
     "labels": {"priority": {"blocker": "p0: `now`"}},
-    "runner": {"labels": ["home one", "home-two"]},
+    "runner": {
+        "labels": ["home one", "home-two"],
+        "prefix": "odd-app",
+        "image_build": "tools/build 'image' $(touch built)",
+    },
 }
 
 
@@ -407,7 +438,7 @@ def test_bash_reads_every_value_once_quoted_for_eval(tmp_path: Path) -> None:
         '"$SHIPLINE_E2E_PLAN" "$SHIPLINE_IMAGES" "$SHIPLINE_LABEL_WORKFLOW" '
         '"$SHIPLINE_LABEL_AUDITED" "$SHIPLINE_PRIORITY_BLOCKER" "$SHIPLINE_PRIORITY_HIGH" '
         '"$SHIPLINE_PRIORITY_MEDIUM" "$SHIPLINE_PRIORITY_LOW" "${#SHIPLINE_RUNNER_LABELS[@]}" '
-        '"${SHIPLINE_RUNNER_LABELS[@]}"',
+        '"${SHIPLINE_RUNNER_LABELS[@]}" "$SHIPLINE_RUNNER_PREFIX" "$SHIPLINE_RUNNER_IMAGE_BUILD"',
     )
 
     assert printed.splitlines() == [
@@ -427,8 +458,11 @@ def test_bash_reads_every_value_once_quoted_for_eval(tmp_path: Path) -> None:
         "2",
         "home one",
         "home-two",
+        "odd-app",
+        "tools/build 'image' $(touch built)",
     ]
     assert not (repo / "nope").exists()
+    assert not (repo / "built").exists()
 
 
 def test_bash_without_a_file_reads_the_defaults(tmp_path: Path) -> None:
@@ -437,7 +471,8 @@ def test_bash_without_a_file_reads_the_defaults(tmp_path: Path) -> None:
     printed = _shell(
         repo,
         'printf "%s\\n" "$SHIPLINE_REPOSITORY" "$SHIPLINE_STATE_FOLDER" "$SHIPLINE_CI_RESULT" '
-        '"${#SHIPLINE_RUNNER_LABELS[@]}" "$SHIPLINE_CONFIG"',
+        '"${#SHIPLINE_RUNNER_LABELS[@]}" "$SHIPLINE_CONFIG" '
+        '"${SHIPLINE_RUNNER_PREFIX-unset}" "${SHIPLINE_RUNNER_IMAGE_BUILD-unset}"',
     )
 
     assert printed.splitlines() == [
@@ -446,6 +481,8 @@ def test_bash_without_a_file_reads_the_defaults(tmp_path: Path) -> None:
         "CI result",
         "0",
         "{}",
+        "",
+        "",
     ]
 
 
@@ -804,6 +841,7 @@ def test_python_bash_node_and_jq_read_the_same_values(workflow: Workflow) -> Non
 def test_the_named_labels_are_what_the_tick_starts_by_and_install_timer_creates(
     workflow: Workflow,
 ) -> None:
+    install_shipline(workflow)
     _commit_on_main(
         workflow,
         {"shipline.json": json.dumps({"labels": {"workflow": "shipline", "audited": "checked"}})},
@@ -1008,6 +1046,7 @@ def test_without_a_repository_only_what_needs_one_stops(workflow: Workflow) -> N
     scripts = workflow.repo / "scripts/workflow"
     shell = subprocess.run(
         ["python3", str(scripts / "workflow_config.py"), "shell"],
+        cwd=workflow.repo,
         env=workflow.env,
         capture_output=True,
         text=True,
