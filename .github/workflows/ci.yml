@@ -11,8 +11,10 @@ on:
 permissions:
   contents: read
 
+# A pull request's newer push cancels its older run. Every commit of main and of the merge queue
+# keeps its own run: the merge gate reads each of them.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -98,14 +100,43 @@ jobs:
           for tool in bash git jq tmux node gh openssl; do
             command -v "$tool" >/dev/null || { echo "missing: $tool"; exit 1; }
           done
+      # Ubuntu's tmux is built with systemd support: it moves each new pane into a scope of its
+      # own, racing the memory-limited scope a session starts its command in, and the first
+      # session can lose its limit (#41). The tests run the scripts with a tmux built without it.
+      - name: Cache tmux without systemd
+        id: tmux
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/tmux
+          # A new runner image may bring other libraries to link against.
+          key: tmux-3.4-no-systemd-${{ env.ImageOS }}-${{ runner.arch }}
+      - name: Build tmux without systemd
+        if: steps.tmux.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq libevent-dev libncurses-dev
+          curl -fsSL -o "$RUNNER_TEMP/tmux.tar.gz" \
+            https://github.com/tmux/tmux/releases/download/3.4/tmux-3.4.tar.gz
+          echo "551ab8dea0bf505c0ad6b7bb35ef567cdde0ccb84357df142c254f35a23e19aa  $RUNNER_TEMP/tmux.tar.gz" |
+            sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/tmux.tar.gz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/tmux-3.4"
+          ./configure --prefix="$HOME/.local/tmux" --disable-systemd
+          make -j4 && make install
+      - name: Use tmux without systemd
+        run: |
+          echo "$HOME/.local/tmux/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/tmux/bin:$PATH"
+          tmux -V
+          if ldd "$(command -v tmux)" | grep -q libsystemd; then echo "tmux uses systemd"; exit 1; fi
       - name: The test tools
         run: python -m pip install --require-hashes -r requirements-test.txt
       - name: Tests
-        run: python -m pytest -n 4 --dist worksteal -m "not serial" ${{ matrix.files }}
+        run: python -m pytest -rs -n 4 --dist worksteal -m "not serial" ${{ matrix.files }}
       # The tests that cannot run beside others, one at a time, in one shard.
       - name: Tests that run alone
         if: matrix.shard == 1
-        run: python -m pytest -p no:xdist -m serial || [ $? -eq 5 ]
+        # Exit code 5: none is marked so.
+        run: python -m pytest -rs -p no:xdist -m serial || [ $? -eq 5 ]
 
   ci:
     # The check the merge queue requires, by this name.

@@ -44,23 +44,42 @@ from workflow_commands import (
 # wait; `pushing_checkout` installs the pushing checkout's packages before its hook and words a
 # hook's refusal; `run_proof` reads and writes the `Workflow-Proof` line with which main skips a
 # job its squash proved. Without them a failed push is refused with its last lines, nothing is
-# installed first, and no proof is read or written, so main never skips a job.
+# installed first, and no proof is read or written, so main never skips a job: a job counts as
+# passed only where it passed itself. A helper that is there but cannot start stops the gate.
 try:
     import advisory_service
-except ModuleNotFoundError:
+except ModuleNotFoundError as error:
+    if error.name != "advisory_service":
+        raise
     advisory_service = None
 try:
     import pushing_checkout
-except ModuleNotFoundError:
+except ModuleNotFoundError as error:
+    if error.name != "pushing_checkout":
+        raise
     pushing_checkout = None
 try:
     from run_proof import RECEIPT, passed_jobs
     from run_proof import WHOLE as WHOLE_REQUEST
-except ModuleNotFoundError:
+except ModuleNotFoundError as error:
+    if error.name != "run_proof":
+        raise
     RECEIPT = WHOLE_REQUEST = None
 
     def passed_jobs(parts: list[dict[str, Any]]) -> set[str]:
-        return set()
+        """The jobs that passed in the run itself, a job run in parts once each of its parts
+        did; no proof line is read."""
+        grouped: dict[str, list[tuple[re.Match[str] | None, dict[str, Any]]]] = {}
+        for job in parts:
+            part = re.fullmatch(r"(.+) \((\d+) of (\d+)\)", job["name"])
+            grouped.setdefault(part[1] if part else job["name"], []).append((part, job))
+        return {
+            name
+            for name, group in grouped.items()
+            if all(job.get("conclusion") == "success" for _, job in group)
+            and sorted((int(part[2]), int(part[3])) for part, _ in group if part)
+            in ([], [(number, len(group)) for number in range(1, len(group) + 1)])
+        }
 
 
 def mechanical_conflicts() -> ModuleType | None:
@@ -69,7 +88,9 @@ def mechanical_conflicts() -> ModuleType | None:
     them no conflict is mechanical and there are no migrations to renumber."""
     try:
         import mechanical_conflicts as rules
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as error:
+        if error.name != "mechanical_conflicts":
+            raise
         return None
     return rules
 
