@@ -965,7 +965,7 @@ def test_a_question_not_owner_only_is_answered_once_after_15_minutes_then_woken(
     assert _answered_in_log(attachable) == [f'{_NOW + 900} answered for the owner: cloud-7, "1"']
     assert _lines(attachable.state / "typed") == [_ANSWERED]
     assert _wake_log(attachable) == [f"{_NOW + 900} woke cloud-7 (question answered)"]
-    # Answered, it no longer waits for the owner, and his phone is not rung for it again.
+    # Answered, it no longer waits for the owner.
     assert not (attachable.repo / ".local/workflow/cloud-7.asking").exists()
 
 
@@ -987,12 +987,23 @@ def test_a_question_not_owner_only_is_answered_once_after_15_minutes_then_woken(
         ),
         (
             "Done so far:\n1. Added the parser\n2. Tests green\n\nWhich order?\n"
-            "1. Oldest first\n2. Newest first\n\nOwner only: no\nReply 1 or 2.",
+            "1. Oldest first (recommended)\n2. Newest first\n\nOwner only: no\nReply 1 or 2.",
             "1",
-            "1. Oldest first",
+            "1. Oldest first (recommended)",
+        ),
+        (
+            "Which retry?\n\n**1** Retry once (recommended)\n\n**2** Retry three times\n\n"
+            "Owner only: no\nReply 1 or 2.",
+            "1",
+            "**1** Retry once (recommended)",
         ),
     ],
-    ids=["quoted words", "marked, in bold", "a numbered list above the choices"],
+    ids=[
+        "quoted words",
+        "marked, in bold",
+        "a numbered list above the choices",
+        "a blank line between the choices",
+    ],
 )
 def test_the_answer_is_the_recommended_choice(
     attachable: Workflow, text: str, word: str, line: str
@@ -1012,12 +1023,28 @@ def test_the_answer_is_the_recommended_choice(
 @pytest.mark.parametrize(
     "text",
     [
-        'I recommend "2".\n\n1. Oldest first\n2. Newest first\n\nOwner only: no\nReply 1 or 2.',
+        'I recommend "2".\n\n1. Oldest first (recommended)\n2. Newest first\n\n'
+        "Owner only: no\nReply 1 or 2.",
+        "1. Oldest first (recommended)\n2. Newest first\nI recommend 2 after all.\n\n"
+        "Owner only: no\nReply 1 or 2.",
+        "1. Oldest first (recommended)\n2. Newest first\n\nOwner only: no\n"
+        "Reply 1 or 2 (I recommend 2).",
         "Which order?\n\n1. Oldest first (recommended)\n2. Newest first (recommended)\n\n"
         "Owner only: no\nReply 1 or 2.",
+        "Which order?\n\n1. Oldest first\n2. Newest first\n\nOwner only: no\nReply 1 or 2.",
+        "1. Retry once\n2. Retry three times\n3. Never retry (not recommended)\n\n"
+        "Owner only: no\nReply 1, 2 or 3.",
         "Which order? Oldest or newest first.\n\nOwner only: no\nReply 1 or 2.",
     ],
-    ids=["recommended elsewhere", "two recommended", "no choice lines"],
+    ids=[
+        "recommended above",
+        "recommended below the choices",
+        "recommended in the reply words",
+        "two marked",
+        "none marked",
+        "not recommended",
+        "no choice lines",
+    ],
 )
 def test_an_unclear_recommendation_is_left_for_the_owner(attachable: Workflow, text: str) -> None:
     attachable.add_pull_request(7)
@@ -1070,13 +1097,22 @@ def test_an_earlier_answer_wins(attachable: Workflow, answerer: str) -> None:
     assert _answered_in_log(attachable) == []
 
 
-def test_an_answer_that_comes_while_the_tick_reads_wins(attachable: Workflow) -> None:
+@pytest.mark.parametrize("late", ["owner", "worker"])
+def test_an_answer_or_a_report_that_comes_while_the_tick_reads_wins(
+    attachable: Workflow, late: str
+) -> None:
     attachable.add_pull_request(7)
     _record(attachable)
     question = _question(attachable)
     _comments(attachable, question)
-    late = {"id": 5, "body": "2", "created_at": "2026-10-19T18:14:00Z", "user": question["user"]}
-    # The owner's reply lands after the tick's first read of the comments.
+    body = "2" if late == "owner" else f"{_MARKER}\nAnother question?"
+    arrival = {
+        "id": 5,
+        "body": body,
+        "created_at": "2026-10-19T18:14:00Z",
+        "user": question["user"],
+    }
+    # The owner's reply, or a new report, lands after the tick's first read of the comments.
     real = attachable.bin / "gh"
     real.rename(attachable.bin / "gh-real")
     attachable.fake(
@@ -1085,7 +1121,7 @@ def test_an_answer_that_comes_while_the_tick_reads_wins(attachable: Workflow) ->
         'if [[ "$*" == *"/comments?per_page=100"* ]]; then\n'
         '  read_once="@STATE@/read-once"\n'
         '  if [ -e "$read_once" ]; then\n'
-        f"    echo {json.dumps(json.dumps([[question, late]]))} > @STATE@/comments-7.json\n"
+        f"    echo {json.dumps(json.dumps([[question, arrival]]))} > @STATE@/comments-7.json\n"
         "  fi\n"
         '  touch "$read_once"\n'
         "fi\n"

@@ -248,10 +248,9 @@ def _may_write(comment: dict[str, object], writers: dict[str, bool]) -> bool:
 
 def _question(body: str) -> tuple[str | None, str, str]:
     """A question's `Owner only:` value (None without the line), its recommended reply word and
-    the line of that choice. The choices are the lines just above `Owner only:` that begin with
-    a reply word of the last lines; the recommended one is the one marked so, else the first.
-    Word and line are empty when that is unclear: no choice, two marked, or a recommendation
-    elsewhere in the question naming another reply word."""
+    the line of that choice: the one line above `Owner only:` that begins with a reply word of
+    the last lines and is marked "(recommended)". Word and line are empty when that is unclear:
+    no such line, two, or another line that recommends and names another reply word."""
     lines = _without_attribution(body).splitlines()
     owner = [
         (at, match[1].lower())
@@ -267,38 +266,31 @@ def _question(body: str) -> tuple[str | None, str, str]:
     ]
 
     def names(line: str, word: str) -> bool:
-        return bool(re.search(rf"""(?<!\w)["'“`]?{re.escape(word)}["'”`]?(?!\w)""", line, re.I))
+        return bool(re.search(rf"""(?<!\w)["'“`]?{re.escape(word)}["'”`]?(?!\w)""", line))
 
     def begins(line: str) -> str:
         bare = re.sub(r"^[\s>*_•-]*", "", line)
         return next(
-            (
-                word
-                for word in words
-                if re.match(rf"""[("'“`]?{re.escape(word)}(?!\w)""", bare, re.I)
-            ),
+            (word for word in words if re.match(rf"""[("'“`]?{re.escape(word)}(?!\w)""", bare)),
             "",
         )
 
-    # The block of lines just above `Owner only:`, past any blank ones.
-    end = at
-    while end and not lines[end - 1].strip():
-        end -= 1
-    start = end
-    while start and lines[start - 1].strip():
-        start -= 1
-    choices = [(line.strip(), begins(line)) for line in lines[start:end] if begins(line)]
-    marked = [choice for choice in choices if re.search(r"recommended", choice[0], re.I)]
-    if not choices or len(marked) > 1:
-        return value, "", ""
-    line, word = marked[0] if marked else choices[0]
-    elsewhere = [
-        other
-        for other in lines[:start]
-        if re.search(r"recommend", other, re.I)
-        and any(names(other, other_word) for other_word in words if other_word != word)
+    marked = [
+        (number, word)
+        for number, line in enumerate(lines[:at])
+        if (word := begins(line)) and re.search(r"\(recommended\)", line, re.I)
     ]
-    return (value, "", "") if elsewhere else (value, word, line)
+    if len(marked) != 1:
+        return value, "", ""
+    chosen, word = marked[0]
+    elsewhere = [
+        line
+        for number, line in enumerate(lines)
+        if number != chosen
+        and re.search(r"recommend", line, re.I)
+        and any(names(line, other) for other in words if other != word)
+    ]
+    return (value, "", "") if elsewhere else (value, word, lines[chosen].strip())
 
 
 def _answer_after_minutes() -> int:
@@ -345,8 +337,12 @@ def _answer_for_owner(
     if owner != "no" or not word or now - int(record["last_comment_at"]) < minutes * 60:
         return
     number = path.name.removeprefix("cloud-")
-    # Read again just before answering: the owner may have answered since.
-    if _answer(_comments(number), question, writers):
+    # Read again just before answering: the owner may have answered, or the worker reported
+    # again, since.
+    fresh = _comments(number)
+    if _answer(fresh, question, writers) or any(
+        comment["id"] > question and str(comment["body"]).startswith(MARKER) for comment in fresh
+    ):
         return
     posted = call(
         "cloud-workers",
