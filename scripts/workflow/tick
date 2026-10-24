@@ -204,6 +204,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 gh() { python3 "$here/github_budget.py" call tick "$@"; }
 source "$here/bridge-failed"
+# Keep the config home anchored to the caller before changing to main: sessions and the
+# other children must read the same file as this tick, even when it began in a worktree.
+if [[ -n ${XDG_CONFIG_HOME:-} && $XDG_CONFIG_HOME != /* ]]; then
+  export XDG_CONFIG_HOME="$PWD/$XDG_CONFIG_HOME"
+fi
 # The repository, its check names, labels and state folder (`workflow_config.py`), read once.
 config=$(python3 "$here/workflow_config.py" shell) || exit 1
 eval "$config"

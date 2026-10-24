@@ -522,6 +522,35 @@ def test_a_tick_can_be_run_from_a_worktree(workflow: Workflow) -> None:
     assert not list(worktree.rglob("*tick.lock"))
 
 
+
+def test_a_tick_keeps_a_relative_config_home_when_starting_from_a_worktree(
+    workflow: Workflow,
+) -> None:
+    worktree = workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    workflow.add_pull_request(8)
+    config_home = worktree / ".local/config home"
+    path = config_home / "shipline/example-org-example-app/shipline.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"state_folder": ".local/named-state"}))
+
+    done = workflow.run_script("tick", cwd=worktree, env={"XDG_CONFIG_HOME": ".local/config home"})
+
+    assert done.returncode == 0, done.stderr
+    assert workflow.is_running("ticket-8")
+    session_worktree = workflow.worktree(8)
+    assert (session_worktree / ".local/named-state").is_dir()
+    lines = (workflow.state / "env/ticket-8").read_text().splitlines()
+    env = dict(line.split("=", 1) for line in lines)
+    assert env["XDG_CONFIG_HOME"] == str(config_home)
+    read = subprocess.run(
+        ["python3", str(workflow.script.parent / "workflow_config.py"), "shell"],
+        cwd=session_worktree, env=env, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert read.returncode == 0, read.stderr
+    assert f"SHIPLINE_CONFIG='{path}'\n" in read.stdout
+
+
 _MARKS_8_READY_DURING_SETUP = """#!/bin/bash
 echo "worktree-setup $* in $PWD" >> "@STATE@/calls.log"
 echo "false workflow" > "@STATE@/listing/8"
