@@ -62,9 +62,10 @@ exec >/dev/null 2>&1
 # from.
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$here/limit-reset"
-main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
 config=$(python3 "$here/workflow_config.py" shell) || exit 1
 eval "$config"
+# The repository's main checkout, never the checkout these scripts are in.
+main=$SHIPLINE_REPO
 worktree=$main/.claude/worktrees/ticket-$number
 [[ $name != hunt-* ]] || worktree=$main/.claude/worktrees/$name
 [[ $name != cloud-* ]] || worktree=$main
