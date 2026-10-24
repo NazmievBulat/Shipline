@@ -11,6 +11,12 @@ the first member waits, the lent runner keeps only the first label, so it takes 
 older ones. When a job of main or of a dispatched run is under way, an idle lent runner loses
 both. A busy runner is never relabelled: its labels go with its registration when the job ends.
 
+It also keeps the merge line's lane, `<label>-main-batch`: the idle main runners carry it while
+no job of a push to main is queued, all but the first when two or more are online, so main
+keeps a runner of its own and goes first. The note it writes for the planner counts the lane's
+free runners, less the lane jobs already queued (`batch_free`); the gate's first run of a prefix
+asks for the lane only when its planner claims one of them (`ci_proof.py main-lane`).
+
 The merge gate writes the train's first member to `~/.local/state/workflow/train-first.json`
 (scripts/workflow/merge_gate.py). This copies it, with the time, into the folder the planner's
 container reads (`home/first.json`), so the planner sends that member's runs to the first label
@@ -194,9 +200,9 @@ def _jobs_under_way(api: Api, repository: str, run: dict[str, Any]) -> list[dict
 def main_waiting(api: Api, repository: str, labels: Labels) -> bool:
     """A job of a push to main, or of a dispatched run, is queued or running for main's runners.
 
-    The merge gate dispatches its prefixes' runs, and their jobs ask for main's label: what a
-    job asks for decides, not what its branch is called. Only runs under way are listed, so
-    finished dispatches never push one off the page."""
+    The merge gate dispatches its prefixes' runs, and their jobs ask for the merge line's lane on
+    main's runners: what a job asks for decides, not what its branch is called. Only runs under
+    way are listed, so finished dispatches never push one off the page."""
     dispatched = f"repos/{repository}/actions/runs?event=workflow_dispatch&per_page=20&status="
     runs = [
         *_active(api, f"repos/{repository}/actions/runs?event=push&branch=main&per_page=10"),
@@ -221,21 +227,53 @@ def main_queued(api: Api, repository: str, labels: Labels) -> bool:
     )
 
 
+def lane_queued(api: Api, repository: str, labels: Labels) -> int:
+    """How many jobs of dispatched runs wait for the merge line's lane."""
+    dispatched = f"repos/{repository}/actions/runs?event=workflow_dispatch&per_page=20&status="
+    return sum(
+        labels.main_batch in job["labels"] and job["status"] == "queued"
+        for status in ("queued", "in_progress")
+        for run in _active(api, f"{dispatched}{status}")
+        for job in _jobs_under_way(api, repository, run)
+    )
+
+
 def lane(
     runners: list[Registration], labels: Labels, *, main_queued: bool
 ) -> list[tuple[str, int, str]]:
-    """The label changes that keep main's place on its runners: each idle online main runner
-    carries the merge line's lane while no push to main waits, and loses it while one does, so
-    a prefix's job never takes a runner ahead of main's. A busy runner is never relabelled."""
+    """The label changes that keep main's place on its runners: the idle online main runners
+    carry the merge line's lane while no push to main waits, and lose it while one does, so a
+    prefix's job never takes a runner ahead of main's. With two or more online, the first never
+    carries it, so a push to main never waits behind prefix jobs already running either. A busy
+    runner is never relabelled."""
+    online = sorted(
+        (runner for runner in runners if labels.main in runner.labels and runner.online),
+        key=lambda runner: runner.id,
+    )
+    laned = online[1:] if len(online) > 1 else online
     changes: list[tuple[str, int, str]] = []
-    for runner in runners:
-        if labels.main not in runner.labels or not runner.online or runner.busy:
+    for runner in online:
+        if runner.busy:
             continue
-        if main_queued and labels.main_batch in runner.labels:
+        wanted = not main_queued and runner in laned
+        if not wanted and labels.main_batch in runner.labels:
             changes.append(("remove", runner.id, labels.main_batch))
-        elif not main_queued and labels.main_batch not in runner.labels:
+        elif wanted and labels.main_batch not in runner.labels:
             changes.append(("add", runner.id, labels.main_batch))
     return changes
+
+
+def _relabel(api: Api, repository: str, change: str, runner: int, label: str) -> None:
+    if change == "add":
+        api(
+            "-X",
+            "POST",
+            f"repos/{repository}/actions/runners/{runner}/labels",
+            "-f",
+            f"labels[]={label}",
+        )
+    else:
+        api("-X", "DELETE", f"repos/{repository}/actions/runners/{runner}/labels/{label}")
 
 
 class First:
@@ -454,23 +492,20 @@ def round_once(
     ]
     waiting = main_waiting(api, repository, labels)
     queued = main_queued(api, repository, labels)
+    taken = lane_queued(api, repository, labels)
     changes = lending(runners, labels, main_waiting=waiting, first_waiting=first_waiting, most=most)
-    lane_changes = lane(runners, labels, main_queued=queued)
-    for change, runner, label in changes + lane_changes:
-        if change == "add":
-            api(
-                "-X",
-                "POST",
-                f"repos/{repository}/actions/runners/{runner}/labels",
-                "-f",
-                f"labels[]={label}",
-            )
-        else:
-            api(
-                "-X",
-                "DELETE",
-                f"repos/{repository}/actions/runners/{runner}/labels/{label}",
-            )
+    for change, runner, label in changes:
+        _relabel(api, repository, change, runner, label)
+    # A lane change GitHub refuses (a runner gone since the listing) is left for the next round;
+    # the note counts only the lane GitHub gave.
+    lane_changes = []
+    for change, runner, label in lane(runners, labels, main_queued=queued):
+        try:
+            _relabel(api, repository, change, runner, label)
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"Lane of runner {runner} not changed: {error}", file=sys.stderr, flush=True)
+            continue
+        lane_changes.append((change, runner, label))
     # A lent runner free for any pull request job keeps a run home, as a free ordinary one does.
     free = sum(
         labels.main in runner.labels
@@ -496,7 +531,7 @@ def round_once(
     )
     # The merge gate's first run of a prefix takes the lane only while one is free (the planner
     # reads this: `ci_proof.py main-lane`), so it never waits on main's runners.
-    batch_free = sum(
+    batch_free = -taken + sum(
         labels.main in runner.labels
         and runner.online
         and not runner.busy
@@ -524,7 +559,7 @@ def round_once(
                 **record,
                 "free": free,
                 "first_free": first_free,
-                "batch_free": batch_free,
+                "batch_free": max(0, batch_free),
                 "updated_at": datetime.now(UTC).isoformat(),
             },
             0o644,

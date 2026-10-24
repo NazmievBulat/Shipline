@@ -82,8 +82,12 @@ def _github(
 _BATCH = f"refs/heads/{PREFIX}0123456789abcdef0123456789abcdef"
 _DISPATCH = "workflow_dispatch"
 
-# (event, ref, the switch, the attempt, the planner's `main_lane`, where the planner runs,
-# where every other job runs)
+# The jobs that never take the merge line's lane: the planner, which looks for it, and CI's
+# summing-up job, which would ask for it long after the planner looked.
+_OFF_THE_LANE = ("plan", "result")
+
+# (event, ref, the switch, the attempt, the planner's `main_lane`, where the planner and the
+# summing-up job run, where every other job runs)
 _CASES = {
     "a merge-line dispatch, main's lane free": (_DISPATCH, _BATCH, "on", 1, "true", HOSTED, LANE),
     # Main's runners offline, busy, or held for a push to main: the ordinary choice.
@@ -117,7 +121,7 @@ def test_each_job_runs_where_its_run_belongs(path: Path, case: str) -> None:
     assert "plan" in jobs and len(jobs) > 1
     context = _github(event, ref, switch, attempt, lane)
     for job, runner in jobs.items():
-        assert value(runner, context) == (planner if job == "plan" else others), job
+        assert value(runner, context) == (planner if job in _OFF_THE_LANE else others), job
 
 
 # (event, ref, the switch, the attempt, whether the planner looks for main's lane)
@@ -185,7 +189,8 @@ def test_main_and_the_merge_line_ask_for_labels_of_their_own(path: Path) -> None
 
     assert _EXAMPLE_RUNNER["label"] == f"{_EXAMPLE_RUNNER['prefix']}-home"
     assert f"'refs/heads/{PREFIX}'" in text
-    assert named.pop("plan") == [MAIN[1]]
+    for job in _OFF_THE_LANE:
+        assert named.pop(job, [MAIN[1]]) == [MAIN[1]], job
     assert named and all(labels == [MAIN[1], LANE[1]] for labels in named.values())
     assert LANE[1] in _EXAMPLE_RUNNER["labels"]
 

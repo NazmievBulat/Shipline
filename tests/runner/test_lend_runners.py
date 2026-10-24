@@ -5,6 +5,7 @@ dispatched run counts by what its jobs ask for, main's label, whatever its branc
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -263,16 +264,27 @@ def _delete(identity: int, label: str) -> tuple[str, ...]:
 def test_main_s_idle_runners_carry_the_merge_line_s_lane_while_no_push_to_main_waits(
     tmp_path: Path,
 ) -> None:
+    """Every idle online main runner but the first: that one stays main's, so a push to main
+    never waits behind prefix jobs already running."""
     github = GitHub({}, {})
 
     _round(github, tmp_path)
 
-    assert _lane(github) == [_post(1, _LANE), _post(2, _LANE)]
+    assert _lane(github) == [_post(2, _LANE)]
     published = json.loads((tmp_path / "first.json").read_text())
-    assert published["batch_free"] == 2
+    assert published["batch_free"] == 1
 
     _round(github, tmp_path)
     assert _lane(github) == []
+
+
+def test_a_lone_main_runner_carries_the_lane(tmp_path: Path) -> None:
+    github = GitHub({}, {})
+    github.runners[1]["status"] = "offline"
+
+    _round(github, tmp_path)
+
+    assert _lane(github) == [_post(1, _LANE)]
 
 
 def test_a_queued_push_to_main_takes_the_lane_off_main_s_idle_runners_until_it_starts(
@@ -282,21 +294,62 @@ def test_a_queued_push_to_main_takes_the_lane_off_main_s_idle_runners_until_it_s
     first. A busy runner is never relabelled; its job ends first."""
     github = GitHub({}, {})
     _round(github, tmp_path)
-    github.runners[1]["busy"] = True
     github.runs = {"push": [_run(11, "push", "main", status="queued")]}
     github.jobs = {11: [_job(1, "queued", LABELS.main)]}
 
     _round(github, tmp_path)
 
-    assert _lane(github) == [_delete(1, _LANE)]
-    assert _LANE in _labels(github, 2)
+    assert _lane(github) == [_delete(2, _LANE)]
     assert json.loads((tmp_path / "first.json").read_text())["batch_free"] == 0
 
     # Main's job runs: the lane comes back to the idle runner.
-    github.runs = {"push": [_run(11, "push", "main")]}
     github.jobs = {11: [_job(1, "in_progress", LABELS.main)]}
     _round(github, tmp_path)
-    assert _lane(github) == [_post(1, _LANE)]
+    assert _lane(github) == [_post(2, _LANE)]
+
+    # A busy runner keeps the lane while main waits: its prefix job ends first.
+    github.runners[1]["busy"] = True
+    github.jobs = {11: [_job(1, "queued", LABELS.main)]}
+    _round(github, tmp_path)
+    assert _lane(github) == []
+    assert _LANE in _labels(github, 2)
+
+
+def test_a_free_runner_counts_once_for_the_lane_jobs_already_queued(tmp_path: Path) -> None:
+    """The planners read the note: a runner a queued prefix job will take is no longer free."""
+    github = GitHub({}, {})
+    _round(github, tmp_path)
+    github.runs = {"workflow_dispatch": [_run(10, "workflow_dispatch", _BATCH)]}
+    github.jobs = {10: [_job(1, "queued", _LANE)]}
+
+    _round(github, tmp_path)
+
+    assert json.loads((tmp_path / "first.json").read_text())["batch_free"] == 0
+
+
+def test_a_lane_change_github_refuses_does_not_end_the_round(tmp_path: Path) -> None:
+    """A runner gone between the listing and the change: the round goes on, and its note
+    counts no lane GitHub did not give."""
+    github = GitHub({}, {})
+    answer = github.__call__
+
+    def refusing(*arguments: str) -> Any:
+        if arguments[:2] == ("-X", "POST") and _LANE in arguments[-1]:
+            raise subprocess.CalledProcessError(1, "gh", stderr="Not Found")
+        return answer(*arguments)
+
+    github.__call__ = refusing  # type: ignore[method-assign]
+    first = lend_runners.First(
+        refusing, _REPOSITORY, tmp_path / "train-first.json", tmp_path / "replanned.json"
+    )
+
+    lend_runners.round_once(
+        refusing, _REPOSITORY, LABELS, 1, first, tmp_path / "first.json", "home-main"
+    )
+
+    published = json.loads((tmp_path / "first.json").read_text())
+    assert published["batch_free"] == 0
+    assert published["free"] == 1
 
 
 def test_another_machine_s_main_runner_is_its_own_lender_s(tmp_path: Path) -> None:
@@ -328,7 +381,7 @@ def test_a_push_to_main_goes_before_the_merge_line_on_main_s_runners() -> None:
     main, lane = frozenset({LABELS.main}), frozenset({LABELS.main_batch})
     # (queued at, name, the labels it asks for, minutes)
     jobs = [(0, f"prefix job {n}", lane, 20) for n in range(8)] + [(1, "main", main, 2)]
-    runners = {1: {LABELS.main, LABELS.main_batch}, 2: {LABELS.main, LABELS.main_batch}}
+    runners = {1: {LABELS.main}, 2: {LABELS.main, LABELS.main_batch}}
     free_at = {1: 0, 2: 0}
     started: dict[str, int] = {}
     waiting = sorted(jobs, key=lambda job: job[0])
@@ -336,14 +389,17 @@ def test_a_push_to_main_goes_before_the_merge_line_on_main_s_runners() -> None:
         identity = min(free_at, key=lambda runner: free_at[runner])
         now = max(free_at[identity], min(job[0] for job in waiting))
         queued = [job for job in waiting if job[0] <= now]
-        # The lender's round on the runner that is free now.
-        registration = lend_runners.Registration(
-            identity, "home-main", True, False, frozenset(runners[identity])
-        )
-        for change, _, label in lend_runners.lane(
-            [registration], LABELS, main_queued=any(job[1] == "main" for job in queued)
+        # The lender's round, as it sees main's runners now.
+        registrations = [
+            lend_runners.Registration(
+                runner, f"home-main-{runner}", True, free_at[runner] > now, frozenset(labels)
+            )
+            for runner, labels in runners.items()
+        ]
+        for change, runner, label in lend_runners.lane(
+            registrations, LABELS, main_queued=any(job[1] == "main" for job in queued)
         ):
-            (runners[identity].add if change == "add" else runners[identity].discard)(label)
+            (runners[runner].add if change == "add" else runners[runner].discard)(label)
         job = next((job for job in queued if job[2] <= runners[identity]), None)
         if job is None:
             free_at[identity] = min(job[0] for job in waiting if job[0] > now) if any(
@@ -356,5 +412,5 @@ def test_a_push_to_main_goes_before_the_merge_line_on_main_s_runners() -> None:
         # An ephemeral runner registers again with main's label alone.
         runners[identity] = {LABELS.main}
 
-    assert started["main"] == 20
-    assert sum(1 for name, at in started.items() if name != "main" and 0 < at <= 20) == 1
+    # The first of main's runners stays main's: main's job starts as soon as it is queued.
+    assert started["main"] == 1

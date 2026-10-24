@@ -2,6 +2,7 @@
 command, and reads the `Workflow-Proof` line of a squash on main the way the gate writes it."""
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -760,3 +761,63 @@ def test_the_planner_takes_main_s_lane_only_when_the_lender_saw_it_free(
 
     assert done.returncode == 0, done.stderr
     assert done.stdout == f"main_lane={lane}\n"
+
+
+def test_planners_reading_one_note_take_no_more_lane_than_it_names_free(
+    workflow: Workflow, tmp_path: Path
+) -> None:
+    """The gate dispatches several prefixes at once: their planners read the same note, and
+    only as many as it names free take main's lane; a later note admits again."""
+    home = tmp_path / "home"
+
+    note = _note(2)
+
+    taken = [_lane(workflow, home, note).stdout for _ in range(3)]
+
+    assert taken == ["main_lane=true\n", "main_lane=true\n", "main_lane=false\n"]
+
+    assert _lane(workflow, home, _note(1, seconds_ago=1)).stdout == "main_lane=true\n"
+
+
+def test_a_planner_that_cannot_claim_the_lane_does_not_take_it(
+    workflow: Workflow, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    (home / ".local/state/ci-overflow").mkdir(parents=True)
+    # The ledger is a file, not a folder: nothing can be claimed there.
+    (home / ".local/state/ci-overflow/ledger").write_text("")
+
+    assert _lane(workflow, home, _note(2)).stdout == "main_lane=false\n"
+
+
+def test_old_claims_are_cleared(workflow: Workflow, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    ledger = home / ".local/state/ci-overflow/ledger"
+    ledger.mkdir(parents=True)
+    old = ledger / "main-lane-old-0"
+    old.write_text("")
+    os.utime(old, (0, 0))
+    other = ledger / "another-planner-file"
+    other.write_text("")
+    os.utime(other, (0, 0))
+
+    assert _lane(workflow, home, _note(1)).stdout == "main_lane=true\n"
+    assert not old.exists() and other.exists()
+
+
+@pytest.mark.parametrize(
+    "updated_at",
+    [
+        # A note from the future, as a clock set wrong would write it.
+        (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        # A time without its zone.
+        datetime.now(UTC).replace(tzinfo=None).isoformat(),
+    ],
+    ids=["from the future", "without its zone"],
+)
+def test_a_note_of_a_time_that_cannot_be_now_is_not_taken(
+    workflow: Workflow, tmp_path: Path, updated_at: str
+) -> None:
+    note = json.dumps({"batch_free": 1, "updated_at": updated_at})
+
+    assert _lane(workflow, tmp_path / "home", note).stdout == "main_lane=false\n"

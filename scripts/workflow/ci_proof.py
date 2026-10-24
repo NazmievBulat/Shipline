@@ -35,9 +35,9 @@ after it.
 
 hands on, as the step output `main_lane`, whether the merge gate's first run of a prefix takes
 the merge line's lane on main's runners: only when the runner pool's lender noted, at most
-LANE_SECONDS ago, that one of main's runners is online and idle with it. The pool's planner
-reads that note; on GitHub's own runners there is none, and the prefix takes the ordinary
-choice.
+LANE_SECONDS ago, that one of main's runners is online and idle with it, and this planner could
+claim one of the free runners the note counts. The pool's planner reads that note; on GitHub's
+own runners there is none, and the prefix takes the ordinary choice.
 """
 
 import argparse
@@ -73,6 +73,11 @@ READ_TIMEOUT = 30
 # may be: the lender writes it every round, a few seconds apart.
 LANE_NOTE = ".local/state/ci-overflow/home/first.json"
 LANE_SECONDS = 60
+# Where the planners claim the free runners a note counts, one file each, so planners that read
+# the same note take no more than it names free; and how long a claim is kept.
+LANE_LEDGER = ".local/state/ci-overflow/ledger"
+LANE_CLAIM = "main-lane-"
+LANE_CLAIM_SECONDS = 600
 _SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -349,15 +354,37 @@ def _run_command(name: str, args: list[str]) -> int:
 
 def main_lane(home: Path, now: datetime | None = None) -> bool:
     """Whether the lender noted, at most LANE_SECONDS ago, that one of main's runners is online
-    and idle with the merge line's lane. A missing, old or unreadable note says no."""
+    and idle with the merge line's lane, and this planner claimed one of the free runners the
+    note counts. A missing, old or unreadable note, or a claim that cannot be made, says no."""
     try:
         note = json.loads((home / LANE_NOTE).read_text())
-        free = note["batch_free"]
-        age = (now or datetime.now(UTC)) - datetime.fromisoformat(note["updated_at"])
+        free, written = note["batch_free"], note["updated_at"]
+        age = (now or datetime.now(UTC)) - datetime.fromisoformat(written)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"main's lane is not taken: {error!r}", file=sys.stderr)
         return False
-    return type(free) is int and free > 0 and 0 <= age.total_seconds() <= LANE_SECONDS
+    if type(free) is not int or free < 1 or not 0 <= age.total_seconds() <= LANE_SECONDS:
+        return False
+    return _claim(home / LANE_LEDGER, re.sub(r"[^0-9A-Za-z]", "", str(written)), free)
+
+
+def _claim(ledger: Path, lender_round: str, free: int) -> bool:
+    """Claim one of the `free` runners of the lender's round `lender_round`, first come first
+    served."""
+    try:
+        ledger.mkdir(parents=True, exist_ok=True)
+        for old in ledger.glob(f"{LANE_CLAIM}*"):
+            if datetime.now(UTC).timestamp() - old.stat().st_mtime > LANE_CLAIM_SECONDS:
+                old.unlink(missing_ok=True)
+        for slot in range(free):
+            try:
+                (ledger / f"{LANE_CLAIM}{lender_round}-{slot}").open("x").close()
+                return True
+            except FileExistsError:
+                continue
+    except OSError as error:
+        print(f"main's lane is not taken: {error!r}", file=sys.stderr)
+    return False
 
 
 def _main_lane(args: list[str]) -> int:

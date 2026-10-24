@@ -68,8 +68,10 @@ one free. They come from the base label, `runner.label`, `<prefix>-home` when it
 | `<label>-docker` | the Docker-capable runners |
 | `runner.planner_label` | the planner's runner; `<label>-planner` when it names none |
 
-`runner.labels`, the labels the merge gate may re-run failed jobs on, are these six; a list
-named in `shipline.json` wins over them. Machines differ only by their runners' names:
+`runner.labels`, the labels the merge gate may re-run failed jobs on, are these seven; a list
+named in `shipline.json` wins over them, and then names `<label>-main-batch` too. The merge
+line's lane is taken only by a planner that runs on the planner's runner, which reads the
+lender's note (`ci_proof.py main-lane`). Machines differ only by their runners' names:
 `<machine>-1`, `<machine>-docker-1`, `<machine>-main` and `<machine>-planner`.
 
 ### The repository's own commands

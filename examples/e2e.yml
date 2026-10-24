@@ -8,12 +8,15 @@
 # runner pool and turns main's runners on with the repository variable `CI_MAIN_RUNNER` set to
 # `on`. Then a push to main runs on main's runners, `<runner.label>-main`. The merge gate's first
 # run of a prefix, its dispatch on a scratch branch of its own (`merge.scratch_prefix`), runs in
-# the merge line's lane on them, `<runner.label>-main-batch`, when its planner finds one of them
-# free there, so a prefix never waits behind pull requests' own runs; else, and on any re-run,
-# it takes the ordinary choice, so it never waits on main's runners either. Main's runners carry
-# the lane only while no push to main waits (runner/lend_runners.py), so main keeps its place.
-# The labels here are the defaults, `<runner.prefix>-home` with the runner prefix `example-app`;
-# a repository with a pool puts its own choice where this says `ubuntu-latest`.
+# the merge line's lane on them, `<runner.label>-main-batch`, when its planner claims one of them
+# free there, so a prefix need not wait behind pull requests' own runs; else, and on any
+# re-run, it takes the ordinary choice, so it never waits on main's runners for one to free. The
+# lender keeps one of main's runners off the lane and takes the lane off the others while a push
+# to main waits (runner/lend_runners.py), so main keeps its place. The labels here are the
+# defaults, `<runner.prefix>-home` with the runner prefix `example-app`. A repository with a pool
+# puts its own choice where this says `ubuntu-latest`, and the planner's own on the planner,
+# `runner.planner_label`: only the pool's planner runner reads the lender's note, so a planner on
+# GitHub's runners never takes the lane.
 #
 # The choice keeps every other run of this workflow, a pull request's among them, off main's
 # runners, but not a branch's own copy of the workflow: a scratch run runs the merge line's
