@@ -86,6 +86,30 @@ main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-d
 config=$(python3 "$here/workflow_config.py" shell) || exit 1
 eval "$config"
 export SHIPLINE_CONFIG
+saved_line=""
+saved_day=$(date -u -d "@$((NOW - 86400))" +%F)
+saved_sent=$main/$SHIPLINE_STATE_FOLDER/prefix-savings.sent
+# A completed UTC day is stable. Keep its line until delivery succeeds, then acknowledge it
+# with the other daily findings; unchanged check-ins must not send it twice.
+if ((github_ready)) && jq -e '.checks.prefix_only // [] | length > 0' <<<"$SHIPLINE_CONFIG" >/dev/null &&
+    [[ ! -r $saved_sent || $(<"$saved_sent") != "$saved_day" ]]; then
+  mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
+  exec 8>"$main/$SHIPLINE_STATE_FOLDER/prefix-savings.lock"
+  flock -n 8 || exit 0
+  # Another wake may have delivered it before this one acquired the lock.
+  if [[ -r $saved_sent && $(<"$saved_sent") == "$saved_day" ]]; then
+    exec 8>&-
+  else
+  saved_pending=$main/$SHIPLINE_STATE_FOLDER/prefix-savings-$saved_day.pending
+  if [[ -r $saved_pending ]]; then
+    saved_line=$(<"$saved_pending")
+  elif saved_line=$(WORKFLOW_BACKGROUND_GITHUB=1 timeout 120 python3 "$here/prefix_savings.py" --now "$NOW" 9>&- 8>&-); then
+    mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
+    (umask 077; printf '%s\n' "$saved_line" >"$saved_pending.tmp")
+    mv "$saved_pending.tmp" "$saved_pending"
+  fi
+  fi
+fi
 resent=("$@")
 mkdir -p "$STATE"
 main_report=$main/$SHIPLINE_STATE_FOLDER/main-status
@@ -434,7 +458,7 @@ if ((${#resent[@]} == 0 && ${#handback_files[@]} == 0 && ${#cloud_files[@]} == 0
     exit "$failed"
   fi
   if [[ -r $TOLD && $(<"$TOLD") == "$seen" ]] &&
-      ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0)); then
+      ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0)) && [[ -z $saved_line ]]; then
     log "  nothing changed since the last check-in; $name not told"
     exit "$failed"
   fi
@@ -461,11 +485,16 @@ fi
 for line in "${metrics_lines[@]}" "${analysis_lines[@]}"; do
   message+=" $line"
 done
+[[ -z $saved_line ]] || message+=$'\n'"$saved_line"
 if [[ -n $service_line ]]; then
   message+=" Package audit: $service_line; pushes wait for it, nothing was found wrong."
 fi
 
 if send_to "$name" "$message"; then
+  if [[ -n $saved_line ]]; then
+    (umask 077; printf '%s\n' "$saved_day" >"$saved_sent")
+    rm -f "$saved_pending"
+  fi
   echo "$seen" >"$TOLD"
   # A question told before stays told while it is open, also while its session works again on
   # its own job and so is not in this check-in.

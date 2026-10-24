@@ -1028,6 +1028,7 @@ def test_the_gate_reads_the_named_checks_titles_workflow_files_and_runner_labels
         "ci_plan": "Build: what to run",
         "e2e_plan": "Browser: what to run",
         "images": "Images",
+        "prefix_only": [],
     }
     proven = {
         "every server test": True,

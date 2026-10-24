@@ -399,6 +399,47 @@ def test_a_proof_on_the_identical_tree_lets_main_inherit_the_jobs_that_passed(
     assert _inherited(workflow, github, "e2e") == {"E2E: what to run": 30, "playwright": 30}
 
 
+@pytest.mark.parametrize("invalid", [None, "tree", "failed", "fork", "missing part", "carried planner"])
+def test_main_inherits_image_parts_only_from_valid_scratch_proof(
+    workflow: Workflow, invalid: str | None,
+) -> None:
+    (workflow.repo / "shipline.json").write_text(json.dumps({"checks": {"prefix_only": ["images"]}}))
+    github = _github(_receipt(sources=[{
+        "workflow": "images", "run": 40, "jobs": ["Docker images: browser tests"]
+    }]))
+    ok = {"status": "completed", "conclusion": "success"}
+    github[f"{_API}/actions/runs/40"] = {
+        "id": 40, "event": "workflow_dispatch", "head_sha": _MERGE,
+        "head_repository": {"full_name": "example-org/example-app"},
+        "path": ".github/workflows/images.yml", **ok,
+    }
+    planner = {"id": 41, "name": "Docker images: what to run", **ok}
+    parts = [planner, *({"id": 41 + n, "name": f"Docker images: browser tests ({n} of 3)", **ok}
+                         for n in (1, 2, 3))]
+    github[f"{_API}/actions/runs/40/jobs?per_page=100"] = {"jobs": parts}
+    notes = [{"title": "Files tested", "message": _TREE}]
+    github[f"{_API}/check-runs/41/annotations?per_page=100"] = notes
+    if invalid == "tree":
+        notes[0]["message"] = "0" * 40
+    elif invalid == "failed":
+        parts[-1]["conclusion"] = "failure"
+    elif invalid == "fork":
+        github[f"{_API}/actions/runs/40"]["head_repository"]["full_name"] = "example-other/example-app"
+    elif invalid == "missing part":
+        parts.pop()
+    elif invalid == "carried planner":
+        planner.update(run_id=40, run_attempt=2, head_sha=_MERGE,
+                       created_at="2026-10-12T12:00:00Z", started_at="2026-10-12T10:00:00Z",
+                       completed_at="2026-10-12T10:01:00Z")
+        github[f"{_API}/check-runs/41/annotations?per_page=100"] = []
+        github[f"{_API}/actions/runs/40/attempts/1/jobs?per_page=100"] = {"jobs": [
+            {**planner, "id": 45, "run_attempt": 1, "created_at": "2026-10-12T09:59:00Z"}
+        ]}
+        github[f"{_API}/check-runs/45/annotations?per_page=100"] = notes
+    expected = {"Docker images: browser tests": 40} if invalid in (None, "carried planner") else {}
+    assert _inherited(workflow, github, "images") == expected
+
+
 def test_the_gate_s_own_proof_is_read_back(workflow: Workflow) -> None:
     done = subprocess.run(
         [

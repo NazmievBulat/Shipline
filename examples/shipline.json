@@ -6,7 +6,8 @@
     "ci_result": "Build result",
     "ci_plan": "Build: what to run",
     "e2e_plan": "Browser: what to run",
-    "images": "Images"
+    "images": "Images",
+    "prefix_only": ["images", "browser_whole", "server_whole"]
   },
   "annotations": {
     "merge_tested": "Merge built",

@@ -2,12 +2,14 @@
 
 import json
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 from workflow_harness import Workflow
+from workflow.test_ci_proof import _github, _receipt, _API, _SQUASH, _TREE
 
 _NEW_YORK = ZoneInfo("America/New_York")
 
@@ -33,6 +35,101 @@ def _wake(
     workflow: Workflow, *woken: str, at: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     return workflow.run_script("wake", *woken, env=at or _at(23, 0))
+
+
+def _savings_day(workflow: Workflow) -> None:
+    """One merged PR, three ready/push/refresh runs, a duplicate ID and a skipped draft."""
+    groups = ["images", "browser_whole", "server_whole"]
+    (workflow.repo / "shipline.json").write_text(json.dumps({"checks": {"prefix_only": groups}}))
+    sources = [
+        {"workflow": "ci", "run": 20, "jobs": ["CI: server tests"]},
+        {"workflow": "e2e", "run": 30, "jobs": ["playwright"]},
+        {"workflow": "images", "run": 40, "jobs": ["Docker images: build", "Docker images: image tests"]},
+    ]
+    data = _github(_receipt(sources=sources))
+    ok = {"status": "completed", "conclusion": "success"}
+    data[f"{_API}/actions/runs/40"] = {
+        **data[f"{_API}/actions/runs/30"], "id": 40, "path": ".github/workflows/images.yml",
+    }
+    data[f"{_API}/actions/runs/40/jobs?per_page=100"] = {"jobs": [
+        {"id": 41, "name": "Docker images: what to run", **ok},
+        {"id": 42, "name": "Docker images: build", **ok},
+        {"id": 43, "name": "Docker images: image tests", **ok},
+    ]}
+    data[f"{_API}/check-runs/41/annotations?per_page=100"] = [{"title": "Files tested", "message": _TREE}]
+    for run in (20, 30, 40):
+        data[f"{_API}/actions/runs/{run}"].update(
+            event="workflow_dispatch", head_branch="workflow/merge-batch-example")
+    for run, durations in [(20, [0, 5, 5, 0, 0, 0]), (30, [0, 12]), (40, [0, 5, 7])]:
+        for job, minutes in zip(data[f"{_API}/actions/runs/{run}/jobs?per_page=100"]["jobs"], durations):
+            job.update(runner_name="example-runner", started_at="2026-10-12T10:00:00Z",
+                       completed_at=f"2026-10-12T10:{minutes:02d}:00Z")
+    data[f"{_API}/pulls/7"] = {
+        "merged_at": "2026-10-12T18:00:00Z", "created_at": "2026-10-11T09:00:00Z",
+        "merge_commit_sha": _SQUASH, "head": {"ref": "ticket/seven"}, "base": {"ref": "main"},
+    }
+    runs = []
+    for run, deferred in [(100, groups), (200, ["images", "server_whole"]),
+                          (300, ["browser_whole"]), (400, [])]:
+        runs.append({"id": run, "head_branch": "ticket/seven", "event": "pull_request",
+                     "created_at": "2026-10-12T11:00:00Z", "pull_requests": [{"number": 7}],
+                     "head_repository": {"full_name": "example-org/example-app"}})
+        data[f"{_API}/actions/runs/{run}/jobs?per_page=100"] = {"jobs": [
+            {"id": run + 1, "name": "CI: what to run", **ok,
+             "conclusion": "success" if deferred else "skipped"}
+        ]}
+        data[f"{_API}/check-runs/{run + 1}/annotations?per_page=100"] = [
+            {"title": "Prefix-only groups", "message": json.dumps(deferred)}
+        ]
+    data["pr-runs"] = {"workflow_runs": [*runs, runs[0]]}
+    fixture = workflow.state / "savings.json"
+    fixture.write_text(json.dumps(data))
+    workflow.fake("gh-before-savings", (workflow.bin / "gh").read_text())
+    workflow.fake("gh", f'''#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if args and args[0] == "api":
+    path = args[-1]
+    data = json.loads(Path({str(fixture)!r}).read_text())
+    if path.startswith("search/issues?"):
+        print(json.dumps({{"total_count": 1, "items": [{{"number": 7}}]}}))
+    elif "/actions/workflows/ci.yml/runs?branch=" in path:
+        print(json.dumps(data["pr-runs"]))
+    elif path in data:
+        print(json.dumps(data[path]))
+    else:
+        sys.exit("unexpected savings API request")
+else:
+    os.execv({str(workflow.bin / "gh-before-savings")!r}, ["gh", *args])
+''')
+
+
+def test_daily_prefix_savings_from_merged_proof_counts_only_avoided_runs(night: Workflow) -> None:
+    _savings_day(night)
+    night.orchestrator("idle")
+    done = _wake(night, at=_at(3, 0))
+    assert done.returncode == 0, done.stderr
+    line = ("Prefix-only runner minutes saved (2026-10-12 UTC): images 24.00; "
+            "browser_whole 24.00; server_whole 20.00; total 68.00.")
+    assert line in night.sent()[-1]
+
+
+def test_daily_prefix_savings_retries_delivery_then_sends_once(night: Workflow) -> None:
+    _savings_day(night)
+    night.orchestrator("idle")
+    (night.state / "send-fails").touch()
+    first = _wake(night, at=_at(3, 0))
+    assert first.returncode == 1
+    (night.state / "send-fails").unlink()
+    done = _wake(night, at=_at(3, 21))
+    assert done.returncode == 0, done.stderr
+    line = ("Prefix-only runner minutes saved (2026-10-12 UTC): images 24.00; "
+            "browser_whole 24.00; server_whole 20.00; total 68.00.")
+    assert line in night.sent()[-1]
+    _wake(night, at=_at(3, 42))
+    assert len(night.sent()) == 2
+    assert (night.repo / ".local/workflow/prefix-savings.sent").read_text().strip() == "2026-10-12"
 
 
 def test_at_night_an_idle_orchestrator_gets_a_check_in(night: Workflow) -> None:

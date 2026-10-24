@@ -146,7 +146,9 @@ def test_the_test_job_runs_the_config_s_command_unless_main_inherited_it(path: P
 
     assert re.search(r'^    name: "CI: server tests[" (]', tests, re.M)
     assert re.search(r"^    needs: plan$", tests, re.M)
-    assert _condition(tests) == f"${{{{ ({_NOT_A_DRAFT}) && {_NOT_INHERITED} }}}}"
+    selection = ("&& contains(fromJSON(needs.plan.outputs.needed), 'server_whole') "
+                 "&& !contains(fromJSON(needs.plan.outputs.prefix_only), 'server_whole') ") if path == _EXAMPLE else ""
+    assert _condition(tests) == f"${{{{ ({_NOT_A_DRAFT}) {selection}&& {_NOT_INHERITED} }}}}"
     assert "python3 scripts/workflow/ci_proof.py test" in tests
 
 
@@ -160,7 +162,8 @@ def test_the_example_s_jobs_carry_the_config_s_default_names() -> None:
     text = _EXAMPLE.read_text()
     names = re.findall(r"^    name: (.+)$", text, re.M)
 
-    assert names == ['"CI: what to run"', '"CI: server tests"', "CI result"]
+    assert names == ['"CI: what to run"', '"CI: server tests"',
+                     '"CI: selected server tests"', '"CI: fast checks"', "CI result"]
     assert re.search(
         r"^  pull_request:\n    types: \[opened, synchronize, reopened, ready_for_review\]\n"
         r"  push:\n    branches: \[main\]\n",
@@ -215,7 +218,7 @@ def test_every_job_is_skipped_while_the_pull_request_is_a_draft(path: Path, resu
     ready (`ready_for_review`) starts its run on the current head."""
     jobs = {job: _condition(_job(path, job)) for job in _jobs(path)}
 
-    assert sorted(jobs) == sorted(["plan", "tests", result])
+    assert sorted(jobs) == sorted(["plan", "tests", result] + (["selected", "fast"] if path == _EXAMPLE else []))
     assert jobs["plan"] == _NOT_A_DRAFT
     assert all(condition and f"({_NOT_A_DRAFT})" in condition for job, condition in jobs.items()
                if job != "plan")

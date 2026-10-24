@@ -1,0 +1,67 @@
+# Install as workflows.images. The same tools/ci-plan as examples/ci.yml supplies `needed`.
+# It compares the scratch commit with main for workflow_dispatch, preserving the path filter.
+name: Images
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "docker/**"
+      - ".github/workflows/images.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  plan:
+    name: "Docker images: what to run"
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    outputs:
+      needed: ${{ steps.selection.outputs.needed }}
+      prefix_only: ${{ steps.deferred.outputs.prefix_only || '[]' }}
+      inherited: ${{ steps.inherited.outputs.inherited || '[]' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: The existing image path selection
+        id: selection
+        run: |
+          tools/ci-plan > "$RUNNER_TEMP/selection.json"
+          echo "needed=$(jq -c '.needed | index("images") != null' "$RUNNER_TEMP/selection.json")" >> "$GITHUB_OUTPUT"
+      - name: Defer images only for a pull request
+        id: deferred
+        if: steps.selection.outputs.needed == 'true'
+        run: python3 scripts/workflow/ci_proof.py prefix-only --needed images
+      - name: The tested tree
+        run: python3 scripts/workflow/ci_proof.py notes
+      - name: Images main inherits on the identical tree
+        id: inherited
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/workflow/ci_proof.py inherited images
+  images:
+    name: "Docker images: image tests"
+    needs: plan
+    if: >-
+      ${{ needs.plan.outputs.needed == 'true'
+      && !contains(fromJSON(needs.plan.outputs.prefix_only), 'images')
+      && !contains(fromJSON(needs.plan.outputs.inherited), 'Docker images: image tests') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Build and test the images
+        run: tools/image-tests
