@@ -1533,9 +1533,10 @@ def browser_needed(base: str, merge: str) -> bool:
 
     The gate reads the exact difference from main, so a merge that changes nothing needs
     none; the planner runs on an empty diff only because it cannot tell one from a misread.
-    The plan reads the changed paths, each ended by a NUL, and exits 0 when browser tests are
-    needed and 1 when not; any other answer counts as needed. Without a plan every merge needs
-    them while the merged tree holds the E2E workflow, and none does without that file.
+    The plan reads the changed paths, each ended by a NUL, exits 0 and prints `needed` or
+    `none`. Only `none` with exit 0 means none: a plan that crashes, as a Python one does with
+    exit 1, never skips the browser tests. Without a plan every merge needs them while the
+    merged tree holds the E2E workflow, and none does without that file.
     """
     changed = command(
         "git", "diff", "--no-renames", "--name-only", "-z", base, merge, errors="surrogateescape"
@@ -1548,13 +1549,17 @@ def browser_needed(base: str, merge: str) -> bool:
     done = repository_command(
         "browser_plan", input="".join(f"{path}\0" for path in changed), errors="surrogateescape"
     )
-    if done is not None and done.returncode not in (0, 1):
+    assert done is not None
+    answer = "" if done.returncode else done.stdout.strip()
+    if answer == "none":
+        return False
+    if answer != "needed":
         print(
             f"the browser plan could not answer, so browser tests run: {said(done)}",
             file=sys.stderr,
             flush=True,
         )
-    return done is not None and done.returncode != 1
+    return True
 
 
 def whole_suite(run: dict[str, Any], parts: list[dict[str, Any]], tree: str) -> bool:
