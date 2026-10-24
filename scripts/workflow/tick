@@ -109,9 +109,11 @@ ANALYST_DAILY_AT=${WORKFLOW_ANALYST_DAILY_AT-08:00}
 # The 5-hour usage window above which, unless it resets within the hour, nothing starts.
 USAGE_CEILING=85
 
-# A shadow tick ends after this many seconds, whatever it waits for: it starts 75 seconds before
-# the real tick, and ends before it. A test names another.
-SHADOW_SECONDS=${WORKFLOW_SHADOW_SECONDS:-70}
+# A shadow tick starts this many seconds before the real tick (its timer, in the README), and ends
+# after SHADOW_SECONDS, whatever it waits for, well before the real tick starts. A test names
+# another bound.
+SHADOW_LEAD_SECONDS=75
+SHADOW_SECONDS=${WORKFLOW_SHADOW_SECONDS:-60}
 # How far past its own clock a shadow tick looks for what comes due: until the next shadow tick,
 # as the real tick between the two reads its clock later.
 SHADOW_AHEAD_SECONDS=180
@@ -153,7 +155,7 @@ cd "$main" || exit 1
 # is stopped, and its log says so, so that `compare-shadow` leaves out the real tick beside it.
 if ((shadow)) && [[ -z ${SHIPLINE_SHADOW_BOUND:-} ]]; then
   SECONDS=0
-  SHIPLINE_SHADOW_BOUND=$NOW timeout --kill-after=5 "$SHADOW_SECONDS" bash "$here/tick" --shadow
+  SHIPLINE_SHADOW_BOUND=$NOW timeout --kill-after=2 "$SHADOW_SECONDS" bash "$here/tick" --shadow
   status=$?
   log=$main/.local/shipline/shadow.log
   # 124 when the bound stopped it, 137 when it had to be killed after that.
@@ -191,8 +193,10 @@ if ((shadow)); then
   (umask 077 && mkdir -p "${SHIPLINE_SHADOW%/*}" && : >>"$SHIPLINE_SHADOW") || exit 1
   # Git takes no lock it can do without, such as the index's in a session's worktree.
   export GIT_OPTIONAL_LOCKS=0
-  # The wake looks as far ahead as the tick (`shadow_due`).
+  # The wake looks as far ahead as the tick (`shadow_due`), and knows the earliest the real
+  # tick reads its clock.
   export SHIPLINE_SHADOW_AHEAD=$SHADOW_AHEAD_SECONDS
+  export SHIPLINE_SHADOW_REAL_FROM=$((NOW + SHADOW_LEAD_SECONDS))
 else
   mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
   exec 9>"$common/shipline-tick.lock"
@@ -223,7 +227,7 @@ shadow_due() {
   local until=$1
   shift
   ((shadow && until > 0 && until <= SHADOW_AHEAD_SECONDS)) || return 0
-  shadow_note "due within $SHADOW_AHEAD_SECONDS s: $*"
+  shadow_note "due within $until s: $*"
 }
 # The seconds until a hunt or an analyst runs over its time, by the clock `find` reads.
 over_in() {
@@ -260,6 +264,18 @@ if ((shadow)); then
   # The notes the shadow tick takes for its own wake, which reads them beside the real ones.
   export SHIPLINE_SHADOW_NOTES=$WORKFLOW_TRAIN_TICK/shadow-notes
   shadow_note "shadow tick"
+  # A real tick that still runs from its last start may write the marks this one reads, and
+  # takes the decisions of its next start too: this shadow tick takes none, and says so, and
+  # `compare-shadow` leaves out the real decisions beside it. SHIPLINE_SHADOW_BESIDE names the
+  # real tick's service (the README sets it).
+  beside=${SHIPLINE_SHADOW_BESIDE:-}
+  if [[ -n $beside ]]; then
+    [[ $beside =~ ^[A-Za-z0-9@._-]+$ ]] || { echo "SHIPLINE_SHADOW_BESIDE is no unit" >&2; exit 2; }
+    if systemctl --user is-active --quiet "$beside" 9>&-; then
+      shadow_note "shadow tick skipped: $beside still runs"
+      exit 0
+    fi
+  fi
 fi
 
 # The tick's list of sessions, kept in step with what a shadow tick would start and stop, as
@@ -545,7 +561,16 @@ start_daily_analyst() {
     read -r last _ <"$main/$SHIPLINE_STATE_FOLDER/last-start" || true
   [[ $last =~ ^[0-9]+$ ]] || last=0
   if ((due)); then
-    usage_allows_start >/dev/null && shadow_due "$due" "analyst-$name started"
+    # As the tick at the start time will find it: held by a start in the 5 minutes before, by
+    # the usage window, or started.
+    if ((at - last < 5 * 60)); then
+      shadow_due "$due" "the daily analyst waits: a session started in the last 5 minutes"
+      usage_allows_start >/dev/null && shadow_due $((last + 5 * 60 - NOW)) "analyst-$name started"
+    elif ! why=$(usage_allows_start); then
+      shadow_due "$due" "the daily analyst waits: $why"
+    else
+      shadow_due "$due" "analyst-$name started"
+    fi
     return 0
   fi
   if ((NOW - last < 5 * 60)); then

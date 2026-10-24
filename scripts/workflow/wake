@@ -283,33 +283,41 @@ fi
 
 # A shadow run also looks when the look comes due within SHIPLINE_SHADOW_AHEAD seconds, as far
 # as its tick looks ahead (the real tick reads its clock later), and the check-in's first line
-# says so: `compare-shadow` reads it as the reason only the real wake looked. A night look the end
-# of the night stops within that time says so too: only the shadow may have looked.
+# says in how many: `compare-shadow` reads it as the reason only the real wake looked. A night
+# look whose night has ended by the earliest the real tick reads its clock
+# (SHIPLINE_SHADOW_REAL_FROM) says so too: only the shadow looked.
 ahead=0
 [[ -z $shadow ]] || ahead=${SHIPLINE_SHADOW_AHEAD:-0}
+real_from=${SHIPLINE_SHADOW_REAL_FROM:-$NOW}
+[[ $real_from =~ ^[0-9]+$ ]] || real_from=$NOW
 due=""
-is_night() {
-  local hour
+# The seconds until it is night, 0 at night.
+night_in() {
+  local hour start
   hour=$(date -d "@$1" +%-H)
-  ((hour >= NIGHT_FROM_HOUR || hour < NIGHT_UNTIL_HOUR))
+  ((hour >= NIGHT_FROM_HOUR || hour < NIGHT_UNTIL_HOUR)) && { echo 0; return; }
+  start=$(date -d "$(date -d "@$1" +%F) $NIGHT_FROM_HOUR:00" +%s)
+  echo $((start - $1))
 }
-# Whether this many seconds have passed since the last look, or will within `ahead`.
+# Whether this many seconds have passed since the last look, or will within `ahead`; and, when
+# the look comes due later, in how many seconds, at the soonest after `$2` (the night's start).
 looked_before() {
-  (($(since_last_look) + 30 >= $1)) && return 0
-  ((ahead && $(since_last_look) + 30 + ahead >= $1)) || return 1
-  [[ -n $due ]] || due="due within $ahead s: "
+  local wait=$(($1 - $(since_last_look) - 30)) after=${2:-0}
+  ((wait <= 0 && after == 0)) && return 0
+  ((wait > after)) || wait=$after
+  ((ahead && wait <= ahead)) || return 1
+  due="due within $wait s: "
 }
 if ((${#resent[@]} == 0)); then
   if [[ -s $PENDING || -s $main_pending || -n $service_line || ${#handback_files[@]} -gt 0 || ${#cloud_files[@]} -gt 0 || ${#analysis_files[@]} -gt 0 || ${#lost_files[@]} -gt 0 || ${#stuck_files[@]} -gt 0 || $tmp_alert == true || -n $untold ]]; then
     looked_before "$RETRY_SECONDS" || exit 0
   else
-    if ! is_night "$NOW"; then
-      ((ahead)) && is_night $((NOW + ahead)) || exit 0
-      due="due within $ahead s: "
-    elif ((ahead)) && ! is_night $((NOW + ahead)); then
-      due="ends within $ahead s: "
+    night=$(night_in "$NOW")
+    ((night == 0 || ahead)) || exit 0
+    looked_before "$LOOK_EVERY_SECONDS" "$night" || exit 0
+    if [[ -n $shadow && $night == 0 && $(night_in "$real_from") != 0 ]]; then
+      due="ends within $((real_from - NOW)) s: "
     fi
-    looked_before "$LOOK_EVERY_SECONDS" || exit 0
   fi
 fi
 [[ -n $shadow ]] || echo "$NOW" >"$LOOKED"
