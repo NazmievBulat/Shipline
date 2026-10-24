@@ -160,15 +160,6 @@ def test_cleanup_keeps_a_merged_worktree_until_the_handoff_finishes(handed: GitH
     assert "merge handoff" in done.stdout
 
 
-def _block(workflow: Workflow, head: str, *, refreshable: bool) -> None:
-    """The line as a reconcile left it: pull request 7 blocked on `head`."""
-    path = _folder(workflow) / "merge-train.json"
-    train = json.loads(path.read_text())
-    train["blocked"]["7"] = head
-    train["refreshable"] = ["7"] if refreshable else []
-    path.write_text(json.dumps(train))
-
-
 @pytest.mark.parametrize("blocked", [False, True])
 def test_a_stale_note_is_refreshed_then_merged_on_a_later_tick(
     handed: GitHub, blocked: bool
@@ -184,7 +175,7 @@ def test_a_stale_note_is_refreshed_then_merged_on_a_later_tick(
     if blocked:
         # Its failed check was re-run green on the older main: blocked on its head, and
         # refreshable at its turn.
-        _block(workflow, handed.head, refreshable=True)
+        _blocked_on_its_head(handed, refreshable=True)
 
     first = workflow.run_script("tick")
 
@@ -212,26 +203,6 @@ def test_a_stale_note_is_refreshed_then_merged_on_a_later_tick(
     assert (workflow.state / "merged").read_text() == "7"
     assert any("--match-head-commit " + refreshed in call for call in workflow.calls("gh pr merge"))
     assert _started(workflow) == []
-
-
-@pytest.mark.parametrize("case", ["blocked", "failed", "failed and refreshable"])
-def test_a_failed_handoff_is_handed_back_to_one_fresh_reviewer(handed: GitHub, case: str) -> None:
-    workflow = handed.workflow
-    if case.startswith("failed"):
-        handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
-        handed.save()
-    if case != "failed":
-        # A failing check wins over a refreshable mark the line saved before it failed.
-        _block(workflow, handed.head, refreshable=case == "failed and refreshable")
-
-    done = workflow.run_script("tick")
-
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert "merge hand-back 7: pull request checks failed" in done.stdout
-    assert not _note(workflow).exists()
-    assert _started(workflow) == ["review-7"]
-    assert not workflow.calls("gh pr merge")
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
 
 
 def test_a_lost_check_is_run_again_then_merged_on_a_later_tick(handed: GitHub) -> None:
@@ -1902,6 +1873,25 @@ def test_a_blocked_handoff_that_is_not_refreshable_is_handed_back(handed: GitHub
     assert not _note(workflow).exists()
     assert _started(workflow) == ["review-7"]
     assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
+
+
+@pytest.mark.parametrize("refreshable", [False, True])
+def test_a_handoff_with_a_failed_check_is_handed_back(handed: GitHub, refreshable: bool) -> None:
+    workflow = handed.workflow
+    handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    handed.save()
+    if refreshable:
+        # A failing check wins over a refreshable mark the line saved before it failed.
+        _blocked_on_its_head(handed, refreshable=True)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "merge hand-back 7: pull request checks failed" in done.stdout
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
+    assert not workflow.calls("gh pr merge")
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
 
 
 def test_a_refresh_refused_for_an_advisory_hands_back_to_one_fresh_reviewer(
