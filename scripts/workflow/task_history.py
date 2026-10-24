@@ -7,8 +7,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-_QUERY = """query($number: Int!) {
-  repository(owner: "NazmievBulat", name: "Shipline") {
+import workflow_config
+
+_QUERY = """query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       includesCreatedEdit
       lastEditedAt
@@ -58,9 +60,22 @@ def main() -> None:
     task = json.load(sys.stdin)
     title, body = task["title"], task["body"]
     note = ""
+    owner, name = workflow_config.current().repository.split("/")
     try:
         result = subprocess.run(
-            ["gh", "api", "graphql", "-f", f"query={_QUERY}", "-F", f"number={number}"],
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={_QUERY}",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+                "-F",
+                f"number={number}",
+            ],
             capture_output=True,
             text=True,
             check=True,
