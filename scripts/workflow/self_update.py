@@ -391,8 +391,15 @@ def register_locks() -> None:
     if common is None:
         return
     main = common.parent if common.name == ".git" else repository.resolve()
-    # A bad config must stop the update before it could move an unrecorded gate's files.
-    state = workflow_config.load(main).state_folder
+    # The state folder alone, from the file the tick reads: a key only a newer Shipline knows
+    # must not stop the update that brings it. A file that cannot be read, or a state folder
+    # that is no path in the checkout, stops the update before it could move an unrecorded
+    # gate's files.
+    document = workflow_config.read_config(main)
+    with workflow_config._file_errors(document.path):
+        only = {key: document.given[key] for key in ("state_folder",) if key in document.given}
+        given = workflow_config._merged({"state_folder": ".local/workflow"}, only, "")
+        state = workflow_config._relative(given["state_folder"], "state_folder")
     known = (NOTES / "locks").read_text().splitlines() if (NOTES / "locks").exists() else []
     wanted = [str(common / "shipline-tick.lock"), str(main / state / "merge.lock")]
     wanted = [path for path in wanted if "\n" not in path and path not in known]

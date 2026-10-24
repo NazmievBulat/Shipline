@@ -1136,3 +1136,26 @@ def test_installation_config_refusals_stop_updates_without_counting_as_crashes(
     assert shipline.tick() == _MOVED
     assert shipline.head == available
     assert shipline.notices() == []
+
+
+def test_a_config_key_only_a_newer_shipline_knows_does_not_stop_the_update(
+    shipline: Shipline,
+) -> None:
+    import fcntl
+
+    config = shipline.root / "installation.json"
+    config.write_text('{"state_folder": ".installed/state", "only_in_a_newer_shipline": true}')
+    shipline.env["SHIPLINE_CONFIG"] = str(config)
+    shipline.good()
+    landed = shipline.land()
+    shipline.later(10)
+    folder = shipline.repo / ".installed/state"
+    folder.mkdir(parents=True)
+    # The state folder is still read from the file: a held gate lock there keeps the move back.
+    with (folder / "merge.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert shipline.tick() == 0
+        assert shipline.head == shipline.first
+    shipline.later(10)
+    assert shipline.tick() == _MOVED
+    assert shipline.head == landed
