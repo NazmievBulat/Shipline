@@ -1,0 +1,100 @@
+{
+ "201-1": [
+  {
+   "name": "tests (1 of 2)",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-10-24T01:00:00Z",
+   "started_at": "2026-10-24T01:02:00Z",
+   "completed_at": "2026-10-24T01:10:00Z"
+  },
+  {
+   "name": "tests (2 of 2)",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-10-24T01:00:00Z",
+   "started_at": "2026-10-24T01:05:00Z",
+   "completed_at": "2026-10-24T01:11:00Z"
+  },
+  {
+   "name": "CI",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-10-24T01:11:00Z",
+   "started_at": "2026-10-24T01:11:00Z",
+   "completed_at": "2026-10-24T01:12:00Z"
+  }
+ ],
+ "202-1": [
+  {
+   "name": "tests (1 of 2)",
+   "status": "completed",
+   "conclusion": "failure",
+   "created_at": "2026-10-24T02:00:00Z",
+   "started_at": "2026-10-24T02:01:00Z",
+   "completed_at": "2026-10-24T02:18:00Z"
+  },
+  {
+   "name": "tests (2 of 2)",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-10-24T02:00:00Z",
+   "started_at": "2026-10-24T02:03:00Z",
+   "completed_at": "2026-10-24T02:10:00Z"
+  },
+  {
+   "name": "CI",
+   "status": "completed",
+   "conclusion": "failure",
+   "created_at": "2026-10-24T02:18:00Z",
+   "started_at": "2026-10-24T02:18:00Z",
+   "completed_at": "2026-10-24T02:19:00Z"
+  }
+ ],
+ "203-1": [
+  {
+   "name": "tests (1 of 2)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "created_at": "2026-10-24T03:00:00Z",
+   "started_at": "2026-10-24T03:02:00Z",
+   "completed_at": "2026-10-24T03:04:00Z"
+  },
+  {
+   "name": "tests (2 of 2)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "created_at": "2026-10-24T03:00:00Z",
+   "started_at": null,
+   "completed_at": null
+  }
+ ],
+ "204-1": [
+  {
+   "name": "browser",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-10-24T04:00:00Z",
+   "started_at": "2026-10-24T04:10:00Z",
+   "completed_at": "2026-10-24T04:30:00Z"
+  },
+  {
+   "name": "images",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-10-24T04:00:00Z",
+   "started_at": "2026-10-24T04:00:00Z",
+   "completed_at": "2026-10-24T04:00:00Z"
+  }
+ ],
+ "206-1": [
+  {
+   "name": "<img src=x>",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-10-24T05:00:00Z",
+   "started_at": "2026-10-24T05:01:00Z",
+   "completed_at": "2026-10-24T05:50:00Z"
+  }
+ ]
+}

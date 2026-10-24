@@ -9,8 +9,8 @@ import pytest
 from workflow_harness import (
     SESSION_LINK,
     Workflow,
+    in_scope,
     instruction,
-    scope_words,
     session_arguments,
 )
 
@@ -27,6 +27,8 @@ _ALLOWED_VARIABLES = {
     "XDG_RUNTIME_DIR",
     "XDG_STATE_HOME",
     "WORKFLOW_SESSION",
+    # The repository's main checkout, for `shipline` and the hooks in the session.
+    "SHIPLINE_REPO",
 }
 # What the shell that runs the stand-in `tmux` adds by itself.
 _SHELL_VARIABLES = {"PWD", "SHLVL", "_", "OLDPWD"}
@@ -193,6 +195,7 @@ def test_the_session_sees_only_the_listed_variables(workflow: Workflow) -> None:
     assert set(seen) - _SHELL_VARIABLES == _ALLOWED_VARIABLES | {"TMUX_TMPDIR"}
     assert seen["WORKFLOW_SESSION"] == "ticket-7"
     assert seen["HOME"] == workflow.env["HOME"]
+    assert seen["SHIPLINE_REPO"] == str(workflow.repo)
     gh_bin = workflow.script.parent / "gh-bin"
     assert seen["PATH"] == f"{gh_bin}:{workflow.env['PATH']}"
 
@@ -499,6 +502,46 @@ def test_a_bad_load_ceiling_does_not_stop_the_listing_the_tick_reads(
     assert "WORKFLOW_LOAD_PER_PROCESSOR" not in done.stderr
 
 
+def _screen_seen(workflow: Workflow, name: str, at: int) -> None:
+    """The tick's note: the sum of the screen and when it last changed, in seconds."""
+    folder = workflow.repo / ".local" / "workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{name}.screen-seen").write_text(f"123456 {at}\n")
+
+
+def test_the_listing_shows_when_the_tick_last_saw_a_screen_change(workflow: Workflow) -> None:
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    workflow.running("audit-8")
+    _screen_seen(workflow, "ticket-7", 1_790_000_000)
+
+    done = workflow.run("list")
+
+    assert done.returncode == 0, done.stderr
+    assert done.stderr == ""
+    # A session the tick has not looked at yet has no time.
+    assert done.stdout.splitlines() == [
+        "audit-8  busy  0 MB held  0 MB in swap",
+        "ticket-7  busy  0 MB held  0 MB in swap  screen changed Sep 21, 2026, 2:13pm (UTC)",
+    ]
+
+
+def test_the_screen_change_comes_before_the_limit_the_tick_reads_last(
+    workflow: Workflow,
+) -> None:
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    workflow.screen("● Working.\n  ⎿  You've hit your session limit · resets 4pm\n", "ticket-7")
+    _screen_seen(workflow, "ticket-7", 1_790_000_000)
+
+    done = workflow.run("list")
+
+    assert done.stdout.splitlines() == [
+        "ticket-7  limit  0 MB held  0 MB in swap  screen changed Sep 21, 2026, 2:13pm (UTC)"
+        "  session limit  resets 4pm"
+    ]
+
+
 @pytest.mark.parametrize(("processors", "waits"), [(4, True), (8, False)])
 def test_the_load_ceiling_scales_with_the_processors(
     workflow: Workflow, processors: int, waits: bool
@@ -586,11 +629,18 @@ def test_marks_left_by_an_earlier_session_of_the_same_name_are_removed(
         (notes / f"ticket-7.{mark}").touch()
     (notes / "audit-7.pushed").touch()
     (notes / "ticket-7.url").write_text("https://claude.ai/code/session_old\n")
+    (notes / "ticket-7.limits").write_text("memory.max max, memory.swap.max max\n")
 
     workflow.run("start", "worker", "7")
 
-    assert sorted(path.name for path in notes.iterdir()) == ["audit-7.pushed", "ticket-7.url"]
+    assert sorted(path.name for path in notes.iterdir()) == [
+        "audit-7.pushed",
+        "ticket-7.limits",
+        "ticket-7.url",
+    ]
     assert (notes / "ticket-7.url").read_text() == SESSION_LINK + "\n"
+    # Written again by this session's own scope as it started.
+    assert (notes / "ticket-7.limits").read_text() == "in place\n"
 
 
 def test_a_new_worktree_starts_at_the_head_of_the_pull_request_not_at_a_stale_local_branch(
@@ -767,9 +817,7 @@ def test_every_session_runs_in_a_scope_of_its_own_with_memory_limits(
     assert done.returncode == 0, done.stderr
     name = {"worker": "ticket-7", "audit": "audit-7", "review": "review-7"}[kind]
     arguments = (workflow.state / "args" / name).read_text().splitlines()
-    start = arguments.index("systemd-run")
-    assert arguments[start:-1] == scope_words(name, arguments[start + 5])
-    assert arguments[-1].startswith("claude --effort ")
+    assert in_scope(arguments, name)[-1].startswith("claude --effort ")
 
 
 def test_the_memory_limits_can_be_set_for_a_test(workflow: Workflow) -> None:
@@ -783,8 +831,7 @@ def test_the_memory_limits_can_be_set_for_a_test(workflow: Workflow) -> None:
     )
 
     arguments = (workflow.state / "args" / "ticket-7").read_text().splitlines()
-    start = arguments.index("systemd-run")
-    assert arguments[start:-1] == scope_words("ticket-7", arguments[start + 5], "64M", "0")
+    assert in_scope(arguments, "ticket-7", "64M", "0")[-1].startswith("claude --effort ")
 
 
 _ANALYST = "analyst-day-2026-10-24"

@@ -743,8 +743,10 @@ def test_it_works_whichever_folder_the_hook_is_called_from(session: Workflow) ->
     elsewhere = session.root / "elsewhere"
     elsewhere.mkdir()
 
-    session.notify(_stop("Worker finished."), cwd=elsewhere)
-    session.notify(_PERMISSION, cwd=elsewhere)
+    # The hook names the repository, as `install-hooks` writes it.
+    named = {"SHIPLINE_REPO": str(session.repo)}
+    session.notify(_stop("Worker finished."), cwd=elsewhere, env=named)
+    session.notify(_PERMISSION, cwd=elsewhere, env=named)
 
     assert _idle(session).exists()
     [push] = session.pushes()
@@ -1165,3 +1167,177 @@ def test_a_worker_github_does_not_answer_for_rings_without_a_question(
     session.notify(_stop("Marked ready. Waiting for CI."))
 
     assert len(session.pushes()) == 1
+
+
+# The question note the tick reads to answer for the owner (`RULES.md`, "Asking the owner").
+
+
+def _question(workflow: Workflow, name: str = "ticket-7") -> dict[str, object] | None:
+    note = workflow.notes(7) / f"{name}.question"
+    return json.loads(note.read_text()) if note.exists() else None
+
+
+def _asked(owner_only: str | None, reply: str = "Reply 1 or 2.") -> str:
+    line = "" if owner_only is None else f"Owner only: {owner_only}\n"
+    return (
+        "Should the limit be 500 or 1,000?\n\n"
+        "Recommendation: 1, 500, as the other services use.\n"
+        f"1. 500\n2. 1,000\n{line}{reply}"
+    )
+
+
+@pytest.mark.parametrize("name", ["ticket-7", "review-7", "audit-7"])
+def test_a_question_not_kept_for_the_owner_notes_its_recommended_reply(
+    session: Workflow, name: str
+) -> None:
+    session.notify(_stop(_asked("no")), session=name, env=_AT_NINE)
+
+    assert _question(session, name) == {
+        "asked": _asking(session, name).read_text().strip(),
+        "owner_only": "no",
+        "reply": "1",
+    }
+    assert _asked_at(session, name) == "1792000000"
+
+
+@pytest.mark.parametrize(
+    "reply,recommended",
+    [
+        ("Reply **2** (recommended) or **1**.", "2"),
+        ('Write "merge it" to merge, "wait" to wait.', "merge it"),
+        ("Reply “1” or “2”.", "1"),
+        ("Reply `1` or `2`.", "1"),
+        ("Please reply with 3, or 4 to stop.", "3"),
+    ],
+)
+def test_the_recommended_reply_is_the_first_reply_word_after_the_line(
+    session: Workflow, reply: str, recommended: str
+) -> None:
+    session.notify(_stop(_asked("no", reply)))
+
+    question = _question(session)
+    assert question is not None
+    assert question["reply"] == recommended
+
+
+@pytest.mark.parametrize(
+    "line", ["Owner only: yes", "**Owner only: yes**", "owner only: YES.", "`Owner only: yes`"], ids=str
+)
+def test_a_question_kept_for_the_owner_is_noted_as_his(session: Workflow, line: str) -> None:
+    session.notify(_stop(_asked(None).replace("Reply 1", f"{line}\nReply 1")))
+
+    question = _question(session)
+    assert question is not None
+    assert question["owner_only"] == "yes"
+    assert question.get("reply") is None
+
+
+def test_the_line_in_backticks_is_read(session: Workflow) -> None:
+    session.notify(_stop(_asked(None).replace("Reply 1", "`Owner only: no`\nReply 1")))
+
+    question = _question(session)
+    assert question is not None
+    assert (question["owner_only"], question["reply"]) == ("no", "1")
+
+
+@pytest.mark.parametrize("second", ["no", "yes"])
+@pytest.mark.parametrize("separator", ["\n", "\n\n"], ids=["one paragraph", "two paragraphs"])
+def test_two_questions_in_one_stop_are_the_owners(
+    session: Workflow, separator: str, second: str
+) -> None:
+    # One reply cannot answer two questions, and either may be his alone.
+    session.notify(_stop(_asked("yes").replace("Should", "A. Should") + separator + _asked(second)))
+
+    question = _question(session)
+    assert question is not None
+    assert question["owner_only"] == "yes"
+    assert question.get("reply") is None
+
+
+def test_the_reply_is_read_only_from_the_last_line_after_the_line(session: Workflow) -> None:
+    # Above the choices, against the rule: a choice's own words are not the reply.
+    message = (
+        "How should the import be tested?\n\nOwner only: no\nRecommendation: 1.\n"
+        "1. Add a test per file format\n2. Write 2 end-to-end tests only\nReply 1 or 2."
+    )
+    session.notify(_stop(message))
+
+    question = _question(session)
+    assert question is not None
+    assert (question["owner_only"], question["reply"]) == ("no", "1")
+
+    session.notify(_stop(_asked("no", "Reply 1 or 2.\nThe list stays as it is meanwhile.")))
+    question = _question(session)
+    assert question is not None
+    assert question["owner_only"] == "no"
+    assert question.get("reply") is None
+
+
+def test_a_question_without_the_line_is_noted_as_missing_it(session: Workflow) -> None:
+    session.notify(_stop(_asked(None)))
+
+    question = _question(session)
+    assert question is not None
+    assert question["owner_only"] == "missing"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Which one do you prefer?",
+        # Typed into Claude Code, these would run a command, not answer.
+        "Type `/clear` to start again. Reply 2 to go on.",
+        "Reply `!git push` to push, or 2.",
+        "Reply `#remember` or 2.",
+        "Reply 12a or 2.",
+    ],
+)
+def test_a_question_marked_no_without_a_plain_reply_word_has_no_reply(
+    session: Workflow, reply: str
+) -> None:
+    session.notify(_stop(_asked("no", reply)))
+
+    question = _question(session)
+    assert question is not None
+    assert question["owner_only"] == "no"
+    assert question.get("reply") is None
+
+
+def test_the_answer_drops_the_question_note_and_a_new_stop_writes_its_own(
+    session: Workflow,
+) -> None:
+    session.notify(_stop(_asked("no")), session="review-7")
+    session.notify(_PROMPT, session="review-7")
+    assert _question(session, "review-7") is None
+
+    session.notify(_stop(_asked("yes")), session="review-7")
+    question = _question(session, "review-7")
+    assert question is not None
+    assert question["owner_only"] == "yes"
+
+    session.notify(_stop("Merged.\n\nreview finished"), session="review-7")
+    assert _question(session, "review-7") is None
+
+
+@pytest.mark.parametrize("case", ["codex", "not a question", "hunt"])
+def test_no_question_note_for_a_bridge_a_stop_that_asks_nothing_or_a_hunt(
+    session: Workflow, case: str
+) -> None:
+    name = "ticket-7"
+    message = _asked("no")
+    if case == "codex":
+        (session.notes(7) / "ticket-7.codex").touch()
+    elif case == "not a question":
+        # A ready worker's stop rings, and asks nothing.
+        session.set_draft(7, draft=False)
+        message = "Marked ready. Waiting for CI."
+    else:
+        session.add_hunt("plan-1")
+        name = "hunt-plan-1"
+
+    session.notify(_stop(message), session=name)
+
+    if case == "hunt":
+        assert not (session.hunt_worktree("plan-1") / ".local/workflow/hunt-plan-1.question").exists()
+    else:
+        assert _question(session) is None

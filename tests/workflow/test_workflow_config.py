@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from workflow_harness import Workflow
+from workflow_harness import Workflow, install_shipline
 
 _WORKFLOW = Path(__file__).resolve().parents[2] / "scripts/workflow"
 # Loaded from its file, so the scripts' folder is not put on the path of every other test.
@@ -62,9 +62,27 @@ _DEFAULTS = {
         },
     },
     "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
+    "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
+    "machines": [],
     "hunts": {"areas": {}, "plans": None},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
-    "commands": {"test": None},
+    "commands": {
+        name: None
+        for name in (
+            "test",
+            "browser_tests_for_changes",
+            "server_tests_for_changes",
+            "pre_train_checks",
+            "mechanical_conflicts",
+            "browser_plan",
+            "hunt_app",
+            "hunt_browser",
+            "hunt_cursor",
+            "advisory_watch",
+            "push_checkout",
+        )
+    },
+    "answer_for_owner_after_minutes": 15,
 }
 
 
@@ -179,6 +197,7 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     assert keys(example) == keys(_DEFAULTS)
     assert example["repository"].endswith("/example-app")
     assert example["runner"]["labels"]
+    assert example["machines"]
     assert example["hunts"]["areas"]
 
 
@@ -190,6 +209,63 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
 
     _write(repo, {"runner": {"prefix": ""}})
     with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be a name"):
+        workflow_config.load(repo)
+
+
+def test_the_test_folders_tools_parity_compares_are_read(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"parity": {"workflow_tests": "app/tests/flow"}})
+
+    parity = workflow_config.load(repo).parity
+    assert (parity.workflow_tests, parity.runner_tests) == ("app/tests/flow", "tests/runner")
+    assert parity.known is None
+
+    _write(repo, {"parity": {"known": "tools/shipline/parity-known.txt"}})
+    assert workflow_config.load(repo).parity.known == "tools/shipline/parity-known.txt"
+
+
+def test_the_machines_are_read_with_their_addresses_and_one_without_is_this_machine(
+    tmp_path: Path,
+) -> None:
+    repo = _repository(tmp_path)
+    _write(
+        repo,
+        {
+            "machines": [
+                {"name": "this machine"},
+                {"name": "runner-1", "address": "runner-1.example"},
+            ]
+        },
+    )
+
+    machines = workflow_config.load(repo).machines
+    assert [(machine.name, machine.address) for machine in machines] == [
+        ("this machine", None),
+        ("runner-1", "runner-1.example"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "machines,named",
+    [
+        ("{}", "machines must be a list"),
+        ('[{"address": "runner-1.example"}]', "machines.name must be a name"),
+        ('[{"name": ""}]', "machines.name must be a name"),
+        ('[{"name": "one", "port": 22}]', "unknown key machines.port"),
+        ('[{"name": "one"}, {"name": "one"}]', "machines must name each machine once"),
+        # ssh would read an address that starts with a dash as one of its own options.
+        ('[{"name": "one", "address": "-oProxyCommand=touch nope"}]', "machines.address"),
+        ('[{"name": "one", "address": "runner 1"}]', "machines.address"),
+        ('[{"name": "one", "address": ""}]', "machines.address"),
+    ],
+)
+def test_a_machine_that_cannot_be_read_is_refused_by_name(
+    tmp_path: Path, machines: str, named: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, f'{{"machines": {machines}}}')
+
+    with pytest.raises(workflow_config.ConfigError, match=f"shipline.json: {named}"):
         workflow_config.load(repo)
 
 
@@ -357,6 +433,9 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"runner": {"labels": "home"}}', "runner.labels"),
         ('{"state_folder": "/var/workflow"}', "state_folder"),
         ('{"state_folder": "../workflow"}', "state_folder"),
+        ('{"parity": {"workflow_tests": "/srv/tests"}}', "parity.workflow_tests"),
+        ('{"parity": {"runner_tests": "../tests"}}', "parity.runner_tests"),
+        ('{"parity": {"known": "/srv/known.txt"}}', "parity.known"),
         ('{"repositry": "example-owner/example-app"}', "repositry"),
         ('{"checks": {"ci_results": "CI result"}}', "checks.ci_results"),
         ('{"hunts": {"areas": [{"name": "phone"}]}}', "hunts.areas"),
@@ -373,6 +452,13 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"hunts": {"plans": "docs/hunt plans.md"}}', "hunts.plans"),
         ('{"hunts": {"plans": "docs/$HOME.md"}}', "hunts.plans"),
         ('{"hunts": {"plan": "docs/hunt-plans.md"}}', "hunts.plan"),
+        ('{"answer_for_owner_after_minutes": "15"}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": -1}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": 1.5}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": true}', "answer_for_owner_after_minutes"),
+        # Bash would wrap a number this large.
+        ('{"answer_for_owner_after_minutes": 2000000000000000000}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": 1441}', "answer_for_owner_after_minutes"),
     ],
 )
 def test_a_file_that_cannot_be_read_is_refused_by_name(
@@ -407,6 +493,18 @@ def test_no_repository_on_github_anywhere_is_refused(tmp_path: Path, origin: str
     assert config.state_folder == ".local/workflow"
     with pytest.raises(workflow_config.ConfigError, match="cannot tell which repository"):
         config.repository
+
+
+@pytest.mark.parametrize("minutes", [0, 15, 90, 1440])
+def test_the_wait_before_answering_for_the_owner_is_read_and_reaches_bash(
+    tmp_path: Path, minutes: int
+) -> None:
+    """0 turns the answers off; Bash reads the number as it is."""
+    repo = _repository(tmp_path)
+    _write(repo, {"answer_for_owner_after_minutes": minutes})
+
+    assert workflow_config.load(repo).answer_for_owner_after_minutes == minutes
+    assert _shell(repo, 'printf "%s" "$SHIPLINE_ANSWER_FOR_OWNER_AFTER_MINUTES"') == str(minutes)
 
 
 _ODD = {
@@ -754,10 +852,11 @@ def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> d
     return texts
 
 
-# The SHA-256 of each text as the scripts wrote it before they read `shipline.json`.
+# The SHA-256 of each text as the scripts wrote it before they read `shipline.json`; the worker's
+# and the cloud worker's since they ask for the `Owner only:` line of a question to the owner.
 _TEXTS_BEFORE = {
-    "worker": "a1ada6cfb39264bb4b6501807f3feb74fbf51c2ea3c32c5b5b56f77a23838b36",
-    "cloud": "9603fac3798a46497342dda2b64491c2523c1e771d7620bb78e15b034c9d7bef",
+    "worker": "325cbf877af37ce9da33010ca5fadb43199e42a93e78235e72d234068a61438c",
+    "cloud": "d86282ba765d20c2c3507b1b0ae52509e72bed886b3eee028ed2c724cd25bfbe",
     "review": "ea932fce613e8e9c075daa884a2adee29b64ee5610f1fcd922f27aa6cd39c49a",
     "wake": "af21558438c99d72e165c8fb8ab4febdd80204e43f532a399697b4131441d080",
 }
@@ -879,6 +978,7 @@ def test_python_bash_node_and_jq_read_the_same_values(workflow: Workflow) -> Non
 def test_the_named_labels_are_what_the_tick_starts_by_and_install_timer_creates(
     workflow: Workflow,
 ) -> None:
+    install_shipline(workflow)
     _commit_on_main(
         workflow,
         {"shipline.json": json.dumps({"labels": {"workflow": "shipline", "audited": "checked"}})},
@@ -1084,6 +1184,7 @@ def test_without_a_repository_only_what_needs_one_stops(workflow: Workflow) -> N
     scripts = workflow.repo / "scripts/workflow"
     shell = subprocess.run(
         ["python3", str(scripts / "workflow_config.py"), "shell"],
+        cwd=workflow.repo,
         env=workflow.env,
         capture_output=True,
         text=True,

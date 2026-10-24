@@ -113,7 +113,9 @@ class Reads:
         else:
             self.steady.discard(head)
 
-    def api(self, path: str, read: Callable[[], Any]) -> Any:
+    def api(self, path: str, read: Callable[[], Any], *, fresh: bool = False) -> Any:
+        """GitHub's answer for `path`, shared within the tick; `fresh` asks GitHub again, and
+        the later reads of the tick share that answer."""
         config = workflow_config.current()
         files = "|".join(re.escape(name) for name in (config.workflows.ci, config.workflows.images))
         head_match = re.search(
@@ -123,7 +125,10 @@ class Reads:
         owner = head_match[1] if head_match else self.owners.get(path)
         token = self.tokens.get(owner or "")
         key = digest([path, token])
-        if key in self.responses:
+        if fresh:
+            value = read()
+            self.responses[key] = value
+        elif key in self.responses:
             value = self.responses[key]
         elif owner in self.steady and self.previous.get(path, {}).get("token") == token:
             value = self.previous[path]["value"]
