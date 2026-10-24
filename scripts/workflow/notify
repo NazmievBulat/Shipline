@@ -83,6 +83,9 @@ pushed=$notes/$name.pushed
 # When the session asked the owner, and a sum of the words it asked with, for the check-in of
 # `wake`. It stays while the session waits for his answer.
 asking=$notes/$name.asking
+# Whether that question is one the owner keeps for himself, and its recommended reply, for the
+# tick, which answers it for him after a while when it is not (`question_of`).
+question=$notes/$name.question
 
 # Only the worker's per-process callback may publish turns. Global callbacks from a
 # review or hunt must not mark the enclosing Claude session idle or ring its phone.
@@ -176,6 +179,36 @@ asks_owner() {
   ' <<<"$1")
   # One record preserves line starts for requests and the paragraph end for question marks.
   LC_ALL=C grep -zqiE "${request_start}${marks}(please[[:space:]]+)?(reply[[:space:]]+(with\>|$word)|choose[[:space:]]+$word|(type|write)[[:space:]]+$quoted)|$question_end" <<<"$paragraph"
+}
+
+# What the tick reads to answer a question for the owner, as JSON: the question's `asking` note,
+# `owner_only` from its line `Owner only: yes` or `Owner only: no` (without one, "missing", and
+# the owner answers; with more than one, "yes": one reply cannot answer two questions, and either
+# may be his alone), and for `no` the recommended reply: the first reply word on the message's
+# last line, when that line comes after the `Owner only:` one (a choice's own words above it are
+# no reply), digits or quoted words ("Reply 1 or 2", 'write "merge it"'), of at most 60
+# characters that starts with a letter or a digit: typed into Claude Code, `/clear` or
+# `!command` would run, not answer. Without one there is no `reply`, and the owner answers.
+question_of() {
+  jq -cn --arg message "$1" --arg asked "$2" '
+    ($message | split("\n")) as $lines
+    | [range(0; $lines | length)
+        | select($lines[.] | test("^[\\s>*_`-]*owner only:[\\s*_`]*(yes|no)[\\s*_`.!]*$"; "i"))] as $marked
+    | ([range(0; $lines | length) | select($lines[.] | test("\\S"))] | last) as $end
+    | {asked: $asked}
+    + if $marked == [] then {owner_only: "missing"}
+      elif ($marked | length) > 1 then {owner_only: "yes"}
+      else $marked[0] as $at
+      | ($lines[$at] | capture("(?<said>yes|no)[\\s*_`.!]*$"; "i").said | ascii_downcase) as $said
+      | {owner_only: $said}
+      + if $said == "yes" or $end <= $at then {}
+        else [$lines[$end]
+          | first(match("(?:^|[^[:alpha:]])(?:reply|type|write|answer|say|choose)(?:\\s+with)?\\s+[*_]*(?:\"([^\"\\n]+)\"|“([^”\\n]+)”|`([^`\\n]+)`|([0-9]+)(?![[:alnum:]]))"; "gi"))
+          | [.captures[].string | strings] | first
+          | select(length <= 60 and test("^[[:alnum:]]") and (test("[[:cntrl:]]") | not))]
+        | if length == 0 then {} else {reply: .[0]} end
+        end
+      end'
 }
 
 # Draft workers stop for progress reports too, so they ring only when they ask. A ready
@@ -283,7 +316,7 @@ on_stop() {
   rm -f "$notes/$name.interaction-blocked"
   # Whatever this stop is, an earlier question is answered or asked again below.
   [[ ! -r $asking ]] || read -r asked <"$asking" || true
-  rm -f "$asking"
+  rm -f "$asking" "$question"
   [[ ! -e $notes/$name.codex ]] || note "$notes/$name.bridge-stopped" ""
   message=$(field .last_assistant_message)
   # Stopped by the usage limit, the session is neither working nor waiting for the owner: the
@@ -337,6 +370,10 @@ on_stop() {
   else
     note "$asking" "${WORKFLOW_NOW:-$(date +%s)} $sum"
   fi
+  # A Codex bridge relays and never answers; a hunt asks nothing.
+  if [[ $name =~ ^(ticket|review|audit)- && ! -e $notes/$name.codex ]] && asks_owner "$message"; then
+    note "$question" "$(question_of "$message" "$(<"$asking")")"
+  fi
   # A session woken by its own job that stops again with the same words rings once.
   [[ ! -e $pushed || $(<"$pushed") != "$message" ]] || return 0
   if [[ ${1:-} == codex || -e $notes/$name.codex ]]; then
@@ -363,7 +400,7 @@ on_prompt() {
   if [[ $(jq -r "$own_turn" <<<"$event" 2>/dev/null) != true ]]; then
     rm -f "$pushed" "$notes/$name.owner-blocked" "$notes/$name.interaction-blocked"
     # The bridge types this itself to relay Codex's next turn: the owner answered nothing.
-    [[ $(field .prompt) == __WORKFLOW_CODEX_TURN__ ]] || rm -f "$asking"
+    [[ $(field .prompt) == __WORKFLOW_CODEX_TURN__ ]] || rm -f "$asking" "$question"
     if [[ -e $notes/$name.codex ]] && jq -e '(.source // "user_input") == "user_input"' <<<"$event" >/dev/null; then
       # jq writes the submitted text exactly, including trailing newlines. An automatic
       # wake authorizes no reply and leaves any pending owner's answer alone.
