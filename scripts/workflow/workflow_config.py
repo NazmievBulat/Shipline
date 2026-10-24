@@ -76,9 +76,13 @@ DEFAULTS: dict[str, Any] = {
         # The runner labels of the machines the gate may re-run failed jobs on.
         "labels": [],
         "identity_folder": "~/.config/shipline-runner",
-        # The prefix the runner pool names its services and containers by; without it, there are
-        # no runner figures (`workflow_metrics.py`).
+        # The prefix the runner pool names everything by: its images, network, services and
+        # containers (`<prefix>-runner…`) and labels; without it, there are no runner figures
+        # (`workflow_metrics.py`).
         "prefix": None,
+        # The command line, run from the main checkout, that builds the runner images; without
+        # it, the pool builds its own Dockerfile.
+        "image_build": None,
     },
 }
 
@@ -131,6 +135,7 @@ class Runner:
     labels: tuple[str, ...]
     identity_folder: str
     prefix: str | None = None
+    image_build: str | None = None
 
     @property
     def identity_path(self) -> Path:
@@ -333,6 +338,7 @@ def load(start: Path | None = None) -> Config:
             labels=tuple(values["runner"]["labels"]),
             identity_folder=values["runner"]["identity_folder"],
             prefix=values["runner"]["prefix"],
+            image_build=values["runner"]["image_build"],
         ),
         given=given,
         main=main,
@@ -363,6 +369,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "labels": list(config.runner.labels),
             "identity_folder": config.runner.identity_folder,
             "prefix": config.runner.prefix,
+            "image_build": config.runner.image_build,
         },
     }
 
@@ -385,6 +392,9 @@ def shell(config: Config) -> str:
         "LABEL_AUDITED": config.labels.audited,
         **{f"PRIORITY_{key.upper()}": value for key, value in config.labels.priority.items()},
         "IDENTITY_FOLDER": config.runner.identity_folder,
+        # Empty when the file names none.
+        "RUNNER_PREFIX": config.runner.prefix or "",
+        "RUNNER_IMAGE_BUILD": config.runner.image_build or "",
         "CONFIG": json.dumps(config.given, separators=(",", ":")),
     }
     lines = [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]
