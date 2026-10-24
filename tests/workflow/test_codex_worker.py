@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from workflow_harness import SESSION_LINK, Workflow, instruction, scope_words
+from workflow_harness import SESSION_LINK, Workflow, install_shipline, instruction, scope_words
 
 
 def _codex(workflow: Workflow, draft: bool = True) -> None:
@@ -623,6 +623,8 @@ def test_installer_refuses_global_codex_option_and_preserves_settings(workflow: 
 
 
 def test_default_installer_does_not_change_codex_settings(workflow: Workflow) -> None:
+    # Installed from a Shipline checkout of its own, as a repository installs it.
+    install_shipline(workflow)
     assert workflow.run_script("install-hooks").returncode == 0
     assert not (workflow.root / "home" / ".codex" / "config.toml").exists()
 

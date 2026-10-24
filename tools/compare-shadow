@@ -36,8 +36,8 @@ the session commands are not compared either.
 Some differences follow from what a shadow tick does not run, and are explained by it: a nudge
 for a new turn of the merge line or a new state of main, which the real tick's own reconcile
 and report refresh make in the same tick (the shadow tick reads the line and the report as the
-tick before left them); and a check-in that tells the orchestrator of a hand-back or a cloud
-worker's report the real tick noted in the same tick. The wake log is the machine's, one for
+tick before left them); and a check-in that tells the orchestrator of a hand-back, a cloud
+worker's report or an analyst's report the real tick noted in the same tick. The wake log is the machine's, one for
 every repository on it: compare a run on a machine that works on one repository only.
 
 Each difference is printed with both versions, the decision of the same session or of the wake
@@ -65,16 +65,20 @@ _CHECK_IN = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)  (.+)$")
 # `journalctl -o short-unix`: the moment, the host, the program and its process, the words.
 _JOURNAL = re.compile(r"^(\d+(?:\.\d+)?) \S+ ([^\s:]+?)(?:\[\d+\])?: (.*)$")
 
-_NAME = r"(?:ticket|review|audit|cloud)-\d+|hunt-[a-z0-9][a-z0-9-]*"
+_NAME = r"(?:ticket|review|audit|cloud)-\d+|(?:hunt|analyst)-[a-z0-9][a-z0-9-]*"
 # The lines of the session commands and of the tick that a journal holds: the session they name,
 # and the words compared.
 _SESSION_LINES = [
     (re.compile(rf"^(?P<who>{_NAME}) stopped$"), None),
-    (re.compile(r"^(?P<who>hunt-[a-z0-9][a-z0-9-]*) is over its time$"), None),
+    (re.compile(r"^(?P<who>(?:hunt|analyst)-[a-z0-9][a-z0-9-]*) is over its time$"), None),
     (re.compile(rf"^(?P<who>{_NAME}) squeezed(?:: .*)?$"), "{who} squeezed"),
     (re.compile(rf"^(?P<who>{_NAME}) was sent its instruction again$"), None),
     (re.compile(r"^(?P<who>ticket-\d+): its bridge was started again$"), None),
-    (re.compile(r"^(?P<who>(?:ticket|cloud)-\d+) started(?:: .*)?$"), "{who} started"),
+    (
+        re.compile(r"^(?P<who>(?:ticket|cloud)-\d+|analyst-[a-z0-9][a-z0-9-]*) started(?:: .*)?$"),
+        "{who} started",
+    ),
+    (re.compile(r"^the daily (?P<who>analyst) waits: .*$"), None),
     (re.compile(r"^(?P<who>)\S.*; the next tick tries this start again$"), None),
 ]
 # The tick's own lines of the wake log.
