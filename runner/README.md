@@ -4,8 +4,9 @@ A repository that uses Shipline can run its CI on its own machines. This folder 
 machine runs:
 - the keepers that register the runners, one fresh container a job (`keep-runner.sh`);
 - the spare and the ordinary slots (`keep-spare.sh`, `ordinary_slots.py`);
-- the lender of main's runners to pull request jobs while main has none (`keep-lending.sh`,
-  `lend_runners.py`);
+- the lender of main's runners to pull request jobs while neither main nor the merge line has a
+  job for them, which also gives them the merge line's lane while no push to main waits
+  (`keep-lending.sh`, `lend_runners.py`);
 - the planner's runner and its state (`keep-planner.sh`, `planner-state.py`);
 - the usage sampler (`sample-usage.sh`, `usage.py`);
 - the firewall that shuts the jobs in (`firewall.sh`, `install-firewall.sh`);
@@ -63,11 +64,14 @@ one free. They come from the base label, `runner.label`, `<prefix>-home` when it
 | `<label>-standby` | an ordinary runner before it takes a slot, the spare among them |
 | `<label>-first` | the slots, and the main runner lent to the merge train's first member |
 | `<label>-main` | main's runners, on the main machine only |
+| `<label>-main-batch` | main's idle runners while no push to main waits: the lane the merge gate's first run of a prefix takes when its planner finds one free (`examples/ci.yml`) |
 | `<label>-docker` | the Docker-capable runners |
 | `runner.planner_label` | the planner's runner; `<label>-planner` when it names none |
 
-`runner.labels`, the labels the merge gate may re-run failed jobs on, are these six; a list
-named in `shipline.json` wins over them. Machines differ only by their runners' names:
+`runner.labels`, the labels the merge gate may re-run failed jobs on, are these seven; a list
+named in `shipline.json` wins over them, and then names `<label>-main-batch` too. The merge
+line's lane is taken only by a planner that runs on the planner's runner, which reads the
+lender's note (`ci_proof.py main-lane`). Machines differ only by their runners' names:
 `<machine>-1`, `<machine>-docker-1`, `<machine>-main` and `<machine>-planner`.
 
 ### The repository's own commands

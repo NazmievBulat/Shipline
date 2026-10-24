@@ -118,7 +118,7 @@ def test_the_cloud_worker_is_told_to_push_as_one_so_its_push_runs_cis_tests(
         "and as that user."
     ) in sentence
     assert (
-        'Only after the server suite timed out in a push, export '
+        "Only after the server suite timed out in a push, export "
         'SHIPLINE_CLOUD_SERVER_PART="1 of 4" (or another part) to run that part as CI parts '
         "it, and unset it once it is not needed."
     ) in sentence
@@ -1135,7 +1135,7 @@ def _alive(pid: int) -> bool:
     """Whether the process runs: one ended but not yet reaped (a zombie) does not."""
     try:
         state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-    except (OSError, IndexError):
+    except OSError, IndexError:
         return False
     return state != "Z"
 
@@ -1208,3 +1208,580 @@ def test_the_owners_quote_reply_of_a_signed_question_wakes_the_worker_then_names
     assert _lines(attachable.state / "typed") == [_ANSWERED]
     assert not (attachable.repo / ".local/workflow/cloud-7.asking").exists()
     assert len(_stuck(attachable)) == 1
+
+
+_ORCHESTRATOR = "<!-- shipline-orchestrator -->"
+_QUESTION = (
+    "How should a failed upload be retried?\n\n"
+    "1. Retry once after a minute (recommended)\n"
+    "2. Retry three times\n"
+    "3. Never retry\n\n"
+    "Owner only: {owner}\n"
+    "Reply 1, 2 or 3."
+)
+
+
+def _question(
+    workflow: Workflow, owner: str = "no", text: str = _QUESTION, login: str = "example-owner"
+) -> dict[str, object]:
+    """The worker's question, from an account that may write to the repository."""
+    (workflow.state / "permission-example-owner").write_text("write\n")
+    comment = _comment(4, text.format(owner=owner))
+    comment["user"] = {"login": login}
+    return comment
+
+
+def _answers(workflow: Workflow) -> list[str]:
+    """The bodies of the comments the tick posted on pull request 7."""
+    pages = json.loads((workflow.state / "comments-7.json").read_text())
+    return [
+        str(comment["body"])
+        for page in pages
+        for comment in page
+        if str(comment["body"]).startswith(f"{_ORCHESTRATOR} answered for the owner")
+    ]
+
+
+def _answered_in_log(workflow: Workflow) -> list[str]:
+    """The tick's lines of its answers, among the lines of the wake's own passes."""
+    return [
+        line
+        for line in _lines(workflow.wake_log)
+        if re.fullmatch(r"[0-9]+ answered for the owner: .*", line)
+    ]
+
+
+def _set_config(workflow: Workflow, **values: int) -> None:
+    config = workflow.repo / "shipline.json"
+    config.write_text(json.dumps({**json.loads(config.read_text()), **values}))
+
+
+def test_a_question_not_owner_only_is_answered_once_after_15_minutes_then_woken(
+    attachable: Workflow,
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _comments(attachable, _question(attachable))
+
+    _tick_at(attachable, 14)
+    assert _answers(attachable) == []
+    assert not (attachable.state / "typed").exists()
+
+    _tick_at(attachable, 15)
+    _tick_at(attachable, 25)
+
+    assert _answers(attachable) == [
+        f"{_ORCHESTRATOR} answered for the owner: 1\n\n> 1. Retry once after a minute (recommended)"
+    ]
+    assert _answered_in_log(attachable) == [f'{_NOW + 900} answered for the owner: cloud-7, "1"']
+    assert _lines(attachable.state / "typed") == [_ANSWERED]
+    assert _wake_log(attachable) == [f"{_NOW + 900} woke cloud-7 (question answered)"]
+    # Answered, it no longer waits for the owner, and the check-in lists it for him to overrule.
+    assert not (attachable.repo / ".local/workflow/cloud-7.asking").exists()
+    [told] = [message for message in attachable.sent() if "answered for the owner" in message]
+    assert 'answered for the owner: cloud-7, "1" (18:15)' in told
+
+
+@pytest.mark.parametrize(
+    ("text", "reply", "quoted"),
+    [
+        (
+            "Rename the flag?\n\n"
+            '"keep it": keep the old name\n"rename it": use the new name\n\n'
+            'Owner only: no\nReply "keep it" or "rename it".',
+            "keep it",
+            '\n\n> "keep it": keep the old name',
+        ),
+        (
+            "Which order?\n\n- **2** Newest first\n- **1** Oldest first\n\n"
+            "**Owner only:** no\nReply 2 or 1.",
+            "2",
+            "\n\n> - **2** Newest first",
+        ),
+        (
+            "Done so far:\n1. Added the parser\n2. Tests green\n\nWhich order?\n"
+            "1. Oldest first\n2. Newest first\n\nOwner only: no\nReply 1 or 2.",
+            "1",
+            "\n\n> 1. Oldest first",
+        ),
+        ('Rename the flag?\n\nOwner only: no\nReply "go ahead" or "wait".', "go ahead", ""),
+    ],
+    ids=["quoted words", "in bold", "a numbered list above the choices", "no choice line"],
+)
+def test_the_answer_is_the_first_reply_word_after_the_line(
+    attachable: Workflow, text: str, reply: str, quoted: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _comments(attachable, _question(attachable, text=text))
+
+    _tick_at(attachable, 15)
+
+    assert _answers(attachable) == [f"{_ORCHESTRATOR} answered for the owner: {reply}{quoted}"]
+    assert _answered_in_log(attachable) == [
+        f'{_NOW + 900} answered for the owner: cloud-7, "{reply}"'
+    ]
+    # The wake's check-in reads it, and moves it once told.
+    [answer] = (attachable.repo / ".local/workflow").glob("answered-for-owner.*/*.json")
+    assert json.loads(answer.read_text()) == {"name": "cloud-7", "reply": reply, "at": _NOW + 900}
+
+
+@pytest.mark.parametrize(
+    ("owner", "text", "named"),
+    [
+        ("yes", _QUESTION, None),
+        ("missing", _QUESTION.replace("Owner only: {owner}\n", ""), "without the Owner only line"),
+        ("no", _QUESTION.replace("Reply 1, 2 or 3.", "1, 2 or 3?"), "without a reply word"),
+        ("no", _QUESTION.replace("Reply 1, 2 or 3.", 'Reply "/clear".'), "without a reply word"),
+    ],
+    ids=["owner only", "no line", "no reply word", "a command"],
+)
+def test_a_question_kept_for_the_owner_or_unclear_is_left(
+    attachable: Workflow, owner: str, text: str, named: str | None
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _comments(attachable, _question(attachable, owner=owner, text=text))
+
+    for minutes in (15, 60, 95):
+        _tick_at(attachable, minutes)
+
+    assert _answers(attachable) == []
+    assert _answered_in_log(attachable) == []
+    assert not (attachable.state / "attached").exists()
+    told = [message for message in attachable.sent() if "owner question" in message]
+    if named is None:
+        assert told == []
+    else:
+        [message] = told
+        assert f"owner question {named}: cloud-7" in message
+
+
+@pytest.mark.parametrize("answerer", ["owner", "orchestrator"])
+def test_an_earlier_answer_wins(attachable: Workflow, answerer: str) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    answer = {
+        "id": 5,
+        "body": "1" if answerer == "owner" else f"{_ORCHESTRATOR}\n2",
+        "created_at": "2026-10-19T18:05:00Z",
+        "user": {"login": "example-owner"},
+    }
+    _comments(attachable, _question(attachable), answer)
+
+    _tick_at(attachable, 15)
+
+    assert _answers(attachable) == []
+    assert _answered_in_log(attachable) == []
+
+
+@pytest.mark.parametrize("late", ["owner", "worker"])
+def test_an_answer_or_a_report_that_comes_while_the_tick_reads_wins(
+    attachable: Workflow, late: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    question = _question(attachable)
+    _comments(attachable, question)
+    body = "2" if late == "owner" else f"{_MARKER}\nAnother question?"
+    arrival = {
+        "id": 5,
+        "body": body,
+        "created_at": "2026-10-19T18:14:00Z",
+        "user": question["user"],
+    }
+    # The owner's reply, or a new report, lands after the tick's first read of the comments.
+    real = attachable.bin / "gh"
+    real.rename(attachable.bin / "gh-real")
+    attachable.fake(
+        "gh",
+        "#!/bin/bash\n"
+        'if [[ "$*" == *"/comments?per_page=100"* ]]; then\n'
+        '  read_once="@STATE@/read-once"\n'
+        '  if [ -e "$read_once" ]; then\n'
+        f"    echo {json.dumps(json.dumps([[question, arrival]]))} > @STATE@/comments-7.json\n"
+        "  fi\n"
+        '  touch "$read_once"\n'
+        "fi\n"
+        'exec "$(dirname "$0")/gh-real" "$@"\n',
+    )
+
+    _tick_at(attachable, 15)
+
+    assert _answers(attachable) == []
+
+
+def test_a_question_from_an_account_that_may_not_write_is_never_answered(
+    attachable: Workflow,
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    (attachable.state / "permission-passer-by").write_text("read\n")
+    _comments(attachable, _question(attachable, login="passer-by"))
+
+    _tick_at(attachable, 60)
+
+    assert _answers(attachable) == []
+
+
+def test_a_failed_answer_is_tried_again_and_posted_once(attachable: Workflow) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _comments(attachable, _question(attachable))
+    (attachable.state / "fail-gh-comment").touch()
+
+    failed = attachable.run_script("tick", env={**_ENV, "WORKFLOW_NOW": str(_NOW + 900)})
+    assert failed.returncode != 0
+    assert _answers(attachable) == []
+    (attachable.state / "fail-gh-comment").unlink()
+    _tick_at(attachable, 18)
+    _tick_at(attachable, 21)
+
+    assert len(_answers(attachable)) == 1
+    assert len(_answered_in_log(attachable)) == 1
+
+
+@pytest.mark.parametrize(("minutes", "answered_at"), [(0, None), (40, 40)])
+def test_the_configured_wait_moves_or_turns_off_the_answer(
+    attachable: Workflow, minutes: int, answered_at: int | None
+) -> None:
+    _set_config(attachable, answer_for_owner_after_minutes=minutes)
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _comments(attachable, _question(attachable))
+
+    for at in (15, 39, 40, 600):
+        _tick_at(attachable, at)
+
+    if answered_at is None:
+        assert _answers(attachable) == []
+        assert not (attachable.state / "attached").exists()
+        return
+    assert len(_answers(attachable)) == 1
+    assert _answered_in_log(attachable) == [
+        f'{_NOW + answered_at * 60} answered for the owner: cloud-7, "1"'
+    ]
+
+
+def test_the_rules_give_a_cloud_workers_question_the_shape_the_tick_answers() -> None:
+    rules = (Path(__file__).resolve().parents[2] / "scripts/workflow/RULES.md").read_text()
+    cloud = " ".join(rules.split("### Cloud workers", 1)[1].split("\n## ", 1)[0].split())
+    assert "the line `Owner only: yes` or `Owner only: no`" in cloud
+    assert f"`{_ORCHESTRATOR} answered for the owner: <reply word>`" in cloud
+
+
+def test_the_same_question_asked_again_after_the_answer_waits_for_the_owner(
+    attachable: Workflow,
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    question = _question(attachable)
+    _comments(attachable, question)
+    _tick_at(attachable, 15)
+    assert len(_answers(attachable)) == 1
+    pages = json.loads((attachable.state / "comments-7.json").read_text())
+    again = {**question, "id": 9, "created_at": "2026-10-19T18:30:00Z"}
+    (attachable.state / "comments-7.json").write_text(json.dumps([pages[0] + [again]]))
+
+    _tick_at(attachable, 31)
+    _tick_at(attachable, 60)
+
+    assert len(_answers(attachable)) == 1
+    assert len(_answered_in_log(attachable)) == 1
+
+
+def test_the_notes_are_named_as_the_ticks_and_a_signed_question_is_read(
+    attachable: Workflow,
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    signed = _QUESTION + "\n\n---\n_Generated by [Claude Code](https://claude.ai/code)_"
+    _comments(attachable, _question(attachable, text=signed.replace("Owner only: {owner}\n", "")))
+
+    _tick_at(attachable, 15)
+
+    notes = attachable.repo / ".local/workflow"
+    [note] = notes.glob("stuck.*/*.json")
+    assert note.name == f"cloud-7-owner-question-{_NOW}.json"
+    assert json.loads(note.read_text()) == {
+        "line": "owner question without the Owner only line: cloud-7"
+    }
+    assert (
+        f"{_NOW + 900} cloud-7 asks the owner without the Owner only line; it waits for him"
+        in _lines(attachable.wake_log)
+    )
+
+    _comments(attachable, _question(attachable, text=signed))
+    (attachable.state / "comments-7.json").write_text(
+        (attachable.state / "comments-7.json").read_text().replace('"id": 4', '"id": 6')
+    )
+    _tick_at(attachable, 40)
+
+    [answer] = notes.glob("answered-for-owner.*/*.json")
+    assert answer.name == f"{_NOW + 2400}-cloud-7.json"
+
+
+def test_zero_minutes_also_leaves_a_question_without_the_line_unnamed(
+    attachable: Workflow,
+) -> None:
+    _set_config(attachable, answer_for_owner_after_minutes=0)
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _comments(
+        attachable, _question(attachable, text=_QUESTION.replace("Owner only: {owner}\n", ""))
+    )
+
+    _tick_at(attachable, 60)
+
+    assert [message for message in attachable.sent() if "owner question" in message] == []
+
+
+# Questions the stop hook (`notify`, `question_of`) and the cloud relay must read alike.
+_SHAPES = [
+    _QUESTION.format(owner="no"),
+    _QUESTION.format(owner="yes"),
+    _QUESTION.replace("Owner only: {owner}\n", ""),
+    'Pick?\n**Owner only:** no\nWrite "merge it" to merge.',
+    'Pick?\n`Owner only: no`\nReply "/clear".',
+    'Pick?\nOwner only: no\nReply "' + "x" * 61 + '".',
+    'Pick?\nOwner only: no\nReply "' + "x" * 60 + '".',
+    "Pick?\nOwner only: no\nReply 12abc or 3.",
+    "Pick?\nOwner only: no\nReply “é ok”.",
+    "Pick?\nOwner only: no Reply 1.",
+    'Pick?\nOwner only: no\nReply "a\x9bb".',
+    "Pick?\nOwner only:\x1fno\nReply 1.",
+    "Pick?\r\nOwner only: no\r\nReply 1.",
+    "Pick?\nOwner only: yes\nOwner only: no\nReply 2.",
+    "Pick?\nOwner only: no\nReply 1.\nThanks.",
+    "Pick?\nOwner only: no\nReply 1.\n\n  \n",
+    "Pick?\nReply 1.\nOwner only: no",
+]
+
+
+def test_a_cloud_question_is_read_as_the_stop_hook_reads_a_local_one() -> None:
+    scripts = Path(__file__).resolve().parents[2] / "scripts/workflow"
+    hook = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source <(sed -n "/^question_of()/,/^}/p" "$1"); shift; '
+            'for message; do question_of "$message" "1 2"; done',
+            "read",
+            str(scripts / "notify"),
+            *_SHAPES,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    relay = subprocess.run(
+        [
+            "python3",
+            "-c",
+            "import json, sys, cloud_workers\n"
+            "for message in json.load(sys.stdin):\n"
+            "    owner, reply, _ = cloud_workers._question(message)\n"
+            "    print(json.dumps([owner, reply]))\n",
+        ],
+        input=json.dumps(_SHAPES),
+        cwd=scripts,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    read = [json.loads(line) for line in hook.stdout.splitlines()]
+    expected = [[note["owner_only"], note.get("reply", "")] for note in read]
+    assert [json.loads(line) for line in relay.stdout.splitlines()] == expected
+
+
+def test_an_answer_posted_but_not_confirmed_is_noted_once_at_the_next_tick(
+    attachable: Workflow,
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _comments(attachable, _question(attachable))
+    (attachable.state / "lose-gh-comment-answer").touch()
+
+    lost = attachable.run_script("tick", env={**_ENV, "WORKFLOW_NOW": str(_NOW + 900)})
+    assert lost.returncode != 0
+    (attachable.state / "lose-gh-comment-answer").unlink()
+    _tick_at(attachable, 18)
+    _tick_at(attachable, 21)
+
+    assert len(_answers(attachable)) == 1
+    assert _answered_in_log(attachable) == [f'{_NOW + 1080} answered for the owner: cloud-7, "1"']
+    [answer] = (attachable.repo / ".local/workflow").glob("answered-for-owner.*/*.json")
+    assert json.loads(answer.read_text())["reply"] == "1"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Which order?\n\n1. Oldest first\n2. Newest first (Recommended)\n\nOwner only: no\n"
+        "Reply 1 or 2.",
+        "Which order?\n\n1. Oldest first\n2. Newest first\n\nI recommend 2.\n\nOwner only: no\n"
+        "Answer 1 or 2.",
+        "Which order?\n\nRecommended: 2\n1. Oldest first\n2. Newest first\n\nOwner only: no\n"
+        "Reply 1 or 2.",
+    ],
+    ids=["marked on a choice", "in a sentence", "above the list"],
+)
+def test_a_recommendation_other_than_the_first_reply_word_waits_and_is_named_once(
+    attachable: Workflow, text: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _comments(attachable, _question(attachable, text=text))
+
+    for minutes in (15, 30, 60):
+        _tick_at(attachable, minutes)
+
+    assert _answers(attachable) == []
+    told = [message for message in attachable.sent() if "owner question" in message]
+    assert len(told) == 1
+    assert (
+        "owner question with a recommendation other than its first reply word: cloud-7"
+        in told[0]
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Which order?\n\nRecommended: 1\n1. Oldest first\n2. Newest first\n\nOwner only: no\n"
+        "Reply 1 or 2.",
+        "Which order?\n\n1. Oldest first\n2. Newest first (not recommended)\n\nOwner only: no\n"
+        "Reply 1 or 2.",
+    ],
+    ids=["agrees", "a choice not recommended"],
+)
+def test_a_recommendation_that_agrees_with_the_first_reply_word_is_answered(
+    attachable: Workflow, text: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    _comments(attachable, _question(attachable, text=text))
+
+    _tick_at(attachable, 15)
+
+    assert [answer.split("\n", 1)[0] for answer in _answers(attachable)] == [
+        f"{_ORCHESTRATOR} answered for the owner: 1"
+    ]
+
+
+@pytest.mark.parametrize(
+    "ending", ["Reply: 1 or 2", "Choose 1 or 2.", "Reply A or B.", "Reply **1** or **2**."]
+)
+def test_common_closing_lines_ask_the_owner(workflow: Workflow, ending: str) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    _keys(workflow)
+    _comments(
+        workflow, _comment(4, f"Which order?\n\n1. Oldest first\n2. Newest first\n\n{ending}")
+    )
+
+    done = workflow.run_script("tick", env=_ENV)
+
+    assert done.returncode == 0, done.stderr
+    assert (workflow.repo / ".local/workflow/cloud-7.asking").exists()
+    [push] = workflow.pushes()
+    assert push.title == "cloud-7 needs you"
+
+
+def test_the_same_question_asked_again_after_the_owner_answered_waits(
+    attachable: Workflow,
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    question = _question(attachable)
+    answer = {
+        "id": 5,
+        "body": "3",
+        "created_at": "2026-10-19T18:05:00Z",
+        "user": {"login": "example-owner"},
+    }
+    _comments(attachable, question, answer)
+    _tick_at(attachable, 6)
+    again = {**question, "id": 9, "created_at": "2026-10-19T18:20:00Z"}
+    _comments(attachable, question, answer, again)
+
+    for minutes in (21, 36, 60):
+        _tick_at(attachable, minutes)
+
+    assert _answers(attachable) == []
+
+
+@pytest.mark.parametrize(
+    "ending",
+    [
+        "Owner only: no\nRecommended: 2\nReply 1 or 2.",
+        "Owner only: no\nReply 1 or 2 (recommended: 2).",
+        "Owner only: no\nAnswer 1 or 2. I recommend 2.",
+        "Owner only: no\nReply 1 (not recommended) or 2 (recommended).",
+    ],
+    ids=["below the line", "on the reply line", "after the reply words", "beside another"],
+)
+def test_a_recommendation_below_the_owner_only_line_is_not_overruled(
+    attachable: Workflow, ending: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    text = f"Which order?\n\n1. Oldest first\n2. Newest first\n\n{ending}"
+    _comments(attachable, _question(attachable, text=text))
+
+    for minutes in (15, 30, 60):
+        _tick_at(attachable, minutes)
+
+    assert _answers(attachable) == []
+    told = [message for message in attachable.sent() if "owner question" in message]
+    assert len(told) == 1
+    assert (
+        "owner question with a recommendation other than its first reply word: cloud-7"
+        in told[0]
+    )
+
+
+@pytest.mark.parametrize(
+    ("ending", "reply"),
+    [
+        ("Owner only: no\nRecommended: 1\nAnswer 1 or 2.", "1"),
+        ("Owner only: no\nAnswer 1 or 2. Recommended: 1", "1"),
+        ("Owner only: no\nReply **2** (recommended) or **1**.", "2"),
+    ],
+    ids=["below the line", "after the reply words", "beside the first reply word"],
+)
+def test_a_recommendation_of_the_first_reply_word_below_the_line_is_answered(
+    attachable: Workflow, ending: str, reply: str
+) -> None:
+    attachable.add_pull_request(7)
+    _record(attachable)
+    text = f"Which order?\n\n1. Oldest first\n2. Newest first\n\n{ending}"
+    _comments(attachable, _question(attachable, text=text))
+
+    _tick_at(attachable, 15)
+
+    assert [answer.split("\n", 1)[0] for answer in _answers(attachable)] == [
+        f"{_ORCHESTRATOR} answered for the owner: {reply}"
+    ]
+
+
+def test_a_question_ending_with_its_recommendation_asks_the_owner(workflow: Workflow) -> None:
+    workflow.add_pull_request(7, labels=())
+    _record(workflow)
+    _keys(workflow)
+    _comments(
+        workflow,
+        _comment(
+            4,
+            "Which order?\n\n1. Oldest first\n2. Newest first\n\nOwner only: no\n"
+            "Answer 1 or 2\nRecommended: 1",
+        ),
+    )
+
+    done = workflow.run_script("tick", env=_ENV)
+
+    assert done.returncode == 0, done.stderr
+    assert (workflow.repo / ".local/workflow/cloud-7.asking").exists()
+    [push] = workflow.pushes()
+    assert push.title == "cloud-7 needs you"
