@@ -6,6 +6,7 @@ hunts every screen and runs alone; with no areas configured, one hunt runs at a 
 
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -211,6 +212,34 @@ def test_an_exploring_hunt_is_not_told_of_the_plans(workflow: Workflow) -> None:
 
     assert done.returncode == 0, done.stderr
     assert f'"Hunt for bugs exploring, as hunt-one, {_RULES}"' in _command(workflow, "one")
+
+
+@pytest.mark.parametrize("program", ["claude", "codex"])
+def test_the_sentence_reaches_the_hunter_word_for_word_through_the_shell(
+    workflow: Workflow, program: str
+) -> None:
+    _configure(workflow, {"phone": ["/contacts/[id]/*", "/~me:@%+{x}"]}, "docs/hunt-plans.md")
+    assert _start(workflow, "one", "plan", program, "phone").returncode == 0
+    # A hunter that writes down the last word it was given: its sentence.
+    hunter = workflow.root / "hunter"
+    hunter.mkdir()
+    (hunter / program).write_text(
+        f'#!/bin/bash\nprintf "%s" "${{@: -1}}" > {workflow.root / "sentence"}\n'
+    )
+    (hunter / program).chmod(0o755)
+
+    subprocess.run(
+        ["bash", "-c", _command(workflow, "one")],
+        cwd=workflow.hunt_worktree("one"),
+        env={**workflow.env, "PATH": f"{hunter}:{workflow.env['PATH']}"},
+        check=True,
+    )
+
+    assert (workflow.root / "sentence").read_text() == (
+        f"Hunt for bugs with a plan, as hunt-one, {_RULES}. The plans are in docs/hunt-plans.md. "
+        "Your area is phone: /contacts/[id]/*, /~me:@%+{x}. Stay off the other areas' screens "
+        "except to pass through them, and take only the plan's tasks marked phone."
+    )
 
 
 def test_stop_forgets_the_area_with_the_other_notes(workflow: Workflow) -> None:
