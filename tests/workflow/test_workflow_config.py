@@ -62,6 +62,7 @@ _DEFAULTS = {
     },
     "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
     "cloud_wake_after_minutes": 30,
+    "answer_for_owner_after_minutes": 15,
 }
 
 
@@ -343,6 +344,13 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"cloud_wake_after_minutes": -1}', "cloud_wake_after_minutes"),
         ('{"cloud_wake_after_minutes": 1.5}', "cloud_wake_after_minutes"),
         ('{"cloud_wake_after_minutes": true}', "cloud_wake_after_minutes"),
+        ('{"answer_for_owner_after_minutes": "15"}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": -1}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": 1.5}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": true}', "answer_for_owner_after_minutes"),
+        # Bash would wrap a number this large.
+        ('{"answer_for_owner_after_minutes": 2000000000000000000}', "answer_for_owner_after_minutes"),
+        ('{"answer_for_owner_after_minutes": 1441}', "answer_for_owner_after_minutes"),
     ],
 )
 def test_a_file_that_cannot_be_read_is_refused_by_name(
@@ -377,6 +385,18 @@ def test_no_repository_on_github_anywhere_is_refused(tmp_path: Path, origin: str
     assert config.state_folder == ".local/workflow"
     with pytest.raises(workflow_config.ConfigError, match="cannot tell which repository"):
         config.repository
+
+
+@pytest.mark.parametrize("minutes", [0, 15, 90, 1440])
+def test_the_wait_before_answering_for_the_owner_is_read_and_reaches_bash(
+    tmp_path: Path, minutes: int
+) -> None:
+    """0 turns the answers off; Bash reads the number as it is."""
+    repo = _repository(tmp_path)
+    _write(repo, {"answer_for_owner_after_minutes": minutes})
+
+    assert workflow_config.load(repo).answer_for_owner_after_minutes == minutes
+    assert _shell(repo, 'printf "%s" "$SHIPLINE_ANSWER_FOR_OWNER_AFTER_MINUTES"') == str(minutes)
 
 
 _ODD = {
@@ -692,11 +712,12 @@ def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> d
     return texts
 
 
-# The SHA-256 of each text as the scripts wrote it before they read `shipline.json`.
-# The cloud one has since gained its sentence on never ending a turn to wait for an answer.
+# The SHA-256 of each text as the scripts wrote it before they read `shipline.json`; the worker's
+# and the cloud worker's since they ask for the `Owner only:` line of a question to the owner,
+# and the cloud one since its sentence on never ending a turn to wait for an answer.
 _TEXTS_BEFORE = {
-    "worker": "a1ada6cfb39264bb4b6501807f3feb74fbf51c2ea3c32c5b5b56f77a23838b36",
-    "cloud": "0db18f0ee8a33f4b5070fdd5345361848baf25923ad9721e6b68b020b71ec6a4",
+    "worker": "325cbf877af37ce9da33010ca5fadb43199e42a93e78235e72d234068a61438c",
+    "cloud": "a331c8a4ccec16eeaf7cf29fc4b5177e6ef0c6e9ef2efc0edb924ad8ce8f90a7",
     "review": "ea932fce613e8e9c075daa884a2adee29b64ee5610f1fcd922f27aa6cd39c49a",
     "wake": "af21558438c99d72e165c8fb8ab4febdd80204e43f532a399697b4131441d080",
 }

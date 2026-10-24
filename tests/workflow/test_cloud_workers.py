@@ -88,6 +88,7 @@ def test_cloud_start_records_the_printed_address_without_preparing_a_local_workt
         "Never end your turn to wait for an answer: poll the pull request's comments every "
         "three minutes instead." in arguments[3]
     )
+    assert "Owner only: yes or Owner only: no just before those words" in arguments[3]
 
 
 def test_start_and_list_use_the_same_per_ticket_lock_as_local_workers(workflow: Workflow) -> None:

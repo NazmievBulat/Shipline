@@ -11,7 +11,8 @@ The defaults are neutral. The repository is the `repository` Bash reads from
 `origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
 ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
 set-up command, run only when present, is `scripts/setup-worktree`; no runner labels and no
-runner prefix; a quiet cloud worker is woken after 30 minutes.
+runner prefix; a quiet cloud worker is woken after 30 minutes; a question to the owner
+marked `Owner only: no` gets its recommended reply after 15 minutes.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -82,7 +83,12 @@ DEFAULTS: dict[str, Any] = {
     },
     # Minutes without a push or a report after which the tick wakes a cloud worker; 0 never does.
     "cloud_wake_after_minutes": 30,
+    # Minutes a question to the owner marked `Owner only: no` waits before the tick types its
+    # recommended reply; 0 turns that off.
+    "answer_for_owner_after_minutes": 15,
 }
+# The most such a wait may be: a day. Bash would wrap a number far larger.
+MOST_MINUTES = 24 * 60
 
 # `.` and `..` are no owner or name: `repos/../..` would leave the repository's own API.
 _REPOSITORY = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
@@ -151,6 +157,7 @@ class Config:
     labels: Labels
     runner: Runner
     cloud_wake_after_minutes: int
+    answer_for_owner_after_minutes: int
     # The file as it was read, without the defaults: `{}` when there is none.
     given: dict[str, Any]
     main: Path
@@ -203,17 +210,21 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
             merged[key] = default
         elif isinstance(default, dict):
             merged[key] = _merged(default, given[key], name + ".")
-        elif isinstance(default, int):
-            value = given[key]
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ConfigError(f"{FILE}: {name} must be a whole number, not {json.dumps(value)}")
-            merged[key] = value
         elif isinstance(default, list):
             value = given[key]
             if not isinstance(value, list) or not all(
                 isinstance(item, str) and item for item in value
             ):
                 raise ConfigError(f"{FILE}: {name} must be a list of names")
+            merged[key] = value
+        elif isinstance(default, int):
+            value = given[key]
+            # `true` is an int to Python, and no number of minutes.
+            if type(value) is not int or not 0 <= value <= MOST_MINUTES:
+                raise ConfigError(
+                    f"{FILE}: {name} must be a whole number from 0 to {MOST_MINUTES}, "
+                    f"not {json.dumps(value)}"
+                )
             merged[key] = value
         else:
             value = given[key]
@@ -319,6 +330,7 @@ def load(start: Path = HERE) -> Config:
             prefix=values["runner"]["prefix"],
         ),
         cloud_wake_after_minutes=values["cloud_wake_after_minutes"],
+        answer_for_owner_after_minutes=values["answer_for_owner_after_minutes"],
         given=given,
         main=main,
     )
@@ -350,6 +362,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             "prefix": config.runner.prefix,
         },
         "cloud_wake_after_minutes": config.cloud_wake_after_minutes,
+        "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
     }
 
 
@@ -371,6 +384,7 @@ def shell(config: Config) -> str:
         "LABEL_AUDITED": config.labels.audited,
         **{f"PRIORITY_{key.upper()}": value for key, value in config.labels.priority.items()},
         "IDENTITY_FOLDER": config.runner.identity_folder,
+        "ANSWER_FOR_OWNER_AFTER_MINUTES": str(config.answer_for_owner_after_minutes),
         "CONFIG": json.dumps(config.given, separators=(",", ":")),
     }
     lines = [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]

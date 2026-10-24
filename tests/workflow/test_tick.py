@@ -1,6 +1,7 @@
 """`tick` does, every few minutes, the part of the workflow that has one right answer."""
 
 import fcntl
+import json
 from pathlib import Path
 
 import pytest
@@ -948,3 +949,300 @@ def test_words_that_an_instruction_follows_do_not_count(
     workflow.run_script("tick")
 
     assert workflow.is_running(name)
+
+
+# A question to the owner marked `Owner only: no` gets its recommended reply after 15 minutes.
+
+_ASKED_AT = 1_790_000_000
+_OWNER_BOX = "─" * 40 + "\n> \n" + "─" * 40 + "\n  ? for shortcuts\n"
+
+
+def _question(owner_only: str | None = "no", reply: str = "Reply 1 or 2.") -> str:
+    line = "" if owner_only is None else f"Owner only: {owner_only}\n"
+    return (
+        "Should the limit be 500 or 1,000?\n\n"
+        "Recommendation: 1, 500, as the other services use.\n"
+        f"1. 500\n2. 1,000\n{line}{reply}"
+    )
+
+
+def _asks_the_owner(workflow: Workflow, name: str = "ticket-7", message: str = "") -> Path:
+    """`name` ended its turn asking the owner at _ASKED_AT; its stop hook wrote the notes."""
+    workflow.add_worktree(7)
+    workflow.set_draft(7, draft=True)
+    workflow.running(name)
+    message = message or _question()
+    workflow.screen("● " + message.replace("\n", "\n  ") + "\n" + _OWNER_BOX, name)
+    done = workflow.notify(
+        {"hook_event_name": "Stop", "last_assistant_message": message},
+        session=name,
+        env={"WORKFLOW_NOW": str(_ASKED_AT)},
+    )
+    assert done.returncode == 0, done.stderr
+    notes = workflow.notes(7) / name
+    assert notes.with_name(f"{name}.question").exists()
+    return notes
+
+
+def _tick_at(workflow: Workflow, at: int) -> None:
+    done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(at)})
+    assert done.returncode == 0, done.stderr
+
+
+def _replies(workflow: Workflow, name: str = "ticket-7") -> list[str]:
+    return [
+        call.split(" -l ", 1)[1]
+        for call in workflow.calls(f"tmux {name} send-keys -t ={name}: -l ")
+    ]
+
+
+def _answered(workflow: Workflow) -> list[dict[str, object]]:
+    folder = workflow.repo / ".local" / "workflow" / "answered-for-owner.pending"
+    if not folder.exists():
+        return []
+    return [json.loads(event.read_text()) for event in sorted(folder.glob("*.json"))]
+
+
+def _wake_notes(workflow: Workflow) -> list[str]:
+    folder = workflow.repo / ".local" / "workflow" / "stuck.pending"
+    if not folder.exists():
+        return []
+    return sorted(json.loads(event.read_text())["line"] for event in folder.iterdir())
+
+
+@pytest.mark.parametrize("name", ["ticket-7", "review-7", "audit-7"])
+def test_a_question_not_kept_for_the_owner_gets_its_reply_after_15_minutes_and_not_again(
+    workflow: Workflow, name: str
+) -> None:
+    _asks_the_owner(workflow, name)
+
+    _tick_at(workflow, _ASKED_AT + 899)
+    assert _replies(workflow, name) == []
+
+    _tick_at(workflow, _ASKED_AT + 900)
+    _tick_at(workflow, _ASKED_AT + 1080)
+    _tick_at(workflow, _ASKED_AT + 7200)
+
+    assert _replies(workflow, name) == ["1"]
+    assert workflow.calls(f"tmux {name} send-keys")[-1].endswith(" Enter")
+    assert f'answered for the owner: {name}, "1"' in workflow.wake_log.read_text()
+    assert _answered(workflow) == [{"name": name, "reply": "1", "at": _ASKED_AT + 900}]
+
+
+def test_the_reply_typed_is_the_recommended_one_in_its_own_words(workflow: Workflow) -> None:
+    _asks_the_owner(
+        workflow, message=_question(reply='Write "merge it" to merge, "wait" to leave it.')
+    )
+
+    _tick_at(workflow, _ASKED_AT + 900)
+
+    assert _replies(workflow) == ["merge it"]
+
+
+def test_a_question_kept_for_the_owner_waits_for_him(workflow: Workflow) -> None:
+    _asks_the_owner(workflow, message=_question("yes"))
+
+    _tick_at(workflow, _ASKED_AT + 900)
+    _tick_at(workflow, _ASKED_AT + 36000)
+
+    assert _replies(workflow) == []
+    assert _answered(workflow) == []
+    assert _wake_notes(workflow) == []
+
+
+def test_a_question_without_the_line_waits_and_is_named_in_the_wake_once(
+    workflow: Workflow,
+) -> None:
+    _asks_the_owner(workflow, message=_question(None))
+
+    _tick_at(workflow, _ASKED_AT + 60)
+    _tick_at(workflow, _ASKED_AT + 900)
+    _tick_at(workflow, _ASKED_AT + 36000)
+
+    assert _replies(workflow) == []
+    assert _wake_notes(workflow) == ["owner question without the Owner only line: ticket-7"]
+
+
+def test_a_question_marked_no_without_a_reply_word_waits_and_is_named_once(
+    workflow: Workflow,
+) -> None:
+    _asks_the_owner(workflow, message=_question(reply="Which one do you prefer?"))
+
+    _tick_at(workflow, _ASKED_AT + 900)
+    _tick_at(workflow, _ASKED_AT + 1800)
+
+    assert _replies(workflow) == []
+    assert _wake_notes(workflow) == ["owner question without a reply word: ticket-7"]
+
+
+def test_the_owners_own_earlier_reply_wins(workflow: Workflow) -> None:
+    _asks_the_owner(workflow)
+    workflow.notify({"hook_event_name": "UserPromptSubmit", "prompt": "2"}, session="ticket-7")
+
+    _tick_at(workflow, _ASKED_AT + 900)
+
+    assert _replies(workflow) == []
+    assert _answered(workflow) == []
+
+
+def test_text_the_owner_has_not_sent_stops_the_reply(workflow: Workflow) -> None:
+    _asks_the_owner(workflow)
+    (workflow.state / "input-ticket-7").write_text("2, but")
+
+    _tick_at(workflow, _ASKED_AT + 900)
+
+    assert _replies(workflow) == []
+    assert (workflow.state / "input-ticket-7").read_text() == "2, but"
+    assert _answered(workflow) == []
+
+
+def test_0_in_the_config_turns_the_replies_off(workflow: Workflow) -> None:
+    _asks_the_owner(workflow, message=_question(None))
+    config = workflow.repo / "shipline.json"
+    config.write_text(
+        json.dumps({**json.loads(config.read_text()), "answer_for_owner_after_minutes": 0})
+    )
+    (workflow.notes(7) / "ticket-7.question").write_text(
+        json.dumps(
+            {
+                "asked": (workflow.notes(7) / "ticket-7.asking").read_text().strip(),
+                "owner_only": "no",
+                "reply": "1",
+            }
+        )
+    )
+
+    _tick_at(workflow, _ASKED_AT + 36000)
+
+    assert _replies(workflow) == []
+    assert _answered(workflow) == []
+
+
+def test_a_longer_wait_in_the_config_is_kept(workflow: Workflow) -> None:
+    _asks_the_owner(workflow)
+    config = workflow.repo / "shipline.json"
+    config.write_text(
+        json.dumps({**json.loads(config.read_text()), "answer_for_owner_after_minutes": 60})
+    )
+
+    _tick_at(workflow, _ASKED_AT + 3599)
+    assert _replies(workflow) == []
+    _tick_at(workflow, _ASKED_AT + 3600)
+
+    assert _replies(workflow) == ["1"]
+
+
+@pytest.mark.parametrize("case", ["permission prompt", "usage limit", "busy", "codex"])
+def test_a_session_on_a_prompt_the_limit_at_work_or_a_bridge_gets_no_reply(
+    workflow: Workflow, case: str
+) -> None:
+    notes = _asks_the_owner(workflow)
+    if case == "permission prompt":
+        workflow.screen(
+            "● Bash(git push)\n\n│ Bash command\n│ Do you want to proceed?\n│ ❯ 1. Yes\n",
+            "ticket-7",
+        )
+    elif case == "usage limit":
+        workflow.screen(
+            "● Waiting.\n  ⎿  You've hit your session limit · resets 4pm\n" + _OWNER_BOX,
+            "ticket-7",
+        )
+    elif case == "busy":
+        notes.with_name("ticket-7.idle").unlink()
+    else:
+        notes.with_name("ticket-7.codex").touch()
+
+    workflow.run_script("tick", env={"WORKFLOW_NOW": str(_ASKED_AT + 900)})
+
+    assert _replies(workflow) == []
+    assert _answered(workflow) == []
+
+
+def test_a_reply_that_could_not_be_typed_is_tried_again(workflow: Workflow) -> None:
+    _asks_the_owner(workflow)
+    (workflow.state / "send-keys-fails").touch()
+    done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_ASKED_AT + 900)})
+    assert done.returncode != 0
+    assert _answered(workflow) == []
+
+    (workflow.state / "send-keys-fails").unlink()
+    _tick_at(workflow, _ASKED_AT + 1080)
+
+    assert _replies(workflow)[-1] == "1"
+    assert workflow.calls("tmux ticket-7 send-keys")[-1].endswith(" Enter")
+    assert len(_answered(workflow)) == 1
+
+
+def test_the_same_question_asked_again_after_the_answer_waits_and_a_new_one_does_not(
+    workflow: Workflow,
+) -> None:
+    _asks_the_owner(workflow)
+    _tick_at(workflow, _ASKED_AT + 900)
+    assert _replies(workflow) == ["1"]
+
+    def asked_again(message: str, at: int) -> None:
+        # The typed reply reached the session as a prompt; it asked again later.
+        workflow.notify({"hook_event_name": "UserPromptSubmit", "prompt": "1"}, session="ticket-7")
+        done = workflow.notify(
+            {"hook_event_name": "Stop", "last_assistant_message": message},
+            session="ticket-7",
+            env={"WORKFLOW_NOW": str(at)},
+        )
+        assert done.returncode == 0, done.stderr
+
+    asked_again(_question(), _ASKED_AT + 1000)
+    _tick_at(workflow, _ASKED_AT + 1000 + 3600)
+    assert _replies(workflow) == ["1"]
+
+    asked_again(_question(reply="Reply 2 or 1."), _ASKED_AT + 5000)
+    _tick_at(workflow, _ASKED_AT + 5000 + 900)
+
+    assert _replies(workflow) == ["1", "2"]
+
+
+def test_an_old_message_of_the_tick_left_in_the_box_is_not_sent_for_the_reply(
+    workflow: Workflow,
+) -> None:
+    notes = _asks_the_owner(workflow)
+    status = "Status check: if what you were waiting for is done, carry on."
+    notes.with_name("ticket-7.typed").write_text(status)
+    (workflow.state / "input-ticket-7").write_text(status)
+
+    _tick_at(workflow, _ASKED_AT + 900)
+
+    assert workflow.calls("tmux ticket-7 send-keys") == []
+    assert (workflow.state / "input-ticket-7").read_text() == status
+    assert _answered(workflow) == []
+    assert notes.with_name("ticket-7.answered-for-owner").exists() is False
+
+
+def test_a_reply_the_tick_typed_but_could_not_send_is_sent_at_the_next_tick(
+    workflow: Workflow,
+) -> None:
+    notes = _asks_the_owner(workflow)
+    notes.with_name("ticket-7.typed").write_text("1")
+    (workflow.state / "input-ticket-7").write_text("1")
+
+    _tick_at(workflow, _ASKED_AT + 900)
+
+    assert workflow.calls("tmux ticket-7 send-keys")[-1].endswith(" Enter")
+    assert (workflow.state / "input-ticket-7").read_text() == ""
+    assert len(_answered(workflow)) == 1
+
+
+@pytest.mark.parametrize("answered", ["question dropped", "another question"])
+def test_a_question_answered_or_changed_meanwhile_is_passed_over_quietly(
+    workflow: Workflow, answered: str
+) -> None:
+    """The owner's reply can come between the tick's reading and the session's typing."""
+    notes = _asks_the_owner(workflow)
+    asked = notes.with_name("ticket-7.asking").read_text().strip()
+    if answered == "question dropped":
+        notes.with_name("ticket-7.asking").unlink()
+    else:
+        notes.with_name("ticket-7.asking").write_text(f"{_ASKED_AT + 60} 42\n")
+
+    done = workflow.run("answer-for-owner", "ticket-7", asked)
+
+    assert done.returncode == 3, done.stderr
+    assert workflow.calls("tmux ticket-7 send-keys") == []
