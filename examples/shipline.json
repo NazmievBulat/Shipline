@@ -7,9 +7,14 @@
   },
   "commands": {
     "test": "tools/run-tests",
-    "browser_tests_for_changes": "tools/shipline/browser-tests-for-changes",
+    "browser_tests_for_changes": {
+      "run": "tools/shipline/browser-tests-for-changes",
+      "form": "json",
+      "field": "specs",
+      "args": ["--ci"]
+    },
     "server_tests_for_changes": "tools/shipline/server-tests-for-changes",
-    "pre_train_checks": "tools/shipline/pre-train-checks",
+    "pre_train_checks": {"run": "tools/shipline/pre-train-checks", "form": "exit"},
     "mechanical_conflicts": "tools/shipline/mechanical-conflicts",
     "browser_plan": "tools/shipline/browser-plan",
     "hunt_app": "tools/shipline/hunt-app",

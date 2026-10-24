@@ -37,6 +37,7 @@ which prints `SHIPLINE_<KEY>=value` lines quoted for `eval`, the file itself amo
 read the JSON with the same defaults.
 """
 
+import ast
 import errno
 import fnmatch
 import glob
@@ -444,18 +445,18 @@ def _generated_no_links(root: Path, path: Path) -> None:
 @dataclass(frozen=True)
 class Commands:
     # Each None when the file names none.
-    test: str | None
-    browser_tests_for_changes: str | None
-    server_tests_for_changes: str | None
-    pre_train_checks: str | None
-    mechanical_conflicts: str | None
-    browser_plan: str | None
-    hunt_app: str | None
-    hunt_browser: str | None
-    hunt_cursor: str | None
-    advisory_watch: str | None
-    push_checkout: str | None
-    push_checks: str | None
+    test: str | dict[str, Any] | None
+    browser_tests_for_changes: str | dict[str, Any] | None
+    server_tests_for_changes: str | dict[str, Any] | None
+    pre_train_checks: str | dict[str, Any] | None
+    mechanical_conflicts: str | dict[str, Any] | None
+    browser_plan: str | dict[str, Any] | None
+    hunt_app: str | dict[str, Any] | None
+    hunt_browser: str | dict[str, Any] | None
+    hunt_cursor: str | dict[str, Any] | None
+    advisory_watch: str | dict[str, Any] | None
+    push_checkout: str | dict[str, Any] | None
+    push_checks: str | dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -519,10 +520,23 @@ class Config:
         line = getattr(self.commands, name)
         if line is None:
             return None
-        words = _words(line, name)
-        script = _script(words)
-        if script is not None:
-            words[script] = str(self.main / words[script])
+        entry = line if isinstance(line, dict) else {"run": line, "form": "lines"}
+        if entry["form"] == "functions":
+            words = [str(self.main / entry["run"])]
+        else:
+            words = _words(entry["run"], name)
+            script = _script(words)
+            if script is not None:
+                words[script] = str(self.main / words[script])
+        words += entry.get("args", [])
+        if entry["form"] in ("functions", "json"):
+            # The same argv works for the gate, shell callers and the launcher. Conversion
+            # runs inside the existing caller's command timeout and process group.
+            return [
+                sys.executable,
+                str(Path(__file__).with_name("workflow_commands.py")),
+                "--repository-command", name, json.dumps(entry), *words,
+            ]
         return words
 
     def words(self, line: str) -> list[str]:
@@ -602,6 +616,8 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
         name = where + key
         if key not in given:
             merged[key] = default
+        elif where == "commands." and isinstance(given[key], dict):
+            merged[key] = _command_entry(given[key], key)
         elif name == "machines":
             merged[key] = _machines(given[key])
         elif name == "hunts.areas":
@@ -734,6 +750,100 @@ def _relative(value: str, name: str) -> str:
     return value
 
 
+# Each command keeps its documented answer; a form only translates how it is obtained.
+_FUNCTIONS = {
+    "mechanical_conflicts": {"resolve", "renumber", "taken"},
+    "advisory_watch": {"unreachable", "answers"},
+    "push_checkout": {"install", "refusal"},
+    "browser_plan": {"browser_plan"},
+}
+_EXIT_COMMANDS = {
+    "test", "pre_train_checks", "hunt_app", "hunt_browser", "hunt_cursor", "push_checks",
+}
+_SERVER_FIELDS = {"whole", "tests", "total", "reasons"}
+
+
+def _command_entry(entry: dict[str, Any], name: str) -> dict[str, Any]:
+    where = f"commands.{name}"
+    form = entry.get("form")
+    allowed = {"lines"}
+    if name in _EXIT_COMMANDS:
+        allowed.add("exit")
+    if name in _FUNCTIONS:
+        allowed.add("functions")
+    if name in ("browser_tests_for_changes", "server_tests_for_changes"):
+        allowed.add("json")
+    if not isinstance(form, str) or form not in allowed:
+        raise ConfigError(f"{FILE}: {where} does not support form {form!r}")
+    keys = {"run", "form", "args"}
+    if form == "functions":
+        keys.add("functions")
+    elif form == "json":
+        keys.add("field" if name == "browser_tests_for_changes" else "fields")
+    unknown = sorted(set(entry) - keys)
+    if unknown:
+        raise ConfigError(f"{FILE}: unknown key {where}.{unknown[0]}")
+    line = entry.get("run")
+    if not isinstance(line, str) or not line.strip():
+        raise ConfigError(f"{FILE}: {where}.run must be a command")
+    args = entry.get("args", [])
+    if not isinstance(args, list) or not all(
+        isinstance(word, str) and "\0" not in word for word in args
+    ):
+        raise ConfigError(f"{FILE}: {where}.args must be a list of words")
+    if form == "functions":
+        _relative(line, where)
+        functions = entry.get("functions")
+        if (
+            not isinstance(functions, dict)
+            or set(functions) != _FUNCTIONS[name]
+            or not all(
+                isinstance(value, str) and value.isidentifier() for value in functions.values()
+            )
+        ):
+            raise ConfigError(
+                f"{FILE}: {where}.functions must map "
+                f"{', '.join(sorted(_FUNCTIONS[name]))} to function names"
+            )
+        if args:
+            raise ConfigError(f"{FILE}: {where}.args is only for command lines")
+    elif form == "json":
+        if name == "browser_tests_for_changes":
+            field = entry.get("field")
+            if not isinstance(field, str) or not field:
+                raise ConfigError(f"{FILE}: {where}.field must name the specs field")
+        else:
+            fields = entry.get("fields")
+            if (
+                not isinstance(fields, dict)
+                or set(fields) != _SERVER_FIELDS
+                or not all(isinstance(value, str) and value for value in fields.values())
+            ):
+                raise ConfigError(
+                    f"{FILE}: {where}.fields must map whole, tests, total, reasons to field names"
+                )
+    if form != "functions" and name != "test":
+        _words(line, name)
+    return entry.copy()
+
+
+def _function_file(main: Path, name: str, entry: dict[str, Any]) -> None:
+    # Parse, never import: configuration is also read in planning and shadow runs.
+    where = f"{FILE}: commands.{name}"
+    path = main / entry["run"]
+    try:
+        path.resolve().relative_to(main.resolve())
+        tree = ast.parse(path.read_bytes(), filename=entry["run"])
+    except (OSError, SyntaxError, ValueError):
+        raise ConfigError(
+            f"{where} cannot read a Python module inside the checkout: {entry['run']}"
+        ) from None
+    defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    for function in entry["functions"].values():
+        if function not in defined:
+            raise ConfigError(f"{where} module does not define function {function}")
+
+
 def _words(line: str, name: str) -> list[str]:
     """A command line split into words as the shell splits them, with nothing expanded."""
     where = f"commands.{name}"
@@ -741,6 +851,8 @@ def _words(line: str, name: str) -> list[str]:
         words = shlex.split(line)
     except ValueError as error:
         raise ConfigError(f"{FILE}: {where} cannot be split into words: {error}") from None
+    if not words or not words[0] or any("\0" in word for word in words):
+        raise ConfigError(f"{FILE}: {where} must be a command")
     script = _script(words)
     if script is not None:
         _relative(words[script], where)
@@ -892,8 +1004,14 @@ def load(start: Path | None = None) -> Config:
     if "labels" not in given.get("runner", {}) and label is not None:
         labels = runner_labels(label, planner_label)
     for name in RUN_AS_WORDS:
-        if values["commands"][name] is not None:
-            _words(values["commands"][name], name)
+        entry = values["commands"][name]
+        if isinstance(entry, dict):
+            if entry["form"] == "functions":
+                _function_file(main, name, entry)
+            else:
+                _words(entry["run"], name)
+        elif entry is not None:
+            _words(entry, name)
     refresh = Refresh(tuple(values["refresh"]["clear_generated"]))
     if refresh.clear_generated:
         refresh.targets(main)

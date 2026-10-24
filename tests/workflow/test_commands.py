@@ -51,7 +51,7 @@ _COMMANDS = (
 )
 
 
-def _configure(workflow: Workflow, **commands: str | None) -> None:
+def _configure(workflow: Workflow, **commands: str | dict | None) -> None:
     """Names `commands` in the main checkout's `shipline.json`; None leaves one out. Git looks
     past the changed file, so a gate that runs in the main checkout finds it clean."""
     path = workflow.repo / "shipline.json"
@@ -1314,7 +1314,7 @@ def test_function_browser_plan_reads_byte_paths(workflow: Workflow, path: str, n
         "run": module, "form": "functions", "functions": {"browser_plan": "browser_needed"},
     })
     _changes(workflow, path)
-    assert _browser_needed(workflow).strip() == str(needed)
+    assert _browser_needed(workflow) == ("needed" if needed else "none")
 
 
 def test_function_browser_plan_preserves_non_utf8_paths(workflow: Workflow) -> None:
@@ -1416,3 +1416,106 @@ def test_missing_function_is_refused_without_executing_the_module(workflow: Work
     with pytest.raises(workflow_config.ConfigError, match="commands.advisory_watch.*missing"):
         workflow_config.load(workflow.repo)
     assert not (workflow.repo / "executed").exists()
+
+
+def test_test_command_object_keeps_shell_semantics_and_literal_leading_args(workflow: Workflow) -> None:
+    _stand_in(workflow, "example-tests", "suite output\n", status=4)
+    _configure(workflow, test={
+        "run": "EXAMPLE_MODE=check example-tests", "form": "exit", "args": ["two words"],
+    })
+    done = subprocess.run(
+        ["python3", str(workflow.script.parent / "ci_proof.py"), "test", "--quiet"],
+        cwd=workflow.repo, env=workflow.env, input="", capture_output=True, text=True,
+        timeout=30, check=False,
+    )
+    assert done.returncode == 4, done.stderr
+    assert done.stdout == "suite output\n"
+    assert "example-tests two words --quiet" in workflow.calls("example-tests")[0]
+
+
+@pytest.mark.parametrize("answer", [
+    '{"all": "yes", "selected": [], "count": 0, "why": []}',
+    '{"all": false, "selected": "tests/test_a.py", "count": 0, "why": []}',
+    '{"all": false, "selected": [], "count": true, "why": []}',
+    '{"all": false, "selected": [], "count": -1, "why": []}',
+    '{"all": false, "selected": [], "count": 0, "why": [1]}',
+])
+def test_bad_server_json_is_a_failure(workflow: Workflow, answer: str) -> None:
+    install_shipline(workflow)
+    _stand_in(workflow, "example-server-tests", answer)
+    _configure(workflow, server_tests_for_changes={
+        "run": "example-server-tests", "form": "json",
+        "fields": {"whole": "all", "tests": "selected", "total": "count", "reasons": "why"},
+    })
+    done = workflow.shipline("server-tests-for-changes", "origin/main")
+    assert done.returncode != 0
+    assert "server_tests_for_changes" in done.stderr
+
+
+def test_json_selector_failure_preserves_its_output_and_status(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    _stand_in(workflow, "example-browser-tests", "selection failed\n", status=7)
+    _configure(workflow, browser_tests_for_changes={
+        "run": "example-browser-tests", "form": "json", "field": "specs",
+    })
+    done = workflow.shipline("browser-tests-for-changes", "origin/main")
+    assert done.returncode == 7
+    assert done.stdout == "selection failed\n"
+
+
+@pytest.mark.parametrize("result", ["None", "'none'", "1"])
+def test_function_browser_plan_invalid_return_never_skips_tests(workflow: Workflow, result: str) -> None:
+    module = _module(workflow, f'def browser_needed(changed):\n    return {result}\n')
+    _configure(workflow, browser_plan={
+        "run": module, "form": "functions", "functions": {"browser_plan": "browser_needed"},
+    })
+    _changes(workflow, "web/example.ts")
+    assert _browser_needed(workflow) == "needed"
+
+
+def test_function_module_cannot_escape_the_main_checkout(workflow: Workflow) -> None:
+    outside = workflow.root / "outside.py"
+    outside.write_text("def browser_needed(changed):\n    return False\n")
+    module = _module(workflow, "")
+    path = workflow.repo / module
+    path.unlink()
+    path.symlink_to(outside)
+    _configure(workflow, browser_plan={
+        "run": module, "form": "functions", "functions": {"browser_plan": "browser_needed"},
+    })
+    with pytest.raises(workflow_config.ConfigError, match="commands.browser_plan"):
+        workflow_config.load(workflow.repo)
+
+
+@pytest.mark.parametrize("form", ["json", "functions"])
+def test_argument_only_calls_finish_with_standard_input_still_open(workflow: Workflow, form: str) -> None:
+    if form == "json":
+        workflow.fake("example-selection", '#!/bin/bash\necho \'{"specs": []}\'\n')
+        name, arguments = "browser_tests_for_changes", ["origin/main"]
+        entry = {"run": "example-selection", "form": "json", "field": "specs"}
+    else:
+        module = _module(workflow, '''
+            def unreachable(output):
+                return None
+            def answers(service):
+                return True
+        ''', "advisories")
+        name, arguments = "advisory_watch", ["answers", "example-service"]
+        entry = {"run": module, "form": "functions", "functions": {
+            "unreachable": "unreachable", "answers": "answers",
+        }}
+    _configure(workflow, **{name: entry})
+    words = workflow_config.load(workflow.repo).command(name)
+    process = subprocess.Popen(
+        [*words, *arguments], cwd=workflow.repo, env=workflow.env,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        # Do not close stdin until the call exits: these calls take only argv arguments.
+        assert process.wait(timeout=10) == 0
+        output, error = process.communicate(timeout=10)
+        assert output == "", error
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=10)

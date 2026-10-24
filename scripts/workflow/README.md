@@ -102,7 +102,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `hunts.areas` | the areas of the application two hunts may keep to at once: an object of each area's name (small letters, digits and dashes) to its screens, paths starting with `/` without a space, comma, quotation mark, dollar, backtick or backslash | none: one hunt runs at a time, on every screen |
 | `hunts.plans` | the repository's file of hunt plans, which the sentence of a hunt with a plan names | none: the sentence names no file |
 | `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
-| `commands.*`, the others | the repository's own commands Shipline calls, each split into words (below) | none |
+| `commands.*`, the others | the repository's own commands and answer forms Shipline calls (below) | none |
 | `review.high_effort_paths` | regular expressions searched for in every path a pull request changes, both sides of a rename or deletion; a match runs its independent reviewer at high effort, not medium (`review-effort N`): stored data, text sent to a model, background work, locks and queues, account boundaries and security | none: only Shipline's own concurrent scripts and a description with the line `Review: high` |
 | `answer_for_owner_after_minutes` | how long a question to the owner marked `Owner only: no` waits before the tick types its recommended reply (see `RULES.md`, "Asking the owner"); `0` turns that off, and it is at most `1440`, a day | `15` |
 | `cloud_wake_after_minutes` | the minutes without a push or a report after which the tick wakes a cloud worker by typing into its session; `0` never does | `30` |
@@ -171,13 +171,92 @@ The merge gate keeps the outage an advisory watch found in its state folder:
 first push of an outage and removed when a push succeeds or the tick finds the service
 answering, and `advisory-service.pending`, the line the wake tells once.
 
-A command reads nothing but what is given on its standard input. Files a repository kept beside
-the scripts before these commands existed, `scripts/workflow/pre-train-checks`,
-`advisory_service.py`, `pushing_checkout.py`, `mechanical_conflicts.py`,
-`server_tests_for_changes.py`, `browser_tests_for_changes.py` and `scripts/e2e-plan.py`, are no
-longer read: each becomes a command named here, which answers in the form above. Its program now
-lives in the main checkout whichever worktree runs it, so one that reads the change finds the
-checkout from the folder it runs in (`git rev-parse --show-toplevel`), not from its own path.
+Each entry may instead be an object with `run` and `form`. Plain strings keep the documented
+answers above. `run` is split and located as above; optional `args` is a list of literal words
+added after `run`'s words and before Shipline's arguments. No shell expands those words.
+`commands.test` keeps its existing shell command semantics, including when written as an
+object; its `args` are still literal words passed before the job's arguments.
+
+| Form | Commands | Meaning |
+| --- | --- | --- |
+| `lines` | any | The documented answer, passed through unchanged (including the server selector's JSON). |
+| `exit` | `test`, `pre_train_checks`, `hunt_app`, `hunt_browser`, `hunt_cursor`, `push_checks` | The documented output and exit code, passed through unchanged. |
+| `functions` | `mechanical_conflicts`, `advisory_watch`, `push_checkout`, `browser_plan` | `run` is a Python file; `functions` maps the calls below to its function names. |
+| `json` | `browser_tests_for_changes` | `field` names the JSON object's list of spec paths, printed one a line. |
+| `json` | `server_tests_for_changes` | `fields` maps all four documented keys (`whole`, `tests`, `total`, `reasons`) to keys in the script's JSON object. |
+
+For example, existing selectors may print differently named JSON keys or require leading
+arguments, while checks keep their exit code:
+
+```json
+{
+  "commands": {
+    "browser_tests_for_changes": {
+      "run": "tools/select-browser", "form": "json", "field": "specs", "args": ["--ci"]
+    },
+    "server_tests_for_changes": {
+      "run": "python3 tools/select-server.py", "form": "json",
+      "fields": {"whole": "all", "tests": "selected", "total": "count", "reasons": "why"}
+    },
+    "pre_train_checks": {"run": "tools/check-change", "form": "exit"},
+    "hunt_app": {"run": "tools/hunt-app", "form": "exit"},
+    "hunt_browser": {"run": "node tools/hunt-browser.mjs", "form": "exit"},
+    "browser_plan": {"run": "tools/browser-plan", "form": "lines"}
+  }
+}
+```
+
+A function form needs no command-line entry point or adapter in the repository:
+
+```json
+{
+  "commands": {
+    "mechanical_conflicts": {
+      "run": "tools/conflicts.py", "form": "functions",
+      "functions": {"resolve": "resolve", "renumber": "renumber_files", "taken": "taken_files"}
+    },
+    "advisory_watch": {
+      "run": "tools/advisories.py", "form": "functions",
+      "functions": {"unreachable": "unreachable", "answers": "answers"}
+    },
+    "push_checkout": {
+      "run": "tools/checkout.py", "form": "functions",
+      "functions": {"install": "install_changed", "refusal": "refusal"}
+    },
+    "browser_plan": {
+      "run": "tools/plan.py", "form": "functions",
+      "functions": {"browser_plan": "browser_needed"}
+    }
+  }
+}
+```
+
+The complete function maps and their arguments are:
+
+| Command | Map keys | Python arguments |
+| --- | --- | --- |
+| `mechanical_conflicts` | `resolve`, `renumber`, `taken` | `(head: str, main: str)` |
+| `advisory_watch` | `unreachable`, `answers` | `(output: str)` for unreachable; `(service: str)` for answers |
+| `push_checkout` | `install`, `refusal` | `(checkout: Path)` for install; `(output: str, checkout: Path)` for refusal |
+| `browser_plan` | `browser_plan` | `(changed: list[bytes])`, decoded from the NUL-separated input without losing path bytes |
+
+Shipline imports the module in a separate Python process in the caller's worktree, with the
+module's own folder first on `sys.path` so its sibling imports work. `run` names only the file,
+without an interpreter or arguments. Mapped functions must be synchronous functions defined at
+the module's top level; configuration loading parses the file without executing it, refusing a
+missing function or unsupported form with the command's name.
+
+A list return prints one entry a line; a mapping prints `<old> <new>` lines; a string prints
+itself; `None` and booleans print nothing. `answers` exits 0 for a true answer and non-zero for
+`None` or `False`. `install` treats a returned string as a failure reason and exits non-zero;
+`None` means success. `browser_plan` requires a bool and prints `needed` for `True`, `none` for
+`False`. An exception exits non-zero with its message on standard error. Python diagnostic
+prints go to standard error, leaving the return value as the answer. Invalid selector JSON or
+fields fail the call rather than selecting no tests.
+
+A command reads nothing but what is given on its standard input. Programs and modules live in
+the main checkout whichever worktree runs them, so one that reads the change finds the checkout
+from the folder it runs in (`git rev-parse --show-toplevel`), not from its own path.
 
 # A shadow run
 
