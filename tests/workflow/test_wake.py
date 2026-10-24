@@ -1162,3 +1162,23 @@ def test_an_answer_the_wake_could_not_send_is_sent_later(day: Workflow) -> None:
 
     assert '\nanswered for the owner: review-7, "1" (14:00)\n' in day.sent()[-1]
     assert not list((day.repo / ".local/workflow/answered-for-owner.pending").iterdir())
+
+
+
+def test_a_prefix_queue_warning_is_told_once_and_kept_until_delivery(night: Workflow) -> None:
+    night.orchestrator("busy")
+    pending = night.repo / ".local/workflow/prefix-queues.pending"
+    pending.mkdir(parents=True)
+    event = pending / "100-2.json"
+    line = "scratch run 100 attempt 2 has a job queued past 20 minutes; still waiting"
+    event.write_text(json.dumps({"line": line}))
+    (night.state / "send-fails").touch()
+    assert _wake(night, at=_at(12, 0)).returncode == 1
+    assert event.exists()
+    (night.state / "send-fails").unlink()
+    assert _wake(night, at=_at(12, 5)).returncode == 0
+    assert _wake(night, at=_at(12, 10)).returncode == 0
+    assert len(night.sent()) == 2
+    assert f"\n{line}\n" in night.sent()[-1]
+    assert not event.exists()
+    assert (pending.with_name("prefix-queues.sent") / event.name).exists()
