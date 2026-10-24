@@ -65,6 +65,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import workflow_config
+
 HOME = Path(__file__).resolve().parents[2]
 NOTES = HOME / ".local" / "shipline"
 FETCH_EVERY_SECONDS = 10 * 60
@@ -389,13 +391,15 @@ def register_locks() -> None:
     if common is None:
         return
     main = common.parent if common.name == ".git" else repository.resolve()
-    state = ".local/workflow"
-    try:
-        given = json.loads((main / "shipline.json").read_text()).get("state_folder", state)
-        if isinstance(given, str) and given and not given.startswith("/") and ".." not in given:
-            state = given
-    except OSError, ValueError, AttributeError:
-        pass
+    # The state folder alone, from the file the tick reads: a key only a newer Shipline knows
+    # must not stop the update that brings it. A file that cannot be read, or a state folder
+    # that is no path in the checkout, stops the update before it could move an unrecorded
+    # gate's files.
+    document = workflow_config.read_config(main)
+    with workflow_config._file_errors(document.path):
+        only = {key: document.given[key] for key in ("state_folder",) if key in document.given}
+        given = workflow_config._merged({"state_folder": ".local/workflow"}, only, "")
+        state = workflow_config._relative(given["state_folder"], "state_folder")
     known = (NOTES / "locks").read_text().splitlines() if (NOTES / "locks").exists() else []
     wanted = [str(common / "shipline-tick.lock"), str(main / state / "merge.lock")]
     wanted = [path for path in wanted if "\n" not in path and path not in known]
@@ -731,7 +735,7 @@ def main() -> int:
         if len(arguments) == 3 and arguments[0] == "gate" and re.fullmatch(r"-?[0-9]+", arguments[1]):
             gate_ran(int(arguments[1]), arguments[2])
             return 0
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except (OSError, subprocess.TimeoutExpired, workflow_config.ConfigError) as error:
         print(f"shipline self-update: {error}", file=sys.stderr)
         return 1
     except Exception as error:
