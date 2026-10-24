@@ -90,11 +90,13 @@ _DEFAULTS = {
             "hunt_cursor",
             "advisory_watch",
             "push_checkout",
+            "push_checks",
         )
     },
     "review": {"high_effort_paths": []},
     "answer_for_owner_after_minutes": 15,
     "cloud_wake_after_minutes": 30,
+    "cloud_pre_push": {"suites": {}},
 }
 
 
@@ -294,8 +296,8 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
     example = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
 
     def keys(value: Any, prefix: str = "") -> set[str]:
-        # The hunt areas are named by the repository, not by Shipline.
-        if not isinstance(value, dict) or prefix == ".hunts.areas":
+        # The hunt areas and the suites are named by the repository, not by Shipline.
+        if not isinstance(value, dict) or prefix in (".hunts.areas", ".cloud_pre_push.suites"):
             return {prefix}
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 
@@ -1192,7 +1194,8 @@ def _texts_sent_to_models(workflow: Workflow, high: str = "priority:+high") -> d
 # the cloud worker's since it is told never to end a turn to wait for an answer.
 _TEXTS_BEFORE = {
     "worker": "325cbf877af37ce9da33010ca5fadb43199e42a93e78235e72d234068a61438c",
-    "cloud": "a331c8a4ccec16eeaf7cf29fc4b5177e6ef0c6e9ef2efc0edb924ad8ce8f90a7",
+    # Since it tells a cloud worker to push as one, so its push runs CI's tests.
+    "cloud": "cd523614cb42d86a5f7b72324e18f0cd0aca26721968201015b5610c5db7252f",
     "review": "ea932fce613e8e9c075daa884a2adee29b64ee5610f1fcd922f27aa6cd39c49a",
     "wake": "af21558438c99d72e165c8fb8ab4febdd80204e43f532a399697b4131441d080",
 }
