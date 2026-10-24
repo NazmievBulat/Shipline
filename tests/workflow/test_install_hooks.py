@@ -5,7 +5,15 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from workflow_harness import Workflow
+import pytest
+from workflow_harness import Workflow, install_shipline
+
+
+@pytest.fixture
+def workflow(workflow: Workflow) -> Workflow:
+    """Installed from a Shipline checkout of its own, as a repository installs it."""
+    install_shipline(workflow)
+    return workflow
 
 
 def _settings_file(workflow: Workflow) -> Path:
@@ -55,27 +63,58 @@ def test_the_hooks_are_added_to_settings_that_do_not_exist_yet(workflow: Workflo
     assert hooks["Notification"][0]["matcher"] == "permission_prompt"
 
 
-def test_each_hook_calls_notify_in_the_main_checkout_with_ten_seconds(workflow: Workflow) -> None:
+def test_each_hook_calls_notify_on_the_main_checkout_with_ten_seconds(workflow: Workflow) -> None:
     workflow.run_script("install-hooks")
 
+    assert workflow.home
+    launcher = workflow.home / "bin" / "shipline"
     for entries in _settings(workflow)["hooks"].values():
         [hook] = entries[0]["hooks"]
         assert hook["type"] == "command"
         assert hook["timeout"] == 10
-        assert str(workflow.repo / "scripts" / "workflow" / "notify") in hook["command"]
+        command = f"bash {launcher} --repo {workflow.repo} notify 2>/dev/null || true"
+        assert hook["command"] == command
 
 
-def test_installed_from_a_worktree_the_hooks_still_call_the_main_checkout(
+def test_installed_from_a_worktree_the_hooks_still_name_the_main_checkout(
     workflow: Workflow,
 ) -> None:
     worktree = workflow.add_worktree(7)
 
-    done = workflow.run_script(str(worktree / "scripts" / "workflow" / "install-hooks"))
+    done = workflow.shipline("install-hooks", cwd=worktree)
 
     assert done.returncode == 0, done.stderr
     [command] = _commands(_settings(workflow), "Stop")
-    assert str(workflow.repo / "scripts" / "workflow" / "notify") in command
+    assert f" --repo {workflow.repo} notify " in command
     assert str(worktree) not in command
+
+
+def test_a_hook_written_when_the_scripts_were_in_the_repository_is_replaced_by_ours(
+    workflow: Workflow,
+) -> None:
+    held = f"bash {workflow.repo}/scripts/workflow/notify 2>/dev/null || true"
+    entry = {"hooks": [{"type": "command", "command": held, "timeout": 10}]}
+    _write_settings(workflow, json.dumps({"hooks": {"Stop": [entry]}}))
+
+    workflow.run_script("install-hooks")
+
+    [command] = _commands(_settings(workflow), "Stop")
+    assert command.endswith(f" --repo {workflow.repo} notify 2>/dev/null || true")
+    assert "scripts/workflow" not in command
+
+
+def test_a_hook_that_calls_a_shipline_checkout_that_moved_is_pointed_at_this_one(
+    workflow: Workflow,
+) -> None:
+    assert workflow.home
+    workflow.run_script("install-hooks")
+    installed = _settings_file(workflow).read_text()
+    _write_settings(workflow, installed.replace(str(workflow.home), "/where/shipline/was"))
+
+    done = workflow.run_script("install-hooks")
+
+    assert done.returncode == 0, done.stderr
+    assert _settings_file(workflow).read_text() == installed
 
 
 def test_the_installed_command_runs_notify_and_never_fails_the_session(workflow: Workflow) -> None:
@@ -215,10 +254,14 @@ def test_the_file_keeps_its_own_indentation(workflow: Workflow) -> None:
 
 
 def test_a_checkout_in_a_folder_with_a_space_gets_a_command_that_runs(workflow: Workflow) -> None:
+    assert workflow.home
     moved = workflow.root / "my code" / "repo"
     moved.parent.mkdir()
     workflow.repo.rename(moved)
     workflow.repo = moved
+    shipline = workflow.root / "my code" / "shipline"
+    workflow.home.rename(shipline)
+    workflow.home = shipline
     workflow.run_script("install-hooks")
     [command] = _commands(_settings(workflow), "Stop")
     (workflow.script.parent / "notify").write_text('cat > "$HOME/received"\n')

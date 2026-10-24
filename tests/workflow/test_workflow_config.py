@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from workflow_harness import Workflow
+from workflow_harness import Workflow, install_shipline
 
 _WORKFLOW = Path(__file__).resolve().parents[2] / "scripts/workflow"
 # Loaded from its file, so the scripts' folder is not put on the path of every other test.
@@ -61,10 +61,26 @@ _DEFAULTS = {
         },
     },
     "runner": {"labels": [], "identity_folder": "~/.config/shipline-runner", "prefix": None},
+    "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
     "machines": [],
     "hunts": {"areas": {}, "plans": None},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
-    "commands": {"test": None},
+    "commands": {
+        name: None
+        for name in (
+            "test",
+            "browser_tests_for_changes",
+            "server_tests_for_changes",
+            "pre_train_checks",
+            "mechanical_conflicts",
+            "browser_plan",
+            "hunt_app",
+            "hunt_browser",
+            "hunt_cursor",
+            "advisory_watch",
+            "push_checkout",
+        )
+    },
     "cloud_wake_after_minutes": 30,
     "answer_for_owner_after_minutes": 15,
 }
@@ -181,6 +197,18 @@ def test_the_runner_prefix_is_read_and_must_be_a_name(tmp_path: Path) -> None:
     _write(repo, {"runner": {"prefix": ""}})
     with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be a name"):
         workflow_config.load(repo)
+
+
+def test_the_test_folders_tools_parity_compares_are_read(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"parity": {"workflow_tests": "app/tests/flow"}})
+
+    parity = workflow_config.load(repo).parity
+    assert (parity.workflow_tests, parity.runner_tests) == ("app/tests/flow", "tests/runner")
+    assert parity.known is None
+
+    _write(repo, {"parity": {"known": "tools/shipline/parity-known.txt"}})
+    assert workflow_config.load(repo).parity.known == "tools/shipline/parity-known.txt"
 
 
 def test_the_machines_are_read_with_their_addresses_and_one_without_is_this_machine(
@@ -392,6 +420,9 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"runner": {"labels": "home"}}', "runner.labels"),
         ('{"state_folder": "/var/workflow"}', "state_folder"),
         ('{"state_folder": "../workflow"}', "state_folder"),
+        ('{"parity": {"workflow_tests": "/srv/tests"}}', "parity.workflow_tests"),
+        ('{"parity": {"runner_tests": "../tests"}}', "parity.runner_tests"),
+        ('{"parity": {"known": "/srv/known.txt"}}', "parity.known"),
         ('{"repositry": "example-owner/example-app"}', "repositry"),
         ('{"checks": {"ci_results": "CI result"}}', "checks.ci_results"),
         ('{"cloud_wake_after_minutes": "30"}', "cloud_wake_after_minutes"),
@@ -939,6 +970,7 @@ def test_python_bash_node_and_jq_read_the_same_values(workflow: Workflow) -> Non
 def test_the_named_labels_are_what_the_tick_starts_by_and_install_timer_creates(
     workflow: Workflow,
 ) -> None:
+    install_shipline(workflow)
     _commit_on_main(
         workflow,
         {"shipline.json": json.dumps({"labels": {"workflow": "shipline", "audited": "checked"}})},
@@ -1143,6 +1175,7 @@ def test_without_a_repository_only_what_needs_one_stops(workflow: Workflow) -> N
     scripts = workflow.repo / "scripts/workflow"
     shell = subprocess.run(
         ["python3", str(scripts / "workflow_config.py"), "shell"],
+        cwd=workflow.repo,
         env=workflow.env,
         capture_output=True,
         text=True,
