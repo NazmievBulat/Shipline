@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+# Read-only for every run; a pull request from a fork gets no secrets either, as GitHub gives
+# `pull_request` runs of forks none.
+permissions:
+  contents: read
+
+# A pull request's newer push cancels its older run. Every commit of main and of the merge queue
+# keeps its own run: the merge gate reads each of them.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tests:
+    name: tests (${{ matrix.shard }} of 4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # The test files, split by their measured time so each shard takes about as long; a new
+      # file is added to the lightest shard (tests/workflow/test_ci.py checks that each file is
+      # in exactly one).
+      matrix:
+        include:
+          - shard: 1
+            files: >-
+              tests/workflow/test_merge_when_current.py
+          - shard: 2
+            files: >-
+              tests/runner/test_layout.py
+              tests/workflow/test_browser_test_slots.py
+              tests/workflow/test_github_identity.py
+              tests/workflow/test_install_hooks.py
+              tests/workflow/test_limit_in_own_words.py
+              tests/workflow/test_merge_driver.py
+              tests/workflow/test_notify.py
+              tests/workflow/test_priority.py
+              tests/workflow/test_session_memory.py
+              tests/workflow/test_session_stop_and_cleanup.py
+              tests/workflow/test_ticket_starts.py
+              tests/workflow/test_train_reads.py
+              tests/workflow/test_usage.py
+              tests/workflow/test_weekly_limit.py
+              tests/workflow/test_workflow_config.py
+              tests/workflow/test_workflow_metrics.py
+          - shard: 3
+            files: >-
+              tests/workflow/test_check_parts.py
+              tests/workflow/test_ci.py
+              tests/workflow/test_cloud_workers.py
+              tests/workflow/test_codex_worker.py
+              tests/workflow/test_conflict_review.py
+              tests/workflow/test_github_budget.py
+              tests/workflow/test_input_box.py
+              tests/workflow/test_install_path.py
+              tests/workflow/test_install_timer.py
+              tests/workflow/test_push_slots.py
+              tests/workflow/test_review_panel.py
+              tests/workflow/test_session_start.py
+              tests/workflow/test_tick_waits.py
+              tests/workflow/test_train_first.py
+              tests/workflow/test_wake.py
+              tests/workflow/test_worker_routing.py
+              tests/workflow/test_workflow_commands.py
+          - shard: 4
+            files: >-
+              tests/workflow/test_checks_finished.py
+              tests/workflow/test_ci_minutes.py
+              tests/workflow/test_independent_review.py
+              tests/workflow/test_lost_check.py
+              tests/workflow/test_merge_train_metrics.py
+              tests/workflow/test_running_command.py
+              tests/workflow/test_session_limit.py
+              tests/workflow/test_session_with_real_tmux.py
+              tests/workflow/test_stand_alone.py
+              tests/workflow/test_test_run.py
+              tests/workflow/test_tick.py
+              tests/workflow/test_tick_limit.py
+              tests/workflow/test_tmp_slots.py
+              tests/workflow/test_weaker_tests.py
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: The tools the scripts call
+        run: |
+          command -v tmux >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq tmux; }
+          for tool in bash git jq tmux node gh openssl; do
+            command -v "$tool" >/dev/null || { echo "missing: $tool"; exit 1; }
+          done
+      # Ubuntu's tmux is built with systemd support: it moves each new pane into a scope of its
+      # own, racing the memory-limited scope a session starts its command in, and the first
+      # session can lose its limit (#41). The tests run the scripts with a tmux built without it.
+      - name: Cache tmux without systemd
+        id: tmux
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/tmux
+          # A new runner image may bring other libraries to link against.
+          key: tmux-3.4-no-systemd-${{ env.ImageOS }}-${{ runner.arch }}
+      - name: Build tmux without systemd
+        if: steps.tmux.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq libevent-dev libncurses-dev
+          curl -fsSL --connect-timeout 20 --max-time 300 -o "$RUNNER_TEMP/tmux.tar.gz" \
+            https://github.com/tmux/tmux/releases/download/3.4/tmux-3.4.tar.gz
+          echo "551ab8dea0bf505c0ad6b7bb35ef567cdde0ccb84357df142c254f35a23e19aa  $RUNNER_TEMP/tmux.tar.gz" |
+            sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/tmux.tar.gz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/tmux-3.4"
+          ./configure --prefix="$HOME/.local/tmux" --disable-systemd
+          make -j4 && make install
+      - name: Use tmux without systemd
+        run: |
+          echo "$HOME/.local/tmux/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/tmux/bin:$PATH"
+          tmux -V
+          if ldd "$(command -v tmux)" | grep -q libsystemd; then echo "tmux uses systemd"; exit 1; fi
+      - name: The test tools
+        run: python -m pip install --require-hashes -r requirements-test.txt
+      - name: Tests
+        run: python -m pytest -rs -n 4 --dist worksteal -m "not serial" ${{ matrix.files }}
+      # The tests that cannot run beside others, one at a time, in one shard.
+      - name: Tests that run alone
+        if: matrix.shard == 1
+        # Exit code 5: none is marked so.
+        run: python -m pytest -rs -p no:xdist -m serial || [ $? -eq 5 ]
+
+  ci:
+    # The check the merge queue requires, by this name.
+    name: CI
+    if: always()
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every shard passed
+        run: test "${{ needs.tests.result }}" = success

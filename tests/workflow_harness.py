@@ -20,6 +20,10 @@ from functools import cache
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "workflow"
+# The command a repository calls Shipline by, `shipline <command>`.
+LAUNCHER = Path(__file__).resolve().parents[1] / "bin" / "shipline"
+# What the scripts read from the rest of a repository, held only as far as the tests read it.
+STAND_INS = Path(__file__).resolve().parent / "workflow" / "stand-ins"
 SESSION_LINK = "https://claude.ai/code/session_01TestLinkForWorkflow"
 
 # A fake outside call whose cancellation is observable independently of runner speed. Its trap
@@ -205,7 +209,7 @@ fi
 # The open pull requests that carry the label, as the JSON GitHub answers with. The script's
 # own filter turns it into lines, as the real `gh` would.
 fields=number,isDraft,baseRefName
-asked="pr list --label workflow --state open --limit 1000 --json $fields --jq ${12}"
+asked="pr list --label $4 --state open --limit 1000 --json $fields --jq ${12}"
 if [ "$*" = "$asked" ] && [ ! -e "@STATE@/fail-gh-list" ]; then
   for listed in "@STATE@"/listing/*; do
     [ -f "$listed" ] || continue
@@ -215,7 +219,7 @@ if [ "$*" = "$asked" ] && [ ! -e "@STATE@/fail-gh-list" ]; then
     base=main
     [ ! -f "@STATE@/base-branch-$number" ] || base=$(cat "@STATE@/base-branch-$number")
     case " $labels " in
-      *" workflow "*) [ "$state" != OPEN ] || echo "$number $draft $base" ;;
+      *" $4 "*) [ "$state" != OPEN ] || echo "$number $draft $base" ;;
     esac
   done | jq --raw-input 'split(" ") | {number: (.[0] | tonumber), isDraft: (.[1] == "true"),
     baseRefName: .[2]}' |
@@ -469,10 +473,33 @@ class Workflow:
     state: Path
     bin: Path
     env: dict[str, str]
+    # Shipline's own checkout, when it is kept apart from the repository (`install_shipline`);
+    # otherwise the scripts are in the repository's `scripts/workflow`.
+    home: Path | None = None
 
     @property
     def script(self) -> Path:
-        return self.repo / "scripts" / "workflow" / "session"
+        return (self.home or self.repo) / "scripts" / "workflow" / "session"
+
+    def shipline(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        stdin: str = "",
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """`shipline <command>` of the separate checkout, as a repository calls it."""
+        assert self.home, "install_shipline first"
+        return subprocess.run(
+            ["bash", str(self.home / "bin" / "shipline"), *args],
+            cwd=cwd or self.repo,
+            env={**self.env, **(env or {})},
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
 
     @property
     def cgroup_root(self) -> Path:
@@ -819,6 +846,9 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
         "WORKFLOW_SWAPS_FILE": str(tmp_path / "proc" / "swaps"),
         "WORKFLOW_LOADAVG_FILE": str(tmp_path / "proc" / "loadavg"),
         "WORKFLOW_CLAUDE_TMP_ROOT": str(tmp_path / "claude-tmp"),
+        # The tick's daily metrics run reads GitHub in the background; a test that wants it names
+        # its time.
+        "WORKFLOW_METRICS_DAILY_AT": "",
     }
     made = Workflow(root=tmp_path, repo=tmp_path / "repo", state=state, bin=bin_folder, env=env)
     made.fake("gh", _FAKE_GH)
@@ -855,6 +885,34 @@ def make_workflow(tmp_path: Path, bin_folder: Path) -> Workflow:
     shutil.copytree(template / "repo", made.repo, symlinks=True)
     made.git("remote", "set-url", "origin", str(origin))
     return made
+
+
+def install_shipline(made: Workflow) -> Path:
+    """Keeps Shipline apart from the repository: a checkout of its own, `shipline` in the test's
+    folder, holding `bin/shipline` and the scripts the repository held, and a repository that
+    no longer holds a `scripts/workflow` (nor the gate's `pre-train-checks`, which were in it).
+    Its setup command and E2E planner stay in its `scripts`. Returns the checkout."""
+    home = made.root / "shipline"
+    held = made.repo / "scripts" / "workflow"
+    shutil.copytree(held, home / "scripts" / "workflow", symlinks=True)
+    (home / "scripts" / "workflow" / "pre-train-checks").unlink()
+    (home / "bin").mkdir()
+    shutil.copy2(LAUNCHER, home / "bin" / "shipline")
+    # A git checkout of its own, so a script that took the repository from its own folder
+    # would work on Shipline instead, and be seen to.
+    env = {**made.env, "GIT_DIR": str(home / ".git"), "GIT_WORK_TREE": str(home)}
+    for args in (
+        ["init", "--quiet", "--initial-branch=main"],
+        ["add", "-A"],
+        ["commit", "--quiet", "-m", "chore: shipline"],
+    ):
+        subprocess.run(["git", *args], cwd=home, env=env, capture_output=True, check=True)
+    made.git("rm", "-r", "--quiet", "scripts/workflow")
+    made.git("commit", "--quiet", "-m", "chore: shipline is called, not held")
+    made.git("push", "--quiet", "origin", "main")
+    shutil.rmtree(held, ignore_errors=True)
+    made.home = home
+    return home
 
 
 @cache
@@ -901,7 +959,12 @@ def _template() -> Path:
     setup.write_text('#!/bin/bash\nexec worktree-setup "$@"\n')
     setup.chmod(0o755)
     # The merge gate asks E2E's planner whether a merge needs browser tests.
-    shutil.copy2(SCRIPTS.parent / "e2e-plan.py", scripts.parent / "e2e-plan.py")
+    shutil.copy2(STAND_INS / "e2e-plan.py", scripts.parent / "e2e-plan.py")
+    # The checks the merge gate runs before a pull request joins the train.
+    shutil.copy2(STAND_INS / "pre-train-checks", scripts / "pre-train-checks")
+    # The prompt a Claude session is woken with when the Codex bridge's `await_turn` ends.
+    (scripts / "tests").mkdir()
+    shutil.copy2(STAND_INS / "await-turn-completed.json", scripts / "tests")
     # These tests drive merge/tick state machines through hundreds of fake reads and hundreds
     # of fake merges, reruns and dispatches. Mock the pacing of both: the mutations' 1 to 1.5 s
     # apart were 486 s of these tests' 4,000 in one measurement. Dedicated helper subprocess tests
@@ -914,14 +977,12 @@ def _template() -> Path:
         assert wait in helper, f"github_budget.py no longer says {wait}"
         helper = helper.replace(wait, wait.split("= ")[0] + "= 0.0" if "=" in wait else "0.0")
     budget_helper.write_text(helper)
+    # The repository `tick` and the Codex worker's `gh` work on.
     runner_settings = repo / ".github" / "runner" / "settings.sh"
     runner_settings.parent.mkdir(parents=True)
-    shutil.copy2(SCRIPTS.parents[1] / ".github" / "runner" / "settings.sh", runner_settings)
-    for name in ("install-github-budget.sh", "github-gh.sh", "github_budget.py"):
-        shutil.copy2(SCRIPTS.parents[1] / ".github/runner" / name, runner_settings.with_name(name))
-    ci_workflow = repo / ".github/workflows/ci.yml"
-    ci_workflow.parent.mkdir(parents=True)
-    shutil.copy2(SCRIPTS.parents[1] / ".github/workflows/ci.yml", ci_workflow)
+    shutil.copy2(STAND_INS / "settings.sh", runner_settings)
+    # The runners the merge gate may re-run failed jobs on: every other value is its default.
+    shutil.copy2(STAND_INS / "shipline.json", repo / "shipline.json")
     (repo / ".gitignore").write_text(".local/\n.claude/\n")
     git("add", "-A")
     git("commit", "--quiet", "-m", "chore: start")
