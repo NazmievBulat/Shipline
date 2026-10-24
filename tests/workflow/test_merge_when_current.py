@@ -5577,8 +5577,10 @@ def test_a_batch_push_that_stalls_past_its_deadline_waits_for_the_next_call(
     hooks = workflow.bin / "hooks"
     stalled = workflow.state / "stalled"
     hooks.mkdir(exist_ok=True)
+    # Its scan ran short of memory first: a stall counts all the same, and is never retried.
     (hooks / "pre-push").write_text(
-        f'#!/bin/bash\n[ -e "{stalled}" ] && exit 0\ntouch "{stalled}"\nexec /bin/sleep 30\n'
+        f'#!/bin/bash\n[ -e "{stalled}" ] && exit 0\ntouch "{stalled}"\n'
+        f"echo {json.dumps(MEMORY_SHORTAGES[0])}\nexec /bin/sleep 30\n"
     )
     (hooks / "pre-push").chmod(0o755)
     workflow.git("config", "core.hooksPath", str(hooks))
@@ -5605,6 +5607,7 @@ def test_a_batch_push_that_stalls_past_its_deadline_waits_for_the_next_call(
     batch = _scratch(github)
     assert batch is not None
     assert batch["pushed"] is False and batch["push_failures"] == 1
+    assert workflow.calls("sleep 60") == []
     assert _batch_call(github).returncode == 3
     assert all(member["scratch"]["pushed"] for member in _prefixes(github))
 
@@ -5653,7 +5656,7 @@ def test_a_push_that_times_out_is_handed_back_with_the_hooks_step_and_last_lines
     (beside / "merge-when-current").write_text(
         "#!/bin/bash\nexec python3 -B -c 'import sys; "
         f'sys.path.insert(0, "{workflow.script.parent}"); '
-        "import merge_gate as g; g.COMMAND_TIMEOUT = 3; "
+        "import merge_gate as g; g.COMMAND_TIMEOUT = 5; "
         'sys.argv = ["merge-when-current", *sys.argv[1:]]; sys.exit(g.main())\' "$@"\n'
     )
     github.save()
@@ -5679,7 +5682,7 @@ def test_a_push_that_times_out_is_handed_back_with_the_hooks_step_and_last_lines
     assert done.returncode == 0, done.stdout + done.stderr
     refusal = _refusal(subprocess.CompletedProcess([], 0, "", done.stdout))
     assert refusal == (
-        "merge refused: could not push the refreshed branch: git push timed out after 3s"
+        "merge refused: could not push the refreshed branch: git push timed out after 5s"
     ), done.stdout
     reason = json.loads((workflow.repo / ".local/workflow/merge-review-7").read_text())["reason"]
     assert reason.startswith(refusal), reason

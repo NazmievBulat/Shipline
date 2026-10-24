@@ -95,8 +95,8 @@ def mechanical_conflicts() -> ModuleType | None:
     return rules
 
 
-# How many of its last lines a failed push is refused with, when the repository words no refusal,
-# and a push that outlasted its deadline.
+# How many of its last lines a failed push is refused with when the repository words no refusal;
+# a push that outlasted its deadline keeps twice as many.
 REFUSAL_LINES = 10
 TIMEOUT_REFUSAL_LINES = 20
 

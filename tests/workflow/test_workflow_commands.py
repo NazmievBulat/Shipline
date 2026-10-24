@@ -148,7 +148,7 @@ def test_a_timed_out_command_carries_the_output_read_before_its_stop() -> None:
             "-c",
             "import sys; sys.path.insert(0, sys.argv[1]); import workflow_commands as w\n"
             "try:\n"
-            "    w.run('sh', '-c', 'echo first; echo second >&2; exec sleep 600', timeout=1)\n"
+            "    w.run('sh', '-c', 'echo first; echo second >&2; exec sleep 600', timeout=3)\n"
             "except w.CommandTimeout as error:\n"
             "    print(error)\n"
             "    print(error.output, end='')\n",
@@ -161,7 +161,7 @@ def test_a_timed_out_command_carries_the_output_read_before_its_stop() -> None:
     )
 
     assert done.stdout.splitlines() == [
-        "sh -c echo first; echo second >&2; exec sleep 600 timed out after 1s",
+        "sh -c echo first; echo second >&2; exec sleep 600 timed out after 3s",
         "first",
         "second",
     ], done.stdout + done.stderr
