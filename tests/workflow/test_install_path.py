@@ -13,12 +13,20 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from test_merge_when_current import (  # noqa: F401  (the gate's stand-in)
+from workflow.test_conflict_review import (  # pyright: ignore[reportPrivateUsage]
+    _folder,
+    _panel_conflict,
+    _resolve,
+)
+from workflow.test_merge_when_current import (  # pyright: ignore[reportPrivateUsage]
     GitHub,
     _two_stale_pulls,
-    github,
 )
+from workflow.test_merge_when_current import github as github_fixture
 from workflow_harness import Workflow, install_shipline, instruction, session_arguments
+
+# The gate's stand-in for GitHub, on the repository with Shipline kept apart (`workflow` below).
+github = github_fixture
 
 _SHIPLINE = Path(__file__).resolve().parents[2]
 _WORKFLOW = _SHIPLINE / "scripts" / "workflow"
@@ -166,7 +174,7 @@ def test_a_repository_without_the_scripts_is_ticked_and_its_ticket_gets_a_sessio
     assert _git(workflow.home, "status", "--porcelain", "--ignored") == ""
 
 
-def test_a_repository_without_the_scripts_passes_the_gate(github: GitHub) -> None:  # noqa: F811
+def test_a_repository_without_the_scripts_passes_the_gate(github: GitHub) -> None:
     workflow = github.workflow
     assert not (workflow.repo / "scripts" / "workflow").exists()
     github.save()
@@ -459,7 +467,7 @@ def _status_check(workflow: Workflow) -> str:
     return typed
 
 
-def _train_wait(github: GitHub) -> str:  # noqa: F811
+def _train_wait(github: GitHub) -> str:
     """The line the gate tells a pull request behind the train's first with."""
     second = _two_stale_pulls(github)
     assert github.run().returncode == 2
@@ -470,7 +478,7 @@ def _train_wait(github: GitHub) -> str:  # noqa: F811
 
 
 def test_each_sentence_is_as_before_with_only_the_command_paths_changed(
-    github: GitHub,  # noqa: F811
+    github: GitHub,
 ) -> None:
     sentences = {"status check": _status_check(github.workflow), "train wait": _train_wait(github)}
 
@@ -508,3 +516,60 @@ def test_the_rules_name_each_command_as_shipline_command() -> None:
         "wake",
         "weaker-tests",
     }
+
+
+def test_a_codex_worker_reaches_the_same_checkout_and_repository(workflow: Workflow) -> None:
+    workflow.add_pull_request(7)
+
+    done = workflow.shipline("session", "start", "worker", "7", "medium", "codex")
+
+    assert done.returncode == 0, done.stderr
+    environment = _environment(workflow, "codex-7")
+    assert environment["SHIPLINE_REPO"] == str(workflow.repo)
+    # Its guarded `gh` first, then `shipline`.
+    assert environment["PATH"].split(":")[:2] == [
+        str(workflow.home / "scripts" / "workflow" / "codex-bin"),
+        str(workflow.home / "bin"),
+    ]
+
+
+def test_notify_and_ticket_files_work_on_the_repository_from_shipline_s_checkout(
+    workflow: Workflow,
+) -> None:
+    worktree = workflow.add_worktree(7)
+    (workflow.state / "body-7").write_text("Change it.\n\n## Files\n\n- `app.txt`\n")
+
+    # As a session runs them in its worktree, the repository in its environment.
+    named = {"SHIPLINE_REPO": str(workflow.repo), "WORKFLOW_SESSION": "ticket-7"}
+    waiting = workflow.shipline("notify", "waiting", env=named, cwd=worktree)
+    files = workflow.shipline("ticket-files", "7", cwd=worktree)
+
+    assert waiting.returncode == 0, waiting.stderr
+    assert (workflow.notes(7) / "ticket-7.waiting").exists()
+    assert files.returncode == 0, files.stderr
+    assert files.stdout == "app.txt\n"
+    assert (workflow.repo / ".local" / "workflow" / "files-7").read_text() == "app.txt\n"
+    assert _git(workflow.home, "status", "--porcelain", "--ignored") == ""
+
+
+def test_a_conflict_review_in_a_repository_without_test_selectors_selects_none(
+    workflow: Workflow,
+) -> None:
+    _panel_conflict(workflow)
+    resolved = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", resolved)
+
+    done = workflow.shipline("review-panel", "7")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    evidence = _folder(workflow) / "reviews" / "7" / resolved
+    assert json.loads((evidence / "server-tests.json").read_text()) == {
+        "whole": True,
+        "tests": [],
+        "total": 0,
+        "reasons": ["no server test selection is configured"],
+    }
+    assert (evidence / "browser-tests.txt").read_text() == ""
+    assert (evidence / "task.md").read_text().endswith(
+        "\nNo browser test selection is configured: CI runs the whole browser suite.\n"
+    )

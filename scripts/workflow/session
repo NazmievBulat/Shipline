@@ -1309,7 +1309,7 @@ start_codex_worker() {
     "$common" "$push_queue" "model_reasoning_effort=$effort" "notify=$config" "$prompt"
   real_gh=$(command -v gh)
   touch "$notes.codex"
-  launch "$codex_name" "$worktree" "$command" "PATH=$script_dir/codex-bin:$PATH" "$name" "WORKFLOW_GH=$real_gh"
+  launch "$codex_name" "$worktree" "$command" "PATH=$script_dir/codex-bin:$shipline_bin$PATH" "$name" "WORKFLOW_GH=$real_gh"
   start_codex_bridge "$name" "$worktree"
 }
 

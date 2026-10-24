@@ -40,10 +40,10 @@ from workflow_commands import (
 )
 
 # The files a repository keeps for the gate are in its own `scripts/workflow`, in its main
-# checkout: the repository Shipline works on, not the checkout these scripts are in. Searched after
-# the scripts' own folder, so none of them stands in for one of the scripts.
+# checkout: the repository Shipline works on, not the checkout these scripts are in. Searched last,
+# so none of them stands in for one of the scripts or for a module of Python's own.
 REPOSITORY_FILES = workflow_config.current().main / "scripts" / "workflow"
-sys.path.insert(1, str(REPOSITORY_FILES))
+sys.path.append(str(REPOSITORY_FILES))
 
 # A repository may hold three helpers there, and the gate uses them when it does:
 # `advisory_service` tells a scan that could not reach a package advisory service, which is a

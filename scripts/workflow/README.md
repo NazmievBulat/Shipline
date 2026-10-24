@@ -19,8 +19,9 @@ outside the repository runs in its main checkout. Every session gets `SHIPLINE_R
 checkout's `bin` in its environment. The files a repository keeps for the gate and the panel
 (`pre-train-checks`, `advisory_service.py`, `pushing_checkout.py`, `run_proof.py`,
 `mechanical_conflicts.py`, `server_tests_for_changes.py`, `browser_tests_for_changes.py`) are
-read from its own `scripts/workflow`, and its E2E planner from `scripts/e2e-plan.py`; the
-gate takes a missing one as none.
+read from its own `scripts/workflow`, and its E2E planner from `scripts/e2e-plan.py`; a
+missing one means none: no check, no helper, no selected test (the panel then notes that CI
+runs the whole suite).
 
 # Workflow workers
 
