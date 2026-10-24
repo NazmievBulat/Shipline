@@ -98,6 +98,7 @@ jobs:
               tests/workflow/test_input_box.py
               tests/workflow/test_install_path.py
               tests/workflow/test_install_timer.py
+              tests/workflow/test_path_filter.py
               tests/workflow/test_push_slots.py
               tests/workflow/test_review_panel.py
               tests/workflow/test_session_start.py
@@ -116,6 +117,7 @@ jobs:
               tests/workflow/test_lost_check.py
               tests/workflow/test_merge_train_metrics.py
               tests/workflow/test_running_command.py
+              tests/workflow/test_session_hunt.py
               tests/workflow/test_session_limit.py
               tests/workflow/test_session_with_real_tmux.py
               tests/workflow/test_stand_alone.py

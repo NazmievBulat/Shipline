@@ -37,6 +37,11 @@ Cloud uses the same screen exclusions as Codex: screen changes and unclear tasks
 with no diff stay with local Claude. Test IDs and data-only route lists retain the
 existing exceptions. A cloud-built ticket returns to the cloud for a fix round,
 even after the default changes, subject to the same screen exclusions.
+A ticket's own record, the single word `cloud`, `claude` or `codex` in
+`.local/workflow/worker-program-N`, overrides the default and these fix-round
+markers for that ticket, under the same screen exclusions; only a cloud
+reservation outranks it. A record holding anything else is read as no record,
+and the wake names it once.
 Independent reviewers always stay local.
 
 Cloud starts bypass the local memory and load checks. The tick waits when the
@@ -82,6 +87,8 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `runner.label` | the label every machine's runners share; main's runners, on the one machine that has them, carry `<label>-main`, which the example workflows name, and the merge line's first member asks for `<label>-first` | `<runner.prefix>-home`; none without a prefix |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
 | `merge.scratch_prefix` | the beginning of the merge gate's scratch branches, ended by `-` or `/`: the gate tests each prefix on one, named by this and 32 hexadecimal digits, and deletes only the branches it named; the example workflows run the gate's dispatches on them on main's runners | `workflow/merge-batch-` |
+| `hunts.areas` | the areas of the application two hunts may keep to at once: an object of each area's name (small letters, digits and dashes) to its screens, paths starting with `/` without a space, comma, quotation mark, dollar, backtick or backslash | none: one hunt runs at a time, on every screen |
+| `hunts.plans` | the repository's file of hunt plans, which the sentence of a hunt with a plan names | none: the sentence names no file |
 | `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
 | `commands.browser` | the command line that runs the repository's browser tests, from the root of its checkout: E2E's `playwright` job runs it (`ci_proof.py browser`), with the job's own arguments after it | none: the browser job fails, saying so |
 

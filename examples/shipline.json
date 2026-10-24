@@ -40,6 +40,13 @@
   "merge": {
     "scratch_prefix": "workflow/merge-batch-"
   },
+  "hunts": {
+    "areas": {
+      "phone": ["/calls", "/contacts"],
+      "billing": ["/invoices", "/settings/billing"]
+    },
+    "plans": "docs/hunt-plans.md"
+  },
   "commands": {
     "test": "tools/run-tests",
     "browser": "tools/run-browser-tests"
