@@ -3240,9 +3240,145 @@ def _suite_state(suite: dict[str, Any]) -> str | None:
     for workflow in _suite_workflows(suite):
         found = _batch_runs(suite, workflow)
         states.append(
-            workflow_verdict(workflow, found[0], jobs(found[0]))[0] if found else "pending"
+            workflow_verdict(workflow, found[0], jobs(found[0]))[0]
+            if found and not _queue_recovery_pending(suite, found[0]) else "pending"
         )
     return "red" if "red" in states else "pending" if "pending" in states else "green"
+
+
+def _queue_recovery_pending(record: dict[str, Any], run: dict[str, Any]) -> bool:
+    entry = record.get("queued_retries", {}).get(str(run["id"]), {})
+    return (
+        entry.get("retry_attempt") == run.get("run_attempt") == 1
+        and entry.get("state") in ("cancel requested", "rerun requested", "rerun refused")
+        and (run.get("status") != "completed" or run.get("conclusion") == "cancelled")
+    )
+
+
+def _queue_warning(folder: Path, run: dict[str, Any], line: str) -> None:
+    name = f"{run['id']}-{run['run_attempt']}.json"
+    pending = folder / "prefix-queues.pending"
+    if (pending / name).exists() or (folder / "prefix-queues.sent" / name).exists():
+        return
+    pending.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=pending, delete=False) as output:
+        json.dump({"line": line}, output)
+    os.replace(output.name, pending / name)
+    wake_log(line)
+
+
+def _queued_prefix(
+    train: Train, record: dict[str, Any], workflow: str, run: dict[str, Any], *, quiet: bool
+) -> None:
+    """Recover only scratch test jobs in the batch lane. Claims live in the saved train,
+    before each mutation, so a restart can finish cancellation without repeating a retry."""
+    label = CONFIG.runner.label
+    attempt = run.get("run_attempt")
+    if (
+        workflow not in ("ci", "e2e")
+        or not label
+        or not record["branch"].startswith(SCRATCH_PREFIX)
+        or run.get("head_branch") != record["branch"]
+        or run.get("head_sha") != record["head"]
+        or run.get("event") != "workflow_dispatch"
+        or type(attempt) is not int
+        or attempt < 1
+    ):
+        return
+    key = str(run["id"])
+    entry = record.get("queued_retries", {}).get(key, {})
+    folder = train.path.parent
+    if entry.get("retry_attempt") == attempt == 1:
+        if entry["state"] == "cancel requested":
+            if run["status"] != "completed":
+                try:
+                    _cancel([run], folder, f"scratch queue recovery on {record['branch']}")
+                finally:
+                    if _planning_reads is not None:
+                        _planning_reads.invalidate()
+                return
+            if run.get("conclusion") == "cancelled":
+                # Claim first: an interrupted request is not sent again. One lost to a GitHub
+                # outage or a stall is: only a fresh read of this cancelled first attempt leads
+                # back here, and a retry GitHub took has made attempt 2.
+                entry["state"] = "rerun requested"
+                train.save()
+                try:
+                    done = command("gh", "run", "rerun", key, "-R", REPOSITORY, check=False)
+                    error = (done.stderr.strip() or done.stdout.strip()) if done.returncode else ""
+                except BudgetWaiting:
+                    entry["state"] = "cancel requested"
+                    train.save()
+                    raise
+                except Refused as failure:
+                    error = str(failure)
+                finally:
+                    if _planning_reads is not None:
+                        _planning_reads.invalidate()
+                if error and transient(error):
+                    entry["state"] = "cancel requested"
+                    train.save()
+                    raise Waiting(f"could not re-run scratch run {key} yet: {error}")
+                if error:
+                    entry["state"] = "rerun refused"
+                    train.save()
+                    _queue_warning(folder, run, f"scratch run {key} queue recovery rerun refused")
+                else:
+                    # Attempt 2 is the same run: a dropped prefix must still be able to cancel it.
+                    (folder / f"cancel-{key}").unlink(missing_ok=True)
+                return
+            # Cancellation lost a race to the run finishing: judge its real result.
+        elif entry["state"] in ("rerun requested", "rerun refused"):
+            return
+    if run.get("status") == "completed":
+        return
+    # Read raw matrix jobs: checks() merges parts and would hide a queued shard's timestamp.
+    parts = api(f"{API}/actions/runs/{key}/jobs?per_page=100", "jobs")
+    queued = [
+        job for job in parts
+        if job.get("status") == "queued"
+        and job.get("run_attempt", attempt) == attempt
+        and (
+            f"{label}-main-batch" in (job.get("labels") or [])
+            or (entry.get("retry_attempt") == 1 and label in (job.get("labels") or []))
+        )
+    ]
+    if not queued:
+        return
+    before = json.dumps(entry, sort_keys=True)
+    record.setdefault("queued_retries", {})[key] = entry
+    observed = entry.setdefault("jobs", {})
+    now = time.time()
+    ages = []
+    for job in queued:
+        identity = f"{attempt}:{job['id']}"
+        stamp = _seconds(job.get("created_at"))
+        # No timestamp is no evidence of an old wait. Persist the first observation instead.
+        since = observed.setdefault(identity, stamp if stamp is not None and stamp <= now else now)
+        ages.append(now - since)
+    limit = CONFIG.merge_train.queued_limit_minutes
+    if max(ages) > limit * 60:
+        if attempt == 1 and "retry_attempt" not in entry:
+            entry.update(state="cancel requested", retry_attempt=1)
+            train.save()
+            try:
+                _cancel([run], folder, f"scratch queue recovery on {record['branch']}")
+            finally:
+                if _planning_reads is not None:
+                    _planning_reads.invalidate()
+        elif attempt > 1:
+            line = (
+                f"scratch run {key} attempt {attempt} has a job queued past {limit} minutes; "
+                "still waiting"
+            )
+            entry["warning"] = line
+            _queue_warning(folder, run, line)
+            if not quiet and attempt not in entry.setdefault("output_attempts", []):
+                entry["output_attempts"].append(attempt)
+                train.save()
+                print(line, flush=True)
+    if json.dumps(entry, sort_keys=True) != before:
+        train.save()
 
 
 def _batch_signal(train: Train) -> None:
@@ -3260,6 +3396,13 @@ def _batch_signal(train: Train) -> None:
         scratch.append((train.suites[train.first], True))
     noted = changed = False
     for record, first in scratch:
+        found = [
+            (workflow, run)
+            for workflow in _suite_workflows(record)
+            for run in _batch_runs(record, workflow)
+        ]
+        for workflow, run in found:
+            _queued_prefix(train, record, workflow, run, quiet=True)
         signal = [
             [
                 workflow,
@@ -3268,8 +3411,7 @@ def _batch_signal(train: Train) -> None:
                 run["status"],
                 run.get("conclusion"),
             ]
-            for workflow in _suite_workflows(record)
-            for run in _batch_runs(record, workflow)
+            for workflow, run in found
         ]
         if _batch_service_answered(record, train.path.parent):
             # Its red run does not change when the service answers again: only this does.
@@ -3846,7 +3988,8 @@ class Prefix:
     run: dict[str, Any] | None = None
 
 
-def _prefix_state(member: dict[str, Any], folder: Path) -> Prefix:
+def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
+    folder = train.path.parent
     scratch, number, tree = member["scratch"], member["number"], member["tree"]
     whose = f"pull request {number}'s prefix"
     evidence: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
@@ -3857,7 +4000,11 @@ def _prefix_state(member: dict[str, Any], folder: Path) -> Prefix:
         if not found:
             pending.append(f"waiting for {workflow} of {whose} to start")
             continue
+        _queued_prefix(train, scratch, workflow, found[0], quiet=False)
         parts = jobs(found[0])
+        if _queue_recovery_pending(scratch, found[0]):
+            pending.append(f"waiting for {workflow} queue recovery of {whose}")
+            continue
         state, failing = workflow_verdict(workflow, found[0], parts)
         if state == "red" and workflow == "ci":
             try:
@@ -4017,7 +4164,7 @@ def _merge_prefixes(
             if number == acting:
                 return None
             return stop(f"merge train: pull request {number} merges by its own checks first")
-        found = _prefix_state(member, folder)
+        found = _prefix_state(member, train)
         if found.state == "pending":
             if merged:
                 _refill(train, record["base"])
@@ -4232,7 +4379,10 @@ def _whole_suite_run(
         found = _batch_runs(suite, workflow)
         if not found:
             return _batch_wait(f"merge train: waiting for {WHOLE[workflow]} to start")
+        _queued_prefix(train, suite, workflow, found[0], quiet=False)
         parts = jobs(found[0])
+        if _queue_recovery_pending(suite, found[0]):
+            return _batch_wait(f"merge train: waiting for {WHOLE[workflow]} queue recovery")
         state, failing = workflow_verdict(workflow, found[0], parts)
         if state == "red" and workflow == "ci":
             # The same package audit as a batch's: a run red only because it could not reach
@@ -4288,8 +4438,19 @@ def _prefix_summary(scratch: dict[str, Any] | None) -> str:
     if not scratch["pushed"]:
         return "not pushed"
     seen = {run[0]: run for run in scratch.get("signal", []) if len(run) == 5}
-    if any(run[3] == "completed" and run[4] != "success" for run in seen.values()):
+    recovering = {
+        workflow for workflow, run in seen.items()
+        if _queue_recovery_pending(scratch, {
+            "id": run[1], "run_attempt": run[2], "status": run[3], "conclusion": run[4]
+        })
+    }
+    if any(
+        run[3] == "completed" and run[4] != "success"
+        for workflow, run in seen.items() if workflow not in recovering
+    ):
         return "failed"
+    if recovering:
+        return "running"
     if set(scratch["workflows"]) - set(seen):
         return "starting"
     if all(run[3] == "completed" for run in seen.values()):
@@ -4354,6 +4515,7 @@ def train_status(folder: Path) -> int:
                             "number": member["number"],
                             "branch": member["scratch"]["branch"] if member["scratch"] else None,
                             "state": _prefix_summary(member["scratch"]),
+                            "queued_retries": (member["scratch"] or {}).get("queued_retries", {}),
                             "runs": [
                                 {
                                     "workflow": run[0],

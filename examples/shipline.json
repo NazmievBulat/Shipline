@@ -91,6 +91,9 @@
       "^app/auth/", "^app/permissions/", "^config/secrets"
     ]
   },
+  "merge_train": {
+    "queued_limit_minutes": 20
+  },
   "answer_for_owner_after_minutes": 15,
   "cloud_pre_push": {
     "suites": {
