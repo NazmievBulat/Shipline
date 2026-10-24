@@ -54,6 +54,7 @@ nothing to install. `examples/shipline.json` names every key, for a repository
 | `runner.labels` | the runner labels the merge gate may re-run failed jobs on | none: the gate re-runs nothing |
 | `runner.prefix` | the prefix the runner pool names its services and containers by; `workflow-metrics` reads their CPU | none: no runner figures |
 | `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it uses the default | `~/.config/shipline-runner` |
+| `machines` | the machines `flow-page` samples for load and memory: a `name` each and, for another machine, the `address` `ssh` reaches it at (a destination, never a word starting with `-`); one without an address is this machine | none: only this machine |
 
 Change `state_folder` only with every session stopped: running sessions keep their notes and
 locks in the folder they started with, and the tick, the gate and `session` look for them in the
