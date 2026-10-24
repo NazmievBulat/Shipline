@@ -66,6 +66,8 @@ _DEFAULTS = {
         "prefix": None,
         "image_build": None,
     },
+    # A repository names its own; CI's test job fails without one (ci_proof.py).
+    "commands": {"test": None},
 }
 
 
@@ -191,6 +193,149 @@ def test_without_an_image_build_command_there_is_none(tmp_path: Path) -> None:
     _write(repo, {"runner": {"prefix": "example-app"}})
 
     assert workflow_config.load(repo).runner.image_build is None
+
+
+@pytest.mark.parametrize(
+    "prefix", ["Example-app", "example_app", "example app", "-app", "app-", "a" * 26, "app/x"]
+)
+def test_a_runner_prefix_that_cannot_name_a_unit_and_a_user_is_refused(
+    tmp_path: Path, prefix: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": prefix}})
+
+    with pytest.raises(workflow_config.ConfigError, match="runner.prefix must be"):
+        workflow_config.load(repo)
+
+
+def _machine(path: Path, text: str) -> Path:
+    """A machine's own runner settings, outside any repository."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+@pytest.fixture
+def machine_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "machine/runner.sh"
+    monkeypatch.setenv("SHIPLINE_RUNNER_SETTINGS", str(path))
+    return path
+
+
+def test_the_runner_labels_are_built_from_the_prefix_and_the_machines(
+    tmp_path: Path, machine_settings: Path
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app"}})
+    _machine(machine_settings, "machine=home\nother_machines=(office)\nrunner_count=2\n")
+
+    assert workflow_config.load(repo).runner.labels == (
+        "example-app-home",
+        "example-app-home-main",
+        "example-app-home-docker",
+        "example-app-office",
+        "example-app-office-main",
+        "example-app-office-docker",
+        "example-app-planner",
+    )
+
+
+def test_the_machine_settings_are_read_from_the_owner_s_config_folder_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SHIPLINE_RUNNER_SETTINGS", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app"}})
+    _machine(tmp_path / "home/.config/shipline/runner.sh", "machine=home\n")
+
+    assert workflow_config.load(repo).runner.labels == (
+        "example-app-home",
+        "example-app-home-main",
+        "example-app-home-docker",
+        "example-app-planner",
+    )
+
+
+def test_without_machine_settings_only_the_planner_is_labelled(
+    tmp_path: Path, machine_settings: Path
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app"}})
+
+    assert workflow_config.load(repo).runner.labels == ("example-app-planner",)
+
+
+def test_without_a_prefix_no_label_is_built_and_the_machine_settings_are_not_read(
+    tmp_path: Path, machine_settings: Path
+) -> None:
+    repo = _repository(tmp_path)
+    _machine(machine_settings, "exit 4\n")
+
+    assert workflow_config.load(repo).runner.labels == ()
+
+
+def test_named_runner_labels_win_over_the_built_ones(
+    tmp_path: Path, machine_settings: Path
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app", "labels": ["example-app-elsewhere"]}})
+    _machine(machine_settings, "exit 4\n")
+
+    assert workflow_config.load(repo).runner.labels == ("example-app-elsewhere",)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "exit 4\nmachine=home\n",
+        "while :; do :; done\n",
+        "machine='home desk'\n",
+        "machine=home\nother_machines=(office ../x)\n",
+        "machine=\"$WORKFLOW_SECRET\"\n",
+        "other_machines=(office)\n",
+    ],
+    ids=["fails", "never ends", "space", "path", "from the caller", "no machine"],
+)
+def test_machine_settings_bash_cannot_read_into_names_are_refused_by_their_path(
+    tmp_path: Path, machine_settings: Path, monkeypatch: pytest.MonkeyPatch, text: str
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app"}})
+    _machine(machine_settings, text)
+    monkeypatch.setenv("WORKFLOW_SECRET", "home")
+
+    with pytest.raises(workflow_config.ConfigError, match=str(machine_settings)):
+        workflow_config.load(repo)
+
+
+def test_bash_reads_the_built_runner_labels(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"runner": {"prefix": "example-app"}})
+    settings = _machine(tmp_path / "machine/runner.sh", "machine=home\n")
+    done = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'config=$(python3 "$1" shell "$2") || exit 1; eval "$config"; '
+            'printf "%s\\n" "${SHIPLINE_RUNNER_LABELS[@]}"',
+            "bash",
+            str(_WORKFLOW / "workflow_config.py"),
+            str(repo),
+        ],
+        cwd=repo,
+        env={**_GIT_ENV, "SHIPLINE_RUNNER_SETTINGS": str(settings)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert done.stdout.splitlines() == [
+        "example-app-home",
+        "example-app-home-main",
+        "example-app-home-docker",
+        "example-app-planner",
+    ]
 
 
 def test_the_repository_named_in_the_file_wins_over_the_runner_settings_and_origin(
@@ -352,6 +497,8 @@ def test_a_worktree_reads_the_file_of_the_main_checkout(tmp_path: Path) -> None:
         ('{"repository": "../example-app"}', "repository"),
         ('{"checks": {"ci_result": ""}}', "checks.ci_result"),
         ('{"checks": "CI result"}', "checks"),
+        ('{"commands": {"test": ""}}', "commands.test"),
+        ('{"commands": {"test": ["pytest"]}}', "commands.test"),
         ('{"runner": {"labels": "home"}}', "runner.labels"),
         ('{"state_folder": "/var/workflow"}', "state_folder"),
         ('{"state_folder": "../workflow"}', "state_folder"),

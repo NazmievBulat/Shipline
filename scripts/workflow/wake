@@ -36,6 +36,11 @@
 # So does the last change of the machine's runner balancer (the tick notes it from
 # `runner-balance.log`), once: `Runner balance, last change: <line>.`
 #
+# An analysis the tick stopped (its analyst said "analysis finished", or its 40 minutes ran out)
+# is told once, at any hour and busy or not, tried again every 5 minutes until the message is
+# sent: `Workflow analysis day-<date> (report <link>): 1. <proposal>; 2. <proposal>.`, or that it
+# ended without publishing its report.
+#
 # A session that ended its turn with a question to the owner is named on a line of its own,
 # with how long it has waited: `asking the owner: review-156 (8 min)`. The stop hook (`notify`)
 # notes the question when the stop rings the phone, and drops it when he answers. A question
@@ -147,6 +152,24 @@ if [[ -d $balance ]]; then
       balance_lines+=("$line")
     fi
   done < <(find "$balance" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+fi
+analyses=$main/$SHIPLINE_STATE_FOLDER/analyses.pending
+analysis_files=()
+analysis_lines=()
+if [[ -d $analyses ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '(.name | strings) as $name | (.report | strings) as $report |
+        (.proposals | map(strings)) as $proposals |
+        if (.url | strings) == "" then
+          "Workflow analysis \($name) ended without publishing its report (\($report))."
+        else
+          "Workflow analysis \($name) (report \(.url)): " +
+            (if ($proposals | length) == 0 then "no proposals" else $proposals | join("; ") end) + "."
+        end' "$event"); then
+      analysis_files+=("$event")
+      analysis_lines+=("$line")
+    fi
+  done < <(find "$analyses" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 fi
 if [[ -d $handbacks ]]; then
   while IFS= read -r -d '' event; do
@@ -264,7 +287,7 @@ if [[ -n $asking ]]; then
 fi
 
 if ((${#resent[@]} == 0)); then
-  if [[ -s $PENDING || -s $main_pending || -n $service_line || ${#handback_files[@]} -gt 0 || ${#cloud_files[@]} -gt 0 || ${#lost_files[@]} -gt 0 || ${#stuck_files[@]} -gt 0 || $tmp_alert == true || -n $untold ]]; then
+  if [[ -s $PENDING || -s $main_pending || -n $service_line || ${#handback_files[@]} -gt 0 || ${#cloud_files[@]} -gt 0 || ${#analysis_files[@]} -gt 0 || ${#lost_files[@]} -gt 0 || ${#stuck_files[@]} -gt 0 || $tmp_alert == true || -n $untold ]]; then
     (($(since_last_look) + 30 >= RETRY_SECONDS)) || exit 0
   else
     hour=$(date -d "@$NOW" +%-H)
@@ -419,7 +442,7 @@ state=${orchestrator%%$'\t'*}
 name=${orchestrator#*$'\t'}
 
 if ((${#resent[@]} == 0 && ${#handback_files[@]} == 0 && ${#cloud_files[@]} == 0 && ${#lost_files[@]} == 0 &&
-  ${#stuck_files[@]} == 0)) &&
+  ${#stuck_files[@]} == 0 && ${#analysis_files[@]} == 0)) &&
   [[ ! -s $main_pending && -z $service_line && -z $untold ]]; then
   if [[ $state != idle && $tmp_alert != true ]]; then
     log "  $name is $state; not told"
@@ -450,7 +473,7 @@ if ((${#start_lines[@]})); then
   joined=$(printf '%s; ' "${start_lines[@]}")
   message+=" Ticket starts by the tick: ${joined%; }."
 fi
-for line in "${metrics_lines[@]}" "${balance_lines[@]}"; do
+for line in "${metrics_lines[@]}" "${analysis_lines[@]}" "${balance_lines[@]}"; do
   message+=" $line"
 done
 if [[ -n $service_line ]]; then
@@ -465,7 +488,8 @@ if send_to "$name" "$message"; then
     grep -xF -f <(asking_notes all; echo) >"$ASKED.new"
   mv "$ASKED.new" "$ASKED"
   rm -f "$PENDING"
-  for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${balance_files[@]}"; do
+  for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${analysis_files[@]}" \
+      "${balance_files[@]}"; do
     rm -f -- "$event"
   done
   # Do not acknowledge a newer outage noted while the message was being sent.

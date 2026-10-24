@@ -40,18 +40,18 @@ from workflow_commands import (
 )
 
 # The files a repository keeps for the gate are in its own `scripts/workflow`, in its main
-# checkout: the repository Shipline works on, not the checkout these scripts are in. Searched after
-# the scripts' own folder, so none of them stands in for one of the scripts.
+# checkout: the repository Shipline works on, not the checkout these scripts are in. Searched last,
+# so none of them stands in for one of the scripts or for a module of Python's own.
 REPOSITORY_FILES = workflow_config.current().main / "scripts" / "workflow"
-sys.path.insert(1, str(REPOSITORY_FILES))
+sys.path.append(str(REPOSITORY_FILES))
 
 # A repository may hold three helpers there, and the gate uses them when it does:
 # `advisory_service` tells a scan that could not reach a package advisory service, which is a
 # wait; `pushing_checkout` installs the pushing checkout's packages before its hook and words a
 # hook's refusal; `run_proof` reads and writes the `Workflow-Proof` line with which main skips a
 # job its squash proved. Without them a failed push is refused with its last lines, nothing is
-# installed first, and no proof is read or written, so main never skips a job: a job counts as
-# passed only where it passed itself. A helper that is there but cannot start stops the gate.
+# installed first, and the proof is Shipline's own (`ci_proof`), the one its example CI reads. A
+# helper that is there but cannot start stops the gate.
 try:
     import advisory_service
 except ModuleNotFoundError as error:
@@ -70,22 +70,8 @@ try:
 except ModuleNotFoundError as error:
     if error.name != "run_proof":
         raise
-    RECEIPT = WHOLE_REQUEST = None
-
-    def passed_jobs(parts: list[dict[str, Any]]) -> set[str]:
-        """The jobs that passed in the run itself, a job run in parts once each of its parts
-        did; no proof line is read."""
-        grouped: dict[str, list[tuple[re.Match[str] | None, dict[str, Any]]]] = {}
-        for job in parts:
-            part = re.fullmatch(r"(.+) \((\d+) of (\d+)\)", job["name"])
-            grouped.setdefault(part[1] if part else job["name"], []).append((part, job))
-        return {
-            name
-            for name, group in grouped.items()
-            if all(job.get("conclusion") == "success" for _, job in group)
-            and sorted((int(part[2]), int(part[3])) for part, _ in group if part)
-            in ([], [(number, len(group)) for number in range(1, len(group) + 1)])
-        }
+    from ci_proof import RECEIPT, passed_jobs
+    from ci_proof import WHOLE as WHOLE_REQUEST
 
 
 def mechanical_conflicts() -> ModuleType | None:
@@ -1370,9 +1356,10 @@ def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
 
 
 def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: str) -> bool:
-    """A green CI run that ran every server test on exactly this commit."""
+    """A green CI run that ran every server test on exactly this commit, run in parts or not."""
     if verdict(run, parts)[0] != "green" or not any(
-        job["name"] == "CI: server tests" and job.get("conclusion") == "success" for job in parts
+        job["name"] == "CI: server tests" and job.get("conclusion") == "success"
+        for job in checks(parts)
     ):
         return False
     return {(NOTES.merge_tested, head), (NOTES.server_tests, "whole")} <= _planner_notes(
@@ -3908,7 +3895,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             reason = f"behind {train.first}" if train.first else "for main to change"
             print(
                 f"merge train: pull request {number} waits {reason}; "
-                "run scripts/workflow/notify waiting and end the turn; the tick wakes you",
+                "run shipline notify waiting and end the turn; the tick wakes you",
                 flush=True,
             )
             command("bash", str(HERE / "notify"), "waiting")

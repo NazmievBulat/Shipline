@@ -5,12 +5,15 @@
 #
 #   1. An idle audit that said "audit finished" is stopped, and so is an idle worker that said
 #      "worker finished", unless its pull request is still a draft, and an idle hunt that said
-#      "hunt finished". A hunt that still runs 65 minutes after its start is stopped too. A
+#      "hunt finished". A hunt that still runs 65 minutes after its start is stopped too. An
+#      analyst that said "analysis finished", idle or not, or that still runs 40 minutes after
+#      its start, is stopped. A
 #      Codex completion is read regardless of its bridge state; a bridge that ended or
 #      failed to parse a tool call gets its bridge again while Codex works. A reviewer that
 #      said "review finished" on an open, ready pull request based on main without handing
 #      its merge to the tick is noted as a rule break for the wake.
-#   2. `session cleanup`: the worktrees of merged pull requests and of ended hunts are removed.
+#   2. `session cleanup`: the worktrees of merged pull requests and of ended hunts and analysts
+#      are removed; an ended analysis is noted for the wake's next check-in first.
 #   3. A session that is idle or stopped on the usage limit and holds more than 300 MB is
 #      squeezed.
 #   4. A worker, independent reviewer or audit that the usage limit stopped is sent its instruction again when
@@ -42,7 +45,10 @@
 #      local reads only. Once a day from 07:50 UTC, once GitHub may be asked, it starts the daily
 #      run, detached: the report goes to .local/analyses/metrics-<date>.md and its findings to
 #      the wake's next check-in.
-#  11. `ci_demand.py`: the CI and image jobs the pushes on their way will start within half an
+#  11. From 08:00 UTC, once the day's metrics report is written, one analyst a day
+#      (`session start analyst day-<date>`, on Sunday `week-<date>` over 7 days), when the
+#      5-hour usage window allows a start: not above 85% unless it resets within the hour.
+#  12. `ci_demand.py`: the CI and image jobs the pushes on their way will start within half an
 #      hour (working cloud workers, busy local workers and reviewers, ready pull requests whose
 #      checks have not started, the merge line's prefixes still to be built), written to
 #      ~/.local/state/workflow/ci-demand.json for the runner balancer.
@@ -51,6 +57,7 @@
 # The starts come last because the steps before them may free memory they need.
 # Audits are not started here: the orchestrator session starts one by hand, and only for a
 # pull request that was built before the workflow existed. Hunts are not started here either.
+# The daily analyst is: it reads the logs and the metrics report, and asks the owner nothing.
 set -uo pipefail
 
 # A session that holds more than this while idle is squeezed.
@@ -64,6 +71,8 @@ NOW=${WORKFLOW_NOW:-$(date +%s)}
 # A hunter hunts for 45 minutes and then writes its report. One that still runs after this
 # many is stuck, or a Codex hunter that never ended; nothing else would stop it.
 HUNT_STOPPED_AFTER_MINUTES=65
+# An analyst has 40 minutes to read the logs and publish its report.
+ANALYST_STOPPED_AFTER_MINUTES=40
 # A session waiting for its own job or its turn loses its cached context an hour after its last
 # turn; one this long idle is asked whether the wait is over. One message per idle stretch.
 KEEP_ALIVE_AFTER_SECONDS=$((50 * 60))
@@ -76,6 +85,11 @@ FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:
 # The time of day, UTC, from which the daily metrics run starts; empty, it never does. A test
 # names another.
 METRICS_DAILY_AT=${WORKFLOW_METRICS_DAILY_AT-07:50}
+# The time of day, UTC, from which the daily analyst starts, after the metrics run; empty, it
+# never does. A test names another.
+ANALYST_DAILY_AT=${WORKFLOW_ANALYST_DAILY_AT-08:00}
+# The 5-hour usage window above which, unless it resets within the hour, nothing starts.
+USAGE_CEILING=85
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 gh() { python3 "$here/github_budget.py" call tick "$@"; }
@@ -124,7 +138,7 @@ session() {
 }
 
 # An audit ends with "audit finished", a worker with "worker finished", a hunt with "hunt
-# finished". The words count only
+# finished", an analyst with "analysis finished". The words count only
 # on a line of their own: after the bullet Claude draws, in bold or not, with a full stop or
 # not. With anything else on the line the session is talking about finishing or quoting the
 # rule, and after `>` it is quoting or it is what the owner typed.
@@ -144,6 +158,7 @@ said_finished() {
   [[ $1 != review-* ]] || words="review finished"
   [[ $1 != ticket-* ]] || words="worker finished"
   [[ $1 != hunt-* ]] || words="hunt finished"
+  [[ $1 != analyst-* ]] || words="analysis finished"
   words=${2:-$words}
   notes=$main/.claude/worktrees/$1/$SHIPLINE_STATE_FOLDER/$1
   if [[ $1 == ticket-* && -e $notes.codex ]]; then
@@ -216,10 +231,64 @@ note_rule_break() {
     mv -- "$folder/rule-breaks.pending/.$event.tmp" "$folder/rule-breaks.pending/$event"
 }
 
-# Read from the time written on the note `session start hunt` leaves.
+# Read from the time written on the note `session start hunt` or `analyst` leaves.
 is_over_its_time() {
   local started=$main/.claude/worktrees/$1/$SHIPLINE_STATE_FOLDER/$1.started
-  [[ -n $(find "$started" -mmin "+$HUNT_STOPPED_AFTER_MINUTES" 2>/dev/null) ]]
+  [[ -n $(find "$started" -mmin "+$2" 2>/dev/null) ]]
+}
+
+# Whether the 5-hour usage window allows a start: not above the ceiling, unless it resets
+# within the hour. A window that cannot be read allows none. Says why not.
+usage_allows_start() {
+  local window percent at
+  while read -r window percent at; do
+    [[ $window == five_hour && $percent =~ ^[0-9]+$ && $at =~ ^[0-9]+$ ]] || continue
+    ((percent <= USAGE_CEILING || at - NOW <= 3600)) && return 0
+    echo "the 5-hour usage window is $percent% used"
+    return 1
+  done < <(bash "$here/usage" 2>/dev/null 9>&-)
+  echo "the 5-hour usage window could not be read"
+  return 1
+}
+
+# One analyst a day, from ANALYST_DAILY_AT, once the day's metrics report is written: it reads
+# that report. Its report folder says it started; a start that waits for memory is left for the
+# next tick, as is one the usage window holds, one within 5 minutes of another start, whose
+# memory and load have not shown yet, and one refused for a reason that passes (exit 75: memory,
+# another start's lock, a fetch that failed). A start that failed otherwise is not tried again
+# that day; a session it left is noted for the wake as an analysis without its report.
+start_daily_analyst() {
+  local day name=day days=1 why last=0 failed_mark
+  [[ $ANALYST_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] || return 0
+  ((10#$(date -u -d "@$NOW" +%H%M) >= 10#${BASH_REMATCH[1]}${BASH_REMATCH[2]})) || return 0
+  day=$(date -u -d "@$NOW" +%F)
+  [[ -e $main/.local/analyses/metrics-$day.md ]] || return 0
+  if [[ $(date -u -d "@$NOW" +%u) == 7 ]]; then
+    name=week
+    days=7
+  fi
+  name=$name-$day
+  failed_mark=$main/$SHIPLINE_STATE_FOLDER/analyst-$name.failed
+  [[ ! -e $main/.local/analyses/$name && ! -e $failed_mark ]] || return 0
+  [[ ! -r $main/$SHIPLINE_STATE_FOLDER/last-start ]] ||
+    read -r last _ <"$main/$SHIPLINE_STATE_FOLDER/last-start" || true
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  if ((NOW - last < 5 * 60)); then
+    echo "the daily analyst waits: a session started in the last 5 minutes"
+    return 0
+  fi
+  if ! why=$(usage_allows_start); then
+    echo "the daily analyst waits: $why"
+    return 0
+  fi
+  session start analyst "$name" "$days"
+  case $? in
+    0 | 75) ;;
+    *)
+      touch "$failed_mark"
+      return 1
+      ;;
+  esac
 }
 
 # Whether the time a limit line names has passed: "4:10pm", "4pm (America/New_York)" or, with
@@ -343,12 +412,21 @@ running=$(session list) || { failed=1; listed=unread; }
 # From the sessions just listed: the sample asks GitHub nothing and lists nothing again.
 bash "$here/workflow-metrics" --sample --sessions "$listed" <<<"$running" 9>&- || failed=1
 
-# Before GitHub is asked anything: a hunt has no pull request, and its time runs out whether
-# or not GitHub answers.
+# Before GitHub is asked anything: a hunt or an analyst has no pull request, and its time runs
+# out whether or not GitHub answers. An analyst's closing line is read whatever its state: it
+# asks nobody anything, and its stop hook marks nothing. `session cleanup` notes its report.
 while read -r name _; do
-  [[ $name == hunt-* ]] && is_over_its_time "$name" || continue
-  echo "$name is over its time"
-  session stop "$name" || failed=1
+  if [[ $name == hunt-* ]] && is_over_its_time "$name" "$HUNT_STOPPED_AFTER_MINUTES"; then
+    echo "$name is over its time"
+    session stop "$name" || failed=1
+  elif [[ $name == analyst-* ]]; then
+    if is_over_its_time "$name" "$ANALYST_STOPPED_AFTER_MINUTES"; then
+      echo "$name is over its time"
+    else
+      said_finished "$name" || continue
+    fi
+    session stop "$name" || failed=1
+  fi
 done <<<"$running"
 
 # Local hunt deadlines still apply while GitHub is unavailable.
@@ -407,6 +485,8 @@ while read -r name state _; do
     fi
   fi
   [[ $state == idle ]] || continue
+  # An analyst is stopped above, whatever its state.
+  [[ $name != analyst-* ]] || continue
   # A Codex worker whose bridge ended is listed idle, and nobody would read its end or relay
   # its question. Its bridge is started again; it shows Codex's last turn.
   if [[ $name == ticket-* && -e $main/.claude/worktrees/$name/$SHIPLINE_STATE_FOLDER/$name.codex ]] &&
@@ -875,7 +955,12 @@ python3 -B "$here/reviewer_start.py" --reconcile "$main/$SHIPLINE_STATE_FOLDER" 
 python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
   failed=1
 
-# Step 11, after this tick's starts: the CI demand on its way, for the runner balancer.
+# Step 11, after the starts the tickets wait for, and not while one waits for memory.
+if ((local_starts_held == 0 && started != 75)); then
+  start_daily_analyst || failed=1
+fi
+
+# Step 12, after this tick's starts: the CI demand on its way, for the runner balancer.
 if running=$(session list); then
   python3 -B "$here/ci_demand.py" write "$main" "$snapshot" <<<"$running" 9>&- || failed=1
 else
