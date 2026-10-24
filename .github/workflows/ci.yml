@@ -11,8 +11,10 @@ on:
 permissions:
   contents: read
 
+# A pull request's newer push cancels its older run. Every commit of main and of the merge queue
+# keeps its own run: the merge gate reads each of them.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -100,11 +102,11 @@ jobs:
       - name: The test tools
         run: python -m pip install --require-hashes -r requirements-test.txt
       - name: Tests
-        run: python -m pytest -n 4 --dist worksteal -m "not serial" ${{ matrix.files }}
+        run: python -m pytest -rs -n 4 --dist worksteal -m "not serial" ${{ matrix.files }}
       # The tests that cannot run beside others, one at a time, in one shard.
       - name: Tests that run alone
         if: matrix.shard == 1
-        run: python -m pytest -p no:xdist -m serial || [ $? -eq 5 ]
+        run: python -m pytest -rs -p no:xdist -m serial
 
   ci:
     # The check the merge queue requires, by this name.
