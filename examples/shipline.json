@@ -1,131 +1,90 @@
 {
-  "repository": "example-owner/example-app",
-  "install_folder": ".",
-  "state_folder": ".local/shipline",
-  "worktree_setup": "tools/prepare-worktree",
-  "refresh": {
-    "clear_generated": []
+  "annotations": {
+    "browser_suite": "Browser specs",
+    "files_tested": "Tree tested",
+    "merge_tested": "Merge built",
+    "server_tests": "Server suite",
+    "web_suite": "Web unit suite"
   },
+  "answer_for_owner_after_minutes": 15,
+  "checks": {
+    "advisory_annotation": "Advisory",
+    "ci_plan": "Build: what to run",
+    "ci_result": "Build result",
+    "dependency_audit": "Build: dependencies",
+    "e2e_plan": "Browser: what to run",
+    "images": "Images",
+    "prefix_only": ["images", "browser_whole", "server_whole"]
+  },
+  "cloud_pre_push": {
+    "suites": {"server": {"select": "tools/shipline/server-tests-for-changes", "run": "tools/shipline/server-tests --workers {workers}", "workers": 4, "part": "--shard {shard}/{shards}"}, "browser": {"select": "tools/shipline/browser-tests-for-changes --ci", "run": "tools/shipline/browser-tests --workers {workers}", "workers": 2, "probe": "tools/shipline/browser-starts"}}
+  },
+  "cloud_wake_after_minutes": 45,
   "commands": {
-    "test": "tools/run-tests",
+    "advisory_watch": "tools/shipline/advisory-watch",
     "browser": "tools/run-browser-tests",
-    "browser_tests_for_changes": {
-      "run": "tools/shipline/browser-tests-for-changes",
-      "form": "json",
-      "field": "specs",
-      "args": ["--ci"]
-    },
-    "server_tests_for_changes": "tools/shipline/server-tests-for-changes",
-    "pre_train_checks": {"run": "tools/shipline/pre-train-checks", "form": "exit"},
-    "mechanical_conflicts": "tools/shipline/mechanical-conflicts",
     "browser_plan": "tools/shipline/browser-plan",
+    "browser_tests_for_changes": {"run": "tools/shipline/browser-tests-for-changes", "form": "json", "field": "specs", "args": ["--ci"]},
     "hunt_app": "tools/shipline/hunt-app",
     "hunt_browser": "node tools/shipline/hunt-browser.mjs",
     "hunt_cursor": "tools/shipline/hunt-cursor",
-    "advisory_watch": "tools/shipline/advisory-watch",
+    "mechanical_conflicts": "tools/shipline/mechanical-conflicts",
+    "pre_train_checks": {"run": "tools/shipline/pre-train-checks", "form": "exit"},
     "push_checkout": "tools/shipline/push-checkout",
-    "push_checks": "tools/shipline/push-checks"
+    "push_checks": "tools/shipline/push-checks",
+    "server_tests_for_changes": "tools/shipline/server-tests-for-changes",
+    "test": "tools/run-tests"
   },
-  "checks": {
-    "ci_result": "Build result",
-    "ci_plan": "Build: what to run",
-    "e2e_plan": "Browser: what to run",
-    "images": "Images",
-    "dependency_audit": "Build: dependencies",
-    "advisory_annotation": "Advisory",
-    "prefix_only": ["images", "browser_whole", "server_whole"]
+  "conflict_review": {"effort": "medium", "model": "sonnet", "max_changed_lines": 40},
+  "hot_paths": ["src/example_app/models.py", "web/src/pages/**"],
+  "hunts": {
+    "areas": {"phone": ["/calls", "/contacts"], "billing": ["/invoices", "/settings/billing"]},
+    "plans": "docs/hunt-plans.md"
   },
-  "annotations": {
-    "merge_tested": "Merge built",
-    "files_tested": "Tree tested",
-    "server_tests": "Server suite",
-    "web_suite": "Web unit suite",
-    "browser_suite": "Browser specs"
+  "install_folder": ".",
+  "labels": {
+    "audited": "audited",
+    "priority": {
+      "blocker": "priority: blocker",
+      "high": "priority: high",
+      "low": "priority: low",
+      "medium": "priority: medium"
+    },
+    "workflow": "shipline"
   },
+  "machines": [{"name": "this machine"}, {"name": "runner-1", "address": "runner@runner-1.example"}],
+  "merge": {
+    "scratch_prefix": "workflow/merge-batch-"
+  },
+  "merge_train": {
+    "queued_limit_minutes": 20
+  },
+  "parity": {
+    "known": "tools/shipline/parity-known.txt",
+    "runner_tests": "tools/runner/tests",
+    "workflow_tests": "tools/shipline/tests"
+  },
+  "refresh": {
+    "clear_generated": []
+  },
+  "repository": "example-owner/example-app",
+  "review": {
+    "high_effort_paths": ["^db/migrations/", "^db/schema\\.sql$", "^app/models/", "^prompts/", "(^|/)AGENTS\\.md$", "\\.prompt\\.md$", "^app/jobs/", "^app/queues/", "(^|/)locks?\\.py$", "^app/auth/", "^app/permissions/", "^config/secrets"]
+  },
+  "runner": {
+    "hub_cache": "tools/shipline/hub-cache",
+    "identity_folder": "~/.config/shipline-runner",
+    "image_build": "tools/shipline/build-runner-images",
+    "label": "example-app-home",
+    "labels": ["example-app-home", "example-app-home-standby", "example-app-home-first", "example-app-home-main", "example-app-home-main-batch", "example-app-home-docker", "example-app-home-planner"],
+    "planner_label": "example-app-home-planner",
+    "prefix": "example-app"
+  },
+  "state_folder": ".local/shipline",
   "workflows": {
     "ci": "build.yml",
     "e2e": "browser.yml",
     "images": "images.yml"
   },
-  "labels": {
-    "workflow": "shipline",
-    "audited": "audited",
-    "priority": {
-      "blocker": "priority: blocker",
-      "high": "priority: high",
-      "medium": "priority: medium",
-      "low": "priority: low"
-    }
-  },
-  "runner": {
-    "labels": [
-      "example-app-home",
-      "example-app-home-standby",
-      "example-app-home-first",
-      "example-app-home-main",
-      "example-app-home-main-batch",
-      "example-app-home-docker",
-      "example-app-home-planner"
-    ],
-    "identity_folder": "~/.config/shipline-runner",
-    "prefix": "example-app",
-    "label": "example-app-home",
-    "planner_label": "example-app-home-planner",
-    "image_build": "tools/shipline/build-runner-images",
-    "hub_cache": "tools/shipline/hub-cache"
-  },
-  "merge": {
-    "scratch_prefix": "workflow/merge-batch-"
-  },
-  "cloud_wake_after_minutes": 45,
-  "parity": {
-    "workflow_tests": "tools/shipline/tests",
-    "runner_tests": "tools/runner/tests",
-    "known": "tools/shipline/parity-known.txt"
-  },
-  "machines": [
-    {"name": "this machine"},
-    {"name": "runner-1", "address": "runner@runner-1.example"}
-  ],
-  "hunts": {
-    "areas": {
-      "phone": ["/calls", "/contacts"],
-      "billing": ["/invoices", "/settings/billing"]
-    },
-    "plans": "docs/hunt-plans.md"
-  },
-  "review": {
-    "high_effort_paths": [
-      "^db/migrations/", "^db/schema\\.sql$", "^app/models/",
-      "^prompts/", "(^|/)AGENTS\\.md$", "\\.prompt\\.md$",
-      "^app/jobs/", "^app/queues/", "(^|/)locks?\\.py$",
-      "^app/auth/", "^app/permissions/", "^config/secrets"
-    ]
-  },
-  "merge_train": {
-    "queued_limit_minutes": 20
-  },
-  "answer_for_owner_after_minutes": 15,
-  "hot_paths": ["src/example_app/models.py", "web/src/pages/**"],
-  "conflict_review": {
-    "effort": "medium",
-    "model": "sonnet",
-    "max_changed_lines": 40
-  },
-  "cloud_pre_push": {
-    "suites": {
-      "server": {
-        "select": "tools/shipline/server-tests-for-changes",
-        "run": "tools/shipline/server-tests --workers {workers}",
-        "workers": 4,
-        "part": "--shard {shard}/{shards}"
-      },
-      "browser": {
-        "select": "tools/shipline/browser-tests-for-changes --ci",
-        "run": "tools/shipline/browser-tests --workers {workers}",
-        "workers": 2,
-        "probe": "tools/shipline/browser-starts"
-      }
-    }
-  }
+  "worktree_setup": "tools/prepare-worktree"
 }

@@ -1,0 +1,1459 @@
+[
+  {
+    "key": "file",
+    "given": {
+      "zzz_unknown": 0,
+      "aaa_unknown": 0
+    },
+    "message": "<config>: unknown key aaa_unknown, zzz_unknown"
+  },
+  {
+    "key": "repository",
+    "given": {
+      "repository": false
+    },
+    "message": "<config>: repository must be a name, not false"
+  },
+  {
+    "key": "repository",
+    "given": {
+      "repository": null
+    },
+    "message": "<config>: repository must be a name, not null"
+  },
+  {
+    "key": "install_folder",
+    "given": {
+      "install_folder": false
+    },
+    "message": "<config>: install_folder must be a path"
+  },
+  {
+    "key": "install_folder",
+    "given": {
+      "install_folder": null
+    },
+    "message": "<config>: install_folder must be a path"
+  },
+  {
+    "key": "state_folder",
+    "given": {
+      "state_folder": false
+    },
+    "message": "<config>: state_folder must be a name, not false"
+  },
+  {
+    "key": "state_folder",
+    "given": {
+      "state_folder": null
+    },
+    "message": "<config>: state_folder must be a name, not null"
+  },
+  {
+    "key": "worktree_setup",
+    "given": {
+      "worktree_setup": false
+    },
+    "message": "<config>: worktree_setup must be a name, not false"
+  },
+  {
+    "key": "worktree_setup",
+    "given": {
+      "worktree_setup": null
+    },
+    "message": "<config>: worktree_setup must be a name, not null"
+  },
+  {
+    "key": "refresh",
+    "given": {
+      "refresh": false
+    },
+    "message": "<config>: refresh. must be an object"
+  },
+  {
+    "key": "refresh",
+    "given": {
+      "refresh": null
+    },
+    "message": "<config>: refresh. must be an object"
+  },
+  {
+    "key": "refresh",
+    "given": {
+      "refresh": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key refresh.aaa_unknown, refresh.zzz_unknown"
+  },
+  {
+    "key": "refresh.clear_generated",
+    "given": {
+      "refresh": {
+        "clear_generated": false
+      }
+    },
+    "message": "<config>: refresh.clear_generated must be a list of names"
+  },
+  {
+    "key": "refresh.clear_generated",
+    "given": {
+      "refresh": {
+        "clear_generated": null
+      }
+    },
+    "message": "<config>: refresh.clear_generated must be a list of names"
+  },
+  {
+    "key": "commands",
+    "given": {
+      "commands": false
+    },
+    "message": "<config>: commands. must be an object"
+  },
+  {
+    "key": "commands",
+    "given": {
+      "commands": null
+    },
+    "message": "<config>: commands. must be an object"
+  },
+  {
+    "key": "commands",
+    "given": {
+      "commands": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key commands.aaa_unknown, commands.zzz_unknown"
+  },
+  {
+    "key": "commands.test",
+    "given": {
+      "commands": {
+        "test": false
+      }
+    },
+    "message": "<config>: commands.test must be a name, not false"
+  },
+  {
+    "key": "commands.test",
+    "given": {
+      "commands": {
+        "test": null
+      }
+    },
+    "message": "<config>: commands.test must be a name, not null"
+  },
+  {
+    "key": "commands.browser",
+    "given": {
+      "commands": {
+        "browser": false
+      }
+    },
+    "message": "<config>: commands.browser must be a name, not false"
+  },
+  {
+    "key": "commands.browser",
+    "given": {
+      "commands": {
+        "browser": null
+      }
+    },
+    "message": "<config>: commands.browser must be a name, not null"
+  },
+  {
+    "key": "commands.browser_tests_for_changes",
+    "given": {
+      "commands": {
+        "browser_tests_for_changes": false
+      }
+    },
+    "message": "<config>: commands.browser_tests_for_changes must be a name, not false"
+  },
+  {
+    "key": "commands.browser_tests_for_changes",
+    "given": {
+      "commands": {
+        "browser_tests_for_changes": null
+      }
+    },
+    "message": "<config>: commands.browser_tests_for_changes must be a name, not null"
+  },
+  {
+    "key": "commands.server_tests_for_changes",
+    "given": {
+      "commands": {
+        "server_tests_for_changes": false
+      }
+    },
+    "message": "<config>: commands.server_tests_for_changes must be a name, not false"
+  },
+  {
+    "key": "commands.server_tests_for_changes",
+    "given": {
+      "commands": {
+        "server_tests_for_changes": null
+      }
+    },
+    "message": "<config>: commands.server_tests_for_changes must be a name, not null"
+  },
+  {
+    "key": "commands.pre_train_checks",
+    "given": {
+      "commands": {
+        "pre_train_checks": false
+      }
+    },
+    "message": "<config>: commands.pre_train_checks must be a name, not false"
+  },
+  {
+    "key": "commands.pre_train_checks",
+    "given": {
+      "commands": {
+        "pre_train_checks": null
+      }
+    },
+    "message": "<config>: commands.pre_train_checks must be a name, not null"
+  },
+  {
+    "key": "commands.mechanical_conflicts",
+    "given": {
+      "commands": {
+        "mechanical_conflicts": false
+      }
+    },
+    "message": "<config>: commands.mechanical_conflicts must be a name, not false"
+  },
+  {
+    "key": "commands.mechanical_conflicts",
+    "given": {
+      "commands": {
+        "mechanical_conflicts": null
+      }
+    },
+    "message": "<config>: commands.mechanical_conflicts must be a name, not null"
+  },
+  {
+    "key": "commands.browser_plan",
+    "given": {
+      "commands": {
+        "browser_plan": false
+      }
+    },
+    "message": "<config>: commands.browser_plan must be a name, not false"
+  },
+  {
+    "key": "commands.browser_plan",
+    "given": {
+      "commands": {
+        "browser_plan": null
+      }
+    },
+    "message": "<config>: commands.browser_plan must be a name, not null"
+  },
+  {
+    "key": "commands.hunt_app",
+    "given": {
+      "commands": {
+        "hunt_app": false
+      }
+    },
+    "message": "<config>: commands.hunt_app must be a name, not false"
+  },
+  {
+    "key": "commands.hunt_app",
+    "given": {
+      "commands": {
+        "hunt_app": null
+      }
+    },
+    "message": "<config>: commands.hunt_app must be a name, not null"
+  },
+  {
+    "key": "commands.hunt_browser",
+    "given": {
+      "commands": {
+        "hunt_browser": false
+      }
+    },
+    "message": "<config>: commands.hunt_browser must be a name, not false"
+  },
+  {
+    "key": "commands.hunt_browser",
+    "given": {
+      "commands": {
+        "hunt_browser": null
+      }
+    },
+    "message": "<config>: commands.hunt_browser must be a name, not null"
+  },
+  {
+    "key": "commands.hunt_cursor",
+    "given": {
+      "commands": {
+        "hunt_cursor": false
+      }
+    },
+    "message": "<config>: commands.hunt_cursor must be a name, not false"
+  },
+  {
+    "key": "commands.hunt_cursor",
+    "given": {
+      "commands": {
+        "hunt_cursor": null
+      }
+    },
+    "message": "<config>: commands.hunt_cursor must be a name, not null"
+  },
+  {
+    "key": "commands.advisory_watch",
+    "given": {
+      "commands": {
+        "advisory_watch": false
+      }
+    },
+    "message": "<config>: commands.advisory_watch must be a name, not false"
+  },
+  {
+    "key": "commands.advisory_watch",
+    "given": {
+      "commands": {
+        "advisory_watch": null
+      }
+    },
+    "message": "<config>: commands.advisory_watch must be a name, not null"
+  },
+  {
+    "key": "commands.push_checkout",
+    "given": {
+      "commands": {
+        "push_checkout": false
+      }
+    },
+    "message": "<config>: commands.push_checkout must be a name, not false"
+  },
+  {
+    "key": "commands.push_checkout",
+    "given": {
+      "commands": {
+        "push_checkout": null
+      }
+    },
+    "message": "<config>: commands.push_checkout must be a name, not null"
+  },
+  {
+    "key": "commands.push_checks",
+    "given": {
+      "commands": {
+        "push_checks": false
+      }
+    },
+    "message": "<config>: commands.push_checks must be a name, not false"
+  },
+  {
+    "key": "commands.push_checks",
+    "given": {
+      "commands": {
+        "push_checks": null
+      }
+    },
+    "message": "<config>: commands.push_checks must be a name, not null"
+  },
+  {
+    "key": "checks",
+    "given": {
+      "checks": false
+    },
+    "message": "<config>: checks. must be an object"
+  },
+  {
+    "key": "checks",
+    "given": {
+      "checks": null
+    },
+    "message": "<config>: checks. must be an object"
+  },
+  {
+    "key": "checks",
+    "given": {
+      "checks": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key checks.aaa_unknown, checks.zzz_unknown"
+  },
+  {
+    "key": "checks.ci_result",
+    "given": {
+      "checks": {
+        "ci_result": false
+      }
+    },
+    "message": "<config>: checks.ci_result must be a name, not false"
+  },
+  {
+    "key": "checks.ci_result",
+    "given": {
+      "checks": {
+        "ci_result": null
+      }
+    },
+    "message": "<config>: checks.ci_result must be a name, not null"
+  },
+  {
+    "key": "checks.ci_plan",
+    "given": {
+      "checks": {
+        "ci_plan": false
+      }
+    },
+    "message": "<config>: checks.ci_plan must be a name, not false"
+  },
+  {
+    "key": "checks.ci_plan",
+    "given": {
+      "checks": {
+        "ci_plan": null
+      }
+    },
+    "message": "<config>: checks.ci_plan must be a name, not null"
+  },
+  {
+    "key": "checks.e2e_plan",
+    "given": {
+      "checks": {
+        "e2e_plan": false
+      }
+    },
+    "message": "<config>: checks.e2e_plan must be a name, not false"
+  },
+  {
+    "key": "checks.e2e_plan",
+    "given": {
+      "checks": {
+        "e2e_plan": null
+      }
+    },
+    "message": "<config>: checks.e2e_plan must be a name, not null"
+  },
+  {
+    "key": "checks.images",
+    "given": {
+      "checks": {
+        "images": false
+      }
+    },
+    "message": "<config>: checks.images must be a name, not false"
+  },
+  {
+    "key": "checks.images",
+    "given": {
+      "checks": {
+        "images": null
+      }
+    },
+    "message": "<config>: checks.images must be a name, not null"
+  },
+  {
+    "key": "checks.dependency_audit",
+    "given": {
+      "checks": {
+        "dependency_audit": false
+      }
+    },
+    "message": "<config>: checks.dependency_audit must be a name, not false"
+  },
+  {
+    "key": "checks.dependency_audit",
+    "given": {
+      "checks": {
+        "dependency_audit": null
+      }
+    },
+    "message": "<config>: checks.dependency_audit must be a name, not null"
+  },
+  {
+    "key": "checks.advisory_annotation",
+    "given": {
+      "checks": {
+        "advisory_annotation": false
+      }
+    },
+    "message": "<config>: checks.advisory_annotation must be a name, not false"
+  },
+  {
+    "key": "checks.advisory_annotation",
+    "given": {
+      "checks": {
+        "advisory_annotation": null
+      }
+    },
+    "message": "<config>: checks.advisory_annotation must be a name, not null"
+  },
+  {
+    "key": "checks.prefix_only",
+    "given": {
+      "checks": {
+        "prefix_only": false
+      }
+    },
+    "message": "<config>: checks.prefix_only must be a list of names"
+  },
+  {
+    "key": "checks.prefix_only",
+    "given": {
+      "checks": {
+        "prefix_only": null
+      }
+    },
+    "message": "<config>: checks.prefix_only must be a list of names"
+  },
+  {
+    "key": "annotations",
+    "given": {
+      "annotations": false
+    },
+    "message": "<config>: annotations. must be an object"
+  },
+  {
+    "key": "annotations",
+    "given": {
+      "annotations": null
+    },
+    "message": "<config>: annotations. must be an object"
+  },
+  {
+    "key": "annotations",
+    "given": {
+      "annotations": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key annotations.aaa_unknown, annotations.zzz_unknown"
+  },
+  {
+    "key": "annotations.merge_tested",
+    "given": {
+      "annotations": {
+        "merge_tested": false
+      }
+    },
+    "message": "<config>: annotations.merge_tested must be a name, not false"
+  },
+  {
+    "key": "annotations.merge_tested",
+    "given": {
+      "annotations": {
+        "merge_tested": null
+      }
+    },
+    "message": "<config>: annotations.merge_tested must be a name, not null"
+  },
+  {
+    "key": "annotations.files_tested",
+    "given": {
+      "annotations": {
+        "files_tested": false
+      }
+    },
+    "message": "<config>: annotations.files_tested must be a name, not false"
+  },
+  {
+    "key": "annotations.files_tested",
+    "given": {
+      "annotations": {
+        "files_tested": null
+      }
+    },
+    "message": "<config>: annotations.files_tested must be a name, not null"
+  },
+  {
+    "key": "annotations.server_tests",
+    "given": {
+      "annotations": {
+        "server_tests": false
+      }
+    },
+    "message": "<config>: annotations.server_tests must be a name, not false"
+  },
+  {
+    "key": "annotations.server_tests",
+    "given": {
+      "annotations": {
+        "server_tests": null
+      }
+    },
+    "message": "<config>: annotations.server_tests must be a name, not null"
+  },
+  {
+    "key": "annotations.web_suite",
+    "given": {
+      "annotations": {
+        "web_suite": false
+      }
+    },
+    "message": "<config>: annotations.web_suite must be a name, not false"
+  },
+  {
+    "key": "annotations.web_suite",
+    "given": {
+      "annotations": {
+        "web_suite": null
+      }
+    },
+    "message": "<config>: annotations.web_suite must be a name, not null"
+  },
+  {
+    "key": "annotations.browser_suite",
+    "given": {
+      "annotations": {
+        "browser_suite": false
+      }
+    },
+    "message": "<config>: annotations.browser_suite must be a name, not false"
+  },
+  {
+    "key": "annotations.browser_suite",
+    "given": {
+      "annotations": {
+        "browser_suite": null
+      }
+    },
+    "message": "<config>: annotations.browser_suite must be a name, not null"
+  },
+  {
+    "key": "workflows",
+    "given": {
+      "workflows": false
+    },
+    "message": "<config>: workflows. must be an object"
+  },
+  {
+    "key": "workflows",
+    "given": {
+      "workflows": null
+    },
+    "message": "<config>: workflows. must be an object"
+  },
+  {
+    "key": "workflows",
+    "given": {
+      "workflows": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key workflows.aaa_unknown, workflows.zzz_unknown"
+  },
+  {
+    "key": "workflows.ci",
+    "given": {
+      "workflows": {
+        "ci": false
+      }
+    },
+    "message": "<config>: workflows.ci must be a name, not false"
+  },
+  {
+    "key": "workflows.ci",
+    "given": {
+      "workflows": {
+        "ci": null
+      }
+    },
+    "message": "<config>: workflows.ci must be a name, not null"
+  },
+  {
+    "key": "workflows.e2e",
+    "given": {
+      "workflows": {
+        "e2e": false
+      }
+    },
+    "message": "<config>: workflows.e2e must be a name, not false"
+  },
+  {
+    "key": "workflows.e2e",
+    "given": {
+      "workflows": {
+        "e2e": null
+      }
+    },
+    "message": "<config>: workflows.e2e must be a name, not null"
+  },
+  {
+    "key": "workflows.images",
+    "given": {
+      "workflows": {
+        "images": false
+      }
+    },
+    "message": "<config>: workflows.images must be a name, not false"
+  },
+  {
+    "key": "workflows.images",
+    "given": {
+      "workflows": {
+        "images": null
+      }
+    },
+    "message": "<config>: workflows.images must be a name, not null"
+  },
+  {
+    "key": "labels",
+    "given": {
+      "labels": false
+    },
+    "message": "<config>: labels. must be an object"
+  },
+  {
+    "key": "labels",
+    "given": {
+      "labels": null
+    },
+    "message": "<config>: labels. must be an object"
+  },
+  {
+    "key": "labels",
+    "given": {
+      "labels": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key labels.aaa_unknown, labels.zzz_unknown"
+  },
+  {
+    "key": "labels.workflow",
+    "given": {
+      "labels": {
+        "workflow": false
+      }
+    },
+    "message": "<config>: labels.workflow must be a name, not false"
+  },
+  {
+    "key": "labels.workflow",
+    "given": {
+      "labels": {
+        "workflow": null
+      }
+    },
+    "message": "<config>: labels.workflow must be a name, not null"
+  },
+  {
+    "key": "labels.audited",
+    "given": {
+      "labels": {
+        "audited": false
+      }
+    },
+    "message": "<config>: labels.audited must be a name, not false"
+  },
+  {
+    "key": "labels.audited",
+    "given": {
+      "labels": {
+        "audited": null
+      }
+    },
+    "message": "<config>: labels.audited must be a name, not null"
+  },
+  {
+    "key": "labels.priority",
+    "given": {
+      "labels": {
+        "priority": false
+      }
+    },
+    "message": "<config>: labels.priority. must be an object"
+  },
+  {
+    "key": "labels.priority",
+    "given": {
+      "labels": {
+        "priority": null
+      }
+    },
+    "message": "<config>: labels.priority. must be an object"
+  },
+  {
+    "key": "labels.priority",
+    "given": {
+      "labels": {
+        "priority": {
+          "zzz_unknown": 0,
+          "aaa_unknown": 0
+        }
+      }
+    },
+    "message": "<config>: unknown key labels.priority.aaa_unknown, labels.priority.zzz_unknown"
+  },
+  {
+    "key": "labels.priority.blocker",
+    "given": {
+      "labels": {
+        "priority": {
+          "blocker": false
+        }
+      }
+    },
+    "message": "<config>: labels.priority.blocker must be a name, not false"
+  },
+  {
+    "key": "labels.priority.blocker",
+    "given": {
+      "labels": {
+        "priority": {
+          "blocker": null
+        }
+      }
+    },
+    "message": "<config>: labels.priority.blocker must be a name, not null"
+  },
+  {
+    "key": "labels.priority.high",
+    "given": {
+      "labels": {
+        "priority": {
+          "high": false
+        }
+      }
+    },
+    "message": "<config>: labels.priority.high must be a name, not false"
+  },
+  {
+    "key": "labels.priority.high",
+    "given": {
+      "labels": {
+        "priority": {
+          "high": null
+        }
+      }
+    },
+    "message": "<config>: labels.priority.high must be a name, not null"
+  },
+  {
+    "key": "labels.priority.medium",
+    "given": {
+      "labels": {
+        "priority": {
+          "medium": false
+        }
+      }
+    },
+    "message": "<config>: labels.priority.medium must be a name, not false"
+  },
+  {
+    "key": "labels.priority.medium",
+    "given": {
+      "labels": {
+        "priority": {
+          "medium": null
+        }
+      }
+    },
+    "message": "<config>: labels.priority.medium must be a name, not null"
+  },
+  {
+    "key": "labels.priority.low",
+    "given": {
+      "labels": {
+        "priority": {
+          "low": false
+        }
+      }
+    },
+    "message": "<config>: labels.priority.low must be a name, not false"
+  },
+  {
+    "key": "labels.priority.low",
+    "given": {
+      "labels": {
+        "priority": {
+          "low": null
+        }
+      }
+    },
+    "message": "<config>: labels.priority.low must be a name, not null"
+  },
+  {
+    "key": "runner",
+    "given": {
+      "runner": false
+    },
+    "message": "<config>: runner. must be an object"
+  },
+  {
+    "key": "runner",
+    "given": {
+      "runner": null
+    },
+    "message": "<config>: runner. must be an object"
+  },
+  {
+    "key": "runner",
+    "given": {
+      "runner": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key runner.aaa_unknown, runner.zzz_unknown"
+  },
+  {
+    "key": "runner.labels",
+    "given": {
+      "runner": {
+        "labels": false
+      }
+    },
+    "message": "<config>: runner.labels must be a list of names"
+  },
+  {
+    "key": "runner.labels",
+    "given": {
+      "runner": {
+        "labels": null
+      }
+    },
+    "message": "<config>: runner.labels must be a list of names"
+  },
+  {
+    "key": "runner.identity_folder",
+    "given": {
+      "runner": {
+        "identity_folder": false
+      }
+    },
+    "message": "<config>: runner.identity_folder must be a name, not false"
+  },
+  {
+    "key": "runner.identity_folder",
+    "given": {
+      "runner": {
+        "identity_folder": null
+      }
+    },
+    "message": "<config>: runner.identity_folder must be a name, not null"
+  },
+  {
+    "key": "runner.prefix",
+    "given": {
+      "runner": {
+        "prefix": false
+      }
+    },
+    "message": "<config>: runner.prefix must be a name, not false"
+  },
+  {
+    "key": "runner.prefix",
+    "given": {
+      "runner": {
+        "prefix": null
+      }
+    },
+    "message": "<config>: runner.prefix must be a name, not null"
+  },
+  {
+    "key": "runner.label",
+    "given": {
+      "runner": {
+        "label": false
+      }
+    },
+    "message": "<config>: runner.label must be a name, not false"
+  },
+  {
+    "key": "runner.label",
+    "given": {
+      "runner": {
+        "label": null
+      }
+    },
+    "message": "<config>: runner.label must be a name, not null"
+  },
+  {
+    "key": "runner.planner_label",
+    "given": {
+      "runner": {
+        "planner_label": false
+      }
+    },
+    "message": "<config>: runner.planner_label must be a name, not false"
+  },
+  {
+    "key": "runner.planner_label",
+    "given": {
+      "runner": {
+        "planner_label": null
+      }
+    },
+    "message": "<config>: runner.planner_label must be a name, not null"
+  },
+  {
+    "key": "runner.image_build",
+    "given": {
+      "runner": {
+        "image_build": false
+      }
+    },
+    "message": "<config>: runner.image_build must be a name, not false"
+  },
+  {
+    "key": "runner.image_build",
+    "given": {
+      "runner": {
+        "image_build": null
+      }
+    },
+    "message": "<config>: runner.image_build must be a name, not null"
+  },
+  {
+    "key": "runner.hub_cache",
+    "given": {
+      "runner": {
+        "hub_cache": false
+      }
+    },
+    "message": "<config>: runner.hub_cache must be a name, not false"
+  },
+  {
+    "key": "runner.hub_cache",
+    "given": {
+      "runner": {
+        "hub_cache": null
+      }
+    },
+    "message": "<config>: runner.hub_cache must be a name, not null"
+  },
+  {
+    "key": "merge",
+    "given": {
+      "merge": false
+    },
+    "message": "<config>: merge. must be an object"
+  },
+  {
+    "key": "merge",
+    "given": {
+      "merge": null
+    },
+    "message": "<config>: merge. must be an object"
+  },
+  {
+    "key": "merge",
+    "given": {
+      "merge": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key merge.aaa_unknown, merge.zzz_unknown"
+  },
+  {
+    "key": "merge.scratch_prefix",
+    "given": {
+      "merge": {
+        "scratch_prefix": false
+      }
+    },
+    "message": "<config>: merge.scratch_prefix must be a name, not false"
+  },
+  {
+    "key": "merge.scratch_prefix",
+    "given": {
+      "merge": {
+        "scratch_prefix": null
+      }
+    },
+    "message": "<config>: merge.scratch_prefix must be a name, not null"
+  },
+  {
+    "key": "parity",
+    "given": {
+      "parity": false
+    },
+    "message": "<config>: parity. must be an object"
+  },
+  {
+    "key": "parity",
+    "given": {
+      "parity": null
+    },
+    "message": "<config>: parity. must be an object"
+  },
+  {
+    "key": "parity",
+    "given": {
+      "parity": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key parity.aaa_unknown, parity.zzz_unknown"
+  },
+  {
+    "key": "parity.workflow_tests",
+    "given": {
+      "parity": {
+        "workflow_tests": false
+      }
+    },
+    "message": "<config>: parity.workflow_tests must be a name, not false"
+  },
+  {
+    "key": "parity.workflow_tests",
+    "given": {
+      "parity": {
+        "workflow_tests": null
+      }
+    },
+    "message": "<config>: parity.workflow_tests must be a name, not null"
+  },
+  {
+    "key": "parity.runner_tests",
+    "given": {
+      "parity": {
+        "runner_tests": false
+      }
+    },
+    "message": "<config>: parity.runner_tests must be a name, not false"
+  },
+  {
+    "key": "parity.runner_tests",
+    "given": {
+      "parity": {
+        "runner_tests": null
+      }
+    },
+    "message": "<config>: parity.runner_tests must be a name, not null"
+  },
+  {
+    "key": "parity.known",
+    "given": {
+      "parity": {
+        "known": false
+      }
+    },
+    "message": "<config>: parity.known must be a name, not false"
+  },
+  {
+    "key": "parity.known",
+    "given": {
+      "parity": {
+        "known": null
+      }
+    },
+    "message": "<config>: parity.known must be a name, not null"
+  },
+  {
+    "key": "machines",
+    "given": {
+      "machines": false
+    },
+    "message": "<config>: machines must be a list of machines"
+  },
+  {
+    "key": "machines",
+    "given": {
+      "machines": null
+    },
+    "message": "<config>: machines must be a list of machines"
+  },
+  {
+    "key": "hunts",
+    "given": {
+      "hunts": false
+    },
+    "message": "<config>: hunts. must be an object"
+  },
+  {
+    "key": "hunts",
+    "given": {
+      "hunts": null
+    },
+    "message": "<config>: hunts. must be an object"
+  },
+  {
+    "key": "hunts",
+    "given": {
+      "hunts": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key hunts.aaa_unknown, hunts.zzz_unknown"
+  },
+  {
+    "key": "hunts.areas",
+    "given": {
+      "hunts": {
+        "areas": false
+      }
+    },
+    "message": "<config>: hunts.areas must be an object of area names to screens"
+  },
+  {
+    "key": "hunts.areas",
+    "given": {
+      "hunts": {
+        "areas": null
+      }
+    },
+    "message": "<config>: hunts.areas must be an object of area names to screens"
+  },
+  {
+    "key": "hunts.plans",
+    "given": {
+      "hunts": {
+        "plans": false
+      }
+    },
+    "message": "<config>: hunts.plans must be a name, not false"
+  },
+  {
+    "key": "hunts.plans",
+    "given": {
+      "hunts": {
+        "plans": null
+      }
+    },
+    "message": "<config>: hunts.plans must be a name, not null"
+  },
+  {
+    "key": "hot_paths",
+    "given": {
+      "hot_paths": false
+    },
+    "message": "<config>: hot_paths must be a list of paths"
+  },
+  {
+    "key": "hot_paths",
+    "given": {
+      "hot_paths": null
+    },
+    "message": "<config>: hot_paths must be a list of paths"
+  },
+  {
+    "key": "conflict_review",
+    "given": {
+      "conflict_review": false
+    },
+    "message": "<config>: conflict_review must be an object"
+  },
+  {
+    "key": "conflict_review",
+    "given": {
+      "conflict_review": null
+    },
+    "message": "<config>: conflict_review must be an object"
+  },
+  {
+    "key": "review",
+    "given": {
+      "review": false
+    },
+    "message": "<config>: review. must be an object"
+  },
+  {
+    "key": "review",
+    "given": {
+      "review": null
+    },
+    "message": "<config>: review. must be an object"
+  },
+  {
+    "key": "review",
+    "given": {
+      "review": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key review.aaa_unknown, review.zzz_unknown"
+  },
+  {
+    "key": "review.high_effort_paths",
+    "given": {
+      "review": {
+        "high_effort_paths": false
+      }
+    },
+    "message": "<config>: review.high_effort_paths must be a list of names"
+  },
+  {
+    "key": "review.high_effort_paths",
+    "given": {
+      "review": {
+        "high_effort_paths": null
+      }
+    },
+    "message": "<config>: review.high_effort_paths must be a list of names"
+  },
+  {
+    "key": "merge_train",
+    "given": {
+      "merge_train": false
+    },
+    "message": "<config>: merge_train. must be an object"
+  },
+  {
+    "key": "merge_train",
+    "given": {
+      "merge_train": null
+    },
+    "message": "<config>: merge_train. must be an object"
+  },
+  {
+    "key": "merge_train",
+    "given": {
+      "merge_train": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key merge_train.aaa_unknown, merge_train.zzz_unknown"
+  },
+  {
+    "key": "merge_train.queued_limit_minutes",
+    "given": {
+      "merge_train": {
+        "queued_limit_minutes": false
+      }
+    },
+    "message": "<config>: merge_train.queued_limit_minutes must be a whole number from 0 to 1440, not false"
+  },
+  {
+    "key": "merge_train.queued_limit_minutes",
+    "given": {
+      "merge_train": {
+        "queued_limit_minutes": null
+      }
+    },
+    "message": "<config>: merge_train.queued_limit_minutes must be a whole number from 0 to 1440, not null"
+  },
+  {
+    "key": "answer_for_owner_after_minutes",
+    "given": {
+      "answer_for_owner_after_minutes": false
+    },
+    "message": "<config>: answer_for_owner_after_minutes must be a whole number from 0 to 1440, not false"
+  },
+  {
+    "key": "answer_for_owner_after_minutes",
+    "given": {
+      "answer_for_owner_after_minutes": null
+    },
+    "message": "<config>: answer_for_owner_after_minutes must be a whole number from 0 to 1440, not null"
+  },
+  {
+    "key": "cloud_wake_after_minutes",
+    "given": {
+      "cloud_wake_after_minutes": false
+    },
+    "message": "<config>: cloud_wake_after_minutes must be a whole number from 0 to 1440, not false"
+  },
+  {
+    "key": "cloud_wake_after_minutes",
+    "given": {
+      "cloud_wake_after_minutes": null
+    },
+    "message": "<config>: cloud_wake_after_minutes must be a whole number from 0 to 1440, not null"
+  },
+  {
+    "key": "cloud_pre_push",
+    "given": {
+      "cloud_pre_push": false
+    },
+    "message": "<config>: cloud_pre_push. must be an object"
+  },
+  {
+    "key": "cloud_pre_push",
+    "given": {
+      "cloud_pre_push": null
+    },
+    "message": "<config>: cloud_pre_push. must be an object"
+  },
+  {
+    "key": "cloud_pre_push",
+    "given": {
+      "cloud_pre_push": {
+        "zzz_unknown": 0,
+        "aaa_unknown": 0
+      }
+    },
+    "message": "<config>: unknown key cloud_pre_push.aaa_unknown, cloud_pre_push.zzz_unknown"
+  },
+  {
+    "key": "cloud_pre_push.suites",
+    "given": {
+      "cloud_pre_push": {
+        "suites": false
+      }
+    },
+    "message": "<config>: cloud_pre_push.suites must be an object"
+  },
+  {
+    "key": "cloud_pre_push.suites",
+    "given": {
+      "cloud_pre_push": {
+        "suites": null
+      }
+    },
+    "message": "<config>: cloud_pre_push.suites must be an object"
+  },
+  {
+    "key": "commands.browser_tests_for_changes",
+    "given": {
+      "commands": {
+        "browser_tests_for_changes": {
+          "run": "tools/select",
+          "form": "lines",
+          "unknown": 0
+        }
+      }
+    },
+    "message": "<config>: unknown key commands.browser_tests_for_changes.unknown"
+  },
+  {
+    "key": "machines",
+    "given": {
+      "machines": [
+        {
+          "name": "example",
+          "unknown": 0
+        }
+      ]
+    },
+    "message": "<config>: unknown key machines.unknown"
+  },
+  {
+    "key": "cloud_pre_push.suites",
+    "given": {
+      "cloud_pre_push": {
+        "suites": {
+          "example": {
+            "unknown": 0
+          }
+        }
+      }
+    },
+    "message": "<config>: unknown key cloud_pre_push.suites.example.unknown"
+  },
+  {
+    "key": "conflict_review",
+    "given": {
+      "conflict_review": {
+        "unknown": 0
+      }
+    },
+    "message": "<config>: unknown key conflict_review.unknown"
+  }
+]

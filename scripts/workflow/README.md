@@ -101,41 +101,78 @@ it names one. Programs and a `parity.known` file can live there. Relative progra
 use the main checkout first, then the installation folder; an `@install/` prefix uses only the
 installation folder, even if the checkout has a file of the same name.
 
-| Key | What it names | Default |
-| --- | --- | --- |
-| `repository` | `owner/name` on GitHub | `repository` as Bash reads it from `.github/runner/settings.sh` (sourced in a `bash` of its own, with only `PATH` and `HOME`, for at most 5 seconds), else the `origin` remote on GitHub; a script that needs it stops when neither names one |
-| `install_folder` | the folder of installation programs; absolute, or relative to the selected config file | the parent of an external config; none for a checkout config |
-| `state_folder` | the folder of the workflow's notes, in the main checkout and in each worktree | `.local/workflow` |
-| `worktree_setup` | the command that prepares a new worktree, run only when present | `scripts/setup-worktree` |
-| `refresh.clear_generated` | generated output a refresh clears in the pull request's worktree after it merges main and before it pushes: paths or globs (`*`, `?`, `[…]`, `**`) from the top of the checkout; only the ignored, untracked files under them are removed, and a path that is tracked, not ignored, outside the checkout or through a symbolic link is refused when the file is read | none: nothing is cleared |
-| `checks.ci_result` | the check that sums up CI | `CI result` |
-| `checks.ci_plan`, `checks.e2e_plan` | the planner checks of CI and of the browser suite | `CI: what to run`, `E2E: what to run` |
-| `checks.images` | the prefix of every image check; its planner is `<prefix>: what to run` | `Docker images` |
-| `checks.dependency_audit` | the job that audits the dependencies against published advisories | none: `CI: dependencies` |
-| `checks.advisory_annotation` | the title of the notice the audit writes on main when advisories alone failed it, a JSON list of `<advisory> in <package> (<summary>)`. With it, main failing only on such an advisory is `advisory`, not red, and the line keeps merging | none: an advisory makes main red |
-| `annotations.*` | the titles of the planners' annotations the merge gate reads: `merge_tested`, `files_tested`, `server_tests`, `web_suite`, `browser_suite` | `Merge tested`, `Files tested`, `Server tests`, `Web suite`, `Browser suite` |
-| `workflows.ci`, `workflows.e2e`, `workflows.images` | the workflow files under `.github/workflows/` | `ci.yml`, `e2e.yml`, `images.yml` |
-| `labels.workflow`, `labels.audited` | the label that starts a ticket, and an audit's | `workflow`, `audited` |
-| `labels.priority.blocker` … `.low` | the four priority labels | `priority: blocker` … `priority: low` |
-| `runner.labels` | the runner labels the merge gate may re-run failed jobs on | the ones built from `runner.label`: `<label>`, `<label>-standby`, `<label>-first`, `<label>-main`, `<label>-main-batch`, `<label>-docker`, and `runner.planner_label`; without a label, none: the gate re-runs nothing. A file that names its own lists `<label>-main-batch` too, or the gate re-runs no job of the merge line's lane |
-| `runner.label` | the base label every machine's runners carry, so GitHub gives a job to whichever machine has one free (`runner/README.md`) | `<prefix>-home`; none without a prefix |
-| `runner.planner_label` | the label the CI planner's runner carries | `<label>-planner` |
-| `runner.prefix` | the one word the runner pool (`runner/`) names everything by: its images, network, services and containers, `<prefix>-runner…`, and its labels; `workflow-metrics` reads the CPU of the `<prefix>-runner…` services and containers | none: no runner figures |
-| `runner.image_build` | the command line, run on main's files, that builds the runner images `<prefix>-runner` and `<prefix>-runner-docker` | none: the runner pool cannot be installed |
-| `runner.hub_cache` | the command line, run on main's files, that runs the Docker Hub cache of the Docker-capable runners | none: no cache, and their virtual machines pull from Docker Hub |
-| `runner.identity_folder` | the runner programs' own GitHub identity (`github_identity.py`); a copy of it installed without `workflow_config.py` beside it reads the folder from the `identity-folder` file beside it, which `runner/install.sh` writes, else uses the default | `~/.config/shipline-runner` |
-| `merge.scratch_prefix` | the beginning of the merge gate's scratch branches, ended by `-` or `/`: the gate tests each prefix on one, named by this and 32 hexadecimal digits, and deletes only branches that begin with it, never one that only ends like them; in the example workflows the gate's first run of a prefix there takes the merge line's lane on main's runners when its planner claims one free | `workflow/merge-batch-` |
-| `machines` | the machines `flow-page` samples for load and memory: a `name` each and, for another machine, the `address` `ssh` reaches it at (a destination, never a word starting with `-`); one without an address is this machine | none: only this machine |
-| `hunts.areas` | the areas of the application two hunts may keep to at once: an object of each area's name (small letters, digits and dashes) to its screens, paths starting with `/` without a space, comma, quotation mark, dollar, backtick or backslash | none: one hunt runs at a time, on every screen |
-| `hunts.plans` | the repository's file of hunt plans, which the sentence of a hunt with a plan names | none: the sentence names no file |
-| `commands.test` | the command line that runs the repository's tests, from the root of its checkout: CI's test job runs it (`ci_proof.py test`), with the job's own arguments after it | none: the test job fails, saying so |
-| `commands.browser` | the command line that runs the repository's browser tests, from the root of its checkout: E2E's `playwright` job runs it (`ci_proof.py browser`), with the job's own arguments after it | none: the browser job fails, saying so |
-| `commands.*`, the others | the repository's own commands and answer forms Shipline calls (below) | none |
-| `review.high_effort_paths` | regular expressions searched for in every path a pull request changes, both sides of a rename or deletion; a match runs its independent reviewer at high effort, not medium (`review-effort N`): stored data, text sent to a model, background work, locks and queues, account boundaries and security | none: only Shipline's own concurrent scripts and a description with the line `Review: high` |
-| `answer_for_owner_after_minutes` | how long a question to the owner marked `Owner only: no` waits before the tick types its recommended reply (see `RULES.md`, "Asking the owner"); `0` turns that off, and it is at most `1440`, a day | `15` |
-| `cloud_wake_after_minutes` | the minutes without a push or a report after which the tick wakes a cloud worker by typing into its session; `0` never does | `30` |
-| `hot_paths` | path patterns of the few files many tickets edit, by GitHub's path filter rules (`*` stays inside a folder, `**` crosses folders): two tickets whose files match the same one never run at once, a pull request waiting in the merge line counting as running, and the merge line serves members sharing one back to back within their priority | none |
-| `conflict_review` | `{"effort": ..., "model": ..., "max_changed_lines": N}`: the reviewer of a conflict on a handed-off pull request whose conflicting hunks, and then whose resolution, stay within `N` lines of the conflicting files and touch no other file; a larger one gets the usual reviewer | none: Claude Opus at high effort for every conflict |
+<!-- shipline-config:start -->
+| Key | Kind | What it names | Default |
+| --- | --- | --- | --- |
+| `annotations.browser_suite` | name | The browser suite annotation title read by the merge gate. | `"Browser suite"` |
+| `annotations.files_tested` | name | The tested tree annotation title read by the merge gate. | `"Files tested"` |
+| `annotations.merge_tested` | name | The tested merge annotation title read by the merge gate. | `"Merge tested"` |
+| `annotations.server_tests` | name | The server tests annotation title read by the merge gate. | `"Server tests"` |
+| `annotations.web_suite` | name | The web suite annotation title read by the merge gate. | `"Web suite"` |
+| `answer_for_owner_after_minutes` | minutes | Minutes before the tick answers a question marked Owner only: no; 0 disables it, at most 1440. | `15` |
+| `checks.advisory_annotation` | name | The advisory notice title on main; omitted means advisories make main red. | none |
+| `checks.ci_plan` | name | The CI planner check name. | `"CI: what to run"` |
+| `checks.ci_result` | name | The check that sums up CI. | `"CI result"` |
+| `checks.dependency_audit` | name | The dependency audit job name; omitted means CI: dependencies. | none |
+| `checks.e2e_plan` | name | The browser suite planner check name. | `"E2E: what to run"` |
+| `checks.images` | name | The prefix of image checks; its planner appends : what to run. | `"Docker images"` |
+| `checks.prefix_only` | names | Distinct groups run only in merge prefixes: images, browser_whole and server_whole. | `[]` |
+| `cloud_pre_push.suites` | suites | Named cloud pre-push suites with select, run, workers and optional part and probe commands. | `{}` |
+| `cloud_wake_after_minutes` | minutes | Minutes without a push or report before a cloud worker is woken; 0 disables it. | `30` |
+| `commands.advisory_watch` | command | The command that detects an advisory service outage and checks whether the service answers again. | none |
+| `commands.browser` | command | The repository browser test command run by bash from the checkout with the E2E job's arguments. | none |
+| `commands.browser_plan` | command | The command that reads NUL-ended changed paths and prints needed or none. | none |
+| `commands.browser_tests_for_changes` | command | The command that selects browser spec paths for a changed base. | none |
+| `commands.hunt_app` | command | The command that manages the application under a hunt, including stop. | none |
+| `commands.hunt_browser` | command | The browser command named in a hunt sentence. | none |
+| `commands.hunt_cursor` | command | The command that starts a Cursor hunt with its worktree, report folder and sentence. | none |
+| `commands.mechanical_conflicts` | command | The command that resolves conflicts, renumbers files and reports taken numbers. | none |
+| `commands.pre_train_checks` | command | The checks run before a pull request is admitted to the merge train. | none |
+| `commands.push_checkout` | command | The command that installs changed checkout files and explains a failed push hook. | none |
+| `commands.push_checks` | command | The checks run by the repository's pre-push hook. | none |
+| `commands.server_tests_for_changes` | command | The command that selects server tests and returns whole, tests, total and reasons. | none |
+| `commands.test` | command | The repository test command run by bash from the checkout with the CI job's arguments. | none |
+| `conflict_review` | conflict | The effort, model and max_changed_lines for a small handed-off conflict; omitted means the usual reviewer. | none |
+| `hot_paths` | paths | GitHub path patterns whose matching tickets run separately and merge back to back within their priority. | `[]` |
+| `hunts.areas` | areas | Area names mapped to lists of screen paths; omitted means one hunt runs on every screen. | `{}` |
+| `hunts.plans` | name | The checkout path of hunt plans named in a hunt sentence. | none |
+| `install_folder` | name | The installation folder, resolved against the selected file; external configs use their parent when omitted. | none |
+| `labels.audited` | name | The label that marks an audit. | `"audited"` |
+| `labels.priority.blocker` | name | The blocker priority label. | `"priority: blocker"` |
+| `labels.priority.high` | name | The high priority label. | `"priority: high"` |
+| `labels.priority.low` | name | The low priority label. | `"priority: low"` |
+| `labels.priority.medium` | name | The medium priority label. | `"priority: medium"` |
+| `labels.workflow` | name | The label that starts a ticket. | `"workflow"` |
+| `machines` | machines | Machines sampled by flow-page, each with a name and optional SSH address; omitted samples this machine. | `[]` |
+| `merge.scratch_prefix` | name | The beginning of scratch branch names for tested merge prefixes, ended by - or /. | `"workflow/merge-batch-"` |
+| `merge_train.queued_limit_minutes` | minutes | Minutes a scratch CI run may remain queued before its wait is bounded. | `20` |
+| `parity.known` | name | The expected differences file read by tools/parity; @install/ requires an installation folder. | none |
+| `parity.runner_tests` | name | The runner tests folder compared by tools/parity. | `"tests/runner"` |
+| `parity.workflow_tests` | name | The workflow tests folder compared by tools/parity. | `"tests/workflow"` |
+| `refresh.clear_generated` | names | Ignored, untracked generated paths or globs cleared after a refresh; tracked paths, links and paths outside the checkout are refused. | `[]` |
+| `repository` | name | The GitHub repository as owner/name; discovered from runner settings, then origin when omitted. | none |
+| `review.high_effort_paths` | names | Regular expressions selecting changed paths for an independent review at high effort. | `[]` |
+| `runner.hub_cache` | name | The command running the Docker Hub cache; omitted means direct pulls. | none |
+| `runner.identity_folder` | name | The folder holding the runner programs' own GitHub identity. | `"~/.config/shipline-runner"` |
+| `runner.image_build` | name | The command that builds runner images; omitted means the pool cannot be installed. | none |
+| `runner.label` | name | The base runner label; derived as <prefix>-home when omitted. | none |
+| `runner.labels` | names | The runner labels eligible for failed-job reruns; derived from the base label when omitted. | `[]` |
+| `runner.planner_label` | name | The planner runner label; derived as <label>-planner when omitted. | none |
+| `runner.prefix` | name | The word naming runner images, services, network and containers; omitted means no runner figures. | none |
+| `state_folder` | name | The folder of workflow notes in the main checkout and each worktree. | `".local/workflow"` |
+| `workflows.ci` | name | The CI workflow file under .github/workflows/. | `"ci.yml"` |
+| `workflows.e2e` | name | The browser workflow file under .github/workflows/. | `"e2e.yml"` |
+| `workflows.images` | name | The image workflow file under .github/workflows/. | `"images.yml"` |
+| `worktree_setup` | name | The command that prepares a new worktree, run only when present. | `"scripts/setup-worktree"` |
+<!-- shipline-config:end -->
+
+To add a configuration key, add one `option(...)` field in its dataclass section in
+`workflow_config.py`, sorted by key name. Its kind selects validation; its default, meaning
+and optional example generate the tables and example file. A new section uses `section()`.
+Run `python3 scripts/workflow/workflow_config.py docs --write` and commit the generated files;
+CI checks that they are current. Shell exports use the field's `shell=(position, name)` metadata;
+keep existing positions, and give new exports an unused position to preserve the interface.
+Defaults in the table apply to omitted keys; `none` means no configured value.
 
 Change `merge.scratch_prefix` only while the merge line is empty: the gate deletes, and cancels
 the runs of, only the scratch branches of the prefix it reads, so those of the old one would stay.
@@ -196,18 +233,23 @@ not have, and Shipline does without it; a command it names but that cannot start
 call. A session runs one as `shipline <command>`, the name with dashes
 (`shipline browser-tests-for-changes origin/main`).
 
+<!-- shipline-commands:start -->
 | Command | Called by, with | Answers | Without it |
 | --- | --- | --- | --- |
-| `browser_tests_for_changes` | the review panel in a conflict round, and sessions: `<base> [--files-from <file>]` and the session's own words | the browser specs the change reaches, one path a line | nothing is selected, and CI runs the whole browser suite |
-| `server_tests_for_changes` | the same: `<base> [--files-from <file>]` | one JSON object, `{"whole": bool, "tests": [paths], "total": int, "reasons": [str]}` | the whole server suite: `{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}` |
-| `pre_train_checks` | the merge gate, before a pull request joins the merge train, in its worktree | exits non-zero when a check failed; what it prints is shown | every pull request is admitted |
-| `mechanical_conflicts` | the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch | `resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line (paths without spaces), or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took | every conflict is left to the session, nothing is renumbered and main took no number |
-| `browser_plan` | the merge gate: the changed paths on standard input, each ended by a NUL | prints `needed` or `none` and exits 0; anything else, a crash or another exit included, counts as needed | every merge that changes a file needs browser tests while the merged tree holds the E2E workflow (`workflows.e2e`), and none does without it |
-| `hunt_app` | `session` when a hunt stops: `stop`, in the hunt's worktree; the hunter itself, by `shipline hunt-app` | | `session start hunt` refuses |
-| `hunt_browser` | the hunter, by `shipline hunt-browser`, which its sentence names | | the sentence names none |
-| `hunt_cursor` | `session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>` | what it prints is kept in the report folder's `cursor.log` | a Cursor hunt is refused |
 | `advisory_watch` | the merge gate: `unreachable` with a failed push's output, or a failed audit's annotations (without the advisories notice, `checks.advisory_annotation`), on standard input; `answers <service>` | `unreachable` prints the advisory service the text says was unreachable, or nothing; `answers` exits 0 when the service answers again. Beside the advisories notice, a service it names, or a failure of its own, keeps main red | no outage is read: a failed push is refused as it is, and main's advisories notice stands alone |
+| `browser` | E2E's browser job: the job's own arguments. | The command's output and exit code. | The browser job fails and asks for commands.browser. |
+| `browser_plan` | the merge gate: the changed paths on standard input, each ended by a NUL | prints `needed` or `none` and exits 0; anything else, a crash or another exit included, counts as needed | every merge that changes a file needs browser tests while the merged tree holds the E2E workflow (`workflows.e2e`), and none does without it |
+| `browser_tests_for_changes` | the review panel in a conflict round, and sessions: `<base> [--files-from <file>]` and the session's own words | the browser specs the change reaches, one path a line | nothing is selected, and CI runs the whole browser suite |
+| `hunt_app` | `session` when a hunt stops: `stop`, in the hunt's worktree; the hunter itself, by `shipline hunt-app` |  | `session start hunt` refuses |
+| `hunt_browser` | the hunter, by `shipline hunt-browser`, which its sentence names |  | the sentence names none |
+| `hunt_cursor` | `session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>` | what it prints is kept in the report folder's `cursor.log` | a Cursor hunt is refused |
+| `mechanical_conflicts` | the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch | `resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line (paths without spaces), or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took | every conflict is left to the session, nothing is renumbered and main took no number |
+| `pre_train_checks` | the merge gate, before a pull request joins the merge train, in its worktree | exits non-zero when a check failed; what it prints is shown | every pull request is admitted |
 | `push_checkout` | the merge gate, before each push and after one that failed: `install <checkout>`; `refusal <checkout>` with the push's whole output on standard input | `install` installs what changed since its last install and exits non-zero with the reason when it failed, which is a wait; `refusal` prints the hook's failed step with its last lines | nothing is installed, and a failed push is refused with its last 10 lines |
+| `push_checks` | The pre-push hook: the selected changes. | The command's output and exit code. | No additional push checks run. |
+| `server_tests_for_changes` | the review panel in a conflict round, and sessions: `<base> [--files-from <file>]` | one JSON object, `{"whole": bool, "tests": [paths], "total": int, "reasons": [str]}` | the whole server suite: `{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}` |
+| `test` | CI's test job: the job's own arguments. | The command's output and exit code. | The test job fails and asks for commands.test. |
+<!-- shipline-commands:end -->
 
 The merge gate keeps the outage an advisory watch found in its state folder:
 `advisory-service-down`, `{"service": ..., "since": "YYYY-MM-DD HH:MM UTC"}`, written by the

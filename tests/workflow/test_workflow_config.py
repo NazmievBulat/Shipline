@@ -2249,3 +2249,108 @@ def test_docs_write_repairs_drift_without_reading_a_repository_config(tmp_path: 
     before = example.read_bytes(), readme.read_bytes()
     assert docs("--write").returncode == 0
     assert (example.read_bytes(), readme.read_bytes()) == before
+
+
+_CONFIG_ERRORS = json.loads((_CONFIG_FIXTURES / "errors.json").read_text())
+
+
+@pytest.mark.parametrize("case", _CONFIG_ERRORS, ids=[case["key"] for case in _CONFIG_ERRORS])
+def test_config_refusals_keep_their_recorded_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: dict[str, Any]
+) -> None:
+    repo = _repository(tmp_path)
+    path = repo / "shipline.json"
+    monkeypatch.setenv("SHIPLINE_CONFIG", str(path))
+    _write(repo, case["given"])
+    with pytest.raises(workflow_config.ConfigError) as refused:
+        workflow_config.load(repo)
+    assert str(refused.value).replace(str(path), "<config>") == case["message"]
+
+
+def test_generated_config_keeps_the_original_examples_values(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    original = json.loads((_CONFIG_FIXTURES / "example.input.json").read_text())
+    generated = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
+    assert generated == original
+    _write(repo, generated)
+    expected = json.loads((_CONFIG_FIXTURES / "example.json").read_text())
+    assert _as_json(workflow_config.load(repo)) == expected["values"]
+
+
+def test_generated_key_and_command_lists_are_sorted_and_complete() -> None:
+    text = (_WORKFLOW / "README.md").read_text()
+    keys = text.split("<!-- shipline-config:start -->")[1].split("<!-- shipline-config:end -->")[0]
+    names = [line.split("`")[1] for line in keys.splitlines() if line.startswith("| `")]
+    assert names == sorted(names)
+    assert len(names) == len(set(names))
+    commands = text.split("<!-- shipline-commands:start -->")[1].split("<!-- shipline-commands:end -->")[0]
+    names = [line.split("`")[1] for line in commands.splitlines() if line.startswith("| `")]
+    assert names == sorted(workflow_config.DEFAULTS["commands"])
+
+
+def test_one_new_declaration_drives_defaults_validation_exports_and_docs(tmp_path: Path) -> None:
+    import shutil
+
+    root = tmp_path / "source"
+    scripts = root / "scripts/workflow"
+    scripts.mkdir(parents=True)
+    (root / "examples").mkdir()
+    script = scripts / "workflow_config.py"
+    shutil.copyfile(_WORKFLOW / "workflow_config.py", script)
+    shutil.copyfile(_WORKFLOW / "README.md", scripts / "README.md")
+    source = script.read_text()
+    source = source.replace(
+        "    prefix_only: list[str] = option(",
+        "    neutral_check: str = option('name', 'Neutral check', 'A neutral check.', "
+        "shell=(60, 'NEUTRAL_CHECK'))\n    prefix_only: list[str] = option(",
+        1,
+    )
+    script.write_text(source)
+    spec = importlib.util.spec_from_file_location("extended_config", script)
+    assert spec and spec.loader
+    extended = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(extended)
+    repo = _repository(tmp_path)
+    _write(repo, {})
+    config = extended.load(repo)
+    assert config.checks.neutral_check == "Neutral check"
+    assert extended.as_dict(config)["checks"]["neutral_check"] == "Neutral check"
+    for posix in (False, True):
+        assert "SHIPLINE_NEUTRAL_CHECK='Neutral check'\n" in extended.shell(config, posix=posix)
+    _write(repo, {"checks": {"neutral_check": "Named check"}})
+    assert extended.load(repo).checks.neutral_check == "Named check"
+    _write(repo, {"checks": {"neutral_check": False}})
+    with pytest.raises(extended.ConfigError, match="checks.neutral_check must be a name, not false"):
+        extended.load(repo)
+    done = subprocess.run(
+        ["python3", str(script), "docs", "--write"],
+        env=_GIT_ENV, capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads((root / "examples/shipline.json").read_text())["checks"]["neutral_check"] == "Neutral check"
+    assert '| `checks.neutral_check` | name | A neutral check. | `"Neutral check"` |' in (
+        scripts / "README.md"
+    ).read_text()
+
+
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "reversed"])
+def test_docs_refuses_broken_markers_before_writing_anything(tmp_path: Path, damage: str) -> None:
+    root = tmp_path
+    scripts = root / "scripts/workflow"
+    scripts.mkdir(parents=True)
+    (root / "examples").mkdir()
+    original = (_WORKFLOW / "README.md").read_text()
+    start, end = "<!-- shipline-commands:start -->", "<!-- shipline-commands:end -->"
+    if damage == "missing":
+        changed = original.replace(start, "")
+    elif damage == "duplicate":
+        changed = original + "\n" + start
+    else:
+        changed = original.replace(start, "temporary marker").replace(end, start).replace(
+            "temporary marker", end
+        )
+    (scripts / "README.md").write_text(changed)
+    with pytest.raises(workflow_config.ConfigError, match="expected one ordered pair"):
+        workflow_config.documentation(root)
+    assert (scripts / "README.md").read_text() == changed
+    assert not (root / "examples/shipline.json").exists()
