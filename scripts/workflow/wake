@@ -100,14 +100,13 @@ if ((github_ready)) && jq -e '.checks.prefix_only // [] | length > 0' <<<"$SHIPL
   if [[ -r $saved_sent && $(<"$saved_sent") == "$saved_day" ]]; then
     exec 8>&-
   else
-  saved_pending=$main/$SHIPLINE_STATE_FOLDER/prefix-savings-$saved_day.pending
-  if [[ -r $saved_pending ]]; then
-    saved_line=$(<"$saved_pending")
-  elif saved_line=$(WORKFLOW_BACKGROUND_GITHUB=1 timeout 120 python3 "$here/prefix_savings.py" --now "$NOW" 9>&- 8>&-); then
-    mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
-    (umask 077; printf '%s\n' "$saved_line" >"$saved_pending.tmp")
-    mv "$saved_pending.tmp" "$saved_pending"
-  fi
+    saved_pending=$main/$SHIPLINE_STATE_FOLDER/prefix-savings-$saved_day.pending
+    if [[ -r $saved_pending ]]; then
+      saved_line=$(<"$saved_pending")
+    elif saved_line=$(WORKFLOW_BACKGROUND_GITHUB=1 timeout 120 python3 "$here/prefix_savings.py" --now "$NOW" 9>&- 8>&-); then
+      (umask 077; printf '%s\n' "$saved_line" >"$saved_pending.tmp")
+      mv "$saved_pending.tmp" "$saved_pending"
+    fi
   fi
 fi
 resent=("$@")

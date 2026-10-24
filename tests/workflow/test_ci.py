@@ -104,7 +104,8 @@ def test_the_summing_up_check_needs_every_job(path: Path, job: str, name: str) -
     text = _job(path, job)
 
     assert re.search(rf"^    name: {name}$", text, re.M)
-    assert re.search(r"^    needs: \[plan, tests\]$", text, re.M)
+    needs = re.search(r"^    needs: \[([^\]]+)\]$", text, re.M)
+    assert needs and needs[1].split(", ") == [other for other in _jobs(path) if other != job]
     assert _condition(text) == f"always() && ({_NOT_A_DRAFT})"
     assert _EVERY_JOB_PASSED in text
 

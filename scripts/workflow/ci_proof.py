@@ -28,6 +28,12 @@ everything checks out; whatever cannot be read means every job runs.
 
 runs the repository's own test command (`commands.test`) from the root of the checkout it is
 called in, with the job's arguments after it.
+
+    ci_proof.py prefix-only [--needed GROUP] ...
+
+hands workflows the configured groups to defer on pull request events, after their existing
+path selectors have named the groups needed. It notes those deferrals in the CI planner for
+the wake's daily savings report. Scratch dispatches and main defer nothing.
 """
 
 import argparse
@@ -374,7 +380,7 @@ def main() -> int:
     commands = {"notes": _main_notes, "inherited": _main_inherited, "test": _main_test,
                 "prefix-only": _main_prefix_only}
     if len(sys.argv) < 2 or sys.argv[1] not in commands:
-        print("usage: ci_proof.py notes|inherited|test ...", file=sys.stderr)
+        print("usage: ci_proof.py notes|inherited|test|prefix-only ...", file=sys.stderr)
         return 2
     try:
         return commands[sys.argv[1]](sys.argv[2:])
