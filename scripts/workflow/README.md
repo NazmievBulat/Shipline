@@ -296,7 +296,7 @@ object; its `args` are still literal words passed before the job's arguments.
 A command with a pass/fail outcome may also set `wait_exit` (a list of exit statuses from
 1 to 255, default `[75]`) and `wait_output` (a regular expression). On a nonzero exit, a
 listed status or a match in standard output followed by standard error means "could not
-finish; try again". Exit 0 always passes. An invalid expression is refused when the config
+finish; try again". The anchors `^` and `$` match each line. Exit 0 always passes. An invalid expression is refused when the config
 is read, naming `commands.<name>.wait_output`. Use `wait_exit: []` to disable the default
 status. A configured wait is reported as exit 75; an ordinary exit 75 with that status
 disabled is reported as exit 1. Output and literal arguments are preserved. Commands with

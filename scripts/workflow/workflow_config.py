@@ -1052,7 +1052,7 @@ def command_waits(entry: dict[str, Any], code: int, output: str) -> bool:
     """Zero always passes; a configured exit or output can make another result a wait."""
     return code != 0 and (
         code in entry.get("wait_exit", [75])
-        or ("wait_output" in entry and re.search(entry["wait_output"], output) is not None)
+        or ("wait_output" in entry and re.search(entry["wait_output"], output, re.MULTILINE) is not None)
     )
 
 

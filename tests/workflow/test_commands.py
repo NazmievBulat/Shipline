@@ -420,6 +420,7 @@ def test_bad_command_wait_options_name_the_key(tmp_path: Path, key: str, value: 
 @pytest.mark.parametrize("name", ["pre_train_checks", "push_checks", "hunt_app", "hunt_browser", "hunt_cursor"])
 @pytest.mark.parametrize("code,answer,options,expected", [
     (1, "try later\n", {"wait_output": "^try later"}, 75),
+    (1, "progress\ntry later\n", {"wait_output": "^try later$"}, 75),
     (42, "busy\n", {"wait_exit": [42]}, 75),
     (0, "try later\n", {"wait_output": "^try later"}, 0),
     (75, "failure\n", {"wait_exit": []}, 1),
@@ -457,6 +458,20 @@ def test_test_and_browser_waits_keep_shell_semantics_and_checkout_root(workflow:
     assert done.returncode == 75, done.stdout + done.stderr
     assert done.stdout == "try later\n"
     assert workflow.calls("example-checks") == [f"example-checks two words --fast (in {workflow.repo})"]
+
+
+def test_a_wait_diagnostic_on_stderr_can_follow_progress_on_stdout(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    workflow.fake("example-checks", '#!/bin/bash\necho progress\necho "try later" >&2\nexit 1\n')
+    _configure(workflow, pre_train_checks={
+        "run": "example-checks", "form": "exit", "wait_output": "^try later$",
+    })
+
+    done = workflow.shipline("pre-train-checks")
+
+    assert done.returncode == 75, done.stdout + done.stderr
+    assert done.stdout == "progress\n"
+    assert done.stderr == "try later\n"
 
 
 @pytest.mark.parametrize("name,subcommand", [
