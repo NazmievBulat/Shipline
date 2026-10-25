@@ -169,11 +169,11 @@ def main_image_source(base: str) -> dict[str, Any] | None:
         found = image_source_runs(source)
         parts = parts_for(found[0]) if found else []
         if (found and workflow_verdict("images", found[0], parts)[0] == "green"
-                and complete_image_jobs(parts)):
+                and complete_image_jobs(parts, allow_skipped=True)):
             return source
     for run in main_image_runs(base, MainImages()):
         parts = parts_for(run)
-        if workflow_verdict("images", run, parts)[0] != "green" or not complete_image_jobs(parts):
+        if workflow_verdict("images", run, parts)[0] != "green" or not complete_image_jobs(parts, allow_skipped=True):
             return None
         trees = [message for title, message in _planner_notes(parts, IMAGES_PLAN)
                  if title == NOTES.files_tested]
@@ -188,14 +188,22 @@ def main_image_source(base: str) -> dict[str, Any] | None:
     return None
 
 
-def complete_image_jobs(parts: list[dict[str, Any]]) -> bool:
-    """A reusable result ran its image jobs, including every part of each matrix."""
+def complete_image_jobs(parts: list[dict[str, Any]], *, allow_skipped: bool = False) -> bool:
+    """Every selected image job passed, including every part of each selected matrix.
+
+    Optional jobs may be skipped for a prefix proof. Main's complete receipt retains its
+    stricter rule: a release job a pull request skipped still needs main's own success.
+    """
     from merge_gate import IMAGES_PLAN, passed_jobs
 
     passed = passed_jobs(parts)
     return (
-        any(job["name"] != IMAGES_PLAN for job in parts)
-        and all(re.sub(r" \(\d+ of \d+\)$", "", job["name"]) in passed for job in parts)
+        any(job["name"] != IMAGES_PLAN and job.get("conclusion") == "success" for job in parts)
+        and all(
+            (allow_skipped and job.get("conclusion") == "skipped")
+            or re.sub(r" \(\d+ of \d+\)$", "", job["name"]) in passed
+            for job in parts
+        )
     )
 
 
@@ -213,7 +221,8 @@ def image_source_runs(source: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     return [current] if (
         current.get("id") == source["run"]["id"]
-        and current.get("head_sha") == source["run"]["head_sha"]
+        and ("head_sha" not in source["run"]
+             or current.get("head_sha") == source["run"]["head_sha"])
     ) else []
 
 

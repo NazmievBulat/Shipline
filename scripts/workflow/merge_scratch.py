@@ -1145,7 +1145,7 @@ def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
             else whole_suite(found[0], parts, tree)
             if workflow == "e2e"
             else _proves_whole("images", found[0], parts, {"tree": tested_tree})
-        ) or (borrowed and not complete_image_jobs(parts)):
+        ) or (workflow == "images" and not complete_image_jobs(parts, allow_skipped=True)):
             if borrowed:
                 return replacement_images()
             short.append(

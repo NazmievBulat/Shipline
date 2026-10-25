@@ -344,7 +344,7 @@ def record_green(
                 "images_tree": image_tree,
                 "images_differing_files": differing,
                 "images_source": {
-                    "run": {"id": images[0]["id"], "head_sha": images[0]["head_sha"]},
+                    "run": {key: images[0][key] for key in ("id", "head_sha") if key in images[0]},
                     "tree": image_tree,
                 } if images_complete else None,
             },

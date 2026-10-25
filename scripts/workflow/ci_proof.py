@@ -15,8 +15,9 @@ of the run's planner job (`checks.ci_plan`, `checks.e2e_plan`), titled as `annot
 prints them as workflow commands, which GitHub turns into the job's annotations.
 
 A squash the gate makes carries one `Workflow-Proof: {json}` line (`squash_proof` in
-`merge_gate.py`): main's parent and tree, and the runs that tested that tree with the jobs that
-passed there. On a push to main,
+`merge_gate.py`): main's parent and tree, and the runs that proved its jobs. CI and E2E prove
+the identical tree; images may prove unchanged image inputs across neutral differences.
+On a push to main,
 
     ci_proof.py inherited WORKFLOW
 
@@ -238,7 +239,7 @@ def image_tree_difference(before: str, after: str, api: Callable[..., Any]) -> l
 
 
 def _source_jobs(source: dict[str, Any], tree: str, api: Callable[..., Any]) -> dict[str, int]:
-    """The jobs a run named by a proof passed on `tree`: none unless its notes prove that tree.
+    """The jobs a proof's run passed for `tree`: its exact files or unchanged image inputs.
 
     A run of a fork, whose workflow the fork may have changed, never counts, nor do CI notes of
     a merge the run did not test: its own head, or GitHub's merge of its head into main."""

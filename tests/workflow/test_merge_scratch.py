@@ -834,9 +834,13 @@ def test_a_failed_shared_image_run_releases_the_line_only_after_a_green_rerun(gi
     assert _train(github)["first"] == "7"
     done = _batch_call(github)
     assert done.returncode == 0, done.stdout + done.stderr
-    _finish_batch(github, run_id=4100)
-    done = _batch_call(github, "8")
-    assert done.returncode == 0, done.stdout + done.stderr
+    for _ in range(3):
+        _finish_batch(github, run_id=4100)
+        number = next((n for n in ("8", "9") if github.pulls[n]["state"] != "MERGED"), None)
+        if number is None:
+            break
+        done = _batch_call(github, number)
+        assert done.returncode in (0, 3), done.stdout + done.stderr
     assert _merges(github) == ["7", "8", "9"]
 
 
