@@ -869,7 +869,10 @@ def test_an_interrupted_revocation_logs_only_when_it_completes_work(
 
 
 @pytest.mark.parametrize("shortage", ["memory", "load"])
-def test_a_hand_back_logs_a_changed_wait_cause_once(handed: GitHub, shortage: str) -> None:
+@pytest.mark.parametrize("noisy_setup", [False, True], ids=["quiet-setup", "noisy-setup"])
+def test_a_hand_back_logs_a_changed_wait_cause_once(
+    handed: GitHub, shortage: str, noisy_setup: bool,
+) -> None:
     workflow = handed.workflow
     _wait_for_allowance(handed)
     first = workflow.run_script("tick")
@@ -883,8 +886,12 @@ def test_a_hand_back_logs_a_changed_wait_cause_once(handed: GitHub, shortage: st
         workflow.loadavg_file.write_text("1.00 9.00 1.00 1/100 1234\n")
         cause = "the processors are overloaded"
     workflow.fake("sleep", '#!/bin/bash\necho "sleep $*" >> "@STATE@/calls.log"\nexit 91\n')
+    if noisy_setup:
+        workflow.fake("worktree-setup", '#!/bin/bash\necho "setup progress 1"\n')
 
     second = workflow.run_script("tick")
+    if noisy_setup:
+        workflow.fake("worktree-setup", '#!/bin/bash\necho "setup progress 2"\n')
     if shortage == "load":
         workflow.loadavg_file.write_text("1.00 10.00 1.00 1/100 1234\n")
     third = workflow.run_script("tick")

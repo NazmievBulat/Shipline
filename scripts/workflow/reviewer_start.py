@@ -158,6 +158,16 @@ def start(
             print(done.stderr or done.stdout, flush=True)
         else:
             reason = (done.stderr or done.stdout).strip()
+            # Setup can print before the resource check. Its progress is not a wait cause.
+            deferred = "; the next tick tries this start again"
+            reason = next(
+                (
+                    line.removesuffix(deferred)
+                    for line in reversed(reason.splitlines())
+                    if line.endswith(deferred)
+                ),
+                " ".join(reason.split()),
+            )
             if reason.startswith("memory is short"):
                 reason = "memory is short"
             elif reason.startswith("the processors are overloaded:"):

@@ -84,7 +84,7 @@ def _hand_back_wait(folder: Path, number: str, cause: str) -> None:
         if not path.exists():
             return
         data = json.loads(path.read_text())
-        cause = cause.removeprefix("needs ")
+        cause = " ".join(cause.removeprefix("needs ").split())
         if data.get("wait") == cause:
             return
         data["wait"] = cause
