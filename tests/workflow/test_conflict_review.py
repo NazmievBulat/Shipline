@@ -550,8 +550,26 @@ def test_codex_resolution_gets_claude_and_cursor(workflow: Workflow, built: bool
     assert workflow.run("start", "review", "7").returncode == 0
     resolved = _resolve(workflow)
     workflow.set_pull_request(7, "OPEN", resolved)
-    for tool in ("claude", "agent", "codex"):
+    for tool in ("agent", "codex"):
         workflow.fake(tool, '#!/bin/bash\necho "@TOOL@ report"\n')
+    workflow.fake(
+        "claude",
+        """#!/bin/bash
+strict=false
+config="" tools=""
+while (($#)); do
+  case $1 in
+    --strict-mcp-config) strict=true ;;
+    --mcp-config) shift; config=$1 ;;
+    --tools) shift; tools=$1 ;;
+  esac
+  shift
+done
+$strict && [[ $tools == Read,Grep,Glob && -f $config ]] || exit 91
+[[ $(cat "$config") == '{"mcpServers":{}}' ]] || exit 92
+echo 'claude report'
+""",
+    )
     done = workflow.run_script("review-panel", "7", "codex", "cursor")
     assert done.returncode == 0, done.stdout + done.stderr
     reports = _folder(workflow) / "reviews/7" / resolved

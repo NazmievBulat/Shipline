@@ -5,14 +5,17 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 run_one() {
   local main=$1 checkout=$2 report=$3 who=$4 prompt=$5 tool result runtime file cleanup
-  case $who in
-    claude) tool=(claude -p --model opus --effort high --setting-sources "" --tools Read,Grep,Glob "$prompt") ;;
-    cursor) tool=(agent -p "$prompt" --mode ask --trust --output-format text) ;;
-    codex) tool=(codex exec --sandbox read-only "$prompt") ;;
-  esac
   runtime=$(mktemp -d "${TMPDIR:-/tmp}/workflow-review-$who.XXXXXX") || return 1
   printf -v cleanup 'rm -rf -- %q' "$runtime"
   trap "$cleanup" EXIT
+  case $who in
+    claude)
+      printf '{"mcpServers":{}}\n' >"$runtime/mcp.json"
+      tool=(claude -p --model opus --effort high --setting-sources "" --strict-mcp-config
+        --mcp-config "$runtime/mcp.json" --tools Read,Grep,Glob "$prompt") ;;
+    cursor) tool=(agent -p "$prompt" --mode ask --trust --output-format text) ;;
+    codex) tool=(codex exec --sandbox read-only "$prompt") ;;
+  esac
   # Give CLIs their own state and sign-in files, and no session history.
   # The only writable host mount is this temporary home, removed when the process ends.
   for file in .codex/auth.json .codex/config.toml .config/cursor/auth.json .cursor/cli-config.json .claude/.credentials.json .claude.json; do
