@@ -278,7 +278,7 @@ def test_a_shadow_tick_logs_the_decisions_the_real_tick_takes(workflow: Workflow
 
     assert compared.returncode == 0, compared.stdout + compared.stderr
     assert compared.stdout.splitlines()[-1] == (
-        "11 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 17:00:00: none differs"
+        "12 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 17:00:00: none differs"
     )
 
 
