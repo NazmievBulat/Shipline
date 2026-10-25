@@ -26,6 +26,30 @@ checkout's `bin` in its environment. The gate reads a repository's `run_proof.py
 "The repository's commands"), read from its main checkout; a missing one means none: no
 check, no helper, no selected test (the panel then notes that CI runs the whole suite).
 
+# The merge gate's modules
+
+`merge_gate.py` remains the command-line entry point and re-exports its existing names.
+The tick, merge driver and repository commands can keep importing from it. Its implementation
+is divided by concern:
+
+| File in `scripts/workflow/` | Concern |
+| --- | --- |
+| `merge_github.py` | Bounded commands, GitHub reads, retries and pushes |
+| `merge_checks.py` | CI jobs, results, lost checks and proof of the tested tree |
+| `merge_health.py` | Main's health, advisories, service outages and health publication |
+| `merge_images.py` | Image runs and workflow path selection |
+| `merge_squash.py` | Squash trees, commit messages and merge attempts |
+| `merge_scratch.py` | Scratch runs, cumulative prefixes and their recovery |
+| `merge_train.py` | Saved line, priority order, reconciliation and status |
+
+Each concern has a matching `tests/workflow/test_merge_*.py` file. Shared stand-ins and
+history builders live in `tests/workflow/merge_gate_fixtures.py`; the original
+`test_merge_when_current.py` retains entry-point tests and re-exports the shared helpers.
+Imports inside the implementation functions resolve dependencies through `merge_gate`,
+so callers' existing command overrides still apply across module boundaries. The two
+process variables reassigned during planning and run discovery stay with their writers;
+`merge_gate` exposes their current values.
+
 # Workflow workers
 
 The tick reads `WORKFLOW_WORKER_PROGRAM` from its environment first, then
