@@ -1991,7 +1991,10 @@ def test_a_blocked_handoff_that_is_not_refreshable_is_handed_back(handed: GitHub
     done = workflow.run_script("tick")
 
     assert done.returncode == 0, done.stdout + done.stderr
-    assert "merge hand-back 7: pull request checks failed" in done.stdout
+    assert (
+        "merge hand-back 7: merge train blocked this head without marking it refreshable; "
+        "its own checks show no failure"
+    ) in done.stdout
     assert not _note(workflow).exists()
     assert _started(workflow) == ["review-7"]
     assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
@@ -2136,8 +2139,8 @@ def _repair_sentence(
     )
 
 
-def _fix_and_hand_off(github: GitHub, run_id: int = 50) -> None:
-    """The worker pushes a fix and marks ready; a fresh reviewer passes it and hands it off."""
+def _push_fix(github: GitHub, run_id: int = 50) -> None:
+    """The worker pushes a green fix and marks ready, before its reviewer hands off."""
     workflow = github.workflow
     root = workflow.worktree(7)
     workflow.git("commit", "--allow-empty", "-m", "fix: parse a leap day", cwd=root)
@@ -2148,12 +2151,22 @@ def _fix_and_hand_off(github: GitHub, run_id: int = 50) -> None:
     (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {github.head}\n")
     workflow.list_pull_request(7, draft=False)
     github.ci(github.base, github.head, run_id=run_id)
+    github.save()
+
+
+def _pass_fix_and_hand_off(github: GitHub) -> None:
     reviews = github.api["repos/example-org/example-app/pulls/7/reviews"]
     reviews.append(
         {"body": "<!-- workflow-review round=2 result=passed -->\nFixed.", "commit_id": github.head}
     )
     github.save()
     _handoff(github)
+
+
+def _fix_and_hand_off(github: GitHub, run_id: int = 50) -> None:
+    """The worker pushes a fix and marks ready; a fresh reviewer passes it and hands it off."""
+    _push_fix(github, run_id)
+    _pass_fix_and_hand_off(github)
 
 
 def _behind(github: GitHub) -> None:
@@ -2237,6 +2250,116 @@ def test_a_failing_test_goes_to_a_medium_worker_naming_the_run_and_keeps_the_lin
     assert (workflow.state / "merged").read_text() == "7"
     assert _started(workflow) == ["ticket-7"]
     assert not (_folder(workflow) / "check-repair-7.json").exists()
+
+
+@pytest.mark.parametrize("repair_left", [False, True], ids=["repair removed", "repair left behind"])
+def test_a_repaired_fix_tested_on_older_main_keeps_its_place_and_refreshes(
+    handed: GitHub, repair_left: bool
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _behind(handed)
+    failed = handed.head
+    _fail(handed)
+
+    first = workflow.run_script("tick")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    repair = _folder(workflow) / "check-repair-7.json"
+    assert json.loads(repair.read_text())["head"] == failed
+    assert _train(workflow)["blocked"] == {"7": failed}
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    assert not _note(workflow).exists()
+
+    second = workflow.run_script("tick")
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _started(workflow) == ["ticket-7"]
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    workflow.run("stop", "ticket-7")
+    old = handed.base
+    _push_fix(handed)
+    fixed = handed.head
+    # CI passed on the fix and the old main, before main moved and the reviewer handed off.
+    workflow.git("commit", "--allow-empty", "-m", "fix: main advanced")
+    handed.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    handed.main()
+    handed.save()
+    if not repair_left:
+        repair.unlink()
+
+    _pass_fix_and_hand_off(handed)
+
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    assert "7" not in _train(workflow)["blocked"]
+    assert _train(workflow)["approved"]["7"] == fixed
+    assert json.loads(_note(workflow).read_text())["head"] == fixed
+    assert repair.exists() == repair_left
+    assert workflow.git("merge-base", fixed, handed.base) == old
+
+    refreshed_tick = workflow.run_script("tick")
+
+    assert refreshed_tick.returncode == 0, refreshed_tick.stdout + refreshed_tick.stderr
+    assert "merge hand-back 7" not in refreshed_tick.stdout
+    refreshed = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
+    assert refreshed != fixed
+    assert workflow.git("show", "-s", "--format=%P", refreshed) == f"{fixed} {handed.base}"
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == refreshed
+    assert json.loads(_note(workflow).read_text())["head"] == refreshed
+    assert _train(workflow)["approved"]["7"] == refreshed
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    assert "7" not in _train(workflow)["blocked"]
+    assert not repair.exists()
+    assert not (workflow.state / "merged").exists()
+    assert not list(_folder(workflow).glob("merge-review-*"))
+    assert _started(workflow) == ["ticket-7"]
+
+    handed.head = refreshed
+    handed.pulls["7"]["headRefOid"] = refreshed
+    (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {refreshed}\n")
+    handed.ci(handed.base, refreshed, run_id=60)
+    handed.save()
+
+    merged_tick = workflow.run_script("tick")
+
+    assert merged_tick.returncode == 0, merged_tick.stdout + merged_tick.stderr
+    assert "merge hand-back 7" not in merged_tick.stdout
+    assert (workflow.state / "merged").read_text() == "7"
+    assert _train(workflow)["waiting"] == ["8"]
+    assert any("--match-head-commit " + refreshed in call for call in workflow.calls("gh pr merge"))
+    assert _started(workflow) == ["ticket-7"]
+    assert not list(_folder(workflow).glob("merge-review-*"))
+
+
+def test_a_repaired_fix_on_older_main_is_still_handed_back_when_its_own_test_fails(
+    handed: GitHub,
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _behind(handed)
+    _fail(handed)
+    first = workflow.run_script("tick")
+    assert first.returncode == 0, first.stdout + first.stderr
+    _push_fix(handed)
+    workflow.git("commit", "--allow-empty", "-m", "fix: main advanced")
+    handed.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    handed.main()
+    handed.save()
+    _pass_fix_and_hand_off(handed)
+    _fail(handed, run_id=50)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    assert _train(workflow)["blocked"]["7"] == handed.head
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
+    assert "pull request checks failed again after a worker's fix" in done.stdout
+    assert not workflow.calls("gh pr merge")
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
 
 
 @pytest.mark.parametrize("rerun", ["fails again", "passes"])
