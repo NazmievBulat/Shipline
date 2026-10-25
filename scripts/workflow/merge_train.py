@@ -72,6 +72,8 @@ class Train:
         data = json.loads(self.path.read_text()) if self.path.exists() else {}
         self.queue: list[str] = data.get("waiting", [])
         self.blocked: dict[str, str] = data.get("blocked", {})
+        # A worker's failed head keeps its slot even after its diagnostic note is cleared.
+        self.repairing: dict[str, str] = data.get("repairing", {})
         self.suspended: dict[str, str] = data.get("suspended", {})
         self.conflicts: dict[str, str] = data.get("conflicts", {})
         self.unavailable: list[str] = data.get("unavailable", [])
@@ -238,6 +240,7 @@ class Train:
                     "proofs": self.proofs,
                     "priorities": self.priorities,
                     "blocked": self.blocked,
+                    "repairing": self.repairing,
                     "suspended": self.suspended,
                     "conflicts": self.conflicts,
                     "unavailable": self.unavailable,
@@ -419,8 +422,9 @@ class Train:
                 repair = check_repair.Repair.read(self.path.parent, number)
             except ValueError:
                 repair = None
+            repair_head = repair.head if repair is not None else self.repairing.get(number)
             if (
-                repair is not None
+                repair_head is not None
                 and pull["state"] == "OPEN"
                 and pull["baseRefName"] == "main"
                 and (
@@ -429,12 +433,14 @@ class Train:
             ):
                 # A failing test of its own went to a worker: as a draft, then on the fix's new
                 # head until its reviewer calls the gate, it keeps its place, passed over.
-                self.blocked.setdefault(number, repair.head)
+                self.blocked.setdefault(number, repair_head)
+                self.repairing[number] = repair_head
                 self.unavailable.append(number)
                 remaining.append(number)
                 continue
             if not ready(pull):
                 self.blocked.pop(number, None)
+                self.repairing.pop(number, None)
                 continue
             if number in self.blocked and self.blocked[number] != pull["headRefOid"]:
                 # A fix on a new head joins at the back when its reviewer calls the gate.
@@ -811,6 +817,7 @@ class Train:
     def remove(self, number: str) -> None:
         self.queue = [entry for entry in self.queue if entry != number]
         self.blocked.pop(number, None)
+        self.repairing.pop(number, None)
         self.refreshable.discard(number)
         self.suspended.pop(number, None)
         self.conflicts.pop(number, None)
@@ -860,6 +867,7 @@ class Train:
             )
         if self.blocked.get(number) != pull["headRefOid"]:
             self.blocked.pop(number, None)
+        self.repairing.pop(number, None)
         if number not in self.queue:
             self.queue.append(number)
             self.reconcile({number: pull}, number)
