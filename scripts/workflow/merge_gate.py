@@ -492,6 +492,8 @@ def _transient_refresh_push(output: str) -> bool:
     return short_of_memory(output) or bool(re.search(
         r"remote end hung up unexpectedly|connection (?:was )?(?:reset|timed out)"
         r"|operation timed out|(?:HTTP(?:/\d(?:\.\d)?)?|returned error:)\s+5\d\d\b"
+        r"|could not resolve host|couldn't connect to server|failed to connect to"
+        r"|network is unreachable"
         r"|waiting for a push slot:",
         output, re.IGNORECASE,
     ))
@@ -826,7 +828,12 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
         if not ready(pull):
             raise Refused("only an open, ready pull request based on main can merge")
         pre_train_checks(number, folder)
-        if delegated and pending is not None and pull["headRefOid"] == pending["commit"]:
+        if delegated and pending is not None and (
+            pull["headRefOid"] == pending["commit"]
+            # GitHub's pull request can still read the old head after the host took the push.
+            or git("ls-remote", "origin", f"refs/heads/{pending['branch']}").split()[:1]
+            == [pending["commit"]]
+        ):
             # The server accepted this exact push before the connection failed. No second
             # push is needed, and a newer main must not reset the now-published commit.
             train = Train(folder)

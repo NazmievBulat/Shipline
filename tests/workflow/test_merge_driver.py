@@ -888,6 +888,12 @@ exec /usr/bin/git "$@"
     ("fatal: unable to access remote: HTTP/2 504", False, False),
     ("waiting for a push slot: 2 ahead", False, False),
     ("io_uring_queue_init: could not lock memory", False, False),
+    ("fatal: unable to access 'https://example.com/example-app.git/': "
+     "Could not resolve host: example.com", False, False),
+    ("fatal: unable to access 'https://example.com/example-app.git/': Failed to connect to "
+     "example.com port 443 after 21 ms: Couldn't connect to server", False, False),
+    ("fatal: unable to access 'https://example.com/example-app.git/': "
+     "Network is unreachable", False, False),
 ])
 def test_the_refresh_push_fails_once(
     handed: GitHub, error: str, repaired: bool, published: bool
@@ -1040,6 +1046,35 @@ def test_a_waiting_refresh_is_redone_when_main_moves_again(handed: GitHub) -> No
     assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == refreshed
     assert json.loads(_note(workflow).read_text())["head"] == refreshed
     assert _train(workflow)["waiting"] == ["7", "8"]
+    assert _started(workflow) == []
+
+
+def test_an_accepted_refresh_github_has_not_read_yet_survives_main_moving(
+    handed: GitHub,
+) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    _drop_refresh_pushes(workflow, ["fatal: the remote end hung up unexpectedly"], published=True)
+    first = workflow.run_script("tick")
+    assert first.returncode == 0, first.stdout + first.stderr
+    published = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == published
+    # The pull request still reads the old head, and main moves before the next tick.
+    workflow.git("commit", "--allow-empty", "-m", "fix: main moved again")
+    handed.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    handed.main()
+    handed.save()
+
+    second = workflow.run_script("tick")
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "merge hand-back 7" not in second.stdout
+    assert "the refreshed branch is published; waiting for its CI" in second.stdout + second.stderr
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == published
+    assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == published
+    assert json.loads(_note(workflow).read_text())["head"] == published
+    assert not (_folder(workflow) / "merge-refresh-7.json").exists()
     assert _started(workflow) == []
 
 
