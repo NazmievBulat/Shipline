@@ -308,6 +308,106 @@ def test_pre_train_checks_named_but_missing_stop_the_gate(workflow: Workflow) ->
     assert "refused: cannot run the repository's pre_train_checks command" in done.stdout
 
 
+@pytest.mark.parametrize("entry,status", [
+    ({"run": "example-checks", "form": "exit", "wait_output": "^check could not finish"}, 1),
+    ("example-checks", 75),
+    ({"run": "example-checks", "form": "exit", "wait_exit": [42]}, 42),
+])
+def test_pre_train_wait_keeps_the_handoff_then_the_next_tick_merges(
+    handed: GitHub, entry: str | dict, status: int,
+) -> None:
+    workflow = handed.workflow
+    folder = workflow.repo / ".local/workflow"
+    note = folder / "merge-wanted-7"
+    before = note.read_text()
+    _configure(workflow, pre_train_checks=entry)
+    _stand_in(workflow, "example-checks", "check could not finish\nmore detail\n", status)
+
+    first = workflow.run_script("tick")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "pre-train checks of 7 wait: check could not finish" in first.stdout
+    assert note.read_text() == before
+    assert "7" in json.loads((folder / "merge-train.json").read_text())["waiting"]
+    assert "merge hand-back" not in first.stdout
+    assert _started(workflow) == []
+    assert not (workflow.state / "merged").exists()
+    _stand_in(workflow, "example-checks", "checks passed\n")
+
+    second = workflow.run_script("tick")
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert (workflow.state / "merged").read_text() == "7"
+    assert not note.exists()
+    assert _started(workflow) == []
+
+
+def test_two_consecutive_pre_train_waits_hand_back_both_outcomes(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _configure(workflow, pre_train_checks={
+        "run": "example-checks", "form": "exit", "wait_output": "^check could not finish",
+    })
+    _stand_in(workflow, "example-checks", "check could not finish: first\n", 1)
+    first = workflow.run_script("tick")
+    assert "merge hand-back" not in first.stdout, first.stdout + first.stderr
+    _stand_in(workflow, "example-checks", "check could not finish: second\n", 1)
+
+    second = workflow.run_script("tick")
+
+    assert "merge hand-back 7" in second.stdout, second.stdout + second.stderr
+    assert "check could not finish: first" in second.stdout
+    assert "check could not finish: second" in second.stdout
+    assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+    assert _started(workflow) == ["review-7"]
+    assert not (workflow.state / "merged").exists()
+
+
+def test_a_real_pre_train_failure_is_handed_back_at_once(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _configure(workflow, pre_train_checks={
+        "run": "example-checks", "form": "exit", "wait_output": "^check could not finish",
+    })
+    _stand_in(workflow, "example-checks", "inventory failed\n", 1)
+
+    done = workflow.run_script("tick")
+
+    assert "merge hand-back 7" in done.stdout, done.stdout + done.stderr
+    assert not (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+    assert _started(workflow) == ["review-7"]
+    assert not (workflow.state / "merged").exists()
+
+
+def test_handoff_records_a_wait_before_the_tick_retries(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _configure(workflow, pre_train_checks="example-checks")
+    _stand_in(workflow, "example-checks", "temporarily unavailable\n", 75)
+
+    done = workflow.run_script("merge-when-current", "--handoff", "7", cwd=workflow.worktree(7))
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "pre-train checks of 7 wait: temporarily unavailable" in done.stdout
+    assert (workflow.repo / ".local/workflow/merge-wanted-7").exists()
+    assert _started(workflow) == []
+    _stand_in(workflow, "example-checks")
+    tick = workflow.run_script("tick")
+    assert tick.returncode == 0, tick.stdout + tick.stderr
+    assert (workflow.state / "merged").read_text() == "7"
+
+
+@pytest.mark.parametrize("key,value", [
+    ("wait_output", "["), ("wait_output", 1),
+    ("wait_exit", [0]), ("wait_exit", [True]), ("wait_exit", [256]),
+    ("wait_exit", [-1]), ("wait_exit", "75"),
+])
+def test_bad_command_wait_options_name_the_key(tmp_path: Path, key: str, value: object) -> None:
+    repo = _repository(tmp_path)
+    (repo / "shipline.json").write_text(json.dumps({"commands": {"pre_train_checks": {
+        "run": "example-checks", "form": "exit", key: value,
+    }}}))
+    with pytest.raises(workflow_config.ConfigError, match="commands.pre_train_checks." + key):
+        workflow_config.load(repo)
+
+
 def _changes(workflow: Workflow, *paths: str) -> None:
     for path in paths:
         (workflow.repo / path).parent.mkdir(parents=True, exist_ok=True)
