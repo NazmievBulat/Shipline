@@ -67,6 +67,7 @@ FILE = "shipline.json"
 # take to read it.
 RUNNER_SETTINGS = ".github/runner/settings.sh"
 RUNNER_SETTINGS_SECONDS = 5
+DEFAULT_DEPENDENCY_JOB = "CI: dependencies"
 # The prefix names a systemd unit and, as `<prefix>-runner`, a user of at most 32 characters.
 _PREFIX = re.compile(r"[a-z](?:[a-z0-9-]{0,23}[a-z0-9])?")
 _LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
@@ -104,6 +105,9 @@ DEFAULTS: dict[str, Any] = {
         "e2e_plan": "E2E: what to run",
         # The prefix of every check of the image workflow.
         "images": "Docker images",
+        "server_tests": "CI: server tests",
+        "web": "CI: web",
+        "older_version": "CI: older version on new tables",
         # The job that audits the dependencies against published advisories (the gate reads
         # "CI: dependencies" when none is named), and the title of the notice it writes on main
         # when advisories alone failed it. Without the notice an advisory on main makes main red,
@@ -120,7 +124,10 @@ DEFAULTS: dict[str, Any] = {
         "web_suite": "Web suite",
         "browser_suite": "Browser suite",
     },
-    "workflows": {"ci": "ci.yml", "e2e": "e2e.yml", "images": "images.yml"},
+    "workflows": {
+        "ci": "ci.yml", "e2e": "e2e.yml", "images": "images.yml",
+        "ci_name": "CI", "images_name": "Images",
+    },
     "labels": {
         "workflow": "workflow",
         "audited": "audited",
@@ -257,12 +264,19 @@ class Checks:
     dependency_audit: str | None = None
     advisory_annotation: str | None = None
     prefix_only: list[str] = field(default_factory=list)
+    server_tests: str = DEFAULTS["checks"]["server_tests"]
+    web: str = DEFAULTS["checks"]["web"]
+    older_version: str = DEFAULTS["checks"]["older_version"]
+
+    @property
+    def dependency_job(self) -> str:
+        return self.dependency_audit or DEFAULT_DEPENDENCY_JOB
 
     def groups(self) -> dict[str, CheckGroup]:
         return {
             "images": CheckGroup("images", (f"{self.images}:",)),
             "browser_whole": CheckGroup("e2e", ("playwright",), "browser_suite"),
-            "server_whole": CheckGroup("ci", ("CI: server tests",), "server_tests"),
+            "server_whole": CheckGroup("ci", (self.server_tests,), "server_tests"),
         }
 
     @property
@@ -284,6 +298,8 @@ class Workflows:
     ci: str
     e2e: str
     images: str
+    ci_name: str
+    images_name: str
 
 
 @dataclass(frozen=True)

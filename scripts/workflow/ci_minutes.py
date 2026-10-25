@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from merge_gate import API, REPOSITORY, SCRATCH_PREFIX, WORKFLOW_FILES, api, command
+from merge_gate import API, CONFIG, REPOSITORY, SCRATCH_PREFIX, WORKFLOW_FILES, api, command
 from merge_train_metrics import instant
 
 
@@ -77,9 +77,10 @@ def summarize(runs: list[dict[str, Any]], since: str, until: str) -> dict[str, A
         conclusion = run.get("conclusion") or "running"
         groups[run["name"], kind, conclusion] += minutes
         for category, selected in {
-            "pr_images": kind == "pr" and run["name"] == "Images",
+            "pr_images": kind == "pr" and run["name"] == CONFIG.workflows.images_name,
             "cancelled": conclusion == "cancelled",
-            "pr_ci_failed": kind == "pr" and run["name"] == "CI" and conclusion == "failure",
+            "pr_ci_failed": kind == "pr" and run["name"] == CONFIG.workflows.ci_name
+            and conclusion == "failure",
             "discarded_prefix": run.get("prefix_disposition") == "discarded",
             "unresolved_prefix": run.get("prefix_disposition") == "unresolved",
             "scratch": kind == "scratch",

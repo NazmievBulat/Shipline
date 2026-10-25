@@ -65,13 +65,6 @@ WHOLE = "Workflow-Whole-Suites: true"
 # The title of the notice that names an inherited job and its run.
 INHERITED = "Inherited job"
 SUITES = ("server_tests", "web_suite", "browser_suite")
-# The job each suite's note speaks for, by the gate's names (merge_gate.py): it is inherited
-# only from a run that ran its suite whole.
-SUITE_JOBS = {
-    "CI: server tests": "server_tests",
-    "CI: web": "web_suite",
-    "playwright": "browser_suite",
-}
 # The workflows a proof may name, by the gate's own names for them.
 PROVEN = ("ci", "e2e", "images")
 DEFERRED = "Prefix-only groups"
@@ -243,11 +236,17 @@ def _source_jobs(source: dict[str, Any], tree: str, api: Callable[..., Any]) -> 
     elif workflow == "images" and (titles.files_tested, tree) not in noted:
         return {}
     passed = passed_jobs(parts)
+    # A suite job is inherited only from a run that ran its configured suite whole.
+    suite_jobs = {
+        config.checks.server_tests: "server_tests",
+        config.checks.web: "web_suite",
+        "playwright": "browser_suite",
+    }
     return {
         job: source["run"]
         for job in source["jobs"]
         if job in passed
-        and (job not in SUITE_JOBS or (getattr(titles, SUITE_JOBS[job]), "whole") in noted)
+        and (job not in suite_jobs or (getattr(titles, suite_jobs[job]), "whole") in noted)
     }
 
 

@@ -31,6 +31,9 @@
     "ci_plan": "Build: what to run",
     "e2e_plan": "Browser: what to run",
     "images": "Images",
+    "server_tests": "Build: server tests",
+    "web": "Build: web",
+    "older_version": "Build: older version on new tables",
     "dependency_audit": "Build: dependencies",
     "advisory_annotation": "Advisory",
     "prefix_only": ["images", "browser_whole", "server_whole"]
@@ -45,7 +48,9 @@
   "workflows": {
     "ci": "build.yml",
     "e2e": "browser.yml",
-    "images": "images.yml"
+    "images": "images.yml",
+    "ci_name": "Build",
+    "images_name": "Images"
   },
   "labels": {
     "workflow": "shipline",

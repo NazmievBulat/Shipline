@@ -98,7 +98,7 @@ IMAGES_PLAN = CONFIG.checks.images_plan
 NOTES = CONFIG.annotations
 # The job that audits the dependencies, and the title of the notice it writes on main when only
 # advisories failed it. With no notice named, an advisory on main makes main red as before.
-DEPENDENCIES = CONFIG.checks.dependency_audit or "CI: dependencies"
+DEPENDENCIES = CONFIG.checks.dependency_job
 ADVISORIES_ONLY = CONFIG.checks.advisory_annotation
 # The workflow files, by the gate's own names for them.
 WORKFLOW_FILES = {
@@ -686,9 +686,10 @@ def job_notes(job: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-# A CI job that runs in parts is named with its part by GitHub, "CI: server tests (1 of 2)", and with
-# its name alone when it was skipped (.github/workflows/ci.yml).
-_PART = re.compile(r"(CI: [^()]+) \((\d+) of (\d+)\)")
+# A CI job run in parts has a ` (k of n)` suffix, and its name alone when skipped.
+# Match the configured CI jobs as well as the other jobs under the CI prefix; image
+# jobs keep their existing, separate grouping.
+_PART = re.compile(r"(.+) \((\d+) of (\d+)\)")
 
 
 def checks(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -702,6 +703,13 @@ def checks(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for job in parts:
         matched = _PART.fullmatch(job.get("name", ""))
+        if matched and not (
+            matched[1].startswith(CI_PREFIX + ": ")
+            or matched[1] in (
+                CONFIG.checks.server_tests, CONFIG.checks.web, CONFIG.checks.older_version,
+            )
+        ):
+            matched = None
         grouped.setdefault(matched[1] if matched else job.get("name", ""), []).append(job)
     merged: list[dict[str, Any]] = []
     for name, group in grouped.items():
@@ -1804,7 +1812,7 @@ def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
 def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: str) -> bool:
     """A green CI run that ran every server test on exactly this commit, run in parts or not."""
     if verdict(run, parts)[0] != "green" or not any(
-        job["name"] == "CI: server tests" and job.get("conclusion") == "success"
+        job["name"] == CONFIG.checks.server_tests and job.get("conclusion") == "success"
         for job in checks(parts)
     ):
         return False
@@ -3220,8 +3228,8 @@ def _batch_ready(pull: dict[str, Any], base: str, *, settling: bool = False) -> 
     # compatibility check depends on this member's own base; keep it on the single
     # path instead of comparing the old application of a combined prefix.
     if any(
-        job["name"] == "CI: older version on new tables" and job.get("conclusion") != "skipped"
-        for job in parts
+        job["name"] == CONFIG.checks.older_version and job.get("conclusion") != "skipped"
+        for job in checks(parts)
     ) and git(
         "diff", "--name-only", f"{base}...{head}", "--",
         "migrations/versions",
@@ -3557,7 +3565,7 @@ def squash_proof(
         if workflow == "ci":
             # The web job can pass with only lint, or without its story tests. Main needs both.
             if (NOTES.web_suite, "whole") not in _planner_notes(parts, CI_PLAN):
-                passed = [name for name in passed if name != "CI: web"]
+                passed = [name for name in passed if name != CONFIG.checks.web]
         sources.append({"workflow": workflow, "run": run["id"], "jobs": passed})
     return RECEIPT + json.dumps(
         {"base": base, "tree": tree, "sources": sources}, separators=(",", ":")

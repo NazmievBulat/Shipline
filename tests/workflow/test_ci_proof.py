@@ -402,6 +402,48 @@ def test_a_proof_on_the_identical_tree_lets_main_inherit_the_jobs_that_passed(
     assert _inherited(workflow, github, "e2e") == {"E2E: what to run": 30, "playwright": 30}
 
 
+@pytest.mark.parametrize("suite,key,name", [
+    ("Server tests", "server_tests", "X"), ("Web suite", "web", "Web tests"),
+])
+@pytest.mark.parametrize("note", ["whole", "selected: 1 of 3 files", "none", None])
+def test_renamed_jobs_are_inherited_only_when_their_whole_suite_is_proven(
+    workflow: Workflow, suite: str, key: str, name: str, note: str | None,
+) -> None:
+    (workflow.repo / "shipline.json").write_text(json.dumps({"checks": {key: name}}))
+    github = _github(_receipt(sources=[{"workflow": "ci", "run": 20, "jobs": [name]}]))
+    ok = {"status": "completed", "conclusion": "success"}
+    github[f"{_API}/actions/runs/20/jobs?per_page=100"]["jobs"] = [
+        {"id": 21, "name": "CI: what to run", **ok},
+        *({"id": 30 + n, "name": f"{name} ({n} of 3)", **ok} for n in (1, 2, 3)),
+    ]
+    notes = [{"title": "Merge tested", "message": _MERGE}]
+    if note is not None:
+        notes.append({"title": suite, "message": note})
+    github[f"{_API}/check-runs/21/annotations?per_page=100"] = notes
+
+    assert _inherited(workflow, github) == ({name: 20} if note == "whole" else {})
+
+
+@pytest.mark.parametrize("whole", [True, False])
+def test_the_gate_records_a_renamed_web_job_only_with_whole_suite_notes(
+    workflow: Workflow, whole: bool,
+) -> None:
+    (workflow.repo / "shipline.json").write_text(json.dumps({"checks": {"web": "Web tests"}}))
+    done = _python(workflow, """
+        import merge_gate as g
+        g.api = lambda *args, **kwargs: (
+            [{"title": "Web suite", "message": "whole"}] if sys.argv[2] == "True" else []
+        )
+        ok = {"status": "completed", "conclusion": "success"}
+        parts = [{"id": 1, "name": "CI: what to run", **ok},
+                 {"id": 2, "name": "Web tests", **ok}]
+        print(g.squash_proof("a" * 40, "b" * 40, {"ci": ({"id": 20}, parts)}))
+    """, str(whole))
+    assert done.returncode == 0, done.stderr
+    proof = json.loads(done.stdout.removeprefix("Workflow-Proof: "))
+    assert ("Web tests" in proof["sources"][0]["jobs"]) == whole
+
+
 @pytest.mark.parametrize("invalid", [None, "tree", "failed", "fork", "missing part", "carried planner"])
 def test_main_inherits_image_parts_only_from_valid_scratch_proof(
     workflow: Workflow, invalid: str | None,

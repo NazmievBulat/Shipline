@@ -6331,13 +6331,21 @@ def test_a_failed_kept_root_frees_capacity_for_the_restored_prefix(
 
 
 @pytest.mark.parametrize("number", ["7", "9"])
+@pytest.mark.parametrize("name,sharded", [(None, False), ("Compatibility", False),
+                                       ("Compatibility", True)])
 def test_a_member_requiring_migration_compatibility_uses_the_single_path(
-    github: GitHub, number: str
+    github: GitHub, number: str, name: str | None, sharded: bool,
 ) -> None:
     _batch_setup(github, compatibility=number)
+    if name is not None:
+        path = github.workflow.repo / "shipline.json"
+        config = json.loads(path.read_text())
+        config.setdefault("checks", {})["older_version"] = name
+        path.write_text(json.dumps(config))
+        github.workflow.git("update-index", "--skip-worktree", "shipline.json")
     job = {
         "id": 30000,
-        "name": "CI: older version on new tables",
+        "name": f"{name} (1 of 1)" if sharded else name or "CI: older version on new tables",
         "status": "completed",
         "conclusion": "success",
     }

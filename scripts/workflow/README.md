@@ -111,10 +111,12 @@ installation folder, even if the checkout has a file of the same name.
 | `checks.ci_result` | the check that sums up CI | `CI result` |
 | `checks.ci_plan`, `checks.e2e_plan` | the planner checks of CI and of the browser suite | `CI: what to run`, `E2E: what to run` |
 | `checks.images` | the prefix of every image check; its planner is `<prefix>: what to run` | `Docker images` |
+| `checks.server_tests`, `checks.web`, `checks.older_version` | the server tests, web suite and previous-version compatibility jobs, without their ` (k of n)` shard suffix | `CI: server tests`, `CI: web`, `CI: older version on new tables` |
 | `checks.dependency_audit` | the job that audits the dependencies against published advisories | none: `CI: dependencies` |
 | `checks.advisory_annotation` | the title of the notice the audit writes on main when advisories alone failed it, a JSON list of `<advisory> in <package> (<summary>)`. With it, main failing only on such an advisory is `advisory`, not red, and the line keeps merging | none: an advisory makes main red |
 | `annotations.*` | the titles of the planners' annotations the merge gate reads: `merge_tested`, `files_tested`, `server_tests`, `web_suite`, `browser_suite` | `Merge tested`, `Files tested`, `Server tests`, `Web suite`, `Browser suite` |
 | `workflows.ci`, `workflows.e2e`, `workflows.images` | the workflow files under `.github/workflows/` | `ci.yml`, `e2e.yml`, `images.yml` |
+| `workflows.ci_name`, `workflows.images_name` | the CI and image workflow run names used by the runner-minutes report | `CI`, `Images` |
 | `labels.workflow`, `labels.audited` | the label that starts a ticket, and an audit's | `workflow`, `audited` |
 | `labels.priority.blocker` … `.low` | the four priority labels | `priority: blocker` … `priority: low` |
 | `runner.labels` | the runner labels the merge gate may re-run failed jobs on | the ones built from `runner.label`: `<label>`, `<label>-standby`, `<label>-first`, `<label>-main`, `<label>-main-batch`, `<label>-docker`, and `runner.planner_label`; without a label, none: the gate re-runs nothing. A file that names its own lists `<label>-main-batch` too, or the gate re-runs no job of the merge line's lane |
