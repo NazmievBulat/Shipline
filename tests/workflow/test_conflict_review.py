@@ -1,8 +1,13 @@
 """A conflict round reuses only proved review evidence, through the real workflow scripts."""
 
 import json
+import os
 import shlex
+import shutil
 import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -965,6 +970,11 @@ def test_codex_conflict_gh_allows_only_its_own_conflict_round(
     head, _ = _codex_conflict(workflow)
     assert workflow.run("start", "review", "7").returncode == 0
     resolved = _resolve(workflow)
+    reports = _folder(workflow) / "reviews/7" / resolved
+    reports.mkdir(parents=True)
+    for who in ("claude", "cursor"):
+        (reports / f"{who}.md").write_text(f"{who} report\nexit 0\n")
+    (reports / "panel.complete").write_text(resolved + "\n")
     payload = workflow.root / "round.json"
     if operation == "dash-file":
         payload = workflow.worktree(7) / "--round.json"
@@ -1234,3 +1244,153 @@ def test_a_reviewer_the_gate_sent_to_the_usual_one_is_stopped_without_a_rule_bre
     workflow.git("commit", "--allow-empty", "-m", "fix: send-back", cwd=workflow.worktree(7))
     _reviewer(workflow)
     assert not (folder / "review-7.usual-reviewer").exists()
+
+
+def _requested_panel(workflow: Workflow) -> str:
+    _panel_conflict(workflow)
+    _program(workflow)
+    _record_handback(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    head = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", head)
+    for tool in ("agent", "claude"):
+        workflow.fake(tool, '#!/bin/bash\necho "@TOOL@ report"\n')
+    # The existing bridge wait contract, with a panel wait as the current completed turn.
+    workflow.run_script("notify", "waiting", env={"WORKFLOW_SESSION": "review-7"})
+    workflow.run_script(
+        "notify", "codex",
+        json.dumps({"type": "agent-turn-complete", "last-assistant-message": _WAIT}),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    with _relay(workflow, "review-7") as relay:
+        assert "result" in _rpc(relay, "tools/call", {"name": "await_turn"})
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _WAIT}, "review-7")
+    workflow.screen("Remote Control: " + SESSION_LINK + "\n● " + _WAIT + _BOX, "review-7")
+    workflow.screen("• Waiting for panel.\n\n› \n", "codex-7")
+    done = workflow.run_script("review-panel", "7", "--request", cwd=workflow.worktree(7),
+                               env={"WORKFLOW_SESSION": "review-7"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    request = json.loads((_folder(workflow) / "review-7.panel-request.json").read_text())
+    assert request == {"number": "7", "head": head, "full_review": False}
+    assert not (_folder(workflow) / "reviews/7" / head / "claude.md").exists()
+    return head
+
+
+def test_tick_runs_requested_panel_outside_resolver_and_wakes_once(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    workflow.fake("claude", '#!/bin/bash\n[[ -z ${WORKFLOW_SESSION:-} ]] || exit 91\necho "Claude report"\n')
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+    reports = _folder(workflow) / "reviews/7" / head
+    assert "Claude report" in (reports / "claude.md").read_text()
+    assert (reports / "panel.complete").read_text().strip() == head
+    assert len(workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")) == 1
+    assert (_folder(workflow) / f"review-7.panel-woken-{head}").exists()
+
+
+@pytest.mark.parametrize("failure", ["missing", "failed", "pending", "wrong head"])
+def test_codex_cannot_publish_without_successful_claude_panel(workflow: Workflow, failure: str) -> None:
+    head, _ = _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow)
+    reports = _folder(workflow) / "reviews/7" / resolved
+    reports.mkdir(parents=True)
+    (reports / "panel.complete").write_text((head if failure == "wrong head" else resolved) + "\n")
+    if failure != "missing":
+        (reports / "claude.md").write_text("Claude report\nexit 1\n" if failure == "failed" else "Claude report\nexit 0\n")
+    if failure == "pending":
+        (reports / "claude.md.pending").write_text("still running")
+    payload = workflow.worktree(7) / "round.json"
+    payload.write_text(json.dumps({"event": "COMMENT", "commit_id": resolved, "body":
+        f"<!-- workflow-review round=2 result=passed -->\n<!-- workflow-conflict extends={head} -->\n"}))
+    env = dict(line.split("=", 1) for line in (workflow.state / "env/codex-7").read_text().splitlines())
+    workflow.fake("gh", '#!/bin/bash\necho allowed\n')
+    shim = Path(env["PATH"].split(":")[0]) / "gh"
+    done = subprocess.run(["bash", str(shim), "api", "-X", "POST",
+        "repos/example-org/example-app/pulls/7/reviews", "--input", str(payload)],
+        cwd=workflow.worktree(7), env=env, text=True, capture_output=True, check=False)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "allowed" not in done.stdout
+
+
+def test_failed_requested_panel_is_reported_and_not_completed(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    workflow.fake("claude", '#!/bin/bash\necho "sandbox failed"\nexit 1\n')
+    done = workflow.run_script("tick")
+    assert done.returncode != 0
+    assert "panel failed" in done.stdout + done.stderr
+    assert not (_folder(workflow) / "reviews/7" / head / "panel.complete").exists()
+
+
+def test_requested_panel_waits_for_github_head_then_falls_back_on_local_head(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    scope = json.loads((_folder(workflow) / "review-7.conflict.json").read_text())
+    workflow.set_pull_request(7, "OPEN", scope["head"])
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not (_folder(workflow) / "review-7.usual-reviewer").exists()
+    assert not (_folder(workflow) / "reviews/7" / head / "panel.complete").exists()
+    assert not workflow.calls("tmux codex-7 send-keys")
+    workflow.set_pull_request(7, "OPEN", head)
+    (workflow.state / "reviews-7.json").write_text("[]")  # scope now requires a full review
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (_folder(workflow) / "review-7.usual-reviewer").read_text().strip() == head
+    assert not workflow.is_running("codex-7")
+    assert workflow.is_running("review-7")
+
+
+def test_codex_panel_argv_reaches_real_claude_parser(workflow: Workflow, tmp_path: Path) -> None:
+    real = shutil.which("claude", path=os.environ.get("PATH", ""))
+    if real is None:
+        pytest.skip("real Claude CLI is not installed")
+    head = _requested_panel(workflow)
+    workflow.fake("claude", '#!/bin/bash\nprintf "%s\\0" "$@" > "@STATE@/claude-argv"\necho report\n')
+    done = workflow.run_script("review-panel", "7", "--head", head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    argv = (workflow.state / "claude-argv").read_text().split("\0")[:-1]
+    config = tmp_path / "mcp.json"
+    config.write_text('{"mcpServers":{}}')
+    for index, arg in enumerate(argv):
+        if arg == "--mcp-config":
+            argv[index + 1] = str(config)
+        elif arg.startswith("--mcp-config="):
+            argv[index] = "--mcp-config=" + str(config)
+    bodies = []
+
+    class Recorder(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            bodies.append(self.rfile.read(int(self.headers.get("content-length", 0))))
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("localhost", 0), Recorder)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    home = tmp_path / "parser-home"
+    home.mkdir()
+    try:
+        process = subprocess.Popen([real, *argv], cwd=home, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env={"PATH": os.environ["PATH"], "HOME": str(home), "ANTHROPIC_API_KEY": "sk-example",
+                 "ANTHROPIC_BASE_URL": f"http://localhost:{server.server_port}",
+                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"})
+        try:
+            deadline = time.monotonic() + 45
+            while process.poll() is None and not bodies and time.monotonic() < deadline:
+                time.sleep(0.1)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            output = process.communicate(timeout=5)[0].decode(errors="replace")
+        marker = json.dumps(argv[-1].splitlines()[0])[1:-1].encode()
+        assert any(marker in body for body in bodies), output
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

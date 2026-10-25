@@ -234,6 +234,9 @@ jobs:
           echo "WORKFLOW_TEST_TMUX_WITH_SYSTEMD=$tmux_with_systemd" >> "$GITHUB_ENV"
       - name: The test tools
         run: python -m pip install --require-hashes -r requirements-test.txt
+      - name: The real Claude argument parser
+        if: matrix.shard == 3
+        run: npm install --global @anthropic-ai/claude-code@2.1.310
       # The test command shipline.json names (commands.test), with this shard's own words.
       - name: Tests
         run: >-
