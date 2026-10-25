@@ -301,6 +301,10 @@ def _batch_signal(train: Train) -> None:
         member = next((m for m in members if m["scratch"] is record), None)
         source = prefix_image_source(member, train) if member else None
         if source:
+            if source != record.get("image_source"):
+                # Proof details can arrive after the run itself already says success.
+                noted = True
+                changed |= first
             record["image_source"] = source
             found += [("images", run) for run in image_source_runs(source)]
         for workflow, run in found:
