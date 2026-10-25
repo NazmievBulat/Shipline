@@ -329,11 +329,12 @@ def request_panel(folder: Path, number: str, full: bool) -> None:
             previous = json.loads(path.read_text())
         except (OSError, ValueError):
             previous = None
-        write_json(path, request)
         if previous != request:
             # A later explicit full-review request supersedes an earlier completed panel.
             for suffix in ("panel-result", "panel-woken"):
                 (folder / f"review-{number}.{suffix}-{head}").unlink(missing_ok=True)
+        # Publish the new request last: a completed replacement never retains old success.
+        write_json(path, request)
 
 
 def panel_complete(folder: Path, number: str, head: str) -> bool:
