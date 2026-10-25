@@ -323,15 +323,17 @@ def request_panel(folder: Path, number: str, full: bool) -> None:
         raise ValueError("the kept resolution must be clean before requesting its panel")
     path = folder / f"review-{number}.panel-request.json"
     request = {"number": number, "head": head, "full_review": full}
-    try:
-        previous = json.loads(path.read_text())
-    except (OSError, ValueError):
-        previous = None
-    write_json(path, request)
-    if previous != request:
-        # A later explicit full-review request supersedes an earlier completed panel.
-        for suffix in ("panel-result", "panel-woken"):
-            (folder / f"review-{number}.{suffix}-{head}").unlink(missing_ok=True)
+    with (folder / f"review-{number}.panel-request.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            previous = json.loads(path.read_text())
+        except (OSError, ValueError):
+            previous = None
+        write_json(path, request)
+        if previous != request:
+            # A later explicit full-review request supersedes an earlier completed panel.
+            for suffix in ("panel-result", "panel-woken"):
+                (folder / f"review-{number}.{suffix}-{head}").unlink(missing_ok=True)
 
 
 def panel_complete(folder: Path, number: str, head: str) -> bool:
@@ -385,9 +387,12 @@ def run_panel(folder: Path, number: str, head: str) -> None:
             status = 1
         if status == 3 or (status == 0 and not panel_complete(folder, number, head)):
             return  # GitHub is late, or a surviving reviewer still holds its report lock.
-        # A new explicit full-review request cannot be overwritten by an older panel.
-        if json.loads(request_path.read_text()) == request:
-            write_json(result, status)
+        # Serialize the comparison AND result write with request replacement/invalidation.
+        # This lock covers metadata only; a full-review request never waits for reviewers.
+        with (folder / f"review-{number}.panel-request.lock").open("a") as request_lock:
+            fcntl.flock(request_lock, fcntl.LOCK_EX)
+            if json.loads(request_path.read_text()) == request:
+                write_json(result, status)
 
 
 def sentence(folder: Path, number: str) -> str:
