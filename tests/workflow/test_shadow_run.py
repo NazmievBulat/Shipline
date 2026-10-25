@@ -1646,7 +1646,7 @@ def test_the_comparison_help_names_both_journal_exports() -> None:
     assert done.returncode == 0, done.stderr
     assert "-t tick" in done.stdout
     assert "-u workflow-tick.service" in done.stdout
-    assert "sort -n -u" in done.stdout
+    assert "sort -n | uniq" in done.stdout
 
 
 def test_a_real_tick_without_a_shadow_tick_beside_it_is_not_compared(tmp_path: Path) -> None:

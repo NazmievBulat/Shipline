@@ -160,7 +160,10 @@ def test_a_conflict_reviewer_is_nudged_only_for_a_later_conflicting_head(
     # The reviewer resolves the merge, while GitHub still reports the passed head.
     resolved = _resolve(workflow)
     _idle(workflow, "review-7")
-    workflow.screen("● Checking the resolution.\n\n> \n", "review-7")
+    workflow.screen(
+        "● Checking the resolution.\n" + "─" * 40 + "\n> \n" + "─" * 40 + "\n",
+        "review-7",
+    )
     if new_head:
         handed.pulls["7"]["headRefOid"] = resolved
         (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {resolved}\n")
