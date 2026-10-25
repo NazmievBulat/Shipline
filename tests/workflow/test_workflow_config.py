@@ -2320,13 +2320,16 @@ def test_config_refusals_keep_their_recorded_messages(
     assert str(refused.value).replace(str(path), "<config>") == case["message"]
 
 
-def test_generated_config_keeps_the_original_examples_values(tmp_path: Path) -> None:
+def test_generated_config_keeps_original_values_and_documents_command_waits(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
     original = json.loads((_CONFIG_FIXTURES / "example.input.json").read_text())
+    waits = {"wait_exit": [75], "wait_output": "^checks temporarily unavailable"}
+    original["commands"]["pre_train_checks"].update(waits)
     generated = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
     assert generated == original
     _write(repo, generated)
     expected = json.loads((_CONFIG_FIXTURES / "example.json").read_text())
+    expected["values"]["commands"]["pre_train_checks"].update(waits)
     assert _as_json(workflow_config.load(repo)) == expected["values"]
 
 
