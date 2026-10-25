@@ -28,8 +28,9 @@ The forecast goes to `~/.local/state/workflow/ci-demand.json`, written whole, mo
 
 and the tick prints "about N ordinary and M Docker jobs within 30 minutes". A completed run's
 counts are kept beside it (`ci-demand-runs.json`) and its jobs are not read again. Without
-runner labels there is no pool and no forecast. A read that fails leaves the last forecast as it
-was: the balancer ignores one older than 10 minutes.
+runner labels there is no pool and no forecast. Unreadable runs are skipped and counted in a
+partial forecast's `skipped_runs`. An unreadable run list, or no readable runs after job reads
+fail, leaves the last forecast as it was: the balancer ignores one older than 10 minutes.
 """
 
 from __future__ import annotations
@@ -78,10 +79,44 @@ def kind(label: str) -> str | None:
     return "docker" if label.endswith("-docker") else "ordinary"
 
 
-def _api(path: str) -> Any:
-    done = call("tick", "api", path)
-    done.check_returncode()
-    return json.loads(done.stdout)
+class ReadError(Exception):
+    """A GitHub read failed or its answer cannot be used for the forecast."""
+
+
+def _api(path: str, field: str) -> list[dict[str, Any]]:
+    try:
+        done = call("tick", "api", path)
+    except subprocess.TimeoutExpired:
+        raise ReadError() from None
+    if done.returncode == 75:
+        raise Limited()
+    if done.returncode:
+        raise ReadError()
+    try:
+        answer = json.loads(done.stdout)
+    except ValueError:
+        raise ReadError() from None
+    rows = answer.get(field) if isinstance(answer, dict) else None
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise ReadError()
+    # Validate GitHub's data here, rather than catching TypeError or KeyError from the
+    # counting code: those exceptions must still expose programming faults.
+    for row in rows:
+        if field == "workflow_runs":
+            if type(row.get("id")) is not int or row["id"] <= 0:
+                raise ReadError()
+            if any(
+                row.get(key) is not None and not isinstance(row[key], str)
+                for key in ("path", "created_at", "status")
+            ):
+                raise ReadError()
+        else:
+            labels = row.get("labels")
+            if labels is not None and (
+                not isinstance(labels, list) or not all(isinstance(label, str) for label in labels)
+            ):
+                raise ReadError()
+    return rows
 
 
 class Runs:
@@ -94,6 +129,10 @@ class Runs:
             kept = {}
         self.kept: dict[str, list[Any]] = kept if isinstance(kept, dict) else {}
         self.used: dict[str, list[Any]] = {}
+        self.skipped: set[int] = set()
+        self.readable = 0
+        # Whether the last push read every run it looked at: only then may it feed the average.
+        self.whole = True
 
     def _counts(self, run: dict[str, Any]) -> tuple[int, int, bool]:
         """Ordinary and Docker jobs the run's push started, its first attempt (a re-run's attempt
@@ -108,7 +147,7 @@ class Runs:
         ):
             ordinary, docker, ran = kept
         else:
-            jobs = _api(f"{CONFIG.api}/actions/runs/{key}/attempts/1/jobs?per_page=100")["jobs"]
+            jobs = _api(f"{CONFIG.api}/actions/runs/{key}/attempts/1/jobs?per_page=100", "jobs")
             started = [job for job in jobs if job.get("conclusion") != "skipped"]
             kinds = [
                 next((found for label in job.get("labels") or [] if (found := kind(label))), None)
@@ -122,20 +161,32 @@ class Runs:
     def push(self, branch: str) -> Counts | None:
         """The jobs one push of the branch starts, or None when no run of it ran a job."""
         query = urlencode({"branch": branch, "per_page": RUNS_PER_PAGE})
-        runs = _api(f"{CONFIG.api}/actions/runs?{query}")["workflow_runs"]
+        runs = _api(f"{CONFIG.api}/actions/runs?{query}", "workflow_runs")
         runs.sort(key=lambda run: (run.get("created_at") or "", run["id"]), reverse=True)
         found = None
+        unreadable = False
         for workflow in vars(CONFIG.workflows).values():
             own = [run for run in runs if _workflow_file(run) == workflow][:RUNS_LOOKED_AT]
             for run in own:
-                ordinary, docker, ran = self._counts(run)
+                if run["id"] in self.skipped:
+                    unreadable = True
+                    continue
+                try:
+                    ordinary, docker, ran = self._counts(run)
+                except ReadError:
+                    self.skipped.add(run["id"])
+                    unreadable = True
+                    continue
+                self.readable += 1
                 if ran:
                     found = (
                         (found or (0, 0))[0] + ordinary,
                         (found or (0, 0))[1] + docker,
                     )
                     break
-        return found
+        self.whole = not unreadable
+        # Missing history uses the other pulls' average; failed reads contribute no jobs.
+        return (0, 0) if found is None and unreadable else found
 
     def keep(self) -> None:
         _save(RUN_COUNTS, self.used)
@@ -251,11 +302,20 @@ def write(main: Path, snapshot: Path, sessions: str) -> int:
     ready = [n for n in unchecked_ready(pulls) if n not in cloud and n not in sessions_busy]
     prefixes = [number for number in prefixes_to_build(notes) if str(number) in pulls]
     runs = Runs()
-    pushes = [
-        runs.push(pulls[str(number)]["headRefName"])
-        for number in (*cloud, *sessions_busy, *ready, *prefixes)
-    ]
-    known = [counts for counts in pushes if counts is not None]
+    pushes = []
+    known = []
+    try:
+        for number in (*cloud, *sessions_busy, *ready, *prefixes):
+            counts = runs.push(pulls[str(number)]["headRefName"])
+            pushes.append(counts)
+            if counts is not None and runs.whole:
+                known.append(counts)
+    except ReadError:
+        print("CI demand: the run list could not be read; the last forecast is kept")
+        return 0
+    if runs.skipped and not runs.readable:
+        print("CI demand: no runs could be read; the last forecast is kept")
+        return 0
     average = (
         (
             math.ceil(sum(counts[0] for counts in known) / len(known)),
@@ -272,11 +332,17 @@ def write(main: Path, snapshot: Path, sessions: str) -> int:
         "docker": sum(counts[1] for counts in counted),
         "pulls": {"cloud": cloud, "busy": sessions_busy, "ready": ready, "prefixes": prefixes},
     }
+    if runs.skipped:
+        forecast["skipped_runs"] = len(runs.skipped)
     _save(FORECAST, forecast)
     runs.keep()
+    skipped = (
+        f"; {len(runs.skipped)} run{'s' if len(runs.skipped) != 1 else ''} skipped"
+        if runs.skipped else ""
+    )
     print(
         f"about {forecast['ordinary']} ordinary and {forecast['docker']} Docker jobs "
-        f"within {WITHIN_MINUTES} minutes"
+        f"within {WITHIN_MINUTES} minutes{skipped}"
     )
     return 0
 

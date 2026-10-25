@@ -16,6 +16,7 @@ API = "repos/example-org/example-app/actions"
 # `jobs.json` ("<run>-<attempt>": jobs); every call goes to the log.
 _FAKE_GH = """#!/usr/bin/env python3
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -23,13 +24,23 @@ from urllib.parse import parse_qs, urlsplit
 
 state = Path("@STATE@")
 arguments = sys.argv[1:]
+path = arguments[-1]
+api = "repos/example-org/example-app/actions"
+jobs_path = re.fullmatch(api + r"/runs/(\\d+)/attempts/(\\d+)/jobs\\?per_page=100", path)
+runs_path = (urlsplit(path).path == api + "/runs"
+             and parse_qs(urlsplit(path).query).get("per_page") == ["30"])
+if not (len(arguments) == 2 and arguments[0] == "api" and (jobs_path or runs_path)):
+    os.execv("@TICK_GH@", ["gh", *arguments])
 with open(state / "calls.log", "a") as log:
     log.write("gh " + " ".join(arguments) + "\\n")
 if (state / "fail-gh").exists():
     sys.exit(1)
-path = arguments[-1]
-api = "repos/example-org/example-app/actions"
-if found := re.fullmatch(api + r"/runs/(\\d+)/attempts/(\\d+)/jobs\\?per_page=100", path):
+if (state / "fail-path").exists() and (state / "fail-path").read_text() in path:
+    sys.exit(1)
+if (state / "bad-path").exists() and (state / "bad-path").read_text() in path:
+    print((state / "bad-answer").read_text())
+    sys.exit(0)
+if found := jobs_path:
     jobs = json.loads((state / "jobs.json").read_text())
     print(json.dumps({"jobs": jobs.get(f"{found[1]}-{found[2]}", [])}))
 elif urlsplit(path).path == api + "/runs":
@@ -65,7 +76,8 @@ class Demand:
 
     def __init__(self, workflow: Workflow) -> None:
         self.workflow = workflow
-        workflow.fake("gh", _FAKE_GH)
+        workflow.fake("gh-tick", (workflow.bin / "gh").read_text())
+        workflow.fake("gh", _FAKE_GH.replace("@TICK_GH@", str(workflow.bin / "gh-tick")))
         self.runs: dict[str, list[dict]] = {}
         self.jobs: dict[str, list[dict]] = {}
         self.pulls: dict[str, dict[str, Any]] = {}
@@ -103,17 +115,22 @@ class Demand:
     def train(self, value: dict[str, Any]) -> None:
         (self.notes / "merge-train.json").write_text(json.dumps(value))
 
-    def write(self, sessions: str = "", *, code: int = 0) -> dict[str, Any] | None:
+    def prepare(self) -> Path:
         state = self.workflow.state
         (state / "runs.json").write_text(json.dumps(self.runs))
         (state / "jobs.json").write_text(json.dumps(self.jobs))
         snapshot = self.workflow.root / "pulls.json"
         snapshot.write_text(json.dumps(self.pulls))
+        return snapshot
+
+    def write(self, sessions: str = "", *, code: int = 0) -> dict[str, Any] | None:
+        snapshot = self.prepare()
         done = self.workflow.run_python(
             "ci_demand.py", "write", str(self.workflow.repo), str(snapshot), stdin=sessions, env=AT
         )
         assert done.returncode == code, done.stdout + done.stderr
         self.printed = done.stdout
+        self.error = done.stderr
         path = self.forecast
         return json.loads(path.read_text()) if path.exists() else None
 
@@ -338,7 +355,193 @@ def test_a_failed_read_keeps_the_last_forecast(demand: Demand) -> None:
     (demand.workflow.state / "fail-gh").touch()
     demand.pull(7, runs=[_ci(73, 5)])
 
-    assert demand.write(code=1) == before
+    original = demand.forecast.read_bytes()
+    assert demand.write() == before
+    assert demand.forecast.read_bytes() == original
+    assert demand.printed == "CI demand: the run list could not be read; the last forecast is kept\n"
+
+
+def test_a_failed_job_read_is_skipped_and_read_again_next_turn(demand: Demand) -> None:
+    demand.pull(7, draft=False, runs=[_ci(71, 9), _ci(70, 2)])
+    demand.pull(8, draft=False, runs=[_ci(81, 3)])
+    failed = demand.workflow.state / "fail-path"
+    failed.write_text("/runs/71/")
+
+    forecast = demand.write()
+
+    assert forecast is not None
+    assert forecast["ordinary"] == 5
+    assert forecast["skipped_runs"] == 1
+    assert "1 run skipped" in demand.printed
+    kept = json.loads(demand.forecast.with_name("ci-demand-runs.json").read_text())
+    assert "71" not in kept
+    failed.unlink()
+    forecast = demand.write()
+    assert forecast["ordinary"] == 12
+    assert "skipped_runs" not in forecast
+    assert sum("/runs/71/" in call for call in demand.workflow.calls("gh api")) == 2
+
+
+def test_no_readable_jobs_keeps_both_last_files(demand: Demand) -> None:
+    demand.pull(7, draft=False, runs=[_ci(71, 2)])
+    demand.write()
+    kept = demand.forecast.with_name("ci-demand-runs.json")
+    before = demand.forecast.read_bytes(), kept.read_bytes()
+    demand.pull(7, draft=False, runs=[_ci(72, 5)])
+    (demand.workflow.state / "fail-path").write_text("/attempts/1/jobs")
+
+    demand.write()
+
+    assert (demand.forecast.read_bytes(), kept.read_bytes()) == before
+    assert demand.printed == "CI demand: no runs could be read; the last forecast is kept\n"
+
+
+def test_failed_runs_are_not_estimated_or_used_in_the_average(demand: Demand) -> None:
+    demand.pull(7, draft=False, runs=[_ci(71, 9)])
+    demand.pull(8, draft=False, runs=[_ci(81, 3)])
+    demand.pull(9, draft=False)
+    (demand.workflow.state / "fail-path").write_text("/runs/71/")
+
+    forecast = demand.write()
+
+    assert forecast["ordinary"] == 6  # Three read, three estimated for the empty history.
+    assert forecast["skipped_runs"] == 1
+
+
+def test_a_partly_read_branch_does_not_feed_the_average(demand: Demand) -> None:
+    # 7's newest run cannot be read and its older one ran no job: 7 counts nothing and must not
+    # lower the average that 9, with no history, takes from the branches read whole.
+    nothing_ran = (_run(71, "ci.yml"), [_job(ORDINARY, "skipped")])
+    demand.pull(7, draft=False, runs=[_ci(72, 9), nothing_ran])
+    demand.pull(8, draft=False, runs=[_ci(81, 4)])
+    demand.pull(9, draft=False)
+    (demand.workflow.state / "fail-path").write_text("/runs/72/")
+
+    forecast = demand.write()
+
+    assert forecast["ordinary"] == 8  # None for 7, four for 8, four estimated for 9.
+    assert forecast["skipped_runs"] == 1
+
+def test_an_unreadable_first_forecast_creates_neither_file(demand: Demand) -> None:
+    demand.pull(7, draft=False, runs=[_ci(71, 9)])
+    (demand.workflow.state / "fail-path").write_text("/attempts/1/jobs")
+
+    assert demand.write() is None
+    assert not demand.forecast.with_name("ci-demand-runs.json").exists()
+
+
+def test_a_later_run_list_failure_keeps_both_files(demand: Demand) -> None:
+    demand.pull(7, draft=False, runs=[_ci(71, 2)])
+    demand.write()
+    kept = demand.forecast.with_name("ci-demand-runs.json")
+    before = demand.forecast.read_bytes(), kept.read_bytes()
+    demand.pull(7, draft=False, runs=[_ci(72, 5)])
+    demand.pull(8, draft=False, runs=[_ci(81, 3)])
+    (demand.workflow.state / "fail-path").write_text("branch=ticket%2Fchange-8")
+
+    demand.write()
+
+    assert (demand.forecast.read_bytes(), kept.read_bytes()) == before
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ["not JSON", "null", '{}', '{"workflow_runs": null}', '{"workflow_runs": [{}]}'],
+)
+def test_an_unusable_run_list_keeps_the_last_forecast(demand: Demand, answer: str) -> None:
+    demand.pull(7, draft=False, runs=[_ci(71, 2)])
+    demand.write()
+    before = demand.forecast.read_bytes()
+    (demand.workflow.state / "bad-path").write_text("/runs?")
+    (demand.workflow.state / "bad-answer").write_text(answer)
+
+    demand.write()
+
+    assert demand.forecast.read_bytes() == before
+    assert "the last forecast is kept" in demand.printed
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "not JSON", "null", '{}', '{"jobs": null}', '{"jobs": [null]}',
+        '{"jobs": [{"labels": [null]}]}',
+    ],
+)
+def test_an_unusable_jobs_answer_skips_only_its_run(demand: Demand, answer: str) -> None:
+    demand.pull(7, draft=False, runs=[_ci(71, 9), _ci(70, 2)])
+    (demand.workflow.state / "bad-path").write_text("/runs/71/")
+    (demand.workflow.state / "bad-answer").write_text(answer)
+
+    forecast = demand.write()
+
+    assert forecast["ordinary"] == 2
+    assert forecast["skipped_runs"] == 1
+
+
+@pytest.mark.parametrize("failure", ["jobs", "run-list", "all-jobs"])
+def test_the_tick_survives_forecast_read_failures(demand: Demand, failure: str) -> None:
+    workflow = demand.workflow
+    workflow.add_worktree(8)
+    workflow.running("ticket-8", held=100 * 1024 * 1024)
+    workflow.screen("Working\n  ✻ Thinking…\n", "ticket-8")
+    demand.pull(8, runs=[_ci(81, 9), _ci(80, 2)])
+    # Match the branch supplied by the tick's real snapshot.
+    demand.runs[workflow.branch(8)] = demand.runs.pop("ticket/change-8")
+    demand.prepare()
+    demand.forecast.parent.mkdir(parents=True)
+    demand.forecast.write_text('{"at": 1, "ordinary": 4, "docker": 0}\n')
+    before = demand.forecast.read_bytes()
+    failed_path = {"jobs": "/runs/81/", "run-list": "/runs?", "all-jobs": "/attempts/1/jobs"}
+    (workflow.state / "fail-path").write_text(failed_path[failure])
+
+    done = workflow.run_script("tick", env=AT)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.wake_log.exists()
+    if failure == "jobs":
+        forecast = json.loads(demand.forecast.read_text())
+        assert forecast["ordinary"] == 2
+        assert forecast["skipped_runs"] == 1
+    else:
+        assert demand.forecast.read_bytes() == before
+        reason = "the run list could not be read" if failure == "run-list" else "no runs could be read"
+        assert f"CI demand: {reason}; the last forecast is kept\n" in done.stdout
+
+
+def test_a_paused_budget_still_returns_75_and_keeps_the_forecast(demand: Demand) -> None:
+    demand.pull(7, draft=False, runs=[_ci(71, 2)])
+    demand.write()
+    before = demand.forecast.read_bytes()
+    budget = demand.forecast.parent / "github-budget/budget.json"
+    budget.write_text(json.dumps({"core": {"remaining": 0, "reset": 4_000_000_000}}))
+
+    demand.write(code=75)
+
+    assert demand.forecast.read_bytes() == before
+
+
+@pytest.mark.parametrize("fault", ["TypeError", "KeyError"])
+def test_a_programming_fault_still_fails_the_tick(demand: Demand, fault: str) -> None:
+    script = demand.workflow.repo / "scripts/workflow/ci_demand.py"
+    text = script.read_text()
+    script.write_text(text.replace("runs = Runs()", f"raise {fault}('broken forecast')"))
+
+    done = demand.workflow.run_script("tick", env=AT)
+
+    assert done.returncode == 1
+    assert "CI demand: 'broken forecast'" in done.stderr or "CI demand: broken forecast" in done.stderr
+    assert demand.workflow.wake_log.exists()
+
+
+def test_a_forecast_write_fault_still_fails_the_tick(demand: Demand) -> None:
+    demand.forecast.mkdir(parents=True)
+
+    done = demand.workflow.run_script("tick", env=AT)
+
+    assert done.returncode == 1
+    assert "CI demand:" in done.stderr
+    assert demand.workflow.wake_log.exists()
 
 
 def test_the_forecast_is_written_whole_for_its_owner_alone(demand: Demand) -> None:
