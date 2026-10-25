@@ -1470,36 +1470,37 @@ send_prompt() {
 # wait before typing; if Enter is not accepted, restore it for the next tick to retry.
 send_codex_prompt() {
   local name=$1 prompt=$2 mode=${3:-resend} target=codex-${1##*-}
-  local notes=$main/.claude/worktrees/ticket-${1##*-}/$SHIPLINE_STATE_FOLDER/$1
+  local relay_notes=$main/.claude/worktrees/ticket-${1##*-}/$SHIPLINE_STATE_FOLDER/$1
   local backup suffix screen sending_resend=true
   (
+    mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
     exec 6>"$main/$SHIPLINE_STATE_FOLDER/start-${name##*-}.lock"
     flock --nonblock 6 || die "another action for pull request ${name##*-} is under way"
     require_running "$target"
-    [[ ! -e $notes.owner-reply ]] || die "$name has a pending owner reply"
+    [[ ! -e $relay_notes.owner-reply ]] || die "$name has a pending owner reply"
     if ! bash "$script_dir/bridge-empty" "$name"; then
       [[ $mode == resend ]] && holds_own_text "$name" ||
         die "$name has text in its bridge input box"
     fi
     if [[ $mode == wake ]]; then
-      [[ ( -e $notes.checks-wait || -e $notes.idle ) && -e $notes.bridge-stopped &&
-         ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked && ! -e $notes.pushed ]] ||
+      [[ ( -e $relay_notes.checks-wait || -e $relay_notes.idle ) && -e $relay_notes.bridge-stopped &&
+         ! -e $relay_notes.owner-blocked && ! -e $relay_notes.interaction-blocked && ! -e $relay_notes.pushed ]] ||
         die "$name is busy or waiting for the owner"
-      cmp -s "$notes.codex-turn.json" "$notes.codex-delivered" ||
+      cmp -s "$relay_notes.codex-turn.json" "$relay_notes.codex-delivered" ||
         die "$name has a turn its bridge has not relayed"
     fi
     screen=$(tmux -L "$target" capture-pane -p -J -t "=$target:") || die "cannot read $target"
     screen=${screen%"${screen##*[![:space:]]}"}
     [[ $screen != *"Press enter to confirm or esc to cancel" ]] || die "$target shows a permission dialog"
     ! LC_ALL=C grep -qE '^• .*\(.*esc to interrupt\)' <<<"$screen" || die "$target is working"
-    backup=$(mktemp -d "$notes.wake.XXXXXX") || exit 1
+    backup=$(mktemp -d "$relay_notes.wake.XXXXXX") || exit 1
     restore_wait() {
       local result=$?
       trap - EXIT
       if ((result != 0)); then
         for suffix in waiting checks-wait job-wait idle; do
-          if [[ -e $backup/$suffix && ! -e $notes.$suffix ]]; then
-            cp -p -- "$backup/$suffix" "$notes.$suffix" || true
+          if [[ -e $backup/$suffix && ! -e $relay_notes.$suffix ]]; then
+            cp -p -- "$backup/$suffix" "$relay_notes.$suffix" || true
           fi
         done
       fi
@@ -1508,12 +1509,12 @@ send_codex_prompt() {
     }
     trap restore_wait EXIT
     for suffix in waiting checks-wait job-wait idle; do
-      [[ ! -e $notes.$suffix ]] || cp -p -- "$notes.$suffix" "$backup/$suffix" || exit 1
+      [[ ! -e $relay_notes.$suffix ]] || cp -p -- "$relay_notes.$suffix" "$backup/$suffix" || exit 1
     done
-    [[ ! -r $notes.codex-turn.json ]] || cp -- "$notes.codex-turn.json" "$backup/turn" || exit 1
-    rm -f "$notes.waiting" "$notes.checks-wait" "$notes.job-wait" "$notes.idle"
+    [[ ! -r $relay_notes.codex-turn.json ]] || cp -- "$relay_notes.codex-turn.json" "$backup/turn" || exit 1
+    rm -f "$relay_notes.waiting" "$relay_notes.checks-wait" "$relay_notes.job-wait" "$relay_notes.idle"
     send_prompt "$target" "$prompt"
-    [[ ! -e $backup/turn ]] || mv -- "$backup/turn" "$notes.codex-followed-up"
+    [[ ! -e $backup/turn ]] || mv -- "$backup/turn" "$relay_notes.codex-followed-up"
   )
 }
 
