@@ -1,6 +1,7 @@
 """`ci_proof.py` writes the notes the merge gate reads from a CI run, runs a repository's own test
 command, and reads the `Workflow-Proof` line of a squash on main the way the gate writes it."""
 
+import base64
 import json
 import os
 import re
@@ -440,6 +441,51 @@ def test_main_inherits_image_parts_only_from_valid_scratch_proof(
         ]}
         github[f"{_API}/check-runs/45/annotations?per_page=100"] = notes
     expected = {"Docker images: browser tests": 40} if invalid in (None, "carried planner") else {}
+    assert _inherited(workflow, github, "images") == expected
+
+
+@pytest.mark.parametrize("difference", ["neutral", "excluded", "image", "rename", "mode", "workflow", "truncated", "unreadable"])
+def test_image_inheritance_checks_the_complete_tree_difference(
+    workflow: Workflow, difference: str,
+) -> None:
+    github = _github(_receipt(sources=[{
+        "workflow": "images", "run": 40, "jobs": ["Docker images: image tests"]
+    }]))
+    old_tree, blob = "1" * 40, "2" * 40
+    ok = {"status": "completed", "conclusion": "success"}
+    github[f"{_API}/actions/runs/40"] = {
+        "id": 40, "event": "workflow_dispatch", "head_sha": _MERGE,
+        "head_repository": {"full_name": "example-org/example-app"},
+        "path": ".github/workflows/images.yml", **ok,
+    }
+    github[f"{_API}/actions/runs/40/jobs?per_page=100"] = {"jobs": [
+        {"id": 41, "name": "Docker images: what to run", **ok},
+        {"id": 42, "name": "Docker images: image tests", **ok},
+    ]}
+    github[f"{_API}/check-runs/41/annotations?per_page=100"] = [
+        {"title": "Files tested", "message": old_tree}
+    ]
+    image_workflow = {"path": ".github/workflows/images.yml", "type": "blob", "mode": "100644", "sha": blob}
+    before = [image_workflow]
+    after = [image_workflow.copy()]
+    path = {"neutral": "docs/change.md", "excluded": "docker/README.md"}.get(difference, "docker/input")
+    after.append({"path": path, "type": "blob", "mode": "100644", "sha": "3" * 40})
+    if difference == "rename":
+        before.append({**after.pop(), "path": "docker/old"})
+        after.append({"path": "docs/old", "type": "blob", "mode": "100644", "sha": "3" * 40})
+    if difference == "mode":
+        before.append({**after[-1], "mode": "100755"})
+    if difference == "workflow":
+        after[:] = [{**image_workflow, "sha": "4" * 40}]
+    github[f"{_API}/git/trees/{old_tree}?recursive=1"] = {"tree": before, "truncated": False}
+    github[f"{_API}/git/trees/{_TREE}?recursive=1"] = {"tree": after, "truncated": difference == "truncated"}
+    text = 'on:\n  pull_request:\n    paths:\n      - "docker/**"\n      - "!docker/**/*.md"\n'
+    github[f"{_API}/git/blobs/{blob}"] = {
+        "encoding": "base64", "content": base64.b64encode(text.encode()).decode()
+    }
+    if difference == "unreadable":
+        github[f"{_API}/git/trees/{old_tree}?recursive=1"] = None
+    expected = {"Docker images: image tests": 40} if difference in ("neutral", "excluded") else {}
     assert _inherited(workflow, github, "images") == expected
 
 

@@ -1364,6 +1364,12 @@ def _batch_setup(
     workflow.git("push", "origin", "main")
     workflow.git("checkout", "ticket/seven")
     github.main()
+    # A green main supplies a complete image proof for image-neutral prefixes.
+    _main_image_run(github, 60, github.base)
+    github.api[f"{_REPO}/actions/runs/60/jobs?per_page=100"]["jobs"][1]["name"] = "Docker images: image tests"
+    github.api[f"{_REPO}/check-runs/61/annotations?per_page=100"] = [
+        {"title": "Files tested", "message": workflow.git("rev-parse", f"{github.base}^{{tree}}")}
+    ]
     for number in range(7, 7 + count) if selected else ():
         head = github.pulls[str(number)]["headRefOid"]
         github.ci(original, head, run_id=number * 1000, server=SELECTED)

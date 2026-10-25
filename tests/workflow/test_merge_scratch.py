@@ -766,6 +766,40 @@ def test_neutral_prefix_after_an_untested_image_change_runs_images(github: GitHu
     assert len(github.workflow.calls("gh workflow run images.yml")) == 1
 
 
+def test_a_neutral_prefix_without_any_main_image_result_runs_its_own(github: GitHub) -> None:
+    _batch_setup(github)
+    github.api[f"{_REPO}/actions/workflows/images.yml/runs?branch=main&per_page=100&page=1"] = {"workflow_runs": []}
+    assert _batch_call(github).returncode == 3
+    assert ["images" in m["scratch"]["workflows"] for m in _prefixes(github)] == [True, False, False]
+
+
+@pytest.mark.parametrize("lost", ["failed", "missing"])
+def test_a_lost_shared_result_after_its_member_merged_gets_a_replacement(github: GitHub, lost: str) -> None:
+    _batch_setup(github, images=True)
+    assert _batch_call(github).returncode == 3
+    source = _scratch(github)
+    _finish_prefix(github, "7")
+    assert _batch_call(github).returncode == 0
+    path = (f"{_REPO}/actions/workflows/images.yml/runs?head_sha={source['head']}"
+            "&event=workflow_dispatch&per_page=100")
+    if lost == "failed":
+        github.api[path]["workflow_runs"][0]["conclusion"] = "failure"
+    else:
+        github.api[path]["workflow_runs"] = []
+    _finish_prefix(github, "8", run_id=1100)
+    _finish_prefix(github, "9", run_id=2100)
+    done = _batch_call(github, "8")
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert _merges(github) == ["7"]
+    assert "images" in _scratch(github, "8")["workflows"]
+    assert _batch_call(github, "8").returncode == 3
+    _finish_prefix(github, "8", run_id=1100)
+    done = _batch_call(github, "8")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
+    assert _receipt(github)["images_run"] == 1120
+
+
 def test_an_image_change_after_a_neutral_member_gets_its_own_run(github: GitHub) -> None:
     _batch_setup(github, images=True, images_member=8)
     assert _batch_call(github).returncode == 3
