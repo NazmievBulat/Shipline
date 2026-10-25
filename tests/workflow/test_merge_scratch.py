@@ -863,15 +863,116 @@ def test_a_prefix_can_introduce_the_image_workflow_before_main_has_it(github: Gi
     assert workflow.git("show", f"origin/main:{path}") == definition.strip()
 
 
+def _skipped_main_image_push(github: GitHub, run_id: int, source: int | None = None) -> None:
+    """A neutral main push whose image tests skip, optionally inheriting another run."""
+    workflow = github.workflow
+    previous = github.base
+    workflow.git("checkout", "main")
+    filename = f"main-neutral-{run_id}.txt"
+    (workflow.repo / filename).write_text("image-neutral change\n")
+    workflow.git("add", filename)
+    tree = workflow.git("write-tree")
+    message = "chore: neutral main push"
+    if source is not None:
+        message += "\n\nWorkflow-Proof: " + json.dumps({
+            "base": previous, "tree": tree,
+            "sources": [{"workflow": "images", "run": source,
+                         "jobs": ["Docker images: image tests"]}],
+        })
+    workflow.git("commit", "-m", message)
+    github.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    workflow.git("checkout", "ticket/seven")
+    github.main()
+    _main_image_run(github, run_id, github.base)
+    github.api[f"{_REPO}/actions/runs/{run_id}/jobs?per_page=100"]["jobs"][1].update(
+        name="Docker images: image tests", conclusion="skipped",
+    )
+    github.api[f"{_REPO}/check-runs/{run_id + 1}/annotations?per_page=100"] = [
+        {"title": "Files tested", "message": tree},
+    ]
+
+
+@pytest.mark.parametrize("kind", ["inherited", "neutral-push", "multi-hop", "scheduled"])
+def test_neutral_line_after_main_skipped_or_inherited_its_image_tests(
+    github: GitHub, kind: str,
+) -> None:
+    _batch_setup(github)
+    source = 8_000_060
+    if kind == "scheduled":
+        github.api[f"{_REPO}/actions/runs/{source}"]["event"] = "schedule"
+    _skipped_main_image_push(github, 8_000_070,
+                            source if kind in ("inherited", "multi-hop") else None)
+    if kind == "multi-hop":
+        _skipped_main_image_push(github, 8_000_080, 8_000_070)
+    # Main's latest image tests skipped, exactly as after a neutral or inherited push.
+    github.api[f"{_REPO}/actions/runs/{8_000_080 if kind == 'multi-hop' else 8_000_070}/jobs?per_page=100"]["jobs"][1]["conclusion"] = "skipped"
+    github.save()
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+    for _ in range(4):
+        _batch_call(github, next((n for n in ("7", "8", "9")
+                                 if github.pulls[n]["state"] != "MERGED"), "9"))
+    assert _merges(github) == ["7", "8", "9"]
+    assert not github.workflow.calls("gh workflow run images.yml")
+    assert _receipt(github)["images_run"] == source
+    assert "main-neutral-8000070.txt" in _receipt(github)["images_differing_files"]
+
+
+@pytest.mark.parametrize("state", ["failure", "pending"])
+def test_an_inherited_main_image_source_must_really_pass(github: GitHub, state: str) -> None:
+    _batch_setup(github)
+    _skipped_main_image_push(github, 8_000_070, 8_000_060)
+    run = github.api[f"{_REPO}/actions/runs/8000060"]
+    run.update(status="in_progress" if state == "pending" else "completed",
+               conclusion=None if state == "pending" else "failure")
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+    done = _batch_call(github)
+    assert done.returncode in (1, 3), done.stdout + done.stderr
+    assert not _merges(github)
+    github.api[f"{_REPO}/actions/runs/8000060"].update(status="completed", conclusion="success")
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
+
+
+def test_a_neutral_own_check_merge_carries_mains_last_image_source(github: GitHub) -> None:
+    _batch_setup(github)
+    github.ci(github.base, github.head, run_id=7000)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7"]
+    receipt = _receipt(github)
+    assert receipt["images_run"] == 8_000_060 and receipt["images_complete"]
+    assert receipt["images_differing_files"] == ["change-7.txt"]
+    _finish_batch(github)
+    done = _batch_call(github, "8")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
+    assert _receipt(github)["images_run"] == 8_000_060
+
+
 def test_a_neutral_prefix_without_any_main_image_result_waits_for_main(github: GitHub) -> None:
     _batch_setup(github)
     github.api[f"{_REPO}/actions/workflows/images.yml/runs?branch=main&per_page=100&page=1"] = {"workflow_runs": []}
+    github.api.pop(f"{_REPO}/actions/runs/8000060")
+    _skipped_main_image_push(github, 8_000_070)
     assert _batch_call(github).returncode == 3
     assert ["images" in m["scratch"]["workflows"] for m in _prefixes(github)] == [False, False, False]
     _finish_batch(github)
     assert _batch_call(github).returncode == 3
     assert _merges(github) == []
     assert not github.workflow.calls("gh workflow run images.yml")
+    # Only an actual passed image run can release this line.
+    _main_image_run(github, 8_000_080, github.base, event="schedule")
+    github.api[f"{_REPO}/actions/runs/8000080/jobs?per_page=100"]["jobs"][1]["name"] = "Docker images: image tests"
+    github.api[f"{_REPO}/check-runs/8000081/annotations?per_page=100"] = [
+        {"title": "Files tested", "message": github.workflow.git("rev-parse", f"{github.base}^{{tree}}")},
+    ]
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
 
 
 @pytest.mark.parametrize("lost", ["failed", "missing"])

@@ -1032,6 +1032,8 @@ def _main_image_run(
             "head_sha": commit,
             "head_branch": "main",
             "event": event,
+            "path": ".github/workflows/images.yml",
+            "head_repository": {"full_name": "example-org/example-app"},
             "status": status,
             "conclusion": conclusion,
             "updated_at": "2026-10-18T07:30:23Z",
