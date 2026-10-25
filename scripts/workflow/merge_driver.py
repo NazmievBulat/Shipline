@@ -133,11 +133,23 @@ def _checks_failed(folder: Path, number: str, pull: dict[str, Any]) -> None:
             # A saved train block is distinct from a failure of the head's own checks.
             train = gate.Train(folder)
             failure = train.batch_failed.get(number)
+            suite = train.suites.get(number)
+            try:
+                suite_red = (
+                    suite is not None
+                    and suite["member"] == pull["headRefOid"]
+                    and gate._suite_state(suite) == "red"
+                )
+            except gate.Refused, gate.Waiting, KeyError, TypeError, ValueError, IndexError:
+                # An unread suite names nothing: the reason falls back to the train's block.
+                suite_red = False
             if failure:
                 reason = (
                     f"{failure['workflow']} run of this pull request's prefix "
                     f"({failure['batch']['branch']}) failed on main and the members ahead of it"
                 )
+            elif suite_red:
+                reason = "a whole suite run on this pull request's tested merge failed"
             else:
                 reason = (
                     "merge train blocked this head without marking it refreshable; "

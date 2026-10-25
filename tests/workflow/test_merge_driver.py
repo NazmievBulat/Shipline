@@ -2030,6 +2030,32 @@ def test_a_blocked_handoff_that_is_not_refreshable_is_handed_back(handed: GitHub
     assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
 
 
+def test_a_failed_whole_suite_names_itself_when_the_driver_hands_it_back(handed: GitHub) -> None:
+    workflow = handed.workflow
+    # The whole suite of its tested merge failed, on this same head.
+    suite = {
+        "member": handed.head,
+        "head": "a" * 40,
+        "branch": "workflow/merge-batch-a",
+        "workflows": ["ci"],
+        "requested": ["ci"],
+    }
+    handed.ci_dispatched(suite["head"], suite["branch"], run_id=40, conclusion="failure")
+    handed.save()
+    _blocked_on_its_head(handed, refreshable=False)
+    path = _folder(workflow) / "merge-train.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "suites": {"7": suite}}))
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (
+        "merge hand-back 7: a whole suite run on this pull request's tested merge failed"
+    ) in done.stdout
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
+
+
 @pytest.mark.parametrize("refreshable", [False, True], ids=["failed", "failed and refreshable"])
 def test_a_handoff_with_a_failed_check_is_handed_back(handed: GitHub, refreshable: bool) -> None:
     workflow = handed.workflow
