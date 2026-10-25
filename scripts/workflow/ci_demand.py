@@ -125,7 +125,7 @@ class Runs:
         runs = _api(f"{CONFIG.api}/actions/runs?{query}")["workflow_runs"]
         runs.sort(key=lambda run: (run.get("created_at") or "", run["id"]), reverse=True)
         found = None
-        for workflow in vars(CONFIG.workflows).values():
+        for workflow in (CONFIG.workflows.ci, CONFIG.workflows.e2e, CONFIG.workflows.images):
             own = [run for run in runs if _workflow_file(run) == workflow][:RUNS_LOOKED_AT]
             for run in own:
                 ordinary, docker, ran = self._counts(run)

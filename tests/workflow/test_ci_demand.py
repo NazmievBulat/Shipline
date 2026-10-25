@@ -153,6 +153,24 @@ def test_every_push_on_its_way_counts_its_last_runs_jobs(demand: Demand) -> None
     assert demand.printed == "about 10 ordinary and 2 Docker jobs within 30 minutes\n"
 
 
+def test_workflow_run_names_are_not_counted_as_workflow_files(demand: Demand) -> None:
+    path = demand.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config["workflows"] = {"ci_name": "ci.yml", "images_name": "other.yml"}
+    path.write_text(json.dumps(config))
+    demand.cloud(7, "working")
+    demand.pull(7, runs=[
+        _ci(71, 2),
+        (_run(72, "images.yml"), [_job(DOCKER)]),
+        (_run(73, "other.yml"), [_job(ORDINARY)] * 5),
+    ])
+
+    forecast = demand.write()
+
+    assert forecast is not None
+    assert (forecast["ordinary"], forecast["docker"]) == (2, 1)
+
+
 def test_only_working_cloud_workers_busy_sessions_and_unchecked_ready_pulls_count(
     demand: Demand,
 ) -> None:
