@@ -299,8 +299,9 @@ list_worktrees() {
 # limit after which its instruction was sent again, the reset of the limit it said it stopped
 # on). None of it is true of the next session.
 forget_notes() {
-  rm -f "$1.url" "$1.idle" "$1.waiting" "$1.pushed" "$1.area" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.checks-wait" "$1.job-wait" "$1.limits"
+  rm -f "$1.url" "$1.idle" "$1.pushed" "$1.area" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.limits"
   if [[ ${2:-} != keep-codex ]]; then
+    rm -f "$1.waiting" "$1.checks-wait" "$1.job-wait"
     rm -f "$1.started" "$1.codex" "$1.asking" "$1.resent" "$1.codex-delivered" "$1.codex-answered" "$1.codex-followed-up" "$1.codex-quota-delivered" "$1.codex-approval-delivered" "$1.codex-recovery-error" "$1.owner-reply"
   fi
 }
@@ -615,6 +616,15 @@ start_cloud_worker() {
   echo "$name started: $link"
 }
 
+record_review_start() {
+  local name=$1 worktree=$2
+  # A native resolver can publish while its bridge is still obtaining a link.
+  touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
+  rm -f "$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-"* \
+    "$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-"* "$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-"* \
+    "$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-"*
+}
+
 cmd_start() {
   local kind=$1 number=$2 effort=$3 model=$4 name prompt worktree other command codex_model=""
   case $kind in
@@ -695,15 +705,9 @@ cmd_start() {
   else
     launch "$name" "$worktree" \
       "claude --effort $effort ${model:+--model $model }--remote-control $name \"$prompt\""
-  fi
-  # The tick wakes a reviewer only for a round published after this moment; an earlier
-  # reviewer's round is not this session's. Written after `launch`, which forgets old notes.
-  # A nudge given to an earlier reviewer on the same head is not this one's.
-  if [[ $kind =~ ^(review|audit)$ ]]; then
-    touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
-    rm -f "$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-"* \
-      "$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-"* "$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-"* \
-      "$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-"*
+    if [[ $kind =~ ^(review|audit)$ ]]; then
+      record_review_start "$name" "$worktree"
+    fi
   fi
   [[ $model == codex ]] || save_link "$name" "$worktree"
   if [[ $kind == review ]]; then
@@ -1337,13 +1341,17 @@ cmd_resend() {
   if [[ $target == "$name" && -e $(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name.codex ]]; then
     # The bridge may have marked a question delivered before Claude hit its own limit.
     # Replay that turn; the worker instruction is never an owner's answer.
-    if [[ ! -r $notes.codex-answered || ! -r $notes.codex-turn.json ]] ||
-        ! cmp -s "$notes.codex-answered" "$notes.codex-turn.json"; then
+    if ! cmp -s "$notes.codex-turn.json" "$notes.codex-answered" &&
+        ! cmp -s "$notes.codex-turn.json" "$notes.codex-followed-up"; then
       rm -f "$notes.codex-delivered"
     fi
     prompt=__WORKFLOW_CODEX_TURN__
   fi
-  send_prompt "$target" "$prompt"
+  if [[ $target != "$name" ]]; then
+    send_codex_prompt "$name" "$prompt"
+  else
+    send_prompt "$target" "$prompt"
+  fi
   if [[ $target != "$name" && $restarted == false ]]; then
     send_prompt "$name" '__WORKFLOW_CODEX_TURN__'
   fi
@@ -1362,7 +1370,23 @@ read_prompt_box() {
   screen=$(tmux -L "$name" capture-pane -p -e -J -t "=$name:" 2>/dev/null) ||
     die "cannot read the input box of $name"
   top=$(strip_ansi <<<"$screen" | LC_ALL=C awk '/^─/ { above = last; last = NR } END { print above + 0 }')
-  if ((top)); then
+  if [[ $name == codex-* ]]; then
+    local plain first last
+    plain=$(strip_ansi <<<"$screen")
+    read -r first last < <(LC_ALL=C awk '
+      /^(›|>|❯)/ { first = NR }
+      NF { last = NR; footer = $0 }
+      END {
+        if (footer ~ /^[[:space:]]*\? for shortcuts([[:space:]]+[0-9]+% context left)?[[:space:]]*$/) last--
+        print first + 0, last + 0
+      }
+    ' <<<"$plain")
+    ((first > 0 && last >= first)) || die "cannot find the input box of $name"
+    # Keep ANSI until nonblank_input removes dim suggestions. Read continuation rows too,
+    # removing only the final footer row, never a footer-looking line inside an owner draft.
+    typed=$(LC_ALL=C sed -n "$first,${last}p" <<<"$screen" |
+      LC_ALL=C sed '1s/›/>/' | nonblank_input)
+  elif ((top)); then
     typed=$(LC_ALL=C sed -n "$((top + 1)),\$p" <<<"$screen" | LC_ALL=C sed -E $'/^(\\x1b\\[[0-?]*[ -/]*[@-~])*─/,$d' | nonblank_input)
   else
     [[ ${sending_resend:-false} == true ]] || die "cannot find the input box of $name"
@@ -1442,6 +1466,70 @@ send_prompt() {
   die "$name still has automation text in its input box after two Enter attempts"
 }
 
+# Deliver native work without turning it into an owner's bridge reply. Clear the previous
+# wait before typing; if Enter is not accepted, restore it for the next tick to retry.
+send_codex_prompt() {
+  local name=$1 prompt=$2 mode=${3:-resend} target=codex-${1##*-}
+  local notes=$main/.claude/worktrees/ticket-${1##*-}/$SHIPLINE_STATE_FOLDER/$1
+  local backup suffix screen sending_resend=true
+  (
+    exec 6>"$main/$SHIPLINE_STATE_FOLDER/start-${name##*-}.lock"
+    flock --nonblock 6 || die "another action for pull request ${name##*-} is under way"
+    require_running "$target"
+    [[ ! -e $notes.owner-reply ]] || die "$name has a pending owner reply"
+    if ! bash "$script_dir/bridge-empty" "$name"; then
+      [[ $mode == resend ]] && holds_own_text "$name" ||
+        die "$name has text in its bridge input box"
+    fi
+    if [[ $mode == wake ]]; then
+      [[ ( -e $notes.checks-wait || -e $notes.idle ) && -e $notes.bridge-stopped &&
+         ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked && ! -e $notes.pushed ]] ||
+        die "$name is busy or waiting for the owner"
+      cmp -s "$notes.codex-turn.json" "$notes.codex-delivered" ||
+        die "$name has a turn its bridge has not relayed"
+    fi
+    screen=$(tmux -L "$target" capture-pane -p -J -t "=$target:") || die "cannot read $target"
+    screen=${screen%"${screen##*[![:space:]]}"}
+    [[ $screen != *"Press enter to confirm or esc to cancel" ]] || die "$target shows a permission dialog"
+    ! LC_ALL=C grep -qE '^• .*\(.*esc to interrupt\)' <<<"$screen" || die "$target is working"
+    backup=$(mktemp -d "$notes.wake.XXXXXX") || exit 1
+    restore_wait() {
+      local result=$?
+      trap - EXIT
+      if ((result != 0)); then
+        for suffix in waiting checks-wait job-wait idle; do
+          if [[ -e $backup/$suffix && ! -e $notes.$suffix ]]; then
+            cp -p -- "$backup/$suffix" "$notes.$suffix" || true
+          fi
+        done
+      fi
+      rm -rf -- "$backup"
+      exit "$result"
+    }
+    trap restore_wait EXIT
+    for suffix in waiting checks-wait job-wait idle; do
+      [[ ! -e $notes.$suffix ]] || cp -p -- "$notes.$suffix" "$backup/$suffix" || exit 1
+    done
+    [[ ! -r $notes.codex-turn.json ]] || cp -- "$notes.codex-turn.json" "$backup/turn" || exit 1
+    rm -f "$notes.waiting" "$notes.checks-wait" "$notes.job-wait" "$notes.idle"
+    send_prompt "$target" "$prompt"
+    [[ ! -e $backup/turn ]] || mv -- "$backup/turn" "$notes.codex-followed-up"
+  )
+}
+
+send_reviewer_update() {
+  local name=$1 prompt=$2 notes
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  if [[ -e $notes.codex ]]; then
+    prompt=${prompt/"merge when they all passed"/"hand off with merge-when-current --handoff ${name##*-} when they all passed"}
+    send_codex_prompt "$name" "Workflow update: $prompt Never merge directly." wake
+    snapshot_busy "$name"
+    # The native completion callback wakes the relay with its sentinel, after the new turn.
+  else
+    send_prompt "$name" "$prompt"
+  fi
+}
+
 cmd_checks_finished() {
   local name=$1 head=$2 reason=${3:-checks} notes
   notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
@@ -1453,18 +1541,18 @@ cmd_checks_finished() {
   if [[ $reason == merged ]]; then
     local finished="review finished"
     [[ $name != audit-* ]] || finished="audit finished"
-    send_prompt "$name" "Pull request ${name#*-} was merged by the merge train, in a batch (commit $head). Do not call the gate again. Do its after-merge duties by the rules, then end with \`$finished\`."
+    send_reviewer_update "$name" "Pull request ${name#*-} was merged by the merge train, in a batch (commit $head). Do not call the gate again. Do its after-merge duties by the rules, then end with \`$finished\`."
     return
   fi
   if [[ $reason == lost ]]; then
-    send_prompt "$name" "GitHub lost a check on $head: it still lists it as running, though its run finished more than 10 minutes ago. Call the merge gate again by the rules; it pushes one empty commit to run CI again, or says why not."
+    send_reviewer_update "$name" "GitHub lost a check on $head: it still lists it as running, though its run finished more than 10 minutes ago. Call the merge gate again by the rules; it pushes one empty commit to run CI again, or says why not."
     return
   fi
   if [[ $reason == conflict ]]; then
-    send_prompt "$name" "GitHub reports a merge conflict on $head (CONFLICTING or DIRTY). Merge current main into this branch by the rules, using \`merge main: conflict in <files>\` for a conflict; ask the owner before resolving a non-mechanical conflict."
+    send_reviewer_update "$name" "GitHub reports a merge conflict on $head (CONFLICTING or DIRTY). Merge current main into this branch by the rules, using \`merge main: conflict in <files>\` for a conflict; ask the owner before resolving a non-mechanical conflict."
     return
   fi
-  send_prompt "$name" "The checks on $head have finished. Read them once and go on by the rules: merge when they all passed, fix or send back when one failed."
+  send_reviewer_update "$name" "The checks on $head have finished. Read them once and go on by the rules: merge when they all passed, fix or send back when one failed."
 }
 
 # The tick's two messages to a Claude worker or reviewer that sits with nothing to do. Never to
@@ -1826,7 +1914,8 @@ start_codex_worker() {
   push_queue=${XDG_STATE_HOME:-$HOME/.local/state}/workflow/pushes
   mkdir -p "$push_queue"
   mkdir -p "$worktree/$SHIPLINE_STATE_FOLDER"
-  rm -f "$notes.started" "$notes.codex-turn.json" "$notes.codex-delivered" "$notes.codex-answered" "$notes.codex-followed-up" "$notes.codex-quota-delivered" "$notes.codex-approval-delivered" "$notes.codex-recovery-error" "$notes.owner-reply"
+  forget_notes "$notes"
+  rm -f "$notes.codex-turn.json"
   [[ $name != ticket-* ]] || touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name##*-}"
   [[ $name != review-* ]] || touch "$main/$SHIPLINE_STATE_FOLDER/codex-resolved-${name##*-}"
   common=$(git rev-parse --path-format=absolute --git-common-dir)
@@ -1847,11 +1936,16 @@ start_codex_worker() {
   real_gh=$(command -v gh)
   touch "$notes.codex"
   launch "$codex_name" "$worktree" "$command" "PATH=$script_dir/codex-bin:$shipline_bin$PATH" "$name" "WORKFLOW_GH=$real_gh"
+  [[ $name != review-* ]] || record_review_start "$name" "$worktree"
   start_codex_bridge "$name" "$worktree"
 }
 
 start_codex_bridge() {
   local name=$1 worktree=$2 on_failure=${3:-stop} command config notes=$2/$SHIPLINE_STATE_FOLDER/$1
+  # Replaying a waiting turn is still a background wait, not a question for the owner.
+  if [[ -e $notes.checks-wait || -e $notes.job-wait ]]; then
+    touch "$notes.waiting"
+  fi
   config=$notes.codex-config.json
   jq -n --arg script "$script_dir/codex-bridge.mjs" --arg worktree "$worktree" --arg name "$name" \
     '{mcpServers: {codex_bridge: {command: "node", args: [$script, $worktree, $name]}}}' >"$config"
@@ -1898,8 +1992,8 @@ cmd_bridge() {
     end_server "$name" || return 1
     snapshot_remove "$name"
   fi
-  if [[ ! -r $notes.codex-answered || ! -r $notes.codex-turn.json ]] ||
-      ! cmp -s "$notes.codex-answered" "$notes.codex-turn.json"; then
+  if ! cmp -s "$notes.codex-turn.json" "$notes.codex-answered" &&
+      ! cmp -s "$notes.codex-turn.json" "$notes.codex-followed-up"; then
     rm -f "$notes.codex-delivered"
   fi
   # A permission panel shown to the bridge that ended may still wait for the owner.

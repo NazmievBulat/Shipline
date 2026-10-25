@@ -835,6 +835,12 @@ current head or a commit the head grew from. The tick records the head under `.l
 and logs each nudge in `~/.local/state/workflow/wake.log`. It leaves owner-blocked sessions
 and unsent input alone; the reviewer reads the results and follows the merge gate rules.
 
+For a Codex conflict reviewer, these workflow updates go directly to native Codex, without
+creating an owner reply in the bridge. Both input boxes, pending replies, permission prompts
+and active native work are protected. Codex's next completed turn wakes the relay normally.
+Bridge startup and recovery preserve a declared background wait and the native review's start
+time, including a wait declared before the bridge first connected.
+
 The tick also keeps waits moving, for Claude workers and reviewers only (never Codex bridges,
 hunts or audits), and never answers a question. It never interrupts a running command but in
 two cases, a still screen and a wait loop that finds itself (below); the full table is in

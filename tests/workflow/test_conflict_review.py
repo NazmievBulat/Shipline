@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 from workflow.test_checks_finished import _BOX, _WAIT, _checks  # pyright: ignore[reportPrivateUsage]
 from workflow.test_codex_worker import (  # pyright: ignore[reportPrivateUsage]
-    _CODEX_WAITING,
     _relay,
     _rpc,
 )
@@ -599,8 +598,11 @@ def _waiting_codex_review(workflow: Workflow) -> str:
         turn = _rpc(relay, "tools/call", {"name": "await_turn"})
         assert turn["result"]["content"][0]["text"] == _WAIT
     workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _WAIT}, "review-7")
-    workflow.screen("● " + _WAIT + _BOX, "review-7")
-    workflow.screen(_CODEX_WAITING, "codex-7")
+    workflow.screen(f"Remote Control: {SESSION_LINK}\n● " + _WAIT + _BOX, "review-7")
+    workflow.screen(
+        "• Waiting for CI.\n\n\u203a \x1b[2mAsk Codex to do anything\x1b[0m\n\n  ? for shortcuts\n",
+        "codex-7",
+    )
     assert (workflow.notes(7) / "review-7.checks-wait").exists()
     return head
 
@@ -641,7 +643,10 @@ def test_reviewer_automation_wakes_native_codex_without_an_owner_reply(
         assert "merge-when-current --handoff 7" in workflow.calls("tmux codex-7 send-keys")[0]
 
 
-@pytest.mark.parametrize("block", ["bridge input", "native input", "pending reply", "unrelayed", "working", "permission"])
+@pytest.mark.parametrize("block", [
+    "bridge input", "native input", "native multiline", "native footer text",
+    "native hint text", "pending reply", "unrelayed", "working", "permission",
+])
 def test_native_review_wake_preserves_owner_input_and_active_work(
     workflow: Workflow, block: str
 ) -> None:
@@ -650,6 +655,12 @@ def test_native_review_wake_preserves_owner_input_and_active_work(
         workflow.screen("● " + _WAIT + _BOX.replace("> \n", "> owner text\n"), "review-7")
     elif block == "native input":
         workflow.screen("\u203a owner text\n", "codex-7")
+    elif block == "native multiline":
+        workflow.screen("\u203a \n  owner text\n\n  ? for shortcuts\n", "codex-7")
+    elif block == "native footer text":
+        workflow.screen("\u203a \n  ? for shortcuts\n\n  ? for shortcuts\n", "codex-7")
+    elif block == "native hint text":
+        workflow.screen("\u203a Ask Codex to do anything\n\n  ? for shortcuts\n", "codex-7")
     elif block == "pending reply":
         (workflow.notes(7) / "review-7.owner-reply").write_text("1")
     elif block == "unrelayed":
@@ -690,6 +701,46 @@ def test_tick_wakes_native_conflict_reviewer_once_for_finished_checks(workflow: 
     assert len(workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")) == 1
     assert (_folder(workflow) / f"review-7.checks-nudged-{head}").exists()
     assert not (workflow.notes(7) / "review-7.owner-reply").exists()
+
+
+def test_native_quota_resend_can_retry_its_own_unsent_bridge_sentinel(workflow: Workflow) -> None:
+    _waiting_codex_review(workflow)
+    quota = "■ You've hit your usage limit. Try again at 4:00 PM.\n\u203a \n"
+    workflow.screen(quota, "codex-7")
+    (workflow.state / "swallow-enter-review-7").write_text("2")
+    first = workflow.run("resend", "review-7")
+    assert first.returncode != 0
+    assert (workflow.notes(7) / "review-7.typed").read_text() == "__WORKFLOW_CODEX_TURN__"
+    workflow.screen(quota, "codex-7")
+    second = workflow.run("resend", "review-7")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert not (workflow.notes(7) / "review-7.typed").exists()
+
+
+def test_recovery_after_native_wake_waits_for_a_fresh_turn(workflow: Workflow) -> None:
+    head = _waiting_codex_review(workflow)
+    assert workflow.run("checks-finished", "review-7", head).returncode == 0
+    notes = workflow.notes(7)
+    (workflow.state / "tmux/review-7").unlink()
+    done = workflow.run("bridge", "review-7")
+    assert done.returncode == 0, done.stderr
+    assert (notes / "review-7.codex-delivered").read_text() == (notes / "review-7.codex-turn.json").read_text()
+    assert not (notes / "review-7.waiting").exists()
+    workflow.run_script("notify", "waiting", env={"WORKFLOW_SESSION": "review-7"})
+    workflow.run_script(
+        "notify", "codex",
+        json.dumps({"type": "agent-turn-complete", "last-assistant-message": _WAIT, "turn-id": "next"}),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    workflow.notify(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "__WORKFLOW_CODEX_TURN__"},
+        "review-7",
+    )
+    with _relay(workflow, "review-7") as relay:
+        assert _rpc(relay, "tools/call", {"name": "await_turn"})["result"]["content"][0]["text"] == _WAIT
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _WAIT}, "review-7")
+    assert (notes / "review-7.checks-wait").exists()
+    assert not (notes / "review-7.owner-blocked").exists()
 
 
 @pytest.mark.parametrize("built", [False, True])

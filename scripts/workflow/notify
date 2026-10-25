@@ -385,7 +385,12 @@ on_stop() {
 }
 
 on_prompt() {
-  rm -f "$idle" "$waiting" "$checks_wait" "$job_wait" "$limit" "$notes/$name.limit-line" "$notes/$name.bridge-stopped"
+  rm -f "$idle" "$limit" "$notes/$name.limit-line" "$notes/$name.bridge-stopped"
+  # Relay startup/recovery only displays a native turn. Its sentinel starts no new native
+  # work and must retain a fast notify waiting, or a wait restored for replay.
+  if [[ ! -e $notes/$name.codex || $(field .prompt) != __WORKFLOW_CODEX_TURN__ ]]; then
+    rm -f "$waiting" "$checks_wait" "$job_wait"
+  fi
   # After the owner answered, the same question is a new one. A turn the session started
   # itself, when its background job ended, is not an answer: the event then says so, in any
   # of these fields. Claude Code 2.1.303 supplies no provenance fields for a queued
