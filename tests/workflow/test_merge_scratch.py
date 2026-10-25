@@ -783,6 +783,7 @@ def test_a_prefix_can_introduce_the_image_workflow_before_main_has_it(github: Gi
     github.main()
     workflow.git("checkout", "ticket/seven")
     workflow.git("merge", "--no-edit", "main")
+    images.parent.mkdir(parents=True, exist_ok=True)
     images.write_text(definition)
     workflow.git("add", path)
     workflow.git("commit", "-m", "ci: introduce the image workflow")
