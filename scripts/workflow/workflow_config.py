@@ -488,7 +488,7 @@ class Commands:
     hunt_browser: str | dict[str, Any] | None = option('command', None, 'The browser command named in a hunt sentence.', example='node tools/shipline/hunt-browser.mjs', shell=(43, 'COMMAND_HUNT_BROWSER'), command_docs=('the hunter, by `shipline hunt-browser`, which its sentence names', '', 'the sentence names none'), position=8)
     hunt_cursor: str | dict[str, Any] | None = option('command', None, 'The command that starts a Cursor hunt with its worktree, report folder and sentence.', example='tools/shipline/hunt-cursor', shell=(44, 'COMMAND_HUNT_CURSOR'), command_docs=('`session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>`', "what it prints is kept in the report folder's `cursor.log`", 'a Cursor hunt is refused'), position=9)
     mechanical_conflicts: str | dict[str, Any] | None = option('command', None, 'The command that resolves conflicts, renumbers files and reports taken numbers.', example='tools/shipline/mechanical-conflicts', shell=(40, 'COMMAND_MECHANICAL_CONFLICTS'), command_docs=("the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch", "`resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line (paths without spaces), or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took", 'every conflict is left to the session, nothing is renumbered and main took no number'), position=5)
-    pre_train_checks: str | dict[str, Any] | None = option('command', None, 'The checks run before a pull request is admitted to the merge train.', example={'run': 'tools/shipline/pre-train-checks', 'form': 'exit'}, shell=(39, 'COMMAND_PRE_TRAIN_CHECKS'), command_docs=('the merge gate, before a pull request joins the merge train, in its worktree', 'exits non-zero when a check failed; what it prints is shown', 'every pull request is admitted'), position=4)
+    pre_train_checks: str | dict[str, Any] | None = option('command', None, 'The checks run before a pull request is admitted to the merge train.', example={'run': 'tools/shipline/pre-train-checks', 'form': 'exit', 'wait_exit': [75], 'wait_output': '^checks temporarily unavailable'}, shell=(39, 'COMMAND_PRE_TRAIN_CHECKS'), command_docs=('the merge gate, before a pull request joins the merge train, in its worktree', 'exits non-zero when a check failed; what it prints is shown', 'every pull request is admitted'), position=4)
     push_checkout: str | dict[str, Any] | None = option('command', None, 'The command that installs changed checkout files and explains a failed push hook.', example='tools/shipline/push-checkout', shell=(46, 'COMMAND_PUSH_CHECKOUT'), command_docs=("the merge gate, before each push and after one that failed: `install <checkout>`; `refusal <checkout>` with the push's whole output on standard input", "`install` installs what changed since its last install and exits non-zero with the reason when it failed, which is a wait; `refusal` prints the hook's failed step with its last lines", 'nothing is installed, and a failed push is refused with its last 10 lines'), position=11)
     push_checks: str | dict[str, Any] | None = option('command', None, "The checks run by the repository's pre-push hook.", example='tools/shipline/push-checks', shell=(47, 'COMMAND_PUSH_CHECKS'), command_docs=('The pre-push hook: the selected changes.', "The command's output and exit code.", 'No additional push checks run.'), position=12)
     server_tests_for_changes: str | dict[str, Any] | None = option('command', None, 'The command that selects server tests and returns whole, tests, total and reasons.', example='tools/shipline/server-tests-for-changes', shell=(38, 'COMMAND_SERVER_TESTS_FOR_CHANGES'), command_docs=('the review panel in a conflict round, and sessions: `<base> [--files-from <file>]`', 'one JSON object, `{"whole": bool, "tests": [paths], "total": int, "reasons": [str]}`', 'the whole server suite: `{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}`'), position=3)
@@ -583,9 +583,11 @@ class Config:
             else:
                 words = self._resolve(_words(entry["run"], name))
         words += entry.get("args", [])
-        if entry["form"] in ("functions", "json"):
+        if entry["form"] in ("functions", "json") or {"wait_exit", "wait_output"} & entry.keys():
             # The same argv works for the gate, shell callers and the launcher. Conversion
             # runs inside the existing caller's command timeout and process group.
+            if {"wait_exit", "wait_output"} & entry.keys():
+                entry = {**entry, "_words": len(words)}
             return [
                 sys.executable,
                 str(Path(__file__).with_name("workflow_commands.py")),
@@ -1034,7 +1036,24 @@ _FUNCTIONS = {
 _EXIT_COMMANDS = {
     "test", "browser", "pre_train_checks", "hunt_app", "hunt_browser", "hunt_cursor", "push_checks",
 }
+_WAIT_CALLS = {
+    "mechanical_conflicts": {"resolve", "renumber"},
+    "advisory_watch": {"answers"},
+    "push_checkout": {"install"},
+}
 _SERVER_FIELDS = {"whole", "tests", "total", "reasons"}
+
+
+def pass_fail_command(name: str, args: list[str] | tuple[str, ...]) -> bool:
+    return name in _EXIT_COMMANDS or bool(args and args[0] in _WAIT_CALLS.get(name, set()))
+
+
+def command_waits(entry: dict[str, Any], code: int, output: str) -> bool:
+    """Zero always passes; a configured exit or output can make another result a wait."""
+    return code != 0 and (
+        code in entry.get("wait_exit", [75])
+        or ("wait_output" in entry and re.search(entry["wait_output"], output) is not None)
+    )
 
 
 def _command_entry(entry: dict[str, Any], name: str) -> dict[str, Any]:
@@ -1050,6 +1069,8 @@ def _command_entry(entry: dict[str, Any], name: str) -> dict[str, Any]:
     if not isinstance(form, str) or form not in allowed:
         raise ConfigError(f"{FILE}: {where} does not support form {form!r}")
     keys = {"run", "form", "args"}
+    if name in _EXIT_COMMANDS or name in _WAIT_CALLS:
+        keys.update({"wait_exit", "wait_output"})
     if form == "functions":
         keys.add("functions")
     elif form == "json":
@@ -1057,6 +1078,17 @@ def _command_entry(entry: dict[str, Any], name: str) -> dict[str, Any]:
     unknown = sorted(set(entry) - keys)
     if unknown:
         raise ConfigError(f"{FILE}: unknown key {where}.{unknown[0]}")
+    exits = entry.get("wait_exit", [75])
+    if not isinstance(exits, list) or any(type(code) is not int or not 1 <= code <= 255 for code in exits):
+        raise ConfigError(f"{FILE}: {where}.wait_exit must be a list of exit statuses from 1 to 255")
+    if "wait_output" in entry:
+        pattern = entry["wait_output"]
+        try:
+            if not isinstance(pattern, str):
+                raise TypeError
+            re.compile(pattern)
+        except (TypeError, re.error):
+            raise ConfigError(f"{FILE}: {where}.wait_output must be a valid regular expression") from None
     line = entry.get("run")
     if not isinstance(line, str) or not line.strip():
         raise ConfigError(f"{FILE}: {where}.run must be a command")

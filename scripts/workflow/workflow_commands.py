@@ -3,6 +3,7 @@
 import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import re
@@ -382,6 +383,7 @@ def _function_answer(name: str, entry: dict, words: list[str]) -> int:
     else:
         call_args = arguments
     # Diagnostics printed by a module are not part of its returned answer.
+    answer_output = sys.stdout
     with contextlib.redirect_stdout(sys.stderr):
         spec.loader.exec_module(module)
         try:
@@ -400,7 +402,7 @@ def _function_answer(name: str, entry: dict, words: list[str]) -> int:
             ):
                 raise
             for path in paths:
-                print(path, file=sys.__stdout__)
+                print(path, file=answer_output)
             print(error, file=sys.stderr)
             return 1
     if name == "browser_plan":
@@ -467,9 +469,46 @@ def repository_answer(args: list[str]) -> int:
     entry = {}
     try:
         entry = json.loads(args[1])
-        if entry["form"] == "functions":
-            return _function_answer(name, entry, args[2:])
-        return _json_answer(name, entry, args[2:])
+        words = args[2:]
+
+        def answer() -> int:
+            if entry["form"] == "functions":
+                return _function_answer(name, entry, words)
+            if entry["form"] == "json":
+                return _json_answer(name, entry, words)
+            # The caller keeps its existing deadline: the gate bounds this whole adapter,
+            # while a launcher or CI command must not gain a shorter command deadline.
+            done = _run(*words, errors="surrogateescape", timeout=None)
+            sys.stdout.write(done.stdout)
+            sys.stderr.write(done.stderr)
+            return done.returncode
+
+        if not {"wait_exit", "wait_output"} & entry.keys():
+            return answer()
+        from workflow_config import command_waits, pass_fail_command
+
+        # A multi-call command's diagnostics and selectors keep their documented answers.
+        call = words
+        if name in ("mechanical_conflicts", "advisory_watch", "push_checkout"):
+            # For command lines, interpreter and script words precede the call. The config
+            # passes their count separately, so literal arguments cannot select a call.
+            call = words[entry["_words"]:]
+        if not pass_fail_command(name, call):
+            return answer()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                code = answer()
+            except Exception as error:
+                prefix = "" if entry["form"] == "functions" else f"commands.{name}: "
+                print(f"{prefix}{error}", file=sys.stderr)
+                code = 1
+        sys.stdout.write(stdout.getvalue())
+        sys.stderr.write(stderr.getvalue())
+        if command_waits(entry, code, stdout.getvalue() + stderr.getvalue()):
+            return 75
+        # With 75 removed from wait_exit, an actual 75 is an ordinary failure.
+        return 1 if code == 75 else code
     except Exception as error:
         # Module errors are a failed answer, not a traceback or an implicit fallback.
         prefix = "" if entry.get("form") == "functions" else f"commands.{name}: "

@@ -327,8 +327,10 @@ def test_pre_train_wait_keeps_the_handoff_then_the_next_tick_merges(
 
     assert first.returncode == 0, first.stdout + first.stderr
     assert "pre-train checks of 7 wait: check could not finish" in first.stdout
+    assert first.stdout.count("pre-train checks of 7 wait:") == 1
     assert note.read_text() == before
     assert "7" in json.loads((folder / "merge-train.json").read_text())["waiting"]
+    assert "7" not in json.loads((folder / "merge-train.json").read_text())["approved"]
     assert "merge hand-back" not in first.stdout
     assert _started(workflow) == []
     assert not (workflow.state / "merged").exists()
@@ -379,6 +381,13 @@ def test_a_real_pre_train_failure_is_handed_back_at_once(handed: GitHub) -> None
 
 def test_handoff_records_a_wait_before_the_tick_retries(handed: GitHub) -> None:
     workflow = handed.workflow
+    folder = workflow.repo / ".local/workflow"
+    (folder / "merge-wanted-7").unlink()
+    train_path = folder / "merge-train.json"
+    train = json.loads(train_path.read_text())
+    train["waiting"] = []
+    train["approved"].pop("7", None)
+    train_path.write_text(json.dumps(train))
     _configure(workflow, pre_train_checks="example-checks")
     _stand_in(workflow, "example-checks", "temporarily unavailable\n", 75)
 
@@ -404,8 +413,144 @@ def test_bad_command_wait_options_name_the_key(tmp_path: Path, key: str, value: 
     (repo / "shipline.json").write_text(json.dumps({"commands": {"pre_train_checks": {
         "run": "example-checks", "form": "exit", key: value,
     }}}))
-    with pytest.raises(workflow_config.ConfigError, match="commands.pre_train_checks." + key):
+    with pytest.raises(workflow_config.ConfigError, match="commands.pre_train_checks." + key + " must"):
         workflow_config.load(repo)
+
+
+@pytest.mark.parametrize("name", ["pre_train_checks", "push_checks", "hunt_app", "hunt_browser", "hunt_cursor"])
+@pytest.mark.parametrize("code,answer,options,expected", [
+    (1, "try later\n", {"wait_output": "^try later"}, 75),
+    (42, "busy\n", {"wait_exit": [42]}, 75),
+    (0, "try later\n", {"wait_output": "^try later"}, 0),
+    (75, "failure\n", {"wait_exit": []}, 1),
+    (1, "failure\n", {"wait_output": "^try later"}, 1),
+])
+def test_pass_fail_commands_report_waits_without_changing_output_or_arguments(
+    workflow: Workflow, name: str, code: int, answer: str, options: dict, expected: int,
+) -> None:
+    install_shipline(workflow)
+    _stand_in(workflow, "example-checks", answer, code)
+    _configure(workflow, **{name: {
+        "run": "example-checks", "form": "exit", "args": ["two words", "$(touch nope)"], **options,
+    }})
+
+    done = workflow.shipline(name.replace("_", "-"), "--fast")
+
+    assert done.returncode == expected, done.stdout + done.stderr
+    assert done.stdout == answer
+    assert "two words $(touch nope) --fast" in workflow.calls("example-checks")[0]
+    assert not (workflow.repo / "nope").exists()
+
+
+@pytest.mark.parametrize("name", ["test", "browser"])
+def test_test_and_browser_waits_keep_shell_semantics_and_checkout_root(workflow: Workflow, name: str) -> None:
+    _stand_in(workflow, "example-checks", "try later\n", 1)
+    _configure(workflow, **{name: {
+        "run": "EXAMPLE_MODE=check example-checks", "form": "exit", "args": ["two words"],
+        "wait_output": "^try later",
+    }})
+    done = subprocess.run(
+        ["python3", str(workflow.script.parent / "ci_proof.py"), name, "--fast"],
+        cwd=workflow.repo / "scripts", env=workflow.env, input="", capture_output=True,
+        text=True, timeout=30, check=False,
+    )
+    assert done.returncode == 75, done.stdout + done.stderr
+    assert done.stdout == "try later\n"
+    assert workflow.calls("example-checks") == [f"example-checks two words --fast (in {workflow.repo})"]
+
+
+@pytest.mark.parametrize("name,subcommand", [
+    ("mechanical_conflicts", "resolve"), ("mechanical_conflicts", "renumber"),
+    ("advisory_watch", "answers"), ("push_checkout", "install"),
+])
+def test_gate_helpers_treat_configured_waits_as_waiting(workflow: Workflow, name: str, subcommand: str) -> None:
+    _stand_in(workflow, "example-helper", "try later\n", 1)
+    _configure(workflow, **{name: {
+        "run": "example-helper --mode", "form": "lines", "wait_output": "^try later",
+    }})
+    done = _gate(workflow, f'''
+        try:
+            g.repository_command({name!r}, {subcommand!r})
+        except g.Waiting as error:
+            print("waiting:", error)
+    ''')
+    assert done.returncode == 0, done.stderr
+    assert f"waiting: {name} waits: try later" in done.stdout
+
+
+def test_function_helper_waits_can_match_an_exception(workflow: Workflow) -> None:
+    module = _module(workflow, '''
+        def install(checkout):
+            raise RuntimeError("try later")
+        def refusal(output, checkout):
+            return "try later"
+    ''')
+    _configure(workflow, push_checkout={
+        "run": module, "form": "functions", "wait_output": "^try later",
+        "functions": {"install": "install", "refusal": "refusal"},
+    })
+    done = _gate(workflow, '''
+        try:
+            g.repository_command("push_checkout", "install", ".")
+        except g.Waiting as error:
+            print("waiting:", error)
+        done = g.repository_command("push_checkout", "refusal", ".", input="failure")
+        print("diagnostic:", done.returncode, done.stdout.strip())
+    ''')
+    assert done.returncode == 0, done.stderr
+    assert "waiting: push_checkout waits: try later" in done.stdout
+    assert "diagnostic: 0 try later" in done.stdout
+
+
+@pytest.mark.parametrize("mechanical", [False, True], ids=["renumber", "resolve"])
+def test_a_mechanical_helper_wait_leaves_a_clean_reviewed_worktree(github: GitHub, mechanical: bool) -> None:
+    workflow = github.workflow
+    workflow.git("checkout", "main")
+    workflow.git("commit", "--allow-empty", "-m", "fix: main moved")
+    github.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    workflow.git("checkout", "ticket/seven")
+    github.main()
+    github.save()
+    _configure(workflow, mechanical_conflicts={
+        "run": "example-helper", "form": "lines", "wait_output": "^try later",
+    })
+    _stand_in(workflow, "example-helper", "try later\n", 1)
+
+    done = _gate(workflow, f'''
+        folder = g.CONFIG.state()
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            g.refresh_pull(g.read_pull("7"), {github.base!r}, g.Train(folder), "7", mechanical={mechanical!r})
+        except g.Waiting as error:
+            print("waiting:", error)
+    ''')
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "waiting: mechanical_conflicts waits: try later" in done.stdout
+    assert workflow.git("rev-parse", "HEAD") == github.head
+    assert workflow.git("status", "--porcelain") == ""
+    assert not (workflow.repo / workflow.git("rev-parse", "--git-path", "MERGE_HEAD")).exists()
+
+
+def test_pre_train_wait_is_reset_by_a_pass_and_by_a_new_head(workflow: Workflow) -> None:
+    _configure(workflow, pre_train_checks="example-checks")
+    _stand_in(workflow, "example-checks", "try later\n", 75)
+    worktree = workflow.add_worktree(7)
+    first = _pre_train_checks(workflow, worktree)
+    assert "pre-train checks of 7 wait: try later" in first.stdout, first.stderr
+    _stand_in(workflow, "example-checks")
+    assert _pre_train_checks(workflow, worktree).stdout == "passed\n"
+    _stand_in(workflow, "example-checks", "try later\n", 75)
+    assert "pre-train checks of 7 wait: try later" in _pre_train_checks(workflow, worktree).stdout
+    workflow.git("commit", "--allow-empty", "-m", "fix: a different head", cwd=worktree)
+    again = _pre_train_checks(workflow, worktree)
+    assert "pre-train checks of 7 wait: try later" in again.stdout, again.stderr
+    assert "refused:" not in again.stdout
+    second = _pre_train_checks(workflow, worktree)
+    third = _pre_train_checks(workflow, worktree)
+    assert "could not finish twice" in second.stdout, second.stderr
+    assert "could not finish twice" in third.stdout, third.stderr
 
 
 def _changes(workflow: Workflow, *paths: str) -> None:

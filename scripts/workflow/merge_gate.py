@@ -378,6 +378,16 @@ def refresh_pull(
     # The repository's command that resolves the conflicts and moves the numbered files a
     # refresh settles itself; without one no conflict is mechanical and nothing is renumbered.
     rules = CONFIG.command("mechanical_conflicts") is not None
+
+    def refresh_command(call: str) -> subprocess.CompletedProcess[str] | None:
+        try:
+            return repository_command("mechanical_conflicts", call, head, base)
+        except Waiting:
+            # The call began clean at the reviewed head. A temporary failure must leave
+            # that same worktree available for the next tick's merge attempt.
+            git("reset", "--merge", head)
+            raise
+
     if mechanical:
         conflicts = git("diff", "--name-only", "--diff-filter=U").splitlines()
         if conflicts:
@@ -399,7 +409,7 @@ def refresh_pull(
         )
     if mechanical and rules:
         # It resolves the merge in the worktree, stages it and names each file it resolved.
-        done = repository_command("mechanical_conflicts", "resolve", head, base)
+        done = refresh_command("resolve")
         assert done is not None
         if done.returncode:
             if conflicts:
@@ -427,7 +437,7 @@ def refresh_pull(
         # Git merges two files numbered alike under different names cleanly; the tool that
         # reads them in order then has two heads. The branch's new ones move past main's last,
         # staged, or wait as a conflict: the command then names the files it could not move.
-        done = repository_command("mechanical_conflicts", "renumber", head, base)
+        done = refresh_command("renumber")
         assert done is not None
         if done.returncode and (paths := nonblank_lines(done.stdout)):
             message = "merge main: conflict in " + ", ".join(paths)
@@ -569,18 +579,45 @@ def clear_generated(worktree: Path) -> None:
         raise Refused(str(error)) from error
 
 
-def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> None:
+def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> str | None:
     """A failed local inventory must neither join nor stay approved for a prefix.
 
     A repository that names no `pre_train_checks` command has none to fail. A caller that does
-    not hold the merge lock (a handoff) takes it only to leave the line."""
+    not hold the merge lock (a handoff) takes it only to record or clear an outcome. A first
+    wait keeps its line entry but withdraws batch approval until the next call passes."""
     done = repository_command("pre_train_checks")
-    if done is None:
-        return
-    print(done.stdout, end="", flush=True)
-    print(done.stderr, end="", file=sys.stderr, flush=True)
-    if done.returncode:
-        with nullcontext() if locked else handoff_lock(folder, number):
+    path = folder / f"pre-train-wait-{number}.json"
+    if (done is None or done.returncode == 0) and not path.exists():
+        if done is not None:
+            print(done.stdout, end="", flush=True)
+            print(done.stderr, end="", file=sys.stderr, flush=True)
+        return None
+    with nullcontext() if locked else handoff_lock(folder, number):
+        if done is None or done.returncode == 0:
+            path.unlink(missing_ok=True)
+        else:
+            head = git("rev-parse", "HEAD")
+            output = done.stdout + done.stderr
+            first_line = next(iter(output.splitlines()), f"command exited {done.returncode}")
+            outcome = f"exit {done.returncode}: {first_line}"
+            previous = json.loads(path.read_text()) if path.exists() else None
+            if done.returncode == 75:
+                if previous is None or previous["head"] != head:
+                    write_json(path, {"head": head, "outcome": outcome})
+                    train = Train(folder)
+                    train.approved.pop(number, None)
+                    train.save()
+                    wait = f"pre-train checks of {number} wait: {first_line}"
+                    print(wait, flush=True)
+                    return wait
+                reason = (
+                    "pre-train checks could not finish twice on the same head: "
+                    f"first {previous['outcome']}; second {outcome}"
+                )
+                write_json(path, {**previous, "second": outcome})
+            else:
+                reason = "pre-train checks failed; fix the inventory before joining the merge train"
+                path.unlink(missing_ok=True)
             train = Train(folder)
             members = train.prefixes["members"] if train.prefixes else []
             for member in members:
@@ -590,7 +627,13 @@ def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> None:
             train.remove(number)
             Handoff.path(folder, number).unlink(missing_ok=True)
             (folder / f"merge-refresh-{number}.json").unlink(missing_ok=True)
-        raise Refused("pre-train checks failed; fix the inventory before joining the merge train")
+            print(done.stdout, end="", flush=True)
+            print(done.stderr, end="", file=sys.stderr, flush=True)
+            raise Refused(reason)
+    if done is not None:
+        print(done.stdout, end="", flush=True)
+        print(done.stderr, end="", file=sys.stderr, flush=True)
+    return None
 
 
 @contextmanager
@@ -726,7 +769,7 @@ def handoff(number: str, folder: Path) -> int:
             scope.validate(Path.cwd(), head)
         except (ValueError, OSError, TypeError) as error:
             raise Refused(f"conflict round needs full review: {error}") from error
-    pre_train_checks(number, folder, locked=False)
+    pre_train_wait = pre_train_checks(number, folder, locked=False)
     note = Handoff(head, max(r[0] for r in rounds), pull["headRefName"])
     checked = pull
     attempts = waits = 0
@@ -778,13 +821,26 @@ def handoff(number: str, folder: Path) -> int:
                 # The tick or a gate changed its place meanwhile: judge it again.
                 pull, view = fresh, None
                 continue
+            if pre_train_wait:
+                path = folder / f"pre-train-wait-{number}.json"
+                saved = json.loads(path.read_text()) if path.exists() else None
+                if saved is not None and saved["head"] == head and "second" in saved:
+                    raise Refused(
+                        "pre-train checks could not finish twice on the same head: "
+                        f"first {saved['outcome']}; second {saved['second']}"
+                    )
             train.admit(view)
+            if pre_train_wait:
+                # The handoff authorizes a retry, but a batch must wait for these checks.
+                train.approved.pop(number, None)
+                train.save()
             # Queued and passed over in its place until the tick's re-run is green; a wait
             # before it was queued is no handoff.
             if outcome is not None and not (isinstance(outcome, Waiting) and number in train.queue):
                 raise outcome
             note.save(folder, number)
-        print(f"pull request {number} handed to the tick after round {note.round}")
+        waiting = "; waiting for pre-train checks on the next tick" if pre_train_wait else ""
+        print(f"pull request {number} handed to the tick after round {note.round}{waiting}")
         return 0
 
 
@@ -828,7 +884,8 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
                 raise Refused("the handed-off worktree is on a different branch")
         if not ready(pull):
             raise Refused("only an open, ready pull request based on main can merge")
-        pre_train_checks(number, folder)
+        if pre_train_checks(number, folder):
+            return 3
         if delegated and pending is not None and (
             pull["headRefOid"] == pending["commit"]
             # GitHub's pull request can still read the old head after the host took the push.
