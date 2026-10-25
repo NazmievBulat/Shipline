@@ -14,6 +14,19 @@ import pytest
 from workflow_harness import Workflow, install_shipline
 
 _WORKFLOW = Path(__file__).resolve().parents[2] / "scripts/workflow"
+
+
+def test_ci_job_names_are_kept_in_config_defaults() -> None:
+    import ast
+
+    for filename in ("merge_gate.py", "ci_proof.py", "check_repair.py",
+                     "merge_driver.py", "ci_minutes.py"):
+        tree = ast.parse((_WORKFLOW / filename).read_text())
+        names = [(node.lineno, node.value) for node in ast.walk(tree)
+                 if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                 and node.value.startswith(("CI:", "Docker images:"))]
+        assert names == [], f"{filename} hard-codes CI job names: {names}"
+
 # Loaded from its file, so the scripts' folder is not put on the path of every other test.
 _SPEC = importlib.util.spec_from_file_location("workflow_config", _WORKFLOW / "workflow_config.py")
 assert _SPEC and _SPEC.loader

@@ -8309,6 +8309,37 @@ def test_a_batch_whose_ci_ran_a_selection_never_merges(github: GitHub) -> None:
     assert batch["workflows"][0] == "ci"
 
 
+@pytest.mark.parametrize("name", [None, "X", "CI: Python"])
+@pytest.mark.parametrize("shards", [[1, 2, 3], [1, 3], [1, 2, 2, 3]])
+def test_a_prefix_proves_the_configured_server_job_only_with_every_shard(
+    github: GitHub, name: str | None, shards: list[int],
+) -> None:
+    _batch_setup(github)
+    if name is not None:
+        path = github.workflow.repo / "shipline.json"
+        config = json.loads(path.read_text())
+        config.setdefault("checks", {})["server_tests"] = name
+        path.write_text(json.dumps(config))
+        github.workflow.git("update-index", "--skip-worktree", "shipline.json")
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+    for index in range(3):
+        parts = github.api[f"{_REPO}/actions/runs/{100 + index * 1000}/jobs?per_page=100"]["jobs"]
+        server = parts.pop()
+        assert server["name"] == "CI: server tests"
+        parts.extend({**server, "id": server["id"] + n,
+                      "name": f"{name or server['name']} ({n} of 3)"} for n in shards)
+
+    done = _batch_call(github)
+
+    if shards == [1, 2, 3]:
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert _merges(github) == ["7", "8", "9"]
+    else:
+        assert done.returncode != 0, done.stdout + done.stderr
+        assert github.workflow.calls("gh pr merge") == []
+
+
 @pytest.mark.parametrize("python", ["skipped", None])
 def test_a_batch_whose_ci_did_not_pass_its_python_job_never_merges(
     github: GitHub, python: str | None
