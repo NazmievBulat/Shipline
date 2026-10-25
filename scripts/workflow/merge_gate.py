@@ -385,21 +385,22 @@ def refresh_pull(
         except Waiting:
             # The call began clean at the reviewed head. A temporary failure must leave
             # that same worktree available for the next tick's merge attempt.
+            checkout = git("rev-parse", "--show-toplevel")
             changed = command(
-                "git", "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                "git", "-C", checkout, "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
                 "--name-only", "-z", head, "--", errors="surrogateescape",
             ).stdout
             if changed:
                 # Restore only changed tracked paths, including incomplete edits. NUL
                 # records and literal pathspecs preserve unusual names without expansion.
                 command(
-                    "git", "--literal-pathspecs", "restore", f"--source={head}",
+                    "git", "--literal-pathspecs", "-C", checkout, "restore", f"--source={head}",
                     "--staged", "--worktree", "--pathspec-from-file=-", "--pathspec-file-nul",
                     input=changed, errors="surrogateescape",
                 )
-            git("reset", "--merge", head)
+            git("-C", checkout, "reset", "--merge", head)
             # No untracked files were present at entry; ignored cache files remain intact.
-            git("clean", "-fd")
+            git("-C", checkout, "clean", "-fd")
             raise
 
     if mechanical:

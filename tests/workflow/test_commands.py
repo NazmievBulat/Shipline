@@ -576,8 +576,9 @@ def test_function_helper_waits_can_match_an_exception(workflow: Workflow) -> Non
 
 @pytest.mark.parametrize("mechanical", [False, True], ids=["renumber", "resolve"])
 @pytest.mark.parametrize("partial", ["none", "tracked", "untracked", "preexisting"])
+@pytest.mark.parametrize("subfolder", [False, True], ids=["root", "subfolder"])
 def test_a_waiting_mechanical_helper_preserves_the_reviewed_worktree(
-    github: GitHub, mechanical: bool, partial: str,
+    github: GitHub, mechanical: bool, partial: str, subfolder: bool,
 ) -> None:
     workflow = github.workflow
     workflow.git("checkout", "main")
@@ -599,7 +600,8 @@ def test_a_waiting_mechanical_helper_preserves_the_reviewed_worktree(
     cache.write_text("keep this cache\n")
     changed = "shared.txt" if partial == "tracked" else "new-helper.txt"
     edit = f'echo partial > "{changed}"\n' if partial in ("tracked", "untracked") else ""
-    workflow.fake("example-helper", "#!/bin/bash\n" + edit + 'echo "try later"\nexit 1\n')
+    workflow.fake("example-helper", '#!/bin/bash\ncd "$(git rev-parse --show-toplevel)"\n'
+                  + edit + 'echo "try later"\nexit 1\n')
     config_before = (workflow.repo / "shipline.json").read_text()
     existing = workflow.repo / "existing-notes.txt"
     if partial == "preexisting":
@@ -613,7 +615,7 @@ def test_a_waiting_mechanical_helper_preserves_the_reviewed_worktree(
             g.refresh_pull(g.read_pull("7"), {github.base!r}, g.Train(folder), "7", mechanical={mechanical!r})
         except g.Waiting as error:
             print("waiting:", error)
-    ''')
+    ''', workflow.repo / "scripts" if subfolder else workflow.repo)
 
     if partial == "preexisting":
         assert existing.read_text() == "keep these notes\n"
