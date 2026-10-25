@@ -834,9 +834,18 @@ def test_a_new_passed_fix_rejoins_the_train_after_a_failed_head(handed: GitHub) 
     assert train["approved"]["7"] == handed.head
 
 
-def _stale_refresh(handed: GitHub) -> None:
+def _stale_refresh(handed: GitHub, *, repaired: bool = False) -> None:
     _behind(handed)
     workflow = handed.workflow
+    if repaired:
+        _github_answers_repairs(workflow)
+        _fail(handed)
+        for _ in range(2):
+            done = workflow.run_script("tick")
+            assert done.returncode == 0, done.stdout + done.stderr
+        assert _started(workflow) == ["ticket-7"]
+        workflow.run("stop", "ticket-7")
+        _fix_and_hand_off(handed)
     old = handed.base
     workflow.git("commit", "--allow-empty", "-m", "fix: main advanced")
     handed.base = workflow.git("rev-parse", "HEAD")
@@ -862,20 +871,24 @@ exec /usr/bin/git "$@"
     )
 
 
-@pytest.mark.parametrize("error", [
-    "fatal: the remote end hung up unexpectedly",
-    "fatal: read error: Connection reset by peer",
-    "fatal: Failed to connect: Connection timed out",
-    "error: RPC failed; curl 28 Operation timed out after 1000 milliseconds",
-    "error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503",
-    "fatal: unable to access remote: The requested URL returned error: 502",
-    "waiting for a push slot: 2 ahead",
-    "io_uring_queue_init: could not lock memory",
+@pytest.mark.parametrize("error,repaired", [
+    ("fatal: the remote end hung up unexpectedly", False),
+    ("fatal: the remote end hung up unexpectedly", True),
+    ("fatal: read error: Connection reset by peer", False),
+    ("fatal: Failed to connect: Connection timed out", False),
+    ("error: RPC failed; curl 28 Operation timed out after 1000 milliseconds", False),
+    ("error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503", False),
+    ("fatal: unable to access remote: The requested URL returned error: 502", False),
+    ("fatal: unable to access remote: HTTP/2 504", False),
+    ("waiting for a push slot: 2 ahead", False),
+    ("io_uring_queue_init: could not lock memory", False),
 ])
-def test_the_refresh_push_fails_once(handed: GitHub, error: str) -> None:
+def test_the_refresh_push_fails_once(handed: GitHub, error: str, repaired: bool) -> None:
     workflow = handed.workflow
-    _stale_refresh(handed)
-    _drop_refresh_pushes(workflow, [error])
+    _stale_refresh(handed, repaired=repaired)
+    started = ["ticket-7"] if repaired else []
+    # The push helper already retries a locked-memory shortage once within a tick.
+    _drop_refresh_pushes(workflow, [error] * (2 if "io_uring_queue_init" in error else 1))
 
     first = workflow.run_script("tick")
 
@@ -885,7 +898,7 @@ def test_the_refresh_push_fails_once(handed: GitHub, error: str) -> None:
     assert json.loads(_note(workflow).read_text())["head"] == handed.head
     assert _train(workflow)["waiting"] == ["7", "8"]
     assert _train(workflow)["approved"]["7"] == handed.head
-    assert _started(workflow) == []
+    assert _started(workflow) == started
     refreshed = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
     assert refreshed != handed.head
     assert workflow.git("rev-parse", "HEAD^2", cwd=workflow.worktree(7)) == handed.base
@@ -914,7 +927,7 @@ def test_the_refresh_push_fails_once(handed: GitHub, error: str) -> None:
     assert (workflow.state / "merged").read_text() == "7"
     assert not _note(workflow).exists()
     assert _train(workflow)["waiting"] == ["8"]
-    assert _started(workflow) == []
+    assert _started(workflow) == started
 
 
 @pytest.mark.parametrize("error", [
@@ -933,7 +946,10 @@ def test_a_remote_refresh_push_rejection_is_handed_back_at_once(
     done = workflow.run_script("tick")
 
     assert done.returncode == 0, done.stdout + done.stderr
-    assert "merge hand-back 7: merge refused: could not push the refreshed branch: " + error in done.stdout
+    assert (
+        "merge hand-back 7: merge refused: could not push the refreshed branch: " + error
+        in done.stdout
+    )
     assert not _note(workflow).exists()
     assert _started(workflow) == ["review-7"]
     assert not workflow.calls("gh pr merge")
@@ -964,7 +980,10 @@ def test_three_transient_refresh_push_failures_hand_back_the_last_error(handed: 
     third = workflow.run_script("tick")
 
     assert third.returncode == 0, third.stdout + third.stderr
-    assert "merge hand-back 7: merge refused: could not push the refreshed branch: " + errors[-1] in third.stdout
+    assert (
+        "merge hand-back 7: merge refused: could not push the refreshed branch: " + errors[-1]
+        in third.stdout
+    )
     assert not _note(workflow).exists()
     assert _started(workflow) == ["review-7"]
     assert not workflow.calls("gh pr merge")
@@ -974,16 +993,27 @@ def test_three_transient_refresh_push_failures_hand_back_the_last_error(handed: 
 def test_a_waiting_refresh_is_redone_when_main_moves_again(handed: GitHub) -> None:
     workflow = handed.workflow
     _stale_refresh(handed)
-    _drop_refresh_pushes(workflow, ["fatal: the remote end hung up unexpectedly"])
-    first = workflow.run_script("tick")
-    assert first.returncode == 0, first.stdout + first.stderr
-    assert _note(workflow).exists()
+    error = "fatal: the remote end hung up unexpectedly"
+    _drop_refresh_pushes(workflow, [error] * 2)
+    for _ in range(2):
+        first = workflow.run_script("tick")
+        assert first.returncode == 0, first.stdout + first.stderr
+        assert "merge hand-back 7" not in first.stdout
+        assert _note(workflow).exists()
     old_local = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
     workflow.git("commit", "--allow-empty", "-m", "fix: main moved again")
     handed.base = workflow.git("rev-parse", "HEAD")
     workflow.git("push", "origin", "main")
     handed.main()
     handed.save()
+    # A different refresh gets its own limit, even after two failures of the old one.
+    _drop_refresh_pushes(workflow, [error] * 2)
+    for _ in range(2):
+        waiting = workflow.run_script("tick")
+        assert waiting.returncode == 0, waiting.stdout + waiting.stderr
+        assert "merge hand-back 7" not in waiting.stdout
+        assert _train(workflow)["waiting"] == ["7", "8"]
+        assert _note(workflow).exists()
 
     second = workflow.run_script("tick")
 
@@ -996,6 +1026,39 @@ def test_a_waiting_refresh_is_redone_when_main_moves_again(handed: GitHub) -> No
     assert json.loads(_note(workflow).read_text())["head"] == refreshed
     assert _train(workflow)["waiting"] == ["7", "8"]
     assert _started(workflow) == []
+
+
+@pytest.mark.parametrize("change", ["dirty", "commit", "branch", "round"])
+def test_a_waiting_refresh_does_not_accept_changes_to_its_worktree_or_review(
+    handed: GitHub, change: str
+) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    _drop_refresh_pushes(workflow, ["fatal: the remote end hung up unexpectedly"])
+    first = workflow.run_script("tick")
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert _note(workflow).exists()
+    root = workflow.worktree(7)
+    if change == "dirty":
+        (root / "unreviewed.txt").write_text("unreviewed\n")
+    elif change == "commit":
+        workflow.git("commit", "--allow-empty", "-m", "fix: unreviewed change", cwd=root)
+    elif change == "branch":
+        workflow.git("checkout", "-b", "ticket/other", cwd=root)
+    else:
+        note = json.loads(_note(workflow).read_text())
+        note["round"] += 1
+        _note(workflow).write_text(json.dumps(note))
+    local = workflow.git("rev-parse", "HEAD", cwd=root)
+
+    second = workflow.run_script("tick")
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "merge hand-back 7" in second.stdout
+    assert not _note(workflow).exists()
+    assert workflow.git("rev-parse", "HEAD", cwd=root) == local
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
+    assert not workflow.calls("gh pr merge")
 
 
 def test_a_failed_refresh_push_keeps_the_commit_for_one_fresh_reviewer(handed: GitHub) -> None:
