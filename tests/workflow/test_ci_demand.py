@@ -26,7 +26,10 @@ state = Path("@STATE@")
 arguments = sys.argv[1:]
 path = arguments[-1]
 api = "repos/example-org/example-app/actions"
-if not (arguments[0] == "api" and path.startswith(api + "/runs")):
+jobs_path = re.fullmatch(api + r"/runs/(\\d+)/attempts/(\\d+)/jobs\\?per_page=100", path)
+runs_path = (urlsplit(path).path == api + "/runs"
+             and parse_qs(urlsplit(path).query).get("per_page") == ["30"])
+if not (len(arguments) == 2 and arguments[0] == "api" and (jobs_path or runs_path)):
     os.execv("@TICK_GH@", ["gh", *arguments])
 with open(state / "calls.log", "a") as log:
     log.write("gh " + " ".join(arguments) + "\\n")
@@ -37,7 +40,7 @@ if (state / "fail-path").exists() and (state / "fail-path").read_text() in path:
 if (state / "bad-path").exists() and (state / "bad-path").read_text() in path:
     print((state / "bad-answer").read_text())
     sys.exit(0)
-if found := re.fullmatch(api + r"/runs/(\\d+)/attempts/(\\d+)/jobs\\?per_page=100", path):
+if found := jobs_path:
     jobs = json.loads((state / "jobs.json").read_text())
     print(json.dumps({"jobs": jobs.get(f"{found[1]}-{found[2]}", [])}))
 elif urlsplit(path).path == api + "/runs":
@@ -393,6 +396,40 @@ def test_no_readable_jobs_keeps_both_last_files(demand: Demand) -> None:
     assert demand.printed == "CI demand: no runs could be read; the last forecast is kept\n"
 
 
+def test_failed_runs_are_not_estimated_or_used_in_the_average(demand: Demand) -> None:
+    demand.pull(7, draft=False, runs=[_ci(71, 9)])
+    demand.pull(8, draft=False, runs=[_ci(81, 3)])
+    demand.pull(9, draft=False)
+    (demand.workflow.state / "fail-path").write_text("/runs/71/")
+
+    forecast = demand.write()
+
+    assert forecast["ordinary"] == 6  # Three read, three estimated for the empty history.
+    assert forecast["skipped_runs"] == 1
+
+
+def test_an_unreadable_first_forecast_creates_neither_file(demand: Demand) -> None:
+    demand.pull(7, draft=False, runs=[_ci(71, 9)])
+    (demand.workflow.state / "fail-path").write_text("/attempts/1/jobs")
+
+    assert demand.write() is None
+    assert not demand.forecast.with_name("ci-demand-runs.json").exists()
+
+
+def test_a_later_run_list_failure_keeps_both_files(demand: Demand) -> None:
+    demand.pull(7, draft=False, runs=[_ci(71, 2)])
+    demand.write()
+    kept = demand.forecast.with_name("ci-demand-runs.json")
+    before = demand.forecast.read_bytes(), kept.read_bytes()
+    demand.pull(7, draft=False, runs=[_ci(72, 5)])
+    demand.pull(8, draft=False, runs=[_ci(81, 3)])
+    (demand.workflow.state / "fail-path").write_text("branch=ticket%2Fchange-8")
+
+    demand.write()
+
+    assert (demand.forecast.read_bytes(), kept.read_bytes()) == before
+
+
 @pytest.mark.parametrize(
     "answer",
     ["not JSON", "null", '{}', '{"workflow_runs": null}', '{"workflow_runs": [{}]}'],
@@ -412,8 +449,10 @@ def test_an_unusable_run_list_keeps_the_last_forecast(demand: Demand, answer: st
 
 @pytest.mark.parametrize(
     "answer",
-    ["not JSON", "null", '{}', '{"jobs": null}', '{"jobs": [null]}',
-     '{"jobs": [{"labels": [null]}]}'],
+    [
+        "not JSON", "null", '{}', '{"jobs": null}', '{"jobs": [null]}',
+        '{"jobs": [{"labels": [null]}]}',
+    ],
 )
 def test_an_unusable_jobs_answer_skips_only_its_run(demand: Demand, answer: str) -> None:
     demand.pull(7, draft=False, runs=[_ci(71, 9), _ci(70, 2)])
