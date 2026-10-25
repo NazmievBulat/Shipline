@@ -23,7 +23,7 @@ import check_repair
 import priority
 import train_reads
 import workflow_config
-from merge_handoff import Handoff, authorized
+from merge_handoff import Handoff, authorized, write_json
 from workflow_commands import (
     COMMAND_TIMEOUT,
     GIT_READ_TIMEOUT,
@@ -452,7 +452,7 @@ def refresh_pull(
     # an empty commit requests a new pull_request event rather than replaying the old event.
     if WHOLE_REQUEST and Handoff.read(train.path.parent, number) is not None:
         message += "\n\n" + WHOLE_REQUEST
-    _commit_and_push(pull, train, number, message, save=unblocked)
+    _commit_and_push(pull, train, number, message, save=unblocked, base=base)
     print(
         f"CI requested on current main {base[:12]}; "
         "wait for the new run, then call this gate again",
@@ -462,19 +462,73 @@ def refresh_pull(
 
 
 def _commit_and_push(
-    pull: dict[str, Any], train: "Train", number: str, message: str, *, save: bool = False
+    pull: dict[str, Any], train: "Train", number: str, message: str, *,
+    save: bool = False, base: str | None = None,
 ) -> None:
-    head = pull["headRefOid"]
     git("commit", "--allow-empty", "-m", message)
     clear_generated(Path.cwd())
+    note = Handoff.read(train.path.parent, number)
+    refresh = None
+    if base is not None and note is not None:
+        refresh = {
+            "head": pull["headRefOid"],
+            "branch": pull["headRefName"],
+            "round": note.round,
+            "commit": git("rev-parse", "HEAD"),
+            "base": base,
+            "failures": 0,
+        }
+    _push_refreshed(pull, train, number, save=save, refresh=refresh)
+
+
+def _transient_refresh_push(output: str) -> bool:
+    # A remote rejection wins even if an earlier line mentioned a network failure.
+    if re.search(
+        r"\[(?:remote )?rejected\]|non-fast-forward|protected branch|hook (?:declined|rejected)"
+        r"|(?:HTTP(?:/\d(?:\.\d)?)?|returned error:)\s+4\d\d\b"
+        r"|authentication failed|permission denied",
+        output, re.IGNORECASE,
+    ):
+        return False
+    return short_of_memory(output) or bool(re.search(
+        r"remote end hung up unexpectedly|connection (?:was )?(?:reset|timed out)"
+        r"|operation timed out|(?:HTTP(?:/\d(?:\.\d)?)?|returned error:)\s+5\d\d\b"
+        r"|could not resolve host|couldn't connect to server|failed to connect to"
+        r"|network is unreachable"
+        r"|waiting for a push slot:",
+        output, re.IGNORECASE,
+    ))
+
+
+def _push_refreshed(
+    pull: dict[str, Any], train: "Train", number: str, *,
+    save: bool = False, refresh: dict[str, Any] | None = None,
+) -> None:
+    head = pull["headRefOid"]
+    path = train.path.parent / f"merge-refresh-{number}.json"
     try:
         pushed = push("origin", f"HEAD:{pull['headRefName']}")
     except PushWaiting:
         # The worktree was clean on the published head: the next call merges main again.
         git("reset", "--keep", head)
+        path.unlink(missing_ok=True)
         raise
     if pushed.returncode:
+        if refresh is not None and _transient_refresh_push(pushed.output):
+            refresh["failures"] += 1
+            if refresh["failures"] < 3:
+                write_json(path, refresh)
+                error = " ".join(pushed.refusal.splitlines())
+                raise Waiting(
+                    f"could not push the refreshed branch (transient failure {refresh['failures']}"
+                    f" of 3); retrying next tick: {error}"
+                )
+        path.unlink(missing_ok=True)
         raise Refused(f"could not push the refreshed branch: {pushed.refusal}")
+    _finish_refresh(train, number, head, save=save)
+
+
+def _finish_refresh(train: "Train", number: str, head: str, *, save: bool = False) -> None:
     if save:
         train.save()
     note = Handoff.read(train.path.parent, number)
@@ -487,6 +541,22 @@ def _commit_and_push(
         note.save(train.path.parent, number)
         train.approved[number] = note.head
         train.save()
+    (train.path.parent / f"merge-refresh-{number}.json").unlink(missing_ok=True)
+
+
+def saved_refresh(folder: Path, number: str, note: Handoff | None) -> dict[str, Any] | None:
+    path = folder / f"merge-refresh-{number}.json"
+    pending = json.loads(path.read_text()) if path.exists() else None
+    if pending is not None and (
+        note is None
+        or pending["head"] != note.head
+        or pending["branch"] != note.branch
+        or pending["round"] != note.round
+        or type(pending["failures"]) is not int
+        or not 1 <= pending["failures"] < 3
+    ):
+        raise Refused("the saved refresh no longer matches the passed review handoff")
+    return pending
 
 
 def clear_generated(worktree: Path) -> None:
@@ -519,6 +589,7 @@ def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> None:
                     break
             train.remove(number)
             Handoff.path(folder, number).unlink(missing_ok=True)
+            (folder / f"merge-refresh-{number}.json").unlink(missing_ok=True)
         raise Refused("pre-train checks failed; fix the inventory before joining the merge train")
 
 
@@ -739,15 +810,39 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             )
             return 0
         if delegated:
-            if not authorized(folder, number, pull["headRefOid"]):
+            pending = saved_refresh(folder, number, Handoff.read(folder, number))
+            reviewed = pending["head"] if pending is not None else pull["headRefOid"]
+            if not authorized(folder, number, reviewed) or (
+                pending is not None
+                and (
+                    pull["headRefOid"] not in (pending["head"], pending["commit"])
+                    or pull["headRefName"] != pending["branch"]
+                )
+            ):
                 raise Refused("the head changed since the passed review handoff")
-            if git("rev-parse", "HEAD") != pull["headRefOid"] or git("status", "--porcelain"):
+            pending_path = folder / f"merge-refresh-{number}.json"
+            expected = pending["commit"] if pending is not None else pull["headRefOid"]
+            if git("rev-parse", "HEAD") != expected or git("status", "--porcelain"):
                 raise Refused("the handed-off worktree is no longer clean at the reviewed head")
             if git("branch", "--show-current") != pull["headRefName"]:
                 raise Refused("the handed-off worktree is on a different branch")
         if not ready(pull):
             raise Refused("only an open, ready pull request based on main can merge")
         pre_train_checks(number, folder)
+        if delegated and pending is not None and (
+            pull["headRefOid"] == pending["commit"]
+            # GitHub's pull request can still read the old head after the host took the push.
+            or git("ls-remote", "origin", f"refs/heads/{pending['branch']}").split()[:1]
+            == [pending["commit"]]
+        ):
+            # The server accepted this exact push before the connection failed. No second
+            # push is needed, and a newer main must not reset the now-published commit.
+            train = Train(folder)
+            unblocked = train.blocked.pop(number, None) is not None
+            train.refreshable.discard(number)
+            _finish_refresh(train, number, pending["head"], save=unblocked)
+            print("the refreshed branch is published; waiting for its CI", flush=True)
+            return 2
         # A direct retry can observe recovery before the next tick. Reconcile suspension
         # against freshly read main health, rather than the previous gate's report.
         base, health = refresh_health(folder)
@@ -770,6 +865,24 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
         if health.state not in (*MERGING, "pending", "red"):
             # An unreadable main stops merging until it can be read; it needs no judgment.
             raise Waiting("merging stopped: " + health.line)
+        if delegated and pending is not None:
+            if failed_checks(pull):
+                raise Refused("the latest checks for this pull request failed")
+            if pending["base"] != base:
+                # Only discard the exact saved merge, checked above. A newer main gets a
+                # fresh merge from the reviewed head and its own consecutive failure count.
+                git("reset", "--keep", pending["head"])
+                pending_path.unlink()
+            else:
+                unblocked = train.blocked.pop(number, None) is not None
+                train.refreshable.discard(number)
+                _push_refreshed(pull, train, number, save=unblocked, refresh=pending)
+                print(
+                    f"CI requested on current main {base[:12]}; "
+                    "wait for the new run, then call this gate again",
+                    flush=True,
+                )
+                return 2
         head = pull["headRefOid"]
         if command("git", "cat-file", "-e", head, check=False).returncode:
             git("fetch", "origin", head)

@@ -58,6 +58,7 @@ def _hand_back(folder: Path, number: str, reason: str) -> None:
             )
         _queue_notice(folder, number, request)
         Handoff.path(folder, number).unlink(missing_ok=True)
+        (folder / f"merge-refresh-{number}.json").unlink(missing_ok=True)
         (folder / f"review-{number}.head").unlink(missing_ok=True)
         train = gate.Train(folder)
         train.approved.pop(number, None)
@@ -112,6 +113,7 @@ def _hand_to_worker(
             )
         Handoff.path(folder, number).unlink(missing_ok=True)
         (folder / f"review-{number}.head").unlink(missing_ok=True)
+        (folder / f"merge-refresh-{number}.json").unlink(missing_ok=True)
         train = gate.Train(folder)
         train.approved.pop(number, None)
         train.blocked[number] = repair.head
@@ -303,6 +305,7 @@ def _restack(folder: Path, number: str, note: Handoff) -> None:
         note.children.remove(child)
         note.save(folder, number)
     Handoff.path(folder, number).unlink()
+    (folder / f"merge-refresh-{number}.json").unlink(missing_ok=True)
 
 
 def _restack_child(folder: Path, number: str, parent_branch: str) -> None:
@@ -464,7 +467,19 @@ def drive(folder: Path) -> None:
             elif note.children is not None:
                 _hand_back(folder, number, "unfinished stack follow-up on an open pull request")
             elif pull["headRefOid"] != note.head or pull["headRefName"] != note.branch:
-                _hand_back(folder, number, "head changed since the passed review handoff")
+                pending = gate.saved_refresh(folder, number, note)
+                if (
+                    pending is not None
+                    and pull["headRefOid"] == pending["commit"]
+                    and pull["headRefName"] == note.branch
+                ):
+                    # A lost response can leave the exact saved refresh already published.
+                    # Only the gate, under merge.lock, may advance its authorization.
+                    if _drive_gate(folder, number):
+                        driven.add(number)
+                    refreshed.add(number)
+                else:
+                    _hand_back(folder, number, "head changed since the passed review handoff")
             elif gate.failed_checks(pull) or (
                 # A green re-run on an older main stays blocked but keeps its place: its turn
                 # refreshes it, as for any stale green run.

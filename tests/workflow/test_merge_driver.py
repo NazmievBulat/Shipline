@@ -834,8 +834,18 @@ def test_a_new_passed_fix_rejoins_the_train_after_a_failed_head(handed: GitHub) 
     assert train["approved"]["7"] == handed.head
 
 
-def test_a_failed_refresh_push_keeps_the_commit_for_one_fresh_reviewer(handed: GitHub) -> None:
+def _stale_refresh(handed: GitHub, *, repaired: bool = False) -> None:
+    _behind(handed)
     workflow = handed.workflow
+    if repaired:
+        _github_answers_repairs(workflow)
+        _fail(handed)
+        for _ in range(2):
+            done = workflow.run_script("tick")
+            assert done.returncode == 0, done.stdout + done.stderr
+        assert _started(workflow) == ["ticket-7"]
+        workflow.run("stop", "ticket-7")
+        _fix_and_hand_off(handed)
     old = handed.base
     workflow.git("commit", "--allow-empty", "-m", "fix: main advanced")
     handed.base = workflow.git("rev-parse", "HEAD")
@@ -843,6 +853,267 @@ def test_a_failed_refresh_push_keeps_the_commit_for_one_fresh_reviewer(handed: G
     handed.main()
     handed.ci(handed.base, handed.head, tested_base=old)
     handed.save()
+
+
+def _drop_refresh_pushes(
+    workflow: Workflow, errors: list[str], *, published: bool = False
+) -> None:
+    (workflow.state / "refresh-push-errors").write_text("\n".join(errors) + "\n")
+    if published:
+        (workflow.state / "refresh-push-accepted").touch()
+    workflow.fake(
+        "git",
+        """#!/bin/bash
+if [[ $1 == push && -s "@STATE@/refresh-push-errors" ]]; then
+  read -r failure < "@STATE@/refresh-push-errors"
+  sed -i '1d' "@STATE@/refresh-push-errors"
+  if [[ -e "@STATE@/refresh-push-accepted" ]]; then /usr/bin/git "$@" || exit; fi
+  echo "$failure" >&2
+  exit 1
+fi
+exec /usr/bin/git "$@"
+""",
+    )
+
+
+@pytest.mark.parametrize("error,repaired,published", [
+    ("fatal: the remote end hung up unexpectedly", False, False),
+    ("fatal: the remote end hung up unexpectedly", True, False),
+    ("fatal: the remote end hung up unexpectedly", False, True),
+    ("fatal: read error: Connection reset by peer", False, False),
+    ("fatal: Failed to connect: Connection timed out", False, False),
+    ("error: RPC failed; curl 28 Operation timed out after 1000 milliseconds", False, False),
+    ("error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503", False, False),
+    ("fatal: unable to access remote: The requested URL returned error: 502", False, False),
+    ("fatal: unable to access remote: HTTP/2 504", False, False),
+    ("waiting for a push slot: 2 ahead", False, False),
+    ("io_uring_queue_init: could not lock memory", False, False),
+    ("fatal: unable to access 'https://example.com/example-app.git/': "
+     "Could not resolve host: example.com", False, False),
+    ("fatal: unable to access 'https://example.com/example-app.git/': Failed to connect to "
+     "example.com port 443 after 21 ms: Couldn't connect to server", False, False),
+    ("fatal: unable to access 'https://example.com/example-app.git/': "
+     "Network is unreachable", False, False),
+])
+def test_the_refresh_push_fails_once(
+    handed: GitHub, error: str, repaired: bool, published: bool
+) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed, repaired=repaired)
+    started = ["ticket-7"] if repaired else []
+    # The push helper already retries a locked-memory shortage once within a tick.
+    _drop_refresh_pushes(
+        workflow, [error] * (2 if "io_uring_queue_init" in error else 1), published=published
+    )
+
+    first = workflow.run_script("tick")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "merge hand-back 7" not in first.stdout
+    assert sum(error in line for line in (first.stdout + first.stderr).splitlines()) == 1
+    assert json.loads(_note(workflow).read_text())["head"] == handed.head
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    assert _train(workflow)["approved"]["7"] == handed.head
+    assert _started(workflow) == started
+    refreshed = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
+    assert refreshed != handed.head
+    assert workflow.git("rev-parse", "HEAD^2", cwd=workflow.worktree(7)) == handed.base
+    remote = workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0]
+    assert remote == (refreshed if published else handed.head)
+    if published:
+        handed.pulls["7"]["headRefOid"] = refreshed
+        (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {refreshed}\n")
+        handed.save()
+
+    second = workflow.run_script("tick")
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "merge hand-back 7" not in second.stdout
+    assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == refreshed
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == refreshed
+    assert json.loads(_note(workflow).read_text())["head"] == refreshed
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    assert _train(workflow)["approved"]["7"] == refreshed
+    assert not list(_folder(workflow).glob("merge-review-*"))
+    handed.head = refreshed
+    handed.pulls["7"]["headRefOid"] = refreshed
+    (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {refreshed}\n")
+    handed.ci(handed.base, refreshed, run_id=50)
+    handed.save()
+
+    third = workflow.run_script("tick")
+
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert "merge hand-back 7" not in third.stdout
+    assert (workflow.state / "merged").read_text() == "7"
+    assert not _note(workflow).exists()
+    assert _train(workflow)["waiting"] == ["8"]
+    assert _started(workflow) == started
+
+
+@pytest.mark.parametrize("error", [
+    "! [rejected] HEAD -> ticket/seven (non-fast-forward)",
+    "! [remote rejected] HEAD -> ticket/seven (protected branch hook declined)",
+    "! [remote rejected] HEAD -> ticket/seven (pre-receive hook declined)",
+    "remote: connection reset; ! [remote rejected] HEAD -> ticket/seven (hook declined)",
+])
+def test_a_remote_refresh_push_rejection_is_handed_back_at_once(
+    handed: GitHub, error: str
+) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    _drop_refresh_pushes(workflow, [error])
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (
+        "merge hand-back 7: merge refused: could not push the refreshed branch: " + error
+        in done.stdout
+    )
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
+    assert not workflow.calls("gh pr merge")
+
+
+def test_three_transient_refresh_push_failures_hand_back_the_last_error(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    errors = [
+        "fatal: the remote end hung up unexpectedly",
+        "fatal: read error: Connection reset by peer",
+        "error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503",
+    ]
+    _drop_refresh_pushes(workflow, errors)
+    local = None
+    for error in errors[:2]:
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert "merge hand-back 7" not in done.stdout
+        assert error in done.stdout + done.stderr
+        assert _note(workflow).exists()
+        assert _train(workflow)["waiting"] == ["7", "8"]
+        assert _started(workflow) == []
+        head = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
+        assert local is None or local == head
+        local = head
+
+    third = workflow.run_script("tick")
+
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert (
+        "merge hand-back 7: merge refused: could not push the refreshed branch: " + errors[-1]
+        in third.stdout
+    )
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
+    assert not workflow.calls("gh pr merge")
+    assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == local
+
+
+def test_a_waiting_refresh_is_redone_when_main_moves_again(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    error = "fatal: the remote end hung up unexpectedly"
+    _drop_refresh_pushes(workflow, [error] * 2)
+    for _ in range(2):
+        first = workflow.run_script("tick")
+        assert first.returncode == 0, first.stdout + first.stderr
+        assert "merge hand-back 7" not in first.stdout
+        assert _note(workflow).exists()
+    old_local = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
+    workflow.git("commit", "--allow-empty", "-m", "fix: main moved again")
+    handed.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    handed.main()
+    handed.save()
+    # A different refresh gets its own limit, even after two failures of the old one.
+    _drop_refresh_pushes(workflow, [error] * 2)
+    for _ in range(2):
+        waiting = workflow.run_script("tick")
+        assert waiting.returncode == 0, waiting.stdout + waiting.stderr
+        assert "merge hand-back 7" not in waiting.stdout
+        assert _train(workflow)["waiting"] == ["7", "8"]
+        assert _note(workflow).exists()
+
+    second = workflow.run_script("tick")
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "merge hand-back 7" not in second.stdout
+    refreshed = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
+    assert refreshed != old_local
+    assert workflow.git("show", "-s", "--format=%P", refreshed) == f"{handed.head} {handed.base}"
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == refreshed
+    assert json.loads(_note(workflow).read_text())["head"] == refreshed
+    assert _train(workflow)["waiting"] == ["7", "8"]
+    assert _started(workflow) == []
+
+
+def test_an_accepted_refresh_github_has_not_read_yet_survives_main_moving(
+    handed: GitHub,
+) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    _drop_refresh_pushes(workflow, ["fatal: the remote end hung up unexpectedly"], published=True)
+    first = workflow.run_script("tick")
+    assert first.returncode == 0, first.stdout + first.stderr
+    published = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == published
+    # The pull request still reads the old head, and main moves before the next tick.
+    workflow.git("commit", "--allow-empty", "-m", "fix: main moved again")
+    handed.base = workflow.git("rev-parse", "HEAD")
+    workflow.git("push", "origin", "main")
+    handed.main()
+    handed.save()
+
+    second = workflow.run_script("tick")
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "merge hand-back 7" not in second.stdout
+    assert "the refreshed branch is published; waiting for its CI" in second.stdout + second.stderr
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == published
+    assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == published
+    assert json.loads(_note(workflow).read_text())["head"] == published
+    assert not (_folder(workflow) / "merge-refresh-7.json").exists()
+    assert _started(workflow) == []
+
+
+@pytest.mark.parametrize("change", ["dirty", "commit", "branch", "round"])
+def test_a_waiting_refresh_does_not_accept_changes_to_its_worktree_or_review(
+    handed: GitHub, change: str
+) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    _drop_refresh_pushes(workflow, ["fatal: the remote end hung up unexpectedly"])
+    first = workflow.run_script("tick")
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert _note(workflow).exists()
+    root = workflow.worktree(7)
+    if change == "dirty":
+        (root / "unreviewed.txt").write_text("unreviewed\n")
+    elif change == "commit":
+        workflow.git("commit", "--allow-empty", "-m", "fix: unreviewed change", cwd=root)
+    elif change == "branch":
+        workflow.git("checkout", "-b", "ticket/other", cwd=root)
+    else:
+        note = json.loads(_note(workflow).read_text())
+        note["round"] += 1
+        _note(workflow).write_text(json.dumps(note))
+    local = workflow.git("rev-parse", "HEAD", cwd=root)
+
+    second = workflow.run_script("tick")
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "merge hand-back 7" in second.stdout
+    assert not _note(workflow).exists()
+    assert workflow.git("rev-parse", "HEAD", cwd=root) == local
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
+    assert not workflow.calls("gh pr merge")
+
+
+def test_a_failed_refresh_push_keeps_the_commit_for_one_fresh_reviewer(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed)
     (workflow.state / "fail-refresh-push").touch()
     workflow.fake(
         "git",
