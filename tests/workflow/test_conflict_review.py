@@ -6,7 +6,12 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from workflow.test_codex_worker import _relay, _rpc  # pyright: ignore[reportPrivateUsage]
+from workflow.test_checks_finished import _BOX, _WAIT, _checks  # pyright: ignore[reportPrivateUsage]
+from workflow.test_codex_worker import (  # pyright: ignore[reportPrivateUsage]
+    _CODEX_WAITING,
+    _relay,
+    _rpc,
+)
 from workflow.test_independent_review import (  # pyright: ignore[reportPrivateUsage]
     _idle,
     _rule_breaks,
@@ -538,6 +543,153 @@ def test_conflict_replaces_a_crashed_workers_codex_flag(workflow: Workflow) -> N
     assert listed.returncode == 0, listed.stderr
     assert listed.stdout.startswith("review-7  idle")
     assert "ticket-7  " not in listed.stdout
+
+
+def _on_launch(workflow: Workflow, name: str, command: str) -> None:
+    script = (workflow.bin / "tmux").read_text()
+    marker = "  new-session)\n"
+    assert marker in script
+    workflow.fake("tmux", script.replace(
+        marker, marker + f"    if [[ $name == {shlex.quote(name)} ]]; then\n{command}\n    fi\n", 1
+    ))
+
+
+def test_codex_review_start_time_precedes_bridge_link_wait(workflow: Workflow) -> None:
+    _codex_conflict(workflow)
+    started = workflow.notes(7) / "review-7.started"
+    _on_launch(
+        workflow, "review-7",
+        f"      [[ -f {shlex.quote(str(started))} ]] || exit 91\n"
+        f"      touch -d @1790000000 {shlex.quote(str(started))}",
+    )
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert started.stat().st_mtime == 1_790_000_000
+
+
+def test_fast_native_wait_survives_initial_bridge_launch_and_sentinel(workflow: Workflow) -> None:
+    _codex_conflict(workflow)
+    waiting = workflow.notes(7) / "review-7.waiting"
+    _on_launch(workflow, "codex-7", f"      touch {shlex.quote(str(waiting))}")
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stderr
+    assert waiting.exists()
+    workflow.notify(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "__WORKFLOW_CODEX_TURN__"},
+        "review-7",
+    )
+    assert waiting.exists()
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _WAIT}, "review-7")
+    assert (workflow.notes(7) / "review-7.checks-wait").exists()
+    assert not (workflow.notes(7) / "review-7.owner-blocked").exists()
+
+
+def _waiting_codex_review(workflow: Workflow) -> str:
+    _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    head = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", head)
+    workflow.run_script("notify", "waiting", env={"WORKFLOW_SESSION": "review-7"})
+    workflow.run_script(
+        "notify", "codex",
+        json.dumps({"type": "agent-turn-complete", "last-assistant-message": _WAIT}),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    with _relay(workflow, "review-7") as relay:
+        turn = _rpc(relay, "tools/call", {"name": "await_turn"})
+        assert turn["result"]["content"][0]["text"] == _WAIT
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _WAIT}, "review-7")
+    workflow.screen("● " + _WAIT + _BOX, "review-7")
+    workflow.screen(_CODEX_WAITING, "codex-7")
+    assert (workflow.notes(7) / "review-7.checks-wait").exists()
+    return head
+
+
+def test_bridge_recovery_replays_a_ci_wait_without_turning_it_into_a_question(
+    workflow: Workflow,
+) -> None:
+    _waiting_codex_review(workflow)
+    started = (workflow.notes(7) / "review-7.started").stat().st_mtime_ns
+    (workflow.state / "tmux/review-7").unlink()
+    done = workflow.run("bridge", "review-7")
+    assert done.returncode == 0, done.stderr
+    assert (workflow.notes(7) / "review-7.started").stat().st_mtime_ns == started
+    workflow.notify(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "__WORKFLOW_CODEX_TURN__"},
+        "review-7",
+    )
+    with _relay(workflow, "review-7") as relay:
+        assert _rpc(relay, "tools/call", {"name": "await_turn"})["result"]["content"][0]["text"] == _WAIT
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _WAIT}, "review-7")
+    assert (workflow.notes(7) / "review-7.checks-wait").exists()
+    assert not (workflow.notes(7) / "review-7.owner-blocked").exists()
+    assert not (workflow.notes(7) / "review-7.owner-reply").exists()
+
+
+@pytest.mark.parametrize("command", ["checks-finished", "lost-check", "conflict-found", "batch-merged"])
+def test_reviewer_automation_wakes_native_codex_without_an_owner_reply(
+    workflow: Workflow, command: str
+) -> None:
+    head = _waiting_codex_review(workflow)
+    done = workflow.run(command, "review-7", head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")) == 1
+    assert not workflow.calls("tmux review-7 send-keys")
+    assert not (workflow.notes(7) / "review-7.owner-reply").exists()
+    assert not (workflow.notes(7) / "review-7.checks-wait").exists()
+    if command == "checks-finished":
+        assert "merge-when-current --handoff 7" in workflow.calls("tmux codex-7 send-keys")[0]
+
+
+@pytest.mark.parametrize("block", ["bridge input", "native input", "pending reply", "unrelayed", "working", "permission"])
+def test_native_review_wake_preserves_owner_input_and_active_work(
+    workflow: Workflow, block: str
+) -> None:
+    head = _waiting_codex_review(workflow)
+    if block == "bridge input":
+        workflow.screen("● " + _WAIT + _BOX.replace("> \n", "> owner text\n"), "review-7")
+    elif block == "native input":
+        workflow.screen("\u203a owner text\n", "codex-7")
+    elif block == "pending reply":
+        (workflow.notes(7) / "review-7.owner-reply").write_text("1")
+    elif block == "unrelayed":
+        (workflow.notes(7) / "review-7.codex-turn.json").write_text(
+            json.dumps({"last-assistant-message": "Which option? Reply 1 or 2."})
+        )
+    elif block == "working":
+        workflow.screen("• Working (1s • esc to interrupt)\n\u203a \n", "codex-7")
+    else:
+        workflow.screen("Would you like to run the following command?\nPress enter to confirm or esc to cancel", "codex-7")
+    before = (workflow.notes(7) / "review-7.checks-wait").stat().st_mtime_ns
+    done = workflow.run("checks-finished", "review-7", head)
+    assert done.returncode != 0
+    assert not workflow.calls("tmux codex-7 send-keys")
+    assert (workflow.notes(7) / "review-7.checks-wait").stat().st_mtime_ns == before
+    if block == "pending reply":
+        assert (workflow.notes(7) / "review-7.owner-reply").read_text() == "1"
+
+
+def test_unsent_native_review_wake_keeps_its_wait_for_retry(workflow: Workflow) -> None:
+    head = _waiting_codex_review(workflow)
+    (workflow.state / "swallow-enter-codex-7").write_text("2")
+    first = workflow.run("checks-finished", "review-7", head)
+    assert first.returncode != 0
+    assert (workflow.notes(7) / "review-7.checks-wait").exists()
+    assert not (workflow.notes(7) / "review-7.codex-followed-up").exists()
+    second = workflow.run("checks-finished", "review-7", head)
+    assert second.returncode == 0, second.stderr
+    assert len(workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")) == 1
+
+
+def test_tick_wakes_native_conflict_reviewer_once_for_finished_checks(workflow: Workflow) -> None:
+    head = _waiting_codex_review(workflow)
+    _checks(workflow)
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")) == 1
+    assert (_folder(workflow) / f"review-7.checks-nudged-{head}").exists()
+    assert not (workflow.notes(7) / "review-7.owner-reply").exists()
 
 
 @pytest.mark.parametrize("built", [False, True])
