@@ -185,6 +185,29 @@ def test_server_whole_group_uses_the_configured_job_and_its_shards(tmp_path: Pat
     assert not group.contains("CI: server tests")
 
 
+@pytest.mark.parametrize("key", ["server_tests", "web", "older_version"])
+@pytest.mark.parametrize("value", ["Build: tests (1 of 3)", "X (12 of 24)", "X (0 of 0)"])
+def test_suite_job_names_with_a_shard_suffix_are_refused(
+    tmp_path: Path, key: str, value: str,
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {key: value}})
+
+    with pytest.raises(workflow_config.ConfigError, match=rf"checks\.{key}.*shard suffix"):
+        workflow_config.load(repo)
+
+
+@pytest.mark.parametrize("key", ["server_tests", "web", "older_version"])
+@pytest.mark.parametrize("value", ["X", "Build: tests (unit)", "X (1 of 3) report"])
+def test_suite_job_names_without_a_shard_suffix_are_kept(
+    tmp_path: Path, key: str, value: str,
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {key: value}})
+
+    assert getattr(workflow_config.load(repo).checks, key) == value
+
+
 @pytest.mark.parametrize("groups", [["unknown"], ["images", "images"], "images", None, [3]])
 def test_invalid_prefix_only_groups_are_refused(tmp_path: Path, groups: Any) -> None:
     repo = _repository(tmp_path)
