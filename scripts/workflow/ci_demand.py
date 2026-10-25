@@ -131,6 +131,8 @@ class Runs:
         self.used: dict[str, list[Any]] = {}
         self.skipped: set[int] = set()
         self.readable = 0
+        # Whether the last push read every run it looked at: only then may it feed the average.
+        self.whole = True
 
     def _counts(self, run: dict[str, Any]) -> tuple[int, int, bool]:
         """Ordinary and Docker jobs the run's push started, its first attempt (a re-run's attempt
@@ -182,6 +184,7 @@ class Runs:
                         (found or (0, 0))[1] + docker,
                     )
                     break
+        self.whole = not unreadable
         # Missing history uses the other pulls' average; failed reads contribute no jobs.
         return (0, 0) if found is None and unreadable else found
 
@@ -303,10 +306,9 @@ def write(main: Path, snapshot: Path, sessions: str) -> int:
     known = []
     try:
         for number in (*cloud, *sessions_busy, *ready, *prefixes):
-            readable = runs.readable
             counts = runs.push(pulls[str(number)]["headRefName"])
             pushes.append(counts)
-            if counts is not None and runs.readable > readable:
+            if counts is not None and runs.whole:
                 known.append(counts)
     except ReadError:
         print("CI demand: the run list could not be read; the last forecast is kept")

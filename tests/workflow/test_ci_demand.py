@@ -408,6 +408,20 @@ def test_failed_runs_are_not_estimated_or_used_in_the_average(demand: Demand) ->
     assert forecast["skipped_runs"] == 1
 
 
+def test_a_partly_read_branch_does_not_feed_the_average(demand: Demand) -> None:
+    # 7's newest run cannot be read and its older one ran no job: 7 counts nothing and must not
+    # lower the average that 9, with no history, takes from the branches read whole.
+    nothing_ran = (_run(71, "ci.yml"), [_job(ORDINARY, "skipped")])
+    demand.pull(7, draft=False, runs=[_ci(72, 9), nothing_ran])
+    demand.pull(8, draft=False, runs=[_ci(81, 4)])
+    demand.pull(9, draft=False)
+    (demand.workflow.state / "fail-path").write_text("/runs/72/")
+
+    forecast = demand.write()
+
+    assert forecast["ordinary"] == 8  # None for 7, four for 8, four estimated for 9.
+    assert forecast["skipped_runs"] == 1
+
 def test_an_unreadable_first_forecast_creates_neither_file(demand: Demand) -> None:
     demand.pull(7, draft=False, runs=[_ci(71, 9)])
     (demand.workflow.state / "fail-path").write_text("/attempts/1/jobs")
