@@ -2123,9 +2123,9 @@ case ${1:-} in
     if [[ $result == 0 ]]; then
       python3 -B "$script_dir/conflict_review.py" panel-complete "$folder" "${2#review-}" "$3" ||
         die 'panel reports are incomplete'
-      send_reviewer_update "$2" "The independent conflict panel on $3 has completed. Read the completed Claude and Cursor reports in $SHIPLINE_STATE_FOLDER/reviews/${2#review-}/$3, then publish only if they and the rules allow it. Hand off with merge-when-current --handoff ${2#review-} when all checks pass."
+      send_reviewer_update "$2" "The independent conflict panel on $3 has completed. Read the completed Claude and Cursor reports in $main/$SHIPLINE_STATE_FOLDER/reviews/${2#review-}/$3, then publish only if they and the rules allow it. Hand off with merge-when-current --handoff ${2#review-} when all checks pass."
     else
-      send_reviewer_update "$2" "The independent conflict panel on $3 failed. Read its reports in $SHIPLINE_STATE_FOLDER/reviews/${2#review-}/$3 and report the failure. Do not publish a conflict round."
+      send_reviewer_update "$2" "The independent conflict panel on $3 failed. Read its reports in $main/$SHIPLINE_STATE_FOLDER/reviews/${2#review-}/$3 and report the failure. Do not publish a conflict round."
     fi
     ;;
   status-check)
