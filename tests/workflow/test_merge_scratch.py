@@ -25,6 +25,7 @@ from workflow.merge_gate_fixtures import (
     _finish_prefix,
     _green_second,
     _images,
+    _main_image_run,
     _main_jobs,
     _merges,
     _numbers,
@@ -756,17 +757,43 @@ def test_neutral_prefixes_share_one_image_run_and_main_keeps_its_proof(github: G
     assert len(github.workflow.calls("gh workflow run images.yml")) == 1
 
 
-def test_neutral_prefix_after_an_untested_image_change_runs_images(github: GitHub) -> None:
+@pytest.mark.parametrize("initial", ["missing", "pending", "skipped"])
+def test_neutral_prefix_after_an_own_check_merge_waits_for_main_images(
+    github: GitHub, initial: str,
+) -> None:
     _batch_setup(github, images=True)
-    # The front's own checks now prove its merge on current main, so it has no prefix run.
+    # The front merges by its own checks, without a scratch image run.
     github.ci(github.base, github.head, run_id=7000)
     _images(github)
     done = _batch_call(github)
     assert done.returncode == 0, done.stdout + done.stderr
     assert _merges(github) == ["7"]
-    assert "images" in _scratch(github, "8")["workflows"]
-    assert "images" not in _scratch(github, "9")["workflows"]
-    assert len(github.workflow.calls("gh workflow run images.yml")) == 1
+    main = github.workflow.git("rev-parse", "origin/main")
+    # No scratch dispatch can test images now: their inputs already match main.
+    assert not github.workflow.calls("gh workflow run images.yml")
+    _finish_batch(github, run_id=1100)
+    if initial != "missing":
+        _main_image_run(github, 8100, main, status="in_progress", conclusion=None)
+        if initial == "skipped":
+            github.api[f"{_REPO}/actions/workflows/images.yml/runs?branch=main&per_page=100&page=1"]["workflow_runs"][0].update(status="completed", conclusion="success")
+            github.api[f"{_REPO}/actions/runs/8100/jobs?per_page=100"]["jobs"][1].update(status="completed", conclusion="skipped")
+    done = _batch_call(github, "8")
+    assert done.returncode in (1, 3), done.stdout + done.stderr
+    assert _merges(github) == ["7"]
+    assert not github.workflow.calls("gh workflow run images.yml")
+    github.save()
+    before = _train(github)["turn"]
+    _main_image_run(github, 8200, main)
+    github.api[f"{_REPO}/check-runs/8201/annotations?per_page=100"] = [
+        {"title": "Files tested", "message": github.workflow.git("rev-parse", f"{main}^{{tree}}")}
+    ]
+    github.save()
+    assert _train(github)["turn"] > before
+    done = _batch_call(github, "8")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
+    assert _receipt(github)["images_run"] == 8200
+    assert not github.workflow.calls("gh workflow run images.yml")
 
 
 def test_existing_image_receipts_still_supply_neutral_prefixes(github: GitHub) -> None:
@@ -825,15 +852,19 @@ def test_a_prefix_can_introduce_the_image_workflow_before_main_has_it(github: Gi
     assert workflow.git("show", f"origin/main:{path}") == definition.strip()
 
 
-def test_a_neutral_prefix_without_any_main_image_result_runs_its_own(github: GitHub) -> None:
+def test_a_neutral_prefix_without_any_main_image_result_waits_for_main(github: GitHub) -> None:
     _batch_setup(github)
     github.api[f"{_REPO}/actions/workflows/images.yml/runs?branch=main&per_page=100&page=1"] = {"workflow_runs": []}
     assert _batch_call(github).returncode == 3
-    assert ["images" in m["scratch"]["workflows"] for m in _prefixes(github)] == [True, False, False]
+    assert ["images" in m["scratch"]["workflows"] for m in _prefixes(github)] == [False, False, False]
+    _finish_batch(github)
+    assert _batch_call(github).returncode == 3
+    assert _merges(github) == []
+    assert not github.workflow.calls("gh workflow run images.yml")
 
 
 @pytest.mark.parametrize("lost", ["failed", "missing"])
-def test_a_lost_shared_result_after_its_member_merged_gets_a_replacement(github: GitHub, lost: str) -> None:
+def test_a_lost_shared_result_after_its_member_merged_waits_for_main(github: GitHub, lost: str) -> None:
     _batch_setup(github, images=True)
     assert _batch_call(github).returncode == 3
     source = _scratch(github)
@@ -853,13 +884,18 @@ def test_a_lost_shared_result_after_its_member_merged_gets_a_replacement(github:
     done = _batch_call(github, "8")
     assert done.returncode == 3, done.stdout + done.stderr
     assert _merges(github) == ["7"]
-    assert "images" in _scratch(github, "8")["workflows"]
+    assert "images" not in _scratch(github, "8")["workflows"]
     assert _batch_call(github, "8").returncode == 3
-    _finish_prefix(github, "8", run_id=1100)
+    main = github.workflow.git("rev-parse", "origin/main")
+    _main_image_run(github, 8200, main)
+    github.api[f"{_REPO}/check-runs/8201/annotations?per_page=100"] = [
+        {"title": "Files tested", "message": github.workflow.git("rev-parse", f"{main}^{{tree}}")}
+    ]
     done = _batch_call(github, "8")
     assert done.returncode == 0, done.stdout + done.stderr
     assert _merges(github) == ["7", "8", "9"]
-    assert _receipt(github)["images_run"] == 1120
+    assert _receipt(github)["images_run"] == 8200
+    assert len(github.workflow.calls("gh workflow run images.yml")) == 1
 
 
 def test_an_image_change_after_a_neutral_member_gets_its_own_run(github: GitHub) -> None:
