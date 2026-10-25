@@ -385,7 +385,21 @@ def refresh_pull(
         except Waiting:
             # The call began clean at the reviewed head. A temporary failure must leave
             # that same worktree available for the next tick's merge attempt.
+            changed = command(
+                "git", "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                "--name-only", "-z", head, "--", errors="surrogateescape",
+            ).stdout
+            if changed:
+                # Restore only changed tracked paths, including incomplete edits. NUL
+                # records and literal pathspecs preserve unusual names without expansion.
+                command(
+                    "git", "--literal-pathspecs", "restore", f"--source={head}",
+                    "--staged", "--worktree", "--pathspec-from-file=-", "--pathspec-file-nul",
+                    input=changed, errors="surrogateescape",
+                )
             git("reset", "--merge", head)
+            # No untracked files were present at entry; ignored cache files remain intact.
+            git("clean", "-fd")
             raise
 
     if mechanical:
@@ -769,7 +783,7 @@ def handoff(number: str, folder: Path) -> int:
             scope.validate(Path.cwd(), head)
         except (ValueError, OSError, TypeError) as error:
             raise Refused(f"conflict round needs full review: {error}") from error
-    pre_train_wait = pre_train_checks(number, folder, locked=False)
+    pre_train_checks(number, folder, locked=False)
     note = Handoff(head, max(r[0] for r in rounds), pull["headRefName"])
     checked = pull
     attempts = waits = 0
@@ -821,19 +835,20 @@ def handoff(number: str, folder: Path) -> int:
                 # The tick or a gate changed its place meanwhile: judge it again.
                 pull, view = fresh, None
                 continue
-            if pre_train_wait:
-                path = folder / f"pre-train-wait-{number}.json"
-                saved = json.loads(path.read_text()) if path.exists() else None
-                if saved is not None and saved["head"] == head and "second" in saved:
-                    raise Refused(
-                        "pre-train checks could not finish twice on the same head: "
-                        f"first {saved['outcome']}; second {saved['second']}"
-                    )
-            train.admit(view)
+            # Another caller can finish newer checks while this handoff reads GitHub.
+            # Its saved outcome supersedes this handoff's own earlier result.
+            path = folder / f"pre-train-wait-{number}.json"
+            saved = json.loads(path.read_text()) if path.exists() else None
+            pre_train_wait = saved is not None and saved["head"] == head
+            if pre_train_wait and "second" in saved:
+                raise Refused(
+                    "pre-train checks could not finish twice on the same head: "
+                    f"first {saved['outcome']}; second {saved['second']}"
+                )
             if pre_train_wait:
                 # The handoff authorizes a retry, but a batch must wait for these checks.
-                train.approved.pop(number, None)
-                train.save()
+                view.approved.pop(number, None)
+            train.admit(view)
             # Queued and passed over in its place until the tick's re-run is green; a wait
             # before it was queued is no handoff.
             if outcome is not None and not (isinstance(outcome, Waiting) and number in train.queue):
