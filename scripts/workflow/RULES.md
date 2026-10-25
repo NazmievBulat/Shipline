@@ -631,14 +631,16 @@ and starts the usual Claude reviewer on the pushed head. That reviewer runs the 
 the recorded fallback keeps this head out of conflict-only review. The panel records Codex's
 resolution in `codex-resolved-N`, so Codex also stays off later panels of its own resolution;
 the fresh Claude reviewer and Cursor provide the independent full review.
+Codex never sends back either: when it would, it takes the same fallback, and the Claude
+reviewer sends back.
 
 Publish the next usual independent round on the resolved head, stating that it is a conflict
 round and naming H, with `<!-- workflow-conflict extends=H -->` on its own line after the
 usual round marker. Explain why the resolution stays within scope and record test evidence.
 Codex publishes with `gh api -X POST repos/{repository}/pulls/N/reviews --input <file>`;
 the JSON file has only `body`, `commit_id` (the resolved head), and `event: "COMMENT"`.
-Its shim permits this own conflict round and reads; it refuses approvals, full rounds and
-other writes. Product questions go through the bridge. A Codex quota stop uses the worker's
+Its shim permits this own passed conflict round and reads; it refuses approvals, send-backs,
+full rounds and other writes. Product questions go through the bridge. A Codex quota stop uses the worker's
 quota handling and leaves the merge line available to other pull requests.
 A full-review fallback uses the usual round marker without that conflict marker and says
 which fallback applied and why. The ordinary send-back count, checks, questions and waiting

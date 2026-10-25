@@ -956,7 +956,8 @@ def test_tick_reads_codex_conflict_completion_and_starts_full_review(
 
 
 @pytest.mark.parametrize(
-    "operation", ["publish", "dash-file", "other", "approve", "full", "ready", "body", "ticket"]
+    "operation",
+    ["publish", "dash-file", "other", "approve", "full", "sent-back", "undo", "ready", "body", "ticket"],
 )
 def test_codex_conflict_gh_allows_only_its_own_conflict_round(
     workflow: Workflow, operation: str
@@ -967,7 +968,9 @@ def test_codex_conflict_gh_allows_only_its_own_conflict_round(
     payload = workflow.root / "round.json"
     if operation == "dash-file":
         payload = workflow.worktree(7) / "--round.json"
-    body = "<!-- workflow-review round=2 result=passed -->\n"
+    # A send-back goes to Claude through the full-review fallback, never from Codex.
+    result = "sent-back" if operation == "sent-back" else "passed"
+    body = f"<!-- workflow-review round=2 result={result} -->\n"
     if operation != "full":
         body += f"<!-- workflow-conflict extends={head} -->\n"
     payload.write_text(
@@ -986,6 +989,8 @@ def test_codex_conflict_gh_allows_only_its_own_conflict_round(
     ]
     if operation == "ready":
         args = ["pr", "ready", "7"]
+    elif operation == "undo":
+        args = ["pr", "ready", "7", "--undo"]
     elif operation == "body":
         args = [
             "api", "-X", "PATCH", "repos/example-org/example-app/pulls/7", "-F",
