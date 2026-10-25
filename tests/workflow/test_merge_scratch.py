@@ -685,8 +685,10 @@ def test_batch_images_must_pass_on_the_scratch_tree(github: GitHub, state: str) 
     assert _batch_call(github).returncode == 3
     scratch = _scratch(github)
     assert scratch is not None
-    # Each prefix holds the image change of 7.
-    assert all(m["scratch"]["workflows"] == ["ci", "images", "e2e"] for m in _prefixes(github))
+    # Later prefixes reuse 7's image proof while testing their own CI and browser suites.
+    assert [m["scratch"]["workflows"] for m in _prefixes(github)] == [
+        ["ci", "images", "e2e"], ["ci", "e2e"], ["ci", "e2e"]
+    ]
     _finish_batch(github)
     image_path = (
         f"{_REPO}/actions/workflows/images.yml/runs?head_sha={scratch['head']}"
@@ -724,7 +726,78 @@ def test_batch_images_must_pass_on_the_scratch_tree(github: GitHub, state: str) 
         receipt = json.loads(
             (github.workflow.repo / ".local/workflow/main-tree-green.json").read_text()
         )
-        assert receipt["images_run"] == 2110 and receipt["images_complete"] is True
+        assert receipt["images_run"] == 110 and receipt["images_complete"] is True
+
+
+def test_neutral_prefixes_share_one_image_run_and_main_keeps_its_proof(github: GitHub) -> None:
+    _batch_setup(github, images=True)
+    assert _batch_call(github).returncode == 3
+    members = _prefixes(github)
+    assert len(github.workflow.calls("gh workflow run images.yml")) == 1
+    for index, number in enumerate(("7", "8", "9")):
+        _finish_prefix(github, number, run_id=100 + 1000 * index)
+        done = _batch_call(github, number)
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert _merges(github) == ["7", "8", "9"][:index + 1]
+        receipt = _receipt(github)
+        assert receipt["images_run"] == 110 and receipt["images_complete"]
+        assert receipt["images_tree"] == members[0]["tree"]
+        assert receipt["images_differing_files"] == [f"change-{n}.txt" for n in range(8, 8 + index)]
+        message = github.workflow.git("show", "-s", "--format=%B", "origin/main")
+        proof = json.loads(next(line.removeprefix("Workflow-Proof: ")
+                                for line in message.splitlines() if line.startswith("Workflow-Proof: ")))
+        assert next(s["run"] for s in proof["sources"] if s["workflow"] == "images") == 110
+        github.save()
+        status = github.workflow.run_script("main-status")
+        assert status.stdout.startswith("main: green"), status.stdout + status.stderr
+        assert "Docker images run 110" in status.stdout
+    assert len(github.workflow.calls("gh workflow run images.yml")) == 1
+
+
+def test_neutral_prefix_after_an_untested_image_change_runs_images(github: GitHub) -> None:
+    _batch_setup(github, images=True)
+    # The front's own checks now prove its merge on current main, so it has no prefix run.
+    github.ci(github.base, github.head, run_id=7000)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7"]
+    assert "images" in _scratch(github, "8")["workflows"]
+    assert "images" not in _scratch(github, "9")["workflows"]
+    assert len(github.workflow.calls("gh workflow run images.yml")) == 1
+
+
+def test_an_image_change_after_a_neutral_member_gets_its_own_run(github: GitHub) -> None:
+    _batch_setup(github, images=True, images_member=8)
+    assert _batch_call(github).returncode == 3
+    assert ["images" in m["scratch"]["workflows"] for m in _prefixes(github)] == [False, True, False]
+    _finish_batch(github)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
+    assert _receipt(github)["images_run"] == 1110
+
+
+def test_a_failed_shared_image_run_releases_the_line_only_after_a_green_rerun(github: GitHub) -> None:
+    _batch_setup(github, images=True)
+    assert _batch_call(github).returncode == 3
+    assert len(github.workflow.calls("gh workflow run images.yml")) == 1
+    original = _prefixes(github)
+    _finish_batch(github)
+    path = (f"{_REPO}/actions/workflows/images.yml/runs?head_sha={original[0]['commit']}"
+            "&event=workflow_dispatch&per_page=100")
+    github.api[path]["workflow_runs"][0]["conclusion"] = "failure"
+    assert _batch_call(github).returncode == 1
+    assert _merges(github) == []
+    _finish_prefix(github, "7", scratch=original[0]["scratch"], tree=original[0]["tree"])
+    github.api[path]["workflow_runs"][0]["run_attempt"] = 2
+    github.save()
+    assert _train(github)["first"] == "7"
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    _finish_batch(github, run_id=4100)
+    done = _batch_call(github, "8")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
 
 
 @pytest.mark.parametrize("change", ["unapproved-queue-entry", "changed-head"])
