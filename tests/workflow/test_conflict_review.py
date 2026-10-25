@@ -1524,3 +1524,65 @@ def test_partial_requested_panel_waits_for_a_surviving_report_lock(workflow: Wor
     done = _finish_requested_panel(workflow, head)
     assert done.returncode == 0, done.stdout + done.stderr
     assert (workflow.state / "cursor-runs").read_text().splitlines() == ["run"]
+
+
+def test_full_review_request_cannot_be_overwritten_by_a_finishing_panel(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    hooks = workflow.root / "race-hooks"
+    hooks.mkdir()
+    (hooks / "sitecustomize.py").write_text('''import os
+import time
+from pathlib import Path
+import merge_handoff
+
+original = merge_handoff.write_json
+
+def paused_write(path, value):
+    if path.name == os.environ["WORKFLOW_RACE_RESULT"] and value == 0:
+        state = Path(os.environ["WORKFLOW_RACE_STATE"])
+        (state / "result-ready").touch()
+        deadline = time.monotonic() + 45
+        while not (state / "release-result").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+    return original(path, value)
+
+merge_handoff.write_json = paused_write
+''')
+    workflow.env.update({
+        "PYTHONPATH": os.pathsep.join((str(hooks), str(workflow.script.parent))),
+        "WORKFLOW_RACE_RESULT": f"review-7.panel-result-{head}",
+        "WORKFLOW_RACE_STATE": str(workflow.state),
+    })
+    release = workflow.state / "release-result"
+    request = None
+    try:
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        deadline = time.monotonic() + 30
+        while not (workflow.state / "result-ready").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert (workflow.state / "result-ready").exists()
+        request = subprocess.Popen(
+            ["bash", str(workflow.script.with_name("review-panel")), "7", "--request", "--full-review"],
+            cwd=workflow.worktree(7), env={**workflow.env, "WORKFLOW_SESSION": "review-7"},
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        # With serialization the request waits for the result writer's short metadata lock.
+        # Without it, the request completes while the obsolete writer is still paused.
+        deadline = time.monotonic() + 5
+        while request.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        release.touch()
+    assert request is not None
+    output, error = request.communicate(timeout=20)
+    assert request.returncode == 0, output + error
+    with (_folder(workflow) / f"review-7.panel-run-{head}.lock").open("a") as runner:
+        fcntl.flock(runner, fcntl.LOCK_EX)
+    assert not (_folder(workflow) / f"review-7.panel-result-{head}").exists(), (
+        "an obsolete panel result overwrote the full-review request"
+    )
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (_folder(workflow) / "review-7.usual-reviewer").read_text().strip() == head
+    assert not workflow.is_running("codex-7")
