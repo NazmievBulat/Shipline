@@ -38,7 +38,8 @@ def _hand_back(folder: Path, number: str, reason: str) -> None:
     with (folder / "merge.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         request = folder / f"merge-review-{number}"
-        if not request.exists():
+        changed = not request.exists()
+        if changed:
             try:
                 note = Handoff.read(folder, number)
                 head = note.head if note is not None else gate.read_pull(number)["headRefOid"]
@@ -57,14 +58,38 @@ def _hand_back(folder: Path, number: str, reason: str) -> None:
                 },
             )
         _queue_notice(folder, number, request)
-        Handoff.path(folder, number).unlink(missing_ok=True)
-        (folder / f"merge-refresh-{number}.json").unlink(missing_ok=True)
-        (folder / f"review-{number}.head").unlink(missing_ok=True)
+        for path in (
+            Handoff.path(folder, number),
+            folder / f"merge-refresh-{number}.json",
+            folder / f"review-{number}.head",
+        ):
+            changed |= path.exists()
+            path.unlink(missing_ok=True)
         train = gate.Train(folder)
+        changed |= number in train.approved or number in train.repairing
         train.approved.pop(number, None)
         train.repairing.pop(number, None)
-        train.save()
-    print(f"merge hand-back {number}: {reason}", flush=True)
+        if changed:
+            train.save()
+            reason = json.loads(request.read_text())["reason"]
+    if changed:
+        print(f"merge hand-back {number}: {reason}", flush=True)
+
+
+def _hand_back_wait(folder: Path, number: str, cause: str) -> None:
+    """Keep a pending request's last wait cause, without making another wake notice."""
+    with (folder / "merge.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = folder / f"merge-review-{number}"
+        if not path.exists():
+            return
+        data = json.loads(path.read_text())
+        cause = cause.removeprefix("needs ")
+        if data.get("wait") == cause:
+            return
+        data["wait"] = cause
+        write_json(path, data)
+    print(f"hand-back {number} waits: {cause}", flush=True)
 
 
 def _queue_notice(folder: Path, number: str, request: Path) -> None:
@@ -267,6 +292,7 @@ def _start_hand_back(folder: Path, number: str) -> int:
         next_round,
         sum(r[1] == "sent-back" for r in rounds),
         pull["headRefName"],
+        report_wait=lambda cause: _hand_back_wait(folder, number, cause),
     )
     if result == 0:
         path.unlink()
@@ -551,9 +577,13 @@ if __name__ == "__main__":
             _tidy_hand_backs(folder)
         elif len(sys.argv) == 3 and sys.argv[1] == "--start-hand-back" and sys.argv[2].isdigit():
             sys.exit(_start_hand_back(folder, sys.argv[2]))
+        elif len(sys.argv) == 3 and sys.argv[1] == "--wait-hand-back" and sys.argv[2].isdigit():
+            _hand_back_wait(folder, sys.argv[2], "its turn in the order of starts")
         elif len(sys.argv) == 1:
             drive(folder)
         else:
-            raise gate.Refused("usage: merge_driver.py [--hand-backs | --start-hand-back N]")
+            raise gate.Refused(
+                "usage: merge_driver.py [--hand-backs | --start-hand-back N | --wait-hand-back N]"
+            )
     except (gate.Refused, OSError, KeyError, TypeError, ValueError) as error:
         raise SystemExit(f"merge driver waits for the next tick: {error}") from error

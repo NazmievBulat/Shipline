@@ -3,6 +3,7 @@
 import json
 import sys
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import merge_gate as gate
@@ -23,7 +24,10 @@ def _notice(
     number: str,
     reason: str,
     blocked: bool = True,
+    report_wait: Callable[[str], None] | None = None,
 ) -> None:
+    if report_wait is not None:
+        report_wait(reason)
     if path.exists() and (
         json.loads(path.read_text())["identity"] == identity
         and json.loads(path.read_text())["blocked"] == blocked
@@ -39,7 +43,8 @@ def _notice(
     event = uuid.uuid4().hex
     write_json(path, {"identity": identity, "event": event, "reason": reason, "blocked": blocked})
     write_json(folder / "merge-handbacks.pending" / event, {"number": number, "reason": reason})
-    print(f"pull request {number} {reason}", flush=True)
+    if report_wait is None:
+        print(f"pull request {number} {reason}", flush=True)
 
 
 def reconcile(folder: Path) -> None:
@@ -95,7 +100,14 @@ def _identity(worktree: Path, head: str, branch_name: str) -> list[str]:
 
 
 def start(
-    folder: Path, number: str, head: str, next_round: int, sent_back: int, branch_name: str
+    folder: Path,
+    number: str,
+    head: str,
+    next_round: int,
+    sent_back: int,
+    branch_name: str,
+    *,
+    report_wait: Callable[[str], None] | None = None,
 ) -> int:
     """Return 0 for started, 2 for an unchanged block, 1 for a new failed start, and 75 when
     memory is short and the start waits for the next tick."""
@@ -110,6 +122,7 @@ def start(
             [head, str(next_round)],
             number,
             f"needs the owner's allowance for round {next_round}",
+            report_wait=report_wait,
         )
         return 2
     _clear(folder, blocked)
@@ -118,7 +131,15 @@ def start(
     refused = folder / f"review-{number}.start-refused"
     if refused.exists() and json.loads(refused.read_text())["identity"] == identity:
         data = json.loads(refused.read_text())
-        _notice(folder, refused, identity, number, data["reason"], data["blocked"])
+        _notice(
+            folder,
+            refused,
+            identity,
+            number,
+            data["reason"],
+            data["blocked"],
+            report_wait=report_wait if data["blocked"] else None,
+        )
         if data["blocked"]:
             return 2
     else:
@@ -133,7 +154,15 @@ def start(
                 break
         return 0
     if done.returncode == 75:
-        print(done.stderr or done.stdout, flush=True)
+        if report_wait is None:
+            print(done.stderr or done.stdout, flush=True)
+        else:
+            reason = (done.stderr or done.stdout).strip()
+            if reason.startswith("memory is short"):
+                reason = "memory is short"
+            elif reason.startswith("the processors are overloaded:"):
+                reason = "the processors are overloaded"
+            report_wait(reason)
         return 75
     # Preparation can create/advance the local branch before refusing it.
     identity = _identity(worktree, head, branch_name)
@@ -144,6 +173,7 @@ def start(
         number,
         f"reviewer start refused: {(done.stderr or done.stdout).strip()}",
         blocked=done.returncode == 3,
+        report_wait=report_wait,
     )
     return 1
 

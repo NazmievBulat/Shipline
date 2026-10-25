@@ -908,8 +908,18 @@ def test_a_hand_back_logs_a_changed_wait_cause_once(handed: GitHub, shortage: st
 def test_a_hand_back_waiting_behind_another_start_logs_its_turn_once(handed: GitHub) -> None:
     workflow = handed.workflow
     handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    head = workflow.add_pull_request(8, draft=False, labels=("workflow", "priority:+high"))
+    handed.pulls["8"] = {
+        **deepcopy(handed.pulls["7"]),
+        "headRefName": workflow.branch(8),
+        "headRefOid": head,
+        "labels": [{"name": "workflow"}, {"name": "priority: high"}],
+    }
+    handed.api["repos/example-org/example-app/pulls/8/reviews"] = []
     handed.save()
-    workflow.add_pull_request(8, labels=("workflow", "priority:+high"))
+    (_folder(workflow) / "merge-review-8").write_text(
+        json.dumps({"reason": "failed checks", "event": "b" * 32})
+    )
     workflow.pressure_file.write_text("some avg60=11.00\n")
     workflow.fake("sleep", '#!/bin/bash\necho "sleep $*" >> "@STATE@/calls.log"\nexit 91\n')
 
@@ -924,7 +934,7 @@ def test_a_hand_back_waiting_behind_another_start_logs_its_turn_once(handed: Git
     workflow.pressure_file.write_text("some avg60=0.00\n")
     done = workflow.run_script("tick")
     assert done.returncode == 0, done.stdout + done.stderr
-    assert _started(workflow) == ["ticket-8", "review-7"]
+    assert _started(workflow) == ["review-8", "review-7"]
 
 
 def test_the_gate_itself_refuses_a_changed_handoff_head(handed: GitHub) -> None:
