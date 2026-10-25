@@ -1018,6 +1018,9 @@ def _prefix_summary(scratch: dict[str, Any] | None) -> str:
         needed.add("images")
     if needed - set(seen):
         return "starting"
+    if "main" in scratch.get("image_source", {}):
+        # A completed planner with skipped image tests is still no image proof.
+        return "running"
     if all(run[3] == "completed" for run in seen.values()):
         return "passed"
     return "running"

@@ -782,8 +782,11 @@ def test_neutral_prefix_after_an_own_check_merge_waits_for_main_images(
     assert _merges(github) == ["7"]
     assert not github.workflow.calls("gh workflow run images.yml")
     github.save()
-    before = _train(github)["turn"]
+    status = _train(github)
+    assert next(p for p in status["prefixes"] if p["number"] == "8")["state"] != "passed"
+    before = status["turn"]
     _main_image_run(github, 8200, main)
+    github.api[f"{_REPO}/actions/runs/8200/jobs?per_page=100"]["jobs"][1]["name"] = "Docker images: image tests"
     github.api[f"{_REPO}/check-runs/8201/annotations?per_page=100"] = [
         {"title": "Files tested", "message": github.workflow.git("rev-parse", f"{main}^{{tree}}")}
     ]
@@ -876,6 +879,7 @@ def test_a_lost_shared_result_after_its_member_merged_waits_for_main(github: Git
         github.api[path]["workflow_runs"][0]["conclusion"] = "failure"
     else:
         github.api[path]["workflow_runs"] = []
+        github.api.pop(f"{_REPO}/actions/runs/110")
     _finish_prefix(github, "8", run_id=1100)
     _finish_prefix(github, "9", run_id=2100)
     github.save()
@@ -888,6 +892,7 @@ def test_a_lost_shared_result_after_its_member_merged_waits_for_main(github: Git
     assert _batch_call(github, "8").returncode == 3
     main = github.workflow.git("rev-parse", "origin/main")
     _main_image_run(github, 8200, main)
+    github.api[f"{_REPO}/actions/runs/8200/jobs?per_page=100"]["jobs"][1]["name"] = "Docker images: image tests"
     github.api[f"{_REPO}/check-runs/8201/annotations?per_page=100"] = [
         {"title": "Files tested", "message": github.workflow.git("rev-parse", f"{main}^{{tree}}")}
     ]

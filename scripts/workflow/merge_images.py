@@ -215,9 +215,13 @@ def complete_image_jobs(parts: list[dict[str, Any]], *, allow_skipped: bool = Fa
 
 def image_source_runs(source: dict[str, Any]) -> list[dict[str, Any]]:
     """Read the source's current attempt, never the saved run status from a receipt."""
-    from merge_gate import API, Refused, Waiting, _batch_runs, api
+    from merge_gate import API, MainImages, Refused, Waiting, _batch_runs, api, main_image_runs
 
     try:
+        if "main_after" in source:
+            return []  # Its member has not yet been squashed onto main.
+        if "main" in source:
+            return main_image_runs(source["main"], MainImages())[:1]
         if "scratch" in source:
             return _batch_runs(source["scratch"], "images")
         current = api(f"{API}/actions/runs/{source['run']['id']}")
@@ -234,7 +238,21 @@ def image_source_runs(source: dict[str, Any]) -> list[dict[str, Any]]:
 
 def prefix_image_source(member: dict[str, Any], train: Any) -> dict[str, Any] | None:
     """A borrowed prefix proof follows its source's replacement branch until it merges."""
+    from merge_gate import git, main_image_source
+
     source = member["scratch"].get("image_source")
+    if source and "main_after" in source:
+        if train.prefixes and any(m["number"] == source["main_after"]
+                                  for m in train.prefixes["members"]):
+            return source
+        if not train.prefixes:
+            return None
+        base = train.prefixes["base"]
+        source = {"main": base, "tree": git("rev-parse", f"{base}^{{tree}}")}
+    if source and "main" in source:
+        # Keep the pending main reference until real image jobs prove this tree. Once
+        # passed, retain their run identity just like any other borrowed proof.
+        return main_image_source(source["main"]) or source
     if source and "number" in source:
         current = next((m for m in train.prefixes["members"]
                         if m["number"] == source["number"]), None) if train.prefixes else None

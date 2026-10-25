@@ -654,7 +654,8 @@ def _prefix_scratch(
     # A prefix may introduce or remove the workflow; dispatch only an available definition.
     if (git("ls-tree", "--name-only", base, "--", path)
             and git("ls-tree", "--name-only", commit, "--", path)):
-        if not image_difference(under, commit)[1]:
+        differs_from_main = image_difference(base, commit)[1]
+        if not image_difference(under, commit)[1] or not differs_from_main:
             source = image_source or main_image_source(base)
             if source:
                 try:
@@ -665,7 +666,10 @@ def _prefix_scratch(
                 except Refused:
                     source = None
         if source is None:
-            workflows.append("images")
+            if differs_from_main:
+                workflows.append("images")
+            else:
+                source = {"main": base, "tree": git("rev-parse", f"{base}^{{tree}}")}
     # Each member's own E2E run may have been a selection; a prefix runs the whole suite.
     if browser_needed(base, commit):
         workflows.append("e2e")
@@ -697,6 +701,7 @@ def _extend_line(train: Train, base: str, fresh: bool) -> None:
         _restore_prefixes,
         _taken_migrations,
         git,
+        image_difference,
         read_pull,
     )
 
@@ -786,6 +791,10 @@ def _extend_line(train: Train, base: str, fresh: bool) -> None:
                     if "images" in previous["scratch"]["workflows"]
                     else previous["scratch"].get("image_source")
                 )
+            elif previous and image_difference(base, previous["tree"])[1]:
+                # Its own checks will merge it without a prefix image run. Neutral
+                # followers wait for that squash's main push, keeping their CI and E2E.
+                source = {"main_after": previous["number"], "tree": previous["tree"]}
             scratch = None if own else _prefix_scratch(current, base, under, source)
         added.append(
             {
@@ -1054,6 +1063,7 @@ def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
         jobs,
         image_difference,
         image_source_runs,
+        main_image_source,
         prefix_image_source,
         whole_suite,
         workflow_verdict,
@@ -1068,11 +1078,22 @@ def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
 
     def replacement_images() -> Prefix:
         scratch.pop("image_source", None)
-        scratch["workflows"].append("images")
+        base = train.prefixes["base"]
+        if image_difference(base, tree)[1]:
+            scratch["workflows"].append("images")
+        else:
+            # Dispatch uses the same main-relative path filter: unchanged image inputs
+            # would skip every test. Main's own push must supply the replacement.
+            scratch["image_source"] = main_image_source(base) or {
+                "main": base, "tree": git("rev-parse", f"{base}^{{tree}}"),
+            }
         train.save()
         return Prefix("pending", f"waiting for replacement images of {whose}", evidence)
 
     source = prefix_image_source(member, train)
+    if source and source != scratch.get("image_source"):
+        scratch["image_source"] = source
+        train.save()
     work = [(workflow, scratch, tree) for workflow in scratch["workflows"]]
     if source:
         work.append(("images", source.get("scratch"), source["tree"]))

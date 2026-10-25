@@ -116,8 +116,10 @@ on a scratch branch of its own, with its CI, the whole browser suite's E2E run a
 required image checks. A prefix runs images for its own change relative to the prefix ahead
 of it (main for the first member). Otherwise it borrows the nearest preceding prefix's image
 proof, or main's proof when no preceding prefix ran images. It merges only after that source
-passed. With no usable source, including an image change ahead merged by its own checks,
-it runs images itself. A rebuilt source replaces the borrowed proof; dropped dependent
+passed. With no usable source it runs images itself only when its image inputs differ from
+main. When those inputs are already in main, including a change ahead merged by its own
+checks, it waits for main's push image result. A skipped run proves no images. A rebuilt
+source replaces the borrowed proof; dropped dependent
 prefixes are rebuilt as before. The nightly image run of main remains the backstop for
 changes outside the filter. The gate's first run of a prefix takes main's runners when the
 repository has them and one is free, in a lane of its own that a push to main goes ahead of, so
