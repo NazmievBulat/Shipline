@@ -578,6 +578,27 @@ echo 'claude report'
     assert not (reports / "codex.md").exists()
 
 
+def test_crash_before_panel_preserves_codex_resolution_provenance(workflow: Workflow) -> None:
+    _panel_conflict(workflow)
+    _program(workflow)
+    _record_handback(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow, "hunk")
+    workflow.set_pull_request(7, "OPEN", resolved)
+    # The resolver ended after pushing, before it could run a panel or request a fallback.
+    assert workflow.run("stop", "review-7").returncode == 0
+    assert workflow.run("start", "review", "7").returncode == 0
+    assert not workflow.is_running("codex-7")
+    args = " ".join(session_arguments(workflow.state, "review-7"))
+    assert "--model opus" in args and "--mcp-config" not in args
+    workflow.fake("agent", '#!/bin/bash\necho "Cursor report"\n')
+    done = workflow.run_script("review-panel", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    reports = _folder(workflow) / "reviews/7" / resolved
+    assert "Codex resolved a conflict" in (reports / "codex.md").read_text()
+    assert "Cursor report" in (reports / "cursor.md").read_text()
+
+
 @pytest.mark.parametrize("extra", ["file", "hunk", "revoked", "corrupt", "full"])
 def test_codex_panel_fallback_returns_to_claude(workflow: Workflow, extra: str) -> None:
     _panel_conflict(workflow)

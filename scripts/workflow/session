@@ -1828,6 +1828,7 @@ start_codex_worker() {
   mkdir -p "$worktree/$SHIPLINE_STATE_FOLDER"
   rm -f "$notes.started" "$notes.codex-turn.json" "$notes.codex-delivered" "$notes.codex-answered" "$notes.codex-followed-up" "$notes.codex-quota-delivered" "$notes.codex-approval-delivered" "$notes.codex-recovery-error" "$notes.owner-reply"
   [[ $name != ticket-* ]] || touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name##*-}"
+  [[ $name != review-* ]] || touch "$main/$SHIPLINE_STATE_FOLDER/codex-resolved-${name##*-}"
   common=$(git rev-parse --path-format=absolute --git-common-dir)
   [[ $effort != max ]] || effort=xhigh
   # Scope the bridge flag to this process's callback. A nested `codex review` must not
