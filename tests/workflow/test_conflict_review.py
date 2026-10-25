@@ -421,6 +421,108 @@ def _reviewer(workflow: Workflow) -> str:
     return done.stdout
 
 
+def _program(workflow: Workflow, program: str = "codex", **options: object) -> None:
+    config = workflow.repo / "shipline.json"
+    values = json.loads(config.read_text())
+    values["conflict_review"] = {"program": program, **options}
+    config.write_text(json.dumps(values))
+
+
+def _codex_conflict(workflow: Workflow) -> tuple[str, str]:
+    workflow.add_worktree(7, draft=False)
+    head, main = _conflict(workflow)
+    _begin_merge(workflow, main)
+    folder = _folder(workflow)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "review-7.conflict.json").write_text(
+        json.dumps({"head": head, "main": main, "files": [_FILE]})
+    )
+    _program(workflow)
+    return head, main
+
+
+def test_codex_conflict_starts_with_its_sentence_and_bridge(workflow: Workflow) -> None:
+    head, _ = _codex_conflict(workflow)
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    args = session_arguments(workflow.state, "codex-7")
+    assert instruction(
+        f"Review conflict resolution for pull request 7 extending passed head {head} "
+        f"in files {_FILE}"
+    ) in args
+    assert "workspace-write" in args
+    bridge = " ".join(session_arguments(workflow.state, "review-7"))
+    assert "--tools ''" in bridge or '--tools ""' in bridge or "--tools  " in bridge
+    assert "codex-bridge" in (workflow.notes(7) / "review-7.codex-config.json").read_text()
+    assert (workflow.notes(7) / "review-7.codex").exists()
+    assert (workflow.notes(7) / "review-7.started").exists()
+    assert not (_folder(workflow) / "codex-built-7").exists()
+    done = workflow.run("stop", "review-7")
+    assert done.returncode == 0, done.stderr
+    assert not workflow.is_running("codex-7")
+    assert not workflow.is_running("review-7")
+
+
+@pytest.mark.parametrize("built", [False, True])
+def test_codex_resolution_gets_claude_and_cursor(workflow: Workflow, built: bool) -> None:
+    _panel_conflict(workflow)
+    _program(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", resolved)
+    if built:
+        (_folder(workflow) / "codex-built-7").touch()
+    for tool in ("claude", "agent", "codex"):
+        workflow.fake(tool, '#!/bin/bash\necho "@TOOL@ report"\n')
+    done = workflow.run_script("review-panel", "7", "codex", "cursor")
+    assert done.returncode == 0, done.stdout + done.stderr
+    reports = _folder(workflow) / "reviews/7" / resolved
+    assert "claude report" in (reports / "claude.md").read_text()
+    assert "agent report" in (reports / "cursor.md").read_text()
+    assert not (reports / "codex.md").exists()
+
+
+@pytest.mark.parametrize("extra", ["file", "hunk", "revoked", "corrupt", "full"])
+def test_codex_panel_fallback_returns_to_claude(workflow: Workflow, extra: str) -> None:
+    _panel_conflict(workflow)
+    _program(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow, extra)
+    workflow.set_pull_request(7, "OPEN", resolved)
+    if extra == "revoked":
+        (workflow.state / "reviews-7.json").write_text("[]")
+    elif extra == "corrupt":
+        (_folder(workflow) / "review-7.conflict.json").write_text("invalid")
+    done = workflow.run_script("review-panel", "7", *(["--full-review"] if extra == "full" else []))
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "Full review required" in done.stderr
+    assert (_folder(workflow) / "review-7.usual-reviewer").read_text().strip() == resolved
+    assert not (_folder(workflow) / "reviews/7" / resolved / "codex.md").exists()
+    assert workflow.run("stop", "review-7").returncode == 0
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    args = " ".join(session_arguments(workflow.state, "review-7"))
+    assert "--model opus" in args and "--mcp-config" not in args
+    assert not workflow.is_running("codex-7")
+
+
+def test_conflict_program_is_validated_by_name(workflow: Workflow) -> None:
+    _program(workflow, "unknown")
+    done = workflow.run("start", "review", "7")
+    assert done.returncode != 0
+    assert "conflict_review.program must be one of claude, codex" in done.stderr
+
+
+@pytest.mark.parametrize("program", ["claude", "codex"])
+def test_program_alone_and_optional_conflict_limits(workflow: Workflow, program: str) -> None:
+    _codex_conflict(workflow)
+    _program(workflow, program)
+    assert _reviewer(workflow) == "high opus\n"
+    _program(workflow, program, effort="medium", model="sonnet", max_changed_lines=5)
+    assert _reviewer(workflow) == "high opus\n"
+    assert not (_folder(workflow) / "review-7.conflict-reviewer").exists()
+
+
 @pytest.mark.parametrize(
     ("state", "reviewer"),
     [
