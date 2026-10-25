@@ -145,7 +145,7 @@ def test_a_conflict_reviewer_is_nudged_only_for_a_later_conflicting_head(
     handed.pulls["7"].update(headRefOid=head, mergeable="CONFLICTING")
     handed.main()
     handed.ci(main, head, tested_base=workflow.git("merge-base", main, head))
-    workflow.set_pull_request(7, "OPEN", head)
+    (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {head}\n")
     note = _folder(workflow) / "merge-wanted-7"
     data = json.loads(note.read_text())
     data["head"] = head
@@ -163,7 +163,7 @@ def test_a_conflict_reviewer_is_nudged_only_for_a_later_conflicting_head(
     workflow.screen("● Checking the resolution.\n\n> \n", "review-7")
     if new_head:
         handed.pulls["7"]["headRefOid"] = resolved
-        workflow.set_pull_request(7, "OPEN", resolved)
+        (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {resolved}\n")
         handed.save()
 
     for _ in range(2):
