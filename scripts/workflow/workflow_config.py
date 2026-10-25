@@ -184,10 +184,10 @@ class Checks:
     dependency_audit: str | None = option('name', None, 'The dependency audit job name; omitted means CI: dependencies.', example='Build: dependencies', optional=True, position=4)
     e2e_plan: str = option('name', 'E2E: what to run', 'The browser suite planner check name.', example='Browser: what to run', shell=(6, 'E2E_PLAN'), position=2)
     images: str = option('name', 'Docker images', 'The prefix of image checks; its planner appends : what to run.', example='Images', shell=(7, 'IMAGES'), derived_shell=(8, 'IMAGES_PLAN', 'images_plan'), position=3)
-    older_version: str = option('name', 'CI: older version on new tables', 'The previous-version compatibility job name without its (k of n) shard suffix.', example='Build: older version on new tables', optional=True, position=9)
+    older_version: str = option('job', 'CI: older version on new tables', 'The previous-version compatibility job name without its (k of n) shard suffix.', example='Build: older version on new tables', optional=True, position=9)
     prefix_only: list[str] = option('names', [], 'Distinct groups run only in merge prefixes: images, browser_whole and server_whole.', example=['images', 'browser_whole', 'server_whole'], optional=True, position=6)
-    server_tests: str = option('name', 'CI: server tests', 'The server tests job name without its (k of n) shard suffix.', example='Build: server tests', optional=True, position=7)
-    web: str = option('name', 'CI: web', 'The web suite job name without its (k of n) shard suffix.', example='Build: web', optional=True, position=8)
+    server_tests: str = option('job', 'CI: server tests', 'The server tests job name without its (k of n) shard suffix.', example='Build: server tests', optional=True, position=7)
+    web: str = option('job', 'CI: web', 'The web suite job name without its (k of n) shard suffix.', example='Build: web', optional=True, position=8)
 
     @property
     def dependency_job(self) -> str:
@@ -784,6 +784,10 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
             value = given[key]
             if not isinstance(value, str) or not value.strip():
                 raise ConfigError(f"{FILE}: {name} must be a name, not {json.dumps(value)}")
+            if DECLARATIONS[name].kind == "job" and re.fullmatch(r".+ \(\d+ of \d+\)", value):
+                raise ConfigError(
+                    f"{FILE}: {name} must name a job without its (k of n) shard suffix"
+                )
             merged[key] = value
     return merged
 

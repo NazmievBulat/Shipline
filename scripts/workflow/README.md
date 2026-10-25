@@ -140,10 +140,10 @@ installation folder, even if the checkout has a file of the same name.
 | `checks.dependency_audit` | name | The dependency audit job name; omitted means CI: dependencies. | none |
 | `checks.e2e_plan` | name | The browser suite planner check name. | `"E2E: what to run"` |
 | `checks.images` | name | The prefix of image checks; its planner appends : what to run. | `"Docker images"` |
-| `checks.older_version` | name | The previous-version compatibility job name without its (k of n) shard suffix. | `"CI: older version on new tables"` |
+| `checks.older_version` | job | The previous-version compatibility job name without its (k of n) shard suffix. | `"CI: older version on new tables"` |
 | `checks.prefix_only` | names | Distinct groups run only in merge prefixes: images, browser_whole and server_whole. | `[]` |
-| `checks.server_tests` | name | The server tests job name without its (k of n) shard suffix. | `"CI: server tests"` |
-| `checks.web` | name | The web suite job name without its (k of n) shard suffix. | `"CI: web"` |
+| `checks.server_tests` | job | The server tests job name without its (k of n) shard suffix. | `"CI: server tests"` |
+| `checks.web` | job | The web suite job name without its (k of n) shard suffix. | `"CI: web"` |
 | `cloud_pre_push.suites` | suites | Named cloud pre-push suites with select, run, workers and optional part and probe commands. | `{}` |
 | `cloud_wake_after_minutes` | minutes | Minutes without a push or report before a cloud worker is woken; 0 disables it. | `30` |
 | `commands.advisory_watch` | command | The command that detects an advisory service outage and checks whether the service answers again. | none |
