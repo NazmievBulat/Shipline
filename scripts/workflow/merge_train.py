@@ -1013,7 +1013,10 @@ def _prefix_summary(scratch: dict[str, Any] | None) -> str:
         return "failed"
     if recovering:
         return "running"
-    if set(scratch["workflows"]) - set(seen):
+    needed = set(scratch["workflows"])
+    if scratch.get("image_source"):
+        needed.add("images")
+    if needed - set(seen):
         return "starting"
     if all(run[3] == "completed" for run in seen.values()):
         return "passed"

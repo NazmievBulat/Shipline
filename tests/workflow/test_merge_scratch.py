@@ -667,7 +667,9 @@ def test_train_status_shows_each_members_prefix_and_its_state(github: GitHub) ->
     assert {run["workflow"]: run["id"] for run in status["prefixes"][1]["runs"]} == {
         "ci": 1100,
         "e2e": 1110,
+        "images": members[1]["scratch"]["image_source"]["run"]["id"],
     }
+    assert status["prefixes"][1]["image_source"]["run"] == members[1]["scratch"]["image_source"]["run"]["id"]
 
 
 def test_the_line_never_tests_more_members_than_its_ceiling(github: GitHub) -> None:
@@ -789,6 +791,9 @@ def test_a_lost_shared_result_after_its_member_merged_gets_a_replacement(github:
         github.api[path]["workflow_runs"] = []
     _finish_prefix(github, "8", run_id=1100)
     _finish_prefix(github, "9", run_id=2100)
+    github.save()
+    status = _train(github)
+    assert next(prefix for prefix in status["prefixes"] if prefix["number"] == "8")["state"] != "passed"
     done = _batch_call(github, "8")
     assert done.returncode == 3, done.stdout + done.stderr
     assert _merges(github) == ["7"]
@@ -1617,6 +1622,8 @@ def test_deferred_images_require_passing_proof_on_the_tested_tree(
 def test_an_image_prefix_cannot_pass_with_only_its_planner(github: GitHub, deferred: bool) -> None:
     _batch_setup(github, count=2, images=True, selected=True)
     _prefix_only(github, ["images"] if deferred else [])
+    if not deferred:
+        _images(github)
     assert _batch_call(github).returncode == 3
     _finish_batch(github)
     scratch = _scratch(github)
