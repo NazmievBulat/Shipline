@@ -77,6 +77,13 @@ jobs:
               tests/workflow/test_break_52.py
               tests/workflow/test_decisions.py
               tests/workflow/test_merge_when_current.py
+              tests/workflow/test_merge_github.py
+              tests/workflow/test_merge_checks.py
+              tests/workflow/test_merge_health.py
+              tests/workflow/test_merge_images.py
+              tests/workflow/test_merge_squash.py
+              tests/workflow/test_merge_scratch.py
+              tests/workflow/test_merge_train.py
           - shard: 2
             files: >-
               tests/runner/test_build_images.py

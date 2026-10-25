@@ -145,8 +145,9 @@ def _as_json(config: Any) -> dict[str, Any]:
 
 
 def test_ci_job_names_are_kept_in_config_defaults() -> None:
-    for filename in ("merge_gate.py", "ci_proof.py", "check_repair.py",
-                     "merge_driver.py", "ci_minutes.py"):
+    for filename in ("merge_gate.py", "merge_checks.py", "merge_github.py", "merge_health.py",
+                     "merge_images.py", "merge_scratch.py", "merge_squash.py", "merge_train.py",
+                     "ci_proof.py", "check_repair.py", "merge_driver.py", "ci_minutes.py"):
         tree = ast.parse((_WORKFLOW / filename).read_text())
         names = [(node.lineno, node.value) for node in ast.walk(tree)
                  if isinstance(node, ast.Constant) and isinstance(node.value, str)
