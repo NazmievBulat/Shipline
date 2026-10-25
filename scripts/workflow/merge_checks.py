@@ -314,9 +314,9 @@ def record_green(
     ):
         print("main did not match the tested squash; waiting for main's own checks", flush=True)
         return
-    if not images and not image_difference(base, tree)[1]:
-        # Own-check neutral merges have no image run of their own. Preserve main's
-        # last real source before replacing its receipt, revalidating its current attempt.
+    if (not images or not complete_image_jobs(image_jobs)) and not image_difference(base, tree)[1]:
+        # A neutral own-check merge can have no images, or skip release checks. Preserve
+        # main's complete source before replacing its receipt, revalidating its attempt.
         source = main_image_source(base)
         if source:
             images = image_source_runs(source)

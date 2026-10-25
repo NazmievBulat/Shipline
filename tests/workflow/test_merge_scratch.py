@@ -937,9 +937,14 @@ def test_an_inherited_main_image_source_must_really_pass(github: GitHub, state: 
     assert _merges(github) == ["7", "8", "9"]
 
 
-def test_a_neutral_own_check_merge_carries_mains_last_image_source(github: GitHub) -> None:
+@pytest.mark.parametrize("partial_images", [False, True])
+def test_a_neutral_own_check_merge_carries_mains_last_image_source(
+    github: GitHub, partial_images: bool,
+) -> None:
     _batch_setup(github)
     github.ci(github.base, github.head, run_id=7000)
+    if partial_images:
+        _images(github)  # Its optional release checks skipped; main's full proof still holds.
     done = _batch_call(github)
     assert done.returncode == 0, done.stdout + done.stderr
     assert _merges(github) == ["7"]
