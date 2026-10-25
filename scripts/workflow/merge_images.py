@@ -12,10 +12,11 @@ import workflow_config
 class MainImages:
     """Main's image runs, newest first, read a page at a time and only as far as needed."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, include_scheduled: bool = False) -> None:
         self.found: list[dict[str, Any]] = []
         self.page = 0
         self.last = False
+        self.include_scheduled = include_scheduled
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         from merge_gate import API, WORKFLOW_FILES, workflow_runs
@@ -41,7 +42,8 @@ class MainImages:
                 run
                 for run in runs_page
                 if run.get("head_branch") == "main"
-                and run["event"] not in ("pull_request", "schedule")
+                and run["event"] != "pull_request"
+                and (self.include_scheduled or run["event"] != "schedule")
             ]
 
 
@@ -149,19 +151,75 @@ def image_difference(before: str, after: str) -> tuple[list[str], bool]:
 
 
 def main_image_source(base: str) -> dict[str, Any] | None:
-    """Main's last complete image proof, including a prefix proof it inherited."""
+    """Follow main's inherited image proof to executed tests on unchanged image inputs.
+
+    A skipped neutral push is no result itself. Older equivalent pushes and scheduled
+    full runs can supply its proof, but a failed or pending source never authorizes reuse.
+    """
+    from ci_proof import receipt as commit_receipt
     from merge_gate import (
-        IMAGES_PLAN, NOTES, MainImages, Refused, Waiting, _planner_notes, git, inherited_green, jobs,
-        main_image_runs, workflow_verdict,
+        API, IMAGES_PLAN, NOTES, REPOSITORY, WORKFLOW_FILES, MainImages, Refused, Waiting,
+        _planner_notes, _proves_whole, api, command, git, inherited_green, jobs, runs,
+        workflow_verdict,
     )
 
-    def parts_for(run: dict[str, Any]) -> list[dict[str, Any]]:
+    def head_tree(run: dict[str, Any]) -> str:
+        head = run["head_sha"]
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise Refused("invalid image source head")
+        if command("git", "cat-file", "-e", head, check=False).returncode:
+            git("fetch", "origin", head)
+        return git("rev-parse", f"{head}^{{tree}}")
+
+    def resolve(run: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+        # The second result stops a search: an explicit failed, pending or unreadable
+        # inheritance chain must not be bypassed with an older green run.
+        seen: set[int] = set()
         try:
-            return jobs(run)
+            while run["id"] not in seen:
+                seen.add(run["id"])
+                parts = jobs(run)
+                if workflow_verdict("images", run, parts)[0] != "green":
+                    return None, True
+                trees = [message for title, message in _planner_notes(parts, IMAGES_PLAN)
+                         if title == NOTES.files_tested]
+                if len(trees) != 1 or not re.fullmatch(r"[0-9a-f]{40}", trees[0]):
+                    return None, True
+                tested = trees[0]
+                on_main = run.get("head_branch") == "main" and run.get("event") != "pull_request"
+                if on_main and tested != head_tree(run):
+                    return None, True
+                if image_difference(tested, base)[1]:
+                    return None, True
+                if (complete_image_jobs(parts, allow_skipped=True)
+                        and _proves_whole("images", run, parts, {"tree": tested})):
+                    return {"run": {"id": run["id"], "head_sha": run["head_sha"]},
+                            "tree": tested}, False
+                if not on_main:
+                    return None, True
+                head = run["head_sha"]
+                proof = commit_receipt(git("show", "-s", "--format=%B", head))
+                if proof is None:
+                    return None, False  # A neutral push can select no image tests.
+                if (proof["tree"] != tested
+                        or proof["base"] != git("show", "-s", "--format=%P", head)):
+                    return None, True
+                sources = [source for source in proof["sources"] if source["workflow"] == "images"]
+                if not sources:
+                    return None, False
+                if len(sources) != 1:
+                    return None, True
+                source = sources[0]
+                run = api(f"{API}/actions/runs/{source['run']}")
+                if (run.get("id") != source["run"]
+                        or run.get("path") != f".github/workflows/{WORKFLOW_FILES['images']}"
+                        or (run.get("head_repository") or {}).get("full_name") != REPOSITORY):
+                    return None, True
+            return None, True  # Cyclic proofs never count.
         except Waiting:
             raise
-        except Refused:
-            return []
+        except (Refused, KeyError, TypeError, ValueError, StopIteration):
+            return None, True
 
     receipt = inherited_green(base)
     if receipt and receipt.get("images_complete") is True:
@@ -173,24 +231,34 @@ def main_image_source(base: str) -> dict[str, Any] | None:
                 source = {"run": {"id": run_id}, "tree": receipt["tree"]}
         if source:
             found = image_source_runs(source)
-            parts = parts_for(found[0]) if found else []
-            if (found and workflow_verdict("images", found[0], parts)[0] == "green"
-                    and complete_image_jobs(parts, allow_skipped=True)):
-                return source
-    for run in main_image_runs(base, MainImages()):
-        parts = parts_for(run)
-        if workflow_verdict("images", run, parts)[0] != "green" or not complete_image_jobs(parts, allow_skipped=True):
-            return None
-        trees = [message for title, message in _planner_notes(parts, IMAGES_PLAN)
-                 if title == NOTES.files_tested]
-        if len(trees) != 1 or not re.fullmatch(r"[0-9a-f]{40}", trees[0]):
-            return None
-        # A main run must actually have tested the main commit it names.
-        if trees[0] != git("rev-parse", f"{run['head_sha']}^{{tree}}"):
-            return None
-        if not image_difference(trees[0], base)[1]:
-            return {"run": {"id": run["id"], "head_sha": run["head_sha"]}, "tree": trees[0]}
-        return None
+            if found:
+                resolved, blocked = resolve(found[0])
+                if resolved or blocked:
+                    return resolved
+    # Keep health's push-only selection unchanged. Proof discovery also reads scheduled
+    # full runs and goes past skipped neutral pushes, including on older pages.
+    own = runs("images", base)[:1] + runs("images", base, scheduled=True)[:1]
+    recent = MainImages(include_scheduled=True)
+    seen: set[int] = set()
+    for group in (sorted(own, key=lambda run: run["id"], reverse=True), recent):
+        for run in group:
+            if run["id"] in seen:
+                continue
+            seen.add(run["id"])
+            try:
+                if image_difference(head_tree(run), base)[1]:
+                    continue
+                if run["event"] != "schedule" and command(
+                    "git", "merge-base", "--is-ancestor", run["head_sha"], base, check=False,
+                ).returncode:
+                    continue
+            except Waiting:
+                raise
+            except (Refused, KeyError, TypeError, ValueError):
+                return None
+            resolved, blocked = resolve(run)
+            if resolved or blocked:
+                return resolved
     return None
 
 

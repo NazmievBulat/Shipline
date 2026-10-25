@@ -69,7 +69,13 @@ audit still refuses an advisory main does not have, and passes over one main has
 warning. After a squash, main inherits the green result
 of the identical tree tested by the pull request CI for each CI job that run passed, and
 images when every image job passed on that tree or a tree whose differences match none of
-the image workflow's path filter; the gate records the source run and differing files. A CI
+the image workflow's path filter; the gate records the source run and differing files. A
+merge that changes no image input carries main's last image source forward, including a
+merge by its own checks. When main's image tests skipped, the gate follows its head's
+`Workflow-Proof` to the run it inherited, or reads an earlier image-equivalent main run.
+Main's latest scheduled full image run on equivalent image inputs can also supply this
+proof. A failed or pending source still blocks, and a line with no executed image proof
+waits for a passed main image run, including the scheduled full run. A CI
 job the pull request skipped, which main always runs, waits for main's own success, and
 nothing merges meanwhile, so no later push cancels that run. The squash commit carries the
 gate's proof (a `Workflow-Proof` line): main's CI and E2E skip a job that line shows passed,

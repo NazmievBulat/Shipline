@@ -303,6 +303,7 @@ def record_green(
     # loses this optimization. A receipt is scoped to the observed commit, never future trees.
     from merge_gate import (
         IMAGES, IMAGES_PLAN, NOTES, _planner_notes, complete_image_jobs, git, image_difference,
+        image_source_runs, jobs, main_image_source, workflow_verdict,
     )
 
     git("fetch", "origin", "main")
@@ -313,6 +314,15 @@ def record_green(
     ):
         print("main did not match the tested squash; waiting for main's own checks", flush=True)
         return
+    if not images and not image_difference(base, tree)[1]:
+        # Own-check neutral merges have no image run of their own. Preserve main's
+        # last real source before replacing its receipt, revalidating its current attempt.
+        source = main_image_source(base)
+        if source:
+            images = image_source_runs(source)
+            image_jobs = jobs(images[0]) if images else []
+            if images and workflow_verdict("images", images[0], image_jobs)[0] != "green":
+                images, image_jobs = [], []
     images_complete = complete_image_jobs(image_jobs)
     image_tree = None
     differing: list[str] = []
