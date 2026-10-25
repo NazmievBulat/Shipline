@@ -192,20 +192,32 @@ def main_image_source(base: str) -> dict[str, Any] | None:
                     return None, True
                 if image_difference(tested, base)[1]:
                     return None, True
+                proof = (
+                    commit_receipt(git("show", "-s", "--format=%B", run["head_sha"]))
+                    if on_main else None
+                )
+                sources = (
+                    [source for source in proof["sources"] if source["workflow"] == "images"]
+                    if proof else []
+                )
+                skipped = {re.sub(r" \(\d+ of \d+\)$", "", job["name"])
+                           for job in parts if job.get("conclusion") == "skipped"}
+                # A release job can pass while image tests inherit. Follow those skipped
+                # groups to their executed proof instead of treating this as a full run.
+                inherited = any(skipped.intersection(source["jobs"]) for source in sources)
                 if (complete_image_jobs(parts, allow_skipped=True)
-                        and _proves_whole("images", run, parts, {"tree": tested})):
+                        and _proves_whole("images", run, parts, {"tree": tested})
+                        and not inherited):
                     return {"run": {"id": run["id"], "head_sha": run["head_sha"]},
                             "tree": tested}, False
                 if not on_main:
                     return None, True
                 head = run["head_sha"]
-                proof = commit_receipt(git("show", "-s", "--format=%B", head))
                 if proof is None:
                     return None, False  # A neutral push can select no image tests.
                 if (proof["tree"] != tested
                         or proof["base"] != git("show", "-s", "--format=%P", head)):
                     return None, True
-                sources = [source for source in proof["sources"] if source["workflow"] == "images"]
                 if not sources:
                     return None, False
                 if len(sources) != 1:

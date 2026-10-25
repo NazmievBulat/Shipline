@@ -893,7 +893,7 @@ def _skipped_main_image_push(github: GitHub, run_id: int, source: int | None = N
     ]
 
 
-@pytest.mark.parametrize("kind", ["inherited", "neutral-push", "multi-hop", "scheduled"])
+@pytest.mark.parametrize("kind", ["inherited", "inherited-with-release", "neutral-push", "multi-hop", "scheduled"])
 def test_neutral_line_after_main_skipped_or_inherited_its_image_tests(
     github: GitHub, kind: str,
 ) -> None:
@@ -902,7 +902,12 @@ def test_neutral_line_after_main_skipped_or_inherited_its_image_tests(
     if kind == "scheduled":
         github.api[f"{_REPO}/actions/runs/{source}"]["event"] = "schedule"
     _skipped_main_image_push(github, 8_000_070,
-                            source if kind in ("inherited", "multi-hop") else None)
+                            source if kind in ("inherited", "inherited-with-release", "multi-hop") else None)
+    if kind == "inherited-with-release":
+        github.api[f"{_REPO}/actions/runs/8000070/jobs?per_page=100"]["jobs"].append({
+            "id": 8_000_073, "name": "Docker images: release tests",
+            "status": "completed", "conclusion": "success",
+        })
     if kind == "multi-hop":
         _skipped_main_image_push(github, 8_000_080, 8_000_070)
     # Main's latest image tests skipped, exactly as after a neutral or inherited push.
