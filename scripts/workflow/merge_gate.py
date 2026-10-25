@@ -367,7 +367,7 @@ def refresh_pull(
         raise Refused(
             "CI is stale; run this gate from the pull request's clean branch worktree to refresh it"
         )
-    if git("status", "--porcelain"):
+    if git("status", "--porcelain", "--untracked-files=all"):
         raise Refused("CI is stale; the pull request worktree has uncommitted changes")
     # A refreshed green rerun is no longer a failure: its new head, or the resolution of a
     # conflict, waits for CI in the saved place like any other refresh. A fix joins the back.

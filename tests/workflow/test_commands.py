@@ -575,8 +575,8 @@ def test_function_helper_waits_can_match_an_exception(workflow: Workflow) -> Non
 
 
 @pytest.mark.parametrize("mechanical", [False, True], ids=["renumber", "resolve"])
-@pytest.mark.parametrize("partial", ["none", "tracked", "untracked"])
-def test_a_mechanical_helper_wait_leaves_a_clean_reviewed_worktree(
+@pytest.mark.parametrize("partial", ["none", "tracked", "untracked", "preexisting"])
+def test_a_waiting_mechanical_helper_preserves_the_reviewed_worktree(
     github: GitHub, mechanical: bool, partial: str,
 ) -> None:
     workflow = github.workflow
@@ -598,9 +598,13 @@ def test_a_mechanical_helper_wait_leaves_a_clean_reviewed_worktree(
     cache.parent.mkdir()
     cache.write_text("keep this cache\n")
     changed = "shared.txt" if partial == "tracked" else "new-helper.txt"
-    edit = f'echo partial > "{changed}"\n' if partial != "none" else ""
+    edit = f'echo partial > "{changed}"\n' if partial in ("tracked", "untracked") else ""
     workflow.fake("example-helper", "#!/bin/bash\n" + edit + 'echo "try later"\nexit 1\n')
     config_before = (workflow.repo / "shipline.json").read_text()
+    existing = workflow.repo / "existing-notes.txt"
+    if partial == "preexisting":
+        workflow.git("config", "status.showUntrackedFiles", "no")
+        existing.write_text("keep these notes\n")
 
     done = _gate(workflow, f'''
         folder = g.CONFIG.state()
@@ -611,6 +615,12 @@ def test_a_mechanical_helper_wait_leaves_a_clean_reviewed_worktree(
             print("waiting:", error)
     ''')
 
+    if partial == "preexisting":
+        assert existing.read_text() == "keep these notes\n"
+        assert done.returncode != 0
+        assert "the pull request worktree has uncommitted changes" in done.stderr
+        assert workflow.git("rev-parse", "HEAD") == github.head
+        return
     assert done.returncode == 0, done.stdout + done.stderr
     assert "waiting: mechanical_conflicts waits: try later" in done.stdout
     assert workflow.git("rev-parse", "HEAD") == github.head
