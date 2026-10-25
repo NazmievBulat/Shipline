@@ -465,11 +465,11 @@ shadow_session() {
     list | running | load | room) bash "$here/session" "$@" 9>&- ;;
     stop)
       # One that runs no more is left as it is: `session stop` says so, and stops nothing.
-      shadow_alive "$2" || { [[ $2 == ticket-* ]] && shadow_alive "codex-${2#ticket-}"; } ||
+      shadow_alive "$2" || { [[ $2 =~ ^(ticket|review)- ]] && shadow_alive "codex-${2##*-}"; } ||
         return 0
       shadow_note "$2 stopped"
-      shadow_stopped+="$2 codex-${2#ticket-} "
-      snapshot_drop "$2" "codex-${2#ticket-}"
+      shadow_stopped+="$2 codex-${2##*-} "
+      snapshot_drop "$2" "codex-${2##*-}"
       ;;
     squeeze) shadow_note "$2 squeezed" ;;
     resend)
@@ -511,8 +511,8 @@ session() {
 session_current() {
   [[ -d $main/$SHIPLINE_STATE_FOLDER ]] || return 1
   tmux -L "$1" has-session -t "=$1" 2>/dev/null 9>&- || {
-    [[ $1 == ticket-* ]] &&
-      tmux -L "codex-${1#ticket-}" has-session -t "=codex-${1#ticket-}" 2>/dev/null 9>&-
+    [[ $1 =~ ^(ticket|review)- ]] &&
+      tmux -L "codex-${1##*-}" has-session -t "=codex-${1##*-}" 2>/dev/null 9>&-
   }
 }
 
@@ -547,8 +547,9 @@ said_finished() {
   [[ $1 != hunt-* ]] || words="hunt finished"
   [[ $1 != analyst-* ]] || words="analysis finished"
   words=${2:-$words}
-  notes=$main/.claude/worktrees/$1/$SHIPLINE_STATE_FOLDER/$1
-  if [[ $1 == ticket-* && -e $notes.codex ]]; then
+  notes=$main/.claude/worktrees/ticket-${1#*-}/$SHIPLINE_STATE_FOLDER/$1
+  [[ $1 != hunt-* && $1 != analyst-* ]] || notes=$main/.claude/worktrees/$1/$SHIPLINE_STATE_FOLDER/$1
+  if [[ -e $notes.codex ]]; then
     # An answered turn is no longer the current work, even before its successor ends.
     [[ ! -e $notes.owner-reply ]] || return 1
     if [[ -r $notes.codex-turn.json ]]; then
@@ -899,8 +900,11 @@ fi
 
 while read -r name state _; do
   # Codex's latest turn is authoritative even if its bridge never ran the Stop hook.
-  if [[ $name == ticket-* && -e $main/.claude/worktrees/$name/$SHIPLINE_STATE_FOLDER/$name.codex ]]; then
-    if ! grep -qE "^${name#ticket-} true " <<<"$pulls" && said_finished "$name"; then
+  if [[ $name =~ ^(ticket|review)- && -e $main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name.codex ]]; then
+    if { [[ $name != ticket-* ]] || ! grep -qE "^${name#ticket-} true " <<<"$pulls"; } && said_finished "$name"; then
+      if [[ $name == review-* ]] && grep -qxF "${name#review-} false main" <<<"$pulls"; then
+        note_rule_break "${name#review-}" || { failed=1; continue; }
+      fi
       session stop "$name" || failed=1
       continue
     fi
@@ -914,9 +918,9 @@ while read -r name state _; do
   [[ $name != analyst-* ]] || continue
   # A Codex worker whose bridge ended is listed idle, and nobody would read its end or relay
   # its question. Its bridge is started again; it shows Codex's last turn.
-  if [[ $name == ticket-* && -e $main/.claude/worktrees/$name/$SHIPLINE_STATE_FOLDER/$name.codex ]] &&
+  if [[ $name =~ ^(ticket|review)- && -e $main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name.codex ]] &&
       ! tmux -L "$name" has-session -t "=$name" 2>/dev/null 9>&- &&
-      { grep -qE "^${name#ticket-} true " <<<"$pulls" || ! said_finished "$name"; }; then
+      { { [[ $name == ticket-* ]] && grep -qE "^${name#ticket-} true " <<<"$pulls"; } || ! said_finished "$name"; }; then
     session bridge "$name" || failed=1
     continue
   fi

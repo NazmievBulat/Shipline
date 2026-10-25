@@ -2,12 +2,14 @@
 
     conflict_review.py sentence <folder> <N>    the sentence the fresh reviewer starts with
     conflict_review.py reviewer <folder> <N>    its effort and model, `high opus` as usual
+    conflict_review.py program <folder> <N>     its recorded program and explicit Codex model
+    conflict_review.py full-review <folder> <N> <head>    keep this head with Claude
     conflict_review.py panel <folder> <N> <root> <head>
 
 The reviewer is the one `conflict_review` of `shipline.json` names while the kept worktree holds
-the conflict's merge and it stays within `max_changed_lines`: both sides of every conflicting
-hunk before the merge is committed, the lines the resolution wrote there after, and no other
-file. The choice is noted in `review-N.conflict-reviewer`, so the gate can hand a resolution
+the conflict's merge and it stays within an optional `max_changed_lines`: both sides of every
+conflicting hunk before the merge is committed, the lines the resolution wrote there after,
+and no other file. The choice is noted in `review-N.conflict-reviewer`, so the gate can hand a resolution
 that grew past it to the usual reviewer (`review-N.usual-reviewer`, which keeps that head with
 the usual reviewer).
 """
@@ -248,7 +250,7 @@ def reviewer(folder: Path, number: str) -> tuple[str, str]:
     named = workflow_config.current().conflict_review
     record = folder / f"review-{number}.conflict-reviewer"
     usual = folder / f"review-{number}.usual-reviewer"
-    chosen, scope = USUAL, None
+    chosen, scope, program = USUAL, None, "claude"
     try:
         root = _worktree(folder, number)
         head = _git(root, "rev-parse", "HEAD").strip()
@@ -259,17 +261,23 @@ def reviewer(folder: Path, number: str) -> tuple[str, str]:
             scope = Scope.read(folder, number)
             if scope and _holds(folder, number, scope):
                 lines, outside = scope.size(root, head)
-                if not outside and lines <= named.max_changed_lines:
+                if not outside and (
+                    named.max_changed_lines is None or lines <= named.max_changed_lines
+                ):
                     chosen = (named.effort, named.model)
+                    program = named.program
     except ValueError, TypeError, OSError, subprocess.SubprocessError, CommandTimeout:
         # A conflict that cannot be measured gets the usual reviewer.
-        chosen = USUAL
-    if chosen == USUAL or scope is None:
+        chosen, program = USUAL, "claude"
+    if (chosen == USUAL and program == "claude") or scope is None:
         record.unlink(missing_ok=True)
     else:
         write_json(
             record,
-            {"head": scope.head, "main": scope.main, "effort": chosen[0], "model": chosen[1]},
+            {
+                "head": scope.head, "main": scope.main,
+                "effort": chosen[0], "model": chosen[1], "program": program,
+            },
         )
     return chosen
 
@@ -278,6 +286,23 @@ def named_reviewer(folder: Path, number: str) -> bool:
     """Whether the reviewer last started for pull request N is the one `conflict_review`
     names: every start notes its choice anew."""
     return (folder / f"review-{number}.conflict-reviewer").exists()
+
+
+def program(folder: Path, number: str) -> str:
+    """The program recorded under the start lock; ordinary reviews always use Claude."""
+    record = folder / f"review-{number}.conflict-reviewer"
+    if record.exists() and json.loads(record.read_text()).get("program") == "codex":
+        # Without an explicit model, use Codex's own configured model, as workers do.
+        named = workflow_config.current().given.get("conflict_review") or {}
+        return "codex " + named.get("model", "")
+    return "claude"
+
+
+def full_review(folder: Path, number: str, head: str) -> None:
+    """Keep this pushed head with the usual reviewer after a Codex scope refusal."""
+    if not _SHA.fullmatch(head):
+        raise ValueError("invalid full review head")
+    (folder / f"review-{number}.usual-reviewer").write_text(head + "\n")
 
 
 def sentence(folder: Path, number: str) -> str:
@@ -305,6 +330,11 @@ def panel(folder: Path, number: str, root: Path, head: str, reviews: list[dict[s
         if earlier is None:
             raise ValueError("no passed round on the handed-off head")
         scope.validate(root, head)
+        named = workflow_config.current().conflict_review if named_reviewer(folder, number) else None
+        if named is not None and named.program == "codex" and named.max_changed_lines is not None:
+            lines, outside = scope.size(root, head)
+            if outside or lines > named.max_changed_lines:
+                raise ValueError("resolution exceeds conflict_review.max_changed_lines")
     except (ValueError, TypeError) as error:
         reason = f"Full review required: {error}.\n"
         with (root / ".review/task.md").open("a") as task:
@@ -343,6 +373,10 @@ def main() -> None:
         sys.stdout.write(sentence(folder, number) + "\n")
     elif action == "reviewer":
         sys.stdout.write(" ".join(reviewer(folder, number)) + "\n")
+    elif action == "program":
+        sys.stdout.write(program(folder, number) + "\n")
+    elif action == "full-review":
+        full_review(folder, number, sys.argv[4])
     elif action == "panel":
         root = Path(sys.argv[4])
         head = sys.argv[5]

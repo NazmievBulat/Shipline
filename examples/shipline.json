@@ -108,6 +108,7 @@
   "answer_for_owner_after_minutes": 15,
   "hot_paths": ["src/example_app/models.py", "web/src/pages/**"],
   "conflict_review": {
+    "program": "claude",
     "effort": "medium",
     "model": "sonnet",
     "max_changed_lines": 40

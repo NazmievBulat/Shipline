@@ -637,7 +637,7 @@ def handoff(number: str, folder: Path) -> int:
                     _usual_reviewer(
                         folder, number, head, f"the resolution changes {', '.join(outside)} too"
                     )
-                if lines > named.max_changed_lines:
+                if named.max_changed_lines is not None and lines > named.max_changed_lines:
                     _usual_reviewer(
                         folder,
                         number,

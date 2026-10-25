@@ -22,6 +22,7 @@
 #                               default when omitted. Audits and reviewers always use opus, but
 #                               for the reviewer of a small conflict `conflict_review` of
 #                               shipline.json names (`conflict_review.py reviewer`).
+#                               conflict_review.program may select Codex with its bridge.
 #   session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>]
 #                               name: small letters, digits and dashes; it names the report.
 #                               When left out, a hunt with a plan, by Claude Code, on every
@@ -298,9 +299,9 @@ list_worktrees() {
 # limit after which its instruction was sent again, the reset of the limit it said it stopped
 # on). None of it is true of the next session.
 forget_notes() {
-  rm -f "$1.url" "$1.idle" "$1.waiting" "$1.pushed" "$1.started" "$1.area" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.checks-wait" "$1.job-wait" "$1.limits"
+  rm -f "$1.url" "$1.idle" "$1.waiting" "$1.pushed" "$1.area" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.checks-wait" "$1.job-wait" "$1.limits"
   if [[ ${2:-} != keep-codex ]]; then
-    rm -f "$1.codex" "$1.asking" "$1.resent" "$1.codex-delivered" "$1.codex-answered" "$1.codex-followed-up" "$1.codex-quota-delivered" "$1.codex-approval-delivered" "$1.codex-recovery-error" "$1.owner-reply"
+    rm -f "$1.started" "$1.codex" "$1.asking" "$1.resent" "$1.codex-delivered" "$1.codex-answered" "$1.codex-followed-up" "$1.codex-quota-delivered" "$1.codex-approval-delivered" "$1.codex-recovery-error" "$1.owner-reply"
   fi
 }
 
@@ -334,12 +335,14 @@ stop_session() {
     # Preserve provenance for workers started before the durable panel marker existed.
     if [[ -e $notes/$name.codex ]]; then
       mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
-      touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name#ticket-}"
+      touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name##*-}"
     fi
-    end_server "codex-${name#ticket-}" || return 1
+  fi
+  if [[ $name == ticket-* || -e $notes/$name.codex ]]; then
+    end_server "codex-${name##*-}" || return 1
   fi
   end_server "$name" || return 1
-  snapshot_remove "$name" "codex-${name#ticket-}"
+  snapshot_remove "$name" "codex-${name##*-}"
   [[ $name != hunt-* ]] || stop_hunted_application "$name"
   forget_notes "$notes/$name"
 }
@@ -613,7 +616,7 @@ start_cloud_worker() {
 }
 
 cmd_start() {
-  local kind=$1 number=$2 effort=$3 model=$4 name prompt worktree other command
+  local kind=$1 number=$2 effort=$3 model=$4 name prompt worktree other command codex_model=""
   case $kind in
     worker) name="ticket-$number" ;;
     audit) name="audit-$number" ;;
@@ -664,6 +667,10 @@ cmd_start() {
     else
       rm -f "$main/$SHIPLINE_STATE_FOLDER/review-$number.conflict-reviewer"
     fi
+    local resolver=claude
+    read -r resolver codex_model < <(python3 -B "$script_dir/conflict_review.py" program \
+      "$main/$SHIPLINE_STATE_FOLDER" "$number")
+    [[ $resolver != codex ]] || model=codex
   fi
 
   if [[ $model == cloud ]]; then
@@ -679,23 +686,23 @@ cmd_start() {
     [[ $effort == medium ]] || effort=high
   fi
   if [[ $model == codex ]]; then
-    start_codex_worker "$name" "$worktree" "$effort" "$prompt"
+    start_codex_worker "$name" "$worktree" "$effort" "$prompt" "$codex_model"
   else
     launch "$name" "$worktree" \
       "claude --effort $effort ${model:+--model $model }--remote-control $name \"$prompt\""
-    # The tick wakes a reviewer only for a round published after this moment; an earlier
-    # reviewer's round is not this session's. Written after `launch`, which forgets old notes.
-    # A nudge given to an earlier reviewer on the same head is not this one's.
-    if [[ $kind =~ ^(review|audit)$ ]]; then
-      touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
-      rm -f "$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-"* \
-        "$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-"* "$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-"* \
-        "$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-"*
-    fi
-    save_link "$name" "$worktree"
-    if [[ $kind == review ]]; then
-      python3 -B "$script_dir/reviewer_start.py" --started "$main/$SHIPLINE_STATE_FOLDER" "$number"
-    fi
+  fi
+  # The tick wakes a reviewer only for a round published after this moment; an earlier
+  # reviewer's round is not this session's. Written after `launch`, which forgets old notes.
+  # A nudge given to an earlier reviewer on the same head is not this one's.
+  if [[ $kind =~ ^(review|audit)$ ]]; then
+    touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
+    rm -f "$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-"* \
+      "$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-"* "$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-"* \
+      "$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-"*
+  fi
+  [[ $model == codex ]] || save_link "$name" "$worktree"
+  if [[ $kind == review ]]; then
+    python3 -B "$script_dir/reviewer_start.py" --started "$main/$SHIPLINE_STATE_FOLDER" "$number"
   fi
 }
 
@@ -856,7 +863,7 @@ launch() {
     scope=(bash -c "$PANE_WAITS" bash "${scope[@]}")
   fi
   mkdir -p "$worktree/$SHIPLINE_STATE_FOLDER"
-  if [[ $name == ticket-* ]] && is_running "codex-${name#ticket-}"; then
+  if [[ $name == ticket-* || $name == review-* ]] && is_running "codex-${name##*-}"; then
     keep=keep-codex
   fi
   # The worker can finish while its bridge is starting. Keep the marker that authorizes
@@ -908,7 +915,9 @@ list_running() {
   for socket in "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"/*; do
     name=${socket##*/}
     if [[ $name =~ ^codex-([0-9]+)$ ]]; then
-      ! is_running "$name" || is_running "ticket-${BASH_REMATCH[1]}" || echo "ticket-${name#codex-}"
+      local paired=ticket-${BASH_REMATCH[1]}
+      [[ ! -e $(worktree_of "$paired")/$SHIPLINE_STATE_FOLDER/review-${name#codex-}.codex ]] || paired=review-${name#codex-}
+      ! is_running "$name" || is_running "$paired" || echo "$paired"
     else
       ! is_session_name "$name" || ! is_running "$name" || echo "$name"
     fi
@@ -1152,7 +1161,7 @@ stopped_on_limit() {
   limit="" resets="" typed=""
   local target=$1
   if [[ -e $(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1.codex ]]; then
-    target=codex-${1#ticket-}
+    target=codex-${1##*-}
     codex_limit "$target" && return 0
   fi
   whole=$(tmux -L "$1" capture-pane -p -e -t "=$1:" 2>/dev/null) || return 1
@@ -1296,7 +1305,7 @@ cmd_resend() {
   worktree=$(worktree_of "$name")
   notes=$worktree/$SHIPLINE_STATE_FOLDER/$name
   if ! is_running "$name"; then
-    [[ $name == ticket-* && -e $notes.codex ]] && is_running "codex-${name#ticket-}" ||
+    [[ -e $notes.codex ]] && is_running "codex-${name##*-}" ||
       die "$name is not running"
   fi
   [[ $name != hunt-* ]] || die "a hunt is not sent its instruction again: its time ran on"
@@ -1305,7 +1314,7 @@ cmd_resend() {
   # The text and the key that sends it go separately: typed in one piece, Claude takes the
   # key for a line break of a paste.
   local target=$name prompt
-  [[ $limit != "Codex limit" ]] || target=codex-${name#ticket-}
+  [[ $limit != "Codex limit" ]] || target=codex-${name##*-}
   # What someone began to type there would be sent along with the instruction. Text this
   # script typed itself is left to send_prompt, which submits it only if it is unchanged.
   [[ -z $typed || -r ${notes%/*}/$target.typed ]] ||
@@ -1637,8 +1646,8 @@ cmd_running() {
 # Resolve both groups before writing either; each must belong to its own tmux scope.
 session_groups() {
   group_of "$1" || return 1
-  if [[ $1 == ticket-* && -e $(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1.codex ]]; then
-    group_of "codex-${1#ticket-}" || return 1
+  if [[ -e $(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1.codex ]]; then
+    group_of "codex-${1##*-}" || return 1
   fi
 }
 
@@ -1666,7 +1675,7 @@ cmd_protect() {
 
 cmd_stop() {
   local name=$1
-  if ! is_running "$name" && { [[ $name != ticket-* ]] || ! is_running "codex-${name#ticket-}"; }; then
+  if ! is_running "$name" && { [[ ! -e $(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name.codex ]] || ! is_running "codex-${name##*-}"; }; then
     echo "$name is not running"
     return 0
   fi
@@ -1807,20 +1816,28 @@ cmd_cleanup() {
 # A bridge has no built-in tools, only the two MCP relay operations. It cannot edit, test,
 # publish or answer for the owner. Codex's notify writes turns to the relay's mailbox.
 start_codex_worker() {
-  local name=$1 worktree=$2 effort=$3 prompt=$4 command config codex_name=codex-${1#ticket-}
+  local name=$1 worktree=$2 effort=$3 prompt=$4 command config codex_name=codex-${1##*-}
   local notes=$worktree/$SHIPLINE_STATE_FOLDER/$name common real_gh push_queue
   push_queue=${XDG_STATE_HOME:-$HOME/.local/state}/workflow/pushes
   mkdir -p "$push_queue"
   mkdir -p "$worktree/$SHIPLINE_STATE_FOLDER"
-  rm -f "$notes.codex-turn.json" "$notes.codex-delivered" "$notes.codex-answered" "$notes.codex-followed-up" "$notes.codex-quota-delivered" "$notes.codex-approval-delivered" "$notes.codex-recovery-error" "$notes.owner-reply"
-  touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name#ticket-}"
+  rm -f "$notes.started" "$notes.codex-turn.json" "$notes.codex-delivered" "$notes.codex-answered" "$notes.codex-followed-up" "$notes.codex-quota-delivered" "$notes.codex-approval-delivered" "$notes.codex-recovery-error" "$notes.owner-reply"
+  [[ $name != ticket-* ]] || touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name##*-}"
   common=$(git rev-parse --path-format=absolute --git-common-dir)
   [[ $effort != max ]] || effort=xhigh
   # Scope the bridge flag to this process's callback. A nested `codex review` must not
   # inherit it and turn a global notify callback into a worker turn.
   config=$(jq -cn --arg script "$script_dir/notify" '["env", "WORKFLOW_CODEX_BRIDGE=1", "bash", $script, "codex"]')
-  printf -v command 'codex --no-alt-screen --sandbox workspace-write --add-dir %q --add-dir %q -c sandbox_workspace_write.network_access=true -c %q -c %q %q' \
-    "$common" "$push_queue" "model_reasoning_effort=$effort" "notify=$config" "$prompt"
+  printf -v command 'codex --no-alt-screen --sandbox workspace-write --add-dir %q --add-dir %q -c sandbox_workspace_write.network_access=true -c %q -c %q' \
+    "$common" "$push_queue" "model_reasoning_effort=$effort" "notify=$config"
+  if [[ $name == review-* ]]; then
+    # The panel, fallback and handoff write shared workflow notes, outside the kept worktree.
+    printf -v command '%s --add-dir %q' "$command" "$main/$SHIPLINE_STATE_FOLDER"
+  fi
+  if [[ -n ${5:-} ]]; then
+    printf -v command '%s --model %q' "$command" "$5"
+  fi
+  printf -v command '%s %q' "$command" "$prompt"
   real_gh=$(command -v gh)
   touch "$notes.codex"
   launch "$codex_name" "$worktree" "$command" "PATH=$script_dir/codex-bin:$shipline_bin$PATH" "$name" "WORKFLOW_GH=$real_gh"
@@ -1854,7 +1871,7 @@ cmd_bridge() {
   local name=$1 worktree notes typed recovered recovery_failed=false
   worktree=$(worktree_of "$name")
   notes=$worktree/$SHIPLINE_STATE_FOLDER/$name
-  [[ -e $notes.codex ]] && is_running "codex-${name#ticket-}" || die "$name has no running Codex worker"
+  [[ -e $notes.codex ]] && is_running "codex-${name##*-}" || die "$name has no running Codex worker"
   if is_running "$name"; then
     bridge_parse_failed "$name" || return 0
     # Never discard an unsent owner reply when replacing the failed bridge.
@@ -1974,8 +1991,9 @@ case ${1:-} in
     cmd_cleanup "${2:-}"
     ;;
   bridge)
-    [[ $# -eq 2 && $2 =~ ^ticket-[0-9]+$ ]] || usage
+    [[ $# -eq 2 && $2 =~ ^(ticket|review)-[0-9]+$ ]] || usage
     find_main_checkout
+    [[ $2 != review-* || -e $(worktree_of "$2")/$SHIPLINE_STATE_FOLDER/$2.codex ]] || usage
     cmd_bridge "$2"
     ;;
   checks-finished | conflict-found | lost-check | batch-merged)

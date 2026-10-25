@@ -8,8 +8,8 @@ import { createInterface } from "node:readline"
 import { setTimeout as delay } from "node:timers/promises"
 
 const [worktree, name] = process.argv.slice(2)
-if (!worktree || !/^ticket-[0-9]+$/.test(name ?? "")) process.exit(2)
-const socket = `codex-${name.slice(7)}`
+if (!worktree || !/^(ticket|review)-[0-9]+$/.test(name ?? "")) process.exit(2)
+const socket = `codex-${name.split("-").at(-1)}`
 // Use the same file selection and validation as Bash and Python, including installations.
 function stateFolder() {
   const config = JSON.parse(execFileSync(

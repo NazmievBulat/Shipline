@@ -175,8 +175,8 @@ DEFAULTS: dict[str, Any] = {
     # folders): two tickets on one never run at once, and the merge line serves its members
     # back to back.
     "hot_paths": [],
-    # The reviewer of a small conflict on a handed-off pull request, `{"effort": ...,
-    # "model": ..., "max_changed_lines": N}`: None is the usual one, Opus at high effort.
+    # The conflict resolver's program, effort, model and optional line cutoff.
+    # None is the usual one, Claude Opus at high effort.
     "conflict_review": None,
     "review": {"high_effort_paths": []},
     "merge_train": {"queued_limit_minutes": 20},
@@ -585,8 +585,9 @@ class Review:
 class ConflictReview:
     effort: str
     model: str
-    # A resolution larger than this, in lines of the conflicting files, gets the usual reviewer.
-    max_changed_lines: int
+    # A larger resolution gets the usual reviewer; None adds no line cutoff.
+    max_changed_lines: int | None
+    program: str = "claude"
 
 
 @dataclass(frozen=True)
@@ -798,10 +799,15 @@ def _hot_paths(value: Any, name: str) -> list[str]:
 def _conflict_review(value: Any, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{FILE}: {name} must be an object")
-    keys = ("effort", "model", "max_changed_lines")
+    keys = ("effort", "model", "max_changed_lines", "program")
     if unknown := sorted(set(value) - set(keys)):
         raise ConfigError(f"{FILE}: unknown key {', '.join(f'{name}.{key}' for key in unknown)}")
-    if missing := [key for key in keys if key not in value]:
+    uncapped = "program" in value and "max_changed_lines" not in value
+    if "program" in value:
+        if value["program"] not in ("claude", "codex"):
+            raise ConfigError(f"{FILE}: {name}.program must be one of claude, codex")
+        value = {"effort": "high", "model": "opus", "max_changed_lines": None, **value}
+    elif missing := [key for key in keys[:-1] if key not in value]:
         raise ConfigError(f"{FILE}: {name} must name {', '.join(missing)}")
     if value["effort"] not in EFFORTS:
         raise ConfigError(f"{FILE}: {name}.effort must be one of {', '.join(EFFORTS)}")
@@ -815,7 +821,7 @@ def _conflict_review(value: Any, name: str) -> dict[str, Any]:
             f"{FILE}: {name}.model must be a model name, not {json.dumps(value['model'])}"
         )
     lines = value["max_changed_lines"]
-    if not isinstance(lines, int) or isinstance(lines, bool) or lines < 1:
+    if not uncapped and (not isinstance(lines, int) or isinstance(lines, bool) or lines < 1):
         raise ConfigError(f"{FILE}: {name}.max_changed_lines must be a whole number above 0")
     return value
 
@@ -1445,6 +1451,17 @@ def current() -> Config:
 
 def as_dict(config: Config) -> dict[str, Any]:
     """Every value, defaults included, in the form of the file."""
+    conflict = vars(config.conflict_review).copy() if config.conflict_review else None
+    # Keep the serialized legacy shape when the program key was not supplied.
+    if conflict is not None:
+        supplied = config.given["conflict_review"]
+        if "program" not in supplied:
+            conflict.pop("program")
+        # Omitted options must still select no cutoff and Codex's configured model when read.
+        if conflict["max_changed_lines"] is None:
+            conflict.pop("max_changed_lines")
+        if config.conflict_review.program == "codex" and "model" not in supplied:
+            conflict.pop("model")
     return {
         "repository": config.repository,
         "install_folder": config.given.get("install_folder"),
@@ -1480,7 +1497,7 @@ def as_dict(config: Config) -> dict[str, Any]:
         },
         "commands": vars(config.commands).copy(),
         "hot_paths": list(config.hot_paths),
-        "conflict_review": vars(config.conflict_review).copy() if config.conflict_review else None,
+        "conflict_review": conflict,
         "review": {"high_effort_paths": list(config.review.high_effort_paths)},
         "merge_train": vars(config.merge_train).copy(),
         "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,

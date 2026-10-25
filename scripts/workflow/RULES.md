@@ -587,7 +587,10 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
 The tick starts this fresh reviewer only after a non-mechanical conflict on a handed-off pull
 request with a passed independent round on H: Claude Opus at high effort, or the effort and
 model `conflict_review` in `shipline.json` names when both sides of every conflicting hunk
-together are at most its `max_changed_lines` lines. For that cheaper reviewer, a resolution
+together are at most its `max_changed_lines` lines. `conflict_review.program` selects `claude`
+(the default) or `codex`. With `program` alone, effort is high, Claude uses Opus, Codex uses its
+configured model, and there is no additional line cutoff; the conflict-hunk scope still applies.
+An explicit `model` names that program's model. For that named reviewer, a resolution
 that writes more lines than that in F, changes another file or lines outside the hunks, and any
 full-review fallback, are the usual reviewer's: when the gate refuses the handoff for it, end
 with `review finished` and the tick starts the usual reviewer, which reviews the pushed
@@ -597,10 +600,14 @@ current rules from main. The earlier round stands for everything the resolution 
 touch; do not repeat its whole-change review.
 
 Resolve the merge in the kept worktree, asking the owner in text for any product decision.
+Codex uses the same bridge as a Codex worker, under `review-N`, for questions and replies.
 Commit as `merge main: conflict in <files>` and push without force. Run the main checkout's
 `review-panel N`: it verifies that this is one merge of H and the recorded main, and gives
 the panel the diffs against both parents for F, with the task and earlier passed round.
-Read its completed reports, narrowed weaker-tests report and reached test selections. Run
+Read its completed reports, narrowed weaker-tests report and reached test selections.
+When Codex resolves, the panel runs Claude and Cursor in separate read-only worktrees and
+excludes Codex, including on a pull request Codex built. Read `claude.md` and `cursor.md`.
+Claude-resolved conflicts use the usual panel. Run
 every selected server test (`server-tests.json`) and the local browser test selection
 (`browser-tests.txt`, empty when the repository configures none, and CI then runs the whole
 browser suite), protecting `review-N`
@@ -615,10 +622,21 @@ follow the ordinary full review instead, running `review-panel N --full-review` 
 fresh full-diff reports in the panel's `full-review/` folder. The panel also falls back when it
 cannot prove the scope, including changed parents, additional commits, or non-text conflicts.
 The gate refuses a narrowed handoff which changes another file or lines outside the hunks.
+Codex never does the full review: if scope cannot be proved, a test expectation changes,
+or a panel report calls for a full review, run `review-panel N --full-review`. It records
+the fallback and exits with status 2, as does an automatic scope refusal. Say why and end
+without publishing a round, with `review finished`; the tick stops Codex and its bridge
+and starts the usual Claude reviewer on the pushed head. That reviewer runs the full panel;
+the recorded fallback keeps this head out of conflict-only review.
 
 Publish the next usual independent round on the resolved head, stating that it is a conflict
 round and naming H, with `<!-- workflow-conflict extends=H -->` on its own line after the
 usual round marker. Explain why the resolution stays within scope and record test evidence.
+Codex publishes with `gh api -X POST repos/{repository}/pulls/N/reviews --input <file>`;
+the JSON file has only `body`, `commit_id` (the resolved head), and `event: "COMMENT"`.
+Its shim permits this own conflict round and reads; it refuses approvals, full rounds and
+other writes. Product questions go through the bridge. A Codex quota stop uses the worker's
+quota handling and leaves the merge line available to other pull requests.
 A full-review fallback uses the usual round marker without that conflict marker and says
 which fallback applied and why. The ordinary send-back count, checks, questions and waiting
 rules still apply. With no findings or questions left and GitHub checks passing, finish

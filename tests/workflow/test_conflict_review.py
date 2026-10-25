@@ -1,10 +1,12 @@
 """A conflict round reuses only proved review evidence, through the real workflow scripts."""
 
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
 import pytest
+from workflow.test_codex_worker import _relay, _rpc  # pyright: ignore[reportPrivateUsage]
 from workflow.test_independent_review import (  # pyright: ignore[reportPrivateUsage]
     _idle,
     _rule_breaks,
@@ -428,6 +430,18 @@ def _program(workflow: Workflow, program: str = "codex", **options: object) -> N
     config.write_text(json.dumps(values))
 
 
+def _record_handback(workflow: Workflow) -> None:
+    (_folder(workflow) / "merge-review-7").write_text(
+        json.dumps(
+            {
+                "head": workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)),
+                "event": "conflict-event",
+                "reason": "non-mechanical conflict in " + _FILE,
+            }
+        )
+    )
+
+
 def _codex_conflict(workflow: Workflow) -> tuple[str, str]:
     workflow.add_worktree(7, draft=False)
     head, main = _conflict(workflow)
@@ -438,6 +452,7 @@ def _codex_conflict(workflow: Workflow) -> tuple[str, str]:
         json.dumps({"head": head, "main": main, "files": [_FILE]})
     )
     _program(workflow)
+    _record_handback(workflow)
     return head, main
 
 
@@ -445,14 +460,16 @@ def test_codex_conflict_starts_with_its_sentence_and_bridge(workflow: Workflow) 
     head, _ = _codex_conflict(workflow)
     done = workflow.run("start", "review", "7")
     assert done.returncode == 0, done.stdout + done.stderr
-    args = session_arguments(workflow.state, "codex-7")
+    args = shlex.split(session_arguments(workflow.state, "codex-7")[-1])
     assert instruction(
         f"Review conflict resolution for pull request 7 extending passed head {head} "
         f"in files {_FILE}"
     ) in args
     assert "workspace-write" in args
-    bridge = " ".join(session_arguments(workflow.state, "review-7"))
-    assert "--tools ''" in bridge or '--tools ""' in bridge or "--tools  " in bridge
+    grants = [args[index + 1] for index, word in enumerate(args) if word == "--add-dir"]
+    assert str(_folder(workflow)) in grants
+    bridge = shlex.split(session_arguments(workflow.state, "review-7")[-1])
+    assert bridge[bridge.index("--tools") + 1] == ""
     assert "codex-bridge" in (workflow.notes(7) / "review-7.codex-config.json").read_text()
     assert (workflow.notes(7) / "review-7.codex").exists()
     assert (workflow.notes(7) / "review-7.started").exists()
@@ -467,11 +484,12 @@ def test_codex_conflict_starts_with_its_sentence_and_bridge(workflow: Workflow) 
 def test_codex_resolution_gets_claude_and_cursor(workflow: Workflow, built: bool) -> None:
     _panel_conflict(workflow)
     _program(workflow)
+    _record_handback(workflow)
+    if built:
+        (_folder(workflow) / "codex-built-7").touch()
     assert workflow.run("start", "review", "7").returncode == 0
     resolved = _resolve(workflow)
     workflow.set_pull_request(7, "OPEN", resolved)
-    if built:
-        (_folder(workflow) / "codex-built-7").touch()
     for tool in ("claude", "agent", "codex"):
         workflow.fake(tool, '#!/bin/bash\necho "@TOOL@ report"\n')
     done = workflow.run_script("review-panel", "7", "codex", "cursor")
@@ -486,6 +504,7 @@ def test_codex_resolution_gets_claude_and_cursor(workflow: Workflow, built: bool
 def test_codex_panel_fallback_returns_to_claude(workflow: Workflow, extra: str) -> None:
     _panel_conflict(workflow)
     _program(workflow)
+    _record_handback(workflow)
     assert workflow.run("start", "review", "7").returncode == 0
     resolved = _resolve(workflow, extra)
     workflow.set_pull_request(7, "OPEN", resolved)
@@ -493,7 +512,9 @@ def test_codex_panel_fallback_returns_to_claude(workflow: Workflow, extra: str) 
         (workflow.state / "reviews-7.json").write_text("[]")
     elif extra == "corrupt":
         (_folder(workflow) / "review-7.conflict.json").write_text("invalid")
-    done = workflow.run_script("review-panel", "7", *(["--full-review"] if extra == "full" else []))
+    done = workflow.run_script(
+        "review-panel", "7", *(["--full-review"] if extra == "full" else [])
+    )
     assert done.returncode == 2, done.stdout + done.stderr
     assert "Full review required" in done.stderr
     assert (_folder(workflow) / "review-7.usual-reviewer").read_text().strip() == resolved
@@ -521,6 +542,158 @@ def test_program_alone_and_optional_conflict_limits(workflow: Workflow, program:
     _program(workflow, program, effort="medium", model="sonnet", max_changed_lines=5)
     assert _reviewer(workflow) == "high opus\n"
     assert not (_folder(workflow) / "review-7.conflict-reviewer").exists()
+
+
+def test_codex_conflict_honors_effort_and_explicit_model(workflow: Workflow) -> None:
+    _codex_conflict(workflow)
+    _program(workflow, effort="medium", model="gpt-example", max_changed_lines=6)
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stderr
+    args = shlex.split(session_arguments(workflow.state, "codex-7")[-1])
+    assert "model_reasoning_effort=medium" in args
+    assert args[args.index("--model") + 1] == "gpt-example"
+
+
+def test_conflict_bridge_relays_question_and_recorded_answer(workflow: Workflow) -> None:
+    _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    message = 'Recommend 1.\nOwner only: yes\nType "1".'
+    done = workflow.run_script(
+        "notify",
+        "codex",
+        json.dumps({"type": "agent-turn-complete", "last-assistant-message": message}),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    assert done.returncode == 0
+    with _relay(workflow, "review-7") as relay:
+        turn = _rpc(relay, "tools/call", {"name": "await_turn"})
+        assert turn["result"]["content"][0]["text"] == message
+        workflow.notify({"hook_event_name": "UserPromptSubmit", "prompt": "1"}, "review-7")
+        assert "result" in _rpc(relay, "tools/call", {"name": "reply"})
+    assert (workflow.notes(7) / "review-7.codex-answered").exists()
+
+
+@pytest.mark.parametrize("lost_bridge", [False, True])
+def test_conflict_codex_quota_and_bridge_recovery(workflow: Workflow, lost_bridge: bool) -> None:
+    _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    workflow.screen(
+        "■ You've hit your usage limit. Try again at 4:00 PM.\n\u203a \n", "codex-7"
+    )
+    if lost_bridge:
+        (workflow.state / "tmux/review-7").unlink()
+    listed = workflow.run("list")
+    assert listed.returncode == 0, listed.stderr
+    assert "review-7  limit" in listed.stdout and "Codex limit" in listed.stdout
+    assert "resets" not in listed.stdout
+    if lost_bridge:
+        done = workflow.run("bridge", "review-7")
+        assert done.returncode == 0, done.stderr
+        assert workflow.is_running("review-7") and workflow.is_running("codex-7")
+
+
+def test_tick_handback_starts_codex_conflict_reviewer(handed: GitHub) -> None:
+    workflow = handed.workflow
+    head, main = _conflict(workflow)
+    _program(workflow)
+    handed.head, handed.base = head, main
+    handed.pulls["7"]["headRefOid"] = head
+    handed.pulls["7"]["mergeable"] = "CONFLICTING"
+    handed.main()
+    handed.ci(main, head, tested_base=workflow.git("merge-base", main, head))
+    (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {head}\n")
+    note = _folder(workflow) / "merge-wanted-7"
+    note.write_text(json.dumps({**json.loads(note.read_text()), "head": head}))
+    _publish(handed, "passed", head)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.is_running("codex-7") and workflow.is_running("review-7")
+    args = shlex.split(session_arguments(workflow.state, "codex-7")[-1])
+    assert args[-1] == instruction(
+        f"Review conflict resolution for pull request 7 extending passed head {head} "
+        f"in files {_FILE}"
+    )
+
+
+@pytest.mark.parametrize("lost_bridge", [False, True])
+def test_tick_reads_codex_conflict_completion_and_starts_full_review(
+    workflow: Workflow, lost_bridge: bool
+) -> None:
+    _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow, "hunk")
+    workflow.set_pull_request(7, "OPEN", resolved)
+    (_folder(workflow) / "review-7.usual-reviewer").write_text(resolved + "\n")
+    done = workflow.run_script(
+        "notify",
+        "codex",
+        json.dumps(
+            {
+                "type": "agent-turn-complete",
+                "last-assistant-message": "Full review required.\nreview finished",
+            }
+        ),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    assert done.returncode == 0
+    assert (workflow.notes(7) / "review-7.codex-turn.json").exists()
+    if lost_bridge:
+        (workflow.state / "tmux/review-7").unlink()
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not workflow.is_running("codex-7")
+    assert workflow.is_running("review-7")
+    assert "--mcp-config" not in " ".join(session_arguments(workflow.state, "review-7"))
+    assert not _rule_breaks(workflow)
+
+
+@pytest.mark.parametrize(
+    "operation", ["publish", "other", "approve", "full", "ready", "body", "ticket"]
+)
+def test_codex_conflict_gh_allows_only_its_own_conflict_round(
+    workflow: Workflow, operation: str
+) -> None:
+    head, _ = _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow)
+    payload = workflow.root / "round.json"
+    body = "<!-- workflow-review round=2 result=passed -->\n"
+    if operation != "full":
+        body += f"<!-- workflow-conflict extends={head} -->\n"
+    payload.write_text(
+        json.dumps(
+            {
+                "body": body,
+                "commit_id": resolved,
+                "event": "APPROVE" if operation == "approve" else "COMMENT",
+            }
+        )
+    )
+    number = 8 if operation == "other" else 7
+    args = [
+        "api", "-X", "POST", f"repos/example-org/example-app/pulls/{number}/reviews",
+        "--input", str(payload),
+    ]
+    if operation == "ready":
+        args = ["pr", "ready", "7"]
+    elif operation == "body":
+        args = [
+            "api", "-X", "PATCH", "repos/example-org/example-app/pulls/7", "-F",
+            "body=@round.json",
+        ]
+    elif operation == "ticket":
+        args = ["pr", "create", "--draft"]
+    env = dict(
+        line.split("=", 1)
+        for line in (workflow.state / "env/codex-7").read_text().splitlines()
+    )
+    workflow.fake("gh", '#!/bin/bash\necho allowed\n')
+    shim = Path(env["PATH"].split(":")[0]) / "gh"
+    done = subprocess.run(
+        ["bash", str(shim), *args], cwd=workflow.worktree(7), env=env,
+        text=True, capture_output=True, check=False,
+    )
+    assert (done.returncode == 0) == (operation == "publish"), done.stdout + done.stderr
 
 
 @pytest.mark.parametrize(
