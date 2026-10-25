@@ -1586,3 +1586,54 @@ merge_handoff.write_json = paused_write
     assert done.returncode == 0, done.stdout + done.stderr
     assert (_folder(workflow) / "review-7.usual-reviewer").read_text().strip() == head
     assert not workflow.is_running("codex-7")
+
+
+def _wait_for_panel_again(workflow: Workflow, said: str) -> None:
+    """The resolver's next turn ends waiting for the panel, as its first one did."""
+    workflow.run_script("notify", "waiting", env={"WORKFLOW_SESSION": "review-7"})
+    workflow.run_script(
+        "notify", "codex",
+        json.dumps({"type": "agent-turn-complete", "last-assistant-message": said}),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    with _relay(workflow, "review-7") as relay:
+        assert "result" in _rpc(relay, "tools/call", {"name": "await_turn"})
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": said}, "review-7")
+    workflow.screen("Remote Control: " + SESSION_LINK + "\n● " + said + _BOX, "review-7")
+    workflow.screen("• Waiting for panel.\n\n› \n", "codex-7")
+
+
+def test_failed_requested_panel_retries_its_failed_reviewer_when_requested_again(
+    workflow: Workflow,
+) -> None:
+    """Claude at its usage limit fails the panel; asking again once it is back reruns only
+    Claude, and the waiting resolver, or a restarted one, is woken again."""
+    head = _requested_panel(workflow)
+    _panel_reviewer(workflow, "agent", '#!/bin/bash\necho run >> "@STATE@/cursor-runs"\necho "Cursor report"\n')
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\necho run >> "@STATE@/claude-runs"\necho "usage limit"\nexit 1\n')
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode != 0 and "panel failed" in done.stdout + done.stderr
+    folder = _folder(workflow)
+    reports = folder / "reviews/7" / head
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\necho run >> "@STATE@/claude-runs"\necho "Claude report"\n')
+    _wait_for_panel_again(workflow, "Claude is back; I asked for the panel again and am waiting.")
+    asked = workflow.run_script("review-panel", "7", "--request", cwd=workflow.worktree(7),
+                                env={"WORKFLOW_SESSION": "review-7"})
+    assert asked.returncode == 0, asked.stdout + asked.stderr
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (reports / "panel.complete").read_text().strip() == head
+    assert "Claude report" in (reports / "claude.md").read_text()
+    assert (workflow.state / "claude-runs").read_text().splitlines() == ["run", "run"]
+    assert (workflow.state / "cursor-runs").read_text().splitlines() == ["run"]
+    woken = workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")
+    assert len(woken) == 2 and "has completed" in woken[-1], woken
+    # A resolver restarted after its wake asks again and is woken from the completed panel.
+    _wait_for_panel_again(workflow, "I was restarted; I asked for the panel and am waiting.")
+    asked = workflow.run_script("review-panel", "7", "--request", cwd=workflow.worktree(7),
+                                env={"WORKFLOW_SESSION": "review-7"})
+    assert asked.returncode == 0, asked.stdout + asked.stderr
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")) == 3
+    assert (workflow.state / "claude-runs").read_text().splitlines() == ["run", "run"]

@@ -611,7 +611,8 @@ in a detached runner under the panel's existing locks, holding no tick lock. Whi
 lists another head it waits without falling back. It runs once for the recorded head and
 wakes native Codex through its bridge after
 completion; blocked input delays delivery without rerunning the panel. A failed reviewer is
-a panel failure reported by the tick, never permission to publish. A Claude resolver runs
+a panel failure reported by the tick, never permission to publish. Once its cause is fixed,
+`review-panel N --request` again reruns only the failed reviewers. A Claude resolver runs
 `review-panel N` directly. The panel verifies one merge of H and the recorded main, and gives
 the panel the diffs against both parents for F, with the task and earlier passed round.
 Read its completed reports, narrowed weaker-tests report and reached test selections.

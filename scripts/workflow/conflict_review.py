@@ -329,10 +329,28 @@ def request_panel(folder: Path, number: str, full: bool) -> None:
             previous = json.loads(path.read_text())
         except (OSError, ValueError):
             previous = None
+        # A resolver asking again is waiting again, after a restart or a reported failure.
+        suffixes = ["panel-woken", "panel-failed"]
+        result = folder / f"review-{number}.panel-result-{head}"
         if previous != request:
             # A later explicit full-review request supersedes an earlier completed panel.
-            for suffix in ("panel-result", "panel-woken"):
-                (folder / f"review-{number}.{suffix}-{head}").unlink(missing_ok=True)
+            suffixes.append("panel-result")
+        elif result.exists() and result.read_text().strip() not in {"0", "2"}:
+            # Asking again after a failure reruns only its failed reviewers.
+            for who in ("claude", "cursor"):
+                report = folder / "reviews" / number / head / f"{who}.md"
+                if not report.exists():
+                    continue
+                with open(f"{report}.lock", "a") as running:
+                    try:
+                        fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue
+                    if report.exists() and report.read_text().splitlines()[-1:] != ["exit 0"]:
+                        report.unlink()
+            suffixes.append("panel-result")
+        for suffix in suffixes:
+            (folder / f"review-{number}.{suffix}-{head}").unlink(missing_ok=True)
         # Publish the new request last: a completed replacement never retains old success.
         write_json(path, request)
 
