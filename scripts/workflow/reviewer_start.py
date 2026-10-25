@@ -126,6 +126,11 @@ def start(
     done = gate.command("bash", str(gate.HERE / "session"), "start", "review", number, check=False)
     if done.returncode == 0:
         _clear(folder, refused)
+        started = f"review-{number} started"
+        for line in done.stdout.splitlines():
+            if line == started or line.startswith(started + ":"):
+                print(started, flush=True)
+                break
         return 0
     if done.returncode == 75:
         print(done.stderr or done.stdout, flush=True)

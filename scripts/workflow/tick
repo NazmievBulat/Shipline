@@ -898,6 +898,22 @@ if ! python3 "$here/tick_snapshot.py" create "$snapshot" 9>&- || ! pulls=$(label
   exit 1
 fi
 
+# A conflict belongs to this pull request head, not to a session. Remember its first
+# observation even when no reviewer can be woken yet, and keep it across session restarts.
+# A shadow tick reads these notes and writes none. Use the observation's clock: the tick
+# may have spent minutes on earlier work before it could read GitHub.
+conflicts_seen_at=${WORKFLOW_NOW:-$(date +%s)}
+conflicts=$(jq -r '.[] | select(.state == "OPEN" and .baseRefName == "main" and
+  (.mergeable == "CONFLICTING" or .mergeStateStatus == "DIRTY")) |
+  select(.number | tostring | test("^[0-9]+$")) |
+  select(.headRefOid | strings | test("^[0-9a-f]{40}$")) |
+  "\(.number) \(.headRefOid)"' "$snapshot") || { failed=1; conflicts=""; }
+while read -r number head; do
+  [[ -n $number ]] || continue
+  seen=$main/$SHIPLINE_STATE_FOLDER/review-$number.conflict-seen-$head
+  [[ -e $seen ]] || (umask 077; keep "$seen" "$conflicts_seen_at") || failed=1
+done <<<"$conflicts"
+
 while read -r name state _; do
   # Codex's latest turn is authoritative even if its bridge never ran the Stop hook.
   if [[ $name =~ ^(ticket|review)- && -e $main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name.codex ]]; then
@@ -1044,6 +1060,22 @@ while read -r name state _; do
     (.mergeable == "CONFLICTING" or .mergeStateStatus == "DIRTY")' <<<"$pull" >/dev/null; then
     mark=$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-$head
     [[ ! -e $mark ]] || continue
+    # The hand-back's scope names the conflict this reviewer was started to resolve,
+    # even when GitHub still reports that head after the local resolution is committed.
+    if [[ $name == review-* ]] && jq -e --arg head "$head" '.head == $head' \
+        "$main/$SHIPLINE_STATE_FOLDER/$name.conflict.json" >/dev/null 2>&1; then
+      continue
+    fi
+    # A reviewer that started after this head's conflict was seen already has it in
+    # front of it. Older sessions still need their once-per-head wake.
+    seen=$main/$SHIPLINE_STATE_FOLDER/review-$number.conflict-seen-$head
+    first_seen=$conflicts_seen_at
+    [[ ! -r $seen ]] || read -r first_seen <"$seen"
+    started=$(stat -c %Y "$notes.started" 2>/dev/null 9>&-) || started=""
+    if [[ $first_seen =~ ^[0-9]+$ && $started =~ ^[0-9]+$ ]] &&
+        ((started > first_seen)); then
+      continue
+    fi
     if delivery=$(session conflict-found "$name" "$head" 2>&1); then
       nudged+="$name "
       write_session_note "$name" "$mark" "$head" || { failed=1; continue; }

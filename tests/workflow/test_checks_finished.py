@@ -60,6 +60,31 @@ def _nudges(workflow: Workflow) -> list[str]:
     return workflow.calls("tmux review-7 send-keys -t =review-7: -l The checks on ")
 
 
+@pytest.mark.parametrize("started_after", [False, True])
+def test_a_conflict_seen_before_a_reviewer_started_needs_no_nudge(
+    workflow: Workflow, started_after: bool
+) -> None:
+    head = _waiting(workflow)
+    (workflow.state / "mergeability-7").write_text("CONFLICTING DIRTY\n")
+    # First seen while the existing session is busy and cannot be nudged.
+    (workflow.notes(7) / "review-7.checks-wait").unlink()
+    first = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_STARTED + 100)})
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert workflow.calls("tmux review-7 send-keys") == []
+
+    started = _STARTED + (101 if started_after else 99)
+    os.utime(workflow.notes(7) / "review-7.started", (started, started))
+    (workflow.notes(7) / "review-7.checks-wait").touch()
+    for at in (_STARTED + 200, _STARTED + 300):
+        done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(at)})
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    nudges = workflow.calls("tmux review-7 send-keys -t =review-7: -l GitHub reports")
+    assert len(nudges) == int(not started_after)
+    if nudges:
+        assert head in nudges[0]
+
+
 def test_finished_checks_wake_an_idle_reviewer_once_and_log_it(workflow: Workflow) -> None:
     head = _waiting(workflow)
 
@@ -680,23 +705,25 @@ def test_stacked_conflict_does_not_receive_an_instruction_to_merge_main(workflow
     assert len(workflow.calls("tmux review-7 send-keys")) == 2
 
 
-def test_a_fresh_reviewer_gets_a_conflict_wake_for_the_same_head(workflow: Workflow) -> None:
+def test_a_fresh_reviewer_is_not_nudged_for_an_already_seen_conflict(workflow: Workflow) -> None:
     head = _waiting(workflow)
     (workflow.state / "mergeability-7").write_text("CONFLICTING DIRTY")
     (workflow.state / "rollup-7.json").write_text("[]")
-    assert workflow.run_script("tick").returncode == 0
+    assert workflow.run_script("tick", env={"WORKFLOW_NOW": str(_STARTED + 100)}).returncode == 0
     assert len(workflow.calls("tmux review-7 send-keys")) == 2
     (workflow.state / "tmux/review-7").unlink()
     (workflow.state / "screen/review-7").unlink()
     done = workflow.run("start", "review", "7")
     assert done.returncode == 0, done.stdout + done.stderr
+    started = workflow.notes(7) / "review-7.started"
+    os.utime(started, (_STARTED + 200, _STARTED + 200))
     assert not (workflow.repo / f".local/workflow/review-7.conflict-nudged-{head}").exists()
     (workflow.notes(7) / "review-7.checks-wait").touch()
     workflow.screen("● " + _WAIT + "\n" + _BOX, "review-7")
-    for _ in range(2):
-        done = workflow.run_script("tick")
+    for at in (_STARTED + 300, _STARTED + 400):
+        done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(at)})
         assert done.returncode == 0, done.stdout + done.stderr
-    assert len(workflow.calls("tmux review-7 send-keys")) == 4
+    assert len(workflow.calls("tmux review-7 send-keys")) == 2
 
 
 @pytest.mark.parametrize("kind", ["review", "audit"])

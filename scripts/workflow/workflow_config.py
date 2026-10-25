@@ -11,26 +11,8 @@ the selected file. Relative programs come from main first, then this folder; `@i
 only the installation. Files are never merged. Missing keys keep their defaults; unknown keys
 and values of the wrong kind are refused with the selected file's path.
 
-The defaults are neutral. The repository is the `repository` Bash reads from
-`.github/runner/settings.sh` when the runner pool names one, else the owner and name of the
-`origin` remote on GitHub; the check names, annotation titles, workflow files and labels are the
-ones Shipline's own CI and labels use; the state folder is `.local/workflow`; the worktree
-set-up command, run only when present, is `scripts/setup-worktree`; the merge gate's scratch
-branches begin `workflow/merge-batch-`; no runner prefix and no image build or hub cache
-command, and the runner label `<prefix>-home` and planner label `<label>-planner`, whose labels
-are the runner labels, main's runners' `<label>-main` among them; none without a prefix; the
-workflow and runner tests `tools/parity` compares are in `tests/workflow` and `tests/runner`,
-and it knows of no differences; no machines named, so `flow-page` samples only the machine it
-runs on; no hunt areas, so one hunt runs at a time, and no hunt plans file; no test command,
-which a repository names for its CI's test job (`ci_proof.py test`), and no browser command,
-which it names for its E2E's browser job (`ci_proof.py browser`); a question to the owner marked
-`Owner only: no` gets its recommended reply after 15 minutes; a quiet cloud worker is woken
-after 30 minutes; no paths that call for a closer review.
-
-`review.high_effort_paths` are regular expressions, each searched for in every path a pull
-request changes: a match runs its independent reviewer at high effort, not medium
-(`review-effort`). A repository names there what it stores, what its models read, its
-background work, locks and queues, and its account boundaries and security.
+Defaults and key meanings are generated in `README.md`, "The configuration file".
+Add a declaration below and run `python3 scripts/workflow/workflow_config.py docs --write`.
 
 Python scripts import it (`current()`, once per run). A Bash script reads every value at once:
 
@@ -57,138 +39,22 @@ import subprocess
 import sys
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from functools import cache
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 FILE = "shipline.json"
 # Where the runner pool names the repository its runners register with, and how long Bash may
 # take to read it.
 RUNNER_SETTINGS = ".github/runner/settings.sh"
 RUNNER_SETTINGS_SECONDS = 5
+DEFAULT_DEPENDENCY_JOB = "CI: dependencies"
 # The prefix names a systemd unit and, as `<prefix>-runner`, a user of at most 32 characters.
 _PREFIX = re.compile(r"[a-z](?:[a-z0-9-]{0,23}[a-z0-9])?")
 _LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 
-# Every key the file may hold, with its default. The repository's default is found, not fixed.
-DEFAULTS: dict[str, Any] = {
-    "repository": None,
-    "install_folder": None,
-    "state_folder": ".local/workflow",
-    "worktree_setup": "scripts/setup-worktree",
-    "refresh": {"clear_generated": []},
-    "commands": {
-        # The command line that runs the repository's tests, from the root of its checkout, by
-        # `bash -c` (`ci_proof.py test`); and the one that runs its browser tests, the same way
-        # (`ci_proof.py browser`).
-        "test": None,
-        "browser": None,
-        # The repository's own commands Shipline calls, each split into words (`Config.command`).
-        "browser_tests_for_changes": None,
-        "server_tests_for_changes": None,
-        "pre_train_checks": None,
-        "mechanical_conflicts": None,
-        "browser_plan": None,
-        "hunt_app": None,
-        "hunt_browser": None,
-        "hunt_cursor": None,
-        "advisory_watch": None,
-        "push_checkout": None,
-        # The checks the repository's pre-push hook runs (`ci_tests_for_changes.py --run`).
-        "push_checks": None,
-    },
-    "checks": {
-        "ci_result": "CI result",
-        "ci_plan": "CI: what to run",
-        "e2e_plan": "E2E: what to run",
-        # The prefix of every check of the image workflow.
-        "images": "Docker images",
-        # The job that audits the dependencies against published advisories (the gate reads
-        # "CI: dependencies" when none is named), and the title of the notice it writes on main
-        # when advisories alone failed it. Without the notice an advisory on main makes main red,
-        # as any other failure.
-        "dependency_audit": None,
-        "advisory_annotation": None,
-        "prefix_only": [],
-    },
-    # The titles of the annotations the CI planners write and the merge gate reads.
-    "annotations": {
-        "merge_tested": "Merge tested",
-        "files_tested": "Files tested",
-        "server_tests": "Server tests",
-        "web_suite": "Web suite",
-        "browser_suite": "Browser suite",
-    },
-    "workflows": {"ci": "ci.yml", "e2e": "e2e.yml", "images": "images.yml"},
-    "labels": {
-        "workflow": "workflow",
-        "audited": "audited",
-        "priority": {
-            "blocker": "priority: blocker",
-            "high": "priority: high",
-            "medium": "priority: medium",
-            "low": "priority: low",
-        },
-    },
-    "runner": {
-        # The runner labels of the machines the gate may re-run failed jobs on; when the file
-        # names none, they are built from the base label (`runner_labels`).
-        "labels": [],
-        "identity_folder": "~/.config/shipline-runner",
-        # The prefix the runner pool names everything by: its images, network, services and
-        # containers (`<prefix>-runner…`) and labels; without it, there are no runner figures
-        # (`workflow_metrics.py`).
-        "prefix": None,
-        # The base label every machine's runners carry; `<prefix>-home` by default.
-        "label": None,
-        # The label the CI planner's runner carries; `<label>-planner` by default.
-        "planner_label": None,
-        # The command line, run from the main checkout, that builds the runner images; without
-        # it, the pool has no images to run.
-        "image_build": None,
-        # The command line, run from the main checkout, that runs the Docker Hub cache of the
-        # Docker-capable runners' virtual machines (`hub-cache.sh`); without it, they pull from
-        # Docker Hub directly.
-        "hub_cache": None,
-    },
-    "merge": {
-        # The merge gate's own branches, each one prefix's test merge: this, then a random name.
-        # The gate deletes them once no prefix needs them, and the example workflows run its
-        # first run of a prefix there in the merge line's lane on main's runners (examples/ci.yml).
-        "scratch_prefix": "workflow/merge-batch-",
-    },
-    # What `tools/parity` reads of a repository that keeps its own copy of the scripts: where its
-    # workflow and runner tests are, and the file that lists the differences it expects.
-    "parity": {"workflow_tests": "tests/workflow", "runner_tests": "tests/runner", "known": None},
-    # The machines `flow-page` samples, each a name and, for another machine, the address `ssh`
-    # reaches it at; one without an address is this machine. None named: only this machine.
-    "machines": [],
-    "hunts": {
-        # Each area of the application a hunt may keep to: its name and the screens (paths) it
-        # covers. With none, a hunt hunts every screen and runs alone (`session start hunt`).
-        "areas": {},
-        # The repository's file of hunt plans, which a hunt with a plan is told of.
-        "plans": None,
-    },
-    # Path patterns of the few files many tickets edit (`*` stays inside a folder, `**` crosses
-    # folders): two tickets on one never run at once, and the merge line serves its members
-    # back to back.
-    "hot_paths": [],
-    # The conflict resolver's program, effort, model and optional line cutoff.
-    # None is the usual one, Claude Opus at high effort.
-    "conflict_review": None,
-    "review": {"high_effort_paths": []},
-    "merge_train": {"queued_limit_minutes": 20},
-    # Minutes a question to the owner marked `Owner only: no` waits before the tick types its
-    # recommended reply; 0 turns that off.
-    "answer_for_owner_after_minutes": 15,
-    # Minutes without a push or a report after which the tick wakes a cloud worker; 0 never does.
-    "cloud_wake_after_minutes": 30,
-    # The suites a cloud worker's push runs as CI will (`ci_tests_for_changes.py`), by name.
-    # Each is read by `_suites`, not key by key: the names are the repository's own.
-    "cloud_pre_push": {"suites": {}},
-}
 # The most such a wait may be: a day. Bash would wrap a number far larger.
 MOST_MINUTES = 24 * 60
 # The keys of one machine.
@@ -237,6 +103,68 @@ def _file_errors(path: Path | str) -> Iterator[None]:
 
 
 @dataclass(frozen=True)
+class Setting:
+    kind: str
+    default: Any
+    meaning: str
+    example: Any
+    name: str | None = None
+    # Stable positions preserve the shell interface while declarations and docs stay sorted.
+    shell: tuple[int, str] | None = None
+    derived_shell: tuple[int, str, str] | None = None
+    convert: Callable[[Any], Any] | None = None
+    serialize: Callable[[Any], Any] | None = None
+    command_docs: tuple[str, str, str] | None = None
+
+
+_UNSET = object()
+
+
+def option(
+    kind: str, default: Any, meaning: str, *, example: Any = _UNSET,
+    name: str | None = None, shell: tuple[int, str] | None = None,
+    derived_shell: tuple[int, str, str] | None = None,
+    convert: Callable[[Any], Any] | None = None,
+    serialize: Callable[[Any], Any] | None = None,
+    command_docs: tuple[str, str, str] | None = None, optional: bool = False,
+    position: int = sys.maxsize,
+) -> Any:
+    """A config key's validation kind, default, documentation and outward interfaces."""
+    setting = Setting(kind, default, meaning, default if example is _UNSET else example,
+                      name, shell, derived_shell, convert, serialize, command_docs)
+    arguments: dict[str, Any] = {"metadata": {"setting": setting, "position": position}}
+    if optional:
+        arguments.update(default_factory=lambda: (
+            convert(deepcopy(default)) if convert else deepcopy(default)
+        ))
+    return field(**arguments)
+
+
+def section(
+    cls: type | None = None, *, mapping: bool = False, position: int = sys.maxsize,
+) -> Any:
+    return field(metadata={"section": cls, "mapping": mapping, "position": position})
+
+
+def config_section(cls: type) -> type:
+    """Keep existing positional constructors while declarations are alphabetic in source."""
+    def order(name: str) -> tuple[bool, int]:
+        item = getattr(cls, name)
+        optional = item.default is not MISSING or item.default_factory is not MISSING
+        return optional, item.metadata["position"]
+
+    cls.__annotations__ = dict(sorted(cls.__annotations__.items(), key=lambda pair: order(pair[0])))
+    return dataclass(frozen=True)(cls)
+
+
+def _declared_fields(cls: type) -> list[Any]:
+    return sorted(fields(cls), key=lambda item: (
+        item.metadata["setting"].name or item.name
+        if "setting" in item.metadata else item.name
+    ))
+
+
+@dataclass(frozen=True)
 class CheckGroup:
     workflow: str
     jobs: tuple[str, ...]
@@ -248,21 +176,28 @@ class CheckGroup:
                    (job.endswith(":") and name.startswith(job + " ")) for job in self.jobs)
 
 
-@dataclass(frozen=True)
+@config_section
 class Checks:
-    ci_result: str
-    ci_plan: str
-    e2e_plan: str
-    images: str
-    dependency_audit: str | None = None
-    advisory_annotation: str | None = None
-    prefix_only: list[str] = field(default_factory=list)
+    advisory_annotation: str | None = option('name', None, 'The advisory notice title on main; omitted means advisories make main red.', example='Advisory', optional=True, position=5)
+    ci_plan: str = option('name', 'CI: what to run', 'The CI planner check name.', example='Build: what to run', shell=(5, 'CI_PLAN'), position=1)
+    ci_result: str = option('name', 'CI result', 'The check that sums up CI.', example='Build result', shell=(4, 'CI_RESULT'), position=0)
+    dependency_audit: str | None = option('name', None, 'The dependency audit job name; omitted means CI: dependencies.', example='Build: dependencies', optional=True, position=4)
+    e2e_plan: str = option('name', 'E2E: what to run', 'The browser suite planner check name.', example='Browser: what to run', shell=(6, 'E2E_PLAN'), position=2)
+    images: str = option('name', 'Docker images', 'The prefix of image checks; its planner appends : what to run.', example='Images', shell=(7, 'IMAGES'), derived_shell=(8, 'IMAGES_PLAN', 'images_plan'), position=3)
+    older_version: str = option('job', 'CI: older version on new tables', 'The previous-version compatibility job name without its (k of n) shard suffix.', example='Build: older version on new tables', optional=True, position=9)
+    prefix_only: list[str] = option('names', [], 'Distinct groups run only in merge prefixes: images, browser_whole and server_whole.', example=['images', 'browser_whole', 'server_whole'], optional=True, position=6)
+    server_tests: str = option('job', 'CI: server tests', 'The server tests job name without its (k of n) shard suffix.', example='Build: server tests', optional=True, position=7)
+    web: str = option('job', 'CI: web', 'The web suite job name without its (k of n) shard suffix.', example='Build: web', optional=True, position=8)
+
+    @property
+    def dependency_job(self) -> str:
+        return self.dependency_audit or DEFAULT_DEPENDENCY_JOB
 
     def groups(self) -> dict[str, CheckGroup]:
         return {
             "images": CheckGroup("images", (f"{self.images}:",)),
             "browser_whole": CheckGroup("e2e", ("playwright",), "browser_suite"),
-            "server_whole": CheckGroup("ci", ("CI: server tests",), "server_tests"),
+            "server_whole": CheckGroup("ci", (self.server_tests,), "server_tests"),
         }
 
     @property
@@ -270,39 +205,48 @@ class Checks:
         return f"{self.images}: what to run"
 
 
-@dataclass(frozen=True)
+@config_section
 class Annotations:
-    merge_tested: str
-    files_tested: str
-    server_tests: str
-    web_suite: str
-    browser_suite: str
+    browser_suite: str = option('name', 'Browser suite', 'The browser suite annotation title read by the merge gate.', example='Browser specs', shell=(13, 'ANNOTATION_BROWSER_SUITE'), position=4)
+    files_tested: str = option('name', 'Files tested', 'The tested tree annotation title read by the merge gate.', example='Tree tested', shell=(10, 'ANNOTATION_FILES_TESTED'), position=1)
+    merge_tested: str = option('name', 'Merge tested', 'The tested merge annotation title read by the merge gate.', example='Merge built', shell=(9, 'ANNOTATION_MERGE_TESTED'), position=0)
+    server_tests: str = option('name', 'Server tests', 'The server tests annotation title read by the merge gate.', example='Server suite', shell=(11, 'ANNOTATION_SERVER_TESTS'), position=2)
+    web_suite: str = option('name', 'Web suite', 'The web suite annotation title read by the merge gate.', example='Web unit suite', shell=(12, 'ANNOTATION_WEB_SUITE'), position=3)
 
 
-@dataclass(frozen=True)
+@config_section
 class Workflows:
-    ci: str
-    e2e: str
-    images: str
+    ci: str = option('name', 'ci.yml', 'The CI workflow file under .github/workflows/.', example='build.yml', shell=(14, 'WORKFLOW_CI'), position=0)
+    ci_name: str = option('name', 'CI', 'The CI workflow run name used by the runner-minutes report.', example='Build', position=3)
+    e2e: str = option('name', 'e2e.yml', 'The browser workflow file under .github/workflows/.', example='browser.yml', shell=(15, 'WORKFLOW_E2E'), position=1)
+    images: str = option('name', 'images.yml', 'The image workflow file under .github/workflows/.', shell=(16, 'WORKFLOW_IMAGES'), position=2)
+    images_name: str = option('name', 'Images', 'The image workflow run name used by the runner-minutes report.', position=4)
 
 
-@dataclass(frozen=True)
+@config_section
+class Priorities:
+    blocker: str = option('name', 'priority: blocker', 'The blocker priority label.', shell=(19, 'PRIORITY_BLOCKER'), position=0)
+    high: str = option('name', 'priority: high', 'The high priority label.', shell=(20, 'PRIORITY_HIGH'), position=1)
+    low: str = option('name', 'priority: low', 'The low priority label.', shell=(22, 'PRIORITY_LOW'), position=3)
+    medium: str = option('name', 'priority: medium', 'The medium priority label.', shell=(21, 'PRIORITY_MEDIUM'), position=2)
+
+
+@config_section
 class Labels:
-    workflow: str
-    audited: str
-    # Most urgent first: blocker, high, medium, low.
-    priority: dict[str, str]
+    audited: str = option('name', 'audited', 'The label that marks an audit.', shell=(18, 'LABEL_AUDITED'), position=1)
+    priority: dict[str, str] = section(Priorities, mapping=True, position=2)
+    workflow: str = option('name', 'workflow', 'The label that starts a ticket.', example='shipline', shell=(17, 'LABEL_WORKFLOW'), position=0)
 
 
-@dataclass(frozen=True)
+@config_section
 class Runner:
-    labels: tuple[str, ...]
-    identity_folder: str
-    prefix: str | None = None
-    label: str | None = None
-    planner_label: str | None = None
-    image_build: str | None = None
-    hub_cache: str | None = None
+    hub_cache: str | None = option('name', None, 'The command running the Docker Hub cache; omitted means direct pulls.', example='tools/shipline/hub-cache', optional=True, shell=(28, 'RUNNER_HUB_CACHE'), position=6)
+    identity_folder: str = option('name', '~/.config/shipline-runner', "The folder holding the runner programs' own GitHub identity.", shell=(23, 'IDENTITY_FOLDER'), position=1)
+    image_build: str | None = option('name', None, 'The command that builds runner images; omitted means the pool cannot be installed.', example='tools/shipline/build-runner-images', optional=True, shell=(27, 'RUNNER_IMAGE_BUILD'), position=5)
+    label: str | None = option('name', None, 'The base runner label; derived as `<prefix>-home` when omitted.', example='example-app-home', optional=True, shell=(25, 'RUNNER_LABEL'), position=3)
+    labels: tuple[str, ...] = option('names', [], 'The runner labels eligible for failed-job reruns; derived from the base label when omitted.', example=['example-app-home', 'example-app-home-standby', 'example-app-home-first', 'example-app-home-main', 'example-app-home-main-batch', 'example-app-home-docker', 'example-app-home-planner'], shell=(34, 'RUNNER_LABELS'), position=0)
+    planner_label: str | None = option('name', None, 'The planner runner label; derived as `<label>-planner` when omitted.', example='example-app-home-planner', optional=True, shell=(26, 'RUNNER_PLANNER_LABEL'), position=4)
+    prefix: str | None = option('name', None, 'The word naming runner images, services, network and containers; omitted means no runner figures.', example='example-app', optional=True, shell=(24, 'RUNNER_PREFIX'), position=2)
 
     @property
     def identity_path(self) -> Path:
@@ -320,16 +264,16 @@ class Runner:
         return None if self.label is None else f"{self.label}-main-batch"
 
 
-@dataclass(frozen=True)
+@config_section
 class Merge:
-    scratch_prefix: str
+    scratch_prefix: str = option('name', 'workflow/merge-batch-', 'The beginning of scratch branch names for tested merge prefixes, ended by - or /.', position=0)
 
 
-@dataclass(frozen=True)
+@config_section
 class Parity:
-    workflow_tests: str
-    runner_tests: str
-    known: str | None = None
+    known: str | None = option('name', None, 'The expected differences file read by tools/parity; @install/ requires an installation folder.', example='tools/shipline/parity-known.txt', optional=True, position=2)
+    runner_tests: str = option('name', 'tests/runner', 'The runner tests folder compared by tools/parity.', example='tools/runner/tests', position=1)
+    workflow_tests: str = option('name', 'tests/workflow', 'The workflow tests folder compared by tools/parity.', example='tools/shipline/tests', position=0)
 
 
 @dataclass(frozen=True)
@@ -339,17 +283,17 @@ class Machine:
     address: str | None = None
 
 
-@dataclass(frozen=True)
+@config_section
 class Hunts:
     # In the order the file names them.
-    areas: dict[str, tuple[str, ...]]
-    plans: str | None = None
+    areas: dict[str, tuple[str, ...]] = option('areas', {}, 'Area names mapped to lists of screen paths; omitted means one hunt runs at a time, on every screen.', example={'phone': ['/calls', '/contacts'], 'billing': ['/invoices', '/settings/billing']}, shell=(35, 'HUNT_AREAS'), position=0)
+    plans: str | None = option('name', None, 'The checkout path of hunt plans named in a hunt sentence.', example='docs/hunt-plans.md', optional=True, shell=(29, 'HUNT_PLANS'), convert=lambda value: _plans(value), position=1)
 
 
-@dataclass(frozen=True)
+@config_section
 class Refresh:
-    clear_generated: tuple[str, ...]
-    config_file: Path | str = FILE
+    clear_generated: tuple[str, ...] = option('names', [], 'Ignored, untracked generated paths or globs cleared after a refresh; tracked paths, links and paths outside the checkout are refused.', convert=tuple, position=0)
+    config_file: Path | str = field(default=FILE, metadata={"position": 1})
 
     def targets(self, checkout: Path) -> list[str]:
         """Validate everything before deleting anything, without following symbolic links.
@@ -533,22 +477,22 @@ def _generated_no_links(root: Path, path: Path) -> None:
                     )
 
 
-@dataclass(frozen=True)
+@config_section
 class Commands:
     # Each None when the file names none.
-    test: str | dict[str, Any] | None
-    browser: str | dict[str, Any] | None
-    browser_tests_for_changes: str | dict[str, Any] | None
-    server_tests_for_changes: str | dict[str, Any] | None
-    pre_train_checks: str | dict[str, Any] | None
-    mechanical_conflicts: str | dict[str, Any] | None
-    browser_plan: str | dict[str, Any] | None
-    hunt_app: str | dict[str, Any] | None
-    hunt_browser: str | dict[str, Any] | None
-    hunt_cursor: str | dict[str, Any] | None
-    advisory_watch: str | dict[str, Any] | None
-    push_checkout: str | dict[str, Any] | None
-    push_checks: str | dict[str, Any] | None
+    advisory_watch: str | dict[str, Any] | None = option('command', None, 'The command that detects an advisory service outage and checks whether the service answers again.', example='tools/shipline/advisory-watch', shell=(45, 'COMMAND_ADVISORY_WATCH'), command_docs=("the merge gate: `unreachable` with a failed push's output, or a failed audit's annotations (without the advisories notice, `checks.advisory_annotation`), on standard input; `answers <service>`", '`unreachable` prints the advisory service the text says was unreachable, or nothing; `answers` exits 0 when the service answers again. Beside the advisories notice, a service it names, or a failure of its own, keeps main red', "no outage is read: a failed push is refused as it is, and main's advisories notice stands alone"), position=10)
+    browser: str | dict[str, Any] | None = option('command', None, "The repository browser test command run by bash from the checkout with the E2E job's arguments.", example='tools/run-browser-tests', command_docs=("E2E's browser job: the job's own arguments.", "The command's output and exit code.", 'The browser job fails and asks for commands.browser.'), position=1)
+    browser_plan: str | dict[str, Any] | None = option('command', None, 'The command that reads NUL-ended changed paths and prints needed or none.', example='tools/shipline/browser-plan', shell=(41, 'COMMAND_BROWSER_PLAN'), command_docs=('the merge gate: the changed paths on standard input, each ended by a NUL', 'prints `needed` or `none` and exits 0; anything else, a crash or another exit included, counts as needed', 'every merge that changes a file needs browser tests while the merged tree holds the E2E workflow (`workflows.e2e`), and none does without it'), position=6)
+    browser_tests_for_changes: str | dict[str, Any] | None = option('command', None, 'The command that selects browser spec paths for a changed base.', example={'run': 'tools/shipline/browser-tests-for-changes', 'form': 'json', 'field': 'specs', 'args': ['--ci']}, shell=(37, 'COMMAND_BROWSER_TESTS_FOR_CHANGES'), command_docs=("the review panel in a conflict round, and sessions: `<base> [--files-from <file>]` and the session's own words", 'the browser specs the change reaches, one path a line', 'nothing is selected, and CI runs the whole browser suite'), position=2)
+    hunt_app: str | dict[str, Any] | None = option('command', None, 'The command that manages the application under a hunt, including stop.', example='tools/shipline/hunt-app', shell=(42, 'COMMAND_HUNT_APP'), command_docs=("`session` when a hunt stops: `stop`, in the hunt's worktree; the hunter itself, by `shipline hunt-app`", '', '`session start hunt` refuses'), position=7)
+    hunt_browser: str | dict[str, Any] | None = option('command', None, 'The browser command named in a hunt sentence.', example='node tools/shipline/hunt-browser.mjs', shell=(43, 'COMMAND_HUNT_BROWSER'), command_docs=('the hunter, by `shipline hunt-browser`, which its sentence names', '', 'the sentence names none'), position=8)
+    hunt_cursor: str | dict[str, Any] | None = option('command', None, 'The command that starts a Cursor hunt with its worktree, report folder and sentence.', example='tools/shipline/hunt-cursor', shell=(44, 'COMMAND_HUNT_CURSOR'), command_docs=('`session start hunt <name> <kind> cursor`: `<worktree> <report folder> <sentence>`', "what it prints is kept in the report folder's `cursor.log`", 'a Cursor hunt is refused'), position=9)
+    mechanical_conflicts: str | dict[str, Any] | None = option('command', None, 'The command that resolves conflicts, renumbers files and reports taken numbers.', example='tools/shipline/mechanical-conflicts', shell=(40, 'COMMAND_MECHANICAL_CONFLICTS'), command_docs=("the merge gate's refresh: `resolve <head> <main>` with the merge of main in progress; `renumber <head> <main>` after a clean merge; `taken <head> <main>` before a batch", "`resolve` stages its resolution, prints each file it resolved and exits 0 only when it resolved them all; `renumber` stages its moves and prints `<old path> <new path>` a line (paths without spaces), or exits non-zero, naming on standard output the files it cannot move (left as a conflict) and why on standard error; `taken` prints the branch's files whose number main took", 'every conflict is left to the session, nothing is renumbered and main took no number'), position=5)
+    pre_train_checks: str | dict[str, Any] | None = option('command', None, 'The checks run before a pull request is admitted to the merge train.', example={'run': 'tools/shipline/pre-train-checks', 'form': 'exit'}, shell=(39, 'COMMAND_PRE_TRAIN_CHECKS'), command_docs=('the merge gate, before a pull request joins the merge train, in its worktree', 'exits non-zero when a check failed; what it prints is shown', 'every pull request is admitted'), position=4)
+    push_checkout: str | dict[str, Any] | None = option('command', None, 'The command that installs changed checkout files and explains a failed push hook.', example='tools/shipline/push-checkout', shell=(46, 'COMMAND_PUSH_CHECKOUT'), command_docs=("the merge gate, before each push and after one that failed: `install <checkout>`; `refusal <checkout>` with the push's whole output on standard input", "`install` installs what changed since its last install and exits non-zero with the reason when it failed, which is a wait; `refusal` prints the hook's failed step with its last lines", 'nothing is installed, and a failed push is refused with its last 10 lines'), position=11)
+    push_checks: str | dict[str, Any] | None = option('command', None, "The checks run by the repository's pre-push hook.", example='tools/shipline/push-checks', shell=(47, 'COMMAND_PUSH_CHECKS'), command_docs=('The pre-push hook: the selected changes.', "The command's output and exit code.", 'No additional push checks run.'), position=12)
+    server_tests_for_changes: str | dict[str, Any] | None = option('command', None, 'The command that selects server tests and returns whole, tests, total and reasons.', example='tools/shipline/server-tests-for-changes', shell=(38, 'COMMAND_SERVER_TESTS_FOR_CHANGES'), command_docs=('the review panel in a conflict round, and sessions: `<base> [--files-from <file>]`', 'one JSON object, `{"whole": bool, "tests": [paths], "total": int, "reasons": [str]}`', 'the whole server suite: `{"whole": true, "tests": [], "total": 0, "reasons": ["no server test selection is configured"]}`'), position=3)
+    test: str | dict[str, Any] | None = option('command', None, "The repository test command run by bash from the checkout with the CI job's arguments.", example='tools/run-tests', command_docs=("CI's test job: the job's own arguments.", "The command's output and exit code.", 'The test job fails and asks for commands.test.'), position=0)
 
 
 @dataclass(frozen=True)
@@ -565,20 +509,15 @@ class Suite:
     probe: str | None = None
 
 
-@dataclass(frozen=True)
+@config_section
 class CloudPrePush:
     # In the order the file names them.
-    suites: tuple[Suite, ...] = ()
+    suites: tuple[Suite, ...] = option('suites', {}, 'Named cloud pre-push suites with select, run, workers and optional part and probe commands.', example={'server': {'select': 'tools/shipline/server-tests-for-changes', 'run': 'tools/shipline/server-tests --workers {workers}', 'workers': 4, 'part': '--shard {shard}/{shards}'}, 'browser': {'select': 'tools/shipline/browser-tests-for-changes --ci', 'run': 'tools/shipline/browser-tests --workers {workers}', 'workers': 2, 'probe': 'tools/shipline/browser-starts'}}, optional=True, convert=tuple, serialize=lambda config: {suite.name: {key: getattr(suite, key) for key in SUITE_KEYS if getattr(suite, key) is not None} for suite in config.suites}, position=0)
 
 
-# The commands run as words, not by a shell: every one but `test` and `browser`, the command
-# lines CI's jobs run by `bash -c` (`ci_proof.py`).
-RUN_AS_WORDS = tuple(name for name in DEFAULTS["commands"] if name not in ("test", "browser"))
-
-
-@dataclass(frozen=True)
+@config_section
 class Review:
-    high_effort_paths: tuple[str, ...]
+    high_effort_paths: tuple[str, ...] = option('names', [], 'Regular expressions selecting changed paths for an independent review at high effort.', example=['^db/migrations/', '^db/schema\\.sql$', '^app/models/', '^prompts/', '(^|/)AGENTS\\.md$', '\\.prompt\\.md$', '^app/jobs/', '^app/queues/', '(^|/)locks?\\.py$', '^app/auth/', '^app/permissions/', '^config/secrets'], convert=lambda value: _patterns(value, "review.high_effort_paths"), position=0)
 
 
 @dataclass(frozen=True)
@@ -590,41 +529,44 @@ class ConflictReview:
     program: str = "claude"
 
 
-@dataclass(frozen=True)
+@config_section
 class MergeTrain:
-    queued_limit_minutes: int
+    queued_limit_minutes: int = option('minutes', 20, 'Minutes a scratch CI run may remain queued before its wait is bounded.', position=0)
 
 
-@dataclass(frozen=True)
+@config_section
 class Config:
-    # None when nothing names it: an error only for a script that needs it.
-    found_repository: str | None
-    state_folder: str
-    worktree_setup: str
-    refresh: Refresh
-    checks: Checks
-    annotations: Annotations
-    workflows: Workflows
-    labels: Labels
-    runner: Runner
-    merge: Merge
-    parity: Parity
-    machines: tuple[Machine, ...]
-    hunts: Hunts
-    commands: Commands
-    hot_paths: tuple[str, ...]
-    # None when the file names none: the usual conflict reviewer.
-    conflict_review: ConflictReview | None
-    review: Review
-    merge_train: MergeTrain
-    answer_for_owner_after_minutes: int
-    cloud_wake_after_minutes: int
-    cloud_pre_push: CloudPrePush
-    # The file as it was read, without the defaults: `{}` when there is none.
-    given: dict[str, Any]
-    main: Path
-    path: Path
-    install_folder: Path | None
+    annotations: Annotations = section(position=5)
+    answer_for_owner_after_minutes: int = option('minutes', 15, 'Minutes before the tick answers a question marked Owner only: no; 0 disables it, at most 1440.', shell=(30, 'ANSWER_FOR_OWNER_AFTER_MINUTES'), position=18)
+    checks: Checks = section(position=4)
+    cloud_pre_push: CloudPrePush = section(position=20)
+    cloud_wake_after_minutes: int = option('minutes', 30, 'Minutes without a push or report before a cloud worker is woken; 0 disables it.', example=45, position=19)
+    commands: Commands = section(position=13)
+    conflict_review: ConflictReview | None = option(
+        'conflict', None,
+        'The resolver of a handed-off conflict: program is claude (default) or codex. With program alone, effort is high, Claude uses Opus, Codex uses its configured model, and there is no additional line cutoff. An explicit model selects that program’s model; a positive max_changed_lines limits both conflicting sides and the resolution. Edits stay within the conflicting hunks. Codex uses its worker bridge with Claude and Cursor on the panel; full-review fallbacks return to Claude. Without program, effort, model and max_changed_lines remain required.',
+        example={'effort': 'medium', 'model': 'sonnet', 'max_changed_lines': 40, 'program': 'claude'},
+        serialize=lambda config: _conflict_values(config), position=15,
+    )
+    hot_paths: tuple[str, ...] = option('paths', [], 'GitHub path patterns whose matching tickets run separately and merge back to back within their priority.', example=['src/example_app/models.py', 'web/src/pages/**'], convert=tuple, position=14)
+    hunts: Hunts = section(position=12)
+    install_folder: Path | None = option('name', None, 'The installation folder, resolved against the selected file; external configs use their parent when omitted.', example='.', serialize=lambda config: config.given.get("install_folder"), position=24)
+    labels: Labels = section(position=7)
+    machines: tuple[Machine, ...] = option('machines', [], 'Machines sampled by flow-page, each with a name and optional SSH address; omitted samples this machine.', example=[{'name': 'this machine'}, {'name': 'runner-1', 'address': 'runner@runner-1.example'}], position=11)
+    merge: Merge = section(position=9)
+    merge_train: MergeTrain = section(position=17)
+    parity: Parity = section(position=10)
+    refresh: Refresh = section(position=3)
+    found_repository: str | None = option('name', None, 'The GitHub repository as owner/name; discovered from runner settings, then origin when omitted.', example='example-owner/example-app', name='repository', shell=(1, 'REPOSITORY'), position=0)
+    review: Review = section(position=16)
+    runner: Runner = section(position=8)
+    state_folder: str = option('name', '.local/workflow', 'The folder of workflow notes in the main checkout and each worktree.', example='.local/shipline', shell=(2, 'STATE_FOLDER'), convert=lambda value: _relative(value, "state_folder"), position=1)
+    workflows: Workflows = section(position=6)
+    worktree_setup: str = option('name', 'scripts/setup-worktree', 'The command that prepares a new worktree, run only when present.', example='tools/prepare-worktree', shell=(3, 'WORKTREE_SETUP'), convert=lambda value: _relative(value, "worktree_setup"), position=2)
+    # The file as read, without defaults. Context fields are not config declarations.
+    given: dict[str, Any] = field(metadata={"position": 21})
+    main: Path = field(metadata={"position": 22})
+    path: Path = field(metadata={"position": 23})
 
     def command(self, name: str) -> list[str] | None:
         """A command's words, with its script resolved from main or the installation folder.
@@ -692,6 +634,74 @@ class Config:
         return [hot for hot in self.hot_paths if _hot_pattern(hot).fullmatch(path)]
 
 
+def _declarations(cls: type = Config, prefix: str = "") -> Iterator[tuple[str, Setting]]:
+    for item in _declared_fields(cls):
+        if setting := item.metadata.get("setting"):
+            yield prefix + (setting.name or item.name), setting
+        elif "section" in item.metadata:
+            yield from _declarations(item.metadata["section"] or item.type,
+                                     prefix + item.name + ".")
+
+
+def _defaults(cls: type = Config) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for item in fields(cls):
+        if setting := item.metadata.get("setting"):
+            result[setting.name or item.name] = deepcopy(setting.default)
+        elif "section" in item.metadata:
+            result[item.name] = _defaults(item.metadata["section"] or item.type)
+    return result
+
+
+def _configured(cls: type, values: dict[str, Any], **overrides: Any) -> Any:
+    """Build declared sections and apply only their existing value conversions."""
+    arguments = {}
+    for item in fields(cls):
+        if item.name in overrides:
+            continue
+        if setting := item.metadata.get("setting"):
+            value = values[setting.name or item.name]
+            arguments[item.name] = setting.convert(value) if setting.convert else value
+        elif "section" in item.metadata:
+            section_type = item.metadata["section"] or item.type
+            child = _configured(section_type, values[item.name])
+            arguments[item.name] = vars(child).copy() if item.metadata["mapping"] else child
+    return cls(**arguments, **overrides)
+
+
+def _json_value(value: Any) -> Any:
+    if is_dataclass(value):
+        return {key: _json_value(value) for key, value in vars(value).items() if value is not None}
+    if isinstance(value, dict):
+        return {key: _json_value(value) for key, value in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_value(item) for item in value]
+    return value
+
+
+def _as_values(config: Any) -> dict[str, Any]:
+    result = {}
+    for item in fields(config):
+        if setting := item.metadata.get("setting"):
+            key = setting.name or item.name
+            value = setting.serialize(config) if setting.serialize else getattr(config, key)
+            result[key] = _json_value(value)
+        elif "section" in item.metadata:
+            value = getattr(config, item.name)
+            result[item.name] = _json_value(value) if item.metadata["mapping"] else _as_values(value)
+    return result
+
+
+DECLARATIONS = dict(_declarations())
+DEFAULTS = _defaults()
+# Shell arrays keep their established order; the fields themselves are sorted by name.
+RUN_AS_WORDS = tuple(
+    name.removeprefix("commands.")
+    for name, setting in sorted(DECLARATIONS.items(), key=lambda pair: pair[1].shell or (0, ""))
+    if name.startswith("commands.") and setting.shell
+)
+
+
 def resolve_file(word: str, main: Path, install_folder: Path | None, config_file: Path) -> Path:
     """Resolve a validated relative program or known-list path, with checkout precedence."""
     if word.startswith("@install/"):
@@ -749,26 +759,25 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
         name = where + key
         if key not in given:
             merged[key] = default
-        elif where == "commands." and isinstance(given[key], dict):
-            merged[key] = _command_entry(given[key], key)
-        elif name in _READERS:
-            merged[key] = _READERS[name](given[key], name)
-        elif name == "machines":
-            merged[key] = _machines(given[key])
-        elif name == "hunts.areas":
-            merged[key] = _areas(given[key])
-        elif name == "cloud_pre_push.suites":
-            merged[key] = _suites(given[key])
-        elif isinstance(default, dict):
+        elif name not in DECLARATIONS:
             merged[key] = _merged(default, given[key], name + ".")
-        elif isinstance(default, list):
+        elif DECLARATIONS[name].kind == "command" and isinstance(given[key], dict):
+            merged[key] = _command_entry(given[key], key)
+        elif DECLARATIONS[name].kind in ("paths", "conflict", "machines", "areas", "suites"):
+            kind = DECLARATIONS[name].kind
+            readers = {"paths": _hot_paths, "conflict": _conflict_review,
+                       "machines": lambda value, _: _machines(value),
+                       "areas": lambda value, _: _areas(value),
+                       "suites": lambda value, _: _suites(value)}
+            merged[key] = readers[kind](given[key], name)
+        elif DECLARATIONS[name].kind == "names":
             value = given[key]
             if not isinstance(value, list) or not all(
                 isinstance(item, str) and item for item in value
             ):
                 raise ConfigError(f"{FILE}: {name} must be a list of names")
             merged[key] = value
-        elif isinstance(default, int):
+        elif DECLARATIONS[name].kind == "minutes":
             value = given[key]
             # `true` is an int to Python, and no number of minutes.
             if type(value) is not int or not 0 <= value <= MOST_MINUTES:
@@ -781,6 +790,10 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
             value = given[key]
             if not isinstance(value, str) or not value.strip():
                 raise ConfigError(f"{FILE}: {name} must be a name, not {json.dumps(value)}")
+            if DECLARATIONS[name].kind == "job" and re.search(r" \(\d+ of \d+\)\Z", value):
+                raise ConfigError(
+                    f"{FILE}: {name} must name a job without its (k of n) shard suffix"
+                )
             merged[key] = value
     return merged
 
@@ -824,10 +837,6 @@ def _conflict_review(value: Any, name: str) -> dict[str, Any]:
     if not uncapped and (not isinstance(lines, int) or isinstance(lines, bool) or lines < 1):
         raise ConfigError(f"{FILE}: {name}.max_changed_lines must be a whole number above 0")
     return value
-
-
-# The keys whose values are read by a reader of their own, by their full name.
-_READERS = {"hot_paths": _hot_paths, "conflict_review": _conflict_review}
 
 
 def path_pattern(pattern: str) -> re.Pattern[str]:
@@ -1314,7 +1323,7 @@ def _load(main: Path, start: Path | None, document: ConfigFile) -> Config:
     given = document.given
     values = _merged(DEFAULTS, given, "")
     groups = values["checks"]["prefix_only"]
-    if len(set(groups)) != len(groups) or set(groups) - set(Checks("", "", "", "").groups()):
+    if len(set(groups)) != len(groups) or set(groups) - set(_configured(Checks, values["checks"]).groups()):
         raise ConfigError(
             f"{FILE}: checks.prefix_only must name distinct groups: images, browser_whole, server_whole"
         )
@@ -1373,42 +1382,16 @@ def _load(main: Path, start: Path | None, document: ConfigFile) -> Config:
         if active.returncode:
             raise ConfigError(f"{FILE}: refresh.clear_generated cannot find the worktree")
         refresh.targets(Path(active.stdout.strip()))
-    config = Config(
+    config = _configured(
+        Config, values,
         found_repository=repository,
-        state_folder=_relative(values["state_folder"], "state_folder"),
-        worktree_setup=_relative(values["worktree_setup"], "worktree_setup"),
         refresh=refresh,
-        checks=Checks(**values["checks"]),
-        annotations=Annotations(**values["annotations"]),
-        workflows=Workflows(**values["workflows"]),
-        labels=Labels(**values["labels"]),
-        runner=Runner(
-            labels=labels,
-            identity_folder=values["runner"]["identity_folder"],
-            prefix=values["runner"]["prefix"],
-            label=label,
-            planner_label=planner_label,
-            image_build=values["runner"]["image_build"],
-            hub_cache=values["runner"]["hub_cache"],
-        ),
-        merge=Merge(scratch_prefix=scratch_prefix),
+        runner=_configured(Runner, values["runner"], labels=labels,
+                           label=label, planner_label=planner_label),
         parity=parity_of(given),
         machines=tuple(Machine(**machine) for machine in values["machines"]),
-        hunts=Hunts(areas=values["hunts"]["areas"], plans=_plans(values["hunts"]["plans"])),
-        commands=Commands(**values["commands"]),
-        hot_paths=tuple(values["hot_paths"]),
         conflict_review=ConflictReview(**values["conflict_review"])
-        if values["conflict_review"]
-        else None,
-        review=Review(
-            high_effort_paths=_patterns(
-                values["review"]["high_effort_paths"], "review.high_effort_paths"
-            )
-        ),
-        merge_train=MergeTrain(**values["merge_train"]),
-        answer_for_owner_after_minutes=values["answer_for_owner_after_minutes"],
-        cloud_wake_after_minutes=values["cloud_wake_after_minutes"],
-        cloud_pre_push=CloudPrePush(tuple(values["cloud_pre_push"]["suites"])),
+        if values["conflict_review"] else None,
         given=given,
         main=main,
         path=document.path,
@@ -1440,7 +1423,7 @@ def parity_of(given: Any) -> Parity:
         ))
         for key, value in values.items()
     }
-    return Parity(**named)
+    return _configured(Parity, named)
 
 
 @cache
@@ -1449,70 +1432,49 @@ def current() -> Config:
     return load()
 
 
-def as_dict(config: Config) -> dict[str, Any]:
-    """Every value, defaults included, in the form of the file."""
+def _conflict_values(config: Config) -> dict[str, Any] | None:
+    """Preserve legacy exports and the meaning of omitted Codex options."""
     conflict = vars(config.conflict_review).copy() if config.conflict_review else None
-    # Keep the serialized legacy shape when the program key was not supplied.
     if conflict is not None:
         supplied = config.given["conflict_review"]
         if "program" not in supplied:
             conflict.pop("program")
-        # Omitted options must still select no cutoff and Codex's configured model when read.
         if conflict["max_changed_lines"] is None:
             conflict.pop("max_changed_lines")
         if config.conflict_review.program == "codex" and "model" not in supplied:
             conflict.pop("model")
-    return {
-        "repository": config.repository,
-        "install_folder": config.given.get("install_folder"),
-        "state_folder": config.state_folder,
-        "worktree_setup": config.worktree_setup,
-        "refresh": {"clear_generated": list(config.refresh.clear_generated)},
-        "checks": vars(config.checks).copy(),
-        "annotations": vars(config.annotations).copy(),
-        "workflows": vars(config.workflows).copy(),
-        "labels": {
-            "workflow": config.labels.workflow,
-            "audited": config.labels.audited,
-            "priority": dict(config.labels.priority),
-        },
-        "runner": {
-            "labels": list(config.runner.labels),
-            "identity_folder": config.runner.identity_folder,
-            "prefix": config.runner.prefix,
-            "label": config.runner.label,
-            "planner_label": config.runner.planner_label,
-            "image_build": config.runner.image_build,
-            "hub_cache": config.runner.hub_cache,
-        },
-        "merge": vars(config.merge).copy(),
-        "parity": vars(config.parity).copy(),
-        "machines": [
-            {"name": machine.name, **({"address": machine.address} if machine.address else {})}
-            for machine in config.machines
-        ],
-        "hunts": {
-            "areas": {area: list(screens) for area, screens in config.hunts.areas.items()},
-            "plans": config.hunts.plans,
-        },
-        "commands": vars(config.commands).copy(),
-        "hot_paths": list(config.hot_paths),
-        "conflict_review": conflict,
-        "review": {"high_effort_paths": list(config.review.high_effort_paths)},
-        "merge_train": vars(config.merge_train).copy(),
-        "answer_for_owner_after_minutes": config.answer_for_owner_after_minutes,
-        "cloud_wake_after_minutes": config.cloud_wake_after_minutes,
-        "cloud_pre_push": {
-            "suites": {
-                suite.name: {
-                    key: getattr(suite, key)
-                    for key in SUITE_KEYS
-                    if getattr(suite, key) is not None
-                }
-                for suite in config.cloud_pre_push.suites
-            }
-        },
-    }
+    return conflict
+
+
+def as_dict(config: Config) -> dict[str, Any]:
+    """Every value, defaults included, in the form of the file."""
+    return _as_values(config)
+
+
+def _shell_fields(
+    config: Any, cls: type | None = None, root: Config | None = None,
+) -> Iterator[tuple[int, str, Any]]:
+    cls = cls or type(config)
+    root = root or config
+    for item in fields(cls):
+        value = config[item.name] if isinstance(config, dict) else getattr(config, item.name)
+        if setting := item.metadata.get("setting"):
+            if setting.shell is None:
+                continue
+            position, name = setting.shell
+            if setting.kind == "command":
+                value = root.command(item.name) or []
+            elif setting.kind == "areas":
+                yield position + 1, name.removesuffix("_AREAS") + "_SCREENS", [
+                    ", ".join(paths) for paths in value.values()
+                ]
+                value = list(value)
+            yield position, name, value
+            if setting.derived_shell:
+                position, name, attribute = setting.derived_shell
+                yield position, name, getattr(config, attribute)
+        elif "section" in item.metadata:
+            yield from _shell_fields(value, item.metadata["section"] or item.type, root)
 
 
 def shell(config: Config, *, posix: bool = False) -> str:
@@ -1520,50 +1482,24 @@ def shell(config: Config, *, posix: bool = False) -> str:
     repository is empty when nothing names it, and a script that needs it stops on that. With
     `posix`, for a plain sh (`workflow_config.py sh`): each list is one value, its names quoted
     for sh and joined by spaces, as Bash would write its array."""
-    values = {
-        "REPOSITORY": config.found_repository or "",
-        "STATE_FOLDER": config.state_folder,
-        "WORKTREE_SETUP": config.worktree_setup,
-        "CI_RESULT": config.checks.ci_result,
-        "CI_PLAN": config.checks.ci_plan,
-        "E2E_PLAN": config.checks.e2e_plan,
-        "IMAGES": config.checks.images,
-        "IMAGES_PLAN": config.checks.images_plan,
-        **{f"ANNOTATION_{key.upper()}": value for key, value in vars(config.annotations).items()},
-        **{f"WORKFLOW_{key.upper()}": value for key, value in vars(config.workflows).items()},
-        "LABEL_WORKFLOW": config.labels.workflow,
-        "LABEL_AUDITED": config.labels.audited,
-        **{f"PRIORITY_{key.upper()}": value for key, value in config.labels.priority.items()},
-        "IDENTITY_FOLDER": config.runner.identity_folder,
-        # Empty when the file names none.
-        "RUNNER_PREFIX": config.runner.prefix or "",
-        "RUNNER_LABEL": config.runner.label or "",
-        "RUNNER_PLANNER_LABEL": config.runner.planner_label or "",
-        "RUNNER_IMAGE_BUILD": config.runner.image_build or "",
-        "RUNNER_HUB_CACHE": config.runner.hub_cache or "",
-        "HUNT_PLANS": config.hunts.plans or "",
-        "ANSWER_FOR_OWNER_AFTER_MINUTES": str(config.answer_for_owner_after_minutes),
-        "CONFIG": str(config.path) if os.path.lexists(config.path) else "",
-        "CONFIG_JSON": json.dumps(config.given, separators=(",", ":")),
-        "INSTALL_FOLDER": str(config.install_folder) if config.install_folder else "",
-    }
-    # Clear an inherited empty export too. A discovered checkout file must not become an
-    # explicit external config for a child, which would invent an installation folder.
-    lines = ["unset SHIPLINE_CONFIG"]
-    lines += [f"SHIPLINE_{key}={shlex.quote(value)}" for key, value in values.items()]
-
     def listed(name: str, items: Iterable[str]) -> str:
         words = " ".join(shlex.quote(item) for item in items)
         return f"{name}={shlex.quote(words)}" if posix else f"{name}=({words})"
 
-    lines.append(listed("SHIPLINE_RUNNER_LABELS", config.runner.labels))
-    # The hunt areas, and at the same place in the other array the screens of each, joined.
-    areas = config.hunts.areas
-    lines.append(listed("SHIPLINE_HUNT_AREAS", areas))
-    lines.append(listed("SHIPLINE_HUNT_SCREENS", (", ".join(paths) for paths in areas.values())))
-    # Each command as its words, empty when the repository has none.
-    for name in RUN_AS_WORDS:
-        lines.append(listed(f"SHIPLINE_COMMAND_{name.upper()}", config.command(name) or []))
+    values = list(_shell_fields(config)) + [
+        (31, "CONFIG", str(config.path) if os.path.lexists(config.path) else ""),
+        (32, "CONFIG_JSON", json.dumps(config.given, separators=(",", ":"))),
+        (33, "INSTALL_FOLDER", str(config.install_folder) if config.install_folder else ""),
+    ]
+    # Clear an inherited empty export too. A discovered checkout file must not become an
+    # explicit external config for a child, which would invent an installation folder.
+    lines = ["unset SHIPLINE_CONFIG"]
+    for _, key, value in sorted(values):
+        name = f"SHIPLINE_{key}"
+        if isinstance(value, (list, tuple)):
+            lines.append(listed(name, value))
+        else:
+            lines.append(f"{name}={shlex.quote(str(value) if value is not None else '')}")
     # The main checkout, exported: every program the script starts works on the same repository,
     # whatever folder it starts in.
     lines.append(f"export SHIPLINE_REPO={shlex.quote(str(config.main))}")
@@ -1573,9 +1509,84 @@ def shell(config: Config, *, posix: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
+DOCS_COMMAND = "python3 scripts/workflow/workflow_config.py docs --write"
+_CONFIG_MARKERS = ("<!-- shipline-config:start -->", "<!-- shipline-config:end -->")
+_COMMAND_MARKERS = ("<!-- shipline-commands:start -->", "<!-- shipline-commands:end -->")
+
+
+def _example(cls: type = Config) -> dict[str, Any]:
+    """Declared key order, retaining the meaningful order of user-named maps."""
+    result = {}
+    for item in _declared_fields(cls):
+        if setting := item.metadata.get("setting"):
+            result[setting.name or item.name] = deepcopy(setting.example)
+        elif "section" in item.metadata:
+            result[item.name] = _example(item.metadata["section"] or item.type)
+    return result
+
+
+def _cell(text: str) -> str:
+    # Escape even inside code spans: Markdown table parsers still split on literal pipes.
+    return text.replace("|", "&#124;").replace("\n", " ")
+
+
+def _replace_block(text: str, markers: tuple[str, str], generated: str) -> str:
+    start, end = markers
+    if text.count(start) != 1 or text.count(end) != 1 or text.index(start) >= text.index(end):
+        raise ConfigError(f"README.md: expected one ordered pair of {start} and {end}")
+    before, after = text.split(start)
+    _, after = after.split(end)
+    return before + start + "\n" + generated + "\n" + end + after
+
+
+def documentation(root: Path) -> dict[Path, str]:
+    keys = ["| Key | Kind | What it names | Default |", "| --- | --- | --- | --- |"]
+    commands = ["| Command | Called by, with | Answers | Without it |",
+                "| --- | --- | --- | --- |"]
+    for name, setting in _declarations():
+        default = "none" if setting.default is None else "`" + json.dumps(
+            setting.default, ensure_ascii=False
+        ) + "`"
+        keys.append(f"| `{name}` | {setting.kind} | {_cell(setting.meaning)} | {_cell(default)} |")
+        if name.startswith("commands."):
+            called, answers, without = setting.command_docs or (
+                setting.meaning, "The command's output and exit code.", "No command is run."
+            )
+            commands.append("| `" + name.removeprefix("commands.") + "` | " + " | ".join(
+                _cell(value) for value in (called, answers, without)
+            ) + " |")
+    readme = root / "scripts/workflow/README.md"
+    text = _replace_block(readme.read_text(), _CONFIG_MARKERS, "\n".join(keys))
+    text = _replace_block(text, _COMMAND_MARKERS, "\n".join(commands))
+    return {root / "examples/shipline.json": json.dumps(_example(), indent=2, ensure_ascii=False) + "\n",
+            readme: text}
+
+
+def docs(*, write: bool = False) -> int:
+    root = Path(__file__).resolve().parents[2]
+    try:
+        generated = documentation(root)
+        stale = [path for path, text in generated.items()
+                 if not path.exists() or path.read_text() != text]
+        if write:
+            for path in stale:
+                path.write_text(generated[path])
+        elif stale:
+            for path in stale:
+                print(f"{path.relative_to(root)} differs from the config declarations")
+            print(f"Run {DOCS_COMMAND}")
+            return 1
+    except (ConfigError, OSError) as error:
+        print(error, file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1:] in (["docs"], ["docs", "--write"]):
+        return docs(write=sys.argv[-1] == "--write")
     if len(sys.argv) not in (2, 3) or sys.argv[1] not in ("shell", "sh", "json"):
-        print("usage: workflow_config.py shell|sh|json [folder]", file=sys.stderr)
+        print("usage: workflow_config.py shell|sh|json [folder] | docs [--write]", file=sys.stderr)
         return 2
     try:
         config = load(Path(sys.argv[2]) if len(sys.argv) == 3 else None)

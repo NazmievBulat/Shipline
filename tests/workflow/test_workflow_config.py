@@ -1,6 +1,7 @@
 """One file, `shipline.json` at the root of the main checkout, names what differs between the
 repositories that use Shipline; `workflow_config.py` reads it, key by key over its defaults."""
 
+import ast
 import hashlib
 import importlib.util
 import fcntl
@@ -43,6 +44,9 @@ _DEFAULTS = {
         "ci_plan": "CI: what to run",
         "e2e_plan": "E2E: what to run",
         "images": "Docker images",
+        "server_tests": "CI: server tests",
+        "web": "CI: web",
+        "older_version": "CI: older version on new tables",
         "dependency_audit": None,
         "advisory_annotation": None,
         "prefix_only": [],
@@ -54,7 +58,10 @@ _DEFAULTS = {
         "web_suite": "Web suite",
         "browser_suite": "Browser suite",
     },
-    "workflows": {"ci": "ci.yml", "e2e": "e2e.yml", "images": "images.yml"},
+    "workflows": {
+        "ci": "ci.yml", "e2e": "e2e.yml", "images": "images.yml",
+        "ci_name": "CI", "images_name": "Images",
+    },
     "labels": {
         "workflow": "workflow",
         "audited": "audited",
@@ -137,6 +144,17 @@ def _as_json(config: Any) -> dict[str, Any]:
     return json.loads(json.dumps(workflow_config.as_dict(config)))
 
 
+def test_ci_job_names_are_kept_in_config_defaults() -> None:
+    for filename in ("merge_gate.py", "merge_checks.py", "merge_github.py", "merge_health.py",
+                     "merge_images.py", "merge_scratch.py", "merge_squash.py", "merge_train.py",
+                     "ci_proof.py", "check_repair.py", "merge_driver.py", "ci_minutes.py"):
+        tree = ast.parse((_WORKFLOW / filename).read_text())
+        names = [(node.lineno, node.value) for node in ast.walk(tree)
+                 if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                 and node.value.startswith(("CI:", "Docker images:"))]
+        assert names == [], f"{filename} hard-codes CI job names: {names}"
+
+
 def test_without_a_file_every_value_is_its_default(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
 
@@ -154,6 +172,41 @@ def test_prefix_only_groups_are_read(tmp_path: Path, groups: list[str]) -> None:
     assert mapped["images"].workflow == "images"
     assert mapped["browser_whole"].jobs == ("playwright",)
     assert mapped["server_whole"].jobs == ("CI: server tests",)
+
+
+def test_server_whole_group_uses_the_configured_job_and_its_shards(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {"server_tests": "X"}})
+    group = workflow_config.load(repo).checks.groups()["server_whole"]
+    assert group.jobs == ("X",)
+    assert group.suite == "server_tests"
+    assert group.contains("X")
+    assert group.contains("X (2 of 3)")
+    assert not group.contains("CI: server tests")
+
+
+@pytest.mark.parametrize("key", ["server_tests", "web", "older_version"])
+@pytest.mark.parametrize("value", ["Build: tests (1 of 3)", "X (12 of 24)", "X (0 of 0)",
+                                   " (1 of 3)"])
+def test_suite_job_names_with_a_shard_suffix_are_refused(
+    tmp_path: Path, key: str, value: str,
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {key: value}})
+
+    with pytest.raises(workflow_config.ConfigError, match=rf"checks\.{key}.*shard suffix"):
+        workflow_config.load(repo)
+
+
+@pytest.mark.parametrize("key", ["server_tests", "web", "older_version"])
+@pytest.mark.parametrize("value", ["X", "Build: tests (unit)", "X (1 of 3) report"])
+def test_suite_job_names_without_a_shard_suffix_are_kept(
+    tmp_path: Path, key: str, value: str,
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {key: value}})
+
+    assert getattr(workflow_config.load(repo).checks, key) == value
 
 
 @pytest.mark.parametrize("groups", [["unknown"], ["images", "images"], "images", None, [3]])
@@ -336,7 +389,7 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 
     # The conflict reviewer is one object, named whole or left out.
-    named = {**_DEFAULTS, "conflict_review": {"effort": "", "model": "", "max_changed_lines": 0}}
+    named = {**_DEFAULTS, "conflict_review": {"effort": "", "model": "", "max_changed_lines": 0, "program": ""}}
     assert keys(example) == keys(named)
     assert example["hot_paths"]
     assert example["repository"].endswith("/example-app")
@@ -1632,7 +1685,7 @@ done = {"status": "completed", "conclusion": "success", "labels": []}
 ci = [
     {"id": 1, "name": names["ci_plan"], **done},
     {"id": 2, "name": names["ci_result"], **done},
-    {"id": 3, "name": "CI: server tests", **done},
+    {"id": 3, "name": g.CONFIG.checks.server_tests, **done},
     {"id": 8, "name": "CI: web", **done},
 ]
 e2e = [{"id": 4, "name": names["e2e_plan"], **done}, {"id": 6, "name": "playwright", **done}]
@@ -1678,7 +1731,7 @@ def _gate_reads(workflow: Workflow, names: dict[str, str]) -> dict[str, bool | N
 def test_the_gate_reads_the_named_checks_titles_workflow_files_and_runner_labels(
     workflow: Workflow,
 ) -> None:
-    default = {**_DEFAULTS["annotations"], **_DEFAULTS["checks"]}
+    default = {**_DEFAULTS["checks"], **_DEFAULTS["annotations"]}
     named = {
         "merge_tested": "Merge built",
         "files_tested": "Tree tested",
@@ -2159,3 +2212,227 @@ def test_install_only_programs_cannot_escape_the_installation_folder(
     done = _read_installation(workflow)
     assert done.returncode == 1
     assert done.stderr.startswith(str(config)) and "commands.pre_train_checks" in done.stderr
+
+
+# Captured from the loader before declarations or documentation generation changed it.
+_CONFIG_FIXTURES = Path(__file__).with_name("fixtures") / "config"
+
+
+@pytest.mark.parametrize("name", ["empty", "example", "installed"])
+def test_config_values_and_both_shell_formats_match_recorded_fixtures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    import sys
+
+    repo = _repository(tmp_path)
+    folder = repo if name != "installed" else tmp_path / "installed"
+    folder.mkdir(exist_ok=True)
+    given = {} if name == "empty" else json.loads(
+        (_CONFIG_FIXTURES / f"{name}.input.json").read_text()
+    )
+    if name == "installed":
+        (folder / "tools").mkdir()
+        (folder / "tools/conflicts.py").write_text(
+            "def resolve(*args): pass\ndef renumber(*args): pass\ndef taken(*args): pass\n"
+        )
+    path = folder / "shipline.json"
+    path.write_text(json.dumps(given))
+    monkeypatch.setenv("SHIPLINE_CONFIG", str(path))
+    monkeypatch.setenv("SHIPLINE_REPO", str(repo))
+    workflow_config.current.cache_clear()
+    try:
+        config = workflow_config.current()
+        expected = json.loads((_CONFIG_FIXTURES / f"{name}.json").read_text())
+        assert _as_json(config) == expected["values"]
+        for mode in ("shell", "sh"):
+            text = workflow_config.shell(config, posix=mode == "sh")
+            for actual, marker in (
+                (str(repo), "<checkout>"), (str(folder), "<install>"),
+                (str(_WORKFLOW), "<workflow>"), (sys.executable, "<python>"),
+            ):
+                text = text.replace(actual, marker)
+            assert text == expected[mode]
+    finally:
+        workflow_config.current.cache_clear()
+
+
+def test_config_documentation_is_current() -> None:
+    done = subprocess.run(
+        ["python3", str(_WORKFLOW / "workflow_config.py"), "docs"],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr + (
+        "\nRun python3 scripts/workflow/workflow_config.py docs --write"
+    )
+
+
+def test_docs_write_repairs_drift_without_reading_a_repository_config(tmp_path: Path) -> None:
+    import shutil
+
+    root = tmp_path / "source"
+    scripts = root / "scripts/workflow"
+    scripts.mkdir(parents=True)
+    (root / "examples").mkdir()
+    for source, target in (
+        (_WORKFLOW / "workflow_config.py", scripts / "workflow_config.py"),
+        (_WORKFLOW / "README.md", scripts / "README.md"),
+        (_WORKFLOW.parents[1] / "examples/shipline.json", root / "examples/shipline.json"),
+    ):
+        shutil.copyfile(source, target)
+    example = root / "examples/shipline.json"
+    example.write_text("{}\n")
+    readme = scripts / "README.md"
+    readme.write_text(readme.read_text().replace("| `state_folder`", "| `stale_folder`"))
+    env = {**os.environ, "SHIPLINE_CONFIG": str(root / "missing.json")}
+
+    def docs(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["python3", str(scripts / "workflow_config.py"), "docs", *args],
+            cwd=tmp_path, env=env, capture_output=True, text=True, check=False, timeout=30,
+        )
+
+    refused = docs()
+    assert refused.returncode == 1
+    assert "python3 scripts/workflow/workflow_config.py docs --write" in refused.stdout
+    assert "examples/shipline.json" in refused.stdout
+    assert "scripts/workflow/README.md" in refused.stdout
+    written = docs("--write")
+    assert written.returncode == 0, written.stdout + written.stderr
+    assert docs().returncode == 0
+    before = example.read_bytes(), readme.read_bytes()
+    assert docs("--write").returncode == 0
+    assert (example.read_bytes(), readme.read_bytes()) == before
+
+
+_CONFIG_ERRORS = json.loads((_CONFIG_FIXTURES / "errors.json").read_text())
+
+
+@pytest.mark.parametrize("case", _CONFIG_ERRORS, ids=[case["key"] for case in _CONFIG_ERRORS])
+def test_config_refusals_keep_their_recorded_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: dict[str, Any]
+) -> None:
+    repo = _repository(tmp_path)
+    path = repo / "shipline.json"
+    monkeypatch.setenv("SHIPLINE_CONFIG", str(path))
+    _write(repo, case["given"])
+    with pytest.raises(workflow_config.ConfigError) as refused:
+        workflow_config.load(repo)
+    assert str(refused.value).replace(str(path), "<config>") == case["message"]
+
+
+def test_generated_config_keeps_the_original_examples_values(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    original = json.loads((_CONFIG_FIXTURES / "example.input.json").read_text())
+    generated = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
+    assert generated == original
+    _write(repo, generated)
+    expected = json.loads((_CONFIG_FIXTURES / "example.json").read_text())
+    assert _as_json(workflow_config.load(repo)) == expected["values"]
+
+
+def test_generated_key_and_command_lists_are_sorted_and_complete() -> None:
+    text = (_WORKFLOW / "README.md").read_text()
+    keys = text.split("<!-- shipline-config:start -->")[1].split("<!-- shipline-config:end -->")[0]
+    names = [line.split("`")[1] for line in keys.splitlines() if line.startswith("| `")]
+    assert names == sorted(names)
+    assert len(names) == len(set(names))
+    commands = text.split("<!-- shipline-commands:start -->")[1].split("<!-- shipline-commands:end -->")[0]
+    names = [line.split("`")[1] for line in commands.splitlines() if line.startswith("| `")]
+    assert names == sorted(workflow_config.DEFAULTS["commands"])
+
+
+def test_one_new_declaration_drives_defaults_validation_exports_and_docs(tmp_path: Path) -> None:
+    import shutil
+
+    root = tmp_path / "source"
+    scripts = root / "scripts/workflow"
+    scripts.mkdir(parents=True)
+    (root / "examples").mkdir()
+    script = scripts / "workflow_config.py"
+    shutil.copyfile(_WORKFLOW / "workflow_config.py", script)
+    shutil.copyfile(_WORKFLOW / "README.md", scripts / "README.md")
+    source = script.read_text()
+    source = source.replace(
+        "    prefix_only: list[str] = option(",
+        "    neutral_check: str = option('name', 'Neutral check', 'A neutral check.', "
+        "shell=(60, 'NEUTRAL_CHECK'))\n    prefix_only: list[str] = option(",
+        1,
+    )
+    script.write_text(source)
+    spec = importlib.util.spec_from_file_location("extended_config", script)
+    assert spec and spec.loader
+    extended = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(extended)
+    repo = _repository(tmp_path)
+    _write(repo, {})
+    config = extended.load(repo)
+    assert config.checks.neutral_check == "Neutral check"
+    assert extended.as_dict(config)["checks"]["neutral_check"] == "Neutral check"
+    for posix in (False, True):
+        assert "SHIPLINE_NEUTRAL_CHECK='Neutral check'\n" in extended.shell(config, posix=posix)
+    _write(repo, {"checks": {"neutral_check": "Named check"}})
+    assert extended.load(repo).checks.neutral_check == "Named check"
+    _write(repo, {"checks": {"neutral_check": False}})
+    with pytest.raises(extended.ConfigError, match="checks.neutral_check must be a name, not false"):
+        extended.load(repo)
+    done = subprocess.run(
+        ["python3", str(script), "docs", "--write"],
+        env=_GIT_ENV, capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads((root / "examples/shipline.json").read_text())["checks"]["neutral_check"] == "Neutral check"
+    assert '| `checks.neutral_check` | name | A neutral check. | `"Neutral check"` |' in (
+        scripts / "README.md"
+    ).read_text()
+
+
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "reversed"])
+def test_docs_refuses_broken_markers_before_writing_anything(tmp_path: Path, damage: str) -> None:
+    import shutil
+
+    root = tmp_path
+    scripts = root / "scripts/workflow"
+    scripts.mkdir(parents=True)
+    (root / "examples").mkdir()
+    shutil.copyfile(_WORKFLOW / "workflow_config.py", scripts / "workflow_config.py")
+    original = (_WORKFLOW / "README.md").read_text()
+    start, end = "<!-- shipline-commands:start -->", "<!-- shipline-commands:end -->"
+    if damage == "missing":
+        changed = original.replace(start, "")
+    elif damage == "duplicate":
+        changed = original + "\n" + start
+    else:
+        changed = original.replace(start, "temporary marker").replace(end, start).replace(
+            "temporary marker", end
+        )
+    (scripts / "README.md").write_text(changed)
+    example = root / "examples/shipline.json"
+    example.write_text("{}\n")
+    done = subprocess.run(
+        ["python3", str(scripts / "workflow_config.py"), "docs", "--write"],
+        env=_GIT_ENV, capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert done.returncode == 1
+    assert "expected one ordered pair" in done.stderr
+    assert (scripts / "README.md").read_text() == changed
+    assert example.read_text() == "{}\n"
+
+
+def test_config_sections_keep_existing_positional_constructors() -> None:
+    checks = workflow_config.Checks("result", "ci", "e2e", "images", "audit", "notice", ["images"])
+    assert (checks.ci_result, checks.ci_plan, checks.e2e_plan, checks.images) == (
+        "result", "ci", "e2e", "images"
+    )
+    assert (checks.dependency_audit, checks.advisory_annotation, checks.prefix_only) == (
+        "audit", "notice", ["images"]
+    )
+    runner = workflow_config.Runner(("runner",), "identity", "prefix", "label", "planner", "build", "cache")
+    assert (runner.labels, runner.identity_folder, runner.prefix, runner.label,
+            runner.planner_label, runner.image_build, runner.hub_cache) == (
+        ("runner",), "identity", "prefix", "label", "planner", "build", "cache"
+    )
+    parity = workflow_config.Parity("workflow-tests", "runner-tests", "known")
+    assert (parity.workflow_tests, parity.runner_tests, parity.known) == (
+        "workflow-tests", "runner-tests", "known"
+    )
+    assert workflow_config.CloudPrePush().suites == ()

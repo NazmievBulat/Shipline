@@ -25,6 +25,7 @@ def _batch_ready(pull: dict[str, Any], base: str, *, settling: bool = False) -> 
     from merge_gate import (
         CONFIG,
         _passing_rollup,
+        checks,
         command,
         conflicting,
         git,
@@ -54,8 +55,8 @@ def _batch_ready(pull: dict[str, Any], base: str, *, settling: bool = False) -> 
     # compatibility check depends on this member's own base; keep it on the single
     # path instead of comparing the old application of a combined prefix.
     if any(
-        job["name"] == "CI: older version on new tables" and job.get("conclusion") != "skipped"
-        for job in parts
+        job["name"] == CONFIG.checks.older_version and job.get("conclusion") != "skipped"
+        for job in checks(parts)
     ) and git(
         "diff", "--name-only", f"{base}...{head}", "--",
         "migrations/versions",

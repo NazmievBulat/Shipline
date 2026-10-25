@@ -50,6 +50,8 @@ def test_tick_hands_finished_worker_to_reviewer(workflow: Workflow) -> None:
     assert done.returncode == 0, done.stderr
     assert not workflow.is_running("ticket-7")
     assert workflow.is_running("review-7")
+    assert done.stdout.splitlines().count("review-7 started") == 1
+    assert not any(line.startswith("review-7 started:") for line in done.stdout.splitlines())
     merges = [c for c in workflow.calls("gh") if c.startswith("gh pr merge ") or "/merge" in c]
     assert merges == []
 

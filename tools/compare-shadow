@@ -8,7 +8,14 @@
 current folder by default), `--wake` the real tick's wake log (`~/.local/state/workflow/wake.log`
 by default), and `--journal` what the real tick printed, as `journalctl -o short-unix` shows it:
 
-    journalctl --user -u workflow-tick.service -o short-unix --since -1d >tick.journal
+    {
+      journalctl --user -t tick -o short-unix --since -1d
+      journalctl --user -u workflow-tick.service -o short-unix --since -1d
+    } | LC_ALL=C sort -n | uniq >tick.journal
+
+The identifier keeps child messages recorded without unit fields; the unit keeps systemd's
+start and finish lines. Use the same time window for both, sort by time, and remove exact
+duplicate lines. `sort -n -u` would also drop distinct messages with the same timestamp.
 
 A time is seconds since the epoch or an ISO date and time, read in the machine's zone. The
 hours compared run from the first shadow tick of the log to its last, or as `--from` and
@@ -46,11 +53,10 @@ is compared only once its real tick has run: within `--window` seconds of it, th
 end at the one before it.
 
 What only one side logs is not compared: the real installation's merge gate and automatic
-ticket starts, which a shadow tick does not run, the nudge of a session whose pull request the
-merge driver merged in a batch, and its worktree cleanup; a reviewer's start, which the real
-tick prints no line for (`reviewer_start.py` keeps the session's words to itself); and the
-train status a shadow tick notes for explaining a difference. Without `--journal` the lines of
-the session commands are not compared either.
+ticket starts, which a shadow tick does not run; the nudge of a session whose pull request the
+merge driver merged in a batch, and its worktree cleanup; and the train status a shadow tick
+notes for explaining a difference. Without `--journal` the lines of the session commands are
+not compared either.
 
 Some differences follow from what a shadow tick does not run, or from the 75 to 100 seconds
 between the two clocks, and are explained by them, not counted as timing: a nudge for a new
@@ -105,7 +111,7 @@ _SESSION_LINES = [
     (re.compile(rf"^(?P<who>{_NAME}) was sent its instruction again$"), None),
     (re.compile(r"^(?P<who>ticket-\d+): its bridge was started again$"), None),
     (
-        re.compile(r"^(?P<who>(?:ticket|cloud)-\d+|analyst-[a-z0-9][a-z0-9-]*) started(?:: .*)?$"),
+        re.compile(r"^(?P<who>(?:ticket|review|cloud)-\d+|analyst-[a-z0-9][a-z0-9-]*) started(?:: .*)?$"),
         "{who} started",
     ),
     (re.compile(r"^the daily (?P<who>analyst) waits: .*$"), None),
@@ -380,7 +386,15 @@ def _shown(at: float) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="List every decision a shadow tick and the real tick took differently."
+        description="List every decision a shadow tick and the real tick took differently.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Export both child messages and the service's systemd start and finish lines:
+  {
+    journalctl --user -t tick -o short-unix --since -1d
+    journalctl --user -u workflow-tick.service -o short-unix --since -1d
+  } | LC_ALL=C sort -n | uniq >tick.journal
+Use the same time window for both exports. Remove exact duplicate lines with uniq;
+sort -n -u would also drop distinct messages with the same timestamp.""",
     )
     parser.add_argument("--shadow", type=Path, default=Path(".local/shipline/shadow.log"))
     parser.add_argument("--wake", type=Path, default=Path.home() / ".local/state/workflow/wake.log")

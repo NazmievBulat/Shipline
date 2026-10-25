@@ -98,7 +98,7 @@ IMAGES_PLAN = CONFIG.checks.images_plan
 NOTES = CONFIG.annotations
 # The job that audits the dependencies, and the title of the notice it writes on main when only
 # advisories failed it. With no notice named, an advisory on main makes main red as before.
-DEPENDENCIES = CONFIG.checks.dependency_audit or "CI: dependencies"
+DEPENDENCIES = CONFIG.checks.dependency_job
 ADVISORIES_ONLY = CONFIG.checks.advisory_annotation
 # The workflow files, by the gate's own names for them.
 WORKFLOW_FILES = {

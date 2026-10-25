@@ -7,6 +7,29 @@ import sys
 from workflow_harness import Workflow
 
 
+def test_ci_minutes_uses_configured_workflow_run_names(workflow: Workflow) -> None:
+    (workflow.repo / "shipline.json").write_text(json.dumps({
+        "workflows": {"ci_name": "Build", "images_name": "Containers"},
+    }))
+    script = workflow.repo / "measure.py"
+    script.write_text('''import json, sys
+sys.path.insert(0, "scripts/workflow")
+from ci_minutes import summarize
+job = {"runner_name": "runner", "started_at": "2026-10-23T01:00:00Z",
+       "completed_at": "2026-10-23T01:01:00Z"}
+runs = [{"name": name, "event": "pull_request", "conclusion": "failure",
+         "jobs": [job]} for name in ("Build", "Containers", "CI", "Images")]
+print(json.dumps(summarize(runs, "2026-10-23T01:00:00Z", "2026-10-23T01:10:00Z")))
+''')
+    done = subprocess.run([sys.executable, str(script)], cwd=workflow.repo, env=workflow.env,
+                          capture_output=True, text=True, check=False, timeout=60)
+    assert done.returncode == 0, done.stderr
+    result = json.loads(done.stdout)
+    assert result["runner_minutes"] == 4
+    assert result["categories_minutes"]["pr_ci_failed"] == 1
+    assert result["categories_minutes"]["pr_images"] == 1
+
+
 def test_ci_minutes_clips_jobs_and_keeps_overlapping_categories(workflow: Workflow) -> None:
     script = workflow.repo / "measure.py"
     script.write_text("""import json

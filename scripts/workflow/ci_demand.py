@@ -165,7 +165,7 @@ class Runs:
         runs.sort(key=lambda run: (run.get("created_at") or "", run["id"]), reverse=True)
         found = None
         unreadable = False
-        for workflow in vars(CONFIG.workflows).values():
+        for workflow in (CONFIG.workflows.ci, CONFIG.workflows.e2e, CONFIG.workflows.images):
             own = [run for run in runs if _workflow_file(run) == workflow][:RUNS_LOOKED_AT]
             for run in own:
                 if run["id"] in self.skipped:

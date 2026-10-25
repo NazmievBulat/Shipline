@@ -137,6 +137,50 @@ def test_tick_starts_conflict_sentence_only_with_passed_handed_off_head(
     assert scope.exists() == (review == "passed")
 
 
+@pytest.mark.parametrize("new_head", [False, True])
+def test_a_conflict_reviewer_is_nudged_only_for_a_later_conflicting_head(
+    handed: GitHub, new_head: bool
+) -> None:
+    workflow = handed.workflow
+    head, main = _conflict(workflow)
+    handed.head, handed.base = head, main
+    handed.pulls["7"].update(headRefOid=head, mergeable="CONFLICTING")
+    handed.main()
+    handed.ci(main, head, tested_base=workflow.git("merge-base", main, head))
+    (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {head}\n")
+    note = _folder(workflow) / "merge-wanted-7"
+    data = json.loads(note.read_text())
+    data["head"] = head
+    note.write_text(json.dumps(data))
+    _publish(handed, head=head)
+
+    started = workflow.run_script("tick")
+    assert started.returncode == 0, started.stdout + started.stderr
+    assert "Review conflict resolution for pull request 7" in " ".join(
+        session_arguments(workflow.state, "review-7")
+    )
+    # The reviewer resolves the merge, while GitHub still reports the passed head.
+    resolved = _resolve(workflow)
+    _idle(workflow, "review-7")
+    workflow.screen(
+        "● Checking the resolution.\n" + "─" * 40 + "\n> \n" + "─" * 40 + "\n",
+        "review-7",
+    )
+    if new_head:
+        handed.pulls["7"]["headRefOid"] = resolved
+        (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {resolved}\n")
+        handed.save()
+
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    nudges = workflow.calls("tmux review-7 send-keys -t =review-7: -l GitHub reports")
+    assert len(nudges) == int(new_head)
+    if new_head:
+        assert f"merge conflict on {resolved}" in nudges[0]
+
+
 @pytest.mark.parametrize("state", ["unresolved", "resolved", "moved on", "no worktree"])
 def test_a_scope_names_the_conflict_only_while_the_worktree_holds_its_merge(
     workflow: Workflow, state: str

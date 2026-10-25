@@ -69,7 +69,7 @@ def squash_proof(
         if workflow == "ci":
             # The web job can pass with only lint, or without its story tests. Main needs both.
             if (NOTES.web_suite, "whole") not in _planner_notes(parts, CI_PLAN):
-                passed = [name for name in passed if name != "CI: web"]
+                passed = [name for name in passed if name != CONFIG.checks.web]
         sources.append({"workflow": workflow, "run": run["id"], "jobs": passed})
     return RECEIPT + json.dumps(
         {"base": base, "tree": tree, "sources": sources}, separators=(",", ":")
