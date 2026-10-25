@@ -1039,14 +1039,10 @@ class Prefix:
 
 def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
     from merge_gate import (
-        CONFIG,
-        IMAGES_PLAN,
-        NOTES,
         Prefix,
         Refused,
         Waiting,
         _batch_runs,
-        _planner_notes,
         _proves_whole,
         _queue_recovery_pending,
         _queued_prefix,
@@ -1149,8 +1145,6 @@ def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
             else whole_suite(found[0], parts, tree)
             if workflow == "e2e"
             else _proves_whole("images", found[0], parts, {"tree": tested_tree})
-            if "images" in CONFIG.checks.prefix_only
-            else (NOTES.files_tested, tested_tree) in _planner_notes(parts, IMAGES_PLAN)
         ) or (borrowed and not complete_image_jobs(parts)):
             if borrowed:
                 return replacement_images()

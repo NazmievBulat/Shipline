@@ -1613,9 +1613,10 @@ def test_deferred_images_require_passing_proof_on_the_tested_tree(
     assert not (github.workflow.state / "merged").exists()
 
 
-def test_a_deferred_image_prefix_cannot_pass_with_only_its_planner(github: GitHub) -> None:
+@pytest.mark.parametrize("deferred", [False, True])
+def test_an_image_prefix_cannot_pass_with_only_its_planner(github: GitHub, deferred: bool) -> None:
     _batch_setup(github, count=2, images=True, selected=True)
-    _prefix_only(github, ["images"])
+    _prefix_only(github, ["images"] if deferred else [])
     assert _batch_call(github).returncode == 3
     _finish_batch(github)
     scratch = _scratch(github)
