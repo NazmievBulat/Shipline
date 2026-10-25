@@ -877,6 +877,7 @@ def test_a_lost_shared_result_after_its_member_merged_waits_for_main(github: Git
             "&event=workflow_dispatch&per_page=100")
     if lost == "failed":
         github.api[path]["workflow_runs"][0]["conclusion"] = "failure"
+        github.api[f"{_REPO}/actions/runs/110"]["conclusion"] = "failure"
     else:
         github.api[path]["workflow_runs"] = []
         github.api.pop(f"{_REPO}/actions/runs/110")

@@ -981,15 +981,20 @@ def _start_prefixes(train: Train) -> None:
         if scratch is None:
             continue
         if "images" not in scratch["workflows"]:
-            # A former source can be replaced by a nearer prefix's fallback image run.
+            # Follow the nearest prefix's replacement, including a main push proof.
             previous = next((m for m in reversed(members[:members.index(member)])
                              if m["number"] in member["ahead"] and m["scratch"]
-                             and "images" in m["scratch"]["workflows"]), None)
-            if previous and not image_difference(previous["tree"], member["tree"])[1]:
-                scratch["image_source"] = {
-                    "number": previous["number"], "tree": previous["tree"],
-                    "scratch": previous["scratch"],
-                }
+                             and ("images" in m["scratch"]["workflows"]
+                                  or m["scratch"].get("image_source"))), None)
+            if previous:
+                source = (
+                    {"number": previous["number"], "tree": previous["tree"],
+                     "scratch": previous["scratch"]}
+                    if "images" in previous["scratch"]["workflows"]
+                    else previous["scratch"]["image_source"]
+                )
+                if not image_difference(source["tree"], member["tree"])[1]:
+                    scratch["image_source"] = source
         if not scratch["pushed"] and started >= train.window:
             continue
         try:
@@ -1116,8 +1121,8 @@ def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
             or workflow_verdict(workflow, found[0], parts)[0] == "red"
             or changed_images
         ):
-            # A merged or dropped source with no usable result cannot leave this prefix
-            # waiting forever or authorize a merge. Its own images replace that proof.
+            # A merged or dropped source cannot authorize a merge. Replace it with
+            # main's push proof or a scratch run that can actually select image tests.
             return replacement_images()
         if not found:
             pending.append(f"waiting for {workflow} of {whose} to start")
