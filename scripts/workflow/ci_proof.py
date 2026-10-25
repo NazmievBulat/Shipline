@@ -47,6 +47,7 @@ the wake's daily savings report. Scratch dispatches and main defer nothing.
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -58,6 +59,7 @@ from pathlib import Path
 from typing import Any
 
 import workflow_config
+from merge_images import path_filter, pull_request_paths
 
 # The squash's proof line, and the line of a refresh commit that asks CI for every suite whole.
 RECEIPT = "Workflow-Proof: "
@@ -205,6 +207,36 @@ def read(path: str, key: str | None = None, *, paginate: bool = True) -> Any:
     return pages[0]
 
 
+def image_tree_difference(before: str, after: str, api: Callable[..., Any]) -> list[str] | None:
+    """Image-neutral differences, or None when a tree or the filter cannot prove reuse.
+
+    Recursive Git trees include deletions, modes and both sides of renames without the
+    compare API's file limit. A truncated tree proves nothing.
+    """
+    if before == after:
+        return []
+    config = workflow_config.current()
+
+    def files(tree: str) -> dict[str, tuple[str, str, str]]:
+        listing = api(f"{config.api}/git/trees/{tree}?recursive=1")
+        if listing.get("truncated") is not False:
+            raise Unreadable("image inheritance needs complete trees")
+        return {entry["path"]: (entry["type"], entry["mode"], entry["sha"])
+                for entry in listing["tree"] if entry["type"] != "tree"}
+
+    old, new = files(before), files(after)
+    changed = sorted(path for path in old.keys() | new.keys() if old.get(path) != new.get(path))
+    workflow = f".github/workflows/{config.workflows.images}"
+    if workflow not in old or old.get(workflow) != new.get(workflow):
+        return None
+    blob = api(f"{config.api}/git/blobs/{old[workflow][2]}")
+    if blob.get("encoding") != "base64":
+        return None
+    text = base64.b64decode("".join(blob["content"].split()), validate=True).decode("utf-8")
+    matches = path_filter(pull_request_paths(text, error=Unreadable))
+    return None if any(matches(path) for path in changed) else changed
+
+
 def _source_jobs(source: dict[str, Any], tree: str, api: Callable[..., Any]) -> dict[str, int]:
     """The jobs a run named by a proof passed on `tree`: none unless its notes prove that tree.
 
@@ -240,8 +272,11 @@ def _source_jobs(source: dict[str, Any], tree: str, api: Callable[..., Any]) -> 
             return {}
     elif workflow == "e2e" and not {(titles.files_tested, tree), (titles.browser_suite, "whole")} <= noted:
         return {}
-    elif workflow == "images" and (titles.files_tested, tree) not in noted:
-        return {}
+    elif workflow == "images":
+        trees = [message for title, message in noted if title == titles.files_tested]
+        if (len(trees) != 1 or not _SHA.fullmatch(trees[0])
+                or image_tree_difference(trees[0], tree, api) is None):
+            return {}
     passed = passed_jobs(parts)
     return {
         job: source["run"]

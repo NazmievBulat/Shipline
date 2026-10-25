@@ -54,16 +54,14 @@ def squash_proof(
     evidence: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]],
 ) -> str:
     """The `Workflow-Proof` line of a squash, or none where the repository writes no proof."""
-    from merge_gate import CI_PLAN, CONFIG, NOTES, RECEIPT, _planner_notes, passed_jobs
+    from merge_gate import CI_PLAN, NOTES, RECEIPT, _planner_notes, passed_jobs
 
     if RECEIPT is None:
         return ""
     sources = []
     for key, (run, parts) in evidence.items():
         workflow = key.split("_", 1)[0]
-        if workflow not in ("ci", "e2e") and not (
-            workflow == "images" and "images" in CONFIG.checks.prefix_only
-        ):
+        if workflow not in ("ci", "e2e", "images"):
             continue
         passed = sorted(passed_jobs(parts))
         if workflow == "ci":

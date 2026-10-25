@@ -68,7 +68,8 @@ tool error or an advisory service that did not answer, leaves main red. A pull r
 audit still refuses an advisory main does not have, and passes over one main has, with a
 warning. After a squash, main inherits the green result
 of the identical tree tested by the pull request CI for each CI job that run passed, and
-images when every image job passed on that same tree; the gate records the source runs. A CI
+images when every image job passed on that tree or a tree whose differences match none of
+the image workflow's path filter; the gate records the source run and differing files. A CI
 job the pull request skipped, which main always runs, waits for main's own success, and
 nothing merges meanwhile, so no later push cancels that run. The squash commit carries the
 gate's proof (a `Workflow-Proof` line): main's CI and E2E skip a job that line shows passed,
@@ -78,7 +79,8 @@ whole, on the identical tree, and name the run they inherited.
 For a listed group, a pull request's ready, push and refresh runs keep the fast checks and
 the tests selected by its change; the whole group runs only on its prefix or, for a first
 member merging alone, the gate's scratch branch. The gate waits for that scratch proof,
-records it in the squash and lets main inherit it on the identical tree, including image jobs.
+records it in the squash and lets main inherit it on the identical tree. Image jobs may also
+be inherited across image-neutral differences, verified against the image workflow's filter.
 A group the path filters need none of runs nowhere; an absent or empty list keeps the usual
 checks. The wake reports the previous UTC day's runner minutes saved once a day: each
 merged pull request's proven scratch group job minutes times its own CI runs whose planner
@@ -111,7 +113,13 @@ one's squash; a hot path never moves a member past another priority. A pull requ
 label changes while it waits moves at the next turn. The gate tests the first members of
 the line at once, each as a prefix: main and every member ahead of it, merged with this one,
 on a scratch branch of its own, with its CI, the whole browser suite's E2E run and any
-required image checks. The gate's first run of a prefix takes main's runners when the
+required image checks. A prefix runs images for its own change relative to the prefix ahead
+of it (main for the first member). Otherwise it borrows the nearest preceding prefix's image
+proof, or main's proof when no preceding prefix ran images. It merges only after that source
+passed. With no usable source, including an image change ahead merged by its own checks,
+it runs images itself. A rebuilt source replaces the borrowed proof; dropped dependent
+prefixes are rebuilt as before. The nightly image run of main remains the backstop for
+changes outside the filter. The gate's first run of a prefix takes main's runners when the
 repository has them and one is free, in a lane of its own that a push to main goes ahead of, so
 a prefix never waits behind pull requests' own CI.
 A scratch CI or E2E job asking for `<label>-main-batch` that queues

@@ -279,6 +279,8 @@ def _batch_signal(train: Train) -> None:
         _batch_service_answered,
         _queued_prefix,
         _suite_workflows,
+        prefix_image_source,
+        image_source_runs,
     )
 
     members = train.prefixes["members"] if train.prefixes else []
@@ -296,8 +298,14 @@ def _batch_signal(train: Train) -> None:
             for workflow in _suite_workflows(record)
             for run in _batch_runs(record, workflow)
         ]
+        member = next((m for m in members if m["scratch"] is record), None)
+        source = prefix_image_source(member, train) if member else None
+        if source:
+            record["image_source"] = source
+            found += [("images", run) for run in image_source_runs(source)]
         for workflow, run in found:
-            _queued_prefix(train, record, workflow, run, quiet=True)
+            if not (source and workflow == "images"):
+                _queued_prefix(train, record, workflow, run, quiet=True)
         signal = [
             [
                 workflow,
@@ -630,14 +638,32 @@ def _proves_on(scratch: dict[str, Any], base: str) -> bool:
     return git("rev-parse", f"{base}^{{tree}}") == scratch["under"]
 
 
-def _prefix_scratch(commit: str, base: str, under: str) -> dict[str, Any]:
+def _prefix_scratch(
+    commit: str, base: str, under: str, image_source: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """A prefix's scratch branch, before it is pushed: `commit` is main and the members ahead,
     merged with this member; `under`, the tree it was put on."""
-    from merge_gate import SCRATCH_PREFIX, browser_needed, images_needed
+    from merge_gate import (
+        SCRATCH_PREFIX, WORKFLOW_FILES, Refused, Waiting, browser_needed, git,
+        image_difference, main_image_source,
+    )
 
     workflows = ["ci"]
-    if images_needed(commit, base, []):
-        workflows.append("images")
+    source = None
+    path = f".github/workflows/{WORKFLOW_FILES['images']}"
+    if git("ls-tree", "--name-only", commit, "--", path):
+        if not image_difference(under, commit)[1]:
+            source = image_source or main_image_source(base)
+            if source:
+                try:
+                    if image_difference(source["tree"], commit)[1]:
+                        source = None
+                except Waiting:
+                    raise
+                except Refused:
+                    source = None
+        if source is None:
+            workflows.append("images")
     # Each member's own E2E run may have been a selection; a prefix runs the whole suite.
     if browser_needed(base, commit):
         workflows.append("e2e")
@@ -648,6 +674,7 @@ def _prefix_scratch(commit: str, base: str, under: str) -> dict[str, Any]:
         "workflows": workflows,
         "requested": [],
         "pushed": False,
+        **({"image_source": source} if source else {}),
     }
 
 
@@ -748,7 +775,16 @@ def _extend_line(train: Train, base: str, fresh: bool) -> None:
                 f"chore: test merge train pull request {number}",
             )
             own = fresh and starting and not added and number == first
-            scratch = None if own else _prefix_scratch(current, base, under)
+            previous = (members + added)[-1] if members or added else None
+            source = None
+            if previous and previous["scratch"]:
+                source = (
+                    {"number": previous["number"], "tree": previous["tree"],
+                     "scratch": previous["scratch"]}
+                    if "images" in previous["scratch"]["workflows"]
+                    else previous["scratch"].get("image_source")
+                )
+            scratch = None if own else _prefix_scratch(current, base, under, source)
         added.append(
             {
                 "number": number,
@@ -925,7 +961,7 @@ def _start_prefixes(train: Train) -> None:
 
     Only the first member's prefix decides this call: a later one that cannot start yet is
     tried again at the next call, and never keeps a member ahead of it from merging."""
-    from merge_gate import Refused, _dispatch_scratch, _drop_prefix, _push_scratch
+    from merge_gate import Refused, _dispatch_scratch, _drop_prefix, _push_scratch, image_difference
 
     members = train.prefixes["members"] if train.prefixes else []
     started = sum(m["scratch"] is None or m["scratch"]["pushed"] for m in members)
@@ -933,6 +969,16 @@ def _start_prefixes(train: Train) -> None:
         scratch = member["scratch"]
         if scratch is None:
             continue
+        if "images" not in scratch["workflows"]:
+            # A former source can be replaced by a nearer prefix's fallback image run.
+            previous = next((m for m in reversed(members[:members.index(member)])
+                             if m["number"] in member["ahead"] and m["scratch"]
+                             and "images" in m["scratch"]["workflows"]), None)
+            if previous and not image_difference(previous["tree"], member["tree"])[1]:
+                scratch["image_source"] = {
+                    "number": previous["number"], "tree": previous["tree"],
+                    "scratch": previous["scratch"],
+                }
         if not scratch["pushed"] and started >= train.window:
             continue
         try:
@@ -1005,8 +1051,12 @@ def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
         _queue_recovery_pending,
         _queued_prefix,
         batch_service_wait,
+        complete_image_jobs,
         git,
         jobs,
+        image_difference,
+        image_source_runs,
+        prefix_image_source,
         whole_suite,
         workflow_verdict,
     )
@@ -1017,14 +1067,45 @@ def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
     evidence: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
     pending: list[str] = []
     short: list[str] = []
-    for workflow in scratch["workflows"]:
-        found = _batch_runs(scratch, workflow)
+
+    def replacement_images() -> Prefix:
+        scratch.pop("image_source", None)
+        scratch["workflows"].append("images")
+        train.save()
+        return Prefix("pending", f"waiting for replacement images of {whose}", evidence)
+
+    source = prefix_image_source(member, train)
+    work = [(workflow, scratch, tree) for workflow in scratch["workflows"]]
+    if source:
+        work.append(("images", source.get("scratch"), source["tree"]))
+    elif "image_source" in scratch:
+        return replacement_images()
+    for workflow, tested, tested_tree in work:
+        borrowed = workflow == "images" and source is not None
+        found = image_source_runs(source) if borrowed else _batch_runs(tested, workflow)
+        try:
+            parts = jobs(found[0]) if found else []
+            changed_images = borrowed and image_difference(tested_tree, tree)[1]
+        except Waiting:
+            raise
+        except Refused:
+            if borrowed:
+                return replacement_images()
+            raise
+        if borrowed and (
+            not found
+            or workflow_verdict(workflow, found[0], parts)[0] == "red"
+            or changed_images
+        ):
+            # A merged or dropped source with no usable result cannot leave this prefix
+            # waiting forever or authorize a merge. Its own images replace that proof.
+            return replacement_images()
         if not found:
             pending.append(f"waiting for {workflow} of {whose} to start")
             continue
-        _queued_prefix(train, scratch, workflow, found[0], quiet=False)
-        parts = jobs(found[0])
-        if _queue_recovery_pending(scratch, found[0]):
+        if not borrowed:
+            _queued_prefix(train, scratch, workflow, found[0], quiet=False)
+        if not borrowed and _queue_recovery_pending(scratch, found[0]):
             pending.append(f"waiting for {workflow} queue recovery of {whose}")
             continue
         state, failing = workflow_verdict(workflow, found[0], parts)
@@ -1067,10 +1148,12 @@ def _prefix_state(member: dict[str, Any], train: Train) -> Prefix:
             if workflow == "ci"
             else whole_suite(found[0], parts, tree)
             if workflow == "e2e"
-            else _proves_whole("images", found[0], parts, {**scratch, "tree": tree})
+            else _proves_whole("images", found[0], parts, {"tree": tested_tree})
             if "images" in CONFIG.checks.prefix_only
-            else (NOTES.files_tested, tree) in _planner_notes(parts, IMAGES_PLAN)
-        ):
+            else (NOTES.files_tested, tested_tree) in _planner_notes(parts, IMAGES_PLAN)
+        ) or (borrowed and not complete_image_jobs(parts)):
+            if borrowed:
+                return replacement_images()
             short.append(
                 f"{whose} e2e did not prove the whole browser suite on its tested files"
                 if workflow == "e2e"
@@ -1265,6 +1348,8 @@ def _merge_prefixes(
             # Retested on a new scratch branch; the prefixes behind it hold the same commit.
             member["scratch"] = {
                 **{key: member["scratch"][key] for key in ("head", "under", "workflows")},
+                **({"image_source": member["scratch"]["image_source"]}
+                   if "image_source" in member["scratch"] else {}),
                 "branch": f"{SCRATCH_PREFIX}{uuid.uuid4().hex}",
                 "requested": [],
                 "pushed": False,

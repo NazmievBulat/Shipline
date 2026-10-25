@@ -1093,6 +1093,12 @@ def train_status(folder: Path) -> int:
                             "state": _prefix_summary(member["scratch"]),
                             "kept": bool(member.get("kept")),
                             "queued_retries": (member["scratch"] or {}).get("queued_retries", {}),
+                            "image_source": (
+                                {"member": source.get("number"), "tree": source["tree"],
+                                 "run": next((run[1] for run in member["scratch"].get("signal", [])
+                                              if len(run) == 5 and run[0] == "images"), None)}
+                                if (source := (member["scratch"] or {}).get("image_source")) else None
+                            ),
                             "runs": [
                                 {
                                     "workflow": run[0],

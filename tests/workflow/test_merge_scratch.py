@@ -758,6 +758,7 @@ def test_neutral_prefix_after_an_untested_image_change_runs_images(github: GitHu
     _batch_setup(github, images=True)
     # The front's own checks now prove its merge on current main, so it has no prefix run.
     github.ci(github.base, github.head, run_id=7000)
+    _images(github)
     done = _batch_call(github)
     assert done.returncode == 0, done.stdout + done.stderr
     assert _merges(github) == ["7"]

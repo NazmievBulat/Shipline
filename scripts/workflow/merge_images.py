@@ -127,14 +127,122 @@ def images_needed(
     return any(matches(path) for path in paths)
 
 
-def pull_request_paths(workflow: str) -> list[str]:
+def image_difference(before: str, after: str) -> tuple[list[str], bool]:
+    """Exact tree differences, and whether any can change an image proof.
+
+    Renames include both paths. The workflow itself must also stay identical for reuse,
+    even when its author omitted it from its own filter.
+    """
+    from merge_gate import WORKFLOW_FILES, command, git
+
+    paths = command(
+        "git", "diff", "--no-renames", "--name-only", "-z", before, after,
+        errors="surrogateescape",
+    ).stdout.split("\0")[:-1]
+    path = f".github/workflows/{WORKFLOW_FILES['images']}"
+    if path in paths:
+        return paths, True
+    if not git("ls-tree", "--name-only", before, "--", path):
+        return paths, False
+    matches = path_filter(pull_request_paths(git("show", f"{before}:{path}")))
+    return paths, any(matches(changed) for changed in paths)
+
+
+def main_image_source(base: str) -> dict[str, Any] | None:
+    """Main's last complete image proof, including a prefix proof it inherited."""
+    from merge_gate import (
+        IMAGES_PLAN, NOTES, MainImages, Refused, Waiting, _planner_notes, git, inherited_green, jobs,
+        main_image_runs, workflow_verdict,
+    )
+
+    def parts_for(run: dict[str, Any]) -> list[dict[str, Any]]:
+        try:
+            return jobs(run)
+        except Waiting:
+            raise
+        except Refused:
+            return []
+
+    receipt = inherited_green(base)
+    if receipt and receipt.get("images_complete") and receipt.get("images_source"):
+        source = receipt["images_source"]
+        found = image_source_runs(source)
+        parts = parts_for(found[0]) if found else []
+        if (found and workflow_verdict("images", found[0], parts)[0] == "green"
+                and complete_image_jobs(parts)):
+            return source
+    for run in main_image_runs(base, MainImages()):
+        parts = parts_for(run)
+        if workflow_verdict("images", run, parts)[0] != "green" or not complete_image_jobs(parts):
+            return None
+        trees = [message for title, message in _planner_notes(parts, IMAGES_PLAN)
+                 if title == NOTES.files_tested]
+        if len(trees) != 1 or not re.fullmatch(r"[0-9a-f]{40}", trees[0]):
+            return None
+        # A main run must actually have tested the main commit it names.
+        if trees[0] != git("rev-parse", f"{run['head_sha']}^{{tree}}"):
+            return None
+        if not image_difference(trees[0], base)[1]:
+            return {"run": {"id": run["id"], "head_sha": run["head_sha"]}, "tree": trees[0]}
+        return None
+    return None
+
+
+def complete_image_jobs(parts: list[dict[str, Any]]) -> bool:
+    """A reusable result ran its image jobs, including every part of each matrix."""
+    from merge_gate import IMAGES_PLAN, passed_jobs
+
+    passed = passed_jobs(parts)
+    return (
+        any(job["name"] != IMAGES_PLAN for job in parts)
+        and all(re.sub(r" \(\d+ of \d+\)$", "", job["name"]) in passed for job in parts)
+    )
+
+
+def image_source_runs(source: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read the source's current attempt, never the saved run status from a receipt."""
+    from merge_gate import API, Refused, Waiting, _batch_runs, api
+
+    try:
+        if "scratch" in source:
+            return _batch_runs(source["scratch"], "images")
+        current = api(f"{API}/actions/runs/{source['run']['id']}")
+    except Waiting:
+        raise
+    except Refused:
+        return []
+    return [current] if (
+        current.get("id") == source["run"]["id"]
+        and current.get("head_sha") == source["run"]["head_sha"]
+    ) else []
+
+
+def prefix_image_source(member: dict[str, Any], train: Any) -> dict[str, Any] | None:
+    """A borrowed prefix proof follows its source's replacement branch until it merges."""
+    source = member["scratch"].get("image_source")
+    if source and "number" in source:
+        current = next((m for m in train.prefixes["members"]
+                        if m["number"] == source["number"]), None) if train.prefixes else None
+        if current is not None:
+            scratch = current["scratch"]
+            if scratch is None or "images" not in scratch["workflows"]:
+                return None
+            source = {"number": current["number"], "tree": current["tree"],
+                      "scratch": scratch}
+    return source
+
+
+def pull_request_paths(workflow: str, *, error: type[Exception] | None = None) -> list[str]:
     """The `paths:` of a workflow's `pull_request:` trigger, each entry as YAML reads it.
 
     Each entry is a double-quoted string on a line of its own, a comment after it allowed.
     Any other line in the list is refused, never skipped: a pattern the gate did not read
     could start a run the gate never waits for.
     """
-    from merge_gate import Refused
+    if error is None:
+        from merge_gate import Refused
+
+        error = Refused
 
     patterns: list[str] = []
     trigger = listed = False
@@ -156,9 +264,9 @@ def pull_request_paths(workflow: str) -> list[str]:
                     continue
             except json.JSONDecodeError:
                 pass
-            raise Refused(f"could not read the Images workflow path filter: {line.strip()}")
+            raise error(f"could not read the Images workflow path filter: {line.strip()}")
     if not patterns:
-        raise Refused("could not read the Images workflow path filter")
+        raise error("could not read the Images workflow path filter")
     return patterns
 
 

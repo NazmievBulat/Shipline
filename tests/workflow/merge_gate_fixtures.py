@@ -992,6 +992,9 @@ def _images(
             },
         ]
     }
+    github.api[f"{_REPO}/actions/runs/40"] = github.api[
+        f"{_REPO}/actions/workflows/images.yml/runs?head_sha={head}{event}&per_page=100"
+    ]["workflow_runs"][0]
     github.api[f"{_REPO}/check-runs/41/annotations?per_page=100"] = [
         {
             "title": "Files tested",
@@ -1050,6 +1053,7 @@ def _main_image_run(
             },
         ]
     }
+    github.api[f"{_REPO}/actions/runs/{run_id}"] = github.api[_MAIN_IMAGES]["workflow_runs"][0]
 
 
 def _scheduled_images(
@@ -1365,9 +1369,10 @@ def _batch_setup(
     workflow.git("checkout", "ticket/seven")
     github.main()
     # A green main supplies a complete image proof for image-neutral prefixes.
-    _main_image_run(github, 60, github.base)
-    github.api[f"{_REPO}/actions/runs/60/jobs?per_page=100"]["jobs"][1]["name"] = "Docker images: image tests"
-    github.api[f"{_REPO}/check-runs/61/annotations?per_page=100"] = [
+    main_images = 8_000_060
+    _main_image_run(github, main_images, github.base)
+    github.api[f"{_REPO}/actions/runs/{main_images}/jobs?per_page=100"]["jobs"][1]["name"] = "Docker images: image tests"
+    github.api[f"{_REPO}/check-runs/{main_images + 1}/annotations?per_page=100"] = [
         {"title": "Files tested", "message": workflow.git("rev-parse", f"{github.base}^{{tree}}")}
     ]
     for number in range(7, 7 + count) if selected else ():
@@ -1425,6 +1430,10 @@ def _finish_prefix(
                 }
             ]
         }
+        github.api[f"{_REPO}/actions/runs/{identity}"] = github.api[
+            f"{_REPO}/actions/workflows/{workflow}.yml/runs?head_sha={scratch['head']}"
+            "&event=workflow_dispatch&per_page=100"
+        ]["workflow_runs"][0]
         if workflow == "e2e":
             github.e2e(
                 scratch["head"],
