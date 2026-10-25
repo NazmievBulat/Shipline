@@ -1,5 +1,6 @@
 """Image runs and workflow path selection."""
 
+import heapq
 import json
 import re
 import sys
@@ -12,10 +13,11 @@ import workflow_config
 class MainImages:
     """Main's image runs, newest first, read a page at a time and only as far as needed."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, include_scheduled: bool = False) -> None:
         self.found: list[dict[str, Any]] = []
         self.page = 0
         self.last = False
+        self.include_scheduled = include_scheduled
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         from merge_gate import API, WORKFLOW_FILES, workflow_runs
@@ -41,7 +43,8 @@ class MainImages:
                 run
                 for run in runs_page
                 if run.get("head_branch") == "main"
-                and run["event"] not in ("pull_request", "schedule")
+                and run["event"] != "pull_request"
+                and (self.include_scheduled or run["event"] != "schedule")
             ]
 
 
@@ -127,14 +130,239 @@ def images_needed(
     return any(matches(path) for path in paths)
 
 
-def pull_request_paths(workflow: str) -> list[str]:
+def image_difference(before: str, after: str) -> tuple[list[str], bool]:
+    """Exact tree differences, and whether any can change an image proof.
+
+    Renames include both paths. The workflow itself must also stay identical for reuse,
+    even when its author omitted it from its own filter.
+    """
+    from merge_gate import WORKFLOW_FILES, command, git
+
+    paths = command(
+        "git", "diff", "--no-renames", "--name-only", "-z", before, after,
+        errors="surrogateescape",
+    ).stdout.split("\0")[:-1]
+    path = f".github/workflows/{WORKFLOW_FILES['images']}"
+    if path in paths:
+        return paths, True
+    if not git("ls-tree", "--name-only", before, "--", path):
+        return paths, False
+    matches = path_filter(pull_request_paths(git("show", f"{before}:{path}")))
+    return paths, any(matches(changed) for changed in paths)
+
+
+def main_image_source(base: str) -> dict[str, Any] | None:
+    """Follow main's inherited image proof to executed tests on unchanged image inputs.
+
+    A skipped neutral push is no result itself. Older equivalent pushes and scheduled
+    full runs can supply its proof, but a failed or pending source never authorizes reuse.
+    """
+    from ci_proof import receipt as commit_receipt
+    from merge_gate import (
+        API, IMAGES_PLAN, NOTES, REPOSITORY, WORKFLOW_FILES, MainImages, Refused, Waiting,
+        _planner_notes, _proves_whole, api, command, git, inherited_green, jobs, runs,
+        workflow_verdict,
+    )
+
+    def head_tree(run: dict[str, Any]) -> str:
+        head = run["head_sha"]
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise Refused("invalid image source head")
+        if command("git", "cat-file", "-e", head, check=False).returncode:
+            git("fetch", "origin", head)
+        return git("rev-parse", f"{head}^{{tree}}")
+
+    def resolve(run: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+        # The second result stops a search: an explicit failed, pending or unreadable
+        # inheritance chain must not be bypassed with an older green run.
+        seen: set[int] = set()
+        try:
+            while run["id"] not in seen:
+                seen.add(run["id"])
+                parts = jobs(run)
+                if workflow_verdict("images", run, parts)[0] != "green":
+                    return None, True
+                trees = [message for title, message in _planner_notes(parts, IMAGES_PLAN)
+                         if title == NOTES.files_tested]
+                if len(trees) != 1 or not re.fullmatch(r"[0-9a-f]{40}", trees[0]):
+                    return None, True
+                tested = trees[0]
+                on_main = run.get("head_branch") == "main" and run.get("event") != "pull_request"
+                if on_main and tested != head_tree(run):
+                    return None, True
+                if image_difference(tested, base)[1]:
+                    return None, True
+                proof = (
+                    commit_receipt(git("show", "-s", "--format=%B", run["head_sha"]))
+                    if on_main else None
+                )
+                sources = (
+                    [source for source in proof["sources"] if source["workflow"] == "images"]
+                    if proof else []
+                )
+                skipped = {re.sub(r" \(\d+ of \d+\)$", "", job["name"])
+                           for job in parts if job.get("conclusion") == "skipped"}
+                # A release job can pass while image tests inherit. Follow those skipped
+                # groups to their executed proof instead of treating this as a full run.
+                inherited = any(skipped.intersection(source["jobs"]) for source in sources)
+                if (complete_image_jobs(parts, allow_skipped=True)
+                        and _proves_whole("images", run, parts, {"tree": tested})
+                        and not inherited):
+                    return {"run": {"id": run["id"], "head_sha": run["head_sha"]},
+                            "tree": tested}, False
+                if not on_main:
+                    return None, True
+                head = run["head_sha"]
+                if proof is None:
+                    return None, False  # A neutral push can select no image tests.
+                if (proof["tree"] != tested
+                        or proof["base"] != git("show", "-s", "--format=%P", head)):
+                    return None, True
+                if not sources:
+                    return None, False
+                if len(sources) != 1:
+                    return None, True
+                source = sources[0]
+                run = api(f"{API}/actions/runs/{source['run']}")
+                if (run.get("id") != source["run"]
+                        or run.get("path") != f".github/workflows/{WORKFLOW_FILES['images']}"
+                        or (run.get("head_repository") or {}).get("full_name") != REPOSITORY):
+                    return None, True
+            return None, True  # Cyclic proofs never count.
+        except Waiting:
+            raise
+        except (Refused, KeyError, TypeError, ValueError, StopIteration):
+            return None, True
+
+    blocked_run = 0
+    receipt = inherited_green(base)
+    if receipt and receipt.get("images_complete") is True:
+        source = receipt.get("images_source")
+        if not source:
+            run_id = receipt.get("images_run")
+            if type(run_id) is int and run_id > 0:
+                # Older receipts proved images on exactly the recorded main tree.
+                source = {"run": {"id": run_id}, "tree": receipt["tree"]}
+        if source:
+            found = image_source_runs(source)
+            if found:
+                resolved, blocked = resolve(found[0])
+                if resolved:
+                    return resolved
+                if blocked:
+                    # A new main run can replace a lost source. An older success cannot.
+                    blocked_run = found[0]["id"]
+    # Keep health's push-only selection unchanged. Proof discovery also reads scheduled
+    # full runs and goes past skipped neutral pushes, including on older pages.
+    own = runs("images", base)[:1] + runs("images", base, scheduled=True)[:1]
+    recent = MainImages(include_scheduled=True)
+    seen: set[int] = set()
+    for run in heapq.merge(sorted(own, key=lambda run: run["id"], reverse=True), recent,
+                           key=lambda run: run["id"], reverse=True):
+        if run["id"] in seen:
+            continue
+        seen.add(run["id"])
+        if run["head_sha"] != base and run["id"] <= blocked_run:
+            continue
+        try:
+            if image_difference(head_tree(run), base)[1]:
+                continue
+            if run["event"] != "schedule" and command(
+                "git", "merge-base", "--is-ancestor", run["head_sha"], base, check=False,
+            ).returncode:
+                continue
+        except Waiting:
+            raise
+        except (Refused, KeyError, TypeError, ValueError):
+            return None
+        resolved, blocked = resolve(run)
+        if resolved or blocked:
+            return resolved
+    return None
+
+
+def complete_image_jobs(parts: list[dict[str, Any]], *, allow_skipped: bool = False) -> bool:
+    """Every selected image job passed, including every part of each selected matrix.
+
+    Optional jobs may be skipped for a prefix proof. Main's complete receipt retains its
+    stricter rule: a release job a pull request skipped still needs main's own success.
+    """
+    from merge_gate import IMAGES_PLAN, passed_jobs
+
+    passed = passed_jobs(parts)
+    return (
+        any(job["name"] != IMAGES_PLAN and job.get("conclusion") == "success" for job in parts)
+        and all(
+            (allow_skipped and job.get("conclusion") == "skipped")
+            or re.sub(r" \(\d+ of \d+\)$", "", job["name"]) in passed
+            for job in parts
+        )
+    )
+
+
+def image_source_runs(source: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read the source's current attempt, never the saved run status from a receipt."""
+    from merge_gate import API, MainImages, Refused, Waiting, _batch_runs, api, main_image_runs
+
+    try:
+        if "main_after" in source:
+            return []  # Its member has not yet been squashed onto main.
+        if "main" in source:
+            return main_image_runs(source["main"], MainImages())[:1]
+        if "scratch" in source:
+            return _batch_runs(source["scratch"], "images")
+        current = api(f"{API}/actions/runs/{source['run']['id']}")
+    except Waiting:
+        raise
+    except Refused:
+        return []
+    return [current] if (
+        current.get("id") == source["run"]["id"]
+        and ("head_sha" not in source["run"]
+             or current.get("head_sha") == source["run"]["head_sha"])
+    ) else []
+
+
+def prefix_image_source(member: dict[str, Any], train: Any) -> dict[str, Any] | None:
+    """A borrowed prefix proof follows its source's replacement branch until it merges."""
+    from merge_gate import git, main_image_source
+
+    source = member["scratch"].get("image_source")
+    if source and "main_after" in source:
+        if train.prefixes and any(m["number"] == source["main_after"]
+                                  for m in train.prefixes["members"]):
+            return source
+        if not train.prefixes:
+            return None
+        base = train.prefixes["base"]
+        source = {"main": base, "tree": git("rev-parse", f"{base}^{{tree}}")}
+    if source and "main" in source:
+        # Keep the pending main reference until real image jobs prove this tree. Once
+        # passed, retain their run identity just like any other borrowed proof.
+        return main_image_source(source["main"]) or source
+    if source and "number" in source:
+        current = next((m for m in train.prefixes["members"]
+                        if m["number"] == source["number"]), None) if train.prefixes else None
+        if current is not None:
+            scratch = current["scratch"]
+            if scratch is None or "images" not in scratch["workflows"]:
+                return None
+            source = {"number": current["number"], "tree": current["tree"],
+                      "scratch": scratch}
+    return source
+
+
+def pull_request_paths(workflow: str, *, error: type[Exception] | None = None) -> list[str]:
     """The `paths:` of a workflow's `pull_request:` trigger, each entry as YAML reads it.
 
     Each entry is a double-quoted string on a line of its own, a comment after it allowed.
     Any other line in the list is refused, never skipped: a pattern the gate did not read
     could start a run the gate never waits for.
     """
-    from merge_gate import Refused
+    if error is None:
+        from merge_gate import Refused
+
+        error = Refused
 
     patterns: list[str] = []
     trigger = listed = False
@@ -156,9 +384,9 @@ def pull_request_paths(workflow: str) -> list[str]:
                     continue
             except json.JSONDecodeError:
                 pass
-            raise Refused(f"could not read the Images workflow path filter: {line.strip()}")
+            raise error(f"could not read the Images workflow path filter: {line.strip()}")
     if not patterns:
-        raise Refused("could not read the Images workflow path filter")
+        raise error("could not read the Images workflow path filter")
     return patterns
 
 

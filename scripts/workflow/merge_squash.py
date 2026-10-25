@@ -61,9 +61,7 @@ def squash_proof(
     sources = []
     for key, (run, parts) in evidence.items():
         workflow = key.split("_", 1)[0]
-        if workflow not in ("ci", "e2e") and not (
-            workflow == "images" and "images" in CONFIG.checks.prefix_only
-        ):
+        if workflow not in ("ci", "e2e", "images"):
             continue
         passed = sorted(passed_jobs(parts))
         if workflow == "ci":

@@ -308,7 +308,10 @@ def record_green(
 ) -> None:
     # GitHub's squash may differ, or somebody may push main outside the lock. Either case
     # loses this optimization. A receipt is scoped to the observed commit, never future trees.
-    from merge_gate import IMAGES, git
+    from merge_gate import (
+        IMAGES, IMAGES_PLAN, NOTES, _planner_notes, complete_image_jobs, git, image_difference,
+        image_source_runs, jobs, main_image_source, workflow_verdict,
+    )
 
     git("fetch", "origin", "main")
     head = git("rev-parse", "origin/main")
@@ -318,9 +321,27 @@ def record_green(
     ):
         print("main did not match the tested squash; waiting for main's own checks", flush=True)
         return
-    images_complete = bool(image_jobs) and all(
-        job.get("conclusion") == "success" for job in image_jobs
-    )
+    if (not images or not complete_image_jobs(image_jobs)) and not image_difference(base, tree)[1]:
+        # A neutral own-check merge can have no images, or skip release checks. Preserve
+        # main's complete source before replacing its receipt, revalidating its attempt.
+        source = main_image_source(base)
+        if source:
+            images = image_source_runs(source)
+            image_jobs = jobs(images[0]) if images else []
+            if images and workflow_verdict("images", images[0], image_jobs)[0] != "green":
+                images, image_jobs = [], []
+    images_complete = complete_image_jobs(image_jobs)
+    image_tree = None
+    differing: list[str] = []
+    if images_complete:
+        trees = [message for title, message in _planner_notes(image_jobs, IMAGES_PLAN)
+                 if title == NOTES.files_tested]
+        if len(trees) == 1 and re.fullmatch(r"[0-9a-f]{40}", trees[0]):
+            image_tree = trees[0]
+            differing, relevant = image_difference(image_tree, tree)
+            images_complete = not relevant
+        else:
+            images_complete = False
     # Skipped by the pull request's path filters: main's own run must pass these itself.
     unproven = sorted(job["name"] for job in ci_jobs if job.get("conclusion") != "success")
     with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as output:
@@ -337,6 +358,12 @@ def record_green(
                 # Main runs release tests that ordinary PRs skip. A skipped PR job cannot
                 # supply the green result for those checks on main.
                 "images_complete": images_complete,
+                "images_tree": image_tree,
+                "images_differing_files": differing,
+                "images_source": {
+                    "run": {key: images[0][key] for key in ("id", "head_sha") if key in images[0]},
+                    "tree": image_tree,
+                } if images_complete else None,
             },
             output,
         )
@@ -348,7 +375,10 @@ def record_green(
         + (f"; main must pass {', '.join(unproven)} itself" if unproven else "")
     )
     print(
-        f"main {head[:12]} recorded {source} for inheritance on identical tree {tree}", flush=True
+        f"main {head[:12]} recorded {source} for inheritance on tree {tree}"
+        + (f"; images differ in {len(differing)} files: {json.dumps(differing[:5])}"
+           if images_complete and differing else ""),
+        flush=True,
     )
 
 

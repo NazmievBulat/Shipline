@@ -262,7 +262,12 @@ from merge_health import (
 from merge_images import (
     MainImages,
     browser_needed,
+    complete_image_jobs,
+    image_source_runs,
     images_needed,
+    image_difference,
+    main_image_source,
+    prefix_image_source,
     inherited_image_jobs,
     main_image_runs,
     main_images_needed,

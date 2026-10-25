@@ -1013,8 +1013,14 @@ def _prefix_summary(scratch: dict[str, Any] | None) -> str:
         return "failed"
     if recovering:
         return "running"
-    if set(scratch["workflows"]) - set(seen):
+    needed = set(scratch["workflows"])
+    if scratch.get("image_source"):
+        needed.add("images")
+    if needed - set(seen):
         return "starting"
+    if "main" in scratch.get("image_source", {}):
+        # A completed planner with skipped image tests is still no image proof.
+        return "running"
     if all(run[3] == "completed" for run in seen.values()):
         return "passed"
     return "running"
@@ -1093,6 +1099,12 @@ def train_status(folder: Path) -> int:
                             "state": _prefix_summary(member["scratch"]),
                             "kept": bool(member.get("kept")),
                             "queued_retries": (member["scratch"] or {}).get("queued_retries", {}),
+                            "image_source": (
+                                {"member": source.get("number"), "tree": source["tree"],
+                                 "run": next((run[1] for run in member["scratch"].get("signal", [])
+                                              if len(run) == 5 and run[0] == "images"), None)}
+                                if (source := (member["scratch"] or {}).get("image_source")) else None
+                            ),
                             "runs": [
                                 {
                                     "workflow": run[0],

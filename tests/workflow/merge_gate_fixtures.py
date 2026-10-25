@@ -992,6 +992,9 @@ def _images(
             },
         ]
     }
+    github.api[f"{_REPO}/actions/runs/40"] = github.api[
+        f"{_REPO}/actions/workflows/images.yml/runs?head_sha={head}{event}&per_page=100"
+    ]["workflow_runs"][0]
     github.api[f"{_REPO}/check-runs/41/annotations?per_page=100"] = [
         {
             "title": "Files tested",
@@ -1029,6 +1032,8 @@ def _main_image_run(
             "head_sha": commit,
             "head_branch": "main",
             "event": event,
+            "path": ".github/workflows/images.yml",
+            "head_repository": {"full_name": "example-org/example-app"},
             "status": status,
             "conclusion": conclusion,
             "updated_at": "2026-10-18T07:30:23Z",
@@ -1050,6 +1055,7 @@ def _main_image_run(
             },
         ]
     }
+    github.api[f"{_REPO}/actions/runs/{run_id}"] = github.api[_MAIN_IMAGES]["workflow_runs"][0]
 
 
 def _scheduled_images(
@@ -1364,6 +1370,13 @@ def _batch_setup(
     workflow.git("push", "origin", "main")
     workflow.git("checkout", "ticket/seven")
     github.main()
+    # A green main supplies a complete image proof for image-neutral prefixes.
+    main_images = 8_000_060
+    _main_image_run(github, main_images, github.base)
+    github.api[f"{_REPO}/actions/runs/{main_images}/jobs?per_page=100"]["jobs"][1]["name"] = "Docker images: image tests"
+    github.api[f"{_REPO}/check-runs/{main_images + 1}/annotations?per_page=100"] = [
+        {"title": "Files tested", "message": workflow.git("rev-parse", f"{github.base}^{{tree}}")}
+    ]
     for number in range(7, 7 + count) if selected else ():
         head = github.pulls[str(number)]["headRefOid"]
         github.ci(original, head, run_id=number * 1000, server=SELECTED)
@@ -1414,11 +1427,17 @@ def _finish_prefix(
                     "head_sha": scratch["head"],
                     "head_branch": scratch["branch"],
                     "event": "workflow_dispatch",
+                    "path": f".github/workflows/{workflow}.yml",
+                    "head_repository": {"full_name": "example-org/example-app"},
                     "status": "completed",
                     "conclusion": conclusion,
                 }
             ]
         }
+        github.api[f"{_REPO}/actions/runs/{identity}"] = github.api[
+            f"{_REPO}/actions/workflows/{workflow}.yml/runs?head_sha={scratch['head']}"
+            "&event=workflow_dispatch&per_page=100"
+        ]["workflow_runs"][0]
         if workflow == "e2e":
             github.e2e(
                 scratch["head"],

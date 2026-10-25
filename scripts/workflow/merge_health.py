@@ -718,6 +718,7 @@ def push_health(
     # Only pending checks may borrow a result. Main's own failures above always win.
     inherited = inherited_green(head)
     sources: list[str] = []
+    images_inherited = False
     # Main's own CI runs whose result it inherited: under the lock they are cancelled, below.
     redundant: list[dict[str, Any]] = []
     if inherited:
@@ -746,8 +747,8 @@ def push_health(
                 redundant += ci
         own_images = any(run["head_sha"] == head for run in images)
         if inherited.get("images_run") and inherited.get("images_complete") is True:
-            # Every image job passed on this very tree, which holds every earlier push of main
-            # too, so it stands in for the head's run and for earlier runs still going.
+            # Every image job passed on this tree's image inputs. The receipt records any
+            # image-neutral differences, so this also covers earlier runs still going.
             if not own_images or any(state == "pending" for state, _, _ in assessments[1:]):
                 assessments = [
                     assessments[0],
@@ -757,6 +758,7 @@ def push_health(
                     ),
                 ]
                 sources.append(f"{IMAGES} run {inherited['images_run']}")
+                images_inherited = True
         elif ci_inherited and not own_images and main_images_needed(head, ci):
             # Main asks this after its own green CI above; an inherited CI asks it here. An
             # earlier push's image run in the list does not stand in for the head's own.
@@ -777,6 +779,9 @@ def push_health(
         if sources
         else ""
     )
+    if images_inherited and (differing := inherited.get("images_differing_files")):
+        source = source.replace("on identical tree", "on tree")
+        source += f"; images unchanged across {len(differing)} files: {json.dumps(differing[:5])}"
     return Health("green", f"main: green ({head[:12]}){source}")
 
 
