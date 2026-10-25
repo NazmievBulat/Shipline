@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from workflow_harness import Workflow, install_shipline, make_workflow
+from workflow_harness import SCRIPTS, Workflow, install_shipline, make_workflow
 
 
 @pytest.fixture
@@ -68,6 +68,23 @@ def test_the_service_leaves_the_sessions_it_started_running(workflow: Workflow) 
 
     service = (_units(workflow) / "workflow-tick.service").read_text().splitlines()
     assert "KillMode=process" in service
+
+
+def test_the_service_tags_its_lines_with_the_identifier_the_journal_export_names(
+    workflow: Workflow,
+) -> None:
+    """systemd would tag them `shipline`, after the launcher, and `journalctl -t tick` would
+    find none of a child's lines that journald keeps without the unit's fields."""
+    workflow.run_script("install-timer")
+
+    service = (_units(workflow) / "workflow-tick.service").read_text().splitlines()
+    assert "SyslogIdentifier=tick" in service
+    compare = SCRIPTS.parents[1] / "tools" / "compare-shadow"
+    help_text = subprocess.run(
+        ["python3", str(compare), "--help"], capture_output=True, text=True, timeout=60, check=True
+    ).stdout
+    for export in (help_text, (SCRIPTS / "README.md").read_text(), compare.read_text()):
+        assert "journalctl --user -t tick " in export
 
 
 def test_the_timer_fires_every_3_minutes(workflow: Workflow) -> None:

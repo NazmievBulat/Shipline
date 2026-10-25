@@ -278,7 +278,7 @@ def test_a_shadow_tick_logs_the_decisions_the_real_tick_takes(workflow: Workflow
 
     assert compared.returncode == 0, compared.stdout + compared.stderr
     assert compared.stdout.splitlines()[-1] == (
-        "11 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 17:00:00: none differs"
+        "12 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 17:00:00: none differs"
     )
 
 
@@ -1615,6 +1615,38 @@ def test_a_journal_line_counts_from_the_start_of_its_service(tmp_path: Path) -> 
         "2026-09-21 17:15:00 ticket-8",
         "2 decisions compared from 2026-09-21 17:00:00 to 2026-09-21 17:14:50: 1 differ",
     ]
+
+
+@pytest.mark.parametrize("event", ["stopped", "started"])
+def test_identifier_lines_are_compared_with_their_service_start(
+    tmp_path: Path, event: str
+) -> None:
+    shadow = (
+        f"{_NOW} shadow tick\n{_NOW} review-7 {event}\n"
+        f"{_NOW + 180} shadow tick\n"
+    )
+    # The identifier export keeps a child's message even without any unit fields.
+    # Its late timestamp must still be anchored by the unit export's systemd line.
+    journal = (
+        f"{_NOW + 75}.0 example-host systemd[1]: Starting workflow-tick.service - Tick...\n"
+        f"{_NOW + 400}.0 example-host tick[7]: review-7 {event}\n"
+        f"{_NOW + 410}.0 example-host systemd[1]: Finished workflow-tick.service - Tick.\n"
+    )
+
+    done = _compare(*_logs(tmp_path, shadow, "", journal))
+
+    assert done.returncode == 0, done.stdout
+    assert "1 decisions compared" in done.stdout
+    assert "none differs" in done.stdout
+
+
+def test_the_comparison_help_names_both_journal_exports() -> None:
+    done = _compare("--help")
+
+    assert done.returncode == 0, done.stderr
+    assert "-t tick" in done.stdout
+    assert "-u workflow-tick.service" in done.stdout
+    assert "sort -n | uniq" in done.stdout
 
 
 def test_a_real_tick_without_a_shadow_tick_beside_it_is_not_compared(tmp_path: Path) -> None:
