@@ -480,6 +480,22 @@ def test_codex_conflict_starts_with_its_sentence_and_bridge(workflow: Workflow) 
     assert not workflow.is_running("review-7")
 
 
+def test_conflict_replaces_a_crashed_workers_codex_flag(workflow: Workflow) -> None:
+    _codex_conflict(workflow)
+    notes = workflow.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stderr
+    assert not (notes / "ticket-7.codex").exists()
+    assert (_folder(workflow) / "codex-built-7").exists()
+    (workflow.state / "tmux/review-7").unlink()
+    listed = workflow.run("list")
+    assert listed.returncode == 0, listed.stderr
+    assert listed.stdout.startswith("review-7  idle")
+    assert "ticket-7  " not in listed.stdout
+
+
 @pytest.mark.parametrize("built", [False, True])
 def test_codex_resolution_gets_claude_and_cursor(workflow: Workflow, built: bool) -> None:
     _panel_conflict(workflow)

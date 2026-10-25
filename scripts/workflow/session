@@ -653,6 +653,11 @@ cmd_start() {
   for other in "ticket-$number" "audit-$number" "review-$number" "codex-$number" "cloud-$number"; do
     ! is_running "$other" || die "$other is already running"
   done
+  # A crashed pair may leave its flag behind. Only the new pair may claim codex-N,
+  # including when its bridge later disappears and list_running reconstructs its name.
+  local old_notes=$main/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER
+  [[ ! -e $old_notes/ticket-$number.codex ]] || touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-$number"
+  rm -f "$old_notes/ticket-$number.codex" "$old_notes/review-$number.codex"
   if [[ $kind == review ]]; then
     # A conflict resolution's reviewer is high on Opus, unless shipline.json names the reviewer
     # of a small conflict and this is one. Chosen under the start lock, with no reviewer running:
