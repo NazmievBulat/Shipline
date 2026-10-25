@@ -361,6 +361,9 @@ and starts it with `systemctl --user enable --now shipline-shadow.timer`. After 
 lists every decision the two took differently, with both versions, and exits 0 when none
 differs. The identifier export keeps child messages recorded without unit fields; the unit
 export keeps systemd's start and finish lines, which anchor those messages to their tick.
+The unit `shipline install-timer` writes tags the tick's lines `tick` (`SyslogIdentifier=tick`);
+a unit written by an older Shipline tags them `shipline`: run `shipline install-timer` again
+before the run.
 Both exports must cover the same time window. Sorting and then `uniq` removes exact duplicate
 lines while keeping distinct messages with the same timestamp (`sort -n -u` would drop them).
 A decision that came due in the seconds between the two ticks' clocks is a timing

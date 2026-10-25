@@ -72,6 +72,8 @@ fi
 # space. The repository is named to the tick, not only its folder.
 escaped=${main//%/%%}
 escaped_launcher=${launcher//%/%%}
+# Its lines are tagged `tick`, not `shipline` after the launcher: `journalctl -t tick` then
+# finds the ones journald keeps without the unit's fields, as a child's that ended first.
 cat >"$units/workflow-tick.service" <<UNIT
 [Unit]
 Description=Workflow tick: starts workers, squeezes idle sessions, removes what is finished
@@ -84,6 +86,7 @@ $(config_environment)
 Environment="SHIPLINE_REPO=$escaped"
 ${TMUX_TMPDIR:+Environment=\"TMUX_TMPDIR=${TMUX_TMPDIR//%/%%}\"}
 ExecStart="${escaped_launcher//\$/\$\$}" tick
+SyslogIdentifier=tick
 KillMode=process
 UNIT
 
