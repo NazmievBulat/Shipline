@@ -134,7 +134,7 @@ installation folder, even if the checkout has a file of the same name.
 | `commands.test` | command | The repository test command run by bash from the checkout with the CI job's arguments. | none |
 | `conflict_review` | conflict | The effort, model and max_changed_lines for a small handed-off conflict; omitted means the usual reviewer. | none |
 | `hot_paths` | paths | GitHub path patterns whose matching tickets run separately and merge back to back within their priority. | `[]` |
-| `hunts.areas` | areas | Area names mapped to lists of screen paths; omitted means one hunt runs on every screen. | `{}` |
+| `hunts.areas` | areas | Area names mapped to lists of screen paths; omitted means one hunt runs at a time, on every screen. | `{}` |
 | `hunts.plans` | name | The checkout path of hunt plans named in a hunt sentence. | none |
 | `install_folder` | name | The installation folder, resolved against the selected file; external configs use their parent when omitted. | none |
 | `labels.audited` | name | The label that marks an audit. | `"audited"` |

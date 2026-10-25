@@ -276,7 +276,7 @@ class Machine:
 @config_section
 class Hunts:
     # In the order the file names them.
-    areas: dict[str, tuple[str, ...]] = option('areas', {}, 'Area names mapped to lists of screen paths; omitted means one hunt runs on every screen.', example={'phone': ['/calls', '/contacts'], 'billing': ['/invoices', '/settings/billing']}, shell=(35, 'HUNT_AREAS'), position=0)
+    areas: dict[str, tuple[str, ...]] = option('areas', {}, 'Area names mapped to lists of screen paths; omitted means one hunt runs at a time, on every screen.', example={'phone': ['/calls', '/contacts'], 'billing': ['/invoices', '/settings/billing']}, shell=(35, 'HUNT_AREAS'), position=0)
     plans: str | None = option('name', None, 'The checkout path of hunt plans named in a hunt sentence.', example='docs/hunt-plans.md', optional=True, shell=(29, 'HUNT_PLANS'), convert=lambda value: _plans(value), position=1)
 
 
