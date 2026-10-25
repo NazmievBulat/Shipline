@@ -389,7 +389,7 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 
     # The conflict reviewer is one object, named whole or left out.
-    named = {**_DEFAULTS, "conflict_review": {"effort": "", "model": "", "max_changed_lines": 0}}
+    named = {**_DEFAULTS, "conflict_review": {"effort": "", "model": "", "max_changed_lines": 0, "program": ""}}
     assert keys(example) == keys(named)
     assert example["hot_paths"]
     assert example["repository"].endswith("/example-app")

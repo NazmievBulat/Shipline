@@ -524,8 +524,9 @@ class Review:
 class ConflictReview:
     effort: str
     model: str
-    # A resolution larger than this, in lines of the conflicting files, gets the usual reviewer.
-    max_changed_lines: int
+    # A larger resolution gets the usual reviewer; None adds no line cutoff.
+    max_changed_lines: int | None
+    program: str = "claude"
 
 
 @config_section
@@ -541,7 +542,12 @@ class Config:
     cloud_pre_push: CloudPrePush = section(position=20)
     cloud_wake_after_minutes: int = option('minutes', 30, 'Minutes without a push or report before a cloud worker is woken; 0 disables it.', example=45, position=19)
     commands: Commands = section(position=13)
-    conflict_review: ConflictReview | None = option('conflict', None, 'The effort, model and max_changed_lines for a small handed-off conflict; omitted means the usual reviewer.', example={'effort': 'medium', 'model': 'sonnet', 'max_changed_lines': 40}, position=15)
+    conflict_review: ConflictReview | None = option(
+        'conflict', None,
+        'The resolver of a handed-off conflict: program is claude (default) or codex. With program alone, effort is high, Claude uses Opus, Codex uses its configured model, and there is no additional line cutoff. An explicit model selects that program’s model; a positive max_changed_lines limits both conflicting sides and the resolution. Edits stay within the conflicting hunks. Codex uses its worker bridge with Claude and Cursor on the panel; full-review fallbacks return to Claude. Without program, effort, model and max_changed_lines remain required.',
+        example={'effort': 'medium', 'model': 'sonnet', 'max_changed_lines': 40, 'program': 'claude'},
+        serialize=lambda config: _conflict_values(config), position=15,
+    )
     hot_paths: tuple[str, ...] = option('paths', [], 'GitHub path patterns whose matching tickets run separately and merge back to back within their priority.', example=['src/example_app/models.py', 'web/src/pages/**'], convert=tuple, position=14)
     hunts: Hunts = section(position=12)
     install_folder: Path | None = option('name', None, 'The installation folder, resolved against the selected file; external configs use their parent when omitted.', example='.', serialize=lambda config: config.given.get("install_folder"), position=24)
@@ -806,10 +812,15 @@ def _hot_paths(value: Any, name: str) -> list[str]:
 def _conflict_review(value: Any, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{FILE}: {name} must be an object")
-    keys = ("effort", "model", "max_changed_lines")
+    keys = ("effort", "model", "max_changed_lines", "program")
     if unknown := sorted(set(value) - set(keys)):
         raise ConfigError(f"{FILE}: unknown key {', '.join(f'{name}.{key}' for key in unknown)}")
-    if missing := [key for key in keys if key not in value]:
+    uncapped = "program" in value and "max_changed_lines" not in value
+    if "program" in value:
+        if value["program"] not in ("claude", "codex"):
+            raise ConfigError(f"{FILE}: {name}.program must be one of claude, codex")
+        value = {"effort": "high", "model": "opus", "max_changed_lines": None, **value}
+    elif missing := [key for key in keys[:-1] if key not in value]:
         raise ConfigError(f"{FILE}: {name} must name {', '.join(missing)}")
     if value["effort"] not in EFFORTS:
         raise ConfigError(f"{FILE}: {name}.effort must be one of {', '.join(EFFORTS)}")
@@ -823,7 +834,7 @@ def _conflict_review(value: Any, name: str) -> dict[str, Any]:
             f"{FILE}: {name}.model must be a model name, not {json.dumps(value['model'])}"
         )
     lines = value["max_changed_lines"]
-    if not isinstance(lines, int) or isinstance(lines, bool) or lines < 1:
+    if not uncapped and (not isinstance(lines, int) or isinstance(lines, bool) or lines < 1):
         raise ConfigError(f"{FILE}: {name}.max_changed_lines must be a whole number above 0")
     return value
 
@@ -1419,6 +1430,20 @@ def parity_of(given: Any) -> Parity:
 def current() -> Config:
     """The configuration of the repository Shipline works on, read once a run."""
     return load()
+
+
+def _conflict_values(config: Config) -> dict[str, Any] | None:
+    """Preserve legacy exports and the meaning of omitted Codex options."""
+    conflict = vars(config.conflict_review).copy() if config.conflict_review else None
+    if conflict is not None:
+        supplied = config.given["conflict_review"]
+        if "program" not in supplied:
+            conflict.pop("program")
+        if conflict["max_changed_lines"] is None:
+            conflict.pop("max_changed_lines")
+        if config.conflict_review.program == "codex" and "model" not in supplied:
+            conflict.pop("model")
+    return conflict
 
 
 def as_dict(config: Config) -> dict[str, Any]:

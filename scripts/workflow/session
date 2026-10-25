@@ -22,6 +22,7 @@
 #                               default when omitted. Audits and reviewers always use opus, but
 #                               for the reviewer of a small conflict `conflict_review` of
 #                               shipline.json names (`conflict_review.py reviewer`).
+#                               conflict_review.program may select Codex with its bridge.
 #   session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>]
 #                               name: small letters, digits and dashes; it names the report.
 #                               When left out, a hunt with a plan, by Claude Code, on every
@@ -49,6 +50,7 @@
 #                               only for one that is stopped on the usage limit
 #   session checks-finished <review-N> <head>
 #   session conflict-found <review-N> <head>
+#   session panel-finished <review-N> <head>
 #   session lost-check <review-N> <head>
 #   session batch-merged <review-N> <squash>
 #                               wake a reviewer waiting for checks, preserving unsent input
@@ -174,6 +176,7 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session resend <ticket-N|audit-N|review-N>
        session checks-finished <review-N> <head>
        session conflict-found <review-N> <head>
+       session panel-finished <review-N> <head>
        session lost-check <review-N> <head>
        session batch-merged <review-N> <squash>
        session status-check <ticket-N|review-N>
@@ -298,9 +301,10 @@ list_worktrees() {
 # limit after which its instruction was sent again, the reset of the limit it said it stopped
 # on). None of it is true of the next session.
 forget_notes() {
-  rm -f "$1.url" "$1.idle" "$1.waiting" "$1.pushed" "$1.started" "$1.area" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.checks-wait" "$1.job-wait" "$1.limits"
+  rm -f "$1.url" "$1.idle" "$1.pushed" "$1.area" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.limits"
   if [[ ${2:-} != keep-codex ]]; then
-    rm -f "$1.codex" "$1.asking" "$1.resent" "$1.codex-delivered" "$1.codex-answered" "$1.codex-followed-up" "$1.codex-quota-delivered" "$1.codex-approval-delivered" "$1.codex-recovery-error" "$1.owner-reply"
+    rm -f "$1.waiting" "$1.checks-wait" "$1.job-wait"
+    rm -f "$1.started" "$1.codex" "$1.asking" "$1.resent" "$1.codex-delivered" "$1.codex-answered" "$1.codex-followed-up" "$1.codex-quota-delivered" "$1.codex-approval-delivered" "$1.codex-recovery-error" "$1.owner-reply"
   fi
 }
 
@@ -334,12 +338,14 @@ stop_session() {
     # Preserve provenance for workers started before the durable panel marker existed.
     if [[ -e $notes/$name.codex ]]; then
       mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
-      touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name#ticket-}"
+      touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name##*-}"
     fi
-    end_server "codex-${name#ticket-}" || return 1
+  fi
+  if [[ $name == ticket-* || -e $notes/$name.codex ]]; then
+    end_server "codex-${name##*-}" || return 1
   fi
   end_server "$name" || return 1
-  snapshot_remove "$name" "codex-${name#ticket-}"
+  snapshot_remove "$name" "codex-${name##*-}"
   [[ $name != hunt-* ]] || stop_hunted_application "$name"
   forget_notes "$notes/$name"
 }
@@ -612,8 +618,17 @@ start_cloud_worker() {
   echo "$name started: $link"
 }
 
+record_review_start() {
+  local name=$1 worktree=$2
+  # A native resolver can publish while its bridge is still obtaining a link.
+  touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
+  rm -f "$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-"* \
+    "$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-"* "$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-"* \
+    "$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-"*
+}
+
 cmd_start() {
-  local kind=$1 number=$2 effort=$3 model=$4 name prompt worktree other command
+  local kind=$1 number=$2 effort=$3 model=$4 name prompt worktree other command codex_model=""
   case $kind in
     worker) name="ticket-$number" ;;
     audit) name="audit-$number" ;;
@@ -650,6 +665,11 @@ cmd_start() {
   for other in "ticket-$number" "audit-$number" "review-$number" "codex-$number" "cloud-$number"; do
     ! is_running "$other" || die "$other is already running"
   done
+  # A crashed pair may leave its flag behind. Only the new pair may claim codex-N,
+  # including when its bridge later disappears and list_running reconstructs its name.
+  local old_notes=$main/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER
+  [[ ! -e $old_notes/ticket-$number.codex ]] || touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-$number"
+  rm -f "$old_notes/ticket-$number.codex" "$old_notes/review-$number.codex"
   if [[ $kind == review ]]; then
     # A conflict resolution's reviewer is high on Opus, unless shipline.json names the reviewer
     # of a small conflict and this is one. Chosen under the start lock, with no reviewer running:
@@ -664,6 +684,10 @@ cmd_start() {
     else
       rm -f "$main/$SHIPLINE_STATE_FOLDER/review-$number.conflict-reviewer"
     fi
+    local resolver=claude
+    read -r resolver codex_model < <(python3 -B "$script_dir/conflict_review.py" program \
+      "$main/$SHIPLINE_STATE_FOLDER" "$number")
+    [[ $resolver != codex ]] || model=codex
   fi
 
   if [[ $model == cloud ]]; then
@@ -679,23 +703,17 @@ cmd_start() {
     [[ $effort == medium ]] || effort=high
   fi
   if [[ $model == codex ]]; then
-    start_codex_worker "$name" "$worktree" "$effort" "$prompt"
+    start_codex_worker "$name" "$worktree" "$effort" "$prompt" "$codex_model"
   else
     launch "$name" "$worktree" \
       "claude --effort $effort ${model:+--model $model }--remote-control $name \"$prompt\""
-    # The tick wakes a reviewer only for a round published after this moment; an earlier
-    # reviewer's round is not this session's. Written after `launch`, which forgets old notes.
-    # A nudge given to an earlier reviewer on the same head is not this one's.
     if [[ $kind =~ ^(review|audit)$ ]]; then
-      touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
-      rm -f "$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-"* \
-        "$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-"* "$main/$SHIPLINE_STATE_FOLDER/$name.conflict-nudged-"* \
-        "$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-"*
+      record_review_start "$name" "$worktree"
     fi
-    save_link "$name" "$worktree"
-    if [[ $kind == review ]]; then
-      python3 -B "$script_dir/reviewer_start.py" --started "$main/$SHIPLINE_STATE_FOLDER" "$number"
-    fi
+  fi
+  [[ $model == codex ]] || save_link "$name" "$worktree"
+  if [[ $kind == review ]]; then
+    python3 -B "$script_dir/reviewer_start.py" --started "$main/$SHIPLINE_STATE_FOLDER" "$number"
   fi
 }
 
@@ -856,7 +874,7 @@ launch() {
     scope=(bash -c "$PANE_WAITS" bash "${scope[@]}")
   fi
   mkdir -p "$worktree/$SHIPLINE_STATE_FOLDER"
-  if [[ $name == ticket-* ]] && is_running "codex-${name#ticket-}"; then
+  if [[ $name == ticket-* || $name == review-* ]] && is_running "codex-${name##*-}"; then
     keep=keep-codex
   fi
   # The worker can finish while its bridge is starting. Keep the marker that authorizes
@@ -908,7 +926,9 @@ list_running() {
   for socket in "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"/*; do
     name=${socket##*/}
     if [[ $name =~ ^codex-([0-9]+)$ ]]; then
-      ! is_running "$name" || is_running "ticket-${BASH_REMATCH[1]}" || echo "ticket-${name#codex-}"
+      local paired=ticket-${BASH_REMATCH[1]}
+      [[ ! -e $(worktree_of "$paired")/$SHIPLINE_STATE_FOLDER/review-${name#codex-}.codex ]] || paired=review-${name#codex-}
+      ! is_running "$name" || is_running "$paired" || echo "$paired"
     else
       ! is_session_name "$name" || ! is_running "$name" || echo "$name"
     fi
@@ -1152,7 +1172,7 @@ stopped_on_limit() {
   limit="" resets="" typed=""
   local target=$1
   if [[ -e $(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1.codex ]]; then
-    target=codex-${1#ticket-}
+    target=codex-${1##*-}
     codex_limit "$target" && return 0
   fi
   whole=$(tmux -L "$1" capture-pane -p -e -t "=$1:" 2>/dev/null) || return 1
@@ -1296,7 +1316,7 @@ cmd_resend() {
   worktree=$(worktree_of "$name")
   notes=$worktree/$SHIPLINE_STATE_FOLDER/$name
   if ! is_running "$name"; then
-    [[ $name == ticket-* && -e $notes.codex ]] && is_running "codex-${name#ticket-}" ||
+    [[ -e $notes.codex ]] && is_running "codex-${name##*-}" ||
       die "$name is not running"
   fi
   [[ $name != hunt-* ]] || die "a hunt is not sent its instruction again: its time ran on"
@@ -1305,7 +1325,7 @@ cmd_resend() {
   # The text and the key that sends it go separately: typed in one piece, Claude takes the
   # key for a line break of a paste.
   local target=$name prompt
-  [[ $limit != "Codex limit" ]] || target=codex-${name#ticket-}
+  [[ $limit != "Codex limit" ]] || target=codex-${name##*-}
   # What someone began to type there would be sent along with the instruction. Text this
   # script typed itself is left to send_prompt, which submits it only if it is unchanged.
   [[ -z $typed || -r ${notes%/*}/$target.typed ]] ||
@@ -1323,13 +1343,17 @@ cmd_resend() {
   if [[ $target == "$name" && -e $(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name.codex ]]; then
     # The bridge may have marked a question delivered before Claude hit its own limit.
     # Replay that turn; the worker instruction is never an owner's answer.
-    if [[ ! -r $notes.codex-answered || ! -r $notes.codex-turn.json ]] ||
-        ! cmp -s "$notes.codex-answered" "$notes.codex-turn.json"; then
+    if ! cmp -s "$notes.codex-turn.json" "$notes.codex-answered" &&
+        ! cmp -s "$notes.codex-turn.json" "$notes.codex-followed-up"; then
       rm -f "$notes.codex-delivered"
     fi
     prompt=__WORKFLOW_CODEX_TURN__
   fi
-  send_prompt "$target" "$prompt"
+  if [[ $target != "$name" ]]; then
+    send_codex_prompt "$name" "$prompt"
+  else
+    send_prompt "$target" "$prompt"
+  fi
   if [[ $target != "$name" && $restarted == false ]]; then
     send_prompt "$name" '__WORKFLOW_CODEX_TURN__'
   fi
@@ -1348,7 +1372,23 @@ read_prompt_box() {
   screen=$(tmux -L "$name" capture-pane -p -e -J -t "=$name:" 2>/dev/null) ||
     die "cannot read the input box of $name"
   top=$(strip_ansi <<<"$screen" | LC_ALL=C awk '/^─/ { above = last; last = NR } END { print above + 0 }')
-  if ((top)); then
+  if [[ $name == codex-* ]]; then
+    local plain first last
+    plain=$(strip_ansi <<<"$screen")
+    read -r first last < <(LC_ALL=C awk '
+      /^(›|>|❯)/ { first = NR }
+      NF { last = NR; footer = $0 }
+      END {
+        if (footer ~ /^[[:space:]]*\? for shortcuts([[:space:]]+[0-9]+% context left)?[[:space:]]*$/) last--
+        print first + 0, last + 0
+      }
+    ' <<<"$plain")
+    ((first > 0 && last >= first)) || die "cannot find the input box of $name"
+    # Keep ANSI until nonblank_input removes dim suggestions. Read continuation rows too,
+    # removing only the final footer row, never a footer-looking line inside an owner draft.
+    typed=$(LC_ALL=C sed -n "$first,${last}p" <<<"$screen" |
+      LC_ALL=C sed '1s/›/>/' | nonblank_input)
+  elif ((top)); then
     typed=$(LC_ALL=C sed -n "$((top + 1)),\$p" <<<"$screen" | LC_ALL=C sed -E $'/^(\\x1b\\[[0-?]*[ -/]*[@-~])*─/,$d' | nonblank_input)
   else
     [[ ${sending_resend:-false} == true ]] || die "cannot find the input box of $name"
@@ -1428,6 +1468,71 @@ send_prompt() {
   die "$name still has automation text in its input box after two Enter attempts"
 }
 
+# Deliver native work without turning it into an owner's bridge reply. Clear the previous
+# wait before typing; if Enter is not accepted, restore it for the next tick to retry.
+send_codex_prompt() {
+  local name=$1 prompt=$2 mode=${3:-resend} target=codex-${1##*-}
+  local relay_notes=$main/.claude/worktrees/ticket-${1##*-}/$SHIPLINE_STATE_FOLDER/$1
+  local backup suffix screen sending_resend=true
+  (
+    mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
+    exec 6>"$main/$SHIPLINE_STATE_FOLDER/start-${name##*-}.lock"
+    flock --nonblock 6 || die "another action for pull request ${name##*-} is under way"
+    require_running "$target"
+    [[ ! -e $relay_notes.owner-reply ]] || die "$name has a pending owner reply"
+    if ! bash "$script_dir/bridge-empty" "$name"; then
+      [[ $mode == resend ]] && holds_own_text "$name" ||
+        die "$name has text in its bridge input box"
+    fi
+    if [[ $mode == wake ]]; then
+      [[ ( -e $relay_notes.checks-wait || -e $relay_notes.idle ) && -e $relay_notes.bridge-stopped &&
+         ! -e $relay_notes.owner-blocked && ! -e $relay_notes.interaction-blocked && ! -e $relay_notes.pushed ]] ||
+        die "$name is busy or waiting for the owner"
+      cmp -s "$relay_notes.codex-turn.json" "$relay_notes.codex-delivered" ||
+        die "$name has a turn its bridge has not relayed"
+    fi
+    screen=$(tmux -L "$target" capture-pane -p -J -t "=$target:") || die "cannot read $target"
+    screen=${screen%"${screen##*[![:space:]]}"}
+    [[ $screen != *"Press enter to confirm or esc to cancel" ]] || die "$target shows a permission dialog"
+    ! LC_ALL=C grep -qE '^• .*\(.*esc to interrupt\)' <<<"$screen" || die "$target is working"
+    backup=$(mktemp -d "$relay_notes.wake.XXXXXX") || exit 1
+    restore_wait() {
+      local result=$?
+      trap - EXIT
+      if ((result != 0)); then
+        for suffix in waiting checks-wait job-wait idle; do
+          if [[ -e $backup/$suffix && ! -e $relay_notes.$suffix ]]; then
+            cp -p -- "$backup/$suffix" "$relay_notes.$suffix" || true
+          fi
+        done
+      fi
+      rm -rf -- "$backup"
+      exit "$result"
+    }
+    trap restore_wait EXIT
+    for suffix in waiting checks-wait job-wait idle; do
+      [[ ! -e $relay_notes.$suffix ]] || cp -p -- "$relay_notes.$suffix" "$backup/$suffix" || exit 1
+    done
+    [[ ! -r $relay_notes.codex-turn.json ]] || cp -- "$relay_notes.codex-turn.json" "$backup/turn" || exit 1
+    rm -f "$relay_notes.waiting" "$relay_notes.checks-wait" "$relay_notes.job-wait" "$relay_notes.idle"
+    send_prompt "$target" "$prompt"
+    [[ ! -e $backup/turn ]] || mv -- "$backup/turn" "$relay_notes.codex-followed-up"
+  )
+}
+
+send_reviewer_update() {
+  local name=$1 prompt=$2 notes
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  if [[ -e $notes.codex ]]; then
+    prompt=${prompt/"merge when they all passed"/"hand off with merge-when-current --handoff ${name##*-} when they all passed"}
+    send_codex_prompt "$name" "Workflow update: $prompt Never merge directly." wake
+    snapshot_busy "$name"
+    # The native completion callback wakes the relay with its sentinel, after the new turn.
+  else
+    send_prompt "$name" "$prompt"
+  fi
+}
+
 cmd_checks_finished() {
   local name=$1 head=$2 reason=${3:-checks} notes
   notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
@@ -1439,18 +1544,18 @@ cmd_checks_finished() {
   if [[ $reason == merged ]]; then
     local finished="review finished"
     [[ $name != audit-* ]] || finished="audit finished"
-    send_prompt "$name" "Pull request ${name#*-} was merged by the merge train, in a batch (commit $head). Do not call the gate again. Do its after-merge duties by the rules, then end with \`$finished\`."
+    send_reviewer_update "$name" "Pull request ${name#*-} was merged by the merge train, in a batch (commit $head). Do not call the gate again. Do its after-merge duties by the rules, then end with \`$finished\`."
     return
   fi
   if [[ $reason == lost ]]; then
-    send_prompt "$name" "GitHub lost a check on $head: it still lists it as running, though its run finished more than 10 minutes ago. Call the merge gate again by the rules; it pushes one empty commit to run CI again, or says why not."
+    send_reviewer_update "$name" "GitHub lost a check on $head: it still lists it as running, though its run finished more than 10 minutes ago. Call the merge gate again by the rules; it pushes one empty commit to run CI again, or says why not."
     return
   fi
   if [[ $reason == conflict ]]; then
-    send_prompt "$name" "GitHub reports a merge conflict on $head (CONFLICTING or DIRTY). Merge current main into this branch by the rules, using \`merge main: conflict in <files>\` for a conflict; ask the owner before resolving a non-mechanical conflict."
+    send_reviewer_update "$name" "GitHub reports a merge conflict on $head (CONFLICTING or DIRTY). Merge current main into this branch by the rules, using \`merge main: conflict in <files>\` for a conflict; ask the owner before resolving a non-mechanical conflict."
     return
   fi
-  send_prompt "$name" "The checks on $head have finished. Read them once and go on by the rules: merge when they all passed, fix or send back when one failed."
+  send_reviewer_update "$name" "The checks on $head have finished. Read them once and go on by the rules: merge when they all passed, fix or send back when one failed."
 }
 
 # The tick's two messages to a Claude worker or reviewer that sits with nothing to do. Never to
@@ -1637,8 +1742,8 @@ cmd_running() {
 # Resolve both groups before writing either; each must belong to its own tmux scope.
 session_groups() {
   group_of "$1" || return 1
-  if [[ $1 == ticket-* && -e $(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1.codex ]]; then
-    group_of "codex-${1#ticket-}" || return 1
+  if [[ -e $(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1.codex ]]; then
+    group_of "codex-${1##*-}" || return 1
   fi
 }
 
@@ -1666,7 +1771,7 @@ cmd_protect() {
 
 cmd_stop() {
   local name=$1
-  if ! is_running "$name" && { [[ $name != ticket-* ]] || ! is_running "codex-${name#ticket-}"; }; then
+  if ! is_running "$name" && { [[ ! -e $(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name.codex ]] || ! is_running "codex-${name##*-}"; }; then
     echo "$name is not running"
     return 0
   fi
@@ -1807,28 +1912,43 @@ cmd_cleanup() {
 # A bridge has no built-in tools, only the two MCP relay operations. It cannot edit, test,
 # publish or answer for the owner. Codex's notify writes turns to the relay's mailbox.
 start_codex_worker() {
-  local name=$1 worktree=$2 effort=$3 prompt=$4 command config codex_name=codex-${1#ticket-}
+  local name=$1 worktree=$2 effort=$3 prompt=$4 command config codex_name=codex-${1##*-}
   local notes=$worktree/$SHIPLINE_STATE_FOLDER/$name common real_gh push_queue
   push_queue=${XDG_STATE_HOME:-$HOME/.local/state}/workflow/pushes
   mkdir -p "$push_queue"
   mkdir -p "$worktree/$SHIPLINE_STATE_FOLDER"
-  rm -f "$notes.codex-turn.json" "$notes.codex-delivered" "$notes.codex-answered" "$notes.codex-followed-up" "$notes.codex-quota-delivered" "$notes.codex-approval-delivered" "$notes.codex-recovery-error" "$notes.owner-reply"
-  touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name#ticket-}"
+  forget_notes "$notes"
+  rm -f "$notes.codex-turn.json"
+  [[ $name != ticket-* ]] || touch "$main/$SHIPLINE_STATE_FOLDER/codex-built-${name##*-}"
+  [[ $name != review-* ]] || touch "$main/$SHIPLINE_STATE_FOLDER/codex-resolved-${name##*-}"
   common=$(git rev-parse --path-format=absolute --git-common-dir)
   [[ $effort != max ]] || effort=xhigh
   # Scope the bridge flag to this process's callback. A nested `codex review` must not
   # inherit it and turn a global notify callback into a worker turn.
   config=$(jq -cn --arg script "$script_dir/notify" '["env", "WORKFLOW_CODEX_BRIDGE=1", "bash", $script, "codex"]')
-  printf -v command 'codex --no-alt-screen --sandbox workspace-write --add-dir %q --add-dir %q -c sandbox_workspace_write.network_access=true -c %q -c %q %q' \
-    "$common" "$push_queue" "model_reasoning_effort=$effort" "notify=$config" "$prompt"
+  printf -v command 'codex --no-alt-screen --sandbox workspace-write --add-dir %q --add-dir %q -c sandbox_workspace_write.network_access=true -c %q -c %q' \
+    "$common" "$push_queue" "model_reasoning_effort=$effort" "notify=$config"
+  if [[ $name == review-* ]]; then
+    # The panel, fallback and handoff write shared workflow notes, outside the kept worktree.
+    printf -v command '%s --add-dir %q' "$command" "$main/$SHIPLINE_STATE_FOLDER"
+  fi
+  if [[ -n ${5:-} ]]; then
+    printf -v command '%s --model %q' "$command" "$5"
+  fi
+  printf -v command '%s %q' "$command" "$prompt"
   real_gh=$(command -v gh)
   touch "$notes.codex"
   launch "$codex_name" "$worktree" "$command" "PATH=$script_dir/codex-bin:$shipline_bin$PATH" "$name" "WORKFLOW_GH=$real_gh"
+  [[ $name != review-* ]] || record_review_start "$name" "$worktree"
   start_codex_bridge "$name" "$worktree"
 }
 
 start_codex_bridge() {
   local name=$1 worktree=$2 on_failure=${3:-stop} command config notes=$2/$SHIPLINE_STATE_FOLDER/$1
+  # Replaying a waiting turn is still a background wait, not a question for the owner.
+  if [[ -e $notes.checks-wait || -e $notes.job-wait ]]; then
+    touch "$notes.waiting"
+  fi
   config=$notes.codex-config.json
   jq -n --arg script "$script_dir/codex-bridge.mjs" --arg worktree "$worktree" --arg name "$name" \
     '{mcpServers: {codex_bridge: {command: "node", args: [$script, $worktree, $name]}}}' >"$config"
@@ -1854,7 +1974,7 @@ cmd_bridge() {
   local name=$1 worktree notes typed recovered recovery_failed=false
   worktree=$(worktree_of "$name")
   notes=$worktree/$SHIPLINE_STATE_FOLDER/$name
-  [[ -e $notes.codex ]] && is_running "codex-${name#ticket-}" || die "$name has no running Codex worker"
+  [[ -e $notes.codex ]] && is_running "codex-${name##*-}" || die "$name has no running Codex worker"
   if is_running "$name"; then
     bridge_parse_failed "$name" || return 0
     # Never discard an unsent owner reply when replacing the failed bridge.
@@ -1875,8 +1995,8 @@ cmd_bridge() {
     end_server "$name" || return 1
     snapshot_remove "$name"
   fi
-  if [[ ! -r $notes.codex-answered || ! -r $notes.codex-turn.json ]] ||
-      ! cmp -s "$notes.codex-answered" "$notes.codex-turn.json"; then
+  if ! cmp -s "$notes.codex-turn.json" "$notes.codex-answered" &&
+      ! cmp -s "$notes.codex-turn.json" "$notes.codex-followed-up"; then
     rm -f "$notes.codex-delivered"
   fi
   # A permission panel shown to the bridge that ended may still wait for the owner.
@@ -1974,8 +2094,9 @@ case ${1:-} in
     cmd_cleanup "${2:-}"
     ;;
   bridge)
-    [[ $# -eq 2 && $2 =~ ^ticket-[0-9]+$ ]] || usage
+    [[ $# -eq 2 && $2 =~ ^(ticket|review)-[0-9]+$ ]] || usage
     find_main_checkout
+    [[ $2 != review-* || -e $(worktree_of "$2")/$SHIPLINE_STATE_FOLDER/$2.codex ]] || usage
     cmd_bridge "$2"
     ;;
   checks-finished | conflict-found | lost-check | batch-merged)
@@ -1989,6 +2110,22 @@ case ${1:-} in
       cmd_checks_finished "$2" "$3" merged
     else
       cmd_checks_finished "$2" "$3"
+    fi
+    ;;
+  panel-finished)
+    [[ $# -eq 3 && $2 =~ ^review-[0-9]+$ && $3 =~ ^[0-9a-f]{40}$ ]] || usage
+    find_main_checkout
+    require_running "$2"
+    ! stopped_on_limit "$2" || die "$2 is stopped on the usage limit"
+    folder=$main/$SHIPLINE_STATE_FOLDER
+    result=$(cat "$folder/$2.panel-result-$3") || exit 1
+    [[ $(git -C "$(worktree_of "$2")" rev-parse HEAD) == "$3" ]] || die 'panel head changed'
+    if [[ $result == 0 ]]; then
+      python3 -B "$script_dir/conflict_review.py" panel-complete "$folder" "${2#review-}" "$3" ||
+        die 'panel reports are incomplete'
+      send_reviewer_update "$2" "The independent conflict panel on $3 has completed. Read the completed Claude and Cursor reports in $main/$SHIPLINE_STATE_FOLDER/reviews/${2#review-}/$3, then publish only if they and the rules allow it. Hand off with merge-when-current --handoff ${2#review-} when all checks pass."
+    else
+      send_reviewer_update "$2" "The independent conflict panel on $3 failed. Read its reports in $main/$SHIPLINE_STATE_FOLDER/reviews/${2#review-}/$3 and report the failure. Do not publish a conflict round."
     fi
     ;;
   status-check)

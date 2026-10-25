@@ -547,13 +547,13 @@ def test_memory_actions_include_codex_and_bridge(workflow: Workflow) -> None:
 
 
 @contextmanager
-def _relay(workflow: Workflow) -> Generator[subprocess.Popen[str]]:
+def _relay(workflow: Workflow, name: str = "ticket-7") -> Generator[subprocess.Popen[str]]:
     process = subprocess.Popen(
         [
             "node",
             str(workflow.script.with_name("codex-bridge.mjs")),
             str(workflow.worktree(7)),
-            "ticket-7",
+            name,
         ],
         env=workflow.env,
         stdin=subprocess.PIPE,

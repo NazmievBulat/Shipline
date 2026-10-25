@@ -1,10 +1,22 @@
 """A conflict round reuses only proved review evidence, through the real workflow scripts."""
 
+import fcntl
 import json
+import os
+import shlex
+import shutil
 import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from workflow.test_checks_finished import _BOX, _WAIT, _checks  # pyright: ignore[reportPrivateUsage]
+from workflow.test_codex_worker import (  # pyright: ignore[reportPrivateUsage]
+    _relay,
+    _rpc,
+)
 from workflow.test_independent_review import (  # pyright: ignore[reportPrivateUsage]
     _idle,
     _rule_breaks,
@@ -465,6 +477,551 @@ def _reviewer(workflow: Workflow) -> str:
     return done.stdout
 
 
+def _program(workflow: Workflow, program: str = "codex", **options: object) -> None:
+    config = workflow.repo / "shipline.json"
+    values = json.loads(config.read_text())
+    values["conflict_review"] = {"program": program, **options}
+    config.write_text(json.dumps(values))
+
+
+def _record_handback(workflow: Workflow) -> None:
+    (_folder(workflow) / "merge-review-7").write_text(
+        json.dumps(
+            {
+                "head": workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)),
+                "event": "conflict-event",
+                "reason": "non-mechanical conflict in " + _FILE,
+            }
+        )
+    )
+
+
+def _codex_conflict(workflow: Workflow) -> tuple[str, str]:
+    workflow.add_worktree(7, draft=False)
+    head, main = _conflict(workflow)
+    _begin_merge(workflow, main)
+    folder = _folder(workflow)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "review-7.conflict.json").write_text(
+        json.dumps({"head": head, "main": main, "files": [_FILE]})
+    )
+    _program(workflow)
+    _record_handback(workflow)
+    return head, main
+
+
+def test_codex_conflict_starts_with_its_sentence_and_bridge(workflow: Workflow) -> None:
+    head, _ = _codex_conflict(workflow)
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    args = shlex.split(session_arguments(workflow.state, "codex-7")[-1])
+    assert instruction(
+        f"Review conflict resolution for pull request 7 extending passed head {head} "
+        f"in files {_FILE}"
+    ) in args
+    assert "workspace-write" in args
+    grants = [args[index + 1] for index, word in enumerate(args) if word == "--add-dir"]
+    assert str(_folder(workflow)) in grants
+    bridge = shlex.split(session_arguments(workflow.state, "review-7")[-1])
+    assert bridge[bridge.index("--tools") + 1] == ""
+    assert "codex-bridge" in (workflow.notes(7) / "review-7.codex-config.json").read_text()
+    assert (workflow.notes(7) / "review-7.codex").exists()
+    assert (workflow.notes(7) / "review-7.started").exists()
+    assert not (_folder(workflow) / "codex-built-7").exists()
+    done = workflow.run("stop", "review-7")
+    assert done.returncode == 0, done.stderr
+    assert not workflow.is_running("codex-7")
+    assert not workflow.is_running("review-7")
+
+
+def test_conflict_replaces_a_crashed_workers_codex_flag(workflow: Workflow) -> None:
+    _codex_conflict(workflow)
+    notes = workflow.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stderr
+    assert not (notes / "ticket-7.codex").exists()
+    assert (_folder(workflow) / "codex-built-7").exists()
+    (workflow.state / "tmux/review-7").unlink()
+    listed = workflow.run("list")
+    assert listed.returncode == 0, listed.stderr
+    assert listed.stdout.startswith("review-7  idle")
+    assert "ticket-7  " not in listed.stdout
+
+
+def _on_launch(workflow: Workflow, name: str, command: str) -> None:
+    script = (workflow.bin / "tmux").read_text()
+    marker = "  new-session)\n"
+    assert marker in script
+    workflow.fake("tmux", script.replace(
+        marker, marker + f"    if [[ $name == {shlex.quote(name)} ]]; then\n{command}\n    fi\n", 1
+    ))
+
+
+def test_codex_review_start_time_precedes_bridge_link_wait(workflow: Workflow) -> None:
+    _codex_conflict(workflow)
+    started = workflow.notes(7) / "review-7.started"
+    _on_launch(
+        workflow, "review-7",
+        f"      [[ -f {shlex.quote(str(started))} ]] || exit 91\n"
+        f"      touch -d @1790000000 {shlex.quote(str(started))}",
+    )
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert started.stat().st_mtime == 1_790_000_000
+
+
+def test_fast_native_wait_survives_initial_bridge_launch_and_sentinel(workflow: Workflow) -> None:
+    _codex_conflict(workflow)
+    waiting = workflow.notes(7) / "review-7.waiting"
+    _on_launch(workflow, "codex-7", f"      touch {shlex.quote(str(waiting))}")
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stderr
+    assert waiting.exists()
+    workflow.notify(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "__WORKFLOW_CODEX_TURN__"},
+        "review-7",
+    )
+    assert waiting.exists()
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _WAIT}, "review-7")
+    assert (workflow.notes(7) / "review-7.checks-wait").exists()
+    assert not (workflow.notes(7) / "review-7.owner-blocked").exists()
+
+
+def _waiting_codex_review(workflow: Workflow) -> str:
+    _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    head = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", head)
+    workflow.run_script("notify", "waiting", env={"WORKFLOW_SESSION": "review-7"})
+    workflow.run_script(
+        "notify", "codex",
+        json.dumps({"type": "agent-turn-complete", "last-assistant-message": _WAIT}),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    with _relay(workflow, "review-7") as relay:
+        turn = _rpc(relay, "tools/call", {"name": "await_turn"})
+        assert turn["result"]["content"][0]["text"] == _WAIT
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _WAIT}, "review-7")
+    workflow.screen(f"Remote Control: {SESSION_LINK}\n● " + _WAIT + _BOX, "review-7")
+    workflow.screen(
+        "• Waiting for CI.\n\n\u203a \x1b[2mAsk Codex to do anything\x1b[0m\n\n  ? for shortcuts\n",
+        "codex-7",
+    )
+    assert (workflow.notes(7) / "review-7.checks-wait").exists()
+    return head
+
+
+def test_bridge_recovery_replays_a_ci_wait_without_turning_it_into_a_question(
+    workflow: Workflow,
+) -> None:
+    _waiting_codex_review(workflow)
+    started = (workflow.notes(7) / "review-7.started").stat().st_mtime_ns
+    (workflow.state / "tmux/review-7").unlink()
+    done = workflow.run("bridge", "review-7")
+    assert done.returncode == 0, done.stderr
+    assert (workflow.notes(7) / "review-7.started").stat().st_mtime_ns == started
+    workflow.notify(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "__WORKFLOW_CODEX_TURN__"},
+        "review-7",
+    )
+    with _relay(workflow, "review-7") as relay:
+        assert _rpc(relay, "tools/call", {"name": "await_turn"})["result"]["content"][0]["text"] == _WAIT
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _WAIT}, "review-7")
+    assert (workflow.notes(7) / "review-7.checks-wait").exists()
+    assert not (workflow.notes(7) / "review-7.owner-blocked").exists()
+    assert not (workflow.notes(7) / "review-7.owner-reply").exists()
+
+
+@pytest.mark.parametrize("command", ["checks-finished", "lost-check", "conflict-found", "batch-merged"])
+def test_reviewer_automation_wakes_native_codex_without_an_owner_reply(
+    workflow: Workflow, command: str
+) -> None:
+    head = _waiting_codex_review(workflow)
+    done = workflow.run(command, "review-7", head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")) == 1
+    assert not workflow.calls("tmux review-7 send-keys")
+    assert not (workflow.notes(7) / "review-7.owner-reply").exists()
+    assert not (workflow.notes(7) / "review-7.checks-wait").exists()
+    if command == "checks-finished":
+        assert "merge-when-current --handoff 7" in workflow.calls("tmux codex-7 send-keys")[0]
+
+
+@pytest.mark.parametrize("block", [
+    "bridge input", "native input", "native multiline", "native footer text",
+    "native hint text", "pending reply", "unrelayed", "working", "permission",
+])
+def test_native_review_wake_preserves_owner_input_and_active_work(
+    workflow: Workflow, block: str
+) -> None:
+    head = _waiting_codex_review(workflow)
+    if block == "bridge input":
+        workflow.screen("● " + _WAIT + _BOX.replace("> \n", "> owner text\n"), "review-7")
+    elif block == "native input":
+        workflow.screen("\u203a owner text\n", "codex-7")
+    elif block == "native multiline":
+        workflow.screen("\u203a \n  owner text\n\n  ? for shortcuts\n", "codex-7")
+    elif block == "native footer text":
+        workflow.screen("\u203a \n  ? for shortcuts\n\n  ? for shortcuts\n", "codex-7")
+    elif block == "native hint text":
+        workflow.screen("\u203a Ask Codex to do anything\n\n  ? for shortcuts\n", "codex-7")
+    elif block == "pending reply":
+        (workflow.notes(7) / "review-7.owner-reply").write_text("1")
+    elif block == "unrelayed":
+        (workflow.notes(7) / "review-7.codex-turn.json").write_text(
+            json.dumps({"last-assistant-message": "Which option? Reply 1 or 2."})
+        )
+    elif block == "working":
+        workflow.screen("• Working (1s • esc to interrupt)\n\u203a \n", "codex-7")
+    else:
+        workflow.screen("Would you like to run the following command?\nPress enter to confirm or esc to cancel", "codex-7")
+    before = (workflow.notes(7) / "review-7.checks-wait").stat().st_mtime_ns
+    done = workflow.run("checks-finished", "review-7", head)
+    assert done.returncode != 0
+    assert not workflow.calls("tmux codex-7 send-keys")
+    assert (workflow.notes(7) / "review-7.checks-wait").stat().st_mtime_ns == before
+    if block == "pending reply":
+        assert (workflow.notes(7) / "review-7.owner-reply").read_text() == "1"
+
+
+def test_unsent_native_review_wake_keeps_its_wait_for_retry(workflow: Workflow) -> None:
+    head = _waiting_codex_review(workflow)
+    (workflow.state / "swallow-enter-codex-7").write_text("2")
+    first = workflow.run("checks-finished", "review-7", head)
+    assert first.returncode != 0
+    assert (workflow.notes(7) / "review-7.checks-wait").exists()
+    assert not (workflow.notes(7) / "review-7.codex-followed-up").exists()
+    second = workflow.run("checks-finished", "review-7", head)
+    assert second.returncode == 0, second.stderr
+    assert len(workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")) == 1
+
+
+def test_tick_wakes_native_conflict_reviewer_once_for_finished_checks(workflow: Workflow) -> None:
+    head = _waiting_codex_review(workflow)
+    _checks(workflow)
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")) == 1
+    assert (_folder(workflow) / f"review-7.checks-nudged-{head}").exists()
+    assert not (workflow.notes(7) / "review-7.owner-reply").exists()
+
+
+def test_native_quota_resend_can_retry_its_own_unsent_bridge_sentinel(workflow: Workflow) -> None:
+    _waiting_codex_review(workflow)
+    quota = "■ You've hit your usage limit. Try again at 4:00 PM.\n\u203a \n"
+    workflow.screen(quota, "codex-7")
+    (workflow.state / "swallow-enter-review-7").write_text("2")
+    first = workflow.run("resend", "review-7")
+    assert first.returncode != 0
+    assert (workflow.notes(7) / "review-7.typed").read_text() == "__WORKFLOW_CODEX_TURN__"
+    workflow.screen(quota, "codex-7")
+    second = workflow.run("resend", "review-7")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert not (workflow.notes(7) / "review-7.typed").exists()
+
+
+def test_recovery_after_native_wake_waits_for_a_fresh_turn(workflow: Workflow) -> None:
+    head = _waiting_codex_review(workflow)
+    assert workflow.run("checks-finished", "review-7", head).returncode == 0
+    notes = workflow.notes(7)
+    (workflow.state / "tmux/review-7").unlink()
+    done = workflow.run("bridge", "review-7")
+    assert done.returncode == 0, done.stderr
+    assert (notes / "review-7.codex-delivered").read_text() == (notes / "review-7.codex-turn.json").read_text()
+    assert not (notes / "review-7.waiting").exists()
+    workflow.run_script("notify", "waiting", env={"WORKFLOW_SESSION": "review-7"})
+    workflow.run_script(
+        "notify", "codex",
+        json.dumps({"type": "agent-turn-complete", "last-assistant-message": _WAIT, "turn-id": "next"}),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    workflow.notify(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "__WORKFLOW_CODEX_TURN__"},
+        "review-7",
+    )
+    with _relay(workflow, "review-7") as relay:
+        assert _rpc(relay, "tools/call", {"name": "await_turn"})["result"]["content"][0]["text"] == _WAIT
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _WAIT}, "review-7")
+    assert (notes / "review-7.checks-wait").exists()
+    assert not (notes / "review-7.owner-blocked").exists()
+
+
+@pytest.mark.parametrize("built", [False, True])
+def test_codex_resolution_gets_claude_and_cursor(workflow: Workflow, built: bool) -> None:
+    _panel_conflict(workflow)
+    _program(workflow)
+    _record_handback(workflow)
+    if built:
+        (_folder(workflow) / "codex-built-7").touch()
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", resolved)
+    for tool in ("agent", "codex"):
+        workflow.fake(tool, '#!/bin/bash\necho "@TOOL@ report"\n')
+    workflow.fake(
+        "claude",
+        """#!/bin/bash
+strict=false
+config="" tools=""
+while (($#)); do
+  case $1 in
+    --strict-mcp-config) strict=true ;;
+    --mcp-config=*) config=${1#--mcp-config=} ;;
+    --tools=*) tools=${1#--tools=} ;;
+  esac
+  shift
+done
+$strict && [[ $tools == Read,Grep,Glob && -f $config ]] || exit 91
+[[ $(cat "$config") == '{"mcpServers":{}}' ]] || exit 92
+echo 'claude report'
+""",
+    )
+    done = workflow.run_script("review-panel", "7", "codex", "cursor")
+    assert done.returncode == 0, done.stdout + done.stderr
+    reports = _folder(workflow) / "reviews/7" / resolved
+    assert "claude report" in (reports / "claude.md").read_text()
+    assert "agent report" in (reports / "cursor.md").read_text()
+    assert not (reports / "codex.md").exists()
+
+
+def test_crash_before_panel_preserves_codex_resolution_provenance(workflow: Workflow) -> None:
+    _panel_conflict(workflow)
+    _program(workflow)
+    _record_handback(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow, "hunk")
+    workflow.set_pull_request(7, "OPEN", resolved)
+    # The resolver ended after pushing, before it could run a panel or request a fallback.
+    assert workflow.run("stop", "review-7").returncode == 0
+    assert workflow.run("start", "review", "7").returncode == 0
+    assert not workflow.is_running("codex-7")
+    args = " ".join(session_arguments(workflow.state, "review-7"))
+    assert "--model opus" in args and "--mcp-config" not in args
+    workflow.fake("agent", '#!/bin/bash\necho "Cursor report"\n')
+    done = workflow.run_script("review-panel", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    reports = _folder(workflow) / "reviews/7" / resolved
+    assert "Codex resolved a conflict" in (reports / "codex.md").read_text()
+    assert "Cursor report" in (reports / "cursor.md").read_text()
+
+
+@pytest.mark.parametrize("extra", ["file", "hunk", "revoked", "corrupt", "full"])
+def test_codex_panel_fallback_returns_to_claude(workflow: Workflow, extra: str) -> None:
+    _panel_conflict(workflow)
+    _program(workflow)
+    _record_handback(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow, extra)
+    workflow.set_pull_request(7, "OPEN", resolved)
+    if extra == "revoked":
+        (workflow.state / "reviews-7.json").write_text("[]")
+    elif extra == "corrupt":
+        (_folder(workflow) / "review-7.conflict.json").write_text("invalid")
+    done = workflow.run_script(
+        "review-panel", "7", *(["--full-review"] if extra == "full" else [])
+    )
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "Full review required" in done.stderr
+    assert (_folder(workflow) / "review-7.usual-reviewer").read_text().strip() == resolved
+    assert not (_folder(workflow) / "reviews/7" / resolved / "codex.md").exists()
+    assert workflow.run("stop", "review-7").returncode == 0
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    args = " ".join(session_arguments(workflow.state, "review-7"))
+    assert "--model opus" in args and "--mcp-config" not in args
+    assert not workflow.is_running("codex-7")
+    workflow.fake("agent", '#!/bin/bash\necho "Cursor report"\n')
+    done = workflow.run_script("review-panel", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    full = _folder(workflow) / "reviews/7" / resolved / "full-review"
+    assert "Codex resolved a conflict" in (full / "codex.md").read_text()
+    assert "Cursor report" in (full / "cursor.md").read_text()
+
+
+def test_conflict_program_is_validated_by_name(workflow: Workflow) -> None:
+    _program(workflow, "unknown")
+    done = workflow.run("start", "review", "7")
+    assert done.returncode != 0
+    assert "conflict_review.program must be one of claude, codex" in done.stderr
+
+
+@pytest.mark.parametrize("program", ["claude", "codex"])
+def test_program_alone_and_optional_conflict_limits(workflow: Workflow, program: str) -> None:
+    _codex_conflict(workflow)
+    _program(workflow, program)
+    assert _reviewer(workflow) == "high opus\n"
+    _program(workflow, program, effort="medium", model="sonnet", max_changed_lines=5)
+    assert _reviewer(workflow) == "high opus\n"
+    assert not (_folder(workflow) / "review-7.conflict-reviewer").exists()
+
+
+def test_codex_conflict_honors_effort_and_explicit_model(workflow: Workflow) -> None:
+    _codex_conflict(workflow)
+    _program(workflow, effort="medium", model="gpt-example", max_changed_lines=6)
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stderr
+    args = shlex.split(session_arguments(workflow.state, "codex-7")[-1])
+    assert "model_reasoning_effort=medium" in args
+    assert args[args.index("--model") + 1] == "gpt-example"
+
+
+def test_conflict_bridge_relays_question_and_recorded_answer(workflow: Workflow) -> None:
+    _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    message = 'Recommend 1.\nOwner only: yes\nType "1".'
+    done = workflow.run_script(
+        "notify",
+        "codex",
+        json.dumps({"type": "agent-turn-complete", "last-assistant-message": message}),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    assert done.returncode == 0
+    with _relay(workflow, "review-7") as relay:
+        turn = _rpc(relay, "tools/call", {"name": "await_turn"})
+        assert turn["result"]["content"][0]["text"] == message
+        workflow.notify({"hook_event_name": "UserPromptSubmit", "prompt": "1"}, "review-7")
+        assert "result" in _rpc(relay, "tools/call", {"name": "reply"})
+    assert (workflow.notes(7) / "review-7.codex-answered").exists()
+
+
+@pytest.mark.parametrize("lost_bridge", [False, True])
+def test_conflict_codex_quota_and_bridge_recovery(workflow: Workflow, lost_bridge: bool) -> None:
+    _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    workflow.screen(
+        "■ You've hit your usage limit. Try again at 4:00 PM.\n\u203a \n", "codex-7"
+    )
+    if lost_bridge:
+        (workflow.state / "tmux/review-7").unlink()
+    listed = workflow.run("list")
+    assert listed.returncode == 0, listed.stderr
+    assert "review-7  limit" in listed.stdout and "Codex limit" in listed.stdout
+    assert "resets" not in listed.stdout
+    if lost_bridge:
+        done = workflow.run("bridge", "review-7")
+        assert done.returncode == 0, done.stderr
+        assert workflow.is_running("review-7") and workflow.is_running("codex-7")
+
+
+def test_tick_handback_starts_codex_conflict_reviewer(handed: GitHub) -> None:
+    workflow = handed.workflow
+    head, main = _conflict(workflow)
+    _program(workflow)
+    handed.head, handed.base = head, main
+    handed.pulls["7"]["headRefOid"] = head
+    handed.pulls["7"]["mergeable"] = "CONFLICTING"
+    handed.main()
+    handed.ci(main, head, tested_base=workflow.git("merge-base", main, head))
+    (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {head}\n")
+    note = _folder(workflow) / "merge-wanted-7"
+    note.write_text(json.dumps({**json.loads(note.read_text()), "head": head}))
+    _publish(handed, "passed", head)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.is_running("codex-7") and workflow.is_running("review-7")
+    args = shlex.split(session_arguments(workflow.state, "codex-7")[-1])
+    assert args[-1] == instruction(
+        f"Review conflict resolution for pull request 7 extending passed head {head} "
+        f"in files {_FILE}"
+    )
+
+
+@pytest.mark.parametrize("lost_bridge", [False, True])
+def test_tick_reads_codex_conflict_completion_and_starts_full_review(
+    workflow: Workflow, lost_bridge: bool
+) -> None:
+    _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow, "hunk")
+    workflow.set_pull_request(7, "OPEN", resolved)
+    (_folder(workflow) / "review-7.usual-reviewer").write_text(resolved + "\n")
+    done = workflow.run_script(
+        "notify",
+        "codex",
+        json.dumps(
+            {
+                "type": "agent-turn-complete",
+                "last-assistant-message": "Full review required.\nreview finished",
+            }
+        ),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    assert done.returncode == 0
+    assert (workflow.notes(7) / "review-7.codex-turn.json").exists()
+    if lost_bridge:
+        (workflow.state / "tmux/review-7").unlink()
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not workflow.is_running("codex-7")
+    assert workflow.is_running("review-7")
+    assert "--mcp-config" not in " ".join(session_arguments(workflow.state, "review-7"))
+    assert not _rule_breaks(workflow)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["publish", "dash-file", "other", "approve", "full", "sent-back", "undo", "ready", "body", "ticket"],
+)
+def test_codex_conflict_gh_allows_only_its_own_conflict_round(
+    workflow: Workflow, operation: str
+) -> None:
+    head, _ = _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow)
+    reports = _folder(workflow) / "reviews/7" / resolved
+    reports.mkdir(parents=True)
+    for who in ("claude", "cursor"):
+        (reports / f"{who}.md").write_text(f"{who} report\nexit 0\n")
+    (reports / "panel.complete").write_text(resolved + "\n")
+    payload = workflow.root / "round.json"
+    if operation == "dash-file":
+        payload = workflow.worktree(7) / "--round.json"
+    # A send-back goes to Claude through the full-review fallback, never from Codex.
+    result = "sent-back" if operation == "sent-back" else "passed"
+    body = f"<!-- workflow-review round=2 result={result} -->\n"
+    if operation != "full":
+        body += f"<!-- workflow-conflict extends={head} -->\n"
+    payload.write_text(
+        json.dumps(
+            {
+                "body": body,
+                "commit_id": resolved,
+                "event": "APPROVE" if operation == "approve" else "COMMENT",
+            }
+        )
+    )
+    number = 8 if operation == "other" else 7
+    args = [
+        "api", "-X", "POST", f"repos/example-org/example-app/pulls/{number}/reviews",
+        "--input", payload.name if operation == "dash-file" else str(payload),
+    ]
+    if operation == "ready":
+        args = ["pr", "ready", "7"]
+    elif operation == "undo":
+        args = ["pr", "ready", "7", "--undo"]
+    elif operation == "body":
+        args = [
+            "api", "-X", "PATCH", "repos/example-org/example-app/pulls/7", "-F",
+            "body=@round.json",
+        ]
+    elif operation == "ticket":
+        args = ["pr", "create", "--draft"]
+    env = dict(
+        line.split("=", 1)
+        for line in (workflow.state / "env/codex-7").read_text().splitlines()
+    )
+    workflow.fake("gh", '#!/bin/bash\necho allowed\n')
+    shim = Path(env["PATH"].split(":")[0]) / "gh"
+    done = subprocess.run(
+        ["bash", str(shim), *args], cwd=workflow.worktree(7), env=env,
+        text=True, capture_output=True, check=False,
+    )
+    assert (done.returncode == 0) == (operation in {"publish", "dash-file"}), done.stdout + done.stderr
+
+
 @pytest.mark.parametrize(
     ("state", "reviewer"),
     [
@@ -688,3 +1245,395 @@ def test_a_reviewer_the_gate_sent_to_the_usual_one_is_stopped_without_a_rule_bre
     workflow.git("commit", "--allow-empty", "-m", "fix: send-back", cwd=workflow.worktree(7))
     _reviewer(workflow)
     assert not (folder / "review-7.usual-reviewer").exists()
+
+
+
+def _panel_reviewer(workflow: Workflow, tool: str, body: str) -> None:
+    if tool == "claude":
+        base = workflow.bin / "claude-workflow"
+        if not base.exists():
+            workflow.fake("claude-workflow", (workflow.bin / "claude").read_text())
+        body = (
+            '#!/bin/bash\nif [[ " $* " != *" --strict-mcp-config "* ]]; then\n'
+            f'  exec {shlex.quote(str(base))} "$@"\nfi\n' + body
+        )
+    workflow.fake(tool, body)
+
+def _requested_panel(workflow: Workflow) -> str:
+    _panel_conflict(workflow)
+    _program(workflow)
+    _record_handback(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    head = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", head)
+    for tool in ("agent", "claude"):
+        _panel_reviewer(workflow, tool, '#!/bin/bash\necho "@TOOL@ report"\n')
+    # The existing bridge wait contract, with a panel wait as the current completed turn.
+    workflow.run_script("notify", "waiting", env={"WORKFLOW_SESSION": "review-7"})
+    workflow.run_script(
+        "notify", "codex",
+        json.dumps({"type": "agent-turn-complete", "last-assistant-message": _WAIT}),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    with _relay(workflow, "review-7") as relay:
+        assert "result" in _rpc(relay, "tools/call", {"name": "await_turn"})
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _WAIT}, "review-7")
+    workflow.screen("Remote Control: " + SESSION_LINK + "\n● " + _WAIT + _BOX, "review-7")
+    workflow.screen("• Waiting for panel.\n\n› \n", "codex-7")
+    done = workflow.run_script("review-panel", "7", "--request", cwd=workflow.worktree(7),
+                               env={"WORKFLOW_SESSION": "review-7"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    request = json.loads((_folder(workflow) / "review-7.panel-request.json").read_text())
+    assert request == {"number": "7", "head": head, "full_review": False}
+    assert not (_folder(workflow) / "reviews/7" / head / "claude.md").exists()
+    return head
+
+
+def _finish_requested_panel(workflow: Workflow, head: str) -> subprocess.CompletedProcess[str]:
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    result = _folder(workflow) / f"review-7.panel-result-{head}"
+    deadline = time.monotonic() + 30
+    while not result.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert result.exists(), (_folder(workflow) / f"review-7.panel-log-{head}").read_text()
+    return workflow.run_script("tick")
+
+
+def test_tick_runs_requested_panel_outside_resolver_and_wakes_once(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\n[[ -z ${WORKFLOW_SESSION:-} ]] || exit 91\necho "Claude report"\n')
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    reports = _folder(workflow) / "reviews/7" / head
+    assert "Claude report" in (reports / "claude.md").read_text()
+    assert (reports / "panel.complete").read_text().strip() == head
+    assert len(workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")) == 1
+    assert (_folder(workflow) / f"review-7.panel-woken-{head}").exists()
+
+
+@pytest.mark.parametrize("failure", ["missing", "missing cursor", "failed", "pending", "wrong head", "full-request"])
+def test_codex_cannot_publish_without_successful_claude_panel(workflow: Workflow, failure: str) -> None:
+    head, _ = _codex_conflict(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    resolved = _resolve(workflow)
+    reports = _folder(workflow) / "reviews/7" / resolved
+    reports.mkdir(parents=True)
+    (reports / "panel.complete").write_text((head if failure == "wrong head" else resolved) + "\n")
+    if failure != "missing cursor":
+        (reports / "cursor.md").write_text("Cursor report\nexit 0\n")
+    if failure != "missing":
+        (reports / "claude.md").write_text("Claude report\nexit 1\n" if failure == "failed" else "Claude report\nexit 0\n")
+    if failure == "pending":
+        (reports / "claude.md.pending").write_text("still running")
+    if failure == "full-request":
+        (_folder(workflow) / "review-7.panel-request.json").write_text(json.dumps(
+            {"number": "7", "head": resolved, "full_review": True}
+        ))
+    payload = workflow.worktree(7) / "round.json"
+    payload.write_text(json.dumps({"event": "COMMENT", "commit_id": resolved, "body":
+        f"<!-- workflow-review round=2 result=passed -->\n<!-- workflow-conflict extends={head} -->\n"}))
+    env = dict(line.split("=", 1) for line in (workflow.state / "env/codex-7").read_text().splitlines())
+    workflow.fake("gh", '#!/bin/bash\necho allowed\n')
+    shim = Path(env["PATH"].split(":")[0]) / "gh"
+    done = subprocess.run(["bash", str(shim), "api", "-X", "POST",
+        "repos/example-org/example-app/pulls/7/reviews", "--input", str(payload)],
+        cwd=workflow.worktree(7), env=env, text=True, capture_output=True, check=False)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "allowed" not in done.stdout
+
+
+@pytest.mark.parametrize("tool", ["claude", "agent"])
+def test_failed_requested_panel_is_reported_and_not_completed(workflow: Workflow, tool: str) -> None:
+    head = _requested_panel(workflow)
+    _panel_reviewer(workflow, tool, '#!/bin/bash\necho "sandbox failed"\nexit 1\n')
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode != 0
+    assert "panel failed" in done.stdout + done.stderr
+    assert not (_folder(workflow) / "reviews/7" / head / "panel.complete").exists()
+
+
+def test_requested_panel_waits_for_github_head_then_falls_back_on_local_head(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    scope = json.loads((_folder(workflow) / "review-7.conflict.json").read_text())
+    workflow.set_pull_request(7, "OPEN", scope["head"])
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    log = _folder(workflow) / f"review-7.panel-log-{head}"
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if log.exists() and "waiting for the requested head" in log.read_text():
+            break
+        time.sleep(0.05)
+    assert "waiting for the requested head" in log.read_text()
+    with (_folder(workflow) / f"review-7.panel-run-{head}.lock").open("a") as runner:
+        fcntl.flock(runner, fcntl.LOCK_EX)
+    assert not (_folder(workflow) / "review-7.usual-reviewer").exists()
+    assert not (_folder(workflow) / "reviews/7" / head / "panel.complete").exists()
+    assert not workflow.calls("tmux codex-7 send-keys")
+    workflow.set_pull_request(7, "OPEN", head)
+    (workflow.state / "reviews-7.json").write_text("[]")  # scope now requires a full review
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (_folder(workflow) / "review-7.usual-reviewer").read_text().strip() == head
+    assert not workflow.is_running("codex-7")
+    assert workflow.is_running("review-7")
+
+
+def test_codex_panel_argv_reaches_real_claude_parser(workflow: Workflow, tmp_path: Path) -> None:
+    real = shutil.which("claude", path=os.environ.get("PATH", ""))
+    if real is None:
+        pytest.skip("real Claude CLI is not installed")
+    _panel_conflict(workflow)
+    _program(workflow)
+    _record_handback(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    head = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", head)
+    workflow.fake("agent", '#!/bin/bash\necho Cursor report\n')
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\nprintf "%s\\0" "$@" > "@STATE@/claude-argv"\necho report\n')
+    done = workflow.run_script("review-panel", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    argv = (workflow.state / "claude-argv").read_text().split("\0")[:-1]
+    config = tmp_path / "mcp.json"
+    config.write_text('{"mcpServers":{}}')
+    for index, arg in enumerate(argv):
+        if arg == "--mcp-config":
+            argv[index + 1] = str(config)
+        elif arg.startswith("--mcp-config="):
+            argv[index] = "--mcp-config=" + str(config)
+    bodies = []
+
+    class Recorder(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            bodies.append(self.rfile.read(int(self.headers.get("content-length", 0))))
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("localhost", 0), Recorder)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    home = tmp_path / "parser-home"
+    home.mkdir()
+    try:
+        process = subprocess.Popen([real, *argv], cwd=home, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env={"PATH": os.environ["PATH"], "HOME": str(home), "ANTHROPIC_API_KEY": "sk-example",
+                 "ANTHROPIC_BASE_URL": f"http://localhost:{server.server_port}",
+                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"})
+        try:
+            deadline = time.monotonic() + 45
+            while process.poll() is None and not bodies and time.monotonic() < deadline:
+                time.sleep(0.1)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            output = process.communicate(timeout=5)[0].decode(errors="replace")
+        marker = json.dumps(argv[-1].splitlines()[0])[1:-1].encode()
+        assert any(marker in body for body in bodies), output
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_panel_delivery_retries_without_running_reviewers_again(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\necho run >> "@STATE@/panel-runs"\necho report\n')
+    workflow.screen("› owner draft\n", "codex-7")
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (_folder(workflow) / "reviews/7" / head / "panel.complete").exists()
+    assert not (_folder(workflow) / f"review-7.panel-woken-{head}").exists()
+    workflow.screen("› \n", "codex-7")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "panel-runs").read_text().splitlines() == ["run"]
+    assert (_folder(workflow) / f"review-7.panel-woken-{head}").exists()
+
+
+def test_full_review_request_supersedes_completed_panel(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    assert _finish_requested_panel(workflow, head).returncode == 0
+    done = workflow.run_script("review-panel", "7", "--request", "--full-review",
+        cwd=workflow.worktree(7), env={"WORKFLOW_SESSION": "review-7"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (_folder(workflow) / "review-7.usual-reviewer").read_text().strip() == head
+    assert not workflow.is_running("codex-7")
+
+
+def test_resolver_must_request_panel_instead_of_nesting_sandboxes(workflow: Workflow) -> None:
+    _requested_panel(workflow)
+    done = workflow.run_script("review-panel", "7", cwd=workflow.worktree(7),
+        env={"WORKFLOW_SESSION": "review-7"})
+    assert done.returncode != 0
+    assert "--request" in done.stderr
+
+
+def test_pending_panel_holds_no_tick_lock_and_is_not_started_twice(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\necho run >> "@STATE@/panel-runs"\nwhile [[ ! -e "@STATE@/release-panel" ]]; do /bin/sleep 0.05; done\necho report\n')
+    release = workflow.state / "release-panel"
+    try:
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        deadline = time.monotonic() + 20
+        while not (workflow.state / "panel-runs").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert (workflow.state / "panel-runs").exists()
+        assert not (_folder(workflow) / f"review-7.panel-result-{head}").exists()
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert (workflow.state / "panel-runs").read_text().splitlines() == ["run"]
+    finally:
+        release.touch()
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "panel-runs").read_text().splitlines() == ["run"]
+
+
+def test_partial_requested_panel_waits_for_a_surviving_report_lock(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    _panel_reviewer(workflow, "agent", '#!/bin/bash\necho run >> "@STATE@/cursor-runs"\necho report\n')
+    reports = _folder(workflow) / "reviews/7" / head
+    reports.mkdir(parents=True)
+    with (reports / "claude.md.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        log = _folder(workflow) / f"review-7.panel-log-{head}"
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if log.exists() and "still running" in log.read_text() and (reports / "cursor.md").exists():
+                break
+            time.sleep(0.05)
+        assert "still running" in log.read_text()
+        assert not (_folder(workflow) / f"review-7.panel-result-{head}").exists()
+        assert not (reports / "panel.complete").exists()
+    # Observe the first runner leaving before asking the next tick to retry it.
+    with (_folder(workflow) / f"review-7.panel-run-{head}.lock").open("a") as runner:
+        fcntl.flock(runner, fcntl.LOCK_EX)
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "cursor-runs").read_text().splitlines() == ["run"]
+
+
+def test_full_review_request_cannot_be_overwritten_by_a_finishing_panel(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    hooks = workflow.root / "race-hooks"
+    hooks.mkdir()
+    (hooks / "sitecustomize.py").write_text('''import os
+import time
+from pathlib import Path
+import merge_handoff
+
+original = merge_handoff.write_json
+
+def paused_write(path, value):
+    if path.name == os.environ["WORKFLOW_RACE_RESULT"] and value == 0:
+        state = Path(os.environ["WORKFLOW_RACE_STATE"])
+        (state / "result-ready").touch()
+        deadline = time.monotonic() + 45
+        while not (state / "release-result").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+    return original(path, value)
+
+merge_handoff.write_json = paused_write
+''')
+    workflow.env.update({
+        "PYTHONPATH": os.pathsep.join((str(hooks), str(workflow.script.parent))),
+        "WORKFLOW_RACE_RESULT": f"review-7.panel-result-{head}",
+        "WORKFLOW_RACE_STATE": str(workflow.state),
+    })
+    release = workflow.state / "release-result"
+    request = None
+    try:
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        deadline = time.monotonic() + 30
+        while not (workflow.state / "result-ready").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert (workflow.state / "result-ready").exists()
+        request = subprocess.Popen(
+            ["bash", str(workflow.script.with_name("review-panel")), "7", "--request", "--full-review"],
+            cwd=workflow.worktree(7), env={**workflow.env, "WORKFLOW_SESSION": "review-7"},
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        # With serialization the request waits for the result writer's short metadata lock.
+        # Without it, the request completes while the obsolete writer is still paused.
+        deadline = time.monotonic() + 5
+        while request.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        release.touch()
+    assert request is not None
+    output, error = request.communicate(timeout=20)
+    assert request.returncode == 0, output + error
+    with (_folder(workflow) / f"review-7.panel-run-{head}.lock").open("a") as runner:
+        fcntl.flock(runner, fcntl.LOCK_EX)
+    assert not (_folder(workflow) / f"review-7.panel-result-{head}").exists(), (
+        "an obsolete panel result overwrote the full-review request"
+    )
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (_folder(workflow) / "review-7.usual-reviewer").read_text().strip() == head
+    assert not workflow.is_running("codex-7")
+
+
+def _wait_for_panel_again(workflow: Workflow, said: str) -> None:
+    """The resolver's next turn ends waiting for the panel, as its first one did."""
+    workflow.run_script("notify", "waiting", env={"WORKFLOW_SESSION": "review-7"})
+    workflow.run_script(
+        "notify", "codex",
+        json.dumps({"type": "agent-turn-complete", "last-assistant-message": said}),
+        env={"WORKFLOW_SESSION": "review-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    with _relay(workflow, "review-7") as relay:
+        assert "result" in _rpc(relay, "tools/call", {"name": "await_turn"})
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": said}, "review-7")
+    workflow.screen("Remote Control: " + SESSION_LINK + "\n● " + said + _BOX, "review-7")
+    workflow.screen("• Waiting for panel.\n\n› \n", "codex-7")
+
+
+def test_failed_requested_panel_retries_its_failed_reviewer_when_requested_again(
+    workflow: Workflow,
+) -> None:
+    """Claude at its usage limit fails the panel; asking again once it is back reruns only
+    Claude, and the waiting resolver, or a restarted one, is woken again."""
+    head = _requested_panel(workflow)
+    _panel_reviewer(workflow, "agent", '#!/bin/bash\necho run >> "@STATE@/cursor-runs"\necho "Cursor report"\n')
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\necho run >> "@STATE@/claude-runs"\necho "usage limit"\nexit 1\n')
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode != 0 and "panel failed" in done.stdout + done.stderr
+    folder = _folder(workflow)
+    reports = folder / "reviews/7" / head
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\necho run >> "@STATE@/claude-runs"\necho "Claude report"\n')
+    _wait_for_panel_again(workflow, "Claude is back; I asked for the panel again and am waiting.")
+    asked = workflow.run_script("review-panel", "7", "--request", cwd=workflow.worktree(7),
+                                env={"WORKFLOW_SESSION": "review-7"})
+    assert asked.returncode == 0, asked.stdout + asked.stderr
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (reports / "panel.complete").read_text().strip() == head
+    assert "Claude report" in (reports / "claude.md").read_text()
+    assert (workflow.state / "claude-runs").read_text().splitlines() == ["run", "run"]
+    assert (workflow.state / "cursor-runs").read_text().splitlines() == ["run"]
+    woken = workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")
+    assert len(woken) == 2 and "has completed" in woken[-1], woken
+    # A resolver restarted after its wake asks again and is woken from the completed panel.
+    _wait_for_panel_again(workflow, "I was restarted; I asked for the panel and am waiting.")
+    asked = workflow.run_script("review-panel", "7", "--request", cwd=workflow.worktree(7),
+                                env={"WORKFLOW_SESSION": "review-7"})
+    assert asked.returncode == 0, asked.stdout + asked.stderr
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("tmux codex-7 send-keys -t =codex-7: -l Workflow update:")) == 3
+    assert (workflow.state / "claude-runs").read_text().splitlines() == ["run", "run"]

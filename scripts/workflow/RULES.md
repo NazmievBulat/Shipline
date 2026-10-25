@@ -481,8 +481,10 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
    and the main version of the workflow rules in `.review/workflow-rules.md`, read-only under
    a filesystem sandbox, each
    with a 30-minute timeout. Codex is skipped on any pull request it built, recorded by
-   `session start worker` in `.local/workflow/codex-built-N` of the main checkout. A missing,
-   signed-out or failed tool is noted and skipped. Cursor and Codex run in parallel.
+   `session start worker` in `.local/workflow/codex-built-N` of the main checkout. A conflict
+   it resolved, recorded in `.local/workflow/codex-resolved-N`, also excludes Codex.
+   A missing, signed-out or failed tool is noted and skipped. Cursor and Codex run in parallel.
+   A Codex-resolved conflict requires successful completed Claude and Cursor reports as below.
    Read `task-as-opened.md` and `task-changes.md` beside the panel reports. A requirement
    removed or narrowed since opening is a finding unless `Answers given for the owner`,
    or the orchestrator's answer under his standing delegation, covers it. If history cannot
@@ -603,7 +605,10 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
 The tick starts this fresh reviewer only after a non-mechanical conflict on a handed-off pull
 request with a passed independent round on H: Claude Opus at high effort, or the effort and
 model `conflict_review` in `shipline.json` names when both sides of every conflicting hunk
-together are at most its `max_changed_lines` lines. For that cheaper reviewer, a resolution
+together are at most its `max_changed_lines` lines. `conflict_review.program` selects `claude`
+(the default) or `codex`. With `program` alone, effort is high, Claude uses Opus, Codex uses its
+configured model, and there is no additional line cutoff; the conflict-hunk scope still applies.
+An explicit `model` names that program's model. For that named reviewer, a resolution
 that writes more lines than that in F, changes another file or lines outside the hunks, and any
 full-review fallback, are the usual reviewer's: when the gate refuses the handoff for it, end
 with `review finished` and the tick starts the usual reviewer, which reviews the pushed
@@ -613,10 +618,23 @@ current rules from main. The earlier round stands for everything the resolution 
 touch; do not repeat its whole-change review.
 
 Resolve the merge in the kept worktree, asking the owner in text for any product decision.
-Commit as `merge main: conflict in <files>` and push without force. Run the main checkout's
-`review-panel N`: it verifies that this is one merge of H and the recorded main, and gives
+Codex uses the same bridge as a Codex worker, under `review-N`, for questions and replies.
+Commit as `merge main: conflict in <files>` and push without force. A Codex resolver runs the
+main checkout's `review-panel N --request`, then `notify waiting` and ends its turn waiting
+for the panel, without `review finished`. This records N and the resolved head in the state
+folder. The tick runs `review-panel N --head <resolved-head>` outside the resolver's sandbox,
+in a detached runner under the panel's existing locks, holding no tick lock. While GitHub
+lists another head it waits without falling back. It runs once for the recorded head and
+wakes native Codex through its bridge after
+completion; blocked input delays delivery without rerunning the panel. A failed reviewer is
+a panel failure reported by the tick, never permission to publish. Once its cause is fixed,
+`review-panel N --request` again reruns only the failed reviewers. A Claude resolver runs
+`review-panel N` directly. The panel verifies one merge of H and the recorded main, and gives
 the panel the diffs against both parents for F, with the task and earlier passed round.
-Read its completed reports, narrowed weaker-tests report and reached test selections. Run
+Read its completed reports, narrowed weaker-tests report and reached test selections.
+When Codex resolves, the panel runs Claude and Cursor in separate read-only worktrees and
+excludes Codex, including on a pull request Codex built. Read `claude.md` and `cursor.md`.
+Claude-resolved conflicts use the usual panel. Run
 every selected server test (`server-tests.json`) and the local browser test selection
 (`browser-tests.txt`, empty when the repository configures none, and CI then runs the whole
 browser suite), protecting `review-N`
@@ -631,10 +649,27 @@ follow the ordinary full review instead, running `review-panel N --full-review` 
 fresh full-diff reports in the panel's `full-review/` folder. The panel also falls back when it
 cannot prove the scope, including changed parents, additional commits, or non-text conflicts.
 The gate refuses a narrowed handoff which changes another file or lines outside the hunks.
+Codex never does the full review: if scope cannot be proved, a test expectation changes,
+or a panel report calls for a full review, run `review-panel N --request --full-review`,
+then `notify waiting` and end the turn. The tick records the fallback for the kept head,
+as it does for an automatic scope refusal, stops Codex and its bridge
+and starts the usual Claude reviewer on the pushed head. That reviewer runs the full panel;
+the recorded fallback keeps this head out of conflict-only review. The panel records Codex's
+resolution in `codex-resolved-N`, so Codex also stays off later panels of its own resolution;
+the fresh Claude reviewer and Cursor provide the independent full review.
+Codex never sends back either: when it would, it takes the same fallback, and the Claude
+reviewer sends back.
 
 Publish the next usual independent round on the resolved head, stating that it is a conflict
 round and naming H, with `<!-- workflow-conflict extends=H -->` on its own line after the
 usual round marker. Explain why the resolution stays within scope and record test evidence.
+Codex publishes with `gh api -X POST repos/{repository}/pulls/N/reviews --input <file>`;
+the JSON file has only `body`, `commit_id` (the resolved head), and `event: "COMMENT"`.
+Its shim requires the panel's success receipt and completed successful Claude and Cursor
+reports on this exact head. It permits this own passed conflict round and reads; it refuses
+approvals, send-backs, full rounds and other writes. Product questions go through the bridge.
+A Codex quota stop uses the worker's
+quota handling and leaves the merge line available to other pull requests.
 A full-review fallback uses the usual round marker without that conflict marker and says
 which fallback applied and why. The ordinary send-back count, checks, questions and waiting
 rules still apply. With no findings or questions left and GitHub checks passing, finish
@@ -829,6 +864,12 @@ that note, an idle reviewer still needs a round published after its session star
 current head or a commit the head grew from. The tick records the head under `.local/workflow/`
 and logs each nudge in `~/.local/state/workflow/wake.log`. It leaves owner-blocked sessions
 and unsent input alone; the reviewer reads the results and follows the merge gate rules.
+
+For a Codex conflict reviewer, these workflow updates go directly to native Codex, without
+creating an owner reply in the bridge. Both input boxes, pending replies, permission prompts
+and active native work are protected. Codex's next completed turn wakes the relay normally.
+Bridge startup and recovery preserve a declared background wait and the native review's start
+time, including a wait declared before the bridge first connected.
 
 The tick also keeps waits moving, for Claude workers and reviewers only (never Codex bridges,
 hunts or audits), and never answers a question. It never interrupts a running command but in

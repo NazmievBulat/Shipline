@@ -68,7 +68,8 @@
   "conflict_review": {
     "effort": "medium",
     "model": "sonnet",
-    "max_changed_lines": 40
+    "max_changed_lines": 40,
+    "program": "claude"
   },
   "hot_paths": [
     "src/example_app/models.py",

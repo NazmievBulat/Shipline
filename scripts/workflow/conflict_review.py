@@ -2,17 +2,24 @@
 
     conflict_review.py sentence <folder> <N>    the sentence the fresh reviewer starts with
     conflict_review.py reviewer <folder> <N>    its effort and model, `high opus` as usual
+    conflict_review.py program <folder> <N>     its recorded program and explicit Codex model
+    conflict_review.py full-review <folder> <N> <head>    keep this head with Claude
+    conflict_review.py request-panel <folder> <N> <full>    queue the kept head for the tick
+    conflict_review.py run-panel <folder> <N> <head>    the tick's detached runner
+    conflict_review.py panel-complete <folder> <N> <head>    require successful reports
     conflict_review.py panel <folder> <N> <root> <head>
 
 The reviewer is the one `conflict_review` of `shipline.json` names while the kept worktree holds
-the conflict's merge and it stays within `max_changed_lines`: both sides of every conflicting
-hunk before the merge is committed, the lines the resolution wrote there after, and no other
-file. The choice is noted in `review-N.conflict-reviewer`, so the gate can hand a resolution
+the conflict's merge and it stays within an optional `max_changed_lines`: both sides of every
+conflicting hunk before the merge is committed, the lines the resolution wrote there after,
+and no other file. The choice is noted in `review-N.conflict-reviewer`, so the gate can hand a resolution
 that grew past it to the usual reviewer (`review-N.usual-reviewer`, which keeps that head with
 the usual reviewer).
 """
 
+import fcntl
 import json
+import os
 import re
 import subprocess
 import sys
@@ -248,7 +255,7 @@ def reviewer(folder: Path, number: str) -> tuple[str, str]:
     named = workflow_config.current().conflict_review
     record = folder / f"review-{number}.conflict-reviewer"
     usual = folder / f"review-{number}.usual-reviewer"
-    chosen, scope = USUAL, None
+    chosen, scope, program = USUAL, None, "claude"
     try:
         root = _worktree(folder, number)
         head = _git(root, "rev-parse", "HEAD").strip()
@@ -259,17 +266,23 @@ def reviewer(folder: Path, number: str) -> tuple[str, str]:
             scope = Scope.read(folder, number)
             if scope and _holds(folder, number, scope):
                 lines, outside = scope.size(root, head)
-                if not outside and lines <= named.max_changed_lines:
+                if not outside and (
+                    named.max_changed_lines is None or lines <= named.max_changed_lines
+                ):
                     chosen = (named.effort, named.model)
+                    program = named.program
     except ValueError, TypeError, OSError, subprocess.SubprocessError, CommandTimeout:
         # A conflict that cannot be measured gets the usual reviewer.
-        chosen = USUAL
-    if chosen == USUAL or scope is None:
+        chosen, program = USUAL, "claude"
+    if (chosen == USUAL and program == "claude") or scope is None:
         record.unlink(missing_ok=True)
     else:
         write_json(
             record,
-            {"head": scope.head, "main": scope.main, "effort": chosen[0], "model": chosen[1]},
+            {
+                "head": scope.head, "main": scope.main,
+                "effort": chosen[0], "model": chosen[1], "program": program,
+            },
         )
     return chosen
 
@@ -278,6 +291,127 @@ def named_reviewer(folder: Path, number: str) -> bool:
     """Whether the reviewer last started for pull request N is the one `conflict_review`
     names: every start notes its choice anew."""
     return (folder / f"review-{number}.conflict-reviewer").exists()
+
+
+def program(folder: Path, number: str) -> str:
+    """The program recorded under the start lock; ordinary reviews always use Claude."""
+    record = folder / f"review-{number}.conflict-reviewer"
+    if record.exists() and json.loads(record.read_text()).get("program") == "codex":
+        # Without an explicit model, use Codex's own configured model, as workers do.
+        named = workflow_config.current().given.get("conflict_review") or {}
+        return "codex " + named.get("model", "")
+    return "claude"
+
+
+def full_review(folder: Path, number: str, head: str) -> None:
+    """Keep this pushed head with the usual reviewer after a Codex scope refusal."""
+    if not _SHA.fullmatch(head):
+        raise ValueError("invalid full review head")
+    (folder / f"review-{number}.usual-reviewer").write_text(head + "\n")
+
+
+def request_panel(folder: Path, number: str, full: bool) -> None:
+    """Queue the kept resolution for the tick, which runs outside the resolver sandbox."""
+    if not number.isdecimal() or not program(folder, number).startswith("codex"):
+        raise ValueError("only a Codex conflict resolver can request this panel")
+    root = _worktree(folder, number)
+    head = _git(root, "rev-parse", "HEAD").strip()
+    scope = None if full else Scope.read(folder, number)
+    if not _SHA.fullmatch(head) or (not full and (scope is None or head == scope.head)):
+        raise ValueError("commit and push the resolution before requesting its panel")
+    if _git(root, "status", "--porcelain", "--untracked-files=no").strip():
+        raise ValueError("the kept resolution must be clean before requesting its panel")
+    path = folder / f"review-{number}.panel-request.json"
+    request = {"number": number, "head": head, "full_review": full}
+    with (folder / f"review-{number}.panel-request.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            previous = json.loads(path.read_text())
+        except (OSError, ValueError):
+            previous = None
+        # A resolver asking again is waiting again, after a restart or a reported failure.
+        suffixes = ["panel-woken", "panel-failed"]
+        result = folder / f"review-{number}.panel-result-{head}"
+        if previous != request:
+            # A later explicit full-review request supersedes an earlier completed panel.
+            suffixes.append("panel-result")
+        elif result.exists() and result.read_text().strip() not in {"0", "2"}:
+            # Asking again after a failure reruns only its failed reviewers.
+            for who in ("claude", "cursor"):
+                report = folder / "reviews" / number / head / f"{who}.md"
+                if not report.exists():
+                    continue
+                with open(f"{report}.lock", "a") as running:
+                    try:
+                        fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue
+                    if report.exists() and report.read_text().splitlines()[-1:] != ["exit 0"]:
+                        report.unlink()
+            suffixes.append("panel-result")
+        for suffix in suffixes:
+            (folder / f"review-{number}.{suffix}-{head}").unlink(missing_ok=True)
+        # Publish the new request last: a completed replacement never retains old success.
+        write_json(path, request)
+
+
+def panel_complete(folder: Path, number: str, head: str) -> bool:
+    """A success receipt and finished reviewer reports for exactly this resolution."""
+    if not number.isdecimal() or not _SHA.fullmatch(head):
+        return False
+    root = folder / "reviews" / number / head
+    try:
+        request = folder / f"review-{number}.panel-request.json"
+        if request.exists():
+            pending = json.loads(request.read_text())
+            if pending.get("head") == head and pending.get("full_review") is True:
+                return False
+        return (root / "panel.complete").read_text().strip() == head and all(
+            not (root / f"{who}.md.pending").exists()
+            and (root / f"{who}.md").read_text().splitlines()[-1:] == ["exit 0"]
+            for who in ("claude", "cursor")
+        )
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def run_panel(folder: Path, number: str, head: str) -> None:
+    """Run detached from the tick, once per request, without retaining any tick locks."""
+    if not number.isdecimal() or not _SHA.fullmatch(head):
+        raise ValueError("invalid queued conflict panel")
+    result = folder / f"review-{number}.panel-result-{head}"
+    request_path = folder / f"review-{number}.panel-request.json"
+    with (folder / f"review-{number}.panel-run-{head}.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        if result.exists():
+            return
+        request = json.loads(request_path.read_text())
+        if request.get("number") != number or request.get("head") != head:
+            return
+        if _git(_worktree(folder, number), "rev-parse", "HEAD").strip() != head:
+            return
+        command = ["bash", str(Path(__file__).with_name("review-panel")), number, "--head", head]
+        if request.get("full_review") is True:
+            command.append("--full-review")
+        env = {key: value for key, value in os.environ.items() if key not in {
+            "WORKFLOW_SESSION", "WORKFLOW_CODEX_BRIDGE", "WORKFLOW_TRAIN_TICK",
+            "WORKFLOW_SESSION_SNAPSHOT",
+        }}
+        try:
+            status = subprocess.run(command, env=env, timeout=1900, check=False).returncode
+        except subprocess.TimeoutExpired:
+            status = 1
+        if status == 3 or (status == 0 and not panel_complete(folder, number, head)):
+            return  # GitHub is late, or a surviving reviewer still holds its report lock.
+        # Serialize the comparison AND result write with request replacement/invalidation.
+        # This lock covers metadata only; a full-review request never waits for reviewers.
+        with (folder / f"review-{number}.panel-request.lock").open("a") as request_lock:
+            fcntl.flock(request_lock, fcntl.LOCK_EX)
+            if json.loads(request_path.read_text()) == request:
+                write_json(result, status)
 
 
 def sentence(folder: Path, number: str) -> str:
@@ -305,6 +439,11 @@ def panel(folder: Path, number: str, root: Path, head: str, reviews: list[dict[s
         if earlier is None:
             raise ValueError("no passed round on the handed-off head")
         scope.validate(root, head)
+        named = workflow_config.current().conflict_review if named_reviewer(folder, number) else None
+        if named is not None and named.program == "codex" and named.max_changed_lines is not None:
+            lines, outside = scope.size(root, head)
+            if outside or lines > named.max_changed_lines:
+                raise ValueError("resolution exceeds conflict_review.max_changed_lines")
     except (ValueError, TypeError) as error:
         reason = f"Full review required: {error}.\n"
         with (root / ".review/task.md").open("a") as task:
@@ -343,6 +482,16 @@ def main() -> None:
         sys.stdout.write(sentence(folder, number) + "\n")
     elif action == "reviewer":
         sys.stdout.write(" ".join(reviewer(folder, number)) + "\n")
+    elif action == "program":
+        sys.stdout.write(program(folder, number) + "\n")
+    elif action == "full-review":
+        full_review(folder, number, sys.argv[4])
+    elif action == "request-panel":
+        request_panel(folder, number, sys.argv[4] == "true")
+    elif action == "panel-complete":
+        sys.exit(0 if panel_complete(folder, number, sys.argv[4]) else 1)
+    elif action == "run-panel":
+        run_panel(folder, number, sys.argv[4])
     elif action == "panel":
         root = Path(sys.argv[4])
         head = sys.argv[5]

@@ -11,17 +11,47 @@ if config=$(python3 "$(dirname "${BASH_SOURCE[0]}")/../workflow_config.py" shell
 fi
 
 refuse() {
-  echo "Codex worker: gh permits reads, its own ready/body update, and draft tickets labelled with only a medium or high priority; this command is refused." >&2
+  if [[ ${WORKFLOW_SESSION:-} == review-* ]]; then
+    echo "Codex conflict resolver: gh permits reads and its own passed conflict COMMENT round; this command is refused." >&2
+  else
+    echo "Codex worker: gh permits reads, its own ready/body update, and draft tickets labelled with only a medium or high priority; this command is refused." >&2
+  fi
   exit 1
 }
 
-[[ ${WORKFLOW_SESSION:-} =~ ^ticket-[0-9]+$ && -n ${WORKFLOW_GH:-} ]] || refuse
+[[ ${WORKFLOW_SESSION:-} =~ ^(ticket|review)-[0-9]+$ && -n ${WORKFLOW_GH:-} ]] || refuse
+conflict=false
+if [[ $WORKFLOW_SESSION == review-* ]]; then
+  conflict=true
+  number=${WORKFLOW_SESSION#review-}
+  folder=$SHIPLINE_REPO/$SHIPLINE_STATE_FOLDER
+  [[ -e $SHIPLINE_REPO/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER/$WORKFLOW_SESSION.codex ]] || refuse
+  # A resolver can only publish a passed COMMENT review on its own resolved head. No approval,
+  # send-back, full round, ready, description edit, ticket creation or extra API argument is
+  # allowed: anything it would send back goes to Claude through the full-review fallback.
+  if [[ ${1:-} == api && $# == 6 && $2 == -X && $3 == POST &&
+        $4 == "repos/$SHIPLINE_REPOSITORY/pulls/$number/reviews" && $5 == --input &&
+        ! -e $folder/review-$number.usual-reviewer ]]; then
+    extended=$(jq -er .head "$folder/review-$number.conflict.json") || refuse
+    [[ $(python3 -B "$(dirname "${BASH_SOURCE[0]}")/../conflict_review.py" program "$folder" "$number") == codex* ]] || refuse
+    python3 -B "$(dirname "${BASH_SOURCE[0]}")/../conflict_review.py" panel-complete \
+      "$folder" "$number" "$(git rev-parse HEAD)" || refuse
+    jq -e --arg head "$(git rev-parse HEAD)" --arg extended "$extended" '
+      keys == ["body", "commit_id", "event"] and .event == "COMMENT" and
+      .commit_id == $head and (.body | type == "string") and
+      (.body | test("^<!-- workflow-review round=[0-9]+ result=passed -->\n")) and
+      (.body | split("\n") | index("<!-- workflow-conflict extends=" + $extended + " -->") != null)
+    ' -- "$6" >/dev/null || refuse
+    exec env WORKFLOW_GITHUB_RAW_GH="$WORKFLOW_GH" python3 "$(dirname "${BASH_SOURCE[0]}")/../github_budget.py" foreground "$@"
+  fi
+fi
 case ${1:-} in
   pr)
     case ${2:-} in
       view|list|diff|checks) ;;
-      ready) [[ $# == 3 && $3 == "${WORKFLOW_SESSION#ticket-}" ]] || refuse ;;
+      ready) [[ $conflict == false && $# == 3 && $3 == "${WORKFLOW_SESSION#ticket-}" ]] || refuse ;;
       create)
+        [[ $conflict == false ]] || refuse
         draft=false
         args=("${@:3}")
         for ((i=0; i<${#args[@]}; i++)); do
@@ -50,7 +80,7 @@ case ${1:-} in
   label) [[ ${2:-} == list ]] || refuse ;;
   api)
     # The one writable API shape: the body of this worker's own pull request.
-    if [[ -n $SHIPLINE_REPOSITORY && $# -ge 6 && $2 == -X && $3 == PATCH &&
+    if [[ $conflict == false && -n $SHIPLINE_REPOSITORY && $# -ge 6 && $2 == -X && $3 == PATCH &&
           $4 == "repos/$SHIPLINE_REPOSITORY/pulls/${WORKFLOW_SESSION#ticket-}" &&
           $5 == -F && $6 == body=@?* ]]; then
       output_args=("${@:7}")

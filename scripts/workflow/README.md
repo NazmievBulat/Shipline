@@ -159,7 +159,7 @@ installation folder, even if the checkout has a file of the same name.
 | `commands.push_checks` | command | The checks run by the repository's pre-push hook. | none |
 | `commands.server_tests_for_changes` | command | The command that selects server tests and returns whole, tests, total and reasons. | none |
 | `commands.test` | command | The repository test command run by bash from the checkout with the CI job's arguments. | none |
-| `conflict_review` | conflict | The effort, model and max_changed_lines for a small handed-off conflict; omitted means the usual reviewer. | none |
+| `conflict_review` | conflict | The resolver of a handed-off conflict: program is claude (default) or codex. With program alone, effort is high, Claude uses Opus, Codex uses its configured model, and there is no additional line cutoff. An explicit model selects that program’s model; a positive max_changed_lines limits both conflicting sides and the resolution. Edits stay within the conflicting hunks. Codex uses its worker bridge with Claude and Cursor on the panel; full-review fallbacks return to Claude. Without program, effort, model and max_changed_lines remain required. | none |
 | `hot_paths` | paths | GitHub path patterns whose matching tickets run separately and merge back to back within their priority. | `[]` |
 | `hunts.areas` | areas | Area names mapped to lists of screen paths; omitted means one hunt runs at a time, on every screen. | `{}` |
 | `hunts.plans` | name | The checkout path of hunt plans named in a hunt sentence. | none |
