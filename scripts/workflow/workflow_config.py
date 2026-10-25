@@ -784,7 +784,7 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
             value = given[key]
             if not isinstance(value, str) or not value.strip():
                 raise ConfigError(f"{FILE}: {name} must be a name, not {json.dumps(value)}")
-            if DECLARATIONS[name].kind == "job" and re.fullmatch(r".+ \(\d+ of \d+\)", value):
+            if DECLARATIONS[name].kind == "job" and re.search(r" \(\d+ of \d+\)\Z", value):
                 raise ConfigError(
                     f"{FILE}: {name} must name a job without its (k of n) shard suffix"
                 )

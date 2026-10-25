@@ -186,7 +186,8 @@ def test_server_whole_group_uses_the_configured_job_and_its_shards(tmp_path: Pat
 
 
 @pytest.mark.parametrize("key", ["server_tests", "web", "older_version"])
-@pytest.mark.parametrize("value", ["Build: tests (1 of 3)", "X (12 of 24)", "X (0 of 0)"])
+@pytest.mark.parametrize("value", ["Build: tests (1 of 3)", "X (12 of 24)", "X (0 of 0)",
+                                   " (1 of 3)"])
 def test_suite_job_names_with_a_shard_suffix_are_refused(
     tmp_path: Path, key: str, value: str,
 ) -> None:
