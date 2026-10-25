@@ -769,6 +769,31 @@ def test_neutral_prefix_after_an_untested_image_change_runs_images(github: GitHu
     assert len(github.workflow.calls("gh workflow run images.yml")) == 1
 
 
+def test_existing_image_receipts_still_supply_neutral_prefixes(github: GitHub) -> None:
+    _batch_setup(github, images=True)
+    assert _batch_call(github).returncode == 3
+    _finish_prefix(github, "7")
+    assert _batch_call(github).returncode == 0
+    folder = github.workflow.repo / ".local/workflow"
+    receipt = _receipt(github)
+    assert receipt["images_run"] == 110 and receipt["images_complete"]
+    for key in ("images_source", "images_tree", "images_differing_files"):
+        receipt.pop(key, None)
+    (folder / "main-tree-green.json").write_text(json.dumps(receipt) + "\n")
+    # A new window reads the receipt written before image source metadata existed.
+    state = _batch_state(github)
+    state["prefixes"] = None
+    (folder / "merge-train.json").write_text(json.dumps(state) + "\n")
+    done = _batch_call(github, "8")
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert len(github.workflow.calls("gh workflow run images.yml")) == 1
+    _finish_batch(github, run_id=4100)
+    done = _batch_call(github, "8")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
+    assert _receipt(github)["images_run"] == 110
+
+
 def test_a_prefix_can_introduce_the_image_workflow_before_main_has_it(github: GitHub) -> None:
     workflow = github.workflow
     path = ".github/workflows/images.yml"
