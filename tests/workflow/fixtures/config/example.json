@@ -1,0 +1,171 @@
+{
+  "values": {
+    "repository": "example-owner/example-app",
+    "install_folder": ".",
+    "state_folder": ".local/shipline",
+    "worktree_setup": "tools/prepare-worktree",
+    "refresh": {
+      "clear_generated": []
+    },
+    "checks": {
+      "ci_result": "Build result",
+      "ci_plan": "Build: what to run",
+      "e2e_plan": "Browser: what to run",
+      "images": "Images",
+      "dependency_audit": "Build: dependencies",
+      "advisory_annotation": "Advisory",
+      "prefix_only": [
+        "images",
+        "browser_whole",
+        "server_whole"
+      ],
+      "server_tests": "Build: server tests",
+      "web": "Build: web",
+      "older_version": "Build: older version on new tables"
+    },
+    "annotations": {
+      "merge_tested": "Merge built",
+      "files_tested": "Tree tested",
+      "server_tests": "Server suite",
+      "web_suite": "Web unit suite",
+      "browser_suite": "Browser specs"
+    },
+    "workflows": {
+      "ci": "build.yml",
+      "e2e": "browser.yml",
+      "images": "images.yml",
+      "ci_name": "Build",
+      "images_name": "Images"
+    },
+    "labels": {
+      "workflow": "shipline",
+      "audited": "audited",
+      "priority": {
+        "blocker": "priority: blocker",
+        "high": "priority: high",
+        "medium": "priority: medium",
+        "low": "priority: low"
+      }
+    },
+    "runner": {
+      "labels": [
+        "example-app-home",
+        "example-app-home-standby",
+        "example-app-home-first",
+        "example-app-home-main",
+        "example-app-home-main-batch",
+        "example-app-home-docker",
+        "example-app-home-planner"
+      ],
+      "identity_folder": "~/.config/shipline-runner",
+      "prefix": "example-app",
+      "label": "example-app-home",
+      "planner_label": "example-app-home-planner",
+      "image_build": "tools/shipline/build-runner-images",
+      "hub_cache": "tools/shipline/hub-cache"
+    },
+    "merge": {
+      "scratch_prefix": "workflow/merge-batch-"
+    },
+    "parity": {
+      "workflow_tests": "tools/shipline/tests",
+      "runner_tests": "tools/runner/tests",
+      "known": "tools/shipline/parity-known.txt"
+    },
+    "machines": [
+      {
+        "name": "this machine"
+      },
+      {
+        "name": "runner-1",
+        "address": "runner@runner-1.example"
+      }
+    ],
+    "hunts": {
+      "areas": {
+        "phone": [
+          "/calls",
+          "/contacts"
+        ],
+        "billing": [
+          "/invoices",
+          "/settings/billing"
+        ]
+      },
+      "plans": "docs/hunt-plans.md"
+    },
+    "commands": {
+      "test": "tools/run-tests",
+      "browser": "tools/run-browser-tests",
+      "browser_tests_for_changes": {
+        "run": "tools/shipline/browser-tests-for-changes",
+        "form": "json",
+        "field": "specs",
+        "args": [
+          "--ci"
+        ]
+      },
+      "server_tests_for_changes": "tools/shipline/server-tests-for-changes",
+      "pre_train_checks": {
+        "run": "tools/shipline/pre-train-checks",
+        "form": "exit"
+      },
+      "mechanical_conflicts": "tools/shipline/mechanical-conflicts",
+      "browser_plan": "tools/shipline/browser-plan",
+      "hunt_app": "tools/shipline/hunt-app",
+      "hunt_browser": "node tools/shipline/hunt-browser.mjs",
+      "hunt_cursor": "tools/shipline/hunt-cursor",
+      "advisory_watch": "tools/shipline/advisory-watch",
+      "push_checkout": "tools/shipline/push-checkout",
+      "push_checks": "tools/shipline/push-checks"
+    },
+    "hot_paths": [
+      "src/example_app/models.py",
+      "web/src/pages/**"
+    ],
+    "conflict_review": {
+      "effort": "medium",
+      "model": "sonnet",
+      "max_changed_lines": 40
+    },
+    "review": {
+      "high_effort_paths": [
+        "^db/migrations/",
+        "^db/schema\\.sql$",
+        "^app/models/",
+        "^prompts/",
+        "(^|/)AGENTS\\.md$",
+        "\\.prompt\\.md$",
+        "^app/jobs/",
+        "^app/queues/",
+        "(^|/)locks?\\.py$",
+        "^app/auth/",
+        "^app/permissions/",
+        "^config/secrets"
+      ]
+    },
+    "merge_train": {
+      "queued_limit_minutes": 20
+    },
+    "answer_for_owner_after_minutes": 15,
+    "cloud_wake_after_minutes": 45,
+    "cloud_pre_push": {
+      "suites": {
+        "server": {
+          "select": "tools/shipline/server-tests-for-changes",
+          "run": "tools/shipline/server-tests --workers {workers}",
+          "workers": 4,
+          "part": "--shard {shard}/{shards}"
+        },
+        "browser": {
+          "select": "tools/shipline/browser-tests-for-changes --ci",
+          "run": "tools/shipline/browser-tests --workers {workers}",
+          "workers": 2,
+          "probe": "tools/shipline/browser-starts"
+        }
+      }
+    }
+  },
+  "shell": "unset SHIPLINE_CONFIG\nSHIPLINE_REPOSITORY=example-owner/example-app\nSHIPLINE_STATE_FOLDER=.local/shipline\nSHIPLINE_WORKTREE_SETUP=tools/prepare-worktree\nSHIPLINE_CI_RESULT='Build result'\nSHIPLINE_CI_PLAN='Build: what to run'\nSHIPLINE_E2E_PLAN='Browser: what to run'\nSHIPLINE_IMAGES=Images\nSHIPLINE_IMAGES_PLAN='Images: what to run'\nSHIPLINE_ANNOTATION_MERGE_TESTED='Merge built'\nSHIPLINE_ANNOTATION_FILES_TESTED='Tree tested'\nSHIPLINE_ANNOTATION_SERVER_TESTS='Server suite'\nSHIPLINE_ANNOTATION_WEB_SUITE='Web unit suite'\nSHIPLINE_ANNOTATION_BROWSER_SUITE='Browser specs'\nSHIPLINE_WORKFLOW_CI=build.yml\nSHIPLINE_WORKFLOW_E2E=browser.yml\nSHIPLINE_WORKFLOW_IMAGES=images.yml\nSHIPLINE_LABEL_WORKFLOW=shipline\nSHIPLINE_LABEL_AUDITED=audited\nSHIPLINE_PRIORITY_BLOCKER='priority: blocker'\nSHIPLINE_PRIORITY_HIGH='priority: high'\nSHIPLINE_PRIORITY_MEDIUM='priority: medium'\nSHIPLINE_PRIORITY_LOW='priority: low'\nSHIPLINE_IDENTITY_FOLDER='~/.config/shipline-runner'\nSHIPLINE_RUNNER_PREFIX=example-app\nSHIPLINE_RUNNER_LABEL=example-app-home\nSHIPLINE_RUNNER_PLANNER_LABEL=example-app-home-planner\nSHIPLINE_RUNNER_IMAGE_BUILD=tools/shipline/build-runner-images\nSHIPLINE_RUNNER_HUB_CACHE=tools/shipline/hub-cache\nSHIPLINE_HUNT_PLANS=docs/hunt-plans.md\nSHIPLINE_ANSWER_FOR_OWNER_AFTER_MINUTES=15\nSHIPLINE_CONFIG=<checkout>/shipline.json\nSHIPLINE_CONFIG_JSON='{\"repository\":\"example-owner/example-app\",\"install_folder\":\".\",\"state_folder\":\".local/shipline\",\"worktree_setup\":\"tools/prepare-worktree\",\"refresh\":{\"clear_generated\":[]},\"commands\":{\"test\":\"tools/run-tests\",\"browser\":\"tools/run-browser-tests\",\"browser_tests_for_changes\":{\"run\":\"tools/shipline/browser-tests-for-changes\",\"form\":\"json\",\"field\":\"specs\",\"args\":[\"--ci\"]},\"server_tests_for_changes\":\"tools/shipline/server-tests-for-changes\",\"pre_train_checks\":{\"run\":\"tools/shipline/pre-train-checks\",\"form\":\"exit\"},\"mechanical_conflicts\":\"tools/shipline/mechanical-conflicts\",\"browser_plan\":\"tools/shipline/browser-plan\",\"hunt_app\":\"tools/shipline/hunt-app\",\"hunt_browser\":\"node tools/shipline/hunt-browser.mjs\",\"hunt_cursor\":\"tools/shipline/hunt-cursor\",\"advisory_watch\":\"tools/shipline/advisory-watch\",\"push_checkout\":\"tools/shipline/push-checkout\",\"push_checks\":\"tools/shipline/push-checks\"},\"checks\":{\"ci_result\":\"Build result\",\"ci_plan\":\"Build: what to run\",\"e2e_plan\":\"Browser: what to run\",\"images\":\"Images\",\"dependency_audit\":\"Build: dependencies\",\"advisory_annotation\":\"Advisory\",\"prefix_only\":[\"images\",\"browser_whole\",\"server_whole\"],\"server_tests\":\"Build: server tests\",\"web\":\"Build: web\",\"older_version\":\"Build: older version on new tables\"},\"annotations\":{\"merge_tested\":\"Merge built\",\"files_tested\":\"Tree tested\",\"server_tests\":\"Server suite\",\"web_suite\":\"Web unit suite\",\"browser_suite\":\"Browser specs\"},\"workflows\":{\"ci\":\"build.yml\",\"e2e\":\"browser.yml\",\"images\":\"images.yml\",\"ci_name\":\"Build\",\"images_name\":\"Images\"},\"labels\":{\"workflow\":\"shipline\",\"audited\":\"audited\",\"priority\":{\"blocker\":\"priority: blocker\",\"high\":\"priority: high\",\"medium\":\"priority: medium\",\"low\":\"priority: low\"}},\"runner\":{\"labels\":[\"example-app-home\",\"example-app-home-standby\",\"example-app-home-first\",\"example-app-home-main\",\"example-app-home-main-batch\",\"example-app-home-docker\",\"example-app-home-planner\"],\"identity_folder\":\"~/.config/shipline-runner\",\"prefix\":\"example-app\",\"label\":\"example-app-home\",\"planner_label\":\"example-app-home-planner\",\"image_build\":\"tools/shipline/build-runner-images\",\"hub_cache\":\"tools/shipline/hub-cache\"},\"merge\":{\"scratch_prefix\":\"workflow/merge-batch-\"},\"cloud_wake_after_minutes\":45,\"parity\":{\"workflow_tests\":\"tools/shipline/tests\",\"runner_tests\":\"tools/runner/tests\",\"known\":\"tools/shipline/parity-known.txt\"},\"machines\":[{\"name\":\"this machine\"},{\"name\":\"runner-1\",\"address\":\"runner@runner-1.example\"}],\"hunts\":{\"areas\":{\"phone\":[\"/calls\",\"/contacts\"],\"billing\":[\"/invoices\",\"/settings/billing\"]},\"plans\":\"docs/hunt-plans.md\"},\"review\":{\"high_effort_paths\":[\"^db/migrations/\",\"^db/schema\\\\.sql$\",\"^app/models/\",\"^prompts/\",\"(^|/)AGENTS\\\\.md$\",\"\\\\.prompt\\\\.md$\",\"^app/jobs/\",\"^app/queues/\",\"(^|/)locks?\\\\.py$\",\"^app/auth/\",\"^app/permissions/\",\"^config/secrets\"]},\"merge_train\":{\"queued_limit_minutes\":20},\"answer_for_owner_after_minutes\":15,\"hot_paths\":[\"src/example_app/models.py\",\"web/src/pages/**\"],\"conflict_review\":{\"effort\":\"medium\",\"model\":\"sonnet\",\"max_changed_lines\":40},\"cloud_pre_push\":{\"suites\":{\"server\":{\"select\":\"tools/shipline/server-tests-for-changes\",\"run\":\"tools/shipline/server-tests --workers {workers}\",\"workers\":4,\"part\":\"--shard {shard}/{shards}\"},\"browser\":{\"select\":\"tools/shipline/browser-tests-for-changes --ci\",\"run\":\"tools/shipline/browser-tests --workers {workers}\",\"workers\":2,\"probe\":\"tools/shipline/browser-starts\"}}}}'\nSHIPLINE_INSTALL_FOLDER=<checkout>\nSHIPLINE_RUNNER_LABELS=(example-app-home example-app-home-standby example-app-home-first example-app-home-main example-app-home-main-batch example-app-home-docker example-app-home-planner)\nSHIPLINE_HUNT_AREAS=(phone billing)\nSHIPLINE_HUNT_SCREENS=('/calls, /contacts' '/invoices, /settings/billing')\nSHIPLINE_COMMAND_BROWSER_TESTS_FOR_CHANGES=(<python> <workflow>/workflow_commands.py --repository-command browser_tests_for_changes '{\"run\": \"tools/shipline/browser-tests-for-changes\", \"form\": \"json\", \"field\": \"specs\", \"args\": [\"--ci\"]}' <checkout>/tools/shipline/browser-tests-for-changes --ci)\nSHIPLINE_COMMAND_SERVER_TESTS_FOR_CHANGES=(<checkout>/tools/shipline/server-tests-for-changes)\nSHIPLINE_COMMAND_PRE_TRAIN_CHECKS=(<checkout>/tools/shipline/pre-train-checks)\nSHIPLINE_COMMAND_MECHANICAL_CONFLICTS=(<checkout>/tools/shipline/mechanical-conflicts)\nSHIPLINE_COMMAND_BROWSER_PLAN=(<checkout>/tools/shipline/browser-plan)\nSHIPLINE_COMMAND_HUNT_APP=(<checkout>/tools/shipline/hunt-app)\nSHIPLINE_COMMAND_HUNT_BROWSER=(node <checkout>/tools/shipline/hunt-browser.mjs)\nSHIPLINE_COMMAND_HUNT_CURSOR=(<checkout>/tools/shipline/hunt-cursor)\nSHIPLINE_COMMAND_ADVISORY_WATCH=(<checkout>/tools/shipline/advisory-watch)\nSHIPLINE_COMMAND_PUSH_CHECKOUT=(<checkout>/tools/shipline/push-checkout)\nSHIPLINE_COMMAND_PUSH_CHECKS=(<checkout>/tools/shipline/push-checks)\nexport SHIPLINE_REPO=<checkout>\nexport SHIPLINE_CONFIG_JSON SHIPLINE_INSTALL_FOLDER\nexport SHIPLINE_CONFIG\n",
+  "sh": "unset SHIPLINE_CONFIG\nSHIPLINE_REPOSITORY=example-owner/example-app\nSHIPLINE_STATE_FOLDER=.local/shipline\nSHIPLINE_WORKTREE_SETUP=tools/prepare-worktree\nSHIPLINE_CI_RESULT='Build result'\nSHIPLINE_CI_PLAN='Build: what to run'\nSHIPLINE_E2E_PLAN='Browser: what to run'\nSHIPLINE_IMAGES=Images\nSHIPLINE_IMAGES_PLAN='Images: what to run'\nSHIPLINE_ANNOTATION_MERGE_TESTED='Merge built'\nSHIPLINE_ANNOTATION_FILES_TESTED='Tree tested'\nSHIPLINE_ANNOTATION_SERVER_TESTS='Server suite'\nSHIPLINE_ANNOTATION_WEB_SUITE='Web unit suite'\nSHIPLINE_ANNOTATION_BROWSER_SUITE='Browser specs'\nSHIPLINE_WORKFLOW_CI=build.yml\nSHIPLINE_WORKFLOW_E2E=browser.yml\nSHIPLINE_WORKFLOW_IMAGES=images.yml\nSHIPLINE_LABEL_WORKFLOW=shipline\nSHIPLINE_LABEL_AUDITED=audited\nSHIPLINE_PRIORITY_BLOCKER='priority: blocker'\nSHIPLINE_PRIORITY_HIGH='priority: high'\nSHIPLINE_PRIORITY_MEDIUM='priority: medium'\nSHIPLINE_PRIORITY_LOW='priority: low'\nSHIPLINE_IDENTITY_FOLDER='~/.config/shipline-runner'\nSHIPLINE_RUNNER_PREFIX=example-app\nSHIPLINE_RUNNER_LABEL=example-app-home\nSHIPLINE_RUNNER_PLANNER_LABEL=example-app-home-planner\nSHIPLINE_RUNNER_IMAGE_BUILD=tools/shipline/build-runner-images\nSHIPLINE_RUNNER_HUB_CACHE=tools/shipline/hub-cache\nSHIPLINE_HUNT_PLANS=docs/hunt-plans.md\nSHIPLINE_ANSWER_FOR_OWNER_AFTER_MINUTES=15\nSHIPLINE_CONFIG=<checkout>/shipline.json\nSHIPLINE_CONFIG_JSON='{\"repository\":\"example-owner/example-app\",\"install_folder\":\".\",\"state_folder\":\".local/shipline\",\"worktree_setup\":\"tools/prepare-worktree\",\"refresh\":{\"clear_generated\":[]},\"commands\":{\"test\":\"tools/run-tests\",\"browser\":\"tools/run-browser-tests\",\"browser_tests_for_changes\":{\"run\":\"tools/shipline/browser-tests-for-changes\",\"form\":\"json\",\"field\":\"specs\",\"args\":[\"--ci\"]},\"server_tests_for_changes\":\"tools/shipline/server-tests-for-changes\",\"pre_train_checks\":{\"run\":\"tools/shipline/pre-train-checks\",\"form\":\"exit\"},\"mechanical_conflicts\":\"tools/shipline/mechanical-conflicts\",\"browser_plan\":\"tools/shipline/browser-plan\",\"hunt_app\":\"tools/shipline/hunt-app\",\"hunt_browser\":\"node tools/shipline/hunt-browser.mjs\",\"hunt_cursor\":\"tools/shipline/hunt-cursor\",\"advisory_watch\":\"tools/shipline/advisory-watch\",\"push_checkout\":\"tools/shipline/push-checkout\",\"push_checks\":\"tools/shipline/push-checks\"},\"checks\":{\"ci_result\":\"Build result\",\"ci_plan\":\"Build: what to run\",\"e2e_plan\":\"Browser: what to run\",\"images\":\"Images\",\"dependency_audit\":\"Build: dependencies\",\"advisory_annotation\":\"Advisory\",\"prefix_only\":[\"images\",\"browser_whole\",\"server_whole\"],\"server_tests\":\"Build: server tests\",\"web\":\"Build: web\",\"older_version\":\"Build: older version on new tables\"},\"annotations\":{\"merge_tested\":\"Merge built\",\"files_tested\":\"Tree tested\",\"server_tests\":\"Server suite\",\"web_suite\":\"Web unit suite\",\"browser_suite\":\"Browser specs\"},\"workflows\":{\"ci\":\"build.yml\",\"e2e\":\"browser.yml\",\"images\":\"images.yml\",\"ci_name\":\"Build\",\"images_name\":\"Images\"},\"labels\":{\"workflow\":\"shipline\",\"audited\":\"audited\",\"priority\":{\"blocker\":\"priority: blocker\",\"high\":\"priority: high\",\"medium\":\"priority: medium\",\"low\":\"priority: low\"}},\"runner\":{\"labels\":[\"example-app-home\",\"example-app-home-standby\",\"example-app-home-first\",\"example-app-home-main\",\"example-app-home-main-batch\",\"example-app-home-docker\",\"example-app-home-planner\"],\"identity_folder\":\"~/.config/shipline-runner\",\"prefix\":\"example-app\",\"label\":\"example-app-home\",\"planner_label\":\"example-app-home-planner\",\"image_build\":\"tools/shipline/build-runner-images\",\"hub_cache\":\"tools/shipline/hub-cache\"},\"merge\":{\"scratch_prefix\":\"workflow/merge-batch-\"},\"cloud_wake_after_minutes\":45,\"parity\":{\"workflow_tests\":\"tools/shipline/tests\",\"runner_tests\":\"tools/runner/tests\",\"known\":\"tools/shipline/parity-known.txt\"},\"machines\":[{\"name\":\"this machine\"},{\"name\":\"runner-1\",\"address\":\"runner@runner-1.example\"}],\"hunts\":{\"areas\":{\"phone\":[\"/calls\",\"/contacts\"],\"billing\":[\"/invoices\",\"/settings/billing\"]},\"plans\":\"docs/hunt-plans.md\"},\"review\":{\"high_effort_paths\":[\"^db/migrations/\",\"^db/schema\\\\.sql$\",\"^app/models/\",\"^prompts/\",\"(^|/)AGENTS\\\\.md$\",\"\\\\.prompt\\\\.md$\",\"^app/jobs/\",\"^app/queues/\",\"(^|/)locks?\\\\.py$\",\"^app/auth/\",\"^app/permissions/\",\"^config/secrets\"]},\"merge_train\":{\"queued_limit_minutes\":20},\"answer_for_owner_after_minutes\":15,\"hot_paths\":[\"src/example_app/models.py\",\"web/src/pages/**\"],\"conflict_review\":{\"effort\":\"medium\",\"model\":\"sonnet\",\"max_changed_lines\":40},\"cloud_pre_push\":{\"suites\":{\"server\":{\"select\":\"tools/shipline/server-tests-for-changes\",\"run\":\"tools/shipline/server-tests --workers {workers}\",\"workers\":4,\"part\":\"--shard {shard}/{shards}\"},\"browser\":{\"select\":\"tools/shipline/browser-tests-for-changes --ci\",\"run\":\"tools/shipline/browser-tests --workers {workers}\",\"workers\":2,\"probe\":\"tools/shipline/browser-starts\"}}}}'\nSHIPLINE_INSTALL_FOLDER=<checkout>\nSHIPLINE_RUNNER_LABELS='example-app-home example-app-home-standby example-app-home-first example-app-home-main example-app-home-main-batch example-app-home-docker example-app-home-planner'\nSHIPLINE_HUNT_AREAS='phone billing'\nSHIPLINE_HUNT_SCREENS=''\"'\"'/calls, /contacts'\"'\"' '\"'\"'/invoices, /settings/billing'\"'\"''\nSHIPLINE_COMMAND_BROWSER_TESTS_FOR_CHANGES='<python> <workflow>/workflow_commands.py --repository-command browser_tests_for_changes '\"'\"'{\"run\": \"tools/shipline/browser-tests-for-changes\", \"form\": \"json\", \"field\": \"specs\", \"args\": [\"--ci\"]}'\"'\"' <checkout>/tools/shipline/browser-tests-for-changes --ci'\nSHIPLINE_COMMAND_SERVER_TESTS_FOR_CHANGES=<checkout>/tools/shipline/server-tests-for-changes\nSHIPLINE_COMMAND_PRE_TRAIN_CHECKS=<checkout>/tools/shipline/pre-train-checks\nSHIPLINE_COMMAND_MECHANICAL_CONFLICTS=<checkout>/tools/shipline/mechanical-conflicts\nSHIPLINE_COMMAND_BROWSER_PLAN=<checkout>/tools/shipline/browser-plan\nSHIPLINE_COMMAND_HUNT_APP=<checkout>/tools/shipline/hunt-app\nSHIPLINE_COMMAND_HUNT_BROWSER='node <checkout>/tools/shipline/hunt-browser.mjs'\nSHIPLINE_COMMAND_HUNT_CURSOR=<checkout>/tools/shipline/hunt-cursor\nSHIPLINE_COMMAND_ADVISORY_WATCH=<checkout>/tools/shipline/advisory-watch\nSHIPLINE_COMMAND_PUSH_CHECKOUT=<checkout>/tools/shipline/push-checkout\nSHIPLINE_COMMAND_PUSH_CHECKS=<checkout>/tools/shipline/push-checks\nexport SHIPLINE_REPO=<checkout>\nexport SHIPLINE_CONFIG_JSON SHIPLINE_INSTALL_FOLDER\nexport SHIPLINE_CONFIG\n"
+}

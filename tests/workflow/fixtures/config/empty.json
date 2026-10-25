@@ -1,0 +1,99 @@
+{
+  "values": {
+    "repository": "example-owner/example-app",
+    "install_folder": null,
+    "state_folder": ".local/workflow",
+    "worktree_setup": "scripts/setup-worktree",
+    "refresh": {
+      "clear_generated": []
+    },
+    "checks": {
+      "ci_result": "CI result",
+      "ci_plan": "CI: what to run",
+      "e2e_plan": "E2E: what to run",
+      "images": "Docker images",
+      "dependency_audit": null,
+      "advisory_annotation": null,
+      "prefix_only": [],
+      "server_tests": "CI: server tests",
+      "web": "CI: web",
+      "older_version": "CI: older version on new tables"
+    },
+    "annotations": {
+      "merge_tested": "Merge tested",
+      "files_tested": "Files tested",
+      "server_tests": "Server tests",
+      "web_suite": "Web suite",
+      "browser_suite": "Browser suite"
+    },
+    "workflows": {
+      "ci": "ci.yml",
+      "e2e": "e2e.yml",
+      "images": "images.yml",
+      "ci_name": "CI",
+      "images_name": "Images"
+    },
+    "labels": {
+      "workflow": "workflow",
+      "audited": "audited",
+      "priority": {
+        "blocker": "priority: blocker",
+        "high": "priority: high",
+        "medium": "priority: medium",
+        "low": "priority: low"
+      }
+    },
+    "runner": {
+      "labels": [],
+      "identity_folder": "~/.config/shipline-runner",
+      "prefix": null,
+      "label": null,
+      "planner_label": null,
+      "image_build": null,
+      "hub_cache": null
+    },
+    "merge": {
+      "scratch_prefix": "workflow/merge-batch-"
+    },
+    "parity": {
+      "workflow_tests": "tests/workflow",
+      "runner_tests": "tests/runner",
+      "known": null
+    },
+    "machines": [],
+    "hunts": {
+      "areas": {},
+      "plans": null
+    },
+    "commands": {
+      "test": null,
+      "browser": null,
+      "browser_tests_for_changes": null,
+      "server_tests_for_changes": null,
+      "pre_train_checks": null,
+      "mechanical_conflicts": null,
+      "browser_plan": null,
+      "hunt_app": null,
+      "hunt_browser": null,
+      "hunt_cursor": null,
+      "advisory_watch": null,
+      "push_checkout": null,
+      "push_checks": null
+    },
+    "hot_paths": [],
+    "conflict_review": null,
+    "review": {
+      "high_effort_paths": []
+    },
+    "merge_train": {
+      "queued_limit_minutes": 20
+    },
+    "answer_for_owner_after_minutes": 15,
+    "cloud_wake_after_minutes": 30,
+    "cloud_pre_push": {
+      "suites": {}
+    }
+  },
+  "shell": "unset SHIPLINE_CONFIG\nSHIPLINE_REPOSITORY=example-owner/example-app\nSHIPLINE_STATE_FOLDER=.local/workflow\nSHIPLINE_WORKTREE_SETUP=scripts/setup-worktree\nSHIPLINE_CI_RESULT='CI result'\nSHIPLINE_CI_PLAN='CI: what to run'\nSHIPLINE_E2E_PLAN='E2E: what to run'\nSHIPLINE_IMAGES='Docker images'\nSHIPLINE_IMAGES_PLAN='Docker images: what to run'\nSHIPLINE_ANNOTATION_MERGE_TESTED='Merge tested'\nSHIPLINE_ANNOTATION_FILES_TESTED='Files tested'\nSHIPLINE_ANNOTATION_SERVER_TESTS='Server tests'\nSHIPLINE_ANNOTATION_WEB_SUITE='Web suite'\nSHIPLINE_ANNOTATION_BROWSER_SUITE='Browser suite'\nSHIPLINE_WORKFLOW_CI=ci.yml\nSHIPLINE_WORKFLOW_E2E=e2e.yml\nSHIPLINE_WORKFLOW_IMAGES=images.yml\nSHIPLINE_LABEL_WORKFLOW=workflow\nSHIPLINE_LABEL_AUDITED=audited\nSHIPLINE_PRIORITY_BLOCKER='priority: blocker'\nSHIPLINE_PRIORITY_HIGH='priority: high'\nSHIPLINE_PRIORITY_MEDIUM='priority: medium'\nSHIPLINE_PRIORITY_LOW='priority: low'\nSHIPLINE_IDENTITY_FOLDER='~/.config/shipline-runner'\nSHIPLINE_RUNNER_PREFIX=''\nSHIPLINE_RUNNER_LABEL=''\nSHIPLINE_RUNNER_PLANNER_LABEL=''\nSHIPLINE_RUNNER_IMAGE_BUILD=''\nSHIPLINE_RUNNER_HUB_CACHE=''\nSHIPLINE_HUNT_PLANS=''\nSHIPLINE_ANSWER_FOR_OWNER_AFTER_MINUTES=15\nSHIPLINE_CONFIG=<checkout>/shipline.json\nSHIPLINE_CONFIG_JSON='{}'\nSHIPLINE_INSTALL_FOLDER=<checkout>\nSHIPLINE_RUNNER_LABELS=()\nSHIPLINE_HUNT_AREAS=()\nSHIPLINE_HUNT_SCREENS=()\nSHIPLINE_COMMAND_BROWSER_TESTS_FOR_CHANGES=()\nSHIPLINE_COMMAND_SERVER_TESTS_FOR_CHANGES=()\nSHIPLINE_COMMAND_PRE_TRAIN_CHECKS=()\nSHIPLINE_COMMAND_MECHANICAL_CONFLICTS=()\nSHIPLINE_COMMAND_BROWSER_PLAN=()\nSHIPLINE_COMMAND_HUNT_APP=()\nSHIPLINE_COMMAND_HUNT_BROWSER=()\nSHIPLINE_COMMAND_HUNT_CURSOR=()\nSHIPLINE_COMMAND_ADVISORY_WATCH=()\nSHIPLINE_COMMAND_PUSH_CHECKOUT=()\nSHIPLINE_COMMAND_PUSH_CHECKS=()\nexport SHIPLINE_REPO=<checkout>\nexport SHIPLINE_CONFIG_JSON SHIPLINE_INSTALL_FOLDER\nexport SHIPLINE_CONFIG\n",
+  "sh": "unset SHIPLINE_CONFIG\nSHIPLINE_REPOSITORY=example-owner/example-app\nSHIPLINE_STATE_FOLDER=.local/workflow\nSHIPLINE_WORKTREE_SETUP=scripts/setup-worktree\nSHIPLINE_CI_RESULT='CI result'\nSHIPLINE_CI_PLAN='CI: what to run'\nSHIPLINE_E2E_PLAN='E2E: what to run'\nSHIPLINE_IMAGES='Docker images'\nSHIPLINE_IMAGES_PLAN='Docker images: what to run'\nSHIPLINE_ANNOTATION_MERGE_TESTED='Merge tested'\nSHIPLINE_ANNOTATION_FILES_TESTED='Files tested'\nSHIPLINE_ANNOTATION_SERVER_TESTS='Server tests'\nSHIPLINE_ANNOTATION_WEB_SUITE='Web suite'\nSHIPLINE_ANNOTATION_BROWSER_SUITE='Browser suite'\nSHIPLINE_WORKFLOW_CI=ci.yml\nSHIPLINE_WORKFLOW_E2E=e2e.yml\nSHIPLINE_WORKFLOW_IMAGES=images.yml\nSHIPLINE_LABEL_WORKFLOW=workflow\nSHIPLINE_LABEL_AUDITED=audited\nSHIPLINE_PRIORITY_BLOCKER='priority: blocker'\nSHIPLINE_PRIORITY_HIGH='priority: high'\nSHIPLINE_PRIORITY_MEDIUM='priority: medium'\nSHIPLINE_PRIORITY_LOW='priority: low'\nSHIPLINE_IDENTITY_FOLDER='~/.config/shipline-runner'\nSHIPLINE_RUNNER_PREFIX=''\nSHIPLINE_RUNNER_LABEL=''\nSHIPLINE_RUNNER_PLANNER_LABEL=''\nSHIPLINE_RUNNER_IMAGE_BUILD=''\nSHIPLINE_RUNNER_HUB_CACHE=''\nSHIPLINE_HUNT_PLANS=''\nSHIPLINE_ANSWER_FOR_OWNER_AFTER_MINUTES=15\nSHIPLINE_CONFIG=<checkout>/shipline.json\nSHIPLINE_CONFIG_JSON='{}'\nSHIPLINE_INSTALL_FOLDER=<checkout>\nSHIPLINE_RUNNER_LABELS=''\nSHIPLINE_HUNT_AREAS=''\nSHIPLINE_HUNT_SCREENS=''\nSHIPLINE_COMMAND_BROWSER_TESTS_FOR_CHANGES=''\nSHIPLINE_COMMAND_SERVER_TESTS_FOR_CHANGES=''\nSHIPLINE_COMMAND_PRE_TRAIN_CHECKS=''\nSHIPLINE_COMMAND_MECHANICAL_CONFLICTS=''\nSHIPLINE_COMMAND_BROWSER_PLAN=''\nSHIPLINE_COMMAND_HUNT_APP=''\nSHIPLINE_COMMAND_HUNT_BROWSER=''\nSHIPLINE_COMMAND_HUNT_CURSOR=''\nSHIPLINE_COMMAND_ADVISORY_WATCH=''\nSHIPLINE_COMMAND_PUSH_CHECKOUT=''\nSHIPLINE_COMMAND_PUSH_CHECKS=''\nexport SHIPLINE_REPO=<checkout>\nexport SHIPLINE_CONFIG_JSON SHIPLINE_INSTALL_FOLDER\nexport SHIPLINE_CONFIG\n"
+}
