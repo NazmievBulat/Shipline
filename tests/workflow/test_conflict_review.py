@@ -1345,9 +1345,15 @@ def test_codex_panel_argv_reaches_real_claude_parser(workflow: Workflow, tmp_pat
     real = shutil.which("claude", path=os.environ.get("PATH", ""))
     if real is None:
         pytest.skip("real Claude CLI is not installed")
-    head = _requested_panel(workflow)
+    _panel_conflict(workflow)
+    _program(workflow)
+    _record_handback(workflow)
+    assert workflow.run("start", "review", "7").returncode == 0
+    head = _resolve(workflow)
+    workflow.set_pull_request(7, "OPEN", head)
+    workflow.fake("agent", '#!/bin/bash\necho Cursor report\n')
     workflow.fake("claude", '#!/bin/bash\nprintf "%s\\0" "$@" > "@STATE@/claude-argv"\necho report\n')
-    done = workflow.run_script("review-panel", "7", "--head", head)
+    done = workflow.run_script("review-panel", "7")
     assert done.returncode == 0, done.stdout + done.stderr
     argv = (workflow.state / "claude-argv").read_text().split("\0")[:-1]
     config = tmp_path / "mcp.json"
