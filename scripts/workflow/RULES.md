@@ -465,8 +465,9 @@ under `.local/workflow/reviews/N/<head>/` are independent review evidence for th
    and the main version of the workflow rules in `.review/workflow-rules.md`, read-only under
    a filesystem sandbox, each
    with a 30-minute timeout. Codex is skipped on any pull request it built, recorded by
-   `session start worker` in `.local/workflow/codex-built-N` of the main checkout. A missing,
-   signed-out or failed tool is noted and skipped. Cursor and Codex run in parallel.
+   `session start worker` in `.local/workflow/codex-built-N` of the main checkout. A conflict
+   it resolved, recorded in `.local/workflow/codex-resolved-N`, also excludes Codex.
+   A missing, signed-out or failed tool is noted and skipped. Cursor and Codex run in parallel.
    Read `task-as-opened.md` and `task-changes.md` beside the panel reports. A requirement
    removed or narrowed since opening is a finding unless `Answers given for the owner`,
    or the orchestrator's answer under his standing delegation, covers it. If history cannot
@@ -627,7 +628,9 @@ or a panel report calls for a full review, run `review-panel N --full-review`. I
 the fallback and exits with status 2, as does an automatic scope refusal. Say why and end
 without publishing a round, with `review finished`; the tick stops Codex and its bridge
 and starts the usual Claude reviewer on the pushed head. That reviewer runs the full panel;
-the recorded fallback keeps this head out of conflict-only review.
+the recorded fallback keeps this head out of conflict-only review. The panel records Codex's
+resolution in `codex-resolved-N`, so Codex also stays off later panels of its own resolution;
+the fresh Claude reviewer and Cursor provide the independent full review.
 
 Publish the next usual independent round on the resolved head, stating that it is a conflict
 round and naming H, with `<!-- workflow-conflict extends=H -->` on its own line after the

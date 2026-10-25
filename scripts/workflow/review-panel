@@ -85,6 +85,8 @@ fallback() {
   exit 2
 }
 if [[ $codex_resolved == true ]]; then
+  # Authorship survives a fallback and the next reviewer start, like codex-built-N.
+  touch "$main/$SHIPLINE_STATE_FOLDER/codex-resolved-$number"
   [[ $full_review == false ]] || fallback 'explicit --full-review'
   [[ -f $main/$SHIPLINE_STATE_FOLDER/review-$number.conflict.json ]] || fallback 'missing conflict scope'
   # Explicit tool arguments cannot let a resolver review its own resolution.
@@ -170,6 +172,10 @@ for who in "${reviewers[@]}"; do
   esac
   if [[ $who == codex && -e $main/$SHIPLINE_STATE_FOLDER/codex-built-$number ]]; then
     echo 'skipped: Codex built this pull request' >"$report"
+    continue
+  fi
+  if [[ $who == codex && -e $main/$SHIPLINE_STATE_FOLDER/codex-resolved-$number ]]; then
+    echo 'skipped: Codex resolved a conflict on this pull request' >"$report"
     continue
   fi
   if [[ $installed == false ]] || ! command -v bwrap >/dev/null; then

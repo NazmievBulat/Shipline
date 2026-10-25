@@ -541,6 +541,12 @@ def test_codex_panel_fallback_returns_to_claude(workflow: Workflow, extra: str) 
     args = " ".join(session_arguments(workflow.state, "review-7"))
     assert "--model opus" in args and "--mcp-config" not in args
     assert not workflow.is_running("codex-7")
+    workflow.fake("agent", '#!/bin/bash\necho "Cursor report"\n')
+    done = workflow.run_script("review-panel", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    full = _folder(workflow) / "reviews/7" / resolved / "full-review"
+    assert "Codex resolved a conflict" in (full / "codex.md").read_text()
+    assert "Cursor report" in (full / "cursor.md").read_text()
 
 
 def test_conflict_program_is_validated_by_name(workflow: Workflow) -> None:
