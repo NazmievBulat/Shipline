@@ -61,6 +61,7 @@ def _hand_back(folder: Path, number: str, reason: str) -> None:
         (folder / f"review-{number}.head").unlink(missing_ok=True)
         train = gate.Train(folder)
         train.approved.pop(number, None)
+        train.repairing.pop(number, None)
         train.save()
     print(f"merge hand-back {number}: {reason}", flush=True)
 
@@ -114,6 +115,7 @@ def _hand_to_worker(
         train = gate.Train(folder)
         train.approved.pop(number, None)
         train.blocked[number] = repair.head
+        train.repairing[number] = repair.head
         if number not in train.queue:
             train.queue.append(number)
         train.save()
@@ -128,8 +130,20 @@ def _checks_failed(folder: Path, number: str, pull: dict[str, Any]) -> None:
         if waits:
             print(f"merge handoff {number} waits: {waits}", flush=True)
         else:
-            # Its line's run failed, not its own checks: a reviewer judges it, as before.
-            _hand_back(folder, number, "pull request checks failed")
+            # A saved train block is distinct from a failure of the head's own checks.
+            train = gate.Train(folder)
+            failure = train.batch_failed.get(number)
+            if failure:
+                reason = (
+                    f"{failure['workflow']} run of this pull request's prefix "
+                    f"({failure['batch']['branch']}) failed on main and the members ahead of it"
+                )
+            else:
+                reason = (
+                    "merge train blocked this head without marking it refreshable; "
+                    "its own checks show no failure"
+                )
+            _hand_back(folder, number, reason)
         return
     diagnosis = check_repair.diagnose(pull, folder=folder)
     if diagnosis.kind == "infrastructure":

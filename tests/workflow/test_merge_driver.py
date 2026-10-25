@@ -1510,6 +1510,36 @@ def test_an_isolated_scratch_failure_hands_back_once_with_green_pr_checks(github
     assert not list(_folder(workflow).glob("merge-wanted-*"))
 
 
+def test_a_saved_prefix_block_names_its_failure_when_the_driver_hands_it_back(
+    github: GitHub,
+) -> None:
+    _handed_batch(github)
+    workflow = github.workflow
+    started = workflow.run_python("merge_driver.py")
+    assert started.returncode == 0, started.stdout + started.stderr
+    github.finish_batch(conclusion="failure")
+    github.save()
+    # A gate call records the failed prefix before the driver sees its handoff again.
+    blocked = workflow.run_script(
+        "merge-when-current", "--drive", "7", cwd=workflow.worktree(7)
+    )
+    assert blocked.returncode == 1, blocked.stdout + blocked.stderr
+    failure = _train(workflow)["batch_failed"]["7"]
+    assert _note(workflow).exists()
+    assert _train(workflow)["blocked"]["7"] == github.head
+
+    done = workflow.run_python("merge_driver.py")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (
+        f"merge hand-back 7: {failure['workflow']} run of this pull request's prefix "
+        f"({failure['batch']['branch']}) failed on main and the members ahead of it"
+    ) in done.stdout
+    assert "merge hand-back 7: pull request checks failed" not in done.stdout
+    assert not _note(workflow).exists()
+    assert all(c["conclusion"] == "SUCCESS" for c in github.pulls["7"]["statusCheckRollup"])
+
+
 def test_a_stacked_startup_lock_keeps_the_parent_note_without_stalling_the_tick(
     handed: GitHub,
 ) -> None:
@@ -2268,6 +2298,7 @@ def test_a_repaired_fix_tested_on_older_main_keeps_its_place_and_refreshes(
     repair = _folder(workflow) / "check-repair-7.json"
     assert json.loads(repair.read_text())["head"] == failed
     assert _train(workflow)["blocked"] == {"7": failed}
+    assert _train(workflow)["repairing"] == {"7": failed}
     assert _train(workflow)["waiting"] == ["7", "8"]
     assert not _note(workflow).exists()
 
@@ -2293,6 +2324,7 @@ def test_a_repaired_fix_tested_on_older_main_keeps_its_place_and_refreshes(
 
     assert _train(workflow)["waiting"] == ["7", "8"]
     assert "7" not in _train(workflow)["blocked"]
+    assert "7" not in _train(workflow)["repairing"]
     assert _train(workflow)["approved"]["7"] == fixed
     assert json.loads(_note(workflow).read_text())["head"] == fixed
     assert repair.exists() == repair_left

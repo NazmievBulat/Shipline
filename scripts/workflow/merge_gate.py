@@ -135,6 +135,7 @@ LOCK_WAITS = 10
 # Each member's own entries in the saved line, by the Train attribute that holds them.
 MEMBER_ENTRIES = (
     "blocked",
+    "repairing",
     "suspended",
     "conflicts",
     "approved",
