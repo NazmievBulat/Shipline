@@ -441,7 +441,19 @@ def drive(folder: Path) -> None:
             elif note.children is not None:
                 _hand_back(folder, number, "unfinished stack follow-up on an open pull request")
             elif pull["headRefOid"] != note.head or pull["headRefName"] != note.branch:
-                _hand_back(folder, number, "head changed since the passed review handoff")
+                pending = gate.saved_refresh(folder, number, note)
+                if (
+                    pending is not None
+                    and pull["headRefOid"] == pending["commit"]
+                    and pull["headRefName"] == note.branch
+                ):
+                    # A lost response can leave the exact saved refresh already published.
+                    # Only the gate, under merge.lock, may advance its authorization.
+                    if _drive_gate(folder, number):
+                        driven.add(number)
+                    refreshed.add(number)
+                else:
+                    _hand_back(folder, number, "head changed since the passed review handoff")
             elif gate.failed_checks(pull) or (
                 # A green re-run on an older main stays blocked but keeps its place: its turn
                 # refreshes it, as for any stale green run.

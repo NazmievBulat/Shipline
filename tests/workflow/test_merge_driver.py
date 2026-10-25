@@ -855,14 +855,19 @@ def _stale_refresh(handed: GitHub, *, repaired: bool = False) -> None:
     handed.save()
 
 
-def _drop_refresh_pushes(workflow: Workflow, errors: list[str]) -> None:
+def _drop_refresh_pushes(
+    workflow: Workflow, errors: list[str], *, published: bool = False
+) -> None:
     (workflow.state / "refresh-push-errors").write_text("\n".join(errors) + "\n")
+    if published:
+        (workflow.state / "refresh-push-accepted").touch()
     workflow.fake(
         "git",
         """#!/bin/bash
 if [[ $1 == push && -s "@STATE@/refresh-push-errors" ]]; then
   read -r failure < "@STATE@/refresh-push-errors"
   sed -i '1d' "@STATE@/refresh-push-errors"
+  if [[ -e "@STATE@/refresh-push-accepted" ]]; then /usr/bin/git "$@" || exit; fi
   echo "$failure" >&2
   exit 1
 fi
@@ -871,24 +876,29 @@ exec /usr/bin/git "$@"
     )
 
 
-@pytest.mark.parametrize("error,repaired", [
-    ("fatal: the remote end hung up unexpectedly", False),
-    ("fatal: the remote end hung up unexpectedly", True),
-    ("fatal: read error: Connection reset by peer", False),
-    ("fatal: Failed to connect: Connection timed out", False),
-    ("error: RPC failed; curl 28 Operation timed out after 1000 milliseconds", False),
-    ("error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503", False),
-    ("fatal: unable to access remote: The requested URL returned error: 502", False),
-    ("fatal: unable to access remote: HTTP/2 504", False),
-    ("waiting for a push slot: 2 ahead", False),
-    ("io_uring_queue_init: could not lock memory", False),
+@pytest.mark.parametrize("error,repaired,published", [
+    ("fatal: the remote end hung up unexpectedly", False, False),
+    ("fatal: the remote end hung up unexpectedly", True, False),
+    ("fatal: the remote end hung up unexpectedly", False, True),
+    ("fatal: read error: Connection reset by peer", False, False),
+    ("fatal: Failed to connect: Connection timed out", False, False),
+    ("error: RPC failed; curl 28 Operation timed out after 1000 milliseconds", False, False),
+    ("error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503", False, False),
+    ("fatal: unable to access remote: The requested URL returned error: 502", False, False),
+    ("fatal: unable to access remote: HTTP/2 504", False, False),
+    ("waiting for a push slot: 2 ahead", False, False),
+    ("io_uring_queue_init: could not lock memory", False, False),
 ])
-def test_the_refresh_push_fails_once(handed: GitHub, error: str, repaired: bool) -> None:
+def test_the_refresh_push_fails_once(
+    handed: GitHub, error: str, repaired: bool, published: bool
+) -> None:
     workflow = handed.workflow
     _stale_refresh(handed, repaired=repaired)
     started = ["ticket-7"] if repaired else []
     # The push helper already retries a locked-memory shortage once within a tick.
-    _drop_refresh_pushes(workflow, [error] * (2 if "io_uring_queue_init" in error else 1))
+    _drop_refresh_pushes(
+        workflow, [error] * (2 if "io_uring_queue_init" in error else 1), published=published
+    )
 
     first = workflow.run_script("tick")
 
@@ -902,7 +912,12 @@ def test_the_refresh_push_fails_once(handed: GitHub, error: str, repaired: bool)
     refreshed = workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7))
     assert refreshed != handed.head
     assert workflow.git("rev-parse", "HEAD^2", cwd=workflow.worktree(7)) == handed.base
-    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
+    remote = workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0]
+    assert remote == (refreshed if published else handed.head)
+    if published:
+        handed.pulls["7"]["headRefOid"] = refreshed
+        (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {refreshed}\n")
+        handed.save()
 
     second = workflow.run_script("tick")
 

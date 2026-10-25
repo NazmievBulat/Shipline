@@ -522,6 +522,10 @@ def _push_refreshed(
                 )
         path.unlink(missing_ok=True)
         raise Refused(f"could not push the refreshed branch: {pushed.refusal}")
+    _finish_refresh(train, number, head, save=save)
+
+
+def _finish_refresh(train: "Train", number: str, head: str, *, save: bool = False) -> None:
     if save:
         train.save()
     note = Handoff.read(train.path.parent, number)
@@ -534,7 +538,22 @@ def _push_refreshed(
         note.save(train.path.parent, number)
         train.approved[number] = note.head
         train.save()
-    path.unlink(missing_ok=True)
+    (train.path.parent / f"merge-refresh-{number}.json").unlink(missing_ok=True)
+
+
+def saved_refresh(folder: Path, number: str, note: Handoff | None) -> dict[str, Any] | None:
+    path = folder / f"merge-refresh-{number}.json"
+    pending = json.loads(path.read_text()) if path.exists() else None
+    if pending is not None and (
+        note is None
+        or pending["head"] != note.head
+        or pending["branch"] != note.branch
+        or pending["round"] != note.round
+        or type(pending["failures"]) is not int
+        or not 1 <= pending["failures"] < 3
+    ):
+        raise Refused("the saved refresh no longer matches the passed review handoff")
+    return pending
 
 
 def clear_generated(worktree: Path) -> None:
@@ -788,21 +807,17 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             )
             return 0
         if delegated:
-            if not authorized(folder, number, pull["headRefOid"]):
+            pending = saved_refresh(folder, number, Handoff.read(folder, number))
+            reviewed = pending["head"] if pending is not None else pull["headRefOid"]
+            if not authorized(folder, number, reviewed) or (
+                pending is not None
+                and (
+                    pull["headRefOid"] not in (pending["head"], pending["commit"])
+                    or pull["headRefName"] != pending["branch"]
+                )
+            ):
                 raise Refused("the head changed since the passed review handoff")
             pending_path = folder / f"merge-refresh-{number}.json"
-            pending = json.loads(pending_path.read_text()) if pending_path.exists() else None
-            if pending is not None:
-                note = Handoff.read(folder, number)
-                if (
-                    note is None
-                    or pending["head"] != note.head
-                    or pending["branch"] != note.branch
-                    or pending["round"] != note.round
-                    or type(pending["failures"]) is not int
-                    or not 1 <= pending["failures"] < 3
-                ):
-                    raise Refused("the saved refresh no longer matches the passed review handoff")
             expected = pending["commit"] if pending is not None else pull["headRefOid"]
             if git("rev-parse", "HEAD") != expected or git("status", "--porcelain"):
                 raise Refused("the handed-off worktree is no longer clean at the reviewed head")
@@ -811,6 +826,15 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
         if not ready(pull):
             raise Refused("only an open, ready pull request based on main can merge")
         pre_train_checks(number, folder)
+        if delegated and pending is not None and pull["headRefOid"] == pending["commit"]:
+            # The server accepted this exact push before the connection failed. No second
+            # push is needed, and a newer main must not reset the now-published commit.
+            train = Train(folder)
+            unblocked = train.blocked.pop(number, None) is not None
+            train.refreshable.discard(number)
+            _finish_refresh(train, number, pending["head"], save=unblocked)
+            print("the refreshed branch is published; waiting for its CI", flush=True)
+            return 2
         # A direct retry can observe recovery before the next tick. Reconcile suspension
         # against freshly read main health, rather than the previous gate's report.
         base, health = refresh_health(folder)
