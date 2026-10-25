@@ -38,7 +38,7 @@ if [[ $WORKFLOW_SESSION == review-* ]]; then
       .commit_id == $head and (.body | type == "string") and
       (.body | test("^<!-- workflow-review round=[0-9]+ result=(passed|sent-back) -->\n")) and
       (.body | split("\n") | index("<!-- workflow-conflict extends=" + $extended + " -->") != null)
-    ' "$6" >/dev/null || refuse
+    ' -- "$6" >/dev/null || refuse
     exec env WORKFLOW_GITHUB_RAW_GH="$WORKFLOW_GH" python3 "$(dirname "${BASH_SOURCE[0]}")/../github_budget.py" foreground "$@"
   fi
 fi

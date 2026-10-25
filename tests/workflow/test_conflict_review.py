@@ -753,7 +753,7 @@ def test_tick_reads_codex_conflict_completion_and_starts_full_review(
 
 
 @pytest.mark.parametrize(
-    "operation", ["publish", "other", "approve", "full", "ready", "body", "ticket"]
+    "operation", ["publish", "dash-file", "other", "approve", "full", "ready", "body", "ticket"]
 )
 def test_codex_conflict_gh_allows_only_its_own_conflict_round(
     workflow: Workflow, operation: str
@@ -762,6 +762,8 @@ def test_codex_conflict_gh_allows_only_its_own_conflict_round(
     assert workflow.run("start", "review", "7").returncode == 0
     resolved = _resolve(workflow)
     payload = workflow.root / "round.json"
+    if operation == "dash-file":
+        payload = workflow.worktree(7) / "--round.json"
     body = "<!-- workflow-review round=2 result=passed -->\n"
     if operation != "full":
         body += f"<!-- workflow-conflict extends={head} -->\n"
@@ -777,7 +779,7 @@ def test_codex_conflict_gh_allows_only_its_own_conflict_round(
     number = 8 if operation == "other" else 7
     args = [
         "api", "-X", "POST", f"repos/example-org/example-app/pulls/{number}/reviews",
-        "--input", str(payload),
+        "--input", payload.name if operation == "dash-file" else str(payload),
     ]
     if operation == "ready":
         args = ["pr", "ready", "7"]
@@ -798,7 +800,7 @@ def test_codex_conflict_gh_allows_only_its_own_conflict_round(
         ["bash", str(shim), *args], cwd=workflow.worktree(7), env=env,
         text=True, capture_output=True, check=False,
     )
-    assert (done.returncode == 0) == (operation == "publish"), done.stdout + done.stderr
+    assert (done.returncode == 0) == (operation in {"publish", "dash-file"}), done.stdout + done.stderr
 
 
 @pytest.mark.parametrize(
