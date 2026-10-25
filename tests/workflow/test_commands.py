@@ -403,6 +403,63 @@ def test_handoff_records_a_wait_before_the_tick_retries(handed: GitHub) -> None:
     assert (workflow.state / "merged").read_text() == "7"
 
 
+@pytest.mark.parametrize("waits", [1, 2])
+def test_a_delayed_passing_handoff_cannot_override_a_newer_wait(handed: GitHub, waits: int) -> None:
+    workflow = handed.workflow
+    _configure(workflow, pre_train_checks="example-checks")
+    workflow.fake("example-checks", '''#!/bin/bash
+        if [[ -e "@STATE@/checks-wait" ]]; then
+          echo "try later"
+          exit 75
+        fi
+    ''')
+    done = _gate(workflow, f'''
+        from pathlib import Path
+        folder = g.CONFIG.state()
+        checked = injected = False
+        original_checks, original_read = g.pre_train_checks, g.read_pull
+
+        def checks(*args, **kwargs):
+            global checked
+            result = original_checks(*args, **kwargs)
+            checked = True
+            return result
+
+        def read(number):
+            global injected
+            pull = original_read(number)
+            if checked and not injected:
+                injected = True
+                Path({str(workflow.state / "checks-wait")!r}).touch()
+                # A driven gate completes these checks while the older passing handoff
+                # is between its own checks and its final admission under merge.lock.
+                for _ in range({waits}):
+                    try:
+                        original_checks(number, folder, locked=False)
+                    except g.Refused:
+                        pass
+            return pull
+
+        g.pre_train_checks, g.read_pull = checks, read
+        try:
+            print("handoff:", g.handoff("7", folder))
+        except g.Refused as error:
+            print("refused:", error)
+        assert injected
+    ''', workflow.worktree(7))
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    folder = workflow.repo / ".local/workflow"
+    assert "7" not in json.loads((folder / "merge-train.json").read_text())["approved"]
+    if waits == 1:
+        assert "handoff: 0" in done.stdout
+        assert "waiting for pre-train checks on the next tick" in done.stdout
+        assert (folder / "merge-wanted-7").exists()
+    else:
+        assert "refused: pre-train checks could not finish twice" in done.stdout
+        assert not (folder / "merge-wanted-7").exists()
+
+
 @pytest.mark.parametrize("key,value", [
     ("wait_output", "["), ("wait_output", 1),
     ("wait_exit", [0]), ("wait_exit", [True]), ("wait_exit", [256]),
@@ -518,9 +575,14 @@ def test_function_helper_waits_can_match_an_exception(workflow: Workflow) -> Non
 
 
 @pytest.mark.parametrize("mechanical", [False, True], ids=["renumber", "resolve"])
-def test_a_mechanical_helper_wait_leaves_a_clean_reviewed_worktree(github: GitHub, mechanical: bool) -> None:
+@pytest.mark.parametrize("partial", ["none", "tracked", "untracked"])
+def test_a_mechanical_helper_wait_leaves_a_clean_reviewed_worktree(
+    github: GitHub, mechanical: bool, partial: str,
+) -> None:
     workflow = github.workflow
     workflow.git("checkout", "main")
+    (workflow.repo / "shared.txt").write_text("main changed\n")
+    workflow.git("add", "shared.txt")
     workflow.git("commit", "--allow-empty", "-m", "fix: main moved")
     github.base = workflow.git("rev-parse", "HEAD")
     workflow.git("push", "origin", "main")
@@ -530,7 +592,15 @@ def test_a_mechanical_helper_wait_leaves_a_clean_reviewed_worktree(github: GitHu
     _configure(workflow, mechanical_conflicts={
         "run": "example-helper", "form": "lines", "wait_output": "^try later",
     })
-    _stand_in(workflow, "example-helper", "try later\n", 1)
+    exclude = workflow.repo / ".git/info/exclude"
+    exclude.write_text(exclude.read_text() + "\npreserved-cache/\n")
+    cache = workflow.repo / "preserved-cache/keep.txt"
+    cache.parent.mkdir()
+    cache.write_text("keep this cache\n")
+    changed = "shared.txt" if partial == "tracked" else "new-helper.txt"
+    edit = f'echo partial > "{changed}"\n' if partial != "none" else ""
+    workflow.fake("example-helper", "#!/bin/bash\n" + edit + 'echo "try later"\nexit 1\n')
+    config_before = (workflow.repo / "shipline.json").read_text()
 
     done = _gate(workflow, f'''
         folder = g.CONFIG.state()
@@ -546,6 +616,8 @@ def test_a_mechanical_helper_wait_leaves_a_clean_reviewed_worktree(github: GitHu
     assert workflow.git("rev-parse", "HEAD") == github.head
     assert workflow.git("status", "--porcelain") == ""
     assert not (workflow.repo / workflow.git("rev-parse", "--git-path", "MERGE_HEAD")).exists()
+    assert cache.read_text() == "keep this cache\n"
+    assert (workflow.repo / "shipline.json").read_text() == config_before
 
 
 def test_pre_train_wait_is_reset_by_a_pass_and_by_a_new_head(workflow: Workflow) -> None:
