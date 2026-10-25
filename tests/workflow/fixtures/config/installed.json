@@ -18,7 +18,10 @@
         "images",
         "browser_whole",
         "server_whole"
-      ]
+      ],
+      "server_tests": "CI: server tests",
+      "web": "CI: web",
+      "older_version": "CI: older version on new tables"
     },
     "annotations": {
       "merge_tested": "Merge built",
@@ -30,7 +33,9 @@
     "workflows": {
       "ci": "build.yml",
       "e2e": "browser.yml",
-      "images": "images.yml"
+      "images": "images.yml",
+      "ci_name": "CI",
+      "images_name": "Images"
     },
     "labels": {
       "workflow": "shipline",

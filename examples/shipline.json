@@ -14,11 +14,14 @@
     "dependency_audit": "Build: dependencies",
     "e2e_plan": "Browser: what to run",
     "images": "Images",
+    "older_version": "Build: older version on new tables",
     "prefix_only": [
       "images",
       "browser_whole",
       "server_whole"
-    ]
+    ],
+    "server_tests": "Build: server tests",
+    "web": "Build: web"
   },
   "cloud_pre_push": {
     "suites": {
@@ -155,8 +158,10 @@
   "state_folder": ".local/shipline",
   "workflows": {
     "ci": "build.yml",
+    "ci_name": "Build",
     "e2e": "browser.yml",
-    "images": "images.yml"
+    "images": "images.yml",
+    "images_name": "Images"
   },
   "worktree_setup": "tools/prepare-worktree"
 }

@@ -1,6 +1,7 @@
 """One file, `shipline.json` at the root of the main checkout, names what differs between the
 repositories that use Shipline; `workflow_config.py` reads it, key by key over its defaults."""
 
+import ast
 import hashlib
 import importlib.util
 import fcntl
@@ -43,6 +44,9 @@ _DEFAULTS = {
         "ci_plan": "CI: what to run",
         "e2e_plan": "E2E: what to run",
         "images": "Docker images",
+        "server_tests": "CI: server tests",
+        "web": "CI: web",
+        "older_version": "CI: older version on new tables",
         "dependency_audit": None,
         "advisory_annotation": None,
         "prefix_only": [],
@@ -54,7 +58,10 @@ _DEFAULTS = {
         "web_suite": "Web suite",
         "browser_suite": "Browser suite",
     },
-    "workflows": {"ci": "ci.yml", "e2e": "e2e.yml", "images": "images.yml"},
+    "workflows": {
+        "ci": "ci.yml", "e2e": "e2e.yml", "images": "images.yml",
+        "ci_name": "CI", "images_name": "Images",
+    },
     "labels": {
         "workflow": "workflow",
         "audited": "audited",
@@ -137,6 +144,17 @@ def _as_json(config: Any) -> dict[str, Any]:
     return json.loads(json.dumps(workflow_config.as_dict(config)))
 
 
+def test_ci_job_names_are_kept_in_config_defaults() -> None:
+    for filename in ("merge_gate.py", "merge_checks.py", "merge_github.py", "merge_health.py",
+                     "merge_images.py", "merge_scratch.py", "merge_squash.py", "merge_train.py",
+                     "ci_proof.py", "check_repair.py", "merge_driver.py", "ci_minutes.py"):
+        tree = ast.parse((_WORKFLOW / filename).read_text())
+        names = [(node.lineno, node.value) for node in ast.walk(tree)
+                 if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                 and node.value.startswith(("CI:", "Docker images:"))]
+        assert names == [], f"{filename} hard-codes CI job names: {names}"
+
+
 def test_without_a_file_every_value_is_its_default(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
 
@@ -154,6 +172,41 @@ def test_prefix_only_groups_are_read(tmp_path: Path, groups: list[str]) -> None:
     assert mapped["images"].workflow == "images"
     assert mapped["browser_whole"].jobs == ("playwright",)
     assert mapped["server_whole"].jobs == ("CI: server tests",)
+
+
+def test_server_whole_group_uses_the_configured_job_and_its_shards(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {"server_tests": "X"}})
+    group = workflow_config.load(repo).checks.groups()["server_whole"]
+    assert group.jobs == ("X",)
+    assert group.suite == "server_tests"
+    assert group.contains("X")
+    assert group.contains("X (2 of 3)")
+    assert not group.contains("CI: server tests")
+
+
+@pytest.mark.parametrize("key", ["server_tests", "web", "older_version"])
+@pytest.mark.parametrize("value", ["Build: tests (1 of 3)", "X (12 of 24)", "X (0 of 0)",
+                                   " (1 of 3)"])
+def test_suite_job_names_with_a_shard_suffix_are_refused(
+    tmp_path: Path, key: str, value: str,
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {key: value}})
+
+    with pytest.raises(workflow_config.ConfigError, match=rf"checks\.{key}.*shard suffix"):
+        workflow_config.load(repo)
+
+
+@pytest.mark.parametrize("key", ["server_tests", "web", "older_version"])
+@pytest.mark.parametrize("value", ["X", "Build: tests (unit)", "X (1 of 3) report"])
+def test_suite_job_names_without_a_shard_suffix_are_kept(
+    tmp_path: Path, key: str, value: str,
+) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"checks": {key: value}})
+
+    assert getattr(workflow_config.load(repo).checks, key) == value
 
 
 @pytest.mark.parametrize("groups", [["unknown"], ["images", "images"], "images", None, [3]])
@@ -1632,7 +1685,7 @@ done = {"status": "completed", "conclusion": "success", "labels": []}
 ci = [
     {"id": 1, "name": names["ci_plan"], **done},
     {"id": 2, "name": names["ci_result"], **done},
-    {"id": 3, "name": "CI: server tests", **done},
+    {"id": 3, "name": g.CONFIG.checks.server_tests, **done},
     {"id": 8, "name": "CI: web", **done},
 ]
 e2e = [{"id": 4, "name": names["e2e_plan"], **done}, {"id": 6, "name": "playwright", **done}]
@@ -1678,7 +1731,7 @@ def _gate_reads(workflow: Workflow, names: dict[str, str]) -> dict[str, bool | N
 def test_the_gate_reads_the_named_checks_titles_workflow_files_and_runner_labels(
     workflow: Workflow,
 ) -> None:
-    default = {**_DEFAULTS["annotations"], **_DEFAULTS["checks"]}
+    default = {**_DEFAULTS["checks"], **_DEFAULTS["annotations"]}
     named = {
         "merge_tested": "Merge built",
         "files_tested": "Tree tested",

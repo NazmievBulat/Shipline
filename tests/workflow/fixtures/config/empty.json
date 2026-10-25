@@ -14,7 +14,10 @@
       "images": "Docker images",
       "dependency_audit": null,
       "advisory_annotation": null,
-      "prefix_only": []
+      "prefix_only": [],
+      "server_tests": "CI: server tests",
+      "web": "CI: web",
+      "older_version": "CI: older version on new tables"
     },
     "annotations": {
       "merge_tested": "Merge tested",
@@ -26,7 +29,9 @@
     "workflows": {
       "ci": "ci.yml",
       "e2e": "e2e.yml",
-      "images": "images.yml"
+      "images": "images.yml",
+      "ci_name": "CI",
+      "images_name": "Images"
     },
     "labels": {
       "workflow": "workflow",

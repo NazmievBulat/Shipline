@@ -91,9 +91,9 @@ def job_notes(job: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-# A CI job that runs in parts is named with its part by GitHub, "CI: server tests (1 of 2)", and with
-# its name alone when it was skipped (.github/workflows/ci.yml).
-_PART = re.compile(r"(CI: [^()]+) \((\d+) of (\d+)\)")
+# A CI job run in parts has a ` (k of n)` suffix, and its name alone when skipped.
+# Image jobs keep their existing, separate grouping.
+_PART = re.compile(r"(.+) \((\d+) of (\d+)\)")
 
 
 def checks(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -104,11 +104,18 @@ def checks(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     whole check, and a fix of a red main must pass every part, however the tests were dealt to
     the parts.
     """
-    from merge_gate import _PART
+    from merge_gate import CI_PREFIX, CONFIG, _PART
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for job in parts:
         matched = _PART.fullmatch(job.get("name", ""))
+        if matched and not (
+            matched[1].startswith(CI_PREFIX + ": ")
+            or matched[1] in (
+                CONFIG.checks.server_tests, CONFIG.checks.web, CONFIG.checks.older_version,
+            )
+        ):
+            matched = None
         grouped.setdefault(matched[1] if matched else job.get("name", ""), []).append(job)
     merged: list[dict[str, Any]] = []
     for name, group in grouped.items():
@@ -386,10 +393,10 @@ def server_tests_selected(parts: list[dict[str, Any]]) -> bool:
 
 def whole_server_tests(run: dict[str, Any], parts: list[dict[str, Any]], head: str) -> bool:
     """A green CI run that ran every server test on exactly this commit, run in parts or not."""
-    from merge_gate import CI_PLAN, NOTES, _planner_notes, checks, verdict
+    from merge_gate import CI_PLAN, CONFIG, NOTES, _planner_notes, checks, verdict
 
     if verdict(run, parts)[0] != "green" or not any(
-        job["name"] == "CI: server tests" and job.get("conclusion") == "success"
+        job["name"] == CONFIG.checks.server_tests and job.get("conclusion") == "success"
         for job in checks(parts)
     ):
         return False

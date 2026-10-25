@@ -13,10 +13,15 @@
       "run": "tools/shipline/browser-tests-for-changes",
       "form": "json",
       "field": "specs",
-      "args": ["--ci"]
+      "args": [
+        "--ci"
+      ]
     },
     "server_tests_for_changes": "tools/shipline/server-tests-for-changes",
-    "pre_train_checks": {"run": "tools/shipline/pre-train-checks", "form": "exit"},
+    "pre_train_checks": {
+      "run": "tools/shipline/pre-train-checks",
+      "form": "exit"
+    },
     "mechanical_conflicts": "tools/shipline/mechanical-conflicts",
     "browser_plan": "tools/shipline/browser-plan",
     "hunt_app": "tools/shipline/hunt-app",
@@ -33,7 +38,14 @@
     "images": "Images",
     "dependency_audit": "Build: dependencies",
     "advisory_annotation": "Advisory",
-    "prefix_only": ["images", "browser_whole", "server_whole"]
+    "prefix_only": [
+      "images",
+      "browser_whole",
+      "server_whole"
+    ],
+    "server_tests": "Build: server tests",
+    "web": "Build: web",
+    "older_version": "Build: older version on new tables"
   },
   "annotations": {
     "merge_tested": "Merge built",
@@ -45,7 +57,9 @@
   "workflows": {
     "ci": "build.yml",
     "e2e": "browser.yml",
-    "images": "images.yml"
+    "images": "images.yml",
+    "ci_name": "Build",
+    "images_name": "Images"
   },
   "labels": {
     "workflow": "shipline",
@@ -84,29 +98,51 @@
     "known": "tools/shipline/parity-known.txt"
   },
   "machines": [
-    {"name": "this machine"},
-    {"name": "runner-1", "address": "runner@runner-1.example"}
+    {
+      "name": "this machine"
+    },
+    {
+      "name": "runner-1",
+      "address": "runner@runner-1.example"
+    }
   ],
   "hunts": {
     "areas": {
-      "phone": ["/calls", "/contacts"],
-      "billing": ["/invoices", "/settings/billing"]
+      "phone": [
+        "/calls",
+        "/contacts"
+      ],
+      "billing": [
+        "/invoices",
+        "/settings/billing"
+      ]
     },
     "plans": "docs/hunt-plans.md"
   },
   "review": {
     "high_effort_paths": [
-      "^db/migrations/", "^db/schema\\.sql$", "^app/models/",
-      "^prompts/", "(^|/)AGENTS\\.md$", "\\.prompt\\.md$",
-      "^app/jobs/", "^app/queues/", "(^|/)locks?\\.py$",
-      "^app/auth/", "^app/permissions/", "^config/secrets"
+      "^db/migrations/",
+      "^db/schema\\.sql$",
+      "^app/models/",
+      "^prompts/",
+      "(^|/)AGENTS\\.md$",
+      "\\.prompt\\.md$",
+      "^app/jobs/",
+      "^app/queues/",
+      "(^|/)locks?\\.py$",
+      "^app/auth/",
+      "^app/permissions/",
+      "^config/secrets"
     ]
   },
   "merge_train": {
     "queued_limit_minutes": 20
   },
   "answer_for_owner_after_minutes": 15,
-  "hot_paths": ["src/example_app/models.py", "web/src/pages/**"],
+  "hot_paths": [
+    "src/example_app/models.py",
+    "web/src/pages/**"
+  ],
   "conflict_review": {
     "effort": "medium",
     "model": "sonnet",

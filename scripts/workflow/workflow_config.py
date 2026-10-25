@@ -50,6 +50,7 @@ FILE = "shipline.json"
 # take to read it.
 RUNNER_SETTINGS = ".github/runner/settings.sh"
 RUNNER_SETTINGS_SECONDS = 5
+DEFAULT_DEPENDENCY_JOB = "CI: dependencies"
 # The prefix names a systemd unit and, as `<prefix>-runner`, a user of at most 32 characters.
 _PREFIX = re.compile(r"[a-z](?:[a-z0-9-]{0,23}[a-z0-9])?")
 _LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
@@ -183,13 +184,20 @@ class Checks:
     dependency_audit: str | None = option('name', None, 'The dependency audit job name; omitted means CI: dependencies.', example='Build: dependencies', optional=True, position=4)
     e2e_plan: str = option('name', 'E2E: what to run', 'The browser suite planner check name.', example='Browser: what to run', shell=(6, 'E2E_PLAN'), position=2)
     images: str = option('name', 'Docker images', 'The prefix of image checks; its planner appends : what to run.', example='Images', shell=(7, 'IMAGES'), derived_shell=(8, 'IMAGES_PLAN', 'images_plan'), position=3)
+    older_version: str = option('job', 'CI: older version on new tables', 'The previous-version compatibility job name without its (k of n) shard suffix.', example='Build: older version on new tables', optional=True, position=9)
     prefix_only: list[str] = option('names', [], 'Distinct groups run only in merge prefixes: images, browser_whole and server_whole.', example=['images', 'browser_whole', 'server_whole'], optional=True, position=6)
+    server_tests: str = option('job', 'CI: server tests', 'The server tests job name without its (k of n) shard suffix.', example='Build: server tests', optional=True, position=7)
+    web: str = option('job', 'CI: web', 'The web suite job name without its (k of n) shard suffix.', example='Build: web', optional=True, position=8)
+
+    @property
+    def dependency_job(self) -> str:
+        return self.dependency_audit or DEFAULT_DEPENDENCY_JOB
 
     def groups(self) -> dict[str, CheckGroup]:
         return {
             "images": CheckGroup("images", (f"{self.images}:",)),
             "browser_whole": CheckGroup("e2e", ("playwright",), "browser_suite"),
-            "server_whole": CheckGroup("ci", ("CI: server tests",), "server_tests"),
+            "server_whole": CheckGroup("ci", (self.server_tests,), "server_tests"),
         }
 
     @property
@@ -209,8 +217,10 @@ class Annotations:
 @config_section
 class Workflows:
     ci: str = option('name', 'ci.yml', 'The CI workflow file under .github/workflows/.', example='build.yml', shell=(14, 'WORKFLOW_CI'), position=0)
+    ci_name: str = option('name', 'CI', 'The CI workflow run name used by the runner-minutes report.', example='Build', position=3)
     e2e: str = option('name', 'e2e.yml', 'The browser workflow file under .github/workflows/.', example='browser.yml', shell=(15, 'WORKFLOW_E2E'), position=1)
     images: str = option('name', 'images.yml', 'The image workflow file under .github/workflows/.', shell=(16, 'WORKFLOW_IMAGES'), position=2)
+    images_name: str = option('name', 'Images', 'The image workflow run name used by the runner-minutes report.', position=4)
 
 
 @config_section
@@ -774,6 +784,10 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
             value = given[key]
             if not isinstance(value, str) or not value.strip():
                 raise ConfigError(f"{FILE}: {name} must be a name, not {json.dumps(value)}")
+            if DECLARATIONS[name].kind == "job" and re.search(r" \(\d+ of \d+\)\Z", value):
+                raise ConfigError(
+                    f"{FILE}: {name} must name a job without its (k of n) shard suffix"
+                )
             merged[key] = value
     return merged
 
