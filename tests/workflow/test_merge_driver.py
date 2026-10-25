@@ -797,6 +797,136 @@ def test_a_hand_back_preserves_the_owners_two_send_back_limit(handed: GitHub) ->
     assert _started(workflow) == ["review-7"]
 
 
+def _wait_for_allowance(handed: GitHub) -> None:
+    handed.api["repos/example-org/example-app/pulls/7/reviews"] = [
+        {"body": f"<!-- workflow-review round={n} result={outcome} -->", "commit_id": handed.head}
+        for n, outcome in [(1, "sent-back"), (2, "sent-back"), (3, "passed")]
+    ]
+    handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    handed.save()
+
+
+def test_a_hand_back_and_its_allowance_wait_are_logged_once_across_three_ticks(
+    handed: GitHub,
+) -> None:
+    workflow = handed.workflow
+    _wait_for_allowance(handed)
+
+    first = workflow.run_script("tick")
+    # The checks recover, but the original hand-back still needs its reviewer.
+    handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "SUCCESS"
+    handed.save()
+    later = [workflow.run_script("tick") for _ in range(2)]
+
+    assert all(done.returncode == 0 for done in [first, *later]), first.stdout + first.stderr
+    assert first.stdout.count("merge hand-back 7:") == 1
+    assert "hand-back 7 waits: the owner's allowance for round 4\n" in first.stdout
+    for done in later:
+        assert "merge hand-back 7:" not in done.stdout
+        assert "hand-back 7 waits:" not in done.stdout
+    assert _started(workflow) == []
+    assert (_folder(workflow) / "merge-review-7").exists()
+    assert not (workflow.state / "merged").exists()
+
+
+@pytest.mark.parametrize("remaining", ["handoff", "refresh", "head", "approval", "repair"])
+def test_an_interrupted_revocation_logs_only_when_it_completes_work(
+    handed: GitHub, remaining: str,
+) -> None:
+    workflow = handed.workflow
+    _wait_for_allowance(handed)
+    folder = _folder(workflow)
+    (folder / "merge-review-7").write_text(
+        json.dumps({"reason": "failed checks", "event": "a" * 32})
+    )
+    if remaining != "handoff":
+        _note(workflow).unlink()
+    train_path = folder / "merge-train.json"
+    train = json.loads(train_path.read_text())
+    train["approved"].pop("7", None)
+    if remaining in ("approval", "repair"):
+        train["approved" if remaining == "approval" else "repairing"] = {"7": handed.head}
+    train_path.write_text(json.dumps(train))
+    residue = {
+        "refresh": folder / "merge-refresh-7.json",
+        "head": folder / "review-7.head",
+    }.get(remaining)
+    if residue is not None:
+        residue.write_text("{}" if remaining == "refresh" else handed.head)
+
+    first = workflow.run_script("tick")
+    second = workflow.run_script("tick")
+
+    assert first.returncode == second.returncode == 0, first.stdout + first.stderr
+    assert first.stdout.count("merge hand-back 7: failed checks\n") == 1
+    assert "merge hand-back 7:" not in second.stdout
+    assert not _note(workflow).exists()
+    assert residue is None or not residue.exists()
+    train = json.loads(train_path.read_text())
+    assert "7" not in train["approved"]
+    assert "7" not in train["repairing"]
+    assert _started(workflow) == []
+
+
+@pytest.mark.parametrize("shortage", ["memory", "load"])
+def test_a_hand_back_logs_a_changed_wait_cause_once(handed: GitHub, shortage: str) -> None:
+    workflow = handed.workflow
+    _wait_for_allowance(handed)
+    first = workflow.run_script("tick")
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "hand-back 7 waits: the owner's allowance for round 4\n" in first.stdout
+    (_folder(workflow) / "review-7.allow-round").write_text("4\n")
+    if shortage == "memory":
+        workflow.pressure_file.write_text("some avg60=11.00\n")
+        cause = "memory is short"
+    else:
+        workflow.loadavg_file.write_text("1.00 9.00 1.00 1/100 1234\n")
+        cause = "the processors are overloaded"
+    workflow.fake("sleep", '#!/bin/bash\necho "sleep $*" >> "@STATE@/calls.log"\nexit 91\n')
+
+    second = workflow.run_script("tick")
+    if shortage == "load":
+        workflow.loadavg_file.write_text("1.00 10.00 1.00 1/100 1234\n")
+    third = workflow.run_script("tick")
+
+    assert second.returncode == third.returncode == 0, second.stdout + second.stderr
+    assert f"hand-back 7 waits: {cause}\n" in second.stdout
+    assert "hand-back 7 waits:" not in third.stdout
+    assert "merge hand-back 7:" not in second.stdout + third.stdout
+    assert cause not in third.stdout
+    assert workflow.calls("sleep") == []
+    assert _started(workflow) == []
+
+    workflow.pressure_file.write_text("some avg60=0.00\n")
+    workflow.loadavg_file.write_text("0.40 0.40 0.40 1/100 1234\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _started(workflow) == ["review-7"]
+    assert not (_folder(workflow) / "merge-review-7").exists()
+
+
+def test_a_hand_back_waiting_behind_another_start_logs_its_turn_once(handed: GitHub) -> None:
+    workflow = handed.workflow
+    handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    handed.save()
+    workflow.add_pull_request(8, labels=("workflow", "priority:+high"))
+    workflow.pressure_file.write_text("some avg60=11.00\n")
+    workflow.fake("sleep", '#!/bin/bash\necho "sleep $*" >> "@STATE@/calls.log"\nexit 91\n')
+
+    first = workflow.run_script("tick")
+    second = workflow.run_script("tick")
+
+    assert first.returncode == second.returncode == 0, first.stdout + first.stderr
+    assert "hand-back 7 waits: its turn in the order of starts\n" in first.stdout
+    assert "hand-back 7 waits:" not in second.stdout
+    assert "merge hand-back 7:" not in second.stdout
+    assert _started(workflow) == []
+    workflow.pressure_file.write_text("some avg60=0.00\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _started(workflow) == ["ticket-8", "review-7"]
+
+
 def test_the_gate_itself_refuses_a_changed_handoff_head(handed: GitHub) -> None:
     workflow = handed.workflow
     # Simulate a push after the driver's preflight, before it acquires merge.lock.
