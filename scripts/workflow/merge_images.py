@@ -1,5 +1,6 @@
 """Image runs and workflow path selection."""
 
+import heapq
 import json
 import re
 import sys
@@ -221,6 +222,7 @@ def main_image_source(base: str) -> dict[str, Any] | None:
         except (Refused, KeyError, TypeError, ValueError, StopIteration):
             return None, True
 
+    blocked_run = 0
     receipt = inherited_green(base)
     if receipt and receipt.get("images_complete") is True:
         source = receipt.get("images_source")
@@ -233,32 +235,37 @@ def main_image_source(base: str) -> dict[str, Any] | None:
             found = image_source_runs(source)
             if found:
                 resolved, blocked = resolve(found[0])
-                if resolved or blocked:
+                if resolved:
                     return resolved
+                if blocked:
+                    # A new main run can replace a lost source. An older success cannot.
+                    blocked_run = found[0]["id"]
     # Keep health's push-only selection unchanged. Proof discovery also reads scheduled
     # full runs and goes past skipped neutral pushes, including on older pages.
     own = runs("images", base)[:1] + runs("images", base, scheduled=True)[:1]
     recent = MainImages(include_scheduled=True)
     seen: set[int] = set()
-    for group in (sorted(own, key=lambda run: run["id"], reverse=True), recent):
-        for run in group:
-            if run["id"] in seen:
+    for run in heapq.merge(sorted(own, key=lambda run: run["id"], reverse=True), recent,
+                           key=lambda run: run["id"], reverse=True):
+        if run["id"] in seen:
+            continue
+        seen.add(run["id"])
+        if run["head_sha"] != base and run["id"] <= blocked_run:
+            continue
+        try:
+            if image_difference(head_tree(run), base)[1]:
                 continue
-            seen.add(run["id"])
-            try:
-                if image_difference(head_tree(run), base)[1]:
-                    continue
-                if run["event"] != "schedule" and command(
-                    "git", "merge-base", "--is-ancestor", run["head_sha"], base, check=False,
-                ).returncode:
-                    continue
-            except Waiting:
-                raise
-            except (Refused, KeyError, TypeError, ValueError):
-                return None
-            resolved, blocked = resolve(run)
-            if resolved or blocked:
-                return resolved
+            if run["event"] != "schedule" and command(
+                "git", "merge-base", "--is-ancestor", run["head_sha"], base, check=False,
+            ).returncode:
+                continue
+        except Waiting:
+            raise
+        except (Refused, KeyError, TypeError, ValueError):
+            return None
+        resolved, blocked = resolve(run)
+        if resolved or blocked:
+            return resolved
     return None
 
 
