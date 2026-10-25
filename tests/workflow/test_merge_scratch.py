@@ -769,6 +769,36 @@ def test_neutral_prefix_after_an_untested_image_change_runs_images(github: GitHu
     assert len(github.workflow.calls("gh workflow run images.yml")) == 1
 
 
+def test_a_prefix_can_introduce_the_image_workflow_before_main_has_it(github: GitHub) -> None:
+    workflow = github.workflow
+    path = ".github/workflows/images.yml"
+    images = workflow.repo / path
+    definition = images.read_text()
+    workflow.git("checkout", "main")
+    images.unlink()
+    workflow.git("add", path)
+    workflow.git("commit", "-m", "chore: start without an image workflow")
+    workflow.git("push", "origin", "main")
+    github.base = workflow.git("rev-parse", "HEAD")
+    github.main()
+    workflow.git("checkout", "ticket/seven")
+    workflow.git("merge", "--no-edit", "main")
+    images.write_text(definition)
+    workflow.git("add", path)
+    workflow.git("commit", "-m", "ci: introduce the image workflow")
+    _batch_setup(github, count=2)
+    github.api[f"{_REPO}/actions/workflows/images.yml/runs?branch=main&per_page=100&page=1"] = {"workflow_runs": []}
+
+    done = _batch_call(github)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert not github.workflow.calls("gh workflow run images.yml")
+    _finish_batch(github)
+    done = _batch_call(github)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8"]
+    assert workflow.git("show", f"origin/main:{path}") == definition.strip()
+
+
 def test_a_neutral_prefix_without_any_main_image_result_runs_its_own(github: GitHub) -> None:
     _batch_setup(github)
     github.api[f"{_REPO}/actions/workflows/images.yml/runs?branch=main&per_page=100&page=1"] = {"workflow_runs": []}
