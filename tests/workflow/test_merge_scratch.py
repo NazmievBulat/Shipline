@@ -953,6 +953,54 @@ def test_a_neutral_own_check_merge_carries_mains_last_image_source(github: GitHu
     assert _receipt(github)["images_run"] == 8_000_060
 
 
+def test_main_follows_its_squash_image_proof_after_losing_the_receipt(github: GitHub) -> None:
+    _batch_setup(github, images=True)
+    assert _batch_call(github).returncode == 3
+    _finish_prefix(github, "7")
+    assert _batch_call(github).returncode == 0
+    assert _merges(github) == ["7"]
+    folder = github.workflow.repo / ".local/workflow"
+    (folder / "main-tree-green.json").unlink()
+    github.base = github.workflow.git("rev-parse", "origin/main")
+    github.main()
+    _main_image_run(github, 8_000_070, github.base)
+    github.api[f"{_REPO}/actions/runs/8000070/jobs?per_page=100"]["jobs"][1].update(
+        name="Docker images: image tests", conclusion="skipped",
+    )
+    github.api[f"{_REPO}/check-runs/8000071/annotations?per_page=100"] = [
+        {"title": "Files tested", "message": github.workflow.git("rev-parse", f"{github.base}^{{tree}}")},
+    ]
+    state = _batch_state(github)
+    state["prefixes"] = None
+    (folder / "merge-train.json").write_text(json.dumps(state))
+    assert _batch_call(github, "8").returncode == 3
+    _finish_batch(github, run_id=4100)
+    done = _batch_call(github, "8")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _merges(github) == ["7", "8", "9"]
+    assert _receipt(github)["images_run"] == 110
+    assert len(github.workflow.calls("gh workflow run images.yml")) == 1
+
+
+@pytest.mark.parametrize("broken", ["cycle", "workflow", "fork", "tree"])
+def test_an_invalid_main_image_chain_cannot_supply_a_proof(github: GitHub, broken: str) -> None:
+    _batch_setup(github)
+    _skipped_main_image_push(github, 8_000_070,
+                            8_000_070 if broken == "cycle" else 8_000_060)
+    source = github.api[f"{_REPO}/actions/runs/8000060"]
+    if broken == "workflow":
+        source["path"] = ".github/workflows/ci.yml"
+    elif broken == "fork":
+        source["head_repository"] = {"full_name": "example-fork/example-app"}
+    elif broken == "tree":
+        github.api[f"{_REPO}/check-runs/8000061/annotations?per_page=100"][0]["message"] = "0" * 40
+    assert _batch_call(github).returncode == 3
+    _finish_batch(github)
+    done = _batch_call(github)
+    assert done.returncode in (1, 3), done.stdout + done.stderr
+    assert not _merges(github)
+
+
 def test_a_neutral_prefix_without_any_main_image_result_waits_for_main(github: GitHub) -> None:
     _batch_setup(github)
     github.api[f"{_REPO}/actions/workflows/images.yml/runs?branch=main&per_page=100&page=1"] = {"workflow_runs": []}

@@ -1427,6 +1427,8 @@ def _finish_prefix(
                     "head_sha": scratch["head"],
                     "head_branch": scratch["branch"],
                     "event": "workflow_dispatch",
+                    "path": f".github/workflows/{workflow}.yml",
+                    "head_repository": {"full_name": "example-org/example-app"},
                     "status": "completed",
                     "conclusion": conclusion,
                 }
