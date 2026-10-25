@@ -351,10 +351,17 @@ settings), so that the shadow tick finds the same sessions and settings:
 
 and starts it with `systemctl --user enable --now shipline-shadow.timer`. After the run:
 
-    journalctl --user -u workflow-tick.service -o short-unix --since <start> >tick.journal
+    {
+      journalctl --user -t tick -o short-unix --since <start>
+      journalctl --user -u workflow-tick.service -o short-unix --since <start>
+    } | LC_ALL=C sort -n | uniq >tick.journal
     tools/compare-shadow --shadow <checkout>/.local/shipline/shadow.log \
       --wake ~/.local/state/workflow/wake.log --journal tick.journal
 
 lists every decision the two took differently, with both versions, and exits 0 when none
-differs. A decision that came due in the seconds between the two ticks' clocks is a timing
+differs. The identifier export keeps child messages recorded without unit fields; the unit
+export keeps systemd's start and finish lines, which anchor those messages to their tick.
+Both exports must cover the same time window. Sorting and then `uniq` removes exact duplicate
+lines while keeping distinct messages with the same timestamp (`sort -n -u` would drop them).
+A decision that came due in the seconds between the two ticks' clocks is a timing
 difference, counted on its last line and listed with `--timing`.
