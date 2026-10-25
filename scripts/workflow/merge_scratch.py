@@ -651,7 +651,9 @@ def _prefix_scratch(
     workflows = ["ci"]
     source = None
     path = f".github/workflows/{WORKFLOW_FILES['images']}"
-    if git("ls-tree", "--name-only", commit, "--", path):
+    # A prefix may introduce or remove the workflow; dispatch only an available definition.
+    if (git("ls-tree", "--name-only", base, "--", path)
+            and git("ls-tree", "--name-only", commit, "--", path)):
         if not image_difference(under, commit)[1]:
             source = image_source or main_image_source(base)
             if source:

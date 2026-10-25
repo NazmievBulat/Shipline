@@ -164,13 +164,19 @@ def main_image_source(base: str) -> dict[str, Any] | None:
             return []
 
     receipt = inherited_green(base)
-    if receipt and receipt.get("images_complete") and receipt.get("images_source"):
-        source = receipt["images_source"]
-        found = image_source_runs(source)
-        parts = parts_for(found[0]) if found else []
-        if (found and workflow_verdict("images", found[0], parts)[0] == "green"
-                and complete_image_jobs(parts, allow_skipped=True)):
-            return source
+    if receipt and receipt.get("images_complete") is True:
+        source = receipt.get("images_source")
+        if not source:
+            run_id = receipt.get("images_run")
+            if type(run_id) is int and run_id > 0:
+                # Older receipts proved images on exactly the recorded main tree.
+                source = {"run": {"id": run_id}, "tree": receipt["tree"]}
+        if source:
+            found = image_source_runs(source)
+            parts = parts_for(found[0]) if found else []
+            if (found and workflow_verdict("images", found[0], parts)[0] == "green"
+                    and complete_image_jobs(parts, allow_skipped=True)):
+                return source
     for run in main_image_runs(base, MainImages()):
         parts = parts_for(run)
         if workflow_verdict("images", run, parts)[0] != "green" or not complete_image_jobs(parts, allow_skipped=True):
