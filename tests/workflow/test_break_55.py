@@ -100,9 +100,10 @@ SHAPES = pytest.mark.parametrize(
 
 
 def _finish_images(github: GitHub, scratch: dict[str, Any]) -> None:
-    github.api[_runs_key(scratch, "images")]["workflow_runs"][0].update(
-        status="completed", conclusion="success"
-    )
+    run = github.api[_runs_key(scratch, "images")]["workflow_runs"][0]
+    run.update(status="completed", conclusion="success")
+    # The harness serializes API responses between calls; both reads name this attempt.
+    github.api[f"{_REPO}/actions/runs/{run['id']}"] = dict(run)
 
 
 def _tick_round(github: GitHub) -> list[Any]:
