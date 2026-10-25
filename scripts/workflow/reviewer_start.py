@@ -1,6 +1,7 @@
 """Start reviewers without losing local work or repeating an unchanged refusal."""
 
 import json
+import re
 import sys
 import uuid
 from collections.abc import Callable
@@ -159,12 +160,15 @@ def start(
         else:
             reason = (done.stderr or done.stdout).strip()
             # Setup can print before the resource check. Its progress is not a wait cause.
-            deferred = "; the next tick tries this start again"
+            deferred = re.compile(
+                r".*(memory is short|the processors are overloaded:.*)"
+                r"; the next tick tries this start again"
+            )
             reason = next(
                 (
-                    line.removesuffix(deferred)
+                    match[1]
                     for line in reversed(reason.splitlines())
-                    if line.endswith(deferred)
+                    if (match := deferred.fullmatch(line))
                 ),
                 " ".join(reason.split()),
             )

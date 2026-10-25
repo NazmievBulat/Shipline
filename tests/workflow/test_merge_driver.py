@@ -891,7 +891,7 @@ def test_a_hand_back_logs_a_changed_wait_cause_once(
 
     second = workflow.run_script("tick")
     if noisy_setup:
-        workflow.fake("worktree-setup", '#!/bin/bash\necho "setup progress 2"\n')
+        workflow.fake("worktree-setup", '#!/bin/bash\nprintf "setup progress 2"\n')
     if shortage == "load":
         workflow.loadavg_file.write_text("1.00 10.00 1.00 1/100 1234\n")
     third = workflow.run_script("tick")
