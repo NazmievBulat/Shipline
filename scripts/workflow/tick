@@ -486,7 +486,7 @@ shadow_session() {
     # The worktrees of finished work stay: removing them decides nothing the real tick logs.
     cleanup) [[ ${2:-} == hunts ]] || shadow_cleanup ;;
     # The tick itself logs each message it would have typed, in the wake log's words.
-    checks-finished | conflict-found | lost-check | batch-merged | status-check | finish-ready) ;;
+    checks-finished | conflict-found | lost-check | batch-merged | panel-finished | status-check | finish-ready) ;;
     # A nudge goes as `session nudge-busy` would send it, pressing nothing: it presses nothing
     # either in the states it checks (exit 3).
     nudge-busy) bash "$here/session" would-nudge "${@:2}" 9>&- ;;
@@ -914,6 +914,53 @@ while read -r number head; do
   [[ -e $seen ]] || (umask 077; keep "$seen" "$conflicts_seen_at") || failed=1
 done <<<"$conflicts"
 
+# A resolver queues the pushed head and waits. Only this unsandboxed tick runs its panel.
+# Results and delivery receipts are separate: blocked input can retry delivery without
+# spending another panel, and a GitHub head that has not caught up records no result.
+while read -r name state _; do
+  [[ $name =~ ^review-([0-9]+)$ ]] || continue
+  number=${BASH_REMATCH[1]}
+  folder=$main/$SHIPLINE_STATE_FOLDER
+  request=$folder/$name.panel-request.json
+  [[ -e $request && -e $main/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER/$name.codex ]] || continue
+  panel_head=$(jq -er --arg number "$number" 'select(.number == $number and
+    (.full_review | type == "boolean")) | .head | select(test("^[0-9a-f]{40}$"))' "$request") || { failed=1; continue; }
+  [[ $(git -C "$main/.claude/worktrees/ticket-$number" rev-parse HEAD) == "$panel_head" ]] || continue
+  grep -qxF "$number false main" <<<"$pulls" || continue
+  if ((shadow)); then
+    shadow_note "$name conflict panel requested on $panel_head"
+    continue
+  fi
+  result_note=$folder/$name.panel-result-$panel_head
+  if [[ ! -r $result_note ]]; then
+    # The runner keeps its own per-head lock. A long panel holds no tick or decide lock,
+    # and later ticks can service other conflicts while its reviewers run.
+    (umask 077
+      setsid python3 -B "$here/conflict_review.py" run-panel "$folder" "$number" "$panel_head" \
+        </dev/null >>"$folder/$name.panel-log-$panel_head" 2>&1 9>&- 8>&- 7>&- &
+    )
+    continue
+  fi
+  result=$(cat "$result_note") || { failed=1; continue; }
+  if [[ $result == 2 ]]; then
+    # The scope refusal is for this kept head; normal starts below now select Claude.
+    session stop "$name" || failed=1
+    continue
+  fi
+  if [[ $result != 0 && ! -e $folder/$name.panel-failed-$panel_head ]]; then
+    echo "$name panel failed on $panel_head; no conflict round may be published" >&2
+    wake_log "$name panel failed on $panel_head; no conflict round may be published" || failed=1
+    keep "$folder/$name.panel-failed-$panel_head" "$panel_head" || failed=1
+    failed=1
+  fi
+  [[ ! -e $folder/$name.panel-woken-$panel_head ]] || continue
+  if delivery=$(session panel-finished "$name" "$panel_head" 2>&1); then
+    keep "$folder/$name.panel-woken-$panel_head" "$panel_head" || failed=1
+    wake_log "$name panel reports ready on $panel_head; resolver nudged" || failed=1
+  fi
+done <<<"$running"
+
+running=$(session list) || failed=1
 while read -r name state _; do
   # Codex's latest turn is authoritative even if its bridge never ran the Stop hook.
   if [[ $name =~ ^(ticket|review)- && -e $main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name.codex ]]; then

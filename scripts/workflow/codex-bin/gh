@@ -34,6 +34,8 @@ if [[ $WORKFLOW_SESSION == review-* ]]; then
         ! -e $folder/review-$number.usual-reviewer ]]; then
     extended=$(jq -er .head "$folder/review-$number.conflict.json") || refuse
     [[ $(python3 -B "$(dirname "${BASH_SOURCE[0]}")/../conflict_review.py" program "$folder" "$number") == codex* ]] || refuse
+    python3 -B "$(dirname "${BASH_SOURCE[0]}")/../conflict_review.py" panel-complete \
+      "$folder" "$number" "$(git rev-parse HEAD)" || refuse
     jq -e --arg head "$(git rev-parse HEAD)" --arg extended "$extended" '
       keys == ["body", "commit_id", "event"] and .event == "COMMENT" and
       .commit_id == $head and (.body | type == "string") and

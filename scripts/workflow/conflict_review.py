@@ -4,6 +4,9 @@
     conflict_review.py reviewer <folder> <N>    its effort and model, `high opus` as usual
     conflict_review.py program <folder> <N>     its recorded program and explicit Codex model
     conflict_review.py full-review <folder> <N> <head>    keep this head with Claude
+    conflict_review.py request-panel <folder> <N> <full>    queue the kept head for the tick
+    conflict_review.py run-panel <folder> <N> <head>    the tick's detached runner
+    conflict_review.py panel-complete <folder> <N> <head>    require successful reports
     conflict_review.py panel <folder> <N> <root> <head>
 
 The reviewer is the one `conflict_review` of `shipline.json` names while the kept worktree holds
@@ -14,7 +17,9 @@ that grew past it to the usual reviewer (`review-N.usual-reviewer`, which keeps 
 the usual reviewer).
 """
 
+import fcntl
 import json
+import os
 import re
 import subprocess
 import sys
@@ -305,6 +310,86 @@ def full_review(folder: Path, number: str, head: str) -> None:
     (folder / f"review-{number}.usual-reviewer").write_text(head + "\n")
 
 
+def request_panel(folder: Path, number: str, full: bool) -> None:
+    """Queue the kept resolution for the tick, which runs outside the resolver sandbox."""
+    if not number.isdecimal() or not program(folder, number).startswith("codex"):
+        raise ValueError("only a Codex conflict resolver can request this panel")
+    root = _worktree(folder, number)
+    head = _git(root, "rev-parse", "HEAD").strip()
+    scope = None if full else Scope.read(folder, number)
+    if not _SHA.fullmatch(head) or (not full and (scope is None or head == scope.head)):
+        raise ValueError("commit and push the resolution before requesting its panel")
+    if _git(root, "status", "--porcelain", "--untracked-files=no").strip():
+        raise ValueError("the kept resolution must be clean before requesting its panel")
+    path = folder / f"review-{number}.panel-request.json"
+    request = {"number": number, "head": head, "full_review": full}
+    try:
+        previous = json.loads(path.read_text())
+    except (OSError, ValueError):
+        previous = None
+    write_json(path, request)
+    if previous != request:
+        # A later explicit full-review request supersedes an earlier completed panel.
+        for suffix in ("panel-result", "panel-woken"):
+            (folder / f"review-{number}.{suffix}-{head}").unlink(missing_ok=True)
+
+
+def panel_complete(folder: Path, number: str, head: str) -> bool:
+    """A success receipt and finished reviewer reports for exactly this resolution."""
+    if not number.isdecimal() or not _SHA.fullmatch(head):
+        return False
+    root = folder / "reviews" / number / head
+    try:
+        request = folder / f"review-{number}.panel-request.json"
+        if request.exists():
+            pending = json.loads(request.read_text())
+            if pending.get("head") == head and pending.get("full_review") is True:
+                return False
+        return (root / "panel.complete").read_text().strip() == head and all(
+            not (root / f"{who}.md.pending").exists()
+            and (root / f"{who}.md").read_text().splitlines()[-1:] == ["exit 0"]
+            for who in ("claude", "cursor")
+        )
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def run_panel(folder: Path, number: str, head: str) -> None:
+    """Run detached from the tick, once per request, without retaining any tick locks."""
+    if not number.isdecimal() or not _SHA.fullmatch(head):
+        raise ValueError("invalid queued conflict panel")
+    result = folder / f"review-{number}.panel-result-{head}"
+    request_path = folder / f"review-{number}.panel-request.json"
+    with (folder / f"review-{number}.panel-run-{head}.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        if result.exists():
+            return
+        request = json.loads(request_path.read_text())
+        if request.get("number") != number or request.get("head") != head:
+            return
+        if _git(_worktree(folder, number), "rev-parse", "HEAD").strip() != head:
+            return
+        command = ["bash", str(Path(__file__).with_name("review-panel")), number, "--head", head]
+        if request.get("full_review") is True:
+            command.append("--full-review")
+        env = {key: value for key, value in os.environ.items() if key not in {
+            "WORKFLOW_SESSION", "WORKFLOW_CODEX_BRIDGE", "WORKFLOW_TRAIN_TICK",
+            "WORKFLOW_SESSION_SNAPSHOT",
+        }}
+        try:
+            status = subprocess.run(command, env=env, timeout=1900, check=False).returncode
+        except subprocess.TimeoutExpired:
+            status = 1
+        if status == 3 or (status == 0 and not panel_complete(folder, number, head)):
+            return  # GitHub is late, or a surviving reviewer still holds its report lock.
+        # A new explicit full-review request cannot be overwritten by an older panel.
+        if json.loads(request_path.read_text()) == request:
+            write_json(result, status)
+
+
 def sentence(folder: Path, number: str) -> str:
     try:
         scope = Scope.read(folder, number)
@@ -377,6 +462,12 @@ def main() -> None:
         sys.stdout.write(program(folder, number) + "\n")
     elif action == "full-review":
         full_review(folder, number, sys.argv[4])
+    elif action == "request-panel":
+        request_panel(folder, number, sys.argv[4] == "true")
+    elif action == "panel-complete":
+        sys.exit(0 if panel_complete(folder, number, sys.argv[4]) else 1)
+    elif action == "run-panel":
+        run_panel(folder, number, sys.argv[4])
     elif action == "panel":
         root = Path(sys.argv[4])
         head = sys.argv[5]

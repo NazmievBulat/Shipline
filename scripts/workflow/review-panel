@@ -12,7 +12,7 @@ run_one() {
     claude)
       printf '{"mcpServers":{}}\n' >"$runtime/mcp.json"
       tool=(claude -p --model opus --effort high --setting-sources "" --strict-mcp-config
-        --mcp-config "$runtime/mcp.json" --tools Read,Grep,Glob "$prompt") ;;
+        --mcp-config="$runtime/mcp.json" --tools=Read,Grep,Glob "$prompt") ;;
     cursor) tool=(agent -p "$prompt" --mode ask --trust --output-format text) ;;
     codex) tool=(codex exec --sandbox read-only "$prompt") ;;
   esac
@@ -58,8 +58,18 @@ select_tests() {
 }
 
 number=${1:-}
-[[ $number =~ ^[0-9]+$ ]] || { echo "usage: review-panel N [cursor|codex ...]" >&2; exit 2; }
+[[ $number =~ ^[0-9]+$ ]] || { echo "usage: review-panel N [--request | --head SHA] [--full-review] [cursor|codex ...]" >&2; exit 2; }
 shift
+request=false
+expected_head=""
+if [[ ${1:-} == --request ]]; then
+  request=true
+  shift
+elif [[ ${1:-} == --head ]]; then
+  expected_head=${2:-}
+  [[ $expected_head =~ ^[0-9a-f]{40}$ ]] || exit 2
+  shift 2
+fi
 full_review=false
 if [[ ${1:-} == --full-review ]]; then
   full_review=true
@@ -75,6 +85,12 @@ eval "$config"
 # The repository's main checkout, never the checkout these scripts are in.
 main=$SHIPLINE_REPO
 [[ -n $SHIPLINE_REPOSITORY ]] || { echo "cannot tell which repository to review in" >&2; exit 1; }
+if [[ $request == true ]]; then
+  [[ $# == 0 && ( -z ${WORKFLOW_SESSION:-} || $WORKFLOW_SESSION == review-$number ) ]] || exit 1
+  python3 -B "$here/conflict_review.py" request-panel "$main/$SHIPLINE_STATE_FOLDER" "$number" "$full_review" || exit 1
+  echo "panel $number requested; run notify waiting and end the turn until the tick returns its reports"
+  exit 0
+fi
 cd "$main" || exit 1
 task=$(gh pr view "$number" --json title,body,baseRefName,headRefOid) || exit 1
 head=$(jq -er .headRefOid <<<"$task") || exit 1
@@ -82,8 +98,21 @@ base=$(jq -er .baseRefName <<<"$task") || exit 1
 resolver=$(python3 -B "$here/conflict_review.py" program "$main/$SHIPLINE_STATE_FOLDER" "$number") || exit 1
 codex_resolved=false
 [[ $resolver != codex* ]] || codex_resolved=true
+local_head=""
+if [[ $codex_resolved == true ]]; then
+  [[ ${WORKFLOW_SESSION:-} != review-* ]] || {
+    echo 'Codex resolver: request the panel with --request; the tick runs it outside the sandbox.' >&2
+    exit 1
+  }
+  local_head=$(git -C "$main/.claude/worktrees/ticket-$number" rev-parse HEAD) || exit 1
+  expected_head=${expected_head:-$local_head}
+fi
+if [[ -n $expected_head && ( $head != "$expected_head" || ( -n $local_head && $local_head != "$expected_head" ) ) ]]; then
+  echo "panel $number waiting for the requested head" >&2
+  exit 3
+fi
 fallback() {
-  python3 -B "$here/conflict_review.py" full-review "$main/$SHIPLINE_STATE_FOLDER" "$number" "$head" || exit 1
+  python3 -B "$here/conflict_review.py" full-review "$main/$SHIPLINE_STATE_FOLDER" "$number" "${local_head:-$head}" || exit 1
   echo "Full review required: $1; end without a round, with review finished; the tick starts Claude." >&2
   exit 2
 }
@@ -102,7 +131,12 @@ root=$main/$SHIPLINE_STATE_FOLDER/reviews/$number/$head
 [[ $full_review == false ]] || root=$root/full-review
 mkdir -p "$root" || exit 1
 exec 9>"$root/panel.lock"
-flock --nonblock 9 || { echo "panel $number already running: $root"; exit 0; }
+flock --nonblock 9 || {
+  echo "panel $number already running: $root"
+  [[ $codex_resolved == false ]] || exit 3
+  exit 0
+}
+[[ $codex_resolved == false ]] || rm -f "$root/panel.complete"
 git fetch --quiet origin "$head" "$base" main || exit 1
 if ! bash "$here/weaker-tests" --base "origin/$base" --head "$head" >"$root/weaker-tests.md.pending"; then
   rm -f "$root/weaker-tests.md.pending"
@@ -149,6 +183,7 @@ if [[ $full_review == false && -f $main/$SHIPLINE_STATE_FOLDER/review-$number.co
   git worktree remove --force "$inputs" >/dev/null 2>&1 || exit 1
 fi
 pids=()
+pending_review=false
 for who in "${reviewers[@]}"; do
   report=$root/$who.md
   # The reviewer inherits this lock and its own processes keep it, even when a panel that
@@ -156,6 +191,7 @@ for who in "${reviewers[@]}"; do
   exec 8>"$report.lock"
   if ! flock --nonblock 8; then
     echo "$who review of $head still running"
+    pending_review=true
     continue
   fi
   # A completed report for this exact head can be reused. Checked under the lock, since a
@@ -208,6 +244,18 @@ for who in "${reviewers[@]}"; do
 done
 exec 8>&-
 for pid in "${pids[@]}"; do wait "$pid" || true; done
+if [[ $codex_resolved == true ]]; then
+  [[ $pending_review == false ]] || exit 3
+  for who in claude cursor; do
+    if [[ ! -f $root/$who.md || -e $root/$who.md.pending ]] ||
+        [[ $(tail -n 1 "$root/$who.md") != 'exit 0' ]]; then
+      echo "panel failed: $who did not complete successfully for $head" >&2
+      exit 1
+    fi
+  done
+  printf '%s\n' "$head" >"$root/panel.complete.pending" &&
+    mv "$root/panel.complete.pending" "$root/panel.complete" || exit 1
+fi
 completed="cursor.md and codex.md"
 [[ $codex_resolved == false ]] || completed="claude.md and cursor.md"
 echo "panel $number reports: $root (read task-history.md, task-changes.md, weaker-tests.md and completed $completed files only)"

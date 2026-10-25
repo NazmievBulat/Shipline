@@ -1,5 +1,6 @@
 """A conflict round reuses only proved review evidence, through the real workflow scripts."""
 
+import fcntl
 import json
 import os
 import shlex
@@ -768,8 +769,8 @@ config="" tools=""
 while (($#)); do
   case $1 in
     --strict-mcp-config) strict=true ;;
-    --mcp-config) shift; config=$1 ;;
-    --tools) shift; tools=$1 ;;
+    --mcp-config=*) config=${1#--mcp-config=} ;;
+    --tools=*) tools=${1#--tools=} ;;
   esac
   shift
 done
@@ -1246,6 +1247,18 @@ def test_a_reviewer_the_gate_sent_to_the_usual_one_is_stopped_without_a_rule_bre
     assert not (folder / "review-7.usual-reviewer").exists()
 
 
+
+def _panel_reviewer(workflow: Workflow, tool: str, body: str) -> None:
+    if tool == "claude":
+        base = workflow.bin / "claude-workflow"
+        if not base.exists():
+            workflow.fake("claude-workflow", (workflow.bin / "claude").read_text())
+        body = (
+            '#!/bin/bash\nif [[ " $* " != *" --strict-mcp-config "* ]]; then\n'
+            f'  exec {shlex.quote(str(base))} "$@"\nfi\n' + body
+        )
+    workflow.fake(tool, body)
+
 def _requested_panel(workflow: Workflow) -> str:
     _panel_conflict(workflow)
     _program(workflow)
@@ -1254,7 +1267,7 @@ def _requested_panel(workflow: Workflow) -> str:
     head = _resolve(workflow)
     workflow.set_pull_request(7, "OPEN", head)
     for tool in ("agent", "claude"):
-        workflow.fake(tool, '#!/bin/bash\necho "@TOOL@ report"\n')
+        _panel_reviewer(workflow, tool, '#!/bin/bash\necho "@TOOL@ report"\n')
     # The existing bridge wait contract, with a panel wait as the current completed turn.
     workflow.run_script("notify", "waiting", env={"WORKFLOW_SESSION": "review-7"})
     workflow.run_script(
@@ -1276,12 +1289,24 @@ def _requested_panel(workflow: Workflow) -> str:
     return head
 
 
+def _finish_requested_panel(workflow: Workflow, head: str) -> subprocess.CompletedProcess[str]:
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    result = _folder(workflow) / f"review-7.panel-result-{head}"
+    deadline = time.monotonic() + 30
+    while not result.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert result.exists(), (_folder(workflow) / f"review-7.panel-log-{head}").read_text()
+    return workflow.run_script("tick")
+
+
 def test_tick_runs_requested_panel_outside_resolver_and_wakes_once(workflow: Workflow) -> None:
     head = _requested_panel(workflow)
-    workflow.fake("claude", '#!/bin/bash\n[[ -z ${WORKFLOW_SESSION:-} ]] || exit 91\necho "Claude report"\n')
-    for _ in range(2):
-        done = workflow.run_script("tick")
-        assert done.returncode == 0, done.stdout + done.stderr
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\n[[ -z ${WORKFLOW_SESSION:-} ]] || exit 91\necho "Claude report"\n')
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
     reports = _folder(workflow) / "reviews/7" / head
     assert "Claude report" in (reports / "claude.md").read_text()
     assert (reports / "panel.complete").read_text().strip() == head
@@ -1289,7 +1314,7 @@ def test_tick_runs_requested_panel_outside_resolver_and_wakes_once(workflow: Wor
     assert (_folder(workflow) / f"review-7.panel-woken-{head}").exists()
 
 
-@pytest.mark.parametrize("failure", ["missing", "failed", "pending", "wrong head"])
+@pytest.mark.parametrize("failure", ["missing", "missing cursor", "failed", "pending", "wrong head", "full-request"])
 def test_codex_cannot_publish_without_successful_claude_panel(workflow: Workflow, failure: str) -> None:
     head, _ = _codex_conflict(workflow)
     assert workflow.run("start", "review", "7").returncode == 0
@@ -1297,10 +1322,16 @@ def test_codex_cannot_publish_without_successful_claude_panel(workflow: Workflow
     reports = _folder(workflow) / "reviews/7" / resolved
     reports.mkdir(parents=True)
     (reports / "panel.complete").write_text((head if failure == "wrong head" else resolved) + "\n")
+    if failure != "missing cursor":
+        (reports / "cursor.md").write_text("Cursor report\nexit 0\n")
     if failure != "missing":
         (reports / "claude.md").write_text("Claude report\nexit 1\n" if failure == "failed" else "Claude report\nexit 0\n")
     if failure == "pending":
         (reports / "claude.md.pending").write_text("still running")
+    if failure == "full-request":
+        (_folder(workflow) / "review-7.panel-request.json").write_text(json.dumps(
+            {"number": "7", "head": resolved, "full_review": True}
+        ))
     payload = workflow.worktree(7) / "round.json"
     payload.write_text(json.dumps({"event": "COMMENT", "commit_id": resolved, "body":
         f"<!-- workflow-review round=2 result=passed -->\n<!-- workflow-conflict extends={head} -->\n"}))
@@ -1314,10 +1345,11 @@ def test_codex_cannot_publish_without_successful_claude_panel(workflow: Workflow
     assert "allowed" not in done.stdout
 
 
-def test_failed_requested_panel_is_reported_and_not_completed(workflow: Workflow) -> None:
+@pytest.mark.parametrize("tool", ["claude", "agent"])
+def test_failed_requested_panel_is_reported_and_not_completed(workflow: Workflow, tool: str) -> None:
     head = _requested_panel(workflow)
-    workflow.fake("claude", '#!/bin/bash\necho "sandbox failed"\nexit 1\n')
-    done = workflow.run_script("tick")
+    _panel_reviewer(workflow, tool, '#!/bin/bash\necho "sandbox failed"\nexit 1\n')
+    done = _finish_requested_panel(workflow, head)
     assert done.returncode != 0
     assert "panel failed" in done.stdout + done.stderr
     assert not (_folder(workflow) / "reviews/7" / head / "panel.complete").exists()
@@ -1329,12 +1361,21 @@ def test_requested_panel_waits_for_github_head_then_falls_back_on_local_head(wor
     workflow.set_pull_request(7, "OPEN", scope["head"])
     done = workflow.run_script("tick")
     assert done.returncode == 0, done.stdout + done.stderr
+    log = _folder(workflow) / f"review-7.panel-log-{head}"
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if log.exists() and "waiting for the requested head" in log.read_text():
+            break
+        time.sleep(0.05)
+    assert "waiting for the requested head" in log.read_text()
+    with (_folder(workflow) / f"review-7.panel-run-{head}.lock").open("a") as runner:
+        fcntl.flock(runner, fcntl.LOCK_EX)
     assert not (_folder(workflow) / "review-7.usual-reviewer").exists()
     assert not (_folder(workflow) / "reviews/7" / head / "panel.complete").exists()
     assert not workflow.calls("tmux codex-7 send-keys")
     workflow.set_pull_request(7, "OPEN", head)
     (workflow.state / "reviews-7.json").write_text("[]")  # scope now requires a full review
-    done = workflow.run_script("tick")
+    done = _finish_requested_panel(workflow, head)
     assert done.returncode == 0, done.stdout + done.stderr
     assert (_folder(workflow) / "review-7.usual-reviewer").read_text().strip() == head
     assert not workflow.is_running("codex-7")
@@ -1352,7 +1393,7 @@ def test_codex_panel_argv_reaches_real_claude_parser(workflow: Workflow, tmp_pat
     head = _resolve(workflow)
     workflow.set_pull_request(7, "OPEN", head)
     workflow.fake("agent", '#!/bin/bash\necho Cursor report\n')
-    workflow.fake("claude", '#!/bin/bash\nprintf "%s\\0" "$@" > "@STATE@/claude-argv"\necho report\n')
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\nprintf "%s\\0" "$@" > "@STATE@/claude-argv"\necho report\n')
     done = workflow.run_script("review-panel", "7")
     assert done.returncode == 0, done.stdout + done.stderr
     argv = (workflow.state / "claude-argv").read_text().split("\0")[:-1]
@@ -1400,3 +1441,86 @@ def test_codex_panel_argv_reaches_real_claude_parser(workflow: Workflow, tmp_pat
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_panel_delivery_retries_without_running_reviewers_again(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\necho run >> "@STATE@/panel-runs"\necho report\n')
+    workflow.screen("› owner draft\n", "codex-7")
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (_folder(workflow) / "reviews/7" / head / "panel.complete").exists()
+    assert not (_folder(workflow) / f"review-7.panel-woken-{head}").exists()
+    workflow.screen("› \n", "codex-7")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "panel-runs").read_text().splitlines() == ["run"]
+    assert (_folder(workflow) / f"review-7.panel-woken-{head}").exists()
+
+
+def test_full_review_request_supersedes_completed_panel(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    assert _finish_requested_panel(workflow, head).returncode == 0
+    done = workflow.run_script("review-panel", "7", "--request", "--full-review",
+        cwd=workflow.worktree(7), env={"WORKFLOW_SESSION": "review-7"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (_folder(workflow) / "review-7.usual-reviewer").read_text().strip() == head
+    assert not workflow.is_running("codex-7")
+
+
+def test_resolver_must_request_panel_instead_of_nesting_sandboxes(workflow: Workflow) -> None:
+    _requested_panel(workflow)
+    done = workflow.run_script("review-panel", "7", cwd=workflow.worktree(7),
+        env={"WORKFLOW_SESSION": "review-7"})
+    assert done.returncode != 0
+    assert "--request" in done.stderr
+
+
+def test_pending_panel_holds_no_tick_lock_and_is_not_started_twice(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    _panel_reviewer(workflow, "claude", '#!/bin/bash\necho run >> "@STATE@/panel-runs"\nwhile [[ ! -e "@STATE@/release-panel" ]]; do /bin/sleep 0.05; done\necho report\n')
+    release = workflow.state / "release-panel"
+    try:
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        deadline = time.monotonic() + 20
+        while not (workflow.state / "panel-runs").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert (workflow.state / "panel-runs").exists()
+        assert not (_folder(workflow) / f"review-7.panel-result-{head}").exists()
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert (workflow.state / "panel-runs").read_text().splitlines() == ["run"]
+    finally:
+        release.touch()
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "panel-runs").read_text().splitlines() == ["run"]
+
+
+def test_partial_requested_panel_waits_for_a_surviving_report_lock(workflow: Workflow) -> None:
+    head = _requested_panel(workflow)
+    _panel_reviewer(workflow, "agent", '#!/bin/bash\necho run >> "@STATE@/cursor-runs"\necho report\n')
+    reports = _folder(workflow) / "reviews/7" / head
+    reports.mkdir(parents=True)
+    with (reports / "claude.md.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        log = _folder(workflow) / f"review-7.panel-log-{head}"
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if log.exists() and "still running" in log.read_text() and (reports / "cursor.md").exists():
+                break
+            time.sleep(0.05)
+        assert "still running" in log.read_text()
+        assert not (_folder(workflow) / f"review-7.panel-result-{head}").exists()
+        assert not (reports / "panel.complete").exists()
+    # Observe the first runner leaving before asking the next tick to retry it.
+    with (_folder(workflow) / f"review-7.panel-run-{head}.lock").open("a") as runner:
+        fcntl.flock(runner, fcntl.LOCK_EX)
+    done = _finish_requested_panel(workflow, head)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "cursor-runs").read_text().splitlines() == ["run"]

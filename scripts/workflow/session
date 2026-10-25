@@ -50,6 +50,7 @@
 #                               only for one that is stopped on the usage limit
 #   session checks-finished <review-N> <head>
 #   session conflict-found <review-N> <head>
+#   session panel-finished <review-N> <head>
 #   session lost-check <review-N> <head>
 #   session batch-merged <review-N> <squash>
 #                               wake a reviewer waiting for checks, preserving unsent input
@@ -175,6 +176,7 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session resend <ticket-N|audit-N|review-N>
        session checks-finished <review-N> <head>
        session conflict-found <review-N> <head>
+       session panel-finished <review-N> <head>
        session lost-check <review-N> <head>
        session batch-merged <review-N> <squash>
        session status-check <ticket-N|review-N>
@@ -2108,6 +2110,22 @@ case ${1:-} in
       cmd_checks_finished "$2" "$3" merged
     else
       cmd_checks_finished "$2" "$3"
+    fi
+    ;;
+  panel-finished)
+    [[ $# -eq 3 && $2 =~ ^review-[0-9]+$ && $3 =~ ^[0-9a-f]{40}$ ]] || usage
+    find_main_checkout
+    require_running "$2"
+    ! stopped_on_limit "$2" || die "$2 is stopped on the usage limit"
+    folder=$main/$SHIPLINE_STATE_FOLDER
+    result=$(cat "$folder/$2.panel-result-$3") || exit 1
+    [[ $(git -C "$(worktree_of "$2")" rev-parse HEAD) == "$3" ]] || die 'panel head changed'
+    if [[ $result == 0 ]]; then
+      python3 -B "$script_dir/conflict_review.py" panel-complete "$folder" "${2#review-}" "$3" ||
+        die 'panel reports are incomplete'
+      send_reviewer_update "$2" "The independent conflict panel on $3 has completed. Read the completed Claude and Cursor reports in $SHIPLINE_STATE_FOLDER/reviews/${2#review-}/$3, then publish only if they and the rules allow it. Hand off with merge-when-current --handoff ${2#review-} when all checks pass."
+    else
+      send_reviewer_update "$2" "The independent conflict panel on $3 failed. Read its reports in $SHIPLINE_STATE_FOLDER/reviews/${2#review-}/$3 and report the failure. Do not publish a conflict round."
     fi
     ;;
   status-check)
