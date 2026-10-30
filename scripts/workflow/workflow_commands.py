@@ -495,19 +495,30 @@ def repository_answer(args: list[str]) -> int:
             call = words[entry["_words"]:]
         if not pass_fail_command(name, call):
             return answer()
-        stdout, stderr = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            try:
-                code = answer()
-            except Exception as error:
-                prefix = "" if entry["form"] == "functions" else f"commands.{name}: "
-                print(f"{prefix}{error}", file=sys.stderr)
-                code = 1
-        sys.stdout.write(stdout.getvalue())
-        sys.stderr.write(stderr.getvalue())
-        if any(command_waits(entry, code, output) for output in (
-            stdout.getvalue(), stderr.getvalue(),
-        )):
+        if entry["form"] == "functions":
+            # A function can write through file descriptors or let subprocesses inherit
+            # them. Capture its interpreter, keeping real streams (and fileno) available.
+            # Only this parent classifies waits; the worker keeps the original answers.
+            worker = {key: value for key, value in entry.items() if key not in (
+                "wait_exit", "wait_output",
+            )}
+            done = _run(
+                sys.executable, __file__, "--repository-command", name, json.dumps(worker),
+                *words, errors="surrogateescape", timeout=None,
+            )
+            code, stdout, stderr = done.returncode, done.stdout, done.stderr
+        else:
+            captured_out, captured_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
+                try:
+                    code = answer()
+                except Exception as error:
+                    print(f"commands.{name}: {error}", file=sys.stderr)
+                    code = 1
+            stdout, stderr = captured_out.getvalue(), captured_err.getvalue()
+        sys.stdout.write(stdout)
+        sys.stderr.write(stderr)
+        if any(command_waits(entry, code, output) for output in (stdout, stderr)):
             return 75
         # With 75 removed from wait_exit, an actual 75 is an ordinary failure.
         return 1 if code == 75 else code
