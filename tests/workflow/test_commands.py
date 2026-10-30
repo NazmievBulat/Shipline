@@ -685,6 +685,47 @@ def test_function_helper_waits_can_match_an_exception(workflow: Workflow) -> Non
     assert "diagnostic: 0 try later" in done.stdout
 
 
+@pytest.mark.parametrize("output", ["stdout", "stderr", "explicit stderr", "descriptor"])
+@pytest.mark.parametrize("fails", [False, True], ids=["pass", "wait"])
+def test_function_waits_capture_child_and_descriptor_output(
+    workflow: Workflow, output: str, fails: bool,
+) -> None:
+    install_shipline(workflow)
+    if output == "descriptor":
+        diagnostic = 'os.write(2, b"try later\\n")'
+    else:
+        child = "import sys; print('try later'" + (", file=sys.stderr)" if output == "stderr" else ")")
+        redirect = ", stdout=sys.stderr" if output == "explicit stderr" else ""
+        diagnostic = f"subprocess.run([sys.executable, '-c', {child!r}]{redirect}, check=True)"
+    module = _module(workflow, f'''
+        import os
+        import subprocess
+        import sys
+
+        def resolve(head, base):
+            {diagnostic}
+            {"raise RuntimeError('resolve failed')" if fails else "return []"}
+
+        def renumber(head, base):
+            return {{}}
+
+        def taken(head, base):
+            return []
+    ''')
+    _configure(workflow, mechanical_conflicts={
+        "run": module, "form": "functions", "wait_output": "^try later$",
+        "functions": {"resolve": "resolve", "renumber": "renumber", "taken": "taken"},
+    })
+
+    done = workflow.shipline("mechanical-conflicts", "resolve", "example-head", "example-base")
+
+    assert done.returncode == (75 if fails else 0), done.stdout + done.stderr
+    assert done.stdout == ("try later\n" if output == "stdout" else "")
+    assert done.stderr == ("" if output == "stdout" else "try later\n") + (
+        "resolve failed\n" if fails else ""
+    )
+
+
 @pytest.mark.parametrize("mechanical", [False, True], ids=["renumber", "resolve"])
 @pytest.mark.parametrize("partial", ["none", "tracked", "untracked", "preexisting"])
 @pytest.mark.parametrize("subfolder", [False, True], ids=["root", "subfolder"])
