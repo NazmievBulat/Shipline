@@ -1769,6 +1769,9 @@ while read -r number draft base; do
   [[ $number =~ ^[0-9]+$ ]] || continue
   ! grep -qxF "$number" <<<"$unfinished" || continue
   if ((local_starts_held)); then
+    if ((shadow == 0)) && [[ -e $main/$SHIPLINE_STATE_FOLDER/merge-review-$number ]]; then
+      python3 -B "$here/merge_driver.py" --wait-hand-back "$number" 9>&- || failed=1
+    fi
     [[ $draft == true ]] && cloud_candidate "$number" || continue
   fi
   if [[ -e $main/$SHIPLINE_STATE_FOLDER/cloud-$number ]]; then
