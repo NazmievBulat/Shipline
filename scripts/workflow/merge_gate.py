@@ -625,10 +625,12 @@ def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> str |
             outcome = f"exit {done.returncode}: {first_line}"
             if done.returncode == 75:
                 if previous is None or previous["head"] != head:
-                    write_json(path, {"head": head, "outcome": outcome, "event": uuid.uuid4().hex})
+                    # Approval goes first: a batch reads it, not this record. A stop between
+                    # the two writes leaves an unapproved member, which a pass approves again.
                     train = Train(folder)
                     train.approved.pop(number, None)
                     train.save()
+                    write_json(path, {"head": head, "outcome": outcome, "event": uuid.uuid4().hex})
                     wait = f"pre-train checks of {number} wait: {first_line}"
                     print(wait, flush=True)
                     return wait

@@ -566,6 +566,40 @@ def test_a_passing_handoff_blocked_at_the_lock_preserves_a_newer_wait(
     assert not (workflow.state / "merged").exists()
 
 
+def test_a_gate_stopped_while_recording_a_wait_leaves_no_batch_approval(handed: GitHub) -> None:
+    # Reconciliation and a batch read the approval, not the wait record. A gate that stops
+    # between the two writes must leave the waiting member unapproved, never approved.
+    workflow = handed.workflow
+    _configure(workflow, pre_train_checks="example-checks")
+    workflow.fake("example-checks", '''#!/bin/bash
+        echo "try later"
+        exit 75
+    ''')
+    done = _gate(workflow, '''
+        folder = g.CONFIG.state()
+        train = g.Train(folder)
+        train.approved["7"] = g.git("rev-parse", "HEAD")
+        train.save()
+        original = g.write_json
+
+        def write_json(path, value):
+            original(path, value)
+            if path.name == "pre-train-wait-7.json":
+                raise SystemExit("stopped")
+
+        g.write_json = write_json
+        try:
+            g.pre_train_checks("7", folder, locked=False)
+        except SystemExit:
+            pass
+    ''', workflow.worktree(7))
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    folder = workflow.repo / ".local/workflow"
+    assert (folder / "pre-train-wait-7.json").exists()
+    assert "7" not in json.loads((folder / "merge-train.json").read_text())["approved"]
+
+
 @pytest.mark.parametrize("key,value", [
     ("wait_output", "["), ("wait_output", 1),
     ("wait_exit", [0]), ("wait_exit", [True]), ("wait_exit", [256]),
