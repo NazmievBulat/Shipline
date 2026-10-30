@@ -322,7 +322,17 @@ def _restack_child(folder: Path, number: str, parent_branch: str) -> None:
             "main",
         ):
             return
-        gate.command("gh", "api", "-X", "PATCH", f"{gate.API}/pulls/{number}", "-f", "base=main")
+        if pull["baseRefName"] != "main":
+            try:
+                gate.command("gh", "api", "-X", "PATCH", f"{gate.API}/pulls/{number}", "-f", "base=main")
+            except gate.Waiting:
+                raise
+            except (gate.Refused, OSError) as error:
+                if not _worktree(folder, number).is_dir() and number not in _sessions():
+                    # The update may have succeeded despite a lost response. Keep the
+                    # saved child and read its base again on the next tick.
+                    raise gate.Waiting(str(error)) from error
+                raise
         if number in _sessions():
             raise gate.Refused("its own session must merge main into its branch")
         worktree = _worktree(folder, number)
