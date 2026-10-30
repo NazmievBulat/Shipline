@@ -58,7 +58,11 @@
     "mechanical_conflicts": "tools/shipline/mechanical-conflicts",
     "pre_train_checks": {
       "run": "tools/shipline/pre-train-checks",
-      "form": "exit"
+      "form": "exit",
+      "wait_exit": [
+        75
+      ],
+      "wait_output": "^checks temporarily unavailable"
     },
     "push_checkout": "tools/shipline/push-checkout",
     "push_checks": "tools/shipline/push-checks",

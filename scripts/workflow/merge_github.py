@@ -76,7 +76,7 @@ def command(
         )
     except CommandTimeout as error:
         raise TimedOut(str(error), error.output, COMMAND_TIMEOUT) from error
-    if done.returncode == 75 and os.environ.get("WORKFLOW_BACKGROUND_GITHUB") == "1":
+    if args[0] == "gh" and done.returncode == 75 and os.environ.get("WORKFLOW_BACKGROUND_GITHUB") == "1":
         raise BudgetWaiting(done.stderr.strip())
     if check and done.returncode:
         raise Refused(f"{' '.join(args)} failed: {done.stderr.strip() or done.stdout.strip()}")
@@ -90,17 +90,22 @@ def repository_command(
     folder and bounded like every command; None when the repository names none. It reads
     `input`, and never the gate's own standard input. A command that is named but cannot start
     stops the gate's call."""
-    from merge_gate import CONFIG, Refused, command
+    from merge_gate import CONFIG, PackagesWaiting, Refused, Waiting, command
+    from workflow_config import pass_fail_command
 
     words = CONFIG.command(name)
     if words is None:
         return None
     try:
-        return command(*words, *args, check=False, input=input or "", errors=errors)
+        done = command(*words, *args, check=False, input=input or "", errors=errors)
     except OSError as error:
         raise Refused(
             f"cannot run the repository's {name} command, {shlex.join(words)}: {error}"
         ) from error
+    if name != "pre_train_checks" and done.returncode == 75 and pass_fail_command(name, args):
+        waiting = PackagesWaiting if name == "push_checkout" else Waiting
+        raise waiting(f"{name} waits: {said(done)}")
+    return done
 
 
 def said(done: subprocess.CompletedProcess[str]) -> str:

@@ -293,10 +293,34 @@ added after `run`'s words and before Shipline's arguments. No shell expands thos
 `commands.test` keeps its existing shell command semantics, including when written as an
 object; its `args` are still literal words passed before the job's arguments.
 
+A command with a pass/fail outcome may also set `wait_exit` (a list of exit statuses from
+1 to 255, default `[75]`) and `wait_output` (a regular expression). On a nonzero exit, a
+listed status or a match in either standard output or standard error means "could not
+finish; try again". The anchors `^` and `$` match each line. Exit 0 always passes. An invalid expression is refused when the config
+is read, naming `commands.<name>.wait_output`. Use `wait_exit: []` to disable the default
+status. A configured wait is reported as exit 75; an ordinary exit 75 with that status
+disabled is reported as exit 1. Output and literal arguments are preserved. Commands with
+explicit wait options buffer their output until they finish.
+
+These options apply to `test`, `browser`, `pre_train_checks`, `hunt_app`, `hunt_browser`,
+`hunt_cursor`, and `push_checks`; also to `mechanical_conflicts` calls `resolve` and
+`renumber`, `advisory_watch answers`, and `push_checkout install`, in their command-line
+or function forms. Selectors and diagnostic calls keep their existing answers. The gate
+treats a helper's wait as a wait; CI still receives a nonzero status and runs the same jobs.
+
+For pre-train checks, the first wait keeps the handoff and the member's place in the line.
+The tick prints `pre-train checks of N wait: <first output line>` and retries on its next
+turn, without a hand-back or a new reviewer. A reviewer's `--handoff` call also records a
+waiting member and succeeds. The state folder's `pre-train-wait-N.json` saves the head and
+first outcome atomically under the merge lock; the waiting member cannot be squashed in a
+batch. A second consecutive wait on that head is refused, naming both outcomes, and the
+tick hands it back. A pass or a different head resets the count. Other failures are refused
+immediately.
+
 | Form | Commands | Meaning |
 | --- | --- | --- |
 | `lines` | any | The documented answer, passed through unchanged (including the server selector's JSON). |
-| `exit` | `test`, `pre_train_checks`, `hunt_app`, `hunt_browser`, `hunt_cursor`, `push_checks` | The documented output and exit code, passed through unchanged. |
+| `exit` | `test`, `browser`, `pre_train_checks`, `hunt_app`, `hunt_browser`, `hunt_cursor`, `push_checks` | The documented output and exit code, passed through unchanged. |
 | `functions` | `mechanical_conflicts`, `advisory_watch`, `push_checkout`, `browser_plan` | `run` is a Python file; `functions` maps the calls below to its function names. |
 | `json` | `browser_tests_for_changes` | `field` names the JSON object's list of spec paths, printed one a line. |
 | `json` | `server_tests_for_changes` | `fields` maps all four documented keys (`whole`, `tests`, `total`, `reasons`) to keys in the script's JSON object. |
@@ -314,7 +338,10 @@ arguments, while checks keep their exit code:
       "run": "python3 tools/select-server.py", "form": "json",
       "fields": {"whole": "all", "tests": "selected", "total": "count", "reasons": "why"}
     },
-    "pre_train_checks": {"run": "tools/check-change", "form": "exit"},
+    "pre_train_checks": {
+      "run": "tools/check-change", "form": "exit", "wait_exit": [75],
+      "wait_output": "^checks temporarily unavailable"
+    },
     "hunt_app": {"run": "tools/hunt-app", "form": "exit"},
     "hunt_browser": {"run": "node tools/hunt-browser.mjs", "form": "exit"},
     "browser_plan": {"run": "tools/browser-plan", "form": "lines"}
