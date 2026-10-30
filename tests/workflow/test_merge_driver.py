@@ -1138,13 +1138,14 @@ exec /usr/bin/git "$@"
     assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
 
 
-def _child(github: GitHub, *, conflict: bool = False) -> tuple[Path, str]:
+def _child(github: GitHub, *, conflict: bool = False, empty: bool = False) -> tuple[Path, str]:
     workflow = github.workflow
     worktree = workflow.worktree(8)
     workflow.git("worktree", "add", "-b", "ticket/eight", str(worktree), github.head)
-    (worktree / "shared.txt").write_text("child content\n")
-    workflow.git("add", "shared.txt", cwd=worktree)
-    workflow.git("commit", "-m", "fix: child", cwd=worktree)
+    if not empty:
+        (worktree / "shared.txt").write_text("child content\n")
+        workflow.git("add", "shared.txt", cwd=worktree)
+    workflow.git("commit", "--allow-empty", "-m", "fix: child", cwd=worktree)
     workflow.git("push", "origin", "HEAD:ticket/eight", cwd=worktree)
     head = workflow.git("rev-parse", "HEAD", cwd=worktree)
     github.pulls["8"] = {
@@ -1163,6 +1164,80 @@ def _child(github: GitHub, *, conflict: bool = False) -> tuple[Path, str]:
         workflow.git("push", "origin", "main")
     github.save()
     return worktree, head
+
+
+@pytest.mark.parametrize("draft", [True, False], ids=["draft", "ready"])
+def test_a_stacked_child_without_a_worktree_only_changes_base(
+    handed: GitHub, draft: bool
+) -> None:
+    workflow = handed.workflow
+    worktree, head = _child(handed, empty=True)
+    workflow.git("worktree", "remove", str(worktree))
+    handed.pulls["8"]["isDraft"] = draft
+    workflow.list_pull_request(8, draft=draft)
+    handed.save()
+
+    done = workflow.run_python("merge_driver.py")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    saved = json.loads((workflow.state / "github.json").read_text())
+    assert saved["pulls"]["8"]["baseRefName"] == "main"
+    assert done.stdout.splitlines().count(
+        "stacked 8 moved to main; its next session merges main"
+    ) == 1
+    assert "merge hand-back" not in done.stdout + done.stderr
+    assert not (_folder(workflow) / "merge-review-8").exists()
+    assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+    assert not list((_folder(workflow) / "merge-handbacks.sent").glob("*"))
+    assert not workflow.sent()
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/eight").split()[0] == head
+    assert not worktree.exists()
+    assert _started(workflow) == []
+    assert not _note(workflow).exists()
+
+    again = workflow.run_python("merge_driver.py")
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "stacked 8" not in again.stdout
+    if not draft:
+        tick = workflow.run_script("tick")
+        assert tick.returncode == 0, tick.stdout + tick.stderr
+        assert _started(workflow) == ["review-8"]
+        assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+        assert not list((_folder(workflow) / "merge-handbacks.sent").glob("*"))
+
+
+@pytest.mark.parametrize("kind", ["dirty", "different branch", "unpublished head"])
+def test_an_unusable_stacked_worktree_is_still_handed_back(handed: GitHub, kind: str) -> None:
+    workflow = handed.workflow
+    worktree, head = _child(handed)
+    if kind == "dirty":
+        (worktree / "shared.txt").write_text("unfinished change\n")
+    elif kind == "different branch":
+        workflow.git("checkout", "-b", "ticket/other", cwd=worktree)
+    else:
+        workflow.git("commit", "--allow-empty", "-m", "fix: unpublished", cwd=worktree)
+    local_head = workflow.git("rev-parse", "HEAD", cwd=worktree)
+
+    done = workflow.run_python("merge_driver.py")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    saved = json.loads((workflow.state / "github.json").read_text())
+    assert saved["pulls"]["8"]["baseRefName"] == "main"
+    reason = (
+        "its worktree is on a different branch"
+        if kind == "different branch"
+        else "its worktree is dirty or differs from the published head"
+    )
+    assert f"merge hand-back 8: stacked on 7: {reason}" in done.stdout
+    request = json.loads((_folder(workflow) / "merge-review-8").read_text())
+    assert request["reason"] == f"stacked on 7: {reason}"
+    assert _handbacks(workflow) == [f"stacked on 7: {reason}"]
+    assert workflow.git("rev-parse", "HEAD", cwd=worktree) == local_head
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/eight").split()[0] == head
+    if kind == "dirty":
+        assert (worktree / "shared.txt").read_text() == "unfinished change\n"
+    assert _started(workflow) == []
+    assert not _note(workflow).exists()
 
 
 def test_a_merge_restacks_a_clean_child_and_pushes_before_starting_its_reviewer(
