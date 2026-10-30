@@ -3,6 +3,8 @@
 import fcntl
 import json
 import re
+import subprocess
+import sys
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -1285,13 +1287,14 @@ exec /usr/bin/git "$@"
     assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
 
 
-def _child(github: GitHub, *, conflict: bool = False) -> tuple[Path, str]:
+def _child(github: GitHub, *, conflict: bool = False, empty: bool = False) -> tuple[Path, str]:
     workflow = github.workflow
     worktree = workflow.worktree(8)
     workflow.git("worktree", "add", "-b", "ticket/eight", str(worktree), github.head)
-    (worktree / "shared.txt").write_text("child content\n")
-    workflow.git("add", "shared.txt", cwd=worktree)
-    workflow.git("commit", "-m", "fix: child", cwd=worktree)
+    if not empty:
+        (worktree / "shared.txt").write_text("child content\n")
+        workflow.git("add", "shared.txt", cwd=worktree)
+    workflow.git("commit", "--allow-empty", "-m", "fix: child", cwd=worktree)
     workflow.git("push", "origin", "HEAD:ticket/eight", cwd=worktree)
     head = workflow.git("rev-parse", "HEAD", cwd=worktree)
     github.pulls["8"] = {
@@ -1310,6 +1313,171 @@ def _child(github: GitHub, *, conflict: bool = False) -> tuple[Path, str]:
         workflow.git("push", "origin", "main")
     github.save()
     return worktree, head
+
+
+@pytest.mark.parametrize("draft", [True, False], ids=["draft", "ready"])
+def test_a_stacked_child_without_a_worktree_only_changes_base(
+    handed: GitHub, draft: bool
+) -> None:
+    workflow = handed.workflow
+    worktree, head = _child(handed, empty=True)
+    workflow.git("worktree", "remove", str(worktree))
+    handed.pulls["8"]["isDraft"] = draft
+    workflow.list_pull_request(8, draft=draft)
+    handed.save()
+
+    done = workflow.run_python("merge_driver.py")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    saved = json.loads((workflow.state / "github.json").read_text())
+    assert saved["pulls"]["8"]["baseRefName"] == "main"
+    assert done.stdout.splitlines().count(
+        "stacked 8 moved to main; its next session merges main"
+    ) == 1
+    assert "merge hand-back" not in done.stdout + done.stderr
+    assert not (_folder(workflow) / "merge-review-8").exists()
+    assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+    assert not list((_folder(workflow) / "merge-handbacks.sent").glob("*"))
+    assert not workflow.sent()
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/eight").split()[0] == head
+    assert not worktree.exists()
+    assert _started(workflow) == []
+    assert not _note(workflow).exists()
+
+    again = workflow.run_python("merge_driver.py")
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "stacked 8" not in again.stdout
+    if not draft:
+        tick = workflow.run_script("tick")
+        assert tick.returncode == 0, tick.stdout + tick.stderr
+        assert _started(workflow) == ["review-8"]
+        assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+        assert not list((_folder(workflow) / "merge-handbacks.sent").glob("*"))
+
+
+@pytest.mark.parametrize("draft", [True, False], ids=["draft", "ready"])
+@pytest.mark.parametrize("failure", ["lost-response", "timeout", "refused"])
+def test_a_lost_patch_response_keeps_the_unstarted_child_retryable(
+    handed: GitHub, draft: bool, failure: str
+) -> None:
+    workflow = handed.workflow
+    worktree, head = _child(handed, empty=True)
+    workflow.git("worktree", "remove", str(worktree))
+    handed.pulls["8"]["isDraft"] = draft
+    workflow.list_pull_request(8, draft=draft)
+    note = json.loads(_note(workflow).read_text())
+    note["children"] = ["8"]
+    _note(workflow).write_text(json.dumps(note))
+    handed.pulls["7"]["state"] = "MERGED"
+    handed.save()
+
+    source = workflow.bin / "gh.py"
+    original = source.read_text()
+    anchor = '''        number = args[3].split("/")[-1]
+        data["pulls"][number]["baseRefName"] = "main"
+        (state / "github.json").write_text(json.dumps(data))'''
+    assert original.count(anchor) == 1
+    delay = "\n        import time\n        time.sleep(2)\n"
+    if failure == "lost-response":
+        replacement = anchor + delay
+    elif failure == "timeout":
+        replacement = delay + anchor
+    else:
+        replacement = '        sys.exit("temporary base update failure")\n' + anchor
+    source.write_text(original.replace(anchor, replacement))
+
+    # Use the breaker's real timeout path with a shorter PATCH deadline only.
+    launcher = '''import runpy, sys
+from pathlib import Path
+script = Path(sys.argv[1])
+sys.path.insert(0, str(script.parent))
+import merge_gate
+original_command = merge_gate.run_command
+def bounded_patch(*args, **kwargs):
+    if args[:4] == ("gh", "api", "-X", "PATCH"):
+        kwargs["timeout"] = 0.25
+    return original_command(*args, **kwargs)
+merge_gate.run_command = bounded_patch
+sys.argv = [str(script)]
+runpy.run_path(str(script), run_name="__main__")
+'''
+    done = subprocess.run(
+        [sys.executable, "-B", "-c", launcher, str(workflow.script.parent / "merge_driver.py")],
+        cwd=workflow.repo, env=workflow.env, capture_output=True, text=True, timeout=15,
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    saved = json.loads((workflow.state / "github.json").read_text())
+    expected_base = "main" if failure == "lost-response" else "ticket/seven"
+    assert saved["pulls"]["8"]["baseRefName"] == expected_base
+    assert "stack follow-up 7 waits:" in done.stdout
+    assert "merge hand-back" not in done.stdout + done.stderr
+    assert json.loads(_note(workflow).read_text())["children"] == ["8"]
+    assert not (_folder(workflow) / "merge-review-8").exists()
+    assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+    assert not list((_folder(workflow) / "merge-handbacks.sent").glob("*"))
+    assert not worktree.exists()
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/eight").split()[0] == head
+
+    # A completed update needs only a read; a failed update needs a new PATCH.
+    if failure == "lost-response":
+        source.write_text(original.replace(anchor, '        sys.exit("unexpected base PATCH")'))
+    else:
+        source.write_text(original)
+    again = workflow.run_python("merge_driver.py")
+
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "waits:" not in again.stdout
+    assert "merge hand-back" not in again.stdout + again.stderr
+    assert not _note(workflow).exists()
+    assert json.loads((workflow.state / "github.json").read_text())["pulls"]["8"]["baseRefName"] == "main"
+    assert not (_folder(workflow) / "merge-review-8").exists()
+    assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+    assert not list((_folder(workflow) / "merge-handbacks.sent").glob("*"))
+    assert not workflow.sent()
+    assert not worktree.exists()
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/eight").split()[0] == head
+    assert _started(workflow) == []
+    if not draft:
+        tick = workflow.run_script("tick")
+        assert tick.returncode == 0, tick.stdout + tick.stderr
+        assert _started(workflow) == ["review-8"]
+        assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+        assert not list((_folder(workflow) / "merge-handbacks.sent").glob("*"))
+
+
+@pytest.mark.parametrize("kind", ["dirty", "different branch", "unpublished head"])
+def test_an_unusable_stacked_worktree_is_still_handed_back(handed: GitHub, kind: str) -> None:
+    workflow = handed.workflow
+    worktree, head = _child(handed)
+    if kind == "dirty":
+        (worktree / "shared.txt").write_text("unfinished change\n")
+    elif kind == "different branch":
+        workflow.git("checkout", "-b", "ticket/other", cwd=worktree)
+    else:
+        workflow.git("commit", "--allow-empty", "-m", "fix: unpublished", cwd=worktree)
+    local_head = workflow.git("rev-parse", "HEAD", cwd=worktree)
+
+    done = workflow.run_python("merge_driver.py")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    saved = json.loads((workflow.state / "github.json").read_text())
+    assert saved["pulls"]["8"]["baseRefName"] == "main"
+    reason = (
+        "its worktree is on a different branch"
+        if kind == "different branch"
+        else "its worktree is dirty or differs from the published head"
+    )
+    assert f"merge hand-back 8: stacked on 7: {reason}" in done.stdout
+    request = json.loads((_folder(workflow) / "merge-review-8").read_text())
+    assert request["reason"] == f"stacked on 7: {reason}"
+    assert _handbacks(workflow) == [f"stacked on 7: {reason}"]
+    assert workflow.git("rev-parse", "HEAD", cwd=worktree) == local_head
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/eight").split()[0] == head
+    if kind == "dirty":
+        assert (worktree / "shared.txt").read_text() == "unfinished change\n"
+    assert _started(workflow) == []
+    assert not _note(workflow).exists()
 
 
 def test_a_merge_restacks_a_clean_child_and_pushes_before_starting_its_reviewer(

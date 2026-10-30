@@ -348,12 +348,23 @@ def _restack_child(folder: Path, number: str, parent_branch: str) -> None:
             "main",
         ):
             return
-        gate.command("gh", "api", "-X", "PATCH", f"{gate.API}/pulls/{number}", "-f", "base=main")
+        if pull["baseRefName"] != "main":
+            try:
+                gate.command("gh", "api", "-X", "PATCH", f"{gate.API}/pulls/{number}", "-f", "base=main")
+            except gate.Waiting:
+                raise
+            except (gate.Refused, OSError) as error:
+                if not _worktree(folder, number).is_dir() and number not in _sessions():
+                    # The update may have succeeded despite a lost response. Keep the
+                    # saved child and read its base again on the next tick.
+                    raise gate.Waiting(str(error)) from error
+                raise
         if number in _sessions():
             raise gate.Refused("its own session must merge main into its branch")
         worktree = _worktree(folder, number)
         if not worktree.is_dir():
-            raise gate.Refused("no clean worktree is available to merge main")
+            print(f"stacked {number} moved to main; its next session merges main", flush=True)
+            return
 
         def git(*args: str, check: bool = True) -> str:
             return gate.command("git", "-C", str(worktree), *args, check=check).stdout.strip()
@@ -451,6 +462,7 @@ def drive(folder: Path) -> None:
     running = _sessions()
     refreshed: set[str] = set()
     driven: set[str] = set()
+    restack_waits: set[str] = set()
     for path in sorted(folder.glob("merge-wanted-*")):
         number = path.name.removeprefix("merge-wanted-")
         if not number.isdigit() or number in running:
@@ -482,6 +494,8 @@ def drive(folder: Path) -> None:
                 try:
                     _restack(folder, number, note)
                 except (gate.Refused, OSError, TypeError, ValueError, KeyError) as error:
+                    if isinstance(error, gate.Waiting):
+                        restack_waits.add(number)
                     print(f"stack follow-up {number} waits: {error}", flush=True)
             elif not gate.ready(pull):
                 repair = check_repair.Repair.read(folder, number)
@@ -553,7 +567,9 @@ def drive(folder: Path) -> None:
         number = path.name.removeprefix("merge-wanted-")
         # A no-merge tick needs no second sweep of GitHub. Every successful squash
         # either was driven above or left the gate's durable batch receipt.
-        if not number.isdigit() or (
+        # A restack that waited above belongs to the next tick, even if its PATCH
+        # succeeded before its response was lost.
+        if not number.isdigit() or number in restack_waits or (
             train_reads.tick() is not None
             and number not in driven
             and not (folder / f"batch-merged-{number}").exists()
