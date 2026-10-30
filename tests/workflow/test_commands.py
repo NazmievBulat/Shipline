@@ -344,6 +344,48 @@ def test_pre_train_wait_keeps_the_handoff_then_the_next_tick_merges(
     assert _started(workflow) == []
 
 
+@pytest.mark.parametrize("progress,stderr", [
+    ("", False), ("selection complete\n", True), ("checking selection...", True),
+], ids=["stdout", "stderr-after-line", "stderr-after-progress"])
+def test_deadline_then_pass_retries_without_another_review(
+    handed: GitHub, progress: str, stderr: bool,
+) -> None:
+    """The break/73 deadline retry case, including stdout without a trailing newline."""
+    workflow = handed.workflow
+    folder = workflow.repo / ".local/workflow"
+    note = folder / "merge-wanted-7"
+    before = note.read_bytes()
+    _configure(workflow, pre_train_checks={
+        "run": "example-checks", "form": "exit",
+        "wait_output": "^checks temporarily unavailable",
+    })
+    workflow.fake("example-checks", "#!/bin/bash\n"
+                  + f"printf '%s' {shlex.quote(progress)}\n"
+                  + "printf '%s\\n' 'checks temporarily unavailable: deadline' "
+                  + (">&2\n" if stderr else "\n") + "exit 1\n")
+
+    first = workflow.run_script("tick")
+
+    assert "merge hand-back" not in first.stdout, first.stdout + first.stderr
+    assert note.read_bytes() == before
+    train = json.loads((folder / "merge-train.json").read_text())
+    assert "7" in train["waiting"]
+    assert "7" not in train["approved"]
+    assert _started(workflow) == []
+    assert not (workflow.state / "merged").exists()
+    assert first.stdout.count("pre-train checks of 7 wait:") == 1
+    record = folder / "pre-train-wait-7.json"
+    assert record.stat().st_mode & 0o077 == 0
+    _stand_in(workflow, "example-checks", "checks passed\n")
+
+    second = workflow.run_script("tick")
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert (workflow.state / "merged").read_text() == "7"
+    assert _started(workflow) == []
+    assert not record.exists()
+
+
 def test_two_consecutive_pre_train_waits_hand_back_both_outcomes(handed: GitHub) -> None:
     workflow = handed.workflow
     _configure(workflow, pre_train_checks={
@@ -458,6 +500,70 @@ def test_a_delayed_passing_handoff_cannot_override_a_newer_wait(handed: GitHub, 
     else:
         assert "refused: pre-train checks could not finish twice" in done.stdout
         assert not (folder / "merge-wanted-7").exists()
+
+
+@pytest.mark.parametrize("replacement", ["second wait", "identical first wait"])
+def test_a_passing_handoff_blocked_at_the_lock_preserves_a_newer_wait(
+    handed: GitHub, replacement: str,
+) -> None:
+    workflow = handed.workflow
+    _configure(workflow, pre_train_checks="example-checks")
+    workflow.fake("example-checks", '''#!/bin/bash
+        if [[ -e "@STATE@/checks-wait" ]]; then
+          echo "try later"
+          exit 75
+        fi
+    ''')
+    done = _gate(workflow, f'''
+        from contextlib import contextmanager
+        from pathlib import Path
+        folder = g.CONFIG.state()
+        waiting = Path({str(workflow.state / "checks-wait")!r})
+        waiting.touch()
+        g.pre_train_checks("7", folder, locked=False)
+        waiting.unlink()
+        original_lock = g.handoff_lock
+        injected = False
+
+        @contextmanager
+        def lock(folder, number):
+            global injected
+            if not injected:
+                injected = True
+                # The older passing check has finished and is about to take the lock.
+                # Let another gate finish its outcome while that handoff waits.
+                if {replacement == 'identical first wait'!r}:
+                    g.pre_train_checks(number, folder, locked=False)
+                waiting.touch()
+                try:
+                    g.pre_train_checks(number, folder, locked=False)
+                except g.Refused:
+                    pass
+            with original_lock(folder, number):
+                yield
+
+        g.handoff_lock = lock
+        try:
+            print("handoff:", g.handoff("7", folder))
+        except g.Refused as error:
+            print("refused:", error)
+        assert injected
+    ''', workflow.worktree(7))
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    folder = workflow.repo / ".local/workflow"
+    assert "7" not in json.loads((folder / "merge-train.json").read_text())["approved"]
+    record = json.loads((folder / "pre-train-wait-7.json").read_text())
+    if replacement == "second wait":
+        assert "refused: pre-train checks could not finish twice" in done.stdout
+        assert "second" in record
+        assert not (folder / "merge-wanted-7").exists()
+    else:
+        assert "handoff: 0" in done.stdout
+        assert "waiting for pre-train checks on the next tick" in done.stdout
+        assert "second" not in record
+        assert (folder / "merge-wanted-7").exists()
+    assert not (workflow.state / "merged").exists()
 
 
 @pytest.mark.parametrize("key,value", [
