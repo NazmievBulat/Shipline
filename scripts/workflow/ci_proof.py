@@ -415,8 +415,9 @@ def _run_command(name: str, args: list[str]) -> int:
     line = entry["run"] if isinstance(entry, dict) else entry
     leading = entry.get("args", []) if isinstance(entry, dict) else []
     if isinstance(entry, dict) and {"wait_exit", "wait_output"} & entry.keys():
-        from workflow_commands import repository_answer
+        from workflow_commands import install_signal_handlers, repository_answer
 
+        install_signal_handlers()
         with chdir(_git("rev-parse", "--show-toplevel")):
             return repository_answer([
                 name, json.dumps(entry), "bash", "-c", line + ' "$@"', name, *leading, *args,

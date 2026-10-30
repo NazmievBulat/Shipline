@@ -600,25 +600,32 @@ def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> str |
     A repository that names no `pre_train_checks` command has none to fail. A caller that does
     not hold the merge lock (a handoff) takes it only to record or clear an outcome. A first
     wait keeps its line entry but withdraws batch approval until the next call passes."""
-    done = repository_command("pre_train_checks")
     path = folder / f"pre-train-wait-{number}.json"
+    try:
+        observed = json.loads(path.read_text())
+    except FileNotFoundError:
+        observed = None
+    done = repository_command("pre_train_checks")
     if (done is None or done.returncode == 0) and not path.exists():
         if done is not None:
             print(done.stdout, end="", flush=True)
             print(done.stderr, end="", file=sys.stderr, flush=True)
         return None
     with nullcontext() if locked else handoff_lock(folder, number):
+        previous = json.loads(path.read_text()) if path.exists() else None
         if done is None or done.returncode == 0:
-            path.unlink(missing_ok=True)
+            # A pass may clear only the outcome it retried. Another gate can record a
+            # newer wait while this command runs or while this handoff waits for the lock.
+            if previous == observed:
+                path.unlink(missing_ok=True)
         else:
             head = git("rev-parse", "HEAD")
             output = done.stdout + done.stderr
             first_line = next(iter(output.splitlines()), f"command exited {done.returncode}")
             outcome = f"exit {done.returncode}: {first_line}"
-            previous = json.loads(path.read_text()) if path.exists() else None
             if done.returncode == 75:
                 if previous is None or previous["head"] != head:
-                    write_json(path, {"head": head, "outcome": outcome})
+                    write_json(path, {"head": head, "outcome": outcome, "event": uuid.uuid4().hex})
                     train = Train(folder)
                     train.approved.pop(number, None)
                     train.save()
@@ -629,7 +636,7 @@ def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> str |
                     "pre-train checks could not finish twice on the same head: "
                     f"first {previous['outcome']}; second {outcome}"
                 )
-                write_json(path, {**previous, "second": outcome})
+                write_json(path, {**previous, "second": outcome, "event": uuid.uuid4().hex})
             else:
                 reason = "pre-train checks failed; fix the inventory before joining the merge train"
                 path.unlink(missing_ok=True)

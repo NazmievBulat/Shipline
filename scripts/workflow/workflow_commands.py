@@ -505,7 +505,9 @@ def repository_answer(args: list[str]) -> int:
                 code = 1
         sys.stdout.write(stdout.getvalue())
         sys.stderr.write(stderr.getvalue())
-        if command_waits(entry, code, stdout.getvalue() + stderr.getvalue()):
+        if any(command_waits(entry, code, output) for output in (
+            stdout.getvalue(), stderr.getvalue(),
+        )):
             return 75
         # With 75 removed from wait_exit, an actual 75 is an ordinary failure.
         return 1 if code == 75 else code

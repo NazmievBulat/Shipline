@@ -623,9 +623,14 @@ def test_test_and_browser_waits_keep_shell_semantics_and_checkout_root(workflow:
     assert workflow.calls("example-checks") == [f"example-checks two words --fast (in {workflow.repo})"]
 
 
-def test_a_wait_diagnostic_on_stderr_can_follow_progress_on_stdout(workflow: Workflow) -> None:
+@pytest.mark.parametrize("progress", ["progress\n", "progress"])
+def test_a_wait_diagnostic_on_stderr_can_follow_progress_on_stdout(
+    workflow: Workflow, progress: str,
+) -> None:
     install_shipline(workflow)
-    workflow.fake("example-checks", '#!/bin/bash\necho progress\necho "try later" >&2\nexit 1\n')
+    workflow.fake("example-checks", "#!/bin/bash\n"
+                  + f"printf '%s' {shlex.quote(progress)}\n"
+                  + 'echo "try later" >&2\nexit 1\n')
     _configure(workflow, pre_train_checks={
         "run": "example-checks", "form": "exit", "wait_output": "^try later$",
     })
@@ -633,7 +638,7 @@ def test_a_wait_diagnostic_on_stderr_can_follow_progress_on_stdout(workflow: Wor
     done = workflow.shipline("pre-train-checks")
 
     assert done.returncode == 75, done.stdout + done.stderr
-    assert done.stdout == "progress\n"
+    assert done.stdout == progress
     assert done.stderr == "try later\n"
 
 
