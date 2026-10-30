@@ -327,7 +327,8 @@ def _restack_child(folder: Path, number: str, parent_branch: str) -> None:
             raise gate.Refused("its own session must merge main into its branch")
         worktree = _worktree(folder, number)
         if not worktree.is_dir():
-            raise gate.Refused("no clean worktree is available to merge main")
+            print(f"stacked {number} moved to main; its next session merges main", flush=True)
+            return
 
         def git(*args: str, check: bool = True) -> str:
             return gate.command("git", "-C", str(worktree), *args, check=check).stdout.strip()
