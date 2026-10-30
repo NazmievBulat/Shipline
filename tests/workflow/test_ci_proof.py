@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import textwrap
@@ -16,6 +17,7 @@ from typing import Any
 
 import pytest
 from workflow_harness import Workflow
+from workflow.test_workflow_commands import _ended, _pid, _TESTS
 
 _API = "repos/example-org/example-app"
 _NOTICE = re.compile(r"::notice title=([^:]*)::(.*)")
@@ -845,6 +847,41 @@ def test_the_test_command_is_given_the_job_s_own_arguments(
 
     assert done.returncode == 0, done.stderr
     assert done.stdout == "[run][--fast][tests/a test.py]"
+
+
+@pytest.mark.parametrize("command", _COMMANDS)
+def test_stopping_a_wait_enabled_command_stops_its_separate_sessions(
+    workflow: Workflow, command: str,
+) -> None:
+    test, detached = workflow.state / "test-pid", workflow.state / "detached-pid"
+    source = workflow.repo / "example-tests.py"
+    source.write_text(_TESTS)
+    (workflow.repo / "shipline.json").write_text(json.dumps({"commands": {command: {
+        "run": f"{sys.executable} example-tests.py", "form": "exit", "wait_exit": [75],
+    }}}))
+    proof = subprocess.Popen(
+        [sys.executable, "-B", str(workflow.script.parent / "ci_proof.py"), command,
+         str(test), str(detached)],
+        cwd=workflow.repo, env=workflow.env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    pids = []
+    try:
+        pids = [_pid(test), _pid(detached)]
+        os.killpg(proof.pid, signal.SIGTERM)
+        proof.wait(timeout=20)
+        assert [pid for pid in pids if not _ended(pid)] == []
+        assert proof.returncode == 128 + signal.SIGTERM
+    finally:
+        for path in (test, detached):
+            if path.exists() and path.read_text().strip():
+                try:
+                    os.kill(int(path.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        if proof.poll() is None:
+            os.killpg(proof.pid, signal.SIGKILL)
+        proof.wait(timeout=20)
 
 
 @pytest.mark.parametrize(
