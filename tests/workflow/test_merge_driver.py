@@ -3,6 +3,8 @@
 import fcntl
 import json
 import re
+import subprocess
+import sys
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -1198,6 +1200,97 @@ def test_a_stacked_child_without_a_worktree_only_changes_base(
     again = workflow.run_python("merge_driver.py")
     assert again.returncode == 0, again.stdout + again.stderr
     assert "stacked 8" not in again.stdout
+    if not draft:
+        tick = workflow.run_script("tick")
+        assert tick.returncode == 0, tick.stdout + tick.stderr
+        assert _started(workflow) == ["review-8"]
+        assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+        assert not list((_folder(workflow) / "merge-handbacks.sent").glob("*"))
+
+
+@pytest.mark.parametrize("draft", [True, False], ids=["draft", "ready"])
+@pytest.mark.parametrize("failure", ["lost-response", "timeout", "refused"])
+def test_a_lost_patch_response_keeps_the_unstarted_child_retryable(
+    handed: GitHub, draft: bool, failure: str
+) -> None:
+    workflow = handed.workflow
+    worktree, head = _child(handed, empty=True)
+    workflow.git("worktree", "remove", str(worktree))
+    handed.pulls["8"]["isDraft"] = draft
+    workflow.list_pull_request(8, draft=draft)
+    note = json.loads(_note(workflow).read_text())
+    note["children"] = ["8"]
+    _note(workflow).write_text(json.dumps(note))
+    handed.pulls["7"]["state"] = "MERGED"
+    handed.save()
+
+    source = workflow.bin / "gh.py"
+    original = source.read_text()
+    anchor = '''        number = args[3].split("/")[-1]
+        data["pulls"][number]["baseRefName"] = "main"
+        (state / "github.json").write_text(json.dumps(data))'''
+    assert original.count(anchor) == 1
+    delay = "\n        import time\n        time.sleep(2)\n"
+    if failure == "lost-response":
+        replacement = anchor + delay
+    elif failure == "timeout":
+        replacement = delay + anchor
+    else:
+        replacement = '        sys.exit("temporary base update failure")\n' + anchor
+    source.write_text(original.replace(anchor, replacement))
+
+    # Use the breaker's real timeout path with a shorter PATCH deadline only.
+    launcher = '''import runpy, sys
+from pathlib import Path
+script = Path(sys.argv[1])
+sys.path.insert(0, str(script.parent))
+import merge_gate
+original_command = merge_gate.run_command
+def bounded_patch(*args, **kwargs):
+    if args[:4] == ("gh", "api", "-X", "PATCH"):
+        kwargs["timeout"] = 0.25
+    return original_command(*args, **kwargs)
+merge_gate.run_command = bounded_patch
+sys.argv = [str(script)]
+runpy.run_path(str(script), run_name="__main__")
+'''
+    done = subprocess.run(
+        [sys.executable, "-B", "-c", launcher, str(workflow.script.parent / "merge_driver.py")],
+        cwd=workflow.repo, env=workflow.env, capture_output=True, text=True, timeout=15,
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    saved = json.loads((workflow.state / "github.json").read_text())
+    expected_base = "main" if failure == "lost-response" else "ticket/seven"
+    assert saved["pulls"]["8"]["baseRefName"] == expected_base
+    assert "stack follow-up 7 waits:" in done.stdout
+    assert "merge hand-back" not in done.stdout + done.stderr
+    assert json.loads(_note(workflow).read_text())["children"] == ["8"]
+    assert not (_folder(workflow) / "merge-review-8").exists()
+    assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+    assert not list((_folder(workflow) / "merge-handbacks.sent").glob("*"))
+    assert not worktree.exists()
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/eight").split()[0] == head
+
+    # A completed update needs only a read; a failed update needs a new PATCH.
+    if failure == "lost-response":
+        source.write_text(original.replace(anchor, '        sys.exit("unexpected base PATCH")'))
+    else:
+        source.write_text(original)
+    again = workflow.run_python("merge_driver.py")
+
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "waits:" not in again.stdout
+    assert "merge hand-back" not in again.stdout + again.stderr
+    assert not _note(workflow).exists()
+    assert json.loads((workflow.state / "github.json").read_text())["pulls"]["8"]["baseRefName"] == "main"
+    assert not (_folder(workflow) / "merge-review-8").exists()
+    assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+    assert not list((_folder(workflow) / "merge-handbacks.sent").glob("*"))
+    assert not workflow.sent()
+    assert not worktree.exists()
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/eight").split()[0] == head
+    assert _started(workflow) == []
     if not draft:
         tick = workflow.run_script("tick")
         assert tick.returncode == 0, tick.stdout + tick.stderr
