@@ -78,6 +78,29 @@ def finding(ecosystem: str, package: Any, ids: tuple[str, ...], fixes: Any,
     return Finding(ecosystem, package, ids, versions(fixes), locks)
 
 
+def published_npm_fixes(package: str, ids: tuple[str, ...]) -> tuple[tuple[str, ...], list[str]]:
+    ghsa = next((identifier for identifier in ids if identifier.startswith("GHSA-")), None)
+    if ghsa is None:
+        raise WatchError("an advisory has no GHSA for finding fixed versions")
+    detail = github("advisories/" + ghsa)
+    if not isinstance(detail, dict) or not isinstance(detail.get("vulnerabilities"), list):
+        raise WatchError("GitHub returned an invalid advisory")
+    fixed = []
+    matched = False
+    for vulnerability in detail["vulnerabilities"]:
+        if not isinstance(vulnerability, dict) or not isinstance(vulnerability.get("package"), dict):
+            raise WatchError("GitHub returned an invalid advisory vulnerability")
+        named = vulnerability["package"]
+        if named.get("ecosystem") != "npm" or named.get("name") != package:
+            continue
+        matched = True
+        if patch := vulnerability.get("first_patched_version"):
+            fixed.append(patch)
+    if not matched:
+        raise WatchError("GitHub's advisory does not name the audited package")
+    return identifiers(list(ids), detail.get("cve_id"), detail.get("ghsa_id")), fixed
+
+
 def bun_findings(report: Any, minimum: str, locks: tuple[str, ...]) -> list[Finding]:
     if not isinstance(report, dict):
         raise WatchError("bun-audit did not return an audit object")
@@ -106,11 +129,18 @@ def bun_findings(report: Any, minimum: str, locks: tuple[str, ...]) -> list[Find
                     raise WatchError("bun-audit returned an invalid advisory")
                 if SEVERITIES.index(advisory["severity"]) < SEVERITIES.index(minimum):
                     continue
-                fixed = entry.get("fixAvailable")
-                fixed = fixed.get("version") if isinstance(fixed, dict) else advisory.get("patched_versions")
                 url_id = str(advisory.get("url", "")).rsplit("/", 1)[-1]
-                result.append(finding("npm", package,
-                                      identifiers(advisory.get("source"), url_id), fixed, locks))
+                ids = identifiers(advisory.get("source"), url_id)
+                available = entry.get("fixAvailable")
+                if isinstance(available, dict) and available.get("name") == package:
+                    fixed = available.get("version")
+                elif "patched_versions" in advisory:
+                    fixed = advisory["patched_versions"]
+                else:
+                    # A fixAvailable version can belong to a parent dependency, not this
+                    # vulnerable package. Resolve its own published releases instead.
+                    ids, fixed = published_npm_fixes(package, ids)
+                result.append(finding("npm", package, ids, fixed, locks))
     elif all(isinstance(entries, list) for entries in report.values()):
         # Bun also prints the registry's bulk response: package -> advisories. This names
         # vulnerable ranges, not fixed releases. Ask the named GHSA for published fixes;
@@ -126,24 +156,7 @@ def bun_findings(report: Any, minimum: str, locks: tuple[str, ...]) -> list[Find
                                   advisory.get("cves", []))
                 fixed = advisory.get("patched_versions")
                 if "patched_versions" not in advisory:
-                    ghsa = next((identifier for identifier in ids if identifier.startswith("GHSA-")), None)
-                    if ghsa is None:
-                        raise WatchError("a bulk advisory has no GHSA for finding fixed versions")
-                    detail = github("advisories/" + ghsa)
-                    if not isinstance(detail, dict) or not isinstance(detail.get("vulnerabilities"), list):
-                        raise WatchError("GitHub returned an invalid advisory")
-                    fixed = []
-                    matched = False
-                    for vulnerability in detail["vulnerabilities"]:
-                        named = vulnerability.get("package", {})
-                        if named.get("ecosystem") != "npm" or named.get("name") != package:
-                            continue
-                        matched = True
-                        if patch := vulnerability.get("first_patched_version"):
-                            fixed.append(patch)
-                    if not matched:
-                        raise WatchError("GitHub's advisory does not name the audited package")
-                    ids = identifiers(list(ids), detail.get("cve_id"), detail.get("ghsa_id"))
+                    ids, fixed = published_npm_fixes(package, ids)
                 result.append(finding("npm", package, ids, fixed, locks))
     else:
         raise WatchError("bun-audit returned no advisories or vulnerabilities object")

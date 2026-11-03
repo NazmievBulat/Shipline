@@ -553,7 +553,7 @@ class Config:
         'Snapshot dependency audits: prepare command lines, audits with run, format (bun-audit or pip-audit), optional cwd and lock_files, and minimum_severity (high by default). {root} is the snapshot path; commands run without a shell. Omitted means nothing to watch.',
         example={'prepare': ['bun install --frozen-lockfile --ignore-scripts'],
                  'audits': [{'run': 'bun audit --audit-level=high --json',
-                             'format': 'bun-audit', 'lock_files': ['bun.lock']}],
+                             'format': 'bun-audit', 'cwd': '.', 'lock_files': ['bun.lock']}],
                  'minimum_severity': 'high'},
         optional=True, position=25,
     )

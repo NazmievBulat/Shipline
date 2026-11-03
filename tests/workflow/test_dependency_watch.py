@@ -479,3 +479,22 @@ def test_a_fork_cannot_obtain_workflow_labels_by_copying_the_marker(watch: Workf
     done = watch.shipline("dependency-watch")
     assert done.returncode == 0, done.stderr
     assert not _calls(watch)
+
+
+@pytest.mark.parametrize("available", [True, False, {"name": "example-parent", "version": "9.0.0"}])
+def test_npm_parent_updates_are_not_reported_as_child_fixed_versions(watch: Workflow, available: object) -> None:
+    (watch.state / "bun.json").write_text(json.dumps({"vulnerabilities": {
+        "example-lib": {"via": [{"source": 123, "severity": "high",
+                                   "url": "https://github.com/advisories/GHSA-aaaa-bbbb-cccc"}],
+                        "fixAvailable": available},
+    }}))
+    (watch.state / "advisory.json").write_text(json.dumps({
+        "ghsa_id": "GHSA-aaaa-bbbb-cccc", "cve_id": "CVE-2026-1234", "vulnerabilities": [{
+            "package": {"ecosystem": "npm", "name": "example-lib"}, "first_patched_version": "2.0.1",
+        }],
+    }))
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    body = _calls(watch, suffix="/pulls")[0][2]["body"]
+    assert "fixed versions: 2.0.1" in body
+    assert "9.0.0" not in body

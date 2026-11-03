@@ -83,6 +83,7 @@
       {
         "run": "bun audit --audit-level=high --json",
         "format": "bun-audit",
+        "cwd": ".",
         "lock_files": [
           "bun.lock"
         ]
