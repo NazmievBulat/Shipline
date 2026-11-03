@@ -322,7 +322,17 @@ def test_hunt_app_keeps_settings_for_start_fresh_and_restart(workflow: Workflow,
     shared = {"FEATURE": "off", "SHARED": "a 'quote' $value `word` = \\ end", "EMPTY": ""}
     config["hunts"].update(settings=shared, area_settings={"phone": {"FEATURE": "on", "PHONE": "yes"}})
     path.write_text(json.dumps(config))
-    workflow.fake("hunt-app", '#!/bin/bash\npython3 -c \'import json, os; print(json.dumps({k: os.environ.get(k) for k in ("FEATURE", "SHARED", "EMPTY", "PHONE")}))\'\n')
+    workflow.fake(
+        "hunt-app",
+        "#!/bin/bash\n"
+        "python3 - \"$1\" <<'PYAPP'\n"
+        "import json, os, sys\n"
+        "values = {k: os.environ.get(k) for k in ('FEATURE', 'SHARED', 'EMPTY', 'PHONE')}\n"
+        "print(json.dumps(values))\n"
+        "with open('app-' + sys.argv[1] + '.json', 'w') as stream:\n"
+        "    json.dump(values, stream)\n"
+        "PYAPP\n",
+    )
     started = _start(workflow, "one", *area)
     assert started.returncode == 0, started.stderr
     expected = {**shared, **({"FEATURE": "on", "PHONE": "yes"} if area else {})}
@@ -330,6 +340,10 @@ def test_hunt_app_keeps_settings_for_start_fresh_and_restart(workflow: Workflow,
     recorded = json.loads(report.split("```json\n", 1)[1].split("\n```", 1)[0])
     assert recorded == expected
     assert "Settings" in report
+    assert "Keep the settings already recorded at the top of report.md" in _command(workflow, "one")
+    snapshot = workflow.hunt_worktree("one") / ".local/workflow/hunt-settings.json"
+    assert snapshot.stat().st_mode & 0o777 == 0o600
+    assert (workflow.hunt_report("one") / "report.md").stat().st_mode & 0o777 == 0o600
     # Editing the installation after launch must not alter this hunt's copy.
     config["hunts"]["settings"] = {"FEATURE": "changed"}
     config["hunts"]["area_settings"] = {}
@@ -343,16 +357,48 @@ def test_hunt_app_keeps_settings_for_start_fresh_and_restart(workflow: Workflow,
         assert json.loads(done.stdout) == {**expected, "PHONE": expected.get("PHONE")}
     hunter_env = (workflow.state / "env" / "hunt-one").read_text()
     assert "FEATURE=" not in hunter_env
+    stopped = workflow.run("stop", "hunt-one")
+    assert stopped.returncode == 0, stopped.stderr
+    assert json.loads((worktree / "app-stop.json").read_text()) == {**expected, "PHONE": expected.get("PHONE")}
     # A configured app run outside a hunt does not acquire hunt settings.
     ordinary = workflow.shipline("hunt-app", "start")
     assert ordinary.returncode == 0, ordinary.stderr
     assert all(value is None for value in json.loads(ordinary.stdout).values())
 
 
-@pytest.mark.parametrize("words", [("--area",), ("--area", "phone", "--area", "billing"),
+@pytest.mark.parametrize("words", [("",), ("--area",), ("--area", "phone", "--area", "billing"),
                                     ("plan", "claude", "phone", "--area", "billing")])
 def test_an_incomplete_or_duplicate_area_option_is_refused(workflow: Workflow, words: tuple[str, ...]) -> None:
     _configure(workflow)
     done = _start(workflow, "one", *words)
     assert done.returncode == 2
     _nothing_started(workflow, "one")
+
+
+@pytest.mark.parametrize("words", [("--area", "phone", "explore", "codex"),
+                                    ("explore", "--area", "phone", "cursor")])
+def test_the_area_option_can_surround_the_existing_hunt_options(workflow: Workflow, words: tuple[str, ...]) -> None:
+    _configure(workflow)
+    done = _start(workflow, "one", *words)
+    assert done.returncode == 0, done.stderr
+    assert _notes(workflow, "one").with_suffix(".area").read_text() == "phone\n"
+
+
+
+def test_two_hunt_apps_keep_their_own_area_settings(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    _configure(workflow)
+    path = workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config["hunts"].update(settings={"FEATURE": "shared"},
+                           area_settings={"phone": {"FEATURE": "phone"},
+                                          "billing": {"FEATURE": "billing"}})
+    path.write_text(json.dumps(config))
+    workflow.fake("hunt-app", '#!/bin/bash\nprintf "%s" "$FEATURE"\n')
+    for name, area in (("one", "phone"), ("two", "billing")):
+        started = _start(workflow, name, "--area", area)
+        assert started.returncode == 0, started.stderr
+    for name, area in (("one", "phone"), ("two", "billing")):
+        done = workflow.shipline("hunt-app", "fresh", cwd=workflow.hunt_worktree(name))
+        assert done.returncode == 0, done.stderr
+        assert done.stdout == area

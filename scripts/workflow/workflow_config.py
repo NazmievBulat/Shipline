@@ -78,11 +78,12 @@ _SCRATCH_PREFIX = re.compile(rf"(?!.*\.\.){_WORD}(?:/{_WORD})*[-/]")
 # What `ssh` reads as a destination and nothing else: `user@host`, a name or an address, never a
 # word that starts with a dash, which it would read as one of its own options.
 _ADDRESS = re.compile(r"(?!-)[A-Za-z0-9_.@:\[\]-]+")
-# An area is the last word of `session start hunt`, and the area and its screens go into the
+# An area can be named by `session start hunt`; the area and its screens go into the
 # sentence a hunt is started with, inside double quotes in a shell command: no quotation mark,
 # dollar, backtick, backslash or space. The screens are joined with commas there.
 _AREA = re.compile(r"[a-z0-9][a-z0-9-]*")
 _SCREEN = re.compile(r"/[A-Za-z0-9/._~:@%+*\[\]{}-]*")
+_SETTING_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
 _PLANS = re.compile(r"[A-Za-z0-9/._-]+")
 
 
@@ -288,6 +289,8 @@ class Hunts:
     # In the order the file names them.
     areas: dict[str, tuple[str, ...]] = option('areas', {}, 'Area names mapped to lists of screen paths; omitted means one hunt runs at a time, on every screen.', example={'phone': ['/calls', '/contacts'], 'billing': ['/invoices', '/settings/billing']}, shell=(35, 'HUNT_AREAS'), position=0)
     plans: str | None = option('name', None, 'The checkout path of hunt plans named in a hunt sentence.', example='docs/hunt-plans.md', optional=True, shell=(29, 'HUNT_PLANS'), convert=lambda value: _plans(value), position=1)
+    settings: dict[str, str] = option('settings', {}, 'Environment settings for every hunt app; uppercase names and string values without newlines.', example={'FEATURE_EXAMPLE': 'off'}, optional=True, position=2)
+    area_settings: dict[str, dict[str, str]] = option('area_settings', {}, 'Settings added to or overriding shared settings for a configured hunt area.', example={'phone': {'FEATURE_EXAMPLE': 'on'}}, optional=True, position=3)
 
 
 @config_section
@@ -765,12 +768,13 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
             merged[key] = _merged(default, given[key], name + ".")
         elif DECLARATIONS[name].kind == "command" and isinstance(given[key], dict):
             merged[key] = _command_entry(given[key], key)
-        elif DECLARATIONS[name].kind in ("paths", "conflict", "machines", "areas", "suites"):
+        elif DECLARATIONS[name].kind in ("paths", "conflict", "machines", "areas", "suites", "settings", "area_settings"):
             kind = DECLARATIONS[name].kind
             readers = {"paths": _hot_paths, "conflict": _conflict_review,
                        "machines": lambda value, _: _machines(value),
                        "areas": lambda value, _: _areas(value),
-                       "suites": lambda value, _: _suites(value)}
+                       "suites": lambda value, _: _suites(value),
+                       "settings": _settings, "area_settings": _area_settings}
             merged[key] = readers[kind](given[key], name)
         elif DECLARATIONS[name].kind == "names":
             value = given[key]
@@ -951,6 +955,27 @@ def _machines(given: Any) -> list[dict[str, str]]:
     if len({machine["name"] for machine in machines}) != len(machines):
         raise ConfigError(f"{FILE}: machines must name each machine once")
     return machines
+
+
+def _settings(given: Any, where: str) -> dict[str, str]:
+    if not isinstance(given, dict):
+        raise ConfigError(f"{FILE}: {where} must be an object of environment names to strings")
+    for name, value in given.items():
+        if not _SETTING_NAME.fullmatch(name):
+            raise ConfigError(
+                f"{FILE}: {where}: {json.dumps(name)} must start with a capital letter "
+                "and contain only capital letters, digits and underscores"
+            )
+        if not isinstance(value, str) or any(char in value for char in "\n\r\0"):
+            # Values may contain sensitive installation data; diagnostics name only the key.
+            raise ConfigError(f"{FILE}: {where}.{name} must be a string without newlines or NUL")
+    return given
+
+
+def _area_settings(given: Any, where: str) -> dict[str, dict[str, str]]:
+    if not isinstance(given, dict):
+        raise ConfigError(f"{FILE}: {where} must be an object of area names to settings")
+    return {area: _settings(settings, f"{where}.{area}") for area, settings in given.items()}
 
 
 def _areas(given: Any) -> dict[str, tuple[str, ...]]:
@@ -1414,6 +1439,12 @@ def _load(main: Path, start: Path | None, document: ConfigFile) -> Config:
         if active.returncode:
             raise ConfigError(f"{FILE}: refresh.clear_generated cannot find the worktree")
         refresh.targets(Path(active.stdout.strip()))
+    unknown_areas = set(values["hunts"]["area_settings"]) - set(values["hunts"]["areas"])
+    if unknown_areas:
+        raise ConfigError(
+            f"{FILE}: hunts.area_settings names areas absent from hunts.areas: "
+            + ", ".join(sorted(unknown_areas))
+        )
     config = _configured(
         Config, values,
         found_repository=repository,

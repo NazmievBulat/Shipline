@@ -161,8 +161,10 @@ installation folder, even if the checkout has a file of the same name.
 | `commands.test` | command | The repository test command run by bash from the checkout with the CI job's arguments. | none |
 | `conflict_review` | conflict | The resolver of a handed-off conflict: program is claude (default) or codex. With program alone, effort is high, Claude uses Opus, Codex uses its configured model, and there is no additional line cutoff. An explicit model selects that program’s model; a positive max_changed_lines limits both conflicting sides and the resolution. Edits stay within the conflicting hunks. Codex uses its worker bridge with Claude and Cursor on the panel; full-review fallbacks return to Claude. Without program, effort, model and max_changed_lines remain required. | none |
 | `hot_paths` | paths | GitHub path patterns whose matching tickets run separately and merge back to back within their priority. | `[]` |
+| `hunts.area_settings` | area_settings | Settings added to or overriding shared settings for a configured hunt area. | `{}` |
 | `hunts.areas` | areas | Area names mapped to lists of screen paths; omitted means one hunt runs at a time, on every screen. | `{}` |
 | `hunts.plans` | name | The checkout path of hunt plans named in a hunt sentence. | none |
+| `hunts.settings` | settings | Environment settings for every hunt app; uppercase names and string values without newlines. | `{}` |
 | `install_folder` | name | The installation folder, resolved against the selected file; external configs use their parent when omitted. | none |
 | `labels.audited` | name | The label that marks an audit. | `"audited"` |
 | `labels.priority.blocker` | name | The blocker priority label. | `"priority: blocker"` |
@@ -245,6 +247,18 @@ How a script reads it:
 
 The machine-wide state, `~/.local/state/workflow`, is shared by every repository on one
 machine, as is its GitHub budget, and is not part of the file.
+
+A hunt's app can receive environment settings from `hunts.settings`, with
+`hunts.area_settings` adding or overriding them for a named area. Start an area hunt with
+`shipline session start hunt example-hunt --area phone`; the existing area argument after
+kind and program also works. Without an area, only shared settings apply. Names start with
+a capital letter and contain only capital letters, digits and underscores; values are strings
+without newlines or NUL. These are app settings, not secrets: their names and values are
+recorded at the top of `report.md`.
+
+The settings are saved when the hunt starts. `shipline hunt-app start`, `fresh` and `restart`
+from its worktree use the saved values even if the installation config changes. Settings are
+passed only to the app command; the hunter and other sessions keep their own environment.
 
 ## The repository's commands
 

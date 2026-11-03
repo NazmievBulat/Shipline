@@ -92,7 +92,9 @@
           "/settings/billing"
         ]
       },
-      "plans": "docs/hunt-plans.md"
+      "plans": "docs/hunt-plans.md",
+      "settings": {},
+      "area_settings": {}
     },
     "commands": {
       "test": "tools/run-tests",

@@ -23,11 +23,11 @@
 #                               for the reviewer of a small conflict `conflict_review` of
 #                               shipline.json names (`conflict_review.py reviewer`).
 #                               conflict_review.program may select Codex with its bridge.
-#   session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>]
+#   session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>] [--area <area>]
 #                               name: small letters, digits and dashes; it names the report.
 #                               When left out, a hunt with a plan, by Claude Code, on every
 #                               screen. The area, one of `hunts.areas` in shipline.json, comes
-#                               last, after the kind and the program. A hunt on every screen
+#                               last, after the kind and the program, or with --area. A hunt on every screen
 #                               runs alone; two hunts run at once only each in its own area, and
 #                               never three. With no areas configured, one hunt runs at a time.
 #   session start analyst <name> [1-7]
@@ -167,7 +167,7 @@ CLAUDE_TMP_ROOT=${WORKFLOW_CLAUDE_TMP_ROOT:-/tmp/claude-$(id -u)}
 usage() {
   cat >&2 <<'EOF'
 usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus|sonnet|codex|cloud]
-       session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>]
+       session start hunt <name> [plan|explore] [claude|codex|cursor] [<area>] [--area <area>]
        session start analyst <name> [1-7]
        session list
        session load
@@ -313,7 +313,8 @@ forget_notes() {
 # started it.
 stop_hunted_application() {
   ((${#SHIPLINE_COMMAND_HUNT_APP[@]} > 0)) || return 0
-  (cd "$(worktree_of "$1")" && "${SHIPLINE_COMMAND_HUNT_APP[@]}" stop) >/dev/null 2>&1 || true
+  (cd "$(worktree_of "$1")" && python3 "$script_dir/hunt_settings.py" run \
+    "$PWD/$SHIPLINE_STATE_FOLDER/hunt-settings.json" "${SHIPLINE_COMMAND_HUNT_APP[@]}" stop) >/dev/null 2>&1 || true
 }
 
 # Ends a `tmux` server and waits a moment for it to go. A server that had already ended counts
@@ -1029,6 +1030,11 @@ cmd_start_hunt() {
   wait_for_resources
 
   mkdir -p "$report"
+  python3 "$script_dir/hunt_settings.py" prepare "$worktree" "$report" "$area"
+  if [[ $(<"$worktree/$SHIPLINE_STATE_FOLDER/hunt-settings.json") != '{}' ]]; then
+    [[ $prompt == *. ]] || prompt+=.
+    prompt+=" Keep the settings already recorded at the top of report.md when writing the report."
+  fi
   if [[ $program == codex || $program == cursor ]]; then
     # These hunters end by themselves when done, and their screen goes with them: what printed
     # is kept beside the report. It may reach the application on this machine and write the
@@ -1042,6 +1048,7 @@ cmd_start_hunt() {
       label=Codex
     fi
     if ! launch "$name" "$worktree" "$command" "WORKFLOW_HUNT_REPORT=$report"; then
+      python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
       rmdir "$report" 2>/dev/null || true
       exit 1
     fi
@@ -1056,6 +1063,7 @@ cmd_start_hunt() {
       cat "$report/$program.log" >&2 2>/dev/null || true
       stop_session "$name"
       rm -f "$report/$program.log"
+      python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
       rmdir "$report" 2>/dev/null || true
       exit 1
     fi
@@ -1066,6 +1074,7 @@ cmd_start_hunt() {
     if ! launch "$name" "$worktree" \
         "claude --effort $HUNT_EFFORT --add-dir $report --remote-control $name \"$prompt\"" \
         "WORKFLOW_HUNT_REPORT=$report"; then
+      python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
       rmdir "$report" 2>/dev/null || true
       exit 1
     fi
@@ -1073,6 +1082,7 @@ cmd_start_hunt() {
     touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
     if ! wait_for_link "$name"; then
       stop_session "$name"
+      python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
       rmdir "$report" 2>/dev/null || true
       exit 1
     fi
@@ -2047,13 +2057,30 @@ case ${1:-} in
       set -- "$1" "$2" "$3" "$WORKER_EFFORT" cloud
     fi
     if [[ ${2:-} == hunt ]]; then
-      [[ $# -ge 3 && $# -le 6 ]] && is_hunt_name "$3" || usage
-      [[ $# -lt 4 || $4 =~ ^(plan|explore)$ ]] || usage
-      [[ $# -lt 5 || $5 =~ ^(claude|codex|cursor)$ ]] || usage
-      # An area has the form of a name; whether it is one is read from shipline.json.
-      [[ $# -lt 6 ]] || is_hunt_name "$6" || usage
+      [[ $# -ge 3 ]] && is_hunt_name "$3" || usage
+      hunt=$3
+      shift 3
+      hunt_words=()
+      hunt_area=""
+      while (($#)); do
+        if [[ $1 == --area ]]; then
+          [[ $# -ge 2 && -z $hunt_area ]] && is_hunt_name "$2" || usage
+          hunt_area=$2
+          shift 2
+        else
+          hunt_words+=("$1")
+          shift
+        fi
+      done
+      ((${#hunt_words[@]} <= 3)) || usage
+      [[ ${hunt_words[0]-plan} =~ ^(plan|explore)$ ]] || usage
+      [[ ${hunt_words[1]-claude} =~ ^(claude|codex|cursor)$ ]] || usage
+      if ((${#hunt_words[@]} == 3)); then
+        [[ -z $hunt_area ]] && is_hunt_name "${hunt_words[2]}" || usage
+        hunt_area=${hunt_words[2]}
+      fi
       find_main_checkout
-      cmd_start_hunt "$3" "${4:-plan}" "${5:-claude}" "${6:-}"
+      cmd_start_hunt "$hunt" "${hunt_words[0]-plan}" "${hunt_words[1]-claude}" "$hunt_area"
       exit 0
     fi
     if [[ ${2:-} == analyst ]]; then

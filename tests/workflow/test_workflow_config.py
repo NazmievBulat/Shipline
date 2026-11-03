@@ -2325,11 +2325,14 @@ def test_generated_config_keeps_original_values_and_documents_command_waits(tmp_
     original = json.loads((_CONFIG_FIXTURES / "example.input.json").read_text())
     waits = {"wait_exit": [75], "wait_output": "^checks temporarily unavailable"}
     original["commands"]["pre_train_checks"].update(waits)
+    original["hunts"].update(settings={"FEATURE_EXAMPLE": "off"},
+                             area_settings={"phone": {"FEATURE_EXAMPLE": "on"}})
     generated = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
     assert generated == original
     _write(repo, generated)
     expected = json.loads((_CONFIG_FIXTURES / "example.json").read_text())
     expected["values"]["commands"]["pre_train_checks"].update(waits)
+    expected["values"]["hunts"].update(original["hunts"])
     assert _as_json(workflow_config.load(repo)) == expected["values"]
 
 
@@ -2439,6 +2442,9 @@ def test_config_sections_keep_existing_positional_constructors() -> None:
         "workflow-tests", "runner-tests", "known"
     )
     assert workflow_config.CloudPrePush().suites == ()
+    hunts = workflow_config.Hunts({"phone": ("/calls",)}, "docs/hunt-plans.md")
+    assert hunts.plans == "docs/hunt-plans.md"
+    assert hunts.settings == hunts.area_settings == {}
 
 
 @pytest.mark.parametrize("key", ["settings", "area_settings"])
@@ -2468,3 +2474,11 @@ def test_hunt_settings_keep_literal_and_empty_values(tmp_path: Path) -> None:
     config = workflow_config.load(repo)
     assert config.hunts.settings == settings
     assert config.hunts.area_settings == {"phone": {"FEATURE": "on"}}
+
+
+@pytest.mark.parametrize("value", [[], None, "phone"])
+def test_area_settings_require_an_object(tmp_path: Path, value: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"hunts": {"area_settings": value}})
+    with pytest.raises(workflow_config.ConfigError, match="hunts.area_settings"):
+        workflow_config.load(repo)
