@@ -53,7 +53,8 @@ else:
     elif path.endswith("/pulls"):
         assert payload["draft"] is True and payload["base"] == "main"
         assert payload["head"].startswith("ticket/dependency-watch-")
-        answer = {**payload, "number": 19, "labels": []}
+        answer = {**payload, "number": 19, "labels": [],
+                  "head": {"ref": payload["head"], "repo": {"full_name": "example-org/example-app"}}}
         prs.append(answer)
         (state / "prs.json").write_text(json.dumps(prs))
     elif path.endswith("/labels"):
@@ -465,6 +466,16 @@ def test_bun_bulk_report_uses_published_fixes_and_aliases(watch: Workflow, patch
 
 def test_empty_bun_bulk_report_is_clean(watch: Workflow) -> None:
     (watch.state / "bun.json").write_text("{}")
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    assert not _calls(watch)
+
+
+def test_a_fork_cannot_obtain_workflow_labels_by_copying_the_marker(watch: Workflow) -> None:
+    _prs(watch, {"number": 3, "title": "fix(deps): example-lib", "body": MARKER,
+                 "draft": True, "labels": [], "head": {
+                     "ref": "ticket/dependency-watch-example", "repo": {"full_name": "contributor/example-app"},
+                 }})
     done = watch.shipline("dependency-watch")
     assert done.returncode == 0, done.stderr
     assert not _calls(watch)

@@ -289,9 +289,10 @@ def reconcile(config: workflow_config.Config, head: str, findings: list[Finding]
     for pr in prs:
         if not (pr.get("draft") and MARKER in (pr.get("body") or "")):
             continue
-        branch = pr.get("head", {})
-        branch = branch.get("ref", "") if isinstance(branch, dict) else branch
-        if not branch.startswith("ticket/dependency-watch-"):
+        head_ref = pr.get("head") or {}
+        repository = head_ref.get("repo") or {}
+        if (repository.get("full_name") != config.repository
+                or not head_ref.get("ref", "").startswith("ticket/dependency-watch-")):
             continue
         matching = [item for item in fixable if covered(item, pr)]
         if not matching:
