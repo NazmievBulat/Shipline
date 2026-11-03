@@ -688,6 +688,29 @@ def test_response_message_does_not_persist_tokens_or_other_body_fields(
     assert json.loads(log)["message"].startswith("secondary rate limit ")
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("pr", "merge", "7", "--squash", "--body", "BODY-SECRET"),
+        ("pr", "create", "--fill", "--body", "BODY-SECRET"),
+        ("pr", "comment", "7", "--edit-last", "--body", "BODY-SECRET"),
+        ("pr", "merge", "7", "--squash", "-b", "BODY-SECRET"),
+        ("pr", "create", "--fill", "--body-file", "BODY-FILE-SECRET"),
+        ("api", "--unknown-switch", "--header", "Token: HEADER-SECRET"),
+        ("api", "--unknown-switch", "--raw-field", "body=BODY-SECRET"),
+        ("pr", "create", "--body", "--BODY-SECRET"),
+    ],
+)
+def test_boolean_flags_cannot_hide_the_following_sensitive_option(
+    host: Path, arguments: tuple[str, ...]
+) -> None:
+    _answer(host, status=429, headers={}, body='{"message":"Slow down"}', exit=1)
+    assert _run("call", *arguments).returncode == 1
+    log = (host / ".local/state/workflow/github-budget/requests.jsonl").read_text()
+    assert "SECRET" not in log
+    assert json.loads(log)["throttled"] is True
+
+
 def test_report_skips_bad_lines_and_shows_only_throttles_in_its_window(
     host: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
