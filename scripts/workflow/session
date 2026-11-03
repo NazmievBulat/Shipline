@@ -1030,7 +1030,7 @@ cmd_start_hunt() {
   wait_for_resources
 
   mkdir -p "$report"
-  python3 "$script_dir/hunt_settings.py" prepare "$worktree" "$report" "$area"
+  env "${session_config[@]}" python3 "$script_dir/hunt_settings.py" prepare "$worktree" "$report" "$area"
   if [[ $(<"$worktree/$SHIPLINE_STATE_FOLDER/hunt-settings.json") != '{}' ]]; then
     [[ $prompt == *. ]] || prompt+=.
     prompt+=" Keep the settings already recorded at the top of report.md when writing the report."
@@ -1048,7 +1048,7 @@ cmd_start_hunt() {
       label=Codex
     fi
     if ! launch "$name" "$worktree" "$command" "WORKFLOW_HUNT_REPORT=$report"; then
-      python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
+      env "${session_config[@]}" python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
       rmdir "$report" 2>/dev/null || true
       exit 1
     fi
@@ -1063,7 +1063,7 @@ cmd_start_hunt() {
       cat "$report/$program.log" >&2 2>/dev/null || true
       stop_session "$name"
       rm -f "$report/$program.log"
-      python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
+      env "${session_config[@]}" python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
       rmdir "$report" 2>/dev/null || true
       exit 1
     fi
@@ -1074,7 +1074,7 @@ cmd_start_hunt() {
     if ! launch "$name" "$worktree" \
         "claude --effort $HUNT_EFFORT --add-dir $report --remote-control $name \"$prompt\"" \
         "WORKFLOW_HUNT_REPORT=$report"; then
-      python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
+      env "${session_config[@]}" python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
       rmdir "$report" 2>/dev/null || true
       exit 1
     fi
@@ -1082,7 +1082,7 @@ cmd_start_hunt() {
     touch "$worktree/$SHIPLINE_STATE_FOLDER/$name.started"
     if ! wait_for_link "$name"; then
       stop_session "$name"
-      python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
+      env "${session_config[@]}" python3 "$script_dir/hunt_settings.py" discard "$worktree" "$report" "$area"
       rmdir "$report" 2>/dev/null || true
       exit 1
     fi

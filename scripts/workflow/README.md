@@ -253,8 +253,7 @@ A hunt's app can receive environment settings from `hunts.settings`, with
 `shipline session start hunt example-hunt --area phone`; the existing area argument after
 kind and program also works. Without an area, only shared settings apply. Names start with
 a capital letter and contain only capital letters, digits and underscores; values are strings
-without newlines or NUL. These are app settings, not secrets: their names and values are
-recorded at the top of `report.md`.
+without newlines or NUL. Their names and values are recorded at the top of `report.md`.
 
 The settings are saved when the hunt starts. `shipline hunt-app start`, `fresh` and `restart`
 from its worktree use the saved values even if the installation config changes. Settings are

@@ -402,3 +402,28 @@ def test_two_hunt_apps_keep_their_own_area_settings(workflow: Workflow) -> None:
         done = workflow.shipline("hunt-app", "fresh", cwd=workflow.hunt_worktree(name))
         assert done.returncode == 0, done.stderr
         assert done.stdout == area
+
+
+
+def test_hunt_settings_use_the_selected_relative_config_home(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    caller = workflow.repo / "nested"
+    caller.mkdir()
+    config_home = caller / "config-home"
+    installation = config_home / "shipline/example-org-example-app"
+    installation.mkdir(parents=True)
+    config = json.loads((workflow.repo / "shipline.json").read_text())
+    config.update(state_folder=".local/hunt-state", hunts={"settings": {"FEATURE": "on"}})
+    (installation / "shipline.json").write_text(json.dumps(config))
+    workflow.fake("hunt-app", '#!/bin/bash\nprintf "%s" "$FEATURE"\n')
+
+    started = workflow.shipline("session", "start", "hunt", "one", cwd=caller,
+                               env={"XDG_CONFIG_HOME": "config-home"})
+
+    assert started.returncode == 0, started.stderr
+    report = (workflow.hunt_report("one") / "report.md").read_text()
+    assert json.loads(report.split("```json\n", 1)[1].split("\n```", 1)[0]) == {"FEATURE": "on"}
+    done = workflow.shipline("hunt-app", "fresh", cwd=workflow.hunt_worktree("one"),
+                            env={"XDG_CONFIG_HOME": str(config_home)})
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "on"
