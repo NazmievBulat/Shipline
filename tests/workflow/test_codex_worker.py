@@ -485,6 +485,41 @@ def test_other_codex_payload_does_nothing(workflow: Workflow, payload: str) -> N
     assert not list(workflow.notes(7).glob("*.idle"))
 
 
+@pytest.mark.parametrize("style", ["2", "90", "38;5;244", "38;2;153;153;153", ""])
+def test_codex_resend_ignores_styled_placeholder_but_preserves_the_same_typed_words(
+    workflow: Workflow, style: str
+) -> None:
+    _codex(workflow)
+    words = "Ask Codex to do anything"
+    placeholder = f"\x1b[{style}m{words}\x1b[0m" if style else words
+    workflow.screen(
+        "■ You've hit your usage limit. Try again at 2026-10-15 16:00 UTC.\n"
+        f"› {placeholder}\n\n  ? for shortcuts\n", "codex-7",
+    )
+    workflow.screen("────────\n> \n────────\n", "ticket-7")
+    tmux = workflow.bin / "tmux"
+    tmux.write_text(tmux.read_text().replace(
+        '    cat "$screen"',
+        '    case " $* " in\n'
+        '      *" -e "*) cat "$screen" ;;\n'
+        "      *) sed -E 's/\\x1b\\[[0-?]*[ -/]*[@-~]//g' \"$screen\" ;;\n"
+        "    esac",
+    ))
+
+    done = workflow.run("resend", "ticket-7", env={"TZ": "UTC"})
+
+    calls = workflow.calls("tmux codex-7 send-keys")
+    if style:
+        assert done.returncode == 0, done.stderr
+        assert len(calls) == 2
+        assert instruction("Implement pull request 7") in calls[0]
+        assert calls[1].endswith(" Enter")
+    else:
+        assert done.returncode != 0
+        assert calls == []
+        assert workflow.calls("tmux ticket-7 send-keys") == []
+
+
 def test_codex_limit_is_listed_and_resend_goes_to_codex_once(workflow: Workflow) -> None:
     _codex(workflow)
     workflow.screen(

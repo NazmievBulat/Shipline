@@ -198,6 +198,103 @@ def test_stripping_escapes_leaves_what_a_plain_capture_shows() -> None:
     assert done.stdout == "\u2500\u2500 ok\n"
 
 
+def _visible_input(text: str) -> str:
+    return subprocess.run(
+        ["bash", "-c", 'source "$1"; nonblank_input', "bash", str(SCRIPTS / "input-box")],
+        input="❯\u00a0" + text + "\n", capture_output=True, text=True, check=True,
+    ).stdout
+
+
+@pytest.mark.parametrize(
+    ("style", "words"),
+    [
+        ("2", "Ask Codex to do anything"),
+        ("90", "go on"),
+        ("38;5;244", "continue"),
+        ("38;2;153;153;153", "1, approve wording"),
+        ("38:5:244", "go on"),
+        ("38:2::153:153:153", "continue"),
+        ("38:2:0:153:153:153", "1, approve wording"),
+    ],
+)
+@pytest.mark.parametrize("decorated", [True, False])
+def test_placeholder_words_are_decoration_only_when_the_terminal_styles_them(
+    style: str, words: str, decorated: bool
+) -> None:
+    text = f"\x1b[{style}m{words}\x1b[0m" if decorated else words
+    assert _visible_input(text) == ("" if decorated else "\u00a0" + words + "\n")
+
+
+@pytest.mark.parametrize("colour", [8, 59, 232, 244, 255])
+def test_indexed_grey_foreground_is_decoration(colour: int) -> None:
+    assert _visible_input(f"\x1b[38;5;{colour}mcontinue\x1b[39m") == ""
+
+
+@pytest.mark.parametrize(
+    "style",
+    ["37", "97", "39", "38;5;231", "38;5;16", "38;5;60", "38;2;12;34;56",
+     "48;2;153;153;153", "58;5;244"],
+)
+def test_normal_foregrounds_and_grey_backgrounds_never_hide_typed_text(style: str) -> None:
+    assert _visible_input(f"\x1b[{style}mcontinue\x1b[0m") == "\u00a0continue\n"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("\x1b[90mghost\x1b[39mtyped", "\u00a0typed\n"),
+        ("\x1b[90mghost\x1b[22mstill grey\x1b[39mtyped", "\u00a0typed\n"),
+        ("\x1b[2;90mghost\x1b[22mstill grey\x1b[39mtyped", "\u00a0typed\n"),
+        ("\x1b[38;5;244mghost\nmore\x1b[39mtyped", "typed\n"),
+        ("\x1b[90mghost\x1b[0mtyped", "\u00a0typed\n"),
+        ("\x1b[90mghost\x1b[37mtyped", "\u00a0typed\n"),
+    ],
+)
+def test_grey_and_dim_state_follow_terminal_resets_across_rows(text: str, expected: str) -> None:
+    assert _visible_input(text) == expected
+
+
+@pytest.mark.parametrize("style", ["2", "90", "38;5;244", "38;2;153;153;153"])
+@pytest.mark.parametrize("typed", ["neither", "native", "bridge"])
+def test_a_codex_reviewer_wakes_through_decorations_but_never_through_typed_words(
+    workflow: Workflow, style: str, typed: str
+) -> None:
+    workflow.add_worktree(7, draft=False)
+    workflow.running("review-7")
+    workflow.running("codex-7")
+    notes = workflow.notes(7)
+    notes.mkdir(parents=True)
+    for marker in ("codex", "checks-wait", "bridge-stopped"):
+        (notes / f"review-7.{marker}").touch()
+    turn = '{"last-assistant-message":"Waiting for checks","turn-id":"one"}'
+    (notes / "review-7.codex-turn.json").write_text(turn)
+    (notes / "review-7.codex-delivered").write_text(turn)
+    native = "Ask Codex to do anything"
+    bridge = "continue"
+    if typed != "native":
+        native = f"\x1b[{style}m{native}\x1b[0m"
+    if typed != "bridge":
+        bridge = f"\x1b[{style}m{bridge}\x1b[0m"
+    workflow.screen(f"Done.\n› {native}\n\n  ? for shortcuts\n", "codex-7")
+    rule = "─" * 40
+    workflow.screen(f"Done.\n{rule}\n❯\u00a0{bridge}\n{rule}\n", "review-7")
+
+    done = workflow.run("checks-finished", "review-7", "a" * 40)
+
+    calls = workflow.calls("tmux codex-7 send-keys")
+    if typed == "neither":
+        assert done.returncode == 0, done.stderr
+        assert len(calls) == 2
+        assert "-l Workflow update: " in calls[0]
+        assert calls[1].endswith(" Enter")
+        assert not (notes / "review-7.checks-wait").exists()
+    else:
+        assert done.returncode != 0
+        assert calls == []
+        assert (notes / "review-7.checks-wait").exists()
+    assert workflow.calls("tmux review-7 send-keys") == []
+
+
 @pytest.mark.parametrize("action", ["checks-finished", "resend", "bridge-empty"])
 @pytest.mark.parametrize("typed", [False, True])
 def test_suggestions_allow_wakes_but_typed_text_still_blocks_them(
