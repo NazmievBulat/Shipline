@@ -1,9 +1,119 @@
 """Suggestions are decoration; only the owner's visible input blocks a wake."""
 
+import os
 import subprocess
 
 import pytest
 from workflow_harness import SCRIPTS, Workflow, instruction
+
+_STATUS = (
+    "Status check: if what you were waiting for is done, carry on; if not, run "
+    "`scripts/workflow/notify waiting` and end your turn."
+)
+
+
+def _bordered_input(
+    workflow: Workflow, *, width: int = 72, footer: str = "rules", text: str = ""
+) -> None:
+    """Draw a padded right border and a status row after the ordinary input box."""
+    workflow.add_worktree(7)
+    workflow.running("review-7")
+    workflow.notes(7).mkdir(parents=True)
+    (workflow.notes(7) / "review-7.idle").touch()
+    workflow.screen("Waiting.\n" + "─" * width + "\n> \n" + "─" * width + "\n", "review-7")
+    (workflow.state / "input-review-7").write_text(text)
+    tmux = workflow.bin / "tmux"
+    script = tmux.read_text().replace(
+        'lines[rules[-2] + 1:rules[-1]] = ["> " + text]',
+        "import textwrap\n    lines[rules[-2] + 1:rules[-1]] = "
+        f'[row.ljust({width}) for row in textwrap.wrap("> " + text, width={width}, '
+        'subsequent_indent="  ", replace_whitespace=False) or ["> "]]',
+    )
+    status = (
+        ["─" * width, "Status: waiting", "─" * width]
+        if footer == "rules"
+        else ["─" * 20 + " Status: waiting " + "─" * 20]
+    )
+    script = script.replace(
+        'print("\\n".join(lines))',
+        f"lines += {status!r}\n"
+        f'print("\\n".join(row.ljust({width}) + "\\x1b[90m│\\x1b[0m" for row in lines))',
+    )
+    tmux.write_text(script)
+
+
+@pytest.mark.parametrize("width", [72, 240])
+@pytest.mark.parametrize("footer", ["rules", "inline"])
+def test_bordered_input_below_a_status_rule_is_found_matched_and_submitted(
+    workflow: Workflow, width: int, footer: str
+) -> None:
+    _bordered_input(workflow, width=width, footer=footer)
+
+    done = workflow.run("status-check", "review-7")
+
+    assert done.returncode == 0, done.stderr
+    assert workflow.calls("tmux review-7 send-keys") == [
+        f"tmux review-7 send-keys -t =review-7: -l {_STATUS}",
+        "tmux review-7 send-keys -t =review-7: Enter",
+    ]
+    assert not (workflow.notes(7) / "review-7.typed").exists()
+    assert (workflow.state / "input-review-7").read_text() == ""
+
+
+@pytest.mark.parametrize("width", [72, 240])
+def test_a_bordered_input_retry_submits_only_the_ticks_own_text(
+    workflow: Workflow, width: int
+) -> None:
+    _bordered_input(workflow, width=width)
+    now = 1_790_000_000
+    waiting = workflow.notes(7) / "review-7.job-wait"
+    waiting.touch()
+    os.utime(waiting, (now - 3000, now - 3000))
+    (workflow.state / "swallow-enter-review-7").write_text("2")
+
+    first = workflow.run_script("tick", env={"WORKFLOW_NOW": str(now)})
+
+    assert first.returncode != 0
+    assert (workflow.notes(7) / "review-7.typed").read_text() == _STATUS
+    second = workflow.run_script("tick", env={"WORKFLOW_NOW": str(now + 180)})
+
+    assert second.returncode == 0, second.stderr
+    assert workflow.calls("tmux review-7 send-keys") == [
+        f"tmux review-7 send-keys -t =review-7: -l {_STATUS}",
+        "tmux review-7 send-keys -t =review-7: Enter",
+        "tmux review-7 send-keys -t =review-7: Enter",
+        "tmux review-7 send-keys -t =review-7: Enter",
+    ]
+    assert not (workflow.notes(7) / "review-7.typed").exists()
+    assert (workflow.state / "input-review-7").read_text() == ""
+
+
+@pytest.mark.parametrize("text", ["Owner draft", _STATUS + " │", _STATUS + " ││", _STATUS + " more"])
+def test_bordered_owner_text_is_never_submitted_even_with_an_automation_note(
+    workflow: Workflow, text: str
+) -> None:
+    _bordered_input(workflow, text=text)
+    (workflow.notes(7) / "review-7.typed").write_text(_STATUS)
+
+    done = workflow.run("status-check", "review-7")
+
+    assert done.returncode == 3
+    assert workflow.calls("tmux review-7 send-keys") == []
+    assert (workflow.state / "input-review-7").read_text() == text
+
+
+def test_owner_edits_in_a_bordered_box_during_paste_settling_are_not_submitted(
+    workflow: Workflow,
+) -> None:
+    _bordered_input(workflow)
+    visible = workflow.state / "input-review-7"
+    (workflow.state / "on-sleep").write_text(f'echo "Owner edited the input" > "{visible}"')
+
+    done = workflow.run("status-check", "review-7")
+
+    assert done.returncode != 0
+    assert "input changed before Enter" in done.stderr
+    assert workflow.calls("tmux review-7 send-keys -t =review-7: Enter") == []
 
 
 @pytest.mark.parametrize(
