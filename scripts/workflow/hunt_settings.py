@@ -15,19 +15,20 @@ def header(report: Path, area: str, settings: dict[str, str]) -> str:
             f"## Settings\n\n```json\n{recorded}\n```\n\n")
 
 
+def write_private(path: Path, text: str) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(text)
+
+
 def prepare(worktree: Path, report: Path, area: str) -> None:
     config = load()
     settings = {**config.hunts.settings, **config.hunts.area_settings.get(area, {})}
     snapshot = config.state(worktree) / "hunt-settings.json"
     snapshot.parent.mkdir(parents=True, exist_ok=True)
     # The snapshot is data, never shell source. Keep installation values private.
-    with snapshot.open("x", opener=lambda path, flags: os.open(path, flags, 0o600)) as stream:
-        json.dump(settings, stream)
-        stream.write("\n")
-    with (report / "report.md").open(
-        "x", opener=lambda path, flags: os.open(path, flags, 0o600)
-    ) as stream:
-        stream.write(header(report, area, settings))
+    write_private(snapshot, json.dumps(settings) + "\n")
+    write_private(report / "report.md", header(report, area, settings))
 
 
 def discard(worktree: Path, report: Path, area: str) -> None:
