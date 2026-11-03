@@ -345,10 +345,10 @@ def _safe_arguments(arguments: tuple[str, ...], token: str | None = None) -> lis
     result: list[str] = []
     hide_next = False
     for argument in arguments:
-        if hide_next:
-            result.append("[redacted]")
-            hide_next = False
-            continue
+        hidden = hide_next
+        hide_next = False
+        # Even a hidden value may be an option after a boolean flag. Parse it too,
+        # so ambiguity can only redact extra arguments, never expose a body/token.
         flag, equal, _ = argument.partition("=")
         if argument.startswith("--") and equal:
             argument = argument if flag in safe_values else flag + "=[redacted]"
@@ -356,11 +356,12 @@ def _safe_arguments(arguments: tuple[str, ...], token: str | None = None) -> lis
             if not argument.startswith("--") and len(argument) > 2:
                 if argument[:2] not in safe_values:
                     argument = argument[:2] + "[redacted]"
+                    hide_next = True
             else:
                 hide_next = True
         if "?" in argument:
             argument = argument.split("?", 1)[0] + "?[redacted]"
-        result.append(_redact(argument, token))
+        result.append("[redacted]" if hidden else _redact(argument, token))
     return result
 
 
