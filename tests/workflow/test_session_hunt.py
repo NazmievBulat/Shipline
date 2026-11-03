@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 import pytest
-from workflow_harness import Workflow, session_arguments
+from workflow_harness import Workflow, install_shipline, session_arguments
 
 _AREAS = {"phone": ["/calls", "/contacts"], "billing": ["/invoices", "/settings/billing"]}
 _RULES = "by the section Hunt for bugs of AGENTS.md in this worktree"
@@ -311,3 +311,48 @@ def _nothing_started(workflow: Workflow, name: str) -> None:
     assert not workflow.is_running(f"hunt-{name}")
     assert not workflow.hunt_worktree(name).exists()
     assert not workflow.hunt_report(name).exists()
+
+
+@pytest.mark.parametrize("area", [(), ("--area", "phone"), ("plan", "claude", "phone")])
+def test_hunt_app_keeps_settings_for_start_fresh_and_restart(workflow: Workflow, area: tuple[str, ...]) -> None:
+    install_shipline(workflow)
+    _configure(workflow)
+    path = workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    shared = {"FEATURE": "off", "SHARED": "a 'quote' $value `word` = \\ end", "EMPTY": ""}
+    config["hunts"].update(settings=shared, area_settings={"phone": {"FEATURE": "on", "PHONE": "yes"}})
+    path.write_text(json.dumps(config))
+    workflow.fake("hunt-app", '#!/bin/bash\npython3 -c \'import json, os; print(json.dumps({k: os.environ.get(k) for k in ("FEATURE", "SHARED", "EMPTY", "PHONE")}))\'\n')
+    started = _start(workflow, "one", *area)
+    assert started.returncode == 0, started.stderr
+    expected = {**shared, **({"FEATURE": "on", "PHONE": "yes"} if area else {})}
+    report = (workflow.hunt_report("one") / "report.md").read_text()
+    recorded = json.loads(report.split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert recorded == expected
+    assert "Settings" in report
+    # Editing the installation after launch must not alter this hunt's copy.
+    config["hunts"]["settings"] = {"FEATURE": "changed"}
+    config["hunts"]["area_settings"] = {}
+    path.write_text(json.dumps(config))
+    worktree = workflow.hunt_worktree("one")
+    nested = worktree / "nested"
+    nested.mkdir()
+    for command in ("start", "fresh", "restart"):
+        done = workflow.shipline("hunt-app", command, cwd=nested)
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout) == {**expected, "PHONE": expected.get("PHONE")}
+    hunter_env = (workflow.state / "env" / "hunt-one").read_text()
+    assert "FEATURE=" not in hunter_env
+    # A configured app run outside a hunt does not acquire hunt settings.
+    ordinary = workflow.shipline("hunt-app", "start")
+    assert ordinary.returncode == 0, ordinary.stderr
+    assert all(value is None for value in json.loads(ordinary.stdout).values())
+
+
+@pytest.mark.parametrize("words", [("--area",), ("--area", "phone", "--area", "billing"),
+                                    ("plan", "claude", "phone", "--area", "billing")])
+def test_an_incomplete_or_duplicate_area_option_is_refused(workflow: Workflow, words: tuple[str, ...]) -> None:
+    _configure(workflow)
+    done = _start(workflow, "one", *words)
+    assert done.returncode == 2
+    _nothing_started(workflow, "one")

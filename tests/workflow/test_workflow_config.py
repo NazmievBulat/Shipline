@@ -85,7 +85,7 @@ _DEFAULTS = {
     "machines": [],
     # The branches the merge gate tests its prefixes on are named by this, then a random name.
     "merge": {"scratch_prefix": "workflow/merge-batch-"},
-    "hunts": {"areas": {}, "plans": None},
+    "hunts": {"areas": {}, "plans": None, "settings": {}, "area_settings": {}},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
     "commands": {
         name: None
@@ -382,7 +382,7 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
         # The hunt areas and the suites are named by the repository, not by Shipline.
         if (
             not isinstance(value, dict)
-            or prefix in (".hunts.areas", ".cloud_pre_push.suites")
+            or prefix in (".hunts.areas", ".hunts.settings", ".hunts.area_settings", ".cloud_pre_push.suites")
             or prefix.startswith(".commands.")
         ):
             return {prefix}
@@ -2439,3 +2439,32 @@ def test_config_sections_keep_existing_positional_constructors() -> None:
         "workflow-tests", "runner-tests", "known"
     )
     assert workflow_config.CloudPrePush().suites == ()
+
+
+@pytest.mark.parametrize("key", ["settings", "area_settings"])
+@pytest.mark.parametrize("value", [[], None, "on", {"bad_name": "on"}, {"_FLAG": "on"},
+                                   {"1FLAG": "on"}, {"FLAG": True}, {"FLAG": 1},
+                                   {"FLAG": "on\noff"}, {"FLAG": "on\roff"}, {"FLAG": "on\0off"}])
+def test_invalid_hunt_settings_are_refused_at_load(tmp_path: Path, key: str, value: Any) -> None:
+    repo = _repository(tmp_path)
+    hunts = {"areas": {"phone": ["/calls"]}, key: value if key == "settings" else {"phone": value}}
+    _write(repo, {"hunts": hunts})
+    with pytest.raises(workflow_config.ConfigError, match=f"hunts.{key}"):
+        workflow_config.load(repo)
+
+
+def test_area_settings_require_a_configured_area(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"hunts": {"area_settings": {"missing": {"FLAG": "on"}}}})
+    with pytest.raises(workflow_config.ConfigError, match="hunts.area_settings.*missing"):
+        workflow_config.load(repo)
+
+
+def test_hunt_settings_keep_literal_and_empty_values(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    settings = {"FLAG_2": "", "FEATURE": "a 'quote' $value `word` = \\ end"}
+    _write(repo, {"hunts": {"areas": {"phone": ["/calls"]}, "settings": settings,
+                              "area_settings": {"phone": {"FEATURE": "on"}}}})
+    config = workflow_config.load(repo)
+    assert config.hunts.settings == settings
+    assert config.hunts.area_settings == {"phone": {"FEATURE": "on"}}
