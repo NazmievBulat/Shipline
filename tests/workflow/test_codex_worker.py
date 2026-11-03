@@ -1540,3 +1540,170 @@ def test_list_shows_the_limit_of_codex_and_its_bridge_once(workflow: Workflow) -
     assert "ticket-7  busy  510 MB held (limit 8 GB each)  0 MB in swap" in (
         workflow.run("list").stdout.splitlines()
     )
+
+
+_CAPACITY = "■ Selected model is at capacity. Please try a different model.\n› \n"
+_CAPACITY_PROMPT = "The model was at capacity. Continue where you stopped."
+_CAPACITY_NOW = 1_792_080_000
+
+
+def _capacity_session(workflow: Workflow, kind: str = "ticket") -> tuple[str, str, Path]:
+    if kind == "hunt":
+        worktree = workflow.add_hunt("example")
+        (workflow.hunt_report("example") / "codex.log").touch()
+        name = target = "hunt-example"
+        notes = worktree / ".local/workflow"
+    else:
+        workflow.add_worktree(7, draft=kind == "ticket")
+        name, target = f"{kind}-7", "codex-7"
+        notes = workflow.notes(7)
+        notes.mkdir(parents=True, exist_ok=True)
+        (notes / f"{name}.codex").touch()
+        workflow.running(target)
+    workflow.running(name)
+    workflow.screen(_CAPACITY, target)
+    return name, target, notes
+
+
+def _capacity_tick(workflow: Workflow, seconds: int = 0, shadow: bool = False) -> None:
+    done = workflow.run_script(
+        "tick", *(["--shadow"] if shadow else []),
+        env={"WORKFLOW_NOW": str(_CAPACITY_NOW + seconds)},
+    )
+    assert done.returncode == 0, done.stderr
+
+
+@pytest.mark.parametrize("kind", ["ticket", "review", "hunt"])
+def test_capacity_retries_once_after_five_minutes(workflow: Workflow, kind: str) -> None:
+    _, target, _ = _capacity_session(workflow, kind)
+    _keys(workflow)
+    _capacity_tick(workflow)
+    _capacity_tick(workflow, 299)
+    assert not workflow.calls(f"tmux {target} send-keys")
+    assert "limit" not in workflow.run("list").stdout
+
+    _capacity_tick(workflow, 300)
+    _capacity_tick(workflow, 3600)
+
+    assert workflow.calls(f"tmux {target} send-keys") == [
+        f"tmux {target} send-keys -t ={target}: -l {_CAPACITY_PROMPT}",
+        f"tmux {target} send-keys -t ={target}: Enter",
+    ]
+    assert workflow.pushes() == []
+    assert "sleep 0.2" in workflow.calls("sleep")
+
+
+@pytest.mark.parametrize(
+    "blocked",
+    ["working", "typed", "wrapped-input", "owner-blocked", "interaction-blocked",
+     "asking", "owner-reply", "bridge-input", "permission", "old-error", "shell"],
+)
+def test_capacity_leaves_busy_or_owner_panes_alone(workflow: Workflow, blocked: str) -> None:
+    name, target, notes = _capacity_session(workflow)
+    if blocked == "working":
+        workflow.screen(_CAPACITY + "• Working (5s • esc to interrupt)\n", target)
+    elif blocked == "typed":
+        workflow.screen(_CAPACITY.rstrip() + "My draft\n", target)
+    elif blocked == "wrapped-input":
+        workflow.screen(_CAPACITY + "  my draft continues here\n", target)
+    elif blocked == "bridge-input":
+        workflow.screen("────\n> My draft\n────\n", name)
+    elif blocked == "permission":
+        workflow.screen(_CAPACITY + "Press enter to confirm or esc to cancel\n", target)
+    elif blocked == "old-error":
+        workflow.screen(_CAPACITY + "› Continue\n• Done.\n› \n", target)
+    elif blocked == "shell":
+        workflow.screen(_CAPACITY.splitlines()[0] + "\n$ \n", target)
+    else:
+        (notes / f"{name}.{blocked}").touch()
+    _capacity_tick(workflow)
+    _capacity_tick(workflow, 300)
+    _capacity_tick(workflow, 3600)
+    assert not workflow.calls(f"tmux {target} send-keys")
+
+
+def test_capacity_rechecks_owner_state_at_delivery(workflow: Workflow) -> None:
+    name, target, notes = _capacity_session(workflow)
+    _capacity_tick(workflow)
+    (notes / f"{name}.owner-blocked").touch()
+    _capacity_tick(workflow, 300)
+    assert not workflow.calls(f"tmux {target} send-keys")
+    (notes / f"{name}.owner-blocked").unlink()
+    _capacity_tick(workflow, 301)
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 2
+
+
+def test_capacity_backoff_and_wake_are_once_per_stop(workflow: Workflow) -> None:
+    name, target, _ = _capacity_session(workflow)
+    workflow.orchestrator(status="busy")
+    _capacity_tick(workflow)
+    _capacity_tick(workflow, 300)
+    # A new output block can appear between ticks, including identical error words.
+    workflow.screen("› First retry\n" + _CAPACITY, target)
+    _capacity_tick(workflow, 301)
+    _capacity_tick(workflow, 1200)
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 2
+    _capacity_tick(workflow, 1201)
+    _capacity_tick(workflow, 1202)
+    line = f"codex at capacity: {name} (15 min)"
+    assert sum(message.count(line) for message in workflow.sent()) == 1
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 4
+
+    for start in (1203, 3005):
+        workflow.screen(f"› Retry at {start}\n" + _CAPACITY, target)
+        _capacity_tick(workflow, start)
+        before = len(workflow.calls(f"tmux {target} send-keys"))
+        _capacity_tick(workflow, start + 1799)
+        assert len(workflow.calls(f"tmux {target} send-keys")) == before
+        _capacity_tick(workflow, start + 1800)
+        assert len(workflow.calls(f"tmux {target} send-keys")) == before + 2
+
+
+def test_capacity_recovery_starts_a_new_stop_even_with_identical_screen(workflow: Workflow) -> None:
+    _, target, _ = _capacity_session(workflow)
+    _capacity_tick(workflow)
+    _capacity_tick(workflow, 300)
+    workflow.screen("• Working (5s • esc to interrupt)\n› \n", target)
+    _capacity_tick(workflow, 301)
+    workflow.screen(_CAPACITY, target)
+    _capacity_tick(workflow, 302)
+    _capacity_tick(workflow, 1201)
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 2
+    _capacity_tick(workflow, 1202)
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 4
+
+
+@pytest.mark.parametrize("program", ["claude", "cursor"])
+def test_capacity_does_not_type_into_other_hunters(workflow: Workflow, program: str) -> None:
+    _, target, _ = _capacity_session(workflow, "hunt")
+    (workflow.hunt_report("example") / "codex.log").unlink()
+    if program == "cursor":
+        (workflow.hunt_report("example") / "cursor.log").touch()
+    _capacity_tick(workflow)
+    _capacity_tick(workflow, 300)
+    assert not workflow.calls(f"tmux {target} send-keys")
+
+
+def test_capacity_shadow_does_not_type_or_consume_retry(workflow: Workflow) -> None:
+    _, target, _ = _capacity_session(workflow)
+    _capacity_tick(workflow)
+    _capacity_tick(workflow, 300, shadow=True)
+    assert not workflow.calls(f"tmux {target} send-keys")
+    _capacity_tick(workflow, 300)
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 2
+
+
+def test_capacity_delivery_recovers_only_its_own_unsent_text(workflow: Workflow) -> None:
+    _, target, _ = _capacity_session(workflow)
+    _capacity_tick(workflow)
+    swallowed = workflow.state / f"swallow-enter-{target}"
+    swallowed.write_text("2\n")
+    done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_CAPACITY_NOW + 300)})
+    assert done.returncode == 1
+    assert "after two Enter attempts" in done.stderr
+    _capacity_tick(workflow, 301)
+    calls = workflow.calls(f"tmux {target} send-keys")
+    assert sum(" -l " in call for call in calls) == 1
+    assert sum(call.endswith(" Enter") for call in calls) == 3
+    _capacity_tick(workflow, 600)
+    assert workflow.calls(f"tmux {target} send-keys") == calls
