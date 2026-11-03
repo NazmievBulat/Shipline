@@ -48,6 +48,8 @@
 #                               automatic ticket start counts the minutes of room)
 #   session resend <name>       type the instruction of a worker or an audit into it again;
 #                               only for one that is stopped on the usage limit
+#   session capacity-stop <name>  print a fingerprint of a Codex capacity stop, if present
+#   session capacity-retry <name> continue a stopped Codex turn, protecting owner input
 #   session checks-finished <review-N> <head>
 #   session conflict-found <review-N> <head>
 #   session panel-finished <review-N> <head>
@@ -174,6 +176,7 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session room
        session squeeze|protect|unprotect|stop <ticket-N|audit-N|review-N|hunt-name|analyst-name>
        session resend <ticket-N|audit-N|review-N>
+       session capacity-stop|capacity-retry|would-capacity-retry <ticket-N|review-N|hunt-name>
        session checks-finished <review-N> <head>
        session conflict-found <review-N> <head>
        session panel-finished <review-N> <head>
@@ -304,6 +307,7 @@ forget_notes() {
   rm -f "$1.url" "$1.idle" "$1.pushed" "$1.area" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.limits"
   if [[ ${2:-} != keep-codex ]]; then
     rm -f "$1.waiting" "$1.checks-wait" "$1.job-wait"
+    rm -f "$1.capacity"
     rm -f "$1.started" "$1.codex" "$1.asking" "$1.resent" "$1.codex-delivered" "$1.codex-answered" "$1.codex-followed-up" "$1.codex-quota-delivered" "$1.codex-approval-delivered" "$1.codex-recovery-error" "$1.owner-reply"
   fi
 }
@@ -1372,7 +1376,7 @@ read_prompt_box() {
   screen=$(tmux -L "$name" capture-pane -p -e -J -t "=$name:" 2>/dev/null) ||
     die "cannot read the input box of $name"
   top=$(strip_ansi <<<"$screen" | LC_ALL=C awk '/^─/ { above = last; last = NR } END { print above + 0 }')
-  if [[ $name == codex-* ]]; then
+  if [[ $name == codex-* || ( $name == hunt-* && -f $(report_of "$name")/codex.log ) ]]; then
     local plain first last
     plain=$(strip_ansi <<<"$screen")
     read -r first last < <(LC_ALL=C awk '
@@ -1490,6 +1494,9 @@ send_codex_prompt() {
         die "$name is busy or waiting for the owner"
       cmp -s "$relay_notes.codex-turn.json" "$relay_notes.codex-delivered" ||
         die "$name has a turn its bridge has not relayed"
+    fi
+    if [[ $mode == capacity ]]; then
+      capacity_retry_allowed "$name" || exit 3
     fi
     screen=$(tmux -L "$target" capture-pane -p -J -t "=$target:") || die "cannot read $target"
     screen=${screen%"${screen##*[![:space:]]}"}
@@ -2032,13 +2039,100 @@ codex_limit() {
   resets="$(LC_ALL=C TZ=UTC date -d "@$at" '+%b %-d, %Y, %-I:%M%P') (UTC)"
 }
 
+# A paired worker/reviewer owns codex-N. A hunter's existing log identifies its program;
+# a noninteractive hunter without a Codex prompt cannot match a capacity stop.
+capacity_target_of() {
+  local name=$1
+  capacity_notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  if [[ $name =~ ^(ticket|review)-[0-9]+$ && -e $capacity_notes.codex ]]; then
+    capacity_target=codex-${name##*-}
+  elif [[ $name == hunt-* && -f $(report_of "$name")/codex.log ]]; then
+    capacity_target=$name
+  else
+    return 1
+  fi
+  is_running "$capacity_target"
+}
+
+# Only the last output immediately above the current prompt counts. Keep the visible
+# history in the fingerprint: another output block can arrive between two ticks, without
+# either tick seeing the intervening working row. Text inside the input box is excluded.
+cmd_capacity_stop() {
+  local capacity_target capacity_notes screen output tail sum
+  capacity_target_of "$1" || return 2
+  screen=$(tmux -L "$capacity_target" capture-pane -p -J -t "=$capacity_target:" 2>/dev/null) || return 2
+  ! LC_ALL=C grep -qE '^[[:space:]]*(•[[:space:]]*)?Working \(|^• .*\(.*esc to interrupt\)' <<<"$screen" || return 1
+  output=$(LC_ALL=C awk '
+    /^(›|>|❯)/ { prompt = NR }
+    { lines[NR] = $0 }
+    END {
+      if (!prompt) exit 1
+      for (i = 1; i < prompt; i++) print lines[i]
+    }
+  ' <<<"$screen") || return 1
+  tail=$(LC_ALL=C awk '
+    /^(›|>|❯)/ { tail = ""; next }
+    /^[[:space:]]*(■|•)?[[:space:]]*Selected model is at capacity/ { tail = ""; found = 1 }
+    { if (found) tail = tail $0 " " }
+    END { print tail }
+  ' <<<"$output")
+  LC_ALL=C grep -qE '^[[:space:]]*(■|•)?[[:space:]]*Selected model is at capacity\.?([[:space:]]*Please try a different model\.)?[[:space:]]*$' <<<"$tail" || return 1
+  sum=$(cksum <<<"$output")
+  echo "${sum%% *}"
+}
+
+capacity_retry_allowed() {
+  local name=$1 capacity_target capacity_notes suffix typed sending_resend=true screen
+  capacity_target_of "$name" || return 3
+  cmd_capacity_stop "$name" >/dev/null || return 3
+  for suffix in owner-blocked interaction-blocked asking owner-reply pushed; do
+    [[ ! -e $capacity_notes.$suffix ]] || return 3
+  done
+  if [[ $capacity_target != "$name" ]]; then
+    bash "$script_dir/bridge-empty" "$name" || return 3
+  fi
+  screen=$(tmux -L "$capacity_target" capture-pane -p -J -t "=$capacity_target:" 2>/dev/null) || return 3
+  [[ $screen != *"Press enter to confirm or esc to cancel"* ]] || return 3
+  name=$capacity_target
+  read_prompt_box
+  if [[ -n $typed ]]; then
+    [[ -r ${capacity_notes%/*}/$name.typed &&
+       $(cat "${capacity_notes%/*}/$name.typed") == "The model was at capacity. Continue where you stopped." ]] || return 3
+    holds_own_text "$name" || return 3
+  fi
+}
+
+cmd_capacity_retry() {
+  local name=$1 capacity_target capacity_notes
+  capacity_retry_allowed "$name" || return 3
+  capacity_target_of "$name" || return 3
+  if [[ $capacity_target == "$name" ]]; then
+    send_prompt "$name" "The model was at capacity. Continue where you stopped."
+  else
+    send_codex_prompt "$name" "The model was at capacity. Continue where you stopped." capacity
+  fi
+  snapshot_busy "$name"
+}
+
 # A shadow run (`tick --shadow`) reads the sessions and changes none, whoever calls this.
-if [[ -n ${SHIPLINE_SHADOW:-} && ! ${1:-} =~ ^(list|running|load|room|would-nudge|would-answer)$ ]]; then
+if [[ -n ${SHIPLINE_SHADOW:-} && ! ${1:-} =~ ^(list|running|load|room|would-nudge|would-answer|capacity-stop|would-capacity-retry)$ ]]; then
   echo "a shadow run does not run session ${1:-}" >&2
   exit 1
 fi
 
 case ${1:-} in
+  capacity-stop | capacity-retry | would-capacity-retry)
+    [[ $# -eq 2 ]] && { [[ $2 =~ ^(ticket|review)-[0-9]+$ ]] ||
+      { [[ $2 == hunt-* ]] && is_hunt_name "${2#hunt-}"; }; } || usage
+    find_main_checkout
+    if [[ $1 == capacity-stop ]]; then
+      cmd_capacity_stop "$2"
+    elif [[ $1 == would-capacity-retry ]]; then
+      capacity_retry_allowed "$2"
+    else
+      cmd_capacity_retry "$2"
+    fi
+    ;;
   start)
     check_load_per_processor
     check_session_limits
