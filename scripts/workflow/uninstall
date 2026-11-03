@@ -110,6 +110,14 @@ if [[ -n ${removed:-} ]]; then
   echo "the flow page is switched off"
 fi
 
+dependency=$units/dependency-watch.service
+if [[ -e $dependency ]] && grep -q '/bin/shipline" --repo ".*" dependency-watch$' "$dependency"; then
+  systemctl --user disable --now dependency-watch.timer
+  rm -f "$dependency" "$units/dependency-watch.timer"
+  systemctl --user daemon-reload
+  echo "the dependency watch is switched off"
+fi
+
 link=$HOME/.local/bin/shipline
 if [[ -L $link && $(readlink "$link") == "$launcher" ]]; then
   rm -f "$link"

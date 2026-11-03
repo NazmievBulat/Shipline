@@ -548,6 +548,15 @@ class Config:
         example={'effort': 'medium', 'model': 'sonnet', 'max_changed_lines': 40, 'program': 'claude'},
         serialize=lambda config: _conflict_values(config), position=15,
     )
+    dependency_watch: dict[str, Any] | None = option(
+        'dependency-watch', None,
+        'Snapshot dependency audits: prepare command lines, audits with run, format (bun-audit or pip-audit), optional cwd and lock_files, and minimum_severity (high by default). {root} is the snapshot path; commands run without a shell. Omitted means nothing to watch.',
+        example={'prepare': ['bun install --frozen-lockfile --ignore-scripts'],
+                 'audits': [{'run': 'bun audit --audit-level=high --json',
+                             'format': 'bun-audit', 'lock_files': ['bun.lock']}],
+                 'minimum_severity': 'high'},
+        optional=True, position=25,
+    )
     hot_paths: tuple[str, ...] = option('paths', [], 'GitHub path patterns whose matching tickets run separately and merge back to back within their priority.', example=['src/example_app/models.py', 'web/src/pages/**'], convert=tuple, position=14)
     hunts: Hunts = section(position=12)
     install_folder: Path | None = option('name', None, 'The installation folder, resolved against the selected file; external configs use their parent when omitted.', example='.', serialize=lambda config: config.given.get("install_folder"), position=24)
@@ -765,12 +774,13 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
             merged[key] = _merged(default, given[key], name + ".")
         elif DECLARATIONS[name].kind == "command" and isinstance(given[key], dict):
             merged[key] = _command_entry(given[key], key)
-        elif DECLARATIONS[name].kind in ("paths", "conflict", "machines", "areas", "suites"):
+        elif DECLARATIONS[name].kind in ("paths", "conflict", "machines", "areas", "suites", "dependency-watch"):
             kind = DECLARATIONS[name].kind
             readers = {"paths": _hot_paths, "conflict": _conflict_review,
                        "machines": lambda value, _: _machines(value),
                        "areas": lambda value, _: _areas(value),
-                       "suites": lambda value, _: _suites(value)}
+                       "suites": lambda value, _: _suites(value),
+                       "dependency-watch": _dependency_watch}
             merged[key] = readers[kind](given[key], name)
         elif DECLARATIONS[name].kind == "names":
             value = given[key]
@@ -798,6 +808,56 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
                 )
             merged[key] = value
     return merged
+
+
+def _dependency_watch(value: Any, name: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ConfigError(f"{FILE}: {name} must be an object")
+    if unknown := set(value) - {"prepare", "audits", "minimum_severity"}:
+        raise ConfigError(f"{FILE}: unknown key {name}.{sorted(unknown)[0]}")
+    prepare, audits = value.get("prepare", []), value.get("audits", [])
+    severity = value.get("minimum_severity", "high")
+    if severity not in ("info", "low", "moderate", "high", "critical"):
+        raise ConfigError(f"{FILE}: {name}.minimum_severity must be info, low, moderate, high or critical")
+    if not isinstance(prepare, list) or not isinstance(audits, list):
+        raise ConfigError(f"{FILE}: {name}.prepare and audits must be lists")
+
+    def command(line: Any) -> None:
+        if not isinstance(line, str) or "\0" in line:
+            raise ConfigError(f"{FILE}: {name} commands must be command lines")
+        try:
+            words = shlex.split(line)
+        except ValueError:
+            words = []
+        if not words:
+            raise ConfigError(f"{FILE}: {name} commands must be nonempty, quoted command lines")
+
+    for line in prepare:
+        command(line)
+    entries = []
+    for audit in audits:
+        if not isinstance(audit, dict) or set(audit) - {"run", "format", "cwd", "lock_files"}:
+            raise ConfigError(f"{FILE}: {name}.audits entries take run, format, cwd and lock_files")
+        command(audit.get("run"))
+        if audit.get("format") not in ("bun-audit", "pip-audit"):
+            raise ConfigError(f"{FILE}: {name}.audits format must be bun-audit or pip-audit")
+        cwd = audit.get("cwd", ".")
+        if not isinstance(cwd, str) or not cwd or "\0" in cwd:
+            raise ConfigError(f"{FILE}: {name}.audits.cwd must be a checkout path")
+        if cwd != ".":
+            _relative(cwd, name + ".audits.cwd")
+        defaults = ["bun.lock", "bun.lockb"] if audit["format"] == "bun-audit" else ["uv.lock"]
+        locks = audit.get("lock_files", [str(PurePosixPath(cwd) / lock) for lock in defaults])
+        if not isinstance(locks, list) or not locks or not all(isinstance(lock, str) for lock in locks):
+            raise ConfigError(f"{FILE}: {name}.audits.lock_files must be a nonempty list of checkout paths")
+        for lock in locks:
+            _relative(lock, name + ".audits.lock_files")
+            if re.search(r"[\x00-\x1f\x7f`<>]", lock):
+                raise ConfigError(f"{FILE}: {name}.audits.lock_files must be plain checkout paths")
+        entries.append({**audit, "cwd": cwd, "lock_files": locks})
+    return {"prepare": prepare, "audits": entries, "minimum_severity": severity}
 
 
 def _hot_paths(value: Any, name: str) -> list[str]:

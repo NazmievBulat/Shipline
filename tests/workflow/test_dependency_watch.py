@@ -13,7 +13,7 @@ _FAKE_GH = '''#!/usr/bin/env python3
 import json
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 state = Path("@STATE@")
 args = sys.argv[1:]
@@ -25,8 +25,13 @@ with (state / "api.jsonl").open("a") as log:
     log.write(json.dumps([method, path, payload]) + "\\n")
 prs = json.loads((state / "prs.json").read_text())
 if method == "GET":
-    if path.endswith("/pulls"):
-        answer = prs
+    if path == "user":
+        answer = {"login": "example-owner", "id": 123, "name": "Example Owner"}
+    elif path.startswith("advisories/"):
+        answer = json.loads((state / "advisory.json").read_text())
+    elif path.endswith("/pulls"):
+        page = int(parse_qs(urlsplit(args[1]).query).get("page", ["1"])[0])
+        answer = prs[(page - 1) * 100:page * 100]
     elif path.endswith("/check-runs"):
         answer = {"check_runs": json.loads((state / "checks.json").read_text())}
     elif path.endswith("/annotations"):
@@ -39,6 +44,7 @@ else:
     if path.endswith("/git/commits"):
         assert payload["tree"] == "main-tree"
         assert len(payload["parents"]) == 1
+        assert payload["author"]["email"] == "123+example-owner@users.noreply.github.com"
         answer = {"sha": "empty-commit"}
     elif path.endswith("/git/refs"):
         assert payload["ref"].startswith("refs/heads/ticket/dependency-watch-")
@@ -108,7 +114,7 @@ sys.exit(1)
 def _config(workflow: Workflow, **changes: object) -> None:
     path = workflow.repo / "shipline.json"
     config = json.loads(path.read_text())
-    config["checks"]["advisory_annotation"] = "Advisory"
+    config.setdefault("checks", {})["advisory_annotation"] = "Advisory"
     config["dependency_watch"] = {
         "prepare": ["prepare-watch {root}"],
         "audits": [
@@ -144,7 +150,7 @@ def test_uncovered_finding_opens_one_empty_draft_with_blocker_labels(watch: Work
         {"id": 8, "name": "CI: dependencies", "conclusion": "failure", "status": "completed"},
     ]))
     (watch.repo / "bun.lock").write_text("uncommitted work\n")
-    before = watch.git("rev-parse", "HEAD").stdout
+    before = watch.git("rev-parse", "HEAD")
 
     done = watch.shipline("dependency-watch")
 
@@ -159,7 +165,7 @@ def test_uncovered_finding_opens_one_empty_draft_with_blocker_labels(watch: Work
     assert created[0][2]["title"].endswith("(ticket, not started)")
     assert _calls(watch, suffix="/labels")[0][2]["labels"] == ["workflow", "priority: blocker"]
     assert (watch.repo / "bun.lock").read_text() == "uncommitted work\n"
-    assert watch.git("rev-parse", "HEAD").stdout == before
+    assert watch.git("rev-parse", "HEAD") == before
     assert not (watch.repo / "prepared").exists()
     folders = (watch.state / "audit-folders").read_text().splitlines()
     assert len(folders) == 2 and all(not Path(folder).exists() for folder in folders)
@@ -293,3 +299,172 @@ def test_timer_and_uninstall_keep_the_installing_environment(watch: Workflow) ->
     assert watch.shipline("uninstall").returncode == 0
     assert not (units / "dependency-watch.service").exists()
     assert not (units / "dependency-watch.timer").exists()
+
+
+def test_two_ecosystems_share_one_ticket_and_keep_all_locks(watch: Workflow) -> None:
+    (watch.state / "pip.json").write_text(json.dumps({"dependencies": [{
+        "name": "example-python", "vulns": [{"id": "PYSEC-2026-123", "aliases": [],
+                                               "fix_versions": ["3.0", "2.1"]}],
+    }]}))
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    created = _calls(watch, suffix="/pulls")
+    assert len(created) == 1
+    body = created[0][2]["body"]
+    assert "example-lib" in body and "example-python" in body
+    assert "backend/uv.lock" in body and "bun.lock" in body
+    assert "2.1 / 3.0" in body
+
+
+def test_a_failed_dependency_check_for_other_advisories_keeps_high_priority(watch: Workflow) -> None:
+    (watch.state / "checks.json").write_text(json.dumps([
+        {"id": 8, "name": "CI: dependencies", "conclusion": "failure", "status": "completed"},
+    ]))
+    (watch.state / "bun.json").write_text(json.dumps({"advisories": {"456": {
+        "module_name": "example-other", "severity": "critical", "github_advisory_id": "GHSA-dddd-eeee-ffff",
+        "patched_versions": ">=3.0",
+    }}}))
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    assert _calls(watch, suffix="/labels")[0][2]["labels"] == ["workflow", "priority: high"]
+
+
+@pytest.mark.parametrize("changes", [
+    {"minimum_severity": "unknown"}, {"prepare": [""]},
+    {"audits": [{"run": "audit-watch bun", "format": "unknown"}]},
+    {"audits": [{"run": "audit-watch bun", "format": "bun-audit", "cwd": "../outside"}]},
+    {"audits": [{"run": "audit-watch bun", "format": "bun-audit", "lock_files": ["../lock"]}]},
+    {"audits": [{"run": "audit-watch bun", "format": "bun-audit", "extra": True}]},
+])
+def test_bad_configuration_stops_before_any_audit(watch: Workflow, changes: dict) -> None:
+    _config(watch, **changes)
+    done = watch.shipline("dependency-watch")
+    assert done.returncode != 0
+    assert not (watch.state / "audit-folders").exists()
+    assert not _calls(watch)
+
+
+def test_a_python_advisory_without_a_fix_is_only_reported(watch: Workflow) -> None:
+    (watch.state / "bun.json").write_text('{"advisories": {}}')
+    (watch.state / "pip.json").write_text(json.dumps([{
+        "name": "example-python", "vulns": [{"id": "PYSEC-2026-123", "fix_versions": []}],
+    }]))
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    assert "no fix: python example-python" in done.stdout
+    assert not _calls(watch)
+
+
+def test_dry_run_retries_no_labels(watch: Workflow) -> None:
+    (watch.state / "fail-labels").touch()
+    assert watch.shipline("dependency-watch").returncode != 0
+    before = _calls(watch)
+    done = watch.shipline("dependency-watch", "--dry-run")
+    assert done.returncode == 0, done.stderr
+    assert "would label draft #19" in done.stdout
+    assert _calls(watch) == before
+
+
+def test_uninstall_leaves_another_programs_dependency_units(watch: Workflow) -> None:
+    units = Path(watch.env["HOME"]) / ".config/systemd/user"
+    units.mkdir(parents=True)
+    (units / "dependency-watch.service").write_text("[Service]\nExecStart=/usr/bin/true\n")
+    (units / "dependency-watch.timer").write_text("[Timer]\nOnCalendar=daily\n")
+    done = watch.shipline("uninstall")
+    assert done.returncode == 0, done.stderr
+    assert (units / "dependency-watch.service").exists()
+    assert (units / "dependency-watch.timer").exists()
+
+
+def test_dependency_coverage_after_the_first_page(watch: Workflow) -> None:
+    _prs(watch, *[
+        {"number": number, "title": "fix: unrelated work", "body": "", "draft": False}
+        for number in range(1, 101)
+    ], {"number": 101, "title": "bump example-lib", "body": "", "draft": False})
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    assert not _calls(watch)
+    assert len(_calls(watch, method="GET", suffix="/pulls")) == 2
+
+
+def test_snapshot_root_with_spaces_is_one_argument(watch: Workflow) -> None:
+    temporary = watch.root / "temporary area"
+    temporary.mkdir()
+    done = watch.shipline("dependency-watch", env={"TMPDIR": str(temporary)})
+    assert done.returncode == 0, done.stderr
+    assert len(_calls(watch, suffix="/pulls")) == 1
+    assert not list(temporary.iterdir())
+
+
+def test_fetch_audits_new_remote_main_without_updating_the_checkout(watch: Workflow) -> None:
+    other = watch.root / "other"
+    watch.git("clone", "--quiet", watch.git("remote", "get-url", "origin"), str(other))
+    (other / "fresh").touch()
+    watch.git("add", "fresh", cwd=other)
+    watch.git("commit", "--quiet", "-m", "chore: fresh main", cwd=other)
+    watch.git("push", "--quiet", "origin", "main", cwd=other)
+    before = watch.git("rev-parse", "HEAD")
+    watch.fake("prepare-watch", '''#!/usr/bin/env python3
+from pathlib import Path
+assert Path("fresh").is_file()
+Path("prepared").touch()
+''')
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    assert not (watch.repo / "fresh").exists()
+    assert watch.git("rev-parse", "HEAD") == before
+    commit = _calls(watch, suffix="/git/commits")[0][2]
+    assert commit["parents"] == [watch.git("rev-parse", "HEAD", cwd=other)]
+
+
+def test_an_escaping_archive_link_is_not_followed(watch: Workflow) -> None:
+    (watch.repo / "escape").symlink_to("../outside")
+    watch.git("add", "escape")
+    watch.git("commit", "--quiet", "-m", "chore: example link")
+    watch.git("push", "--quiet", "origin", "main")
+    done = watch.shipline("dependency-watch")
+    assert done.returncode != 0
+    assert not (watch.state / "audit-folders").exists()
+    assert not _calls(watch)
+
+
+def test_npm_style_vulnerability_report_keeps_the_fixed_version(watch: Workflow) -> None:
+    (watch.state / "bun.json").write_text(json.dumps({"vulnerabilities": {
+        "example-lib": {"via": [{"source": 123, "severity": "high",
+                                   "url": "https://github.com/advisories/GHSA-aaaa-bbbb-cccc"}],
+                        "fixAvailable": {"name": "example-lib", "version": "2.0.1"}},
+    }}))
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    body = _calls(watch, suffix="/pulls")[0][2]["body"]
+    assert "fixed versions: 2.0.1" in body
+    assert "GHSA-aaaa-bbbb-cccc" in body
+
+
+@pytest.mark.parametrize("patched", ["2.0.1", None])
+def test_bun_bulk_report_uses_published_fixes_and_aliases(watch: Workflow, patched: str | None) -> None:
+    (watch.state / "bun.json").write_text(json.dumps({"example-lib": [{
+        "id": 123, "severity": "high", "vulnerable_versions": "<2.0.1",
+        "url": "https://github.com/advisories/GHSA-aaaa-bbbb-cccc",
+    }]}))
+    (watch.state / "advisory.json").write_text(json.dumps({
+        "ghsa_id": "GHSA-aaaa-bbbb-cccc", "cve_id": "CVE-2026-1234",
+        "vulnerabilities": [{"package": {"ecosystem": "npm", "name": "example-lib"},
+                             "first_patched_version": patched}],
+    }))
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    created = _calls(watch, suffix="/pulls")
+    if patched:
+        assert len(created) == 1
+        assert "fixed versions: 2.0.1" in created[0][2]["body"]
+        assert "CVE-2026-1234" in created[0][2]["body"]
+    else:
+        assert not created and "no fix" in done.stdout
+
+
+def test_empty_bun_bulk_report_is_clean(watch: Workflow) -> None:
+    (watch.state / "bun.json").write_text("{}")
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    assert not _calls(watch)

@@ -21,8 +21,10 @@ set -euo pipefail
 COMMANDS=(
   ci-tests-for-changes
   decide
+  dependency-watch
   flow-page
   install
+  install-dependency-timer
   install-flow-page-timer
   install-hooks
   install-timer

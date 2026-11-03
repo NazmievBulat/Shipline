@@ -111,6 +111,7 @@ _DEFAULTS = {
     # No hot paths, and the conflict reviewer of today.
     "hot_paths": [],
     "conflict_review": None,
+    "dependency_watch": None,
     "merge_train": {"queued_limit_minutes": 20},
     "cloud_pre_push": {"suites": {}},
 }

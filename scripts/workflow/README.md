@@ -26,6 +26,58 @@ checkout's `bin` in its environment. The gate reads a repository's `run_proof.py
 "The repository's commands"), read from its main checkout; a missing one means none: no
 check, no helper, no selected test (the panel then notes that CI runs the whole suite).
 
+# Dependency watch
+
+`shipline dependency-watch` fetches main, archives its fetched head into a private temporary
+folder and runs the installation's `dependency_watch` commands there. Preparation must disable
+package install scripts. Command lines are split into arguments without a shell; `{root}` in
+an argument names the snapshot even when its path contains spaces. Audit `cwd` paths and
+`lock_files` are relative to the snapshot root. Without `lock_files`, bun uses `bun.lock` or
+`bun.lockb` and Python uses `uv.lock`, under that audit's `cwd` (default `.`).
+
+```json
+{
+  "dependency_watch": {
+    "prepare": [
+      "bun install --frozen-lockfile --ignore-scripts",
+      "uv sync --project {root}/backend --locked"
+    ],
+    "audits": [
+      {"run": "bun audit --audit-level=high --json", "format": "bun-audit"},
+      {"run": "pip-audit --skip-editable --format json", "format": "pip-audit", "cwd": "backend"}
+    ],
+    "minimum_severity": "high"
+  }
+}
+```
+
+The supported formats are bun's npm-style advisory JSON and pip-audit's dependency JSON.
+For Bun's raw bulk response, fixed releases and CVE aliases come from the named GitHub
+advisory; vulnerable version ranges alone are never treated as published fixes.
+`minimum_severity` applies only to npm reports; it accepts `info`, `low`, `moderate`, `high`
+and `critical`. Python advisories have no severity filter. Findings without fixed versions
+are printed but open no ticket. Without the block, there is nothing to watch.
+
+An open dependency PR covers a package when its title starts with `fix(deps…)`,
+`chore(deps-…)`, another conventional dependency prefix, or `bump `, or its body contains
+`<!-- dependency-advisory-watch -->`, and its title or body names the whole package.
+Python package names treat `-`, `_` and `.` alike. Uncovered findings go into one empty
+draft, created with GitHub's API on main's tree; no local commit or hook runs. Its labels
+use the configured workflow and priority names. A failing dependency check on the audited
+head gives blocker priority only when its annotations name a finding's advisory or alias;
+otherwise priority is high. Failed label requests are retried from the marked draft next run.
+
+`--dry-run` prints the proposed ticket and makes no GitHub writes. It still takes the lock,
+fetches main and prepares and audits the temporary snapshot. All runs use
+`dependency-watch.lock` in the configured state folder, and a concurrent run exits with a
+short message. The summary counts fixable, covered and unfixable findings for the wake.
+
+`shipline install-dependency-timer` installs a systemd user oneshot and Persistent timer,
+running at 03:17 and 15:17 UTC with a 15 minute limit. It keeps the installing PATH, config
+selection and an explicit `GH_CONFIG_DIR`; credentials are read by `gh`, never written into
+the service. Run it again after changing those settings. `shipline uninstall` switches it
+off and removes its units, leaving units that run another program alone.
+
 # The merge gate's modules
 
 `merge_gate.py` remains the command-line entry point and re-exports its existing names.
@@ -160,6 +212,7 @@ installation folder, even if the checkout has a file of the same name.
 | `commands.server_tests_for_changes` | command | The command that selects server tests and returns whole, tests, total and reasons. | none |
 | `commands.test` | command | The repository test command run by bash from the checkout with the CI job's arguments. | none |
 | `conflict_review` | conflict | The resolver of a handed-off conflict: program is claude (default) or codex. With program alone, effort is high, Claude uses Opus, Codex uses its configured model, and there is no additional line cutoff. An explicit model selects that program’s model; a positive max_changed_lines limits both conflicting sides and the resolution. Edits stay within the conflicting hunks. Codex uses its worker bridge with Claude and Cursor on the panel; full-review fallbacks return to Claude. Without program, effort, model and max_changed_lines remain required. | none |
+| `dependency_watch` | dependency-watch | Snapshot dependency audits: prepare command lines, audits with run, format (bun-audit or pip-audit), optional cwd and lock_files, and minimum_severity (high by default). {root} is the snapshot path; commands run without a shell. Omitted means nothing to watch. | none |
 | `hot_paths` | paths | GitHub path patterns whose matching tickets run separately and merge back to back within their priority. | `[]` |
 | `hunts.areas` | areas | Area names mapped to lists of screen paths; omitted means one hunt runs at a time, on every screen. | `{}` |
 | `hunts.plans` | name | The checkout path of hunt plans named in a hunt sentence. | none |

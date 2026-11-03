@@ -75,6 +75,21 @@
     "max_changed_lines": 40,
     "program": "claude"
   },
+  "dependency_watch": {
+    "prepare": [
+      "bun install --frozen-lockfile --ignore-scripts"
+    ],
+    "audits": [
+      {
+        "run": "bun audit --audit-level=high --json",
+        "format": "bun-audit",
+        "lock_files": [
+          "bun.lock"
+        ]
+      }
+    ],
+    "minimum_severity": "high"
+  },
   "hot_paths": [
     "src/example_app/models.py",
     "web/src/pages/**"
