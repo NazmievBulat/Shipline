@@ -173,7 +173,9 @@ def test_quoted_bridge_completion_is_a_fallback(workflow: Workflow, line: str) -
     assert workflow.is_running("review-7")
 
 
-@pytest.mark.parametrize("reason", ["draft", "later-turn", "continued", "answered", "pending", "border"])
+@pytest.mark.parametrize(
+    "reason", ["draft", "later-turn", "continued", "answered", "pending", "border"]
+)
 def test_old_or_unfinished_codex_completion_does_not_stop_worker(
     workflow: Workflow, reason: str
 ) -> None:

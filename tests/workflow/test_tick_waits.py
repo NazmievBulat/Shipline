@@ -925,14 +925,15 @@ def test_the_idle_line_leaves_out_the_lines_claude_draws_after_a_turn(
 def test_the_idle_last_line_shows_words_inside_screen_borders(
     workflow: Workflow, words: str, left: str, right: str
 ) -> None:
-    # A draft worker cannot stop yet, even when it has said closing words.
     _idle(workflow, _NOW - 3000)
-    screen = f"● {words}\n\n✻ Worked for 3m 2s\n\n" + _BOX
-    workflow.screen("\n".join(f"{left}{line:<60}{right}" for line in screen.splitlines()), "ticket-7")
+    message = f"The session has not said {words} yet."
+    screen = f"● {message}\n\n✻ Worked for 3m 2s\n\n"
+    screen = "\n".join(f"{left}{line:<60}{right}" for line in screen.splitlines()) + "\n"
+    workflow.screen(screen + _BOX, "ticket-7")
 
     _tick(workflow, _NOW)
 
-    assert _pending(workflow) == [f"idle, no rule: ticket-7 (50 min, last line: {words})"]
+    assert _pending(workflow) == [f"idle, no rule: ticket-7 (50 min, last line: {message})"]
 
 
 def test_an_idle_session_no_rule_covers_is_named_again_on_a_new_head(workflow: Workflow) -> None:

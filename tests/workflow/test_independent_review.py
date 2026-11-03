@@ -94,13 +94,21 @@ def test_tick_reads_closing_words_inside_screen_borders(
 
 @pytest.mark.parametrize(
     ("name", "words"),
-    [("review-7", "review finished"), ("review-7", "review sent back"),
-     ("ticket-7", "worker finished")],
+    [
+        ("review-7", "review finished"),
+        ("review-7", "review sent back"),
+        ("ticket-7", "worker finished"),
+    ],
 )
 @pytest.mark.parametrize(
     "reply",
-    ["I will say {words} when done.", "{words} after the checks pass.",
-     "> {words}", '"{words}"', "{words}\nWhich option?"],
+    [
+        "I will say {words} when done.",
+        "{words} after the checks pass.",
+        "> {words}",
+        '"{words}"',
+        "{words}\nWhich option?",
+    ],
 )
 def test_tick_does_not_finish_for_bordered_sentences_quotes_or_more_reply(
     workflow: Workflow, name: str, words: str, reply: str

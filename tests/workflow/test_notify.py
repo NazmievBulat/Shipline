@@ -550,13 +550,21 @@ def test_finished_stop_overrides_an_earlier_wait(
 
 @pytest.mark.parametrize(
     ("name", "words"),
-    [("review-7", "review finished"), ("review-7", "review sent back"),
-     ("ticket-7", "worker finished")],
+    [
+        ("review-7", "review finished"),
+        ("review-7", "review sent back"),
+        ("ticket-7", "worker finished"),
+    ],
 )
 @pytest.mark.parametrize(
     "reply",
-    ["I will say {words} when done.", "{words} after the checks pass.",
-     "> {words}", '"{words}"', "{words}\nWhich option?"],
+    [
+        "I will say {words} when done.",
+        "{words} after the checks pass.",
+        "> {words}",
+        '"{words}"',
+        "{words}\nWhich option?",
+    ],
 )
 def test_bordered_sentences_quotes_or_more_reply_still_ring(
     session: Workflow, name: str, words: str, reply: str
@@ -568,6 +576,33 @@ def test_bordered_sentences_quotes_or_more_reply_still_ring(
     done = session.notify(_stop(message), session=name)
 
     assert done.returncode == 0
+    assert len(session.pushes()) == 1
+
+
+@pytest.mark.parametrize("locale", ["C", "C.UTF-8"])
+def test_every_box_drawing_character_can_frame_the_closing_words(
+    session: Workflow, locale: str
+) -> None:
+    session.set_draft(7, draft=False)
+    spaces = " \t\u0085\u00a0\u1680\u2000\u200a\u2028\u2029\u202f\u205f\u3000"
+    borders = spaces.join(chr(code) for code in range(0x2500, 0x2580))
+
+    done = session.notify(
+        _stop(f"{borders} **worker finished.** {borders}"), env={"LC_ALL": locale}
+    )
+
+    assert done.returncode == 0
+    assert session.pushes() == []
+
+
+@pytest.mark.parametrize(
+    "message", ["⓿ worker finished │", "│ worker finished ▀", "│ worker │ finished │"]
+)
+def test_only_box_drawing_at_the_edges_is_removed(session: Workflow, message: str) -> None:
+    session.set_draft(7, draft=False)
+
+    session.notify(_stop(message))
+
     assert len(session.pushes()) == 1
 
 
