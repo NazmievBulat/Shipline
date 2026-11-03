@@ -254,6 +254,20 @@ def test_grey_and_dim_state_follow_terminal_resets_across_rows(text: str, expect
     assert _visible_input(text) == expected
 
 
+@pytest.mark.parametrize("style", ["2", "90"])
+@pytest.mark.parametrize("typed", [False, True])
+def test_box_input_retains_style_set_before_its_opening_rule(style: str, typed: bool) -> None:
+    words = ("\x1b[0m" if typed else "") + "continue"
+    rule = "─" * 40
+    screen = f"\x1b[{style}m{rule}\n> {words}\n{rule}\n"
+    done = subprocess.run(
+        ["bash", "-c", 'source "$1"; claude_input "$(cat)"',
+         "bash", str(SCRIPTS / "input-box")],
+        input=screen, capture_output=True, text=True, check=True,
+    )
+    assert done.stdout.strip() == ("continue" if typed else "")
+
+
 @pytest.mark.parametrize("style", ["2", "90", "38;5;244", "38;2;153;153;153"])
 @pytest.mark.parametrize("typed", ["neither", "native", "bridge"])
 def test_a_codex_reviewer_wakes_through_decorations_but_never_through_typed_words(
@@ -278,6 +292,14 @@ def test_a_codex_reviewer_wakes_through_decorations_but_never_through_typed_word
     workflow.screen(f"Done.\n› {native}\n\n  ? for shortcuts\n", "codex-7")
     rule = "─" * 40
     workflow.screen(f"Done.\n{rule}\n❯\u00a0{bridge}\n{rule}\n", "review-7")
+    tmux = workflow.bin / "tmux"
+    tmux.write_text(tmux.read_text().replace(
+        '    cat "$screen"',
+        '    case " $* " in\n'
+        '      *" -e "*) cat "$screen" ;;\n'
+        "      *) sed -E 's/\\x1b\\[[0-?]*[ -/]*[@-~]//g' \"$screen\" ;;\n"
+        "    esac",
+    ))
 
     done = workflow.run("checks-finished", "review-7", "a" * 40)
 

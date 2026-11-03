@@ -1164,11 +1164,11 @@ protect_hunt() {
 # stop hook (`notify`) marked it idle and noted when the limit resets. The note goes when the
 # session is given its next prompt.
 #
-# The box is the last two rules drawn from the left edge; what is under it is not read.
+# The box encloses its prompt between two rules; later status rules are not input.
 # Sets limit to the name of the limit ("session limit"), resets to when it resets, as the
 # line says it, or to nothing, and typed to what stands in the box, or to nothing.
 stopped_on_limit() {
-  local screen whole top said after notes at limit_at
+  local screen whole top bottom framed said after notes at limit_at
   limit="" resets="" typed=""
   local target=$1
   if [[ -e $(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1.codex ]]; then
@@ -1176,15 +1176,20 @@ stopped_on_limit() {
     codex_limit "$target" && return 0
   fi
   whole=$(tmux -L "$1" capture-pane -p -e -t "=$1:" 2>/dev/null) || return 1
-  top=$(strip_ansi <<<"$whole" | LC_ALL=C awk '
-    /^─/ { above = last; last = NR }
-    END { print above ? above : (last ? last : NR + 1) }
-  ')
+  read -r top bottom framed < <(input_box_bounds <<<"$whole") || return 1
+  if ((top == 0)); then
+    top=$(strip_ansi <<<"$whole" | LC_ALL=C awk '
+      /^─/ { above = last; last = NR }
+      END { print above ? above : (last ? last : NR + 1) }
+    ')
+  fi
   # The lines of the box, without its rules, its prompt mark and its empty lines. `list` does not
   # read them, and the four programs that find them would run for each session it lists.
   if [[ ${2:-} != without-box ]]; then
-    typed=$(LC_ALL=C sed -n "$((top + 1)),\$p" <<<"$whole" | LC_ALL=C sed -E $'/^(\\x1b\\[[0-?]*[ -/]*[@-~])*─/,$d' |
-      nonblank_input)
+    if ! typed=$(claude_input "$whole"); then
+      typed=$(LC_ALL=C sed -n "$((top + 1)),\$p" <<<"$whole" | LC_ALL=C sed -E $'/^(\\x1b\\[[0-?]*[ -/]*[@-~])*─/,$d' |
+        nonblank_input)
+    fi
   fi
   screen=$(LC_ALL=C sed -n "1,$((top - 1))p" <<<"$whole" | strip_ansi)
   said=$(LC_ALL=C grep -nE "$LIMIT_LINE" <<<"$screen") || said=""
@@ -1372,29 +1377,17 @@ read_prompt_box() {
   screen=$(tmux -L "$name" capture-pane -p -e -J -t "=$name:" 2>/dev/null) ||
     die "cannot read the input box of $name"
   if [[ $name == codex-* ]]; then
-    local plain first last
-    plain=$(strip_ansi <<<"$screen")
-    read -r first last < <(LC_ALL=C awk '
-      /^(›|>|❯)/ { first = NR }
-      NF { last = NR; footer = $0 }
-      END {
-        if (footer ~ /^[[:space:]]*\? for shortcuts([[:space:]]+[0-9]+% context left)?[[:space:]]*$/) last--
-        print first + 0, last + 0
-      }
-    ' <<<"$plain")
-    ((first > 0 && last >= first)) || die "cannot find the input box of $name"
-    # Keep ANSI until nonblank_input removes dim suggestions. Read continuation rows too,
-    # removing only the final footer row, never a footer-looking line inside an owner draft.
-    typed=$(LC_ALL=C sed -n "$first,${last}p" <<<"$screen" |
-      LC_ALL=C sed '1s/›/>/' | nonblank_input)
+    typed=$(codex_input "$screen") || die "cannot find the input box of $name"
   elif typed=$(claude_input "$screen"); then
     :
   else
     [[ ${sending_resend:-false} == true ]] || die "cannot find the input box of $name"
-    typed=$(strip_ansi <<<"$screen" | LC_ALL=C awk '
-      /^›|^>|^❯/ { text = $0; next }
-      END { print text }
-    ' | sed -E 's/^›/>/' | nonblank_input)
+    local row
+    row=$(strip_ansi <<<"$screen" | LC_ALL=C awk '/^›|^>|^❯/ { row = NR } END { print row + 0 }')
+    typed=""
+    if ((row)); then
+      typed=$(LC_ALL=C sed "${row}s/›/>/" <<<"$screen" | nonblank_input "$row" "$row")
+    fi
   fi
   # The separator after the prompt is decoration, including Claude's no-break space.
   typed=$(LC_ALL=C sed -E $'1s/^([[:blank:]]|\xc2\xa0)*//; s/[[:blank:]]+$//' <<<"$typed")
@@ -2008,8 +2001,10 @@ cmd_bridge() {
 # Codex currently prints a dated retry time, sometimes wrapped across terminal lines. Only
 # the last output before its prompt counts. Leave unparseable limits stopped for the owner.
 codex_limit() {
-  local screen line retry at said after
-  screen=$(tmux -L "$1" capture-pane -p -J -t "=$1:" 2>/dev/null) || return 1
+  local screen whole line retry at said after
+  whole=$(tmux -L "$1" capture-pane -p -e -J -t "=$1:" 2>/dev/null) || return 1
+  # Limit words are plain text; the input guard must retain the placeholder styling.
+  screen=$(strip_ansi <<<"$whole")
   # The block between the two latest prompts is the current output. Earlier quota
   # errors remain in inline-mode scrollback after the session went on.
   screen=$(LC_ALL=C awk '
@@ -2021,7 +2016,7 @@ codex_limit() {
   said=${said##*$'\n'}
   after=$(LC_ALL=C sed -n "${said%%:*},\$p" <<<"$screen")
   line=$(sed '/^›/,$d; /^>/,$d; /^❯/,$d' <<<"$after" | tr '\n' ' ')
-  typed=$(sed -nE 's/^[›>❯][[:space:]]*//p' <<<"$after")
+  typed=$(codex_input "$whole") || typed=""
   limit="Codex limit" resets=""
   [[ $line == *"try again at "* || $line == *"Try again at "* ]] || return 0
   retry=$(sed -E 's/.*[Tt]ry again at //; s/([0-9])(st|nd|rd|th)/\1/g; s/\.[[:space:]]*$//; s/[[:space:]]+$//' <<<"$line")

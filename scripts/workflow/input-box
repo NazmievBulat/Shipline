@@ -2,7 +2,7 @@
 # Shared by session and bridge-empty: what the owner has typed into a Claude input box.
 # Claude Code draws the empty prompt as the mark and a no-break space (U+00A0).
 
-# Capture with -e so dim suggestions can be distinguished from the owner's text. Such a
+# Capture with -e so dim or grey suggestions can be distinguished from the owner's text. Such a
 # capture also holds hyperlinks (OSC 8); both kinds are removed, leaving the plain capture.
 strip_ansi() {
   LC_ALL=C sed -E $'s/\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)//g'
@@ -33,17 +33,35 @@ input_box_bounds() {
 # Strip exactly the frame found on both rules, keeping ANSI attributes and any border
 # characters the owner typed before it. Removing a run here could authorize an edited reply.
 strip_input_border() {
-  LC_ALL=C sed -E $'s/│((\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)|[[:blank:]])*)$/\\1/'
+  local rows=""
+  if (($#)); then rows="$1,$2"; fi
+  LC_ALL=C sed -E "$rows"$'s/│((\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)|[[:blank:]])*)$/\\1/'
 }
 
-# Read a Claude box without changing the ANSI state of dim suggestions. The caller handles
+# Read a Claude box with the whole capture's ANSI state for dim or grey suggestions. The caller handles
 # older screens that have a prompt without two rules.
 claude_input() {
   local screen=$1 top bottom framed
   read -r top bottom framed < <(input_box_bounds <<<"$screen") || return 1
   ((top > 0 && bottom > top)) || return 1
-  LC_ALL=C sed -n "$((top + 1)),$((bottom - 1))p" <<<"$screen" |
-    { if ((framed)); then strip_input_border; else cat; fi; } | nonblank_input
+  { if ((framed)); then strip_input_border "$((top + 1))" "$((bottom - 1))"; else cat; fi; } \
+    <<<"$screen" | nonblank_input "$((top + 1))" "$((bottom - 1))"
+}
+
+# The native prompt and continuation rows, excluding its final shortcuts footer. Keep
+# styling from the whole capture: a colour may have been set before the prompt row.
+codex_input() {
+  local screen=$1 first last
+  read -r first last < <(strip_ansi <<<"$screen" | LC_ALL=C awk '
+    /^(›|>|❯)/ { first = NR }
+    NF { last = NR; footer = $0 }
+    END {
+      if (footer ~ /^[[:space:]]*\? for shortcuts([[:space:]]+[0-9]+% context left)?[[:space:]]*$/) last--
+      print first + 0, last + 0
+    }
+  ') || return 1
+  ((first > 0 && last >= first)) || return 1
+  LC_ALL=C sed "${first}s/›/>/" <<<"$screen" | nonblank_input "$first" "$last"
 }
 
 # Strip the prompt mark and blank input lines. Use complete UTF-8 byte sequences for
@@ -53,31 +71,59 @@ claude_input() {
 nonblank_input() {
   # U+0085, U+00A0, U+1680, U+2000..200A, U+2028..2029, U+202F, U+205F, U+3000.
   local spaces=$'[[:space:]]|\xc2\x85|\xc2\xa0|\xe1\x9a\x80|\xe2\x80[\x80-\x8a\xa8\xa9\xaf]|\xe2\x81\x9f|\xe3\x80\x80'
-  # SGR attributes persist across lines. Only reset (0) and normal intensity (22)
-  # end dim; changing colour alone does not. Skip extended colour parameters so
-  # the 2 in an RGB colour is not mistaken for dim.
-  LC_ALL=C awk '
+  # SGR intensity and foreground colour persist independently, including before the
+  # selected rows. Only foreground grey is decoration: white, black, backgrounds and
+  # underline colours must not hide typed text. Colour subparameters are not SGR codes.
+  LC_ALL=C awk -v first="${1:-1}" -v last="${2:-0}" '
+    function grey_index(value) {
+      return value == 8 || (value >= 232 && value <= 255) ||
+        value == 59 || value == 102 || value == 145 || value == 188
+    }
+    function grey_rgb(red, green, blue) {
+      return red > 0 && red < 255 && red == green && green == blue
+    }
     {
+      selected = NR >= first && (!last || NR <= last)
       rest = $0
       while (match(rest, /\033(\[[0-?]*[ -\/]*[@-~]|\][^\007\033]*(\007|\033\\))/)) {
-        if (!dim) printf "%s", substr(rest, 1, RSTART - 1)
+        if (selected && !dim && !grey) printf "%s", substr(rest, 1, RSTART - 1)
         escape = substr(rest, RSTART, RLENGTH)
         rest = substr(rest, RSTART + RLENGTH)
-        if (escape ~ /^\033\[[0-9;]*m$/) {
+        if (escape ~ /^\033\[[0-9;:]*m$/) {
           count = split(substr(escape, 3, length(escape) - 3), codes, ";")
-          if (!count) dim = 0
+          if (!count) { dim = 0; grey = 0 }
           for (i = 1; i <= count; i++) {
+            if (index(codes[i], ":")) {
+              fields = split(codes[i], colour, ":")
+              if (colour[1] + 0 == 38) {
+                grey = 0
+                if (colour[2] + 0 == 5 && fields == 3)
+                  grey = grey_index(colour[3] + 0)
+                else if (colour[2] + 0 == 2 && (fields == 5 || fields == 6))
+                  grey = grey_rgb(colour[fields - 2] + 0, colour[fields - 1] + 0, colour[fields] + 0)
+              }
+              continue
+            }
             code = codes[i] + 0
             if (code == 38 || code == 48 || code == 58) {
+              if (code == 38) {
+                grey = 0
+                if (codes[i + 1] == 5 && i + 2 <= count) grey = grey_index(codes[i + 2] + 0)
+                else if (codes[i + 1] == 2 && i + 4 <= count)
+                  grey = grey_rgb(codes[i + 2] + 0, codes[i + 3] + 0, codes[i + 4] + 0)
+              }
               if (codes[i + 1] == 2) i += 4
               else if (codes[i + 1] == 5) i += 2
-            } else if (code == 0 || code == 22) dim = 0
+            } else if (code == 0) { dim = 0; grey = 0 }
+            else if (code == 22) dim = 0
             else if (code == 2) dim = 1
+            else if (code == 39) grey = 0
+            else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) grey = code == 90
           }
         }
       }
-      if (!dim) printf "%s", rest
-      printf "\n"
+      if (selected && !dim && !grey) printf "%s", rest
+      if (selected) printf "\n"
     }
   ' | LC_ALL=C sed -E "s/^(>|❯)//; /^($spaces)*$/d"
 }
