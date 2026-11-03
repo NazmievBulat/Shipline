@@ -36,9 +36,12 @@ def _bordered_input(
         else ["─" * 20 + " Status: waiting " + "─" * 20]
     )
     script = script.replace(
+        " <<'BOX'", " \"$*\" <<'BOX'"
+    ).replace(
         'print("\\n".join(lines))',
         f"lines += {status!r}\n"
-        f'print("\\n".join(row.ljust({width}) + "\\x1b[90m│\\x1b[0m" for row in lines))',
+        'border = "\\x1b[90m│\\x1b[0m" if "-e" in sys.argv[3].split() else "│"\n'
+        f'print("\\n".join(row.ljust({width}) + border for row in lines))',
     )
     tmux.write_text(script)
 
