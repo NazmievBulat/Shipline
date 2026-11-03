@@ -8,6 +8,9 @@ screen=$(tmux -L "$1" capture-pane -p -e -t "=$1:" 2>/dev/null) || exit 1
 if typed=$(claude_input "$screen"); then
   [[ -z $typed ]]
   exit $?
+else
+  # An incomplete ruled box is not evidence that the bridge is empty.
+  [[ $? == 1 ]] || exit 1
 fi
 top=$(strip_ansi <<<"$screen" | LC_ALL=C awk '
   /^─/ { above = last; last = NR }

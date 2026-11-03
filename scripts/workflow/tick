@@ -1288,9 +1288,9 @@ asks_permission() {
 # Claude draws itself, its spinner and the time a turn took ("✻ Worked for 3m 2s"), are not
 # words of the session.
 last_line() {
-  local screen top bottom framed
+  local screen top bottom framed ruled
   screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 1
-  read -r top bottom framed < <(input_box_bounds <<<"$screen") || return 1
+  read -r top bottom framed ruled < <(input_box_bounds <<<"$screen") || return 1
   if ((top == 0)); then
     top=$(LC_ALL=C awk -v rule="$SCREEN_INPUT_RULE" '$0 ~ rule { above = last; last = NR }
       END { print above ? above : (last ? last : NR + 1) }' <<<"$screen")

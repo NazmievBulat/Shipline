@@ -10,6 +10,7 @@ strip_ansi() {
 
 # The input is the pair of rules with a prompt immediately under the first one. Status
 # rules drawn later are not another input box. Keep row numbers for the capture with ANSI.
+# The fourth field records whether any rule was seen, even if its box is incomplete.
 input_box_bounds() {
   strip_ansi | LC_ALL=C awk '
     {
@@ -24,8 +25,8 @@ input_box_bounds() {
       if (rule && NR == rule + 1 && /^(>|❯)/) prompt = 1
     }
     END {
-      if (latest <= top || latest >= bottom) print 0, 0, 0
-      else print top + 0, bottom + 0, border + 0
+      if (latest <= top || latest >= bottom) print 0, 0, 0, (rule > 0)
+      else print top + 0, bottom + 0, border + 0, (rule > 0)
     }
   '
 }
@@ -39,11 +40,15 @@ strip_input_border() {
 }
 
 # Read a Claude box with the whole capture's ANSI state for dim or grey suggestions. The caller handles
-# older screens that have a prompt without two rules.
+# older screens that have a prompt without rules. Return 2 for a ruled screen whose
+# current box is incomplete, so callers cannot treat it as a legacy layout.
 claude_input() {
-  local screen=$1 top bottom framed
-  read -r top bottom framed < <(input_box_bounds <<<"$screen") || return 1
-  ((top > 0 && bottom > top)) || return 1
+  local screen=$1 top bottom framed ruled
+  read -r top bottom framed ruled < <(input_box_bounds <<<"$screen") || return 1
+  if ((top == 0 || bottom <= top)); then
+    ((ruled == 0)) || return 2
+    return 1
+  fi
   { if ((framed)); then strip_input_border "$((top + 1))" "$((bottom - 1))"; else cat; fi; } \
     <<<"$screen" | nonblank_input "$((top + 1))" "$((bottom - 1))"
 }

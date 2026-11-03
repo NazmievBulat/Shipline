@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 
 import pytest
@@ -171,6 +172,31 @@ def test_resend_never_submits_an_owner_continuation_in_an_incomplete_box(
     workflow.screen(
         f"{rule}\n> \n{rule}\n\n{rule}\n"
         "> previous automation\n  Owner addition\n", "ticket-7"
+    )
+
+    done = workflow.run("resend", "ticket-7")
+
+    assert done.returncode != 0
+    assert workflow.calls("tmux ticket-7 send-keys") == []
+    assert (notes / "ticket-7.typed").read_text() == "previous automation"
+
+
+def test_resend_refuses_an_incomplete_redraw_before_pressing_enter(
+    workflow: Workflow,
+) -> None:
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    notes = workflow.notes(7)
+    notes.mkdir(parents=True)
+    (notes / "ticket-7.typed").write_text("previous automation")
+    rule = "─" * 40
+    screen = f"You've hit your session limit\n{rule}\n> previous automation\n{rule}\n"
+    workflow.screen(screen, "ticket-7")
+    redraw = workflow.state / "incomplete-screen"
+    redraw.write_text(screen + f"\n{rule}\n> previous automation\n  Owner addition\n")
+    visible = workflow.state / "screen/ticket-7"
+    (workflow.state / "on-sleep").write_text(
+        f"cp {shlex.quote(str(redraw))} {shlex.quote(str(visible))}\n"
     )
 
     done = workflow.run("resend", "ticket-7")
