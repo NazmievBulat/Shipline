@@ -1368,10 +1368,9 @@ cmd_resend() {
 # Read only the current input, joining terminal wraps (-J). Legacy limit screens and
 # Codex inline mode use a prompt instead of Claude's two horizontal rules.
 read_prompt_box() {
-  local screen top
+  local screen
   screen=$(tmux -L "$name" capture-pane -p -e -J -t "=$name:" 2>/dev/null) ||
     die "cannot read the input box of $name"
-  top=$(strip_ansi <<<"$screen" | LC_ALL=C awk '/^─/ { above = last; last = NR } END { print above + 0 }')
   if [[ $name == codex-* ]]; then
     local plain first last
     plain=$(strip_ansi <<<"$screen")
@@ -1388,8 +1387,8 @@ read_prompt_box() {
     # removing only the final footer row, never a footer-looking line inside an owner draft.
     typed=$(LC_ALL=C sed -n "$first,${last}p" <<<"$screen" |
       LC_ALL=C sed '1s/›/>/' | nonblank_input)
-  elif ((top)); then
-    typed=$(LC_ALL=C sed -n "$((top + 1)),\$p" <<<"$screen" | LC_ALL=C sed -E $'/^(\\x1b\\[[0-?]*[ -/]*[@-~])*─/,$d' | nonblank_input)
+  elif typed=$(claude_input "$screen"); then
+    :
   else
     [[ ${sending_resend:-false} == true ]] || die "cannot find the input box of $name"
     typed=$(strip_ansi <<<"$screen" | LC_ALL=C awk '

@@ -1,5 +1,6 @@
 """Suggestions are decoration; only the owner's visible input blocks a wake."""
 
+import json
 import os
 import subprocess
 
@@ -44,7 +45,7 @@ def _bordered_input(
 
 @pytest.mark.parametrize("width", [72, 240])
 @pytest.mark.parametrize("footer", ["rules", "inline"])
-def test_bordered_input_below_a_status_rule_is_found_matched_and_submitted(
+def test_bordered_input_with_later_status_rules_is_matched_and_submitted(
     workflow: Workflow, width: int, footer: str
 ) -> None:
     _bordered_input(workflow, width=width, footer=footer)
@@ -88,7 +89,9 @@ def test_a_bordered_input_retry_submits_only_the_ticks_own_text(
     assert (workflow.state / "input-review-7").read_text() == ""
 
 
-@pytest.mark.parametrize("text", ["Owner draft", _STATUS + " │", _STATUS + " ││", _STATUS + " more"])
+@pytest.mark.parametrize(
+    "text", ["Owner draft", _STATUS + " │", _STATUS + " ││", _STATUS + " more"]
+)
 def test_bordered_owner_text_is_never_submitted_even_with_an_automation_note(
     workflow: Workflow, text: str
 ) -> None:
@@ -114,6 +117,43 @@ def test_owner_edits_in_a_bordered_box_during_paste_settling_are_not_submitted(
     assert done.returncode != 0
     assert "input changed before Enter" in done.stderr
     assert workflow.calls("tmux review-7 send-keys -t =review-7: Enter") == []
+
+
+def test_a_newer_incomplete_box_does_not_authorize_older_automation() -> None:
+    screen = "─" * 40 + "\n> previous automation\n" + "─" * 40
+    screen += "\nA newer turn.\n" + "─" * 40 + "\n> Owner draft\n"
+
+    done = subprocess.run(
+        [
+            "bash", "-c", 'source "$1"; screen=$(cat); claude_input "$screen"',
+            "bash", str(SCRIPTS / "input-box"),
+        ],
+        input=screen,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode != 0
+    assert done.stdout == ""
+
+
+@pytest.mark.parametrize("footer", ["rules", "inline"])
+def test_wake_last_line_stops_at_the_input_box_before_status_rules(
+    workflow: Workflow, footer: str
+) -> None:
+    _bordered_input(workflow, footer=footer)
+    now = 1_790_000_000
+    idle = workflow.notes(7) / "review-7.idle"
+    os.utime(idle, (now - 3000, now - 3000))
+
+    done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(now)})
+
+    assert done.returncode == 0, done.stderr
+    pending = workflow.repo / ".local/workflow/stuck.pending"
+    assert [json.loads(path.read_text())["line"] for path in pending.glob("*.json")] == [
+        "idle, no rule: review-7 (50 min, last line: Waiting.)"
+    ]
 
 
 @pytest.mark.parametrize(

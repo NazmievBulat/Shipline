@@ -5,6 +5,10 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/input-box"
 [[ ${1:-} =~ ^(ticket|review)-[0-9]+$ ]] || exit 2
 screen=$(tmux -L "$1" capture-pane -p -e -t "=$1:" 2>/dev/null) || exit 1
+if typed=$(claude_input "$screen"); then
+  [[ -z $typed ]]
+  exit $?
+fi
 top=$(strip_ansi <<<"$screen" | LC_ALL=C awk '
   /^─/ { above = last; last = NR }
   END { print above ? above : (last ? last : NR + 1) }

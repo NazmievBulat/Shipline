@@ -8,6 +8,44 @@ strip_ansi() {
   LC_ALL=C sed -E $'s/\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)//g'
 }
 
+# The input is the pair of rules with a prompt immediately under the first one. Status
+# rules drawn later are not another input box. Keep row numbers for the capture with ANSI.
+input_box_bounds() {
+  strip_ansi | LC_ALL=C awk '
+    {
+      line = $0
+      if (/^(>|❯)/) latest = NR
+      right = sub(/│[[:blank:]]*$/, "", line)
+      if (line ~ /^(─)+[[:blank:]]*$/) {
+        if (prompt && right == frame) { top = rule; bottom = NR; border = frame }
+        rule = NR; frame = right; prompt = 0
+        next
+      }
+      if (rule && NR == rule + 1 && /^(>|❯)/) prompt = 1
+    }
+    END {
+      if (latest <= top || latest >= bottom) print 0, 0, 0
+      else print top + 0, bottom + 0, border + 0
+    }
+  '
+}
+
+# Strip exactly the frame found on both rules, keeping ANSI attributes and any border
+# characters the owner typed before it. Removing a run here could authorize an edited reply.
+strip_input_border() {
+  LC_ALL=C sed -E $'s/│((\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)|[[:blank:]])*)$/\\1/'
+}
+
+# Read a Claude box without changing the ANSI state of dim suggestions. The caller handles
+# older screens that have a prompt without two rules.
+claude_input() {
+  local screen=$1 top bottom framed
+  read -r top bottom framed < <(input_box_bounds <<<"$screen") || return 1
+  ((top > 0 && bottom > top)) || return 1
+  LC_ALL=C sed -n "$((top + 1)),$((bottom - 1))p" <<<"$screen" |
+    { if ((framed)); then strip_input_border; else cat; fi; } | nonblank_input
+}
+
 # Strip the prompt mark and blank input lines. Use complete UTF-8 byte sequences for
 # Unicode White_Space, so this works even with LC_ALL=C and never drops part of a letter.
 # Resend's first check, send_prompt's last check and the bridge's wake must agree on an
