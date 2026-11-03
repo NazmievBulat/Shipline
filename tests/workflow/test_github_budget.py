@@ -127,7 +127,7 @@ def test_low_response_stops_other_processes_once_until_the_server_reset(
     second = _run("call", "api", "repos/owner/repo/actions/runs")
     third = _run("ready")
     assert second.returncode == third.returncode == 75
-    assert second.stderr.count("budget low") == 1
+    assert second.stderr.count("GitHub's hourly limit (499 left, resets ") == 1
     assert third.stderr == ""
     assert len((host / "calls").read_text().splitlines()) == 1
     module = _module()
@@ -279,7 +279,9 @@ def test_tick_and_wake_leave_the_reserve_without_calling_github(
     second = workflow.run_script(script)
     assert first.returncode == second.returncode == 0
     # Tick also gives wake a chance to deliver local notifications.
-    assert first.stderr.count("budget low") == (2 if script == "tick" else 1)
+    assert first.stderr.count("GitHub's hourly limit (499 left, resets ") == (
+        2 if script == "tick" else 1
+    )
     assert second.stderr == ""
     assert workflow.calls("gh") == []
 
@@ -560,6 +562,154 @@ def test_secondary_limit_is_recognized_from_the_response_body_without_cli_text(h
     assert done.stderr.count("requests pause") == 1
     assert _run("ready").returncode == 75
     assert len((host / "calls").read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize(
+    "status,body,diagnostic",
+    [
+        (200, "", "gh: command failed while reading rate limit settings\n"),
+        (403, '{"message":"Permission to read rate limit settings denied"}', ""),
+        (403, '{"message":"Forbidden"}', "gh: rate limit settings unavailable\n"),
+        (403, '{"detail":"secondary rate limit"}', ""),
+        (403, "secondary rate limit", ""),
+        (403, '{"message":["secondary rate limit"]}', ""),
+        (500, '{"message":"API rate limit exceeded"}', "gh: rate limit\n"),
+    ],
+)
+def test_unrelated_failures_never_arm_a_pause(
+    host: Path, status: int, body: str, diagnostic: str
+) -> None:
+    _answer(host, status=status, body=body, diagnostic=diagnostic, exit=1)
+    done = _run("call", "api", "repos/owner/repo/actions/runners")
+    assert done.returncode == 1
+    assert done.stdout == body
+    assert done.stderr == diagnostic
+    assert _run("ready").returncode == 0
+    rows = [
+        json.loads(line)
+        for line in (host / ".local/state/workflow/github-budget/requests.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert not any(row.get("throttled") for row in rows)
+
+
+def test_failed_call_without_an_http_response_never_arms_a_pause(host: Path) -> None:
+    (host / "bin/gh").write_text(
+        "#!/usr/bin/env python3\nimport sys\n"
+        "print('gh: could not read rate limit settings', file=sys.stderr)\nsys.exit(1)\n"
+    )
+    failed = _run("call", "pr", "list")
+    assert failed.returncode == 1
+    assert failed.stderr == "gh: could not read rate limit settings\n"
+    assert _run("ready").returncode == 0
+
+
+@pytest.mark.parametrize(
+    "status,headers,message",
+    [
+        (429, {}, ""),
+        (429, {"Retry-After": "120"}, "Slow down"),
+        (403, {"Retry-After": "90"}, "Forbidden"),
+        (403, {"X-Ratelimit-Remaining": "0"}, "Forbidden"),
+        (403, {}, "You have exceeded a secondary rate limit"),
+        (403, {}, "API rate limit exceeded for this request"),
+    ],
+)
+def test_github_limit_responses_pause_and_record_the_cause_once(
+    host: Path, status: int, headers: dict[str, str], message: str
+) -> None:
+    _answer(
+        host, status=status, headers=headers, body=json.dumps({"message": message}), exit=1
+    )
+    arguments = ("api", "repos/owner/repo/actions/runners")
+    done = _run("call", *arguments)
+    assert done.returncode == 1
+    assert f"GitHub's secondary limit ({status} from test)" in done.stderr
+    assert "budget low" not in done.stderr
+    assert _run("ready").returncode == 75
+    assert len((host / "calls").read_text().splitlines()) == 1
+    log = host / ".local/state/workflow/github-budget/requests.jsonl"
+    [row] = [json.loads(line) for line in log.read_text().splitlines()]
+    assert row["throttled"] is True
+    assert row["program"] == "test"
+    assert row["arguments"] == list(arguments)
+    assert row["status"] == status
+    assert row.get("retry_after") == headers.get("Retry-After")
+    assert row["message"] == message
+    assert row["requests"] == 1
+
+
+def test_throttled_telemetry_removes_credentials_and_request_bodies(
+    host: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GH_TOKEN", "EXAMPLE-LOGIN-SECRET")
+    message = "secondary rate limit " + "x" * 220
+    _answer(host, status=429, headers={}, body=json.dumps({"message": message}), exit=1)
+    arguments = (
+        "api", "-X", "POST", "repos/owner/repo/issues?access_token=QUERY-SECRET",
+        "-H", "Authorization: Bearer HEADER-SECRET", "--header=Token: INLINE-SECRET",
+        "-f", "body=BODY-SECRET", "-Ftitle=TITLE-SECRET", "--input", "INPUT-SECRET",
+        "--body=BODY-FLAG-SECRET", "--body-file", "FILE-SECRET",
+        "--token", "EXAMPLE-LOGIN-SECRET",
+    )
+    done = _run("call", *arguments)
+    assert done.returncode == 1
+    log = (host / ".local/state/workflow/github-budget/requests.jsonl").read_text()
+    assert "SECRET" not in log
+    assert "PRIVATE-REQUEST-BODY" not in log
+    row = json.loads(log)
+    assert row["message"] == message[:200]
+    assert row["arguments"][:3] == ["api", "-X", "POST"]
+    assert "repos/owner/repo/issues" in row["arguments"][3]
+
+
+def test_response_message_does_not_persist_tokens_or_other_body_fields(
+    host: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GH_TOKEN", "EXAMPLE-LOGIN-SECRET")
+    _answer(
+        host, status=429, headers={}, exit=1,
+        body=json.dumps({
+            "message": "secondary rate limit EXAMPLE-LOGIN-SECRET ghp_ExampleSecret123",
+            "detail": "PRIVATE-RESPONSE-DETAIL",
+        }),
+    )
+    assert _run("call", "pr", "list").returncode == 1
+    log = (host / ".local/state/workflow/github-budget/requests.jsonl").read_text()
+    assert "EXAMPLE-LOGIN-SECRET" not in log
+    assert "ghp_ExampleSecret123" not in log
+    assert "PRIVATE-RESPONSE-DETAIL" not in log
+    assert json.loads(log)["message"].startswith("secondary rate limit ")
+
+
+def test_report_skips_bad_lines_and_shows_only_throttles_in_its_window(
+    host: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    monkeypatch.setattr(module.time, "time", lambda: 1000)
+    path = module.folder()
+    counts = {"requests": 1, "unchanged": 0, "core": 1, "graphql": 0}
+    old = {"at": 800, "program": "old", **counts, "throttled": True, "message": "old limit"}
+    recent = {
+        "at": 990, "program": "test", **counts, "throttled": True,
+        "arguments": ["pr", "list"], "status": 429, "retry_after": "120",
+        "message": "secondary rate limit",
+    }
+    (path / "requests.previous.jsonl").write_text(json.dumps(old) + "\n{broken\n")
+    (path / "requests.jsonl").write_text(
+        json.dumps(recent) + '\n{"truncated":\n'
+        + json.dumps({"at": 995, "program": "other", **counts}) + "\n"
+    )
+    module.report(60)
+    output = capsys.readouterr().out
+    assert "test\t1\t0\t1\t0" in output
+    assert "other\t1\t0\t1\t0" in output
+    assert "Malformed lines skipped: 2" in output
+    assert "old limit" not in output
+    assert "Throttled requests:" in output
+    [shown] = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+    assert shown == recent
 
 
 def test_foreground_wrapper_preserves_binary_downloads(host: Path) -> None:
