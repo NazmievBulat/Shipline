@@ -729,7 +729,8 @@ def test_a_budget_spent_after_the_checks_does_not_hold_the_merge_lock(github: Gi
 
     assert done.returncode == 0, done.stdout + done.stderr
     # It waited for the budget, before the lock.
-    assert "GitHub budget low" in done.stderr and time.monotonic() - started > 8
+    assert "GitHub's hourly limit (0 left, resets " in done.stderr
+    assert time.monotonic() - started > 8
     held = _held(workflow)
     assert len(held) == 1 and held[0] < 5, held
 

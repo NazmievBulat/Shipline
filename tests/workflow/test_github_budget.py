@@ -525,7 +525,7 @@ def test_changes_on_github_start_a_second_or_more_apart(
 
 
 def test_an_inflight_response_cannot_shorten_another_retry_after(
-    host: Path, monkeypatch: pytest.MonkeyPatch
+    host: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     module = _module()
     monkeypatch.setattr(module.time, "time", lambda: 1000)
@@ -534,7 +534,9 @@ def test_an_inflight_response_cannot_shorten_another_retry_after(
         command: list[str], _env: dict[str, str], _seconds: float | None, _fd: int
     ) -> subprocess.CompletedProcess[str]:
         # Another outstanding request has already installed the longer cooldown.
-        module.save(module.folder() / "budget.json", {"secondary": {"remaining": 0, "reset": 1120}})
+        module.save(module.folder() / "budget.json", {
+            "secondary": {"remaining": 0, "reset": 1120, "status": 429, "program": "other"}
+        })
         trace = (
             "* Request at now\n< HTTP/2.0 403 Forbidden\n< Retry-After: 60\n\n"
             '{"message":"secondary rate limit"}\n* Request took 1ms\n'
@@ -546,6 +548,7 @@ def test_an_inflight_response_cannot_shorten_another_retry_after(
         == 1
     )
     assert module.delay("test") == 121
+    assert "GitHub's secondary limit (429 from other)" in capsys.readouterr().err
 
 
 def test_secondary_limit_is_recognized_from_the_response_body_without_cli_text(host: Path) -> None:
@@ -647,10 +650,12 @@ def test_throttled_telemetry_removes_credentials_and_request_bodies(
     message = "secondary rate limit " + "x" * 220
     _answer(host, status=429, headers={}, body=json.dumps({"message": message}), exit=1)
     arguments = (
-        "api", "-X", "POST", "repos/owner/repo/issues?access_token=QUERY-SECRET",
+        "api", "-X", "POST",
+        "https://USERINFO-SECRET@api.github.com/repos/owner/repo/issues?access_token=QUERY-SECRET",
         "-H", "Authorization: Bearer HEADER-SECRET", "--header=Token: INLINE-SECRET",
         "-f", "body=BODY-SECRET", "-Ftitle=TITLE-SECRET", "--input", "INPUT-SECRET",
         "--body=BODY-FLAG-SECRET", "--body-file", "FILE-SECRET",
+        "-bINLINE-BODY-SECRET", "--raw-field=body=RAW-BODY-SECRET",
         "--token", "EXAMPLE-LOGIN-SECRET",
     )
     done = _run("call", *arguments)

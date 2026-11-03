@@ -1,7 +1,7 @@
 """Shared budget and conditional reads for the host's background GitHub clients.
 
-Keep gh's stdout and exit status intact. HTTP debugging stays in memory: only counts and
-rate-limit headers are persisted, never credentials, request URLs or request bodies.
+Keep gh's stdout and exit status intact. HTTP debugging stays in memory: persist counts,
+rate-limit headers and sanitized throttle causes, never credentials or request bodies.
 """
 
 from __future__ import annotations
@@ -133,26 +133,34 @@ def delay(
     identity = _effective(identity)
     with locked() as path:
         state = read(path / (_prefix(identity) + "budget.json"))
-        until = max(
-            [0.0]
-            + [
-                float(row["reset"]) + 1
-                for resource, row in state.items()
-                if row["remaining"]
-                < (RESERVE if background and resource in HOURLY else 1)
-                and row["reset"] >= now
-            ]
-        )
-        if until <= now:
+        paused = [
+            (resource, row)
+            for resource, row in state.items()
+            if row["remaining"] < (RESERVE if background and resource in HOURLY else 1)
+            and row["reset"] >= now
+        ]
+        if not paused:
             return 0
+        resource, row = max(paused, key=lambda item: float(item[1]["reset"]))
+        until = float(row["reset"]) + 1
         marker = path / (
             "logged-"
             + hashlib.sha256((_prefix(identity) + program).encode()).hexdigest()
         )
         if read(marker).get("until") != until:
+            reset = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))
+            if resource == "secondary":
+                cause = "GitHub's secondary limit"
+                if "status" in row and "program" in row:
+                    cause += f" ({row['status']} from {row['program']})"
+            else:
+                name = "hourly" if resource in HOURLY else resource
+                server_reset = time.strftime(
+                    '%Y-%m-%d %H:%M:%S UTC', time.gmtime(row["reset"])
+                )
+                cause = f"GitHub's {name} limit ({row['remaining']} left, resets {server_reset})"
             print(
-                f"{program}: GitHub budget low; requests pause until "
-                f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}",
+                f"{program}: {cause}; requests pause until {reset}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -279,6 +287,81 @@ def _trace(stderr: str) -> tuple[list[dict[str, str]], str]:
         elif not debugging:
             diagnostic.append(line)
     return responses, "".join(diagnostic)
+
+
+def _message(response: dict[str, str]) -> str:
+    try:
+        value = json.loads(response.get("body", ""))
+    except ValueError:
+        return ""
+    message = value.get("message") if isinstance(value, dict) else None
+    return message if isinstance(message, str) else ""
+
+
+def _limited(response: dict[str, str]) -> bool:
+    if response["status"] == "429":
+        return True
+    if response["status"] != "403":
+        return False
+    message = _message(response).lower()
+    return (
+        "retry-after" in response
+        or response.get("x-ratelimit-remaining") == "0"
+        or any(
+            text in message
+            for text in ("secondary rate limit", "api rate limit exceeded")
+        )
+    )
+
+
+def _redact(text: str, token: str | None = None) -> str:
+    for secret in (
+        token,
+        *(
+            os.environ.get(name)
+            for name in (
+                "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"
+            )
+        ),
+    ):
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    text = re.sub(
+        r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b",
+        "[redacted]",
+        text,
+    )
+    return re.sub(r"(https?://)[^/\s@]+@", r"\1[redacted]@", text, flags=re.I)
+
+
+def _safe_arguments(arguments: tuple[str, ...], token: str | None = None) -> list[str]:
+    # Never persist field/header values, bodies, file paths or arbitrary option values.
+    # Keep the command, endpoint path and routing/method flags useful for tracing a call.
+    safe_values = {"-X", "--method", "-R", "--repo"}
+    switches = {
+        "--paginate", "--slurp", "--silent", "--include", "-i", "--verbose",
+        "--help", "-h", "--watch", "--exit-status", "--fail-fast", "--draft", "--web",
+    }
+    result: list[str] = []
+    hide_next = False
+    for argument in arguments:
+        if hide_next:
+            result.append("[redacted]")
+            hide_next = False
+            continue
+        flag, equal, _ = argument.partition("=")
+        if argument.startswith("--") and equal:
+            argument = argument if flag in safe_values else flag + "=[redacted]"
+        elif argument.startswith("-") and argument not in safe_values | switches:
+            if not argument.startswith("--") and len(argument) > 2:
+                if argument[:2] not in safe_values:
+                    argument = argument[:2] + "[redacted]"
+            else:
+                hide_next = True
+        if "?" in argument:
+            argument = argument.split("?", 1)[0] + "?[redacted]"
+        result.append(_redact(argument, token))
+    return result
 
 
 def _partial_page(arguments: tuple[str, ...], response: dict[str, str]) -> bool:
@@ -546,34 +629,30 @@ def call(
                 if row["reset"] == old.get("reset"):
                     row["remaining"] = min(row["remaining"], old["remaining"])
                 state[resource] = row
-        throttled = next(
-            (
-                row
-                for row in responses
-                if row["status"] == "429"
-                or (
-                    row["status"] == "403"
-                    and (
-                        "retry-after" in row
-                        or "rate limit" in (row.get("body", "") + diagnostic).lower()
-                    )
-                )
-            ),
-            None,
-        )
-        if throttled or (done.returncode and "rate limit" in diagnostic.lower()):
+        throttled = next((row for row in responses if _limited(row)), None)
+        cause: dict[str, Any] = {}
+        if throttled:
             seconds = 60
-            if throttled:
-                try:
-                    seconds = max(seconds, int(throttled.get("retry-after", "60")))
-                except ValueError:
-                    pass
-            state["secondary"] = {
-                "remaining": 0,
-                "reset": max(
-                    state.get("secondary", {}).get("reset", 0), int(now + seconds)
-                ),
+            try:
+                seconds = max(seconds, int(throttled.get("retry-after", "60")))
+            except ValueError:
+                pass
+            cause = {
+                "throttled": True,
+                "arguments": _safe_arguments(arguments, token),
+                "status": int(throttled["status"]),
+                "message": _redact(_message(throttled), token)[:200],
             }
+            if "retry-after" in throttled:
+                cause["retry_after"] = _redact(throttled["retry-after"], token)
+            # An in-flight response cannot shorten the pause or misattribute its cause.
+            if int(now + seconds) >= state.get("secondary", {}).get("reset", 0):
+                state["secondary"] = {
+                    "remaining": 0,
+                    "reset": int(now + seconds),
+                    "program": program,
+                    "status": cause["status"],
+                }
         save(budget, state)
         log = path / "requests.jsonl"
         if log.exists() and log.stat().st_size > 10_000_000:
@@ -595,6 +674,7 @@ def call(
                             row.get("x-ratelimit-resource") == "graphql"
                             for row in responses
                         ),
+                        **cause,
                     }
                 )
                 + "\n"
@@ -624,11 +704,27 @@ def call(
 
 def report(seconds: float) -> None:
     totals: dict[str, Counter[str]] = {}
+    throttled: list[dict[str, Any]] = []
+    malformed = 0
     since = time.time() - seconds
     with locked() as path:
         for log in path.glob("requests*.jsonl"):
             for line in log.read_text().splitlines():
-                row = json.loads(line)
+                try:
+                    row = json.loads(line)
+                    if (
+                        not isinstance(row, dict)
+                        or not isinstance(row.get("at"), (int, float))
+                        or not isinstance(row.get("program"), str)
+                        or any(
+                            not isinstance(row.get(key), int)
+                            for key in ("requests", "unchanged", "core", "graphql")
+                        )
+                    ):
+                        raise ValueError("invalid request counts")
+                except ValueError:
+                    malformed += 1
+                    continue
                 if row["at"] >= since:
                     total = totals.setdefault(row["program"], Counter())
                     total.update(
@@ -637,6 +733,8 @@ def report(seconds: float) -> None:
                             for key in ("requests", "unchanged", "core", "graphql")
                         }
                     )
+                    if row.get("throttled") is True:
+                        throttled.append(row)
     print("program\tHTTP requests\t304\tREST non-304\tGraphQL requests")
     for program, total in sorted(totals.items()):
         print(
@@ -644,6 +742,10 @@ def report(seconds: float) -> None:
             *(total[key] for key in ("requests", "unchanged", "core", "graphql")),
             sep="\t",
         )
+    print(f"Malformed lines skipped: {malformed}")
+    print("Throttled requests:")
+    for row in sorted(throttled, key=lambda row: row["at"]):
+        print(json.dumps(row))
 
 
 def _terminal_execute(
