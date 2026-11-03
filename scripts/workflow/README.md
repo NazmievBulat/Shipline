@@ -40,16 +40,22 @@ an argument names the snapshot even when its path contains spaces. Audit `cwd` p
   "dependency_watch": {
     "prepare": [
       "bun install --frozen-lockfile --ignore-scripts",
-      "uv sync --project {root}/backend --locked"
+      "uv sync --project {root}/backend --locked --no-build --no-install-project"
     ],
     "audits": [
       {"run": "bun audit --audit-level=high --json", "format": "bun-audit"},
-      {"run": "pip-audit --skip-editable --format json", "format": "pip-audit", "cwd": "backend"}
+      {"run": "{root}/backend/.venv/bin/python -m pip_audit --skip-editable --format json", "format": "pip-audit", "cwd": "backend"}
     ],
     "minimum_severity": "high"
   }
 }
 ```
+
+The Python example assumes `pip-audit` is included in the project's locked dependencies.
+It invokes the snapshot's interpreter explicitly: changing the working folder alone does
+not select that environment. `--no-build` refuses dependencies that need a build backend,
+and `--no-install-project` leaves the project itself out of preparation. Keep package builds
+and lifecycle scripts disabled when adapting these commands to a repository.
 
 The supported formats are bun's npm-style advisory JSON and pip-audit's dependency JSON.
 For Bun's raw bulk response, fixed releases and CVE aliases come from the named GitHub
