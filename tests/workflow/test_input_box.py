@@ -141,6 +141,45 @@ def test_a_newer_incomplete_box_does_not_authorize_older_automation() -> None:
     assert done.stdout == ""
 
 
+def test_bridge_empty_refuses_an_owner_draft_below_a_newer_incomplete_box(
+    workflow: Workflow,
+) -> None:
+    workflow.add_worktree(7)
+    workflow.running("review-7")
+    rule = "─" * 40
+    workflow.screen(
+        f"{rule}\n> \n{rule}\n\n{rule}\n> Owner draft\n", "review-7"
+    )
+
+    done = workflow.run_script("bridge-empty", "review-7")
+
+    assert done.returncode != 0
+    assert workflow.calls("tmux review-7 send-keys") == []
+
+
+def test_resend_never_submits_an_owner_continuation_in_an_incomplete_box(
+    workflow: Workflow,
+) -> None:
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    notes = workflow.notes(7)
+    notes.mkdir(parents=True)
+    (notes / "ticket-7.idle").touch()
+    (notes / "ticket-7.limit").write_text("0\n")
+    (notes / "ticket-7.typed").write_text("previous automation")
+    rule = "─" * 40
+    workflow.screen(
+        f"{rule}\n> \n{rule}\n\n{rule}\n"
+        "> previous automation\n  Owner addition\n", "ticket-7"
+    )
+
+    done = workflow.run("resend", "ticket-7")
+
+    assert done.returncode != 0
+    assert workflow.calls("tmux ticket-7 send-keys") == []
+    assert (notes / "ticket-7.typed").read_text() == "previous automation"
+
+
 @pytest.mark.parametrize("footer", ["rules", "inline"])
 def test_wake_last_line_stops_at_the_input_box_before_status_rules(
     workflow: Workflow, footer: str
