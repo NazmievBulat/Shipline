@@ -173,7 +173,7 @@ def test_quoted_bridge_completion_is_a_fallback(workflow: Workflow, line: str) -
     assert workflow.is_running("review-7")
 
 
-@pytest.mark.parametrize("reason", ["draft", "later-turn", "continued", "answered", "pending"])
+@pytest.mark.parametrize("reason", ["draft", "later-turn", "continued", "answered", "pending", "border"])
 def test_old_or_unfinished_codex_completion_does_not_stop_worker(
     workflow: Workflow, reason: str
 ) -> None:
@@ -192,6 +192,9 @@ def test_old_or_unfinished_codex_completion_does_not_stop_worker(
         )
     elif reason == "pending":
         (workflow.notes(7) / "ticket-7.owner-reply").write_text("One more fix")
+    elif reason == "border":
+        # Recorded text is authoritative and has no screen borders to strip.
+        _notify(workflow, "worker finished                 │", bridge=True)
 
     done = workflow.run_script("tick")
 
