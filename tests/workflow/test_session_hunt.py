@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 import pytest
-from workflow_harness import Workflow, session_arguments
+from workflow_harness import Workflow, install_shipline, session_arguments
 
 _AREAS = {"phone": ["/calls", "/contacts"], "billing": ["/invoices", "/settings/billing"]}
 _RULES = "by the section Hunt for bugs of AGENTS.md in this worktree"
@@ -311,3 +311,199 @@ def _nothing_started(workflow: Workflow, name: str) -> None:
     assert not workflow.is_running(f"hunt-{name}")
     assert not workflow.hunt_worktree(name).exists()
     assert not workflow.hunt_report(name).exists()
+
+
+@pytest.mark.parametrize("area", [(), ("--area", "phone"), ("plan", "claude", "phone")])
+def test_hunt_app_keeps_settings_for_start_fresh_and_restart(workflow: Workflow, area: tuple[str, ...]) -> None:
+    install_shipline(workflow)
+    _configure(workflow)
+    path = workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    shared = {"FEATURE": "off", "SHARED": "a 'quote' $value `word` = \\ end", "EMPTY": ""}
+    config["hunts"].update(settings=shared, area_settings={"phone": {"FEATURE": "on", "PHONE": "yes"}})
+    path.write_text(json.dumps(config))
+    workflow.fake(
+        "hunt-app",
+        "#!/bin/bash\n"
+        "python3 - \"$1\" <<'PYAPP'\n"
+        "import json, os, sys\n"
+        "values = {k: os.environ.get(k) for k in ('FEATURE', 'SHARED', 'EMPTY', 'PHONE')}\n"
+        "print(json.dumps(values))\n"
+        "with open('app-' + sys.argv[1] + '.json', 'w') as stream:\n"
+        "    json.dump(values, stream)\n"
+        "PYAPP\n",
+    )
+    started = _start(workflow, "one", *area)
+    assert started.returncode == 0, started.stderr
+    expected = {**shared, **({"FEATURE": "on", "PHONE": "yes"} if area else {})}
+    report = (workflow.hunt_report("one") / "report.md").read_text()
+    recorded = json.loads(report.split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert recorded == expected
+    assert "Settings" in report
+    assert "Keep the settings already recorded at the top of report.md" in _command(workflow, "one")
+    snapshot = workflow.hunt_worktree("one") / ".local/workflow/hunt-settings.json"
+    assert snapshot.stat().st_mode & 0o777 == 0o600
+    assert (workflow.hunt_report("one") / "report.md").stat().st_mode & 0o777 == 0o600
+    # Editing the installation after launch must not alter this hunt's copy.
+    config["hunts"]["settings"] = {"FEATURE": "changed"}
+    config["hunts"]["area_settings"] = {}
+    path.write_text(json.dumps(config))
+    worktree = workflow.hunt_worktree("one")
+    nested = worktree / "nested"
+    nested.mkdir()
+    for command in ("start", "fresh", "restart"):
+        done = workflow.shipline("hunt-app", command, cwd=nested)
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout) == {**expected, "PHONE": expected.get("PHONE")}
+    hunter_env = (workflow.state / "env" / "hunt-one").read_text()
+    assert "FEATURE=" not in hunter_env
+    stopped = workflow.run("stop", "hunt-one")
+    assert stopped.returncode == 0, stopped.stderr
+    assert json.loads((worktree / "app-stop.json").read_text()) == {**expected, "PHONE": expected.get("PHONE")}
+    # A configured app run outside a hunt does not acquire hunt settings.
+    ordinary = workflow.shipline("hunt-app", "start")
+    assert ordinary.returncode == 0, ordinary.stderr
+    assert all(value is None for value in json.loads(ordinary.stdout).values())
+
+
+@pytest.mark.parametrize("words", [("",), ("--area",), ("--area", "phone", "--area", "billing"),
+                                    ("plan", "claude", "phone", "--area", "billing")])
+def test_an_incomplete_or_duplicate_area_option_is_refused(workflow: Workflow, words: tuple[str, ...]) -> None:
+    _configure(workflow)
+    done = _start(workflow, "one", *words)
+    assert done.returncode == 2
+    _nothing_started(workflow, "one")
+
+
+@pytest.mark.parametrize("words", [("--area", "phone", "explore", "codex"),
+                                    ("explore", "--area", "phone", "cursor")])
+def test_the_area_option_can_surround_the_existing_hunt_options(workflow: Workflow, words: tuple[str, ...]) -> None:
+    _configure(workflow)
+    done = _start(workflow, "one", *words)
+    assert done.returncode == 0, done.stderr
+    assert _notes(workflow, "one").with_suffix(".area").read_text() == "phone\n"
+
+
+
+def test_two_hunt_apps_keep_their_own_area_settings(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    _configure(workflow)
+    path = workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config["hunts"].update(settings={"FEATURE": "shared"},
+                           area_settings={"phone": {"FEATURE": "phone"},
+                                          "billing": {"FEATURE": "billing"}})
+    path.write_text(json.dumps(config))
+    workflow.fake("hunt-app", '#!/bin/bash\nprintf "%s" "$FEATURE"\n')
+    for name, area in (("one", "phone"), ("two", "billing")):
+        started = _start(workflow, name, "--area", area)
+        assert started.returncode == 0, started.stderr
+    for name, area in (("one", "phone"), ("two", "billing")):
+        done = workflow.shipline("hunt-app", "fresh", cwd=workflow.hunt_worktree(name))
+        assert done.returncode == 0, done.stderr
+        assert done.stdout == area
+
+
+
+def test_hunt_settings_use_the_selected_relative_config_home(workflow: Workflow) -> None:
+    install_shipline(workflow)
+    caller = workflow.repo / "nested"
+    caller.mkdir()
+    config_home = caller / "config-home"
+    installation = config_home / "shipline/example-org-example-app"
+    installation.mkdir(parents=True)
+    config = json.loads((workflow.repo / "shipline.json").read_text())
+    config.update(state_folder=".local/hunt-state", hunts={"settings": {"FEATURE": "on"}})
+    (installation / "shipline.json").write_text(json.dumps(config))
+    workflow.fake("hunt-app", '#!/bin/bash\nprintf "%s" "$FEATURE"\n')
+
+    started = workflow.shipline("session", "start", "hunt", "one", cwd=caller,
+                               env={"XDG_CONFIG_HOME": "config-home"})
+
+    assert started.returncode == 0, started.stderr
+    report = (workflow.hunt_report("one") / "report.md").read_text()
+    assert json.loads(report.split("```json\n", 1)[1].split("\n```", 1)[0]) == {"FEATURE": "on"}
+    done = workflow.shipline("hunt-app", "fresh", cwd=workflow.hunt_worktree("one"),
+                            env={"XDG_CONFIG_HOME": str(config_home)})
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "on"
+
+
+@pytest.mark.parametrize("target", ["hunt-settings.json", "report.md"])
+@pytest.mark.parametrize("stage", ["open", "write"])
+def test_hunt_preparation_storage_error_releases_the_name(
+    workflow: Workflow, target: str, stage: str
+) -> None:
+    _configure(workflow)
+    hooks = workflow.root / "storage-fault"
+    hooks.mkdir()
+    (hooks / "sitecustomize.py").write_text(
+        "import errno, os\n"
+        "from contextlib import contextmanager\n"
+        f"target, stage = {target!r}, {stage!r}\n"
+        "original_open, original_fdopen = os.open, os.fdopen\n"
+        "fault_fd = None\n"
+        "def fail():\n"
+        "    raise OSError(errno.ENOSPC, 'example storage full')\n"
+        "def open_file(path, flags, mode=0o777, **kwargs):\n"
+        "    global fault_fd\n"
+        "    selected = str(path).endswith('/' + target)\n"
+        "    if selected and stage == 'open':\n"
+        "        fail()\n"
+        "    fd = original_open(path, flags, mode, **kwargs)\n"
+        "    if selected:\n"
+        "        fault_fd = fd\n"
+        "    return fd\n"
+        "class PartialWriter:\n"
+        "    def __init__(self, stream):\n"
+        "        self.stream = stream\n"
+        "    def write(self, text):\n"
+        "        self.stream.write(text[:8])\n"
+        "        self.stream.flush()\n"
+        "        fail()\n"
+        "@contextmanager\n"
+        "def open_stream(fd, *args, **kwargs):\n"
+        "    with original_fdopen(fd, *args, **kwargs) as stream:\n"
+        "        yield PartialWriter(stream) if fd == fault_fd and stage == 'write' else stream\n"
+        "os.open, os.fdopen = open_file, open_stream\n"
+    )
+
+    failed = workflow.run("start", "hunt", "one", "--area", "phone",
+                          env={"PYTHONPATH": str(hooks)})
+
+    assert failed.returncode != 0
+    assert "could not use hunt settings" in failed.stderr
+    assert not workflow.is_running("hunt-one")
+    assert not workflow.hunt_report("one").exists()
+    assert not (workflow.hunt_worktree("one") / ".local/workflow/hunt-settings.json").exists()
+    retried = _start(workflow, "one", "--area", "phone")
+    assert retried.returncode == 0, retried.stderr
+    assert workflow.is_running("hunt-one")
+
+
+@pytest.mark.parametrize("count", [None, 0, 3])
+def test_metrics_read_the_findings_after_the_saved_settings(
+    workflow: Workflow, count: int | None
+) -> None:
+    _configure(workflow)
+    path = workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    # A value resembling a count must never supply the report's findings count.
+    config["hunts"]["settings"] = {"EXAMPLE": "Findings: 99", **{
+        f"FEATURE_{i}": "on" for i in range(30)
+    }}
+    path.write_text(json.dumps(config))
+    started = _start(workflow, "one", "--area", "phone")
+    assert started.returncode == 0, started.stderr
+    report = workflow.hunt_report("one") / "report.md"
+    with report.open("a") as stream:
+        stream.write("# Results\n\n" + (f"Findings: {count}\n" if count is not None else "Pending.\n"))
+    done = subprocess.run(
+        ["python3", "-c", "import json; from pathlib import Path; "
+         "from workflow_metrics import read_hunts; print(json.dumps(read_hunts(Path.cwd())))"],
+        cwd=workflow.repo,
+        env={**workflow.env, "PYTHONPATH": str(workflow.script.parent)},
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout)[0][1:] == ["one", count]

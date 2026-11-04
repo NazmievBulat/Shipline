@@ -4,6 +4,10 @@
 #   five_hour <per cent used> <reset, in seconds since 1970>
 #   seven_day <per cent used> <reset, in seconds since 1970>
 #
+# A numeric utilization with an explicit null reset has not started. Its reset is provisionally
+# now plus the window's length, and a fourth field, `not_started`, distinguishes that state.
+# Readers use the first three fields as usual and may use the fourth to describe the window.
+#
 # The figures are those the status line shows ("USE: 5H: 76% 1h9m"). They are read from the
 # file the status line keeps when it is at most 5 minutes old, and otherwise asked of
 # Anthropic with the token Claude Code signed in with, as the status line does. Nothing is
@@ -21,16 +25,28 @@ ANSWER_SECONDS=${WORKFLOW_USAGE_SECONDS:-4}
 NOW=${WORKFLOW_NOW:-$(date +%s)}
 
 # The two lines, from the JSON the status line keeps and Anthropic answers with. A window
-# whose reset cannot be read is left out; with neither, it fails.
+# whose reset cannot be read (other than an explicit null) is left out; with neither, it fails.
 lines_of() {
-  local window percent at printed=1
+  local window percent at state printed=1
   for window in five_hour seven_day; do
-    read -r percent at < <(jq -r --arg window "$window" \
-      '.[$window] | select(type == "object") | "\(.utilization // "") \(.resets_at // "")"' \
+    read -r percent state at < <(jq -r --arg window "$window" \
+      '.[$window] | select(type == "object") | select(.utilization | type == "number")
+       | "\(.utilization) \(if has("resets_at") and .resets_at == null
+           then "not_started" else "started" end) \(.resets_at // "")"' \
       <<<"$1" 2>/dev/null) || continue
-    [[ $percent =~ ^[0-9]+(\.[0-9]+)?$ && -n $at ]] || continue
-    at=$(date -d "$at" +%s 2>/dev/null) || continue
-    echo "$window ${percent%.*} $at"
+    [[ $percent =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
+    if [[ $state == not_started ]]; then
+      case $window in
+        five_hour) at=$((NOW + 5 * 3600)) ;;
+        seven_day) at=$((NOW + 7 * 86400)) ;;
+      esac
+      state=" not_started"
+    else
+      [[ -n $at ]] || continue
+      at=$(date -d "$at" +%s 2>/dev/null) || continue
+      state=""
+    fi
+    echo "$window ${percent%.*} $at$state"
     printed=0
   done
   return "$printed"

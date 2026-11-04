@@ -750,6 +750,126 @@ def test_a_listed_run_that_failed_before_its_cancel_is_still_red(github: GitHub)
     assert "CI: web" in status.stdout
 
 
+@pytest.mark.parametrize(
+    "status,conclusion",
+    [
+        ("in_progress", None),
+        ("completed", "cancelled"),
+        ("completed", "failure"),
+        ("completed", "success"),
+    ],
+)
+def test_a_listed_run_finishing_its_cancellation_is_pending(
+    gate: Any, monkeypatch: pytest.MonkeyPatch, status: str, conclusion: str | None
+) -> None:
+    monkeypatch.setattr(gate, "cancelled_inherited", lambda run: True)
+    monkeypatch.setattr(gate, "lender_replanning", lambda *args, **kwargs: False)
+    run = {"id": 10, "status": status, "conclusion": conclusion}
+    parts = [
+        {"name": gate.CI_RESULT, "status": "completed", "conclusion": "failure"},
+        {"name": "CI: web", "status": "completed", "conclusion": "cancelled"},
+        {"name": _PYTHON, "status": "in_progress", "conclusion": None},
+        {"name": _DEPENDENCIES, "status": "completed", "conclusion": "success"},
+        {"name": _OLDER, "status": "completed", "conclusion": "skipped"},
+    ]
+
+    assert gate.verdict(run, parts) == ("pending", [gate.CI_RESULT])
+
+
+@pytest.mark.parametrize(
+    "listed,failed,expected",
+    [(True, False, "green"), (True, True, "red"), (False, False, "red")],
+)
+def test_main_inherits_a_cancellation_still_finishing_only_without_real_failures(
+    github: GitHub, listed: bool, failed: bool, expected: str
+) -> None:
+    workflow = github.workflow
+    _squash_with_pending_main(github)
+    if listed:
+        done = workflow.run_script("main-status", "--tick-main-status")
+        assert done.stdout.startswith("main: green"), done.stdout + done.stderr
+    assert _main_ci_run(github)["status"] == "in_progress"
+    assert _main_ci_run(github)["conclusion"] is None
+    _main_jobs(
+        github,
+        ("CI result", "completed", "failure"),
+        ("CI: web", "completed", "cancelled"),
+        (_PYTHON, "completed" if failed else "in_progress", "failure" if failed else None),
+    )
+
+    status = workflow.run_script("main-status")
+
+    assert status.stdout.startswith(f"main: {expected}"), status.stdout + status.stderr
+    if expected == "green":
+        assert "inherited from CI run 20" in status.stdout
+    elif failed:
+        assert _PYTHON in status.stdout
+    else:
+        assert "CI: web" in status.stdout
+
+
+@pytest.mark.parametrize("listed", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("conclusion", [None, "cancelled", "failure"])
+def test_a_lender_cancellation_still_finishing_is_pending_only_without_real_failures(
+    gate: Any, monkeypatch: pytest.MonkeyPatch, listed: bool, failed: bool,
+    conclusion: str | None,
+) -> None:
+    monkeypatch.setattr(gate, "cancelled_inherited", lambda run: False)
+
+    def replanning(run_id: str, *, head: str, attempt: int) -> bool:
+        assert (run_id, head, attempt) == ("20", "a" * 40, 1)
+        return listed
+
+    monkeypatch.setattr(gate, "lender_replanning", replanning)
+    run = {
+        "id": 20,
+        "head_sha": "a" * 40,
+        "run_attempt": 1,
+        "status": "in_progress" if conclusion is None else "completed",
+        "conclusion": conclusion,
+    }
+    parts = [
+        {"name": gate.CI_RESULT, "status": "completed", "conclusion": "cancelled"},
+        {"name": "CI: web", "status": "completed", "conclusion": "cancelled"},
+        {
+            "name": _PYTHON,
+            "status": "completed" if failed else "in_progress",
+            "conclusion": "failure" if failed else None,
+        },
+    ]
+
+    state, names = gate.verdict(run, parts)
+
+    assert state == ("pending" if listed and not failed and conclusion != "failure" else "red")
+    if state == "pending":
+        assert names == [gate.CI_RESULT]
+    elif failed:
+        assert _PYTHON in names
+
+
+@pytest.mark.parametrize("conclusions", [("cancelled", "failure"), ("failure", "cancelled")])
+def test_an_inherited_cancellation_cannot_hide_a_failed_part(
+    github: GitHub, conclusions: tuple[str, str]
+) -> None:
+    workflow = github.workflow
+    _squash_with_pending_main(github)
+    assert workflow.run_script("main-status", "--tick-main-status").stdout.startswith("main: green")
+    _main_jobs(
+        github,
+        ("CI result", "completed", "failure"),
+        *[
+            (f"{_PYTHON} ({part} of 2)", "completed", conclusion)
+            for part, conclusion in enumerate(conclusions, start=1)
+        ],
+    )
+
+    status = workflow.run_script("main-status")
+
+    assert status.stdout.startswith("main: red"), status.stdout + status.stderr
+    assert _PYTHON in status.stdout
+
+
 def test_a_main_run_not_yet_inherited_is_never_cancelled(github: GitHub) -> None:
     workflow = github.workflow
     _pull_skipped_older(github)

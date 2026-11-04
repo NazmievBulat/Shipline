@@ -63,7 +63,9 @@
     "machines": [],
     "hunts": {
       "areas": {},
-      "plans": null
+      "plans": null,
+      "settings": {},
+      "area_settings": {}
     },
     "commands": {
       "test": null,

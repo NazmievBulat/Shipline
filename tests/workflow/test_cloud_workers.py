@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 from workflow_harness import Workflow
+from workflow.test_usage import _ANSWER, _usage_answer
 
 _URL = "https://claude.ai/code/session_01Cloud?from=cli&m=0"
 _NOW = 1792432800
@@ -538,6 +539,28 @@ def test_unread_usage_waits_for_a_later_tick(workflow: Workflow) -> None:
     done = workflow.run_script("tick", env=_cloud_tick(workflow))
     assert done.returncode == 0, done.stderr
     assert len(workflow.calls("tmux cloud-7 new-session")) == 1
+
+
+@pytest.mark.parametrize("source", ["cache", "live"])
+@pytest.mark.parametrize("kind", ["not started", "missing", "non-numeric"])
+def test_cloud_starts_distinguish_not_started_from_unknown_usage(
+    workflow: Workflow, source: str, kind: str
+) -> None:
+    workflow.add_pull_request(7)
+    answer = {"seven_day": _ANSWER["seven_day"]}
+    if kind != "missing":
+        answer["five_hour"] = {
+            "utilization": 0.0 if kind == "not started" else "0",
+            "resets_at": None,
+        }
+    _usage_answer(workflow, answer, source)
+
+    done = workflow.run_script("tick", env={**_ENV, "WORKFLOW_WORKER_PROGRAM": "cloud"})
+
+    assert done.returncode == 0, done.stderr
+    assert bool(workflow.calls("tmux cloud-7 new-session")) is (kind == "not started")
+    if kind != "not started":
+        assert "cloud start waits: the 5-hour usage window could not be read" in done.stdout
 
 
 def test_cloud_start_ignores_local_memory_and_load(workflow: Workflow) -> None:
