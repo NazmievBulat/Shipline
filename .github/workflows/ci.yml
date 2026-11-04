@@ -84,6 +84,7 @@ jobs:
               tests/workflow/test_merge_squash.py
               tests/workflow/test_merge_scratch.py
               tests/workflow/test_merge_train.py
+              tests/workflow/test_wake.py
               tests/workflow/test_workflow_commands.py
           - shard: 2
             files: >-
@@ -137,7 +138,6 @@ jobs:
               tests/workflow/test_session_start.py
               tests/workflow/test_tick_waits.py
               tests/workflow/test_train_first.py
-              tests/workflow/test_wake.py
               tests/workflow/test_worker_routing.py
           - shard: 4
             files: >-
