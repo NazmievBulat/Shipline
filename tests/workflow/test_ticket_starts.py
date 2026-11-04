@@ -317,6 +317,7 @@ def test_room_is_sampled_through_a_twelve_minute_tick(
     notes = _notes(workflow)
     program = """
 import os, pathlib, sys
+from types import SimpleNamespace
 sys.path.insert(0, sys.argv[1])
 import ticket_starts
 
@@ -339,7 +340,7 @@ def advance(seconds):
     pressure.write_text('some avg10=50.00 avg60=50.00 avg300=50.00 total=0\\n'
                         if step == 2 and excursion == 'memory' else usual_pressure)
 
-ticket_starts.time.sleep = advance
+ticket_starts.time = SimpleNamespace(sleep=advance, time=ticket_starts.time.time)
 ticket_starts.watch_room(pathlib.Path(sys.argv[2]), os.getppid())
 """
     done = subprocess.run(
