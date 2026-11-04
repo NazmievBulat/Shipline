@@ -1378,10 +1378,13 @@ def test_a_lost_patch_response_keeps_the_unstarted_child_retryable(
         (state / "github.json").write_text(json.dumps(data))'''
     assert original.count(anchor) == 1
     delay = "\n        import time\n        time.sleep(2)\n"
+    # The stand-in answers in a thread of this process, which outlives the cut-off call: its
+    # late write must land before the retry, and never in a later test's reused folder.
+    finished = '\n        (state / "delayed-call-done").touch()\n'
     if failure == "lost-response":
-        replacement = anchor + delay
+        replacement = anchor + delay + finished
     elif failure == "timeout":
-        replacement = delay + anchor
+        replacement = delay + anchor + finished
     else:
         replacement = '        sys.exit("temporary base update failure")\n' + anchor
     source.write_text(original.replace(anchor, replacement))
@@ -1418,6 +1421,11 @@ runpy.run_path(str(script), run_name="__main__")
     assert not list((_folder(workflow) / "merge-handbacks.sent").glob("*"))
     assert not worktree.exists()
     assert workflow.git("ls-remote", "origin", "refs/heads/ticket/eight").split()[0] == head
+    if failure != "refused":
+        deadline = time.monotonic() + 10
+        while not (workflow.state / "delayed-call-done").exists():
+            assert time.monotonic() < deadline, "the delayed stand-in call did not finish"
+            time.sleep(0.05)
 
     # A completed update needs only a read; a failed update needs a new PATCH.
     if failure == "lost-response":
