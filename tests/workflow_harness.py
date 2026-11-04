@@ -403,7 +403,7 @@ case "$command" in
     [ "$(target "$@")" = "=$name:" ] || { echo "can't find pane" >&2; exit 1; }
     # Lines that left the top of the screen are printed only when the history is asked for.
     case " $* " in
-      *" -S -200 "*) [ ! -f "@STATE@/scrollback/$name" ] || cat "@STATE@/scrollback/$name" ;;
+      *" -S -200 "*|*" -S - "*) [ ! -f "@STATE@/scrollback/$name" ] || cat "@STATE@/scrollback/$name" ;;
     esac
     screen="@STATE@/screen/$name"
     [ -f "$screen" ] || screen="@STATE@/screen/default"
@@ -422,8 +422,10 @@ if len(rules) >= 2:
 else:
     prompts = (">", chr(0x276f), chr(0x203a))
     boxes = [i for i, line in enumerate(lines) if line.startswith(prompts)]
-    at = boxes[-1] - len(boxes) + 1 if boxes else len(lines)
-    lines = [line for line in lines if not line.startswith(prompts)]
+    at = boxes[-1] if boxes else len(lines)
+    # Historical submitted prompts remain output, as in a real tmux capture.
+    if boxes:
+        lines.pop(at)
     # The box stays where the prompt was drawn, above the rows of the footer.
     lines[at:at] = ["> " + text]
 print("\\n".join(lines))

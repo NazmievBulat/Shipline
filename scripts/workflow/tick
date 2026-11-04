@@ -18,6 +18,9 @@
 #      squeezed.
 #   4. A worker, independent reviewer or audit that the usage limit stopped is sent its instruction again when
 #      the time the limit resets has passed, once for each reset.
+#      A Codex worker, conflict reviewer or hunter stopped on model capacity is told to
+#      continue after 5 minutes, then 15 and 30 for repeated stops, once per stop. Owner
+#      questions and input stay untouched; repeated capacity waits are named in the wake.
 #   5. `wake`: the orchestrator session is told of the sessions step 4 woke, and looked in on
 #      every 20 minutes at night. This is the one step that may call a model, to deliver the
 #      message.
@@ -479,7 +482,7 @@ shadow_cleanup() {
 # session command prints when it does it.
 shadow_session() {
   case $1 in
-    list | running | load | room) bash "$here/session" "$@" 9>&- ;;
+    list | running | load | room | capacity-stop) bash "$here/session" "$@" 9>&- ;;
     stop)
       # One that runs no more is left as it is: `session stop` says so, and stops nothing.
       shadow_alive "$2" || { [[ $2 =~ ^(ticket|review)- ]] && shadow_alive "codex-${2##*-}"; } ||
@@ -509,6 +512,7 @@ shadow_session() {
     nudge-busy) bash "$here/session" would-nudge "${@:2}" 9>&- ;;
     # An answer for the owner too, as `session answer-for-owner` would type it.
     answer-for-owner) bash "$here/session" would-answer "${@:2}" 9>&- ;;
+    capacity-retry) bash "$here/session" would-capacity-retry "${@:2}" 9>&- ;;
     *) shadow_note "session $*" ;;
   esac
 }
@@ -792,6 +796,83 @@ local_done=0
 budget_ready() {
   python3 "$here/github_budget.py" ready tick
 }
+
+# A line for the wake, kept until the orchestrator was told it. `key` names it once.
+note_for_wake() {
+  local key=$1 line=$2 folder=$main/$SHIPLINE_STATE_FOLDER/stuck.pending
+  ((shadow == 0)) || folder=$SHIPLINE_SHADOW_NOTES/stuck.pending
+  mkdir -p "$folder" && jq -n --arg line "$line" '{line: $line}' >"$folder/$key.json"
+}
+
+# Capacity is a provider stop, independent of account quota and GitHub availability.
+# Remember the output block after a retry so an unchanged stop never gets another one.
+# A working pane or a different output block begins a new stop, retaining the backoff.
+capacity_duties() {
+  local name notes mark tries since previous sent named sum minutes delivery result
+  while read -r name _; do
+    [[ $name =~ ^(ticket|review)-[0-9]+$ || $name == hunt-* ]] || continue
+    session_current "$name" || continue
+    if [[ $name == hunt-* ]]; then
+      notes=$main/.claude/worktrees/$name/$SHIPLINE_STATE_FOLDER/$name
+    else
+      notes=$main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name
+    fi
+    [[ -e $notes.codex || ( $name == hunt-* &&
+       -f $main/.local/hunts/${name#hunt-}/codex.log ) ]] || continue
+    mark=$notes.capacity
+    tries=0 since=0 previous=- sent=0 named=0
+    if [[ -r $mark ]]; then
+      read -r tries since previous sent named <"$mark" || true
+      if [[ ! $tries =~ ^[0-3]$ || ! $since =~ ^[0-9]+$ ||
+            ! $previous =~ ^(-|[0-9]+)$ || ! $sent =~ ^[01]$ || ! $named =~ ^[01]$ ]]; then
+        tries=0 since=0 previous=- sent=0 named=0
+      fi
+    fi
+    sum=$(session capacity-stop "$name")
+    result=$?
+    if ((result != 0)); then
+      # An unreadable pane is no evidence of recovery; keep its delivery receipt.
+      if [[ $result == 1 && $previous != - ]]; then
+        write_session_note "$name" "$mark" "$tries 0 - 0 0" || failed=1
+      fi
+      continue
+    fi
+    if [[ $sum != "$previous" ]]; then
+      since=$NOW sent=0 named=0
+      write_session_note "$name" "$mark" "$tries $since $sum $sent $named" || { failed=1; continue; }
+    fi
+    ((sent == 0)) || continue
+    case $tries in
+      0) minutes=5 ;;
+      1) minutes=15 ;;
+      *) minutes=30 ;;
+    esac
+    if ((NOW - since < minutes * 60)); then
+      shadow_due $((since + minutes * 60 - NOW)) "$name capacity retry sent"
+      continue
+    fi
+    if ((tries > 0 && named == 0)); then
+      if note_for_wake "$name-capacity-$since-$sum" "codex at capacity: $name ($minutes min)"; then
+        named=1
+        write_session_note "$name" "$mark" "$tries $since $sum $sent $named" || { failed=1; continue; }
+      else
+        failed=1
+        continue
+      fi
+    fi
+    delivery=$(session capacity-retry "$name" 2>&1)
+    result=$?
+    if ((result == 0)); then
+      ((tries >= 3)) || tries=$((tries + 1))
+      write_session_note "$name" "$mark" "$tries $since $sum 1 $named" || failed=1
+      wake_log "$name capacity retry sent" || failed=1
+    elif ((result != 3)); then
+      echo "$delivery" >&2
+      failed=1
+    fi
+  done <<<"$running"
+}
+
 # GitHub pauses do not hold back what needs no GitHub: squeezing and resending after a
 # usage reset, then local alerts and pending owner/cloud notifications in the wake.
 paused() {
@@ -835,6 +916,7 @@ local_duties() {
       failed=1
     fi
   done <<<"$running"
+  capacity_duties
 }
 
 # Set in the timer environment, or persistently in this file. Claude stays the default until
@@ -913,6 +995,9 @@ if ! python3 "$here/tick_snapshot.py" create "$snapshot" 9>&- || ! pulls=$(label
   # The application an ended hunt left running is stopped all the same.
   session cleanup hunts
   budget_ready || paused
+  # Capacity recovery needs no pull request listing. Leave the other local duties
+  # on their existing paths, including their protections during listing failures.
+  capacity_duties
   exit 1
 fi
 
@@ -1270,13 +1355,6 @@ screen_sum() {
     { LC_ALL=C grep -vE '^[[:space:]]*(·|✢|✳|✶|✻|✽|\*)[[:space:]]+[^[:space:]]+…' || true; } |
     LC_ALL=C sed -E 's/[0-9]+(\.[0-9]+)?(ms|s|m|h)\b//g' | cksum) || return 1
   echo "${sum%% *}"
-}
-
-# A line for the wake, kept until the orchestrator was told it. `key` names it once.
-note_for_wake() {
-  local key=$1 line=$2 folder=$main/$SHIPLINE_STATE_FOLDER/stuck.pending
-  ((shadow == 0)) || folder=$SHIPLINE_SHADOW_NOTES/stuck.pending
-  mkdir -p "$folder" && jq -n --arg line "$line" '{line: $line}' >"$folder/$key.json"
 }
 
 # A session that would be told something: not given a message already in this tick, not
