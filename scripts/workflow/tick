@@ -296,7 +296,22 @@ export WORKFLOW_TRAIN_TICK
 WORKFLOW_TRAIN_TICK=$(mktemp -d)
 export WORKFLOW_SESSION_SNAPSHOT=$WORKFLOW_TRAIN_TICK/sessions
 python3 -c 'import json,sys,time; json.dump({"started": time.time()}, open(sys.argv[1], "w"))' "$WORKFLOW_TRAIN_TICK/context.json"
-trap 'tick_code=$?; rm -rf "$WORKFLOW_TRAIN_TICK"; tick_ended "$tick_code"' EXIT
+room_sampler=
+tick_cleanup() {
+  if [[ -n $room_sampler ]]; then
+    kill "$room_sampler" 2>/dev/null || true
+    wait "$room_sampler" 2>/dev/null || true
+  fi
+  rm -rf "$WORKFLOW_TRAIN_TICK"
+  tick_ended "$1"
+}
+trap 'tick_cleanup $?' EXIT
+# The pick's resource history must keep moving while this tick drives the train. The
+# sampler closes the tick's lock, stops on exit, and never runs for a shadow tick.
+if ((shadow == 0)); then
+  python3 -B "$here/ticket_starts.py" watch-room "$main" "$$" </dev/null >/dev/null 7>&- 9>&- &
+  room_sampler=$!
+fi
 
 # A decision of a shadow tick: a line of its log.
 shadow_note() {
