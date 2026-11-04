@@ -149,16 +149,19 @@ def delay(
         )
         if read(marker).get("until") != until:
             reset = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))
-            if resource == "secondary":
+            quota = row.get("cause") if resource == "secondary" else None
+            if resource == "secondary" and quota is None:
                 cause = "GitHub's secondary limit"
                 if "status" in row and "program" in row:
                     cause += f" ({row['status']} from {row['program']})"
             else:
-                name = "hourly" if resource in HOURLY else resource
+                source = quota if quota is not None else row
+                source_resource = source.get("resource", resource)
+                name = "hourly" if source_resource in HOURLY else source_resource
                 server_reset = time.strftime(
-                    '%Y-%m-%d %H:%M:%S UTC', time.gmtime(row["reset"])
+                    '%Y-%m-%d %H:%M:%S UTC', time.gmtime(source["reset"])
                 )
-                cause = f"GitHub's {name} limit ({row['remaining']} left, resets {server_reset})"
+                cause = f"GitHub's {name} limit ({source['remaining']} left, resets {server_reset})"
             print(
                 f"{program}: {cause}; requests pause until {reset}",
                 file=sys.stderr,
@@ -633,6 +636,7 @@ def call(
         throttled = next((row for row in responses if _limited(row)), None)
         cause: dict[str, Any] = {}
         if throttled:
+            message = _message(throttled)
             seconds = 60
             try:
                 seconds = max(seconds, int(throttled.get("retry-after", "60")))
@@ -642,7 +646,7 @@ def call(
                 "throttled": True,
                 "arguments": _safe_arguments(arguments, token),
                 "status": int(throttled["status"]),
-                "message": _redact(_message(throttled), token)[:200],
+                "message": _redact(message, token)[:200],
             }
             if "retry-after" in throttled:
                 cause["retry_after"] = _redact(throttled["retry-after"], token)
@@ -654,6 +658,20 @@ def call(
                     "program": program,
                     "status": cause["status"],
                 }
+                # The existing cooldown floor can outlast an exhausted quota window.
+                # Keep that response's source separate from the controlling deadline.
+                if (
+                    throttled.get("x-ratelimit-remaining") == "0"
+                    and "secondary rate limit" not in message.lower()
+                ):
+                    try:
+                        state["secondary"]["cause"] = {
+                            "resource": throttled["x-ratelimit-resource"],
+                            "remaining": 0,
+                            "reset": int(throttled["x-ratelimit-reset"]),
+                        }
+                    except KeyError, ValueError:
+                        pass
         save(budget, state)
         log = path / "requests.jsonl"
         if log.exists() and log.stat().st_size > 10_000_000:

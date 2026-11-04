@@ -671,6 +671,26 @@ def test_hourly_cause_survives_a_cooldown_longer_than_the_server_reset(
     assert expected in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("status", [403, 429])
+def test_explicit_secondary_cause_wins_over_a_short_exhausted_hourly_window(
+    host: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    status: int,
+) -> None:
+    module = _module()
+    monkeypatch.setattr(module.time, "time", lambda: 1000)
+    _answer(
+        host, status=status, exit=1,
+        body='{"message":"You have exceeded a secondary rate limit"}',
+        headers={
+            "X-Ratelimit-Remaining": "0", "X-Ratelimit-Reset": "1020",
+            "X-Ratelimit-Resource": "core", "Retry-After": "120",
+        },
+    )
+    assert module.call("test", "api", "repos/owner/repo/actions/runners").returncode == 1
+    assert module.delay("test") == 121
+    assert f"GitHub's secondary limit ({status} from test)" in capsys.readouterr().err
+
+
 def test_throttled_telemetry_removes_credentials_and_request_bodies(
     host: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
