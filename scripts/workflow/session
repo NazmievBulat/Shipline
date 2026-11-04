@@ -1030,7 +1030,11 @@ cmd_start_hunt() {
   wait_for_resources
 
   mkdir -p "$report"
-  env "${session_config[@]}" python3 "$script_dir/hunt_settings.py" prepare "$worktree" "$report" "$area"
+  if ! env "${session_config[@]}" python3 "$script_dir/hunt_settings.py" prepare "$worktree" "$report" "$area"; then
+    # No hunter launched. The helper rolls back its own files; keep any other contents.
+    rmdir "$report" 2>/dev/null || true
+    exit 1
+  fi
   if [[ $(<"$worktree/$SHIPLINE_STATE_FOLDER/hunt-settings.json") != '{}' ]]; then
     [[ $prompt == *. ]] || prompt+=.
     prompt+=" Keep the settings already recorded at the top of report.md when writing the report."

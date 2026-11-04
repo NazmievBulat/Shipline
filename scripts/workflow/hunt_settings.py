@@ -17,8 +17,13 @@ def header(report: Path, area: str, settings: dict[str, str]) -> str:
 
 def write_private(path: Path, text: str) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        stream.write(text)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(text)
+    except OSError:
+        # Exclusive creation succeeded: only this operation's partial file is removed.
+        path.unlink()
+        raise
 
 
 def prepare(worktree: Path, report: Path, area: str) -> None:
@@ -28,7 +33,11 @@ def prepare(worktree: Path, report: Path, area: str) -> None:
     snapshot.parent.mkdir(parents=True, exist_ok=True)
     # The snapshot is data, never shell source. Keep installation values private.
     write_private(snapshot, json.dumps(settings) + "\n")
-    write_private(report / "report.md", header(report, area, settings))
+    try:
+        write_private(report / "report.md", header(report, area, settings))
+    except OSError:
+        snapshot.unlink()
+        raise
 
 
 def discard(worktree: Path, report: Path, area: str) -> None:
