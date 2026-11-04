@@ -54,20 +54,34 @@ claude_input() {
     <<<"$screen" | nonblank_input "$((top + 1))" "$((bottom - 1))"
 }
 
-# Native Codex and legacy Claude prompt rows. Only native callers trim the shortcuts footer.
+# Native Codex and legacy Claude prompt rows. Only native callers trim Codex footers.
 # Legacy callers pass false to retain every continuation row. Keep
 # styling from the whole capture: a colour may have been set before the prompt row.
 codex_input() {
-  local screen=$1 first last trim_footer=${2:-true}
-  read -r first last < <(strip_ansi <<<"$screen" | LC_ALL=C awk -v trim_footer="$trim_footer" '
+  local screen=$1 first last status_footer trim_footer=${2:-true}
+  read -r first last status_footer < <(strip_ansi <<<"$screen" | LC_ALL=C awk -v trim_footer="$trim_footer" '
     /^(›|>|❯)/ { first = NR }
-    NF { last = NR; footer = $0 }
+    NF { last = NR; footer = $0; separated = blank }
+    { blank = !NF }
     END {
       if (trim_footer == "true" && footer ~ /^[[:space:]]*\? for shortcuts([[:space:]]+[0-9]+% context left)?[[:space:]]*$/) last--
-      print first + 0, last + 0
+      else if (trim_footer == "true" && last > first && separated &&
+               split(footer, parts, / · /) >= 3 &&
+               parts[1] ~ /^[[:blank:]]+[[:alnum:]][[:alnum:]_. -]*$/ &&
+               parts[2] ~ /^(~\/|\/|\.\/|\.\.\/)/ && parts[3] ~ /[^[:blank:]]/)
+        status_footer = 1
+      print first + 0, last + 0, status_footer + 0
     }
   ') || return 1
   ((first > 0 && last >= first)) || return 1
+  # The final status row is outside the box, separated by a blank row and drawn in
+  # foreground colour. Require its styling before the model name as well as its
+  # structure: a plain owner continuation can spell the very same model/path/title.
+  # Never trim the prompt row, an earlier lookalike, or a row joined to the draft.
+  if ((status_footer)) && LC_ALL=C sed -n "${last}p" <<<"$screen" |
+      LC_ALL=C grep -qE $'^[[:blank:]]*(\x1b\\[[0-9;:]*m[[:blank:]]*)*\x1b\\[([0-9]+;)*(3[0-7]|9[0-7]|38[;:][25][;:])[0-9;:]*m'; then
+    last=$((last - 1))
+  fi
   nonblank_input "$first" "$last" <<<"$screen"
 }
 
