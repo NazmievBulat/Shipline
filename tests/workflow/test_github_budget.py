@@ -643,6 +643,34 @@ def test_github_limit_responses_pause_and_record_the_cause_once(
     assert row["requests"] == 1
 
 
+@pytest.mark.parametrize("status", [403, 429])
+@pytest.mark.parametrize("resource", ["core", "graphql"])
+def test_hourly_cause_survives_a_cooldown_longer_than_the_server_reset(
+    host: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    status: int, resource: str,
+) -> None:
+    module = _module()
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "time", lambda: clock[0])
+    _answer(
+        host, status=status, exit=1, body='{"message":"API rate limit exceeded"}',
+        headers={
+            "X-Ratelimit-Remaining": "0", "X-Ratelimit-Reset": "1020",
+            "X-Ratelimit-Resource": resource,
+        },
+    )
+    assert module.call("test", "api", "repos/owner/repo/actions/runners").returncode == 1
+    assert module.delay("test") == 61
+    expected = "GitHub's hourly limit (0 left, resets 1970-01-01 00:17:00 UTC)"
+    message = capsys.readouterr().err
+    assert expected in message
+    assert "requests pause until 1970-01-01 00:17:41 UTC" in message
+    # Another client must still see the true source after the hourly window resets.
+    clock[0] = 1030
+    assert module.delay("other") == 31
+    assert expected in capsys.readouterr().err
+
+
 def test_throttled_telemetry_removes_credentials_and_request_bodies(
     host: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
