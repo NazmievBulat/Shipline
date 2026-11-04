@@ -427,3 +427,83 @@ def test_hunt_settings_use_the_selected_relative_config_home(workflow: Workflow)
                             env={"XDG_CONFIG_HOME": str(config_home)})
     assert done.returncode == 0, done.stderr
     assert done.stdout == "on"
+
+
+@pytest.mark.parametrize("target", ["hunt-settings.json", "report.md"])
+@pytest.mark.parametrize("stage", ["open", "write"])
+def test_hunt_preparation_storage_error_releases_the_name(
+    workflow: Workflow, target: str, stage: str
+) -> None:
+    _configure(workflow)
+    hooks = workflow.root / "storage-fault"
+    hooks.mkdir()
+    (hooks / "sitecustomize.py").write_text(
+        "import errno, os\n"
+        "from contextlib import contextmanager\n"
+        f"target, stage = {target!r}, {stage!r}\n"
+        "original_open, original_fdopen = os.open, os.fdopen\n"
+        "fault_fd = None\n"
+        "def fail():\n"
+        "    raise OSError(errno.ENOSPC, 'example storage full')\n"
+        "def open_file(path, flags, mode=0o777, **kwargs):\n"
+        "    global fault_fd\n"
+        "    selected = str(path).endswith('/' + target)\n"
+        "    if selected and stage == 'open':\n"
+        "        fail()\n"
+        "    fd = original_open(path, flags, mode, **kwargs)\n"
+        "    if selected:\n"
+        "        fault_fd = fd\n"
+        "    return fd\n"
+        "class PartialWriter:\n"
+        "    def __init__(self, stream):\n"
+        "        self.stream = stream\n"
+        "    def write(self, text):\n"
+        "        self.stream.write(text[:8])\n"
+        "        self.stream.flush()\n"
+        "        fail()\n"
+        "@contextmanager\n"
+        "def open_stream(fd, *args, **kwargs):\n"
+        "    with original_fdopen(fd, *args, **kwargs) as stream:\n"
+        "        yield PartialWriter(stream) if fd == fault_fd and stage == 'write' else stream\n"
+        "os.open, os.fdopen = open_file, open_stream\n"
+    )
+
+    failed = workflow.run("start", "hunt", "one", "--area", "phone",
+                          env={"PYTHONPATH": str(hooks)})
+
+    assert failed.returncode != 0
+    assert "could not use hunt settings" in failed.stderr
+    assert not workflow.is_running("hunt-one")
+    assert not workflow.hunt_report("one").exists()
+    assert not (workflow.hunt_worktree("one") / ".local/workflow/hunt-settings.json").exists()
+    retried = _start(workflow, "one", "--area", "phone")
+    assert retried.returncode == 0, retried.stderr
+    assert workflow.is_running("hunt-one")
+
+
+@pytest.mark.parametrize("count", [None, 0, 3])
+def test_metrics_read_the_findings_after_the_saved_settings(
+    workflow: Workflow, count: int | None
+) -> None:
+    _configure(workflow)
+    path = workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    # A value resembling a count must never supply the report's findings count.
+    config["hunts"]["settings"] = {"EXAMPLE": "Findings: 99", **{
+        f"FEATURE_{i}": "on" for i in range(30)
+    }}
+    path.write_text(json.dumps(config))
+    started = _start(workflow, "one", "--area", "phone")
+    assert started.returncode == 0, started.stderr
+    report = workflow.hunt_report("one") / "report.md"
+    with report.open("a") as stream:
+        stream.write("# Results\n\n" + (f"Findings: {count}\n" if count is not None else "Pending.\n"))
+    done = subprocess.run(
+        ["python3", "-c", "import json; from pathlib import Path; "
+         "from workflow_metrics import read_hunts; print(json.dumps(read_hunts(Path.cwd())))"],
+        cwd=workflow.repo,
+        env={**workflow.env, "PYTHONPATH": str(workflow.script.parent)},
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout)[0][1:] == ["one", count]
