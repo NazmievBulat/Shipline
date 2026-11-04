@@ -736,6 +736,65 @@ def test_response_message_does_not_persist_tokens_or_other_body_fields(
     assert json.loads(log)["message"].startswith("secondary rate limit ")
 
 
+@pytest.fixture(params=["user", "installation", "client", "multiline-client"])
+def primary_limit_message(request: pytest.FixtureRequest) -> str:
+    # Synthetic caller identifiers; construct the address rather than record one.
+    subject = (
+        ".".join(map(str, (192, 0, 2, 1)))
+        if "client" in request.param
+        else f"{request.param} ID 42424242"
+    )
+    separator = "\n" if request.param == "multiline-client" else " "
+    return f"API rate limit exceeded for{separator}{subject}."
+
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_primary_limit_caller_is_removed_before_telemetry_is_written(
+    host: Path, primary_limit_message: str, status: int,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    body = json.dumps({"message": primary_limit_message})
+    _answer(host, status=status, remaining=0, body=body, exit=1)
+    done = _run("call", "pr", "checks", "7")
+    assert done.returncode == 1
+    assert done.stdout == body
+    assert "GitHub's hourly limit (0 left, resets " in done.stderr
+    assert _run("ready").returncode == 75
+    path = host / ".local/state/workflow/github-budget"
+    [row] = [json.loads(line) for line in (path / "requests.jsonl").read_text().splitlines()]
+    # A fixed expectation keeps even synthetic caller details out of failure output.
+    assert row["message"] == "API rate limit exceeded for [redacted]"
+    assert row["throttled"] is True
+    assert row["status"] == status
+    _module().report(60)
+    [shown] = [
+        json.loads(line) for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{")
+    ]
+    assert shown == row
+
+
+@pytest.mark.parametrize("log_name", ["requests.jsonl", "requests.previous.jsonl"])
+def test_report_removes_primary_limit_callers_from_existing_logs(
+    host: Path, primary_limit_message: str, log_name: str,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _module()
+    monkeypatch.setattr(module.time, "time", lambda: 1000)
+    row = {
+        "at": 990, "program": "example-app", "requests": 1, "unchanged": 0,
+        "core": 1, "graphql": 0, "throttled": True, "status": 403,
+        "message": primary_limit_message,
+    }
+    (module.folder() / log_name).write_text(json.dumps(row) + "\n")
+    module.report(60)
+    output = capsys.readouterr().out
+    assert "example-app\t1\t0\t1\t0" in output
+    [shown] = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+    assert shown["message"] == "API rate limit exceeded for [redacted]"
+    assert shown == {**row, "message": shown["message"]}
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
