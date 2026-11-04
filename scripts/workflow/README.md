@@ -53,7 +53,10 @@ an argument names the snapshot even when its path contains spaces. Audit `cwd` p
 
 The Python example assumes `pip-audit` is included in the project's locked dependencies.
 It invokes the snapshot's interpreter explicitly: changing the working folder alone does
-not select that environment. `--no-build` refuses dependencies that need a build backend,
+not select that environment. A bare `pip-audit` command uses the executable in the audit
+`cwd`'s `.venv/bin` and stops if it is missing; it never falls back to the inherited PATH.
+For another environment layout, name the snapshot interpreter explicitly as in the example.
+`--no-build` refuses dependencies that need a build backend,
 and `--no-install-project` leaves the project itself out of preparation. Keep package builds
 and lifecycle scripts disabled when adapting these commands to a repository.
 
@@ -71,7 +74,9 @@ Python package names treat `-`, `_` and `.` alike. Uncovered findings go into on
 draft, created with GitHub's API on main's tree; no local commit or hook runs. Its labels
 use the configured workflow and priority names. A failing dependency check on the audited
 head gives blocker priority only when its annotations name a finding's advisory or alias;
-otherwise priority is high. Failed label requests are retried from the marked draft next run.
+otherwise priority is high. Failed label requests are retried from the marked draft next run,
+even when main no longer reports those findings. Without a matching current finding, recovery
+keeps an existing blocker or high priority label, defaulting to high when neither is present.
 
 `--dry-run` prints the proposed ticket and makes no GitHub writes. It still takes the lock,
 fetches main and prepares and audits the temporary snapshot. All runs use

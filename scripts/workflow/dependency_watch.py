@@ -293,7 +293,7 @@ def reconcile(config: workflow_config.Config, head: str, findings: list[Finding]
     no_fix = [item for item in findings if not item.fixes]
     for item in no_fix:
         print(f"no fix: {item.ecosystem} {item.package} ({', '.join(item.ids)})")
-    prs = pages(config, "pulls?state=open&base=main") if fixable else []
+    prs = pages(config, "pulls?state=open&base=main")
     missing = [item for item in fixable if not any(covered(item, pr) for pr in prs)]
     print(f"dependency watch: {len(fixable)} fixable, {len(fixable) - len(missing)} covered, "
           f"{len(no_fix)} with no fix")
@@ -308,10 +308,13 @@ def reconcile(config: workflow_config.Config, head: str, findings: list[Finding]
                 or not head_ref.get("ref", "").startswith("ticket/dependency-watch-")):
             continue
         matching = [item for item in fixable if covered(item, pr)]
-        if not matching:
-            continue
         existing = {entry["name"] for entry in pr.get("labels", [])}
-        required = [config.labels.workflow, priority(config, head, matching)]
+        # Main can be fixed before recovery. Keep any recorded priority in that case;
+        # otherwise high is the default when no current advisory proves blocker priority.
+        recovered_priority = next((config.labels.priority[name] for name in ("blocker", "high")
+                                   if config.labels.priority[name] in existing), config.labels.priority["high"])
+        required = [config.labels.workflow,
+                    priority(config, head, matching) if matching else recovered_priority]
         if not set(required) <= existing:
             if dry:
                 print(f"would label draft #{pr['number']}: {', '.join(required)}")
@@ -367,9 +370,16 @@ def audit(config: workflow_config.Config, settings: dict, dry: bool) -> None:
                 locks = tuple(path for path in entry["lock_files"] if inside(root, path).is_file())
                 if not locks:
                     raise WatchError("an audit has no configured lock file in the snapshot")
+                command = [word.replace("{root}", str(root)) for word in shlex.split(entry["run"])]
+                if entry["format"] == "pip-audit" and command[0] == "pip-audit":
+                    # A working directory alone does not select a Python environment.
+                    # Resolve bare pip-audit only in the environment prepared for this project.
+                    auditor = inside(root, str(cwd.relative_to(root) / ".venv/bin/pip-audit"))
+                    if not auditor.is_file() or not os.access(auditor, os.X_OK):
+                        raise WatchError("pip-audit requires an executable in the audit cwd's .venv/bin")
+                    command[0] = str(auditor)
                 with directory(cwd):
-                    done = run(*(word.replace("{root}", str(root)) for word in shlex.split(entry["run"])),
-                               timeout=180, input="")
+                    done = run(*command, timeout=180, input="")
                 if done.returncode not in (0, 1):
                     raise WatchError(f"{entry['format']} failed (exit {done.returncode})")
                 try:

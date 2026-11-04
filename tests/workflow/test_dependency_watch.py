@@ -260,7 +260,7 @@ program.chmod(0o700)
     _config(watch, prepare=["prepare-python-watch"] if prepared else [], audits=[{
         "run": "pip-audit --skip-editable --format json", "format": "pip-audit", "cwd": "backend",
     }])
-    temporary = watch.root / "python snapshots"
+    temporary = watch.bin / "python snapshots"
     temporary.mkdir()
     done = watch.shipline("dependency-watch", env={"TMPDIR": str(temporary)})
     if prepared:
@@ -273,6 +273,35 @@ program.chmod(0o700)
         assert done.returncode != 0
         assert not _calls(watch)
     assert not list(temporary.iterdir())
+
+
+def test_label_recovery_keeps_recorded_blocker_priority_after_a_clean_audit(watch: Workflow) -> None:
+    _prs(watch, {"number": 7, "draft": True, "title": "fix(deps): example-python", "body": MARKER,
+                 "labels": [{"name": "priority: blocker"}], "head": {
+                     "ref": "ticket/dependency-watch-example",
+                     "repo": {"full_name": "example-org/example-app"},
+                 }})
+    (watch.state / "bun.json").write_text('{"advisories": {}}')
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    assert _calls(watch, suffix="/labels")[0][2]["labels"] == ["workflow", "priority: blocker"]
+    assert not _calls(watch, suffix="/pulls")
+
+
+@pytest.mark.parametrize("draft,repository,branch", [
+    (False, "example-org/example-app", "ticket/dependency-watch-example"),
+    (True, "contributor/example-app", "ticket/dependency-watch-example"),
+    (True, "example-org/example-app", "unrelated-branch"),
+])
+def test_clean_audit_recovers_labels_only_for_owned_watch_drafts(
+    watch: Workflow, draft: bool, repository: str, branch: str,
+) -> None:
+    _prs(watch, {"number": 7, "draft": draft, "title": "fix(deps): example-python", "body": MARKER,
+                 "labels": [], "head": {"ref": branch, "repo": {"full_name": repository}}})
+    (watch.state / "bun.json").write_text('{"advisories": {}}')
+    done = watch.shipline("dependency-watch")
+    assert done.returncode == 0, done.stderr
+    assert not _calls(watch)
 
 
 def test_no_fix_is_reported_without_opening_a_ticket(watch: Workflow) -> None:
