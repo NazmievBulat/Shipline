@@ -111,6 +111,7 @@ _DEFAULTS = {
     # No hot paths, and the conflict reviewer of today.
     "hot_paths": [],
     "conflict_review": None,
+    "dependency_watch": None,
     "merge_train": {"queued_limit_minutes": 20},
     "cloud_pre_push": {"suites": {}},
 }
@@ -389,7 +390,9 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 
     # The conflict reviewer is one object, named whole or left out.
-    named = {**_DEFAULTS, "conflict_review": {"effort": "", "model": "", "max_changed_lines": 0, "program": ""}}
+    named = {**_DEFAULTS,
+             "conflict_review": {"effort": "", "model": "", "max_changed_lines": 0, "program": ""},
+             "dependency_watch": {"prepare": [], "audits": [], "minimum_severity": "high"}}
     assert keys(example) == keys(named)
     assert example["hot_paths"]
     assert example["repository"].endswith("/example-app")

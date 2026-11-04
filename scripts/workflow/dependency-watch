@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Audit an isolated snapshot of origin/main and open a draft for uncovered advisories.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec python3 -B "$here/dependency_watch.py" "$@"

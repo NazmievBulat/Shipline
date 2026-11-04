@@ -164,5 +164,21 @@
         "probe": "tools/shipline/browser-starts"
       }
     }
+  },
+  "dependency_watch": {
+    "prepare": [
+      "bun install --frozen-lockfile --ignore-scripts"
+    ],
+    "audits": [
+      {
+        "run": "bun audit --audit-level=high --json",
+        "format": "bun-audit",
+        "cwd": ".",
+        "lock_files": [
+          "bun.lock"
+        ]
+      }
+    ],
+    "minimum_severity": "high"
   }
 }
