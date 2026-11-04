@@ -1709,11 +1709,14 @@ def docs(*, write: bool = False) -> int:
 def main() -> int:
     if sys.argv[1:] in (["docs"], ["docs", "--write"]):
         return docs(write=sys.argv[-1] == "--write")
-    if len(sys.argv) not in (2, 3) or sys.argv[1] not in ("shell", "sh", "json"):
-        print("usage: workflow_config.py shell|sh|json [folder] | docs [--write]", file=sys.stderr)
+    if len(sys.argv) not in (2, 3) or sys.argv[1] not in ("shell", "sh", "json", "worktree-setup"):
+        print("usage: workflow_config.py shell|sh|json|worktree-setup [folder] | docs [--write]", file=sys.stderr)
         return 2
     try:
         config = load(Path(sys.argv[2]) if len(sys.argv) == 3 else None)
+        if sys.argv[1] == "worktree-setup":
+            print(config.file(config.worktree_setup))
+            return 0
     except ConfigError as error:
         print(error, file=sys.stderr)
         return 1
