@@ -522,8 +522,12 @@ def test_waiting_covers_one_stop_only(session: Workflow) -> None:
         ("review-7", "review sent back"),
     ],
 )
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [("", ""), ("", "│"), ("│ ", " │"), ("╭ │ ", " │ ╯"), ("╿\t", "\t╼ ╽")],
+)
 def test_finished_stop_overrides_an_earlier_wait(
-    session: Workflow, name: str, finished: str
+    session: Workflow, name: str, finished: str, left: str, right: str
 ) -> None:
     if name.startswith("hunt-"):
         notes = session.add_hunt("example") / ".local" / "workflow"
@@ -531,7 +535,9 @@ def test_finished_stop_overrides_an_earlier_wait(
         notes = session.notes(7)
     session.run_script("notify", "waiting", env={"WORKFLOW_SESSION": name})
 
-    done = session.notify(_stop(f"Work completed.\n\n**{finished}.**\n"), session=name)
+    message = f"Work completed.\n\n**{finished}.**\n\n"
+    message = "\n".join(f"{left}{line:<60}{right}" for line in message.splitlines())
+    done = session.notify(_stop(message), session=name)
 
     assert done.returncode == 0
     assert (notes / f"{name}.idle").exists()
@@ -540,6 +546,64 @@ def test_finished_stop_overrides_an_earlier_wait(
     assert not (notes / f"{name}.job-wait").exists()
     assert not (notes / f"{name}.asking").exists()
     assert session.pushes() == []
+
+
+@pytest.mark.parametrize(
+    ("name", "words"),
+    [
+        ("review-7", "review finished"),
+        ("review-7", "review sent back"),
+        ("ticket-7", "worker finished"),
+    ],
+)
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "I will say {words} when done.",
+        "{words} after the checks pass.",
+        "> {words}",
+        '"{words}"',
+        "{words}\nWhich option?",
+    ],
+)
+def test_bordered_sentences_quotes_or_more_reply_still_ring(
+    session: Workflow, name: str, words: str, reply: str
+) -> None:
+    session.set_draft(7, draft=words == "review sent back")
+    message = reply.format(words=words) + "\n\n"
+    message = "\n".join(f"│ {line:<60} │" for line in message.splitlines())
+
+    done = session.notify(_stop(message), session=name)
+
+    assert done.returncode == 0
+    assert len(session.pushes()) == 1
+
+
+@pytest.mark.parametrize("locale", ["C", "C.UTF-8"])
+def test_every_box_drawing_character_can_frame_the_closing_words(
+    session: Workflow, locale: str
+) -> None:
+    session.set_draft(7, draft=False)
+    spaces = " \t\u0085\u00a0\u1680\u2000\u200a\u2028\u2029\u202f\u205f\u3000"
+    borders = spaces.join(chr(code) for code in range(0x2500, 0x2580))
+
+    done = session.notify(
+        _stop(f"{borders} **worker finished.** {borders}"), env={"LC_ALL": locale}
+    )
+
+    assert done.returncode == 0
+    assert session.pushes() == []
+
+
+@pytest.mark.parametrize(
+    "message", ["⓿ worker finished │", "│ worker finished ▀", "│ worker │ finished │"]
+)
+def test_only_box_drawing_at_the_edges_is_removed(session: Workflow, message: str) -> None:
+    session.set_draft(7, draft=False)
+
+    session.notify(_stop(message))
+
+    assert len(session.pushes()) == 1
 
 
 @pytest.mark.parametrize(

@@ -204,6 +204,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 gh() { python3 "$here/github_budget.py" call tick "$@"; }
 source "$here/bridge-failed"
+source "$here/screen-borders"
+source "$here/input-box"
 # Keep the config home anchored to the caller before changing to main: sessions and the
 # other children must read the same file as this tick, even when it began in a worktree. A
 # leading `~` is the loader's to expand.
@@ -568,9 +570,10 @@ said_finished() {
     pattern="^[[:space:]]*(●|[*-])?[[:space:]]*(Codex says:[[:space:]]*)?(\"|“|')?[*_]*WORDS[.!]?[*_]*(\"|”|')?[[:space:]]*$"
   fi
   screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 1
-  said=$(LC_ALL=C grep -niE "${pattern/WORDS/$words}" <<<"$screen") || return 1
+  said=$(strip_screen_borders <<<"$screen" | LC_ALL=C grep -niE "${pattern/WORDS/$words}") || return 1
   said=${said##*$'\n'}
-  after=$(LC_ALL=C sed -n "$((${said%%:*} + 1)),\$p" <<<"$screen" | LC_ALL=C sed '/^─/,$d')
+  after=$(LC_ALL=C sed -n "$((${said%%:*} + 1)),\$p" <<<"$screen" |
+    LC_ALL=C sed -E "/$SCREEN_INPUT_RULE/,\$d" | strip_screen_borders)
   ! LC_ALL=C grep -qvE '^([[:space:]]*((·|✢|✳|✶|✻|✽|⎿).*)?|(>|❯)[[:space:]]*)$' <<<"$after"
 }
 
@@ -1285,11 +1288,14 @@ asks_permission() {
 # Claude draws itself, its spinner and the time a turn took ("✻ Worked for 3m 2s"), are not
 # words of the session.
 last_line() {
-  local screen top
+  local screen top bottom framed rules
   screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 1
-  top=$(LC_ALL=C awk '/^─/ { above = last; last = NR }
-    END { print above ? above : (last ? last : NR + 1) }' <<<"$screen")
-  LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" |
+  read -r top bottom framed rules < <(input_box_bounds <<<"$screen") || return 1
+  if ((top == 0)); then
+    top=$(LC_ALL=C awk -v rule="$SCREEN_INPUT_RULE" '$0 ~ rule { above = last; last = NR }
+      END { print above ? above : (last ? last : NR + 1) }' <<<"$screen")
+  fi
+  LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" | strip_screen_borders |
     { LC_ALL=C grep -vE '^[[:space:]]*((·|✢|✳|✶|✻|✽)[[:space:]]|\*[[:space:]]+[^[:space:]]+…)' || true; } |
     LC_ALL=C sed -E 's/^[[:space:]]*((●|⎿)[[:space:]]*)*//; s/[[:space:]]+$//' |
     LC_ALL=C awk 'NF { line = $0 } END { print line }'
