@@ -848,6 +848,28 @@ def test_a_lender_cancellation_still_finishing_is_pending_only_without_real_fail
         assert _PYTHON in names
 
 
+@pytest.mark.parametrize("conclusions", [("cancelled", "failure"), ("failure", "cancelled")])
+def test_an_inherited_cancellation_cannot_hide_a_failed_part(
+    github: GitHub, conclusions: tuple[str, str]
+) -> None:
+    workflow = github.workflow
+    _squash_with_pending_main(github)
+    assert workflow.run_script("main-status", "--tick-main-status").stdout.startswith("main: green")
+    _main_jobs(
+        github,
+        ("CI result", "completed", "failure"),
+        *[
+            (f"{_PYTHON} ({part} of 2)", "completed", conclusion)
+            for part, conclusion in enumerate(conclusions, start=1)
+        ],
+    )
+
+    status = workflow.run_script("main-status")
+
+    assert status.stdout.startswith("main: red"), status.stdout + status.stderr
+    assert _PYTHON in status.stdout
+
+
 def test_a_main_run_not_yet_inherited_is_never_cancelled(github: GitHub) -> None:
     workflow = github.workflow
     _pull_skipped_older(github)

@@ -123,7 +123,10 @@ def checks(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             merged.append(group[0])
             continue
         conclusions = [job.get("conclusion") for job in group]
-        failed = [c for c in conclusions if c not in (None, "success", "skipped")]
+        # Cancellation of one part must not hide an actual failure in another.
+        failed = [c for c in conclusions if c not in (None, "success", "skipped", "cancelled")]
+        if not failed and "cancelled" in conclusions:
+            failed = ["cancelled"]
         dealt = sorted(
             (int(matched[3]), int(matched[2]))
             for matched in (_PART.fullmatch(job.get("name", "")) for job in group)
