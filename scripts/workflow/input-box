@@ -68,7 +68,7 @@ codex_input() {
     }
   ') || return 1
   ((first > 0 && last >= first)) || return 1
-  LC_ALL=C sed "${first}s/›/>/" <<<"$screen" | nonblank_input "$first" "$last"
+  nonblank_input "$first" "$last" <<<"$screen"
 }
 
 # Strip the prompt mark and blank input lines. Use complete UTF-8 byte sequences for
@@ -82,6 +82,15 @@ nonblank_input() {
   # selected rows. Only foreground grey is decoration: white, black, backgrounds and
   # underline colours must not hide typed text. Colour subparameters are not SGR codes.
   LC_ALL=C awk -v first="${1:-1}" -v last="${2:-0}" '
+    function input_span(text) {
+      # Locate the structural mark before discarding its styling. Otherwise a styled
+      # prefix can vanish and make an owner quote look like the prompt mark instead.
+      if (NR == first && !prefix_seen && length(text)) {
+        prefix_seen = 1
+        sub(/^(>|❯|›)/, "", text)
+      }
+      if (selected && !dim && !grey) printf "%s", text
+    }
     function grey_index(value) {
       return value == 8 || (value >= 232 && value <= 255) ||
         value == 59 || value == 102 || value == 145 || value == 188
@@ -93,7 +102,7 @@ nonblank_input() {
       selected = NR >= first && (!last || NR <= last)
       rest = $0
       while (match(rest, /\033(\[[0-?]*[ -\/]*[@-~]|\][^\007\033]*(\007|\033\\))/)) {
-        if (selected && !dim && !grey) printf "%s", substr(rest, 1, RSTART - 1)
+        input_span(substr(rest, 1, RSTART - 1))
         escape = substr(rest, RSTART, RLENGTH)
         rest = substr(rest, RSTART + RLENGTH)
         if (escape ~ /^\033\[[0-9;:]*m$/) {
@@ -129,8 +138,8 @@ nonblank_input() {
           }
         }
       }
-      if (selected && !dim && !grey) printf "%s", rest
+      input_span(rest)
       if (selected) printf "\n"
     }
-  ' | LC_ALL=C sed -E "s/^(>|❯)//; /^($spaces)*$/d"
+  ' | LC_ALL=C sed -E "/^($spaces)*$/d"
 }
