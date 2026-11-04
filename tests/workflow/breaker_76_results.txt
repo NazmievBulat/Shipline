@@ -1,0 +1,56 @@
+PR head tested: fe6c4aa546bdfa7f14227b30a308636f40c486b6
+Independent tests: tests/workflow/test_breaker_dependency_watch_76.py
+
+Environment: virtual environment inside the clone, installed from
+requirements-test.txt with --require-hashes. No existing test file was run.
+All repositories and services used by these cases are local stand-ins.
+
+Command:
+  .local/breaker/venv/bin/python -m pytest tests/workflow/test_breaker_dependency_watch_76.py --basetemp=.local/breaker/cases-final --tb=short --no-header -q
+  TMPDIR was set to a temporary directory inside the clone.
+
+Final result:
+  2 failed, 39 passed in 1.36s
+
+BROKE: test_bare_pip_audit_reads_prepared_snapshot_environment
+  Preparation creates a snapshot-local Python environment. Its audit reports
+  a fixable advisory; the other auditor on PATH reports a clean environment.
+  The configured bare pip-audit command runs the latter and silently opens
+  no ticket. Changing cwd to backend does not select its environment.
+  Last relevant output:
+    dependency watch: 0 fixable, 0 covered, 0 with no fix
+    AssertionError: snapshot Python advisory was missed: PATH selected the installing environment's auditor
+    assert 0 == 1
+
+BROKE: test_failed_labels_are_retried_after_main_is_fixed
+  The ticket is created, but its label request fails. Before the retry,
+  main's findings disappear. The next run never reads the marked draft and
+  leaves it unlabelled. The ticket promises recovery on the next run.
+  Last relevant output:
+    dependency watch: GitHub label request failed (exit 1)
+    dependency watch: 0 fixable, 0 covered, 0 with no fix
+    AssertionError: marked draft remains unlabelled after findings disappear
+    assert [] == ['workflow', 'priority: high']
+
+SURVIVED: snapshot isolation, dirty checkout, newly fetched main, exact
+preparation and audit arguments, joined title, no-reply commit identity,
+one empty draft for both ecosystems, locks in the body, title fallback,
+high/critical severity selection, whole-package coverage boundaries,
+Python separator normalization, findings without fixes, check and annotation
+pagination, missing/pending/successful rerun checks, failed/lost label
+responses with unchanged findings, held lock, two live calls, timeout,
+audit exit failure, invalid JSON, missing lock file, absent settings,
+dry-run label recovery, fork label exclusion, advisory prose exclusion,
+command-text rejection, private state and lock permissions, timer schedule,
+PATH and GitHub configuration preservation, private unit permissions,
+and timer uninstall.
+
+Read-only security review: no additional blocking exposure or injection
+finding in the changed code, commit messages or PR description. Commands
+have explicit bounds, extraction uses the data filter, only fetched main
+is prepared, and fork markers do not cause workflow-label writes.
+
+Choices: retain the two failures as regressions; change no implementation,
+model text or product behavior. No owner decision or extra review requested.
+
+verdict: broke
