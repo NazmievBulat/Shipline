@@ -11,7 +11,7 @@ LIMIT_STOP_PERCENT=90
 # window. Both full selects the weekly window, as notify does for a session's own closing message.
 usage_reset_for_clock() {
   local named=$1 text=$2 zone="" hour minute suffix clock_hour clock_minute clock_second
-  local window percent at five=0 seven=0 five_at="" seven_at="" figures delta now
+  local window percent at state five=0 seven=0 five_at="" seven_at="" figures delta now
   local -a in_zone=()
   if [[ $text =~ ^(.*[^[:space:]])[[:space:]]*\(([A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*)\)$ ]]; then
     text=${BASH_REMATCH[1]}
@@ -24,7 +24,7 @@ usage_reset_for_clock() {
   hour=$((10#$hour % 12))
   [[ $suffix != pm ]] || hour=$((hour + 12))
   figures=$(WORKFLOW_USAGE_SECONDS=1 timeout 1.5 bash "$LIMIT_USAGE_SCRIPT" 2>/dev/null) || return 1
-  while read -r window percent at; do
+  while read -r window percent at state; do
     [[ $percent =~ ^[0-9]+$ && $at =~ ^[0-9]+$ ]] || continue
     case $window in
       five_hour) five=$percent five_at=$at ;;

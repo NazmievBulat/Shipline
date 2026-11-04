@@ -96,6 +96,11 @@
     "web/src/pages/**"
   ],
   "hunts": {
+    "area_settings": {
+      "phone": {
+        "FEATURE_EXAMPLE": "on"
+      }
+    },
     "areas": {
       "phone": [
         "/calls",
@@ -106,7 +111,10 @@
         "/settings/billing"
       ]
     },
-    "plans": "docs/hunt-plans.md"
+    "plans": "docs/hunt-plans.md",
+    "settings": {
+      "FEATURE_EXAMPLE": "off"
+    }
   },
   "install_folder": ".",
   "labels": {
