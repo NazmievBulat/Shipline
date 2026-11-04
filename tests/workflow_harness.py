@@ -403,7 +403,7 @@ case "$command" in
     [ "$(target "$@")" = "=$name:" ] || { echo "can't find pane" >&2; exit 1; }
     # Lines that left the top of the screen are printed only when the history is asked for.
     case " $* " in
-      *" -S -200 "*) [ ! -f "@STATE@/scrollback/$name" ] || cat "@STATE@/scrollback/$name" ;;
+      *" -S -200 "*|*" -S - "*) [ ! -f "@STATE@/scrollback/$name" ] || cat "@STATE@/scrollback/$name" ;;
     esac
     screen="@STATE@/screen/$name"
     [ -f "$screen" ] || screen="@STATE@/screen/default"

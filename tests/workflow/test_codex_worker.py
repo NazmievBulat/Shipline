@@ -1790,3 +1790,69 @@ def test_capacity_unreadable_pane_does_not_forget_a_sent_retry(workflow: Workflo
     _capacity_tick(workflow, 302)
     _capacity_tick(workflow, 3600)
     assert len(workflow.calls(f"tmux {target} send-keys")) == 2
+
+
+@pytest.mark.parametrize("already_sent", [False, True])
+def test_capacity_resize_preserves_the_timer_and_delivery_receipt(
+    workflow: Workflow, already_sent: bool
+) -> None:
+    _, target, _ = _capacity_session(workflow)
+    history = "• Read example-app\n• Checked configuration\n"
+    workflow.screen(history + _CAPACITY, target)
+    _capacity_tick(workflow)
+    if already_sent:
+        _capacity_tick(workflow, 300)
+    # The terminal shrinks: these rows move into tmux history, without new output.
+    workflow.scrollback(history, target)
+    workflow.screen(_CAPACITY, target)
+    _capacity_tick(workflow, 301 if already_sent else 299)
+    _capacity_tick(workflow, 1201 if already_sent else 300)
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 2
+    # Expanding again must preserve the same receipt too.
+    workflow.scrollback("", target)
+    workflow.screen(history + _CAPACITY, target)
+    _capacity_tick(workflow, 2401)
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 2
+
+
+def test_capacity_identical_viewport_retains_new_stop_in_scrollback(workflow: Workflow) -> None:
+    _, target, _ = _capacity_session(workflow)
+    block = f"› {_CAPACITY_PROMPT}\n{_CAPACITY.splitlines()[0]}\n\n"
+    # Every visible row is identical before and after another immediate error.
+    visible = block * 8 + "› \n"
+    workflow.screen(visible, target)
+    workflow.scrollback(block * 20, target)
+    _capacity_tick(workflow)
+    _capacity_tick(workflow, 300)
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 2
+    # The stand-in's input overlay normally removes historical prompt rows. Clear
+    # that overlay to retain the transcript, as a real terminal does after Enter.
+    (workflow.state / f"input-{target}").unlink()
+    workflow.scrollback(block * 21, target)
+    assert (workflow.state / "screen" / target).read_text() == visible
+    _capacity_tick(workflow, 301)
+    _capacity_tick(workflow, 1200)
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 2
+    _capacity_tick(workflow, 1201)
+    _capacity_tick(workflow, 3600)
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 4
+
+
+@pytest.mark.parametrize("listing_status", [1, 124])
+def test_capacity_local_recovery_survives_github_listing_errors(
+    workflow: Workflow, listing_status: int
+) -> None:
+    _, target, _ = _capacity_session(workflow)
+    gh = workflow.bin / "gh"
+    gh.write_text(gh.read_text().replace(
+        '#!/bin/bash\n',
+        '#!/bin/bash\n'
+        f'if [[ $1 == pr && $2 == list ]]; then exit {listing_status}; fi\n',
+        1,
+    ))
+    for seconds in (0, 299, 300, 3600):
+        done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_CAPACITY_NOW + seconds)})
+        assert done.returncode == 1, done.stderr
+        assert "cannot list the pull requests" in done.stderr
+        expected = 0 if seconds < 300 else 2
+        assert len(workflow.calls(f"tmux {target} send-keys")) == expected
