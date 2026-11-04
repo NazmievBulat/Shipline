@@ -305,6 +305,73 @@ def test_a_gap_between_two_looks_starts_the_count_again(workflow: Workflow) -> N
     assert (_notes(workflow) / "room").read_text().split() == [str(moment), str(moment)]
 
 
+@pytest.mark.parametrize("excursion", [None, "load", "memory"])
+def test_room_is_sampled_through_a_twelve_minute_tick(
+    workflow: Workflow, excursion: str | None
+) -> None:
+    """Move the sampler's clock, using the real resource check at each observation."""
+    _model(workflow)
+    _draft(workflow, 7, "web")
+    moment = _start_now()
+    notes = _notes(workflow)
+    program = """
+import os, pathlib, sys
+sys.path.insert(0, sys.argv[1])
+import ticket_starts
+
+moment = int(sys.argv[3])
+excursion = sys.argv[4]
+step = 0
+load = pathlib.Path(os.environ['WORKFLOW_LOADAVG_FILE'])
+pressure = pathlib.Path(os.environ['WORKFLOW_PRESSURE_FILE'])
+usual_load, usual_pressure = load.read_text(), pressure.read_text()
+
+def advance(seconds):
+    global step
+    assert seconds <= 180
+    step += 1
+    if step == 5:
+        raise SystemExit(0)
+    os.environ['WORKFLOW_NOW'] = str(moment + step * 180)
+    load.write_text('6.50 6.40 6.30 1/100 1234\\n'
+                    if step == 2 and excursion == 'load' else usual_load)
+    pressure.write_text('some avg10=50.00 avg60=50.00 avg300=50.00 total=0\\n'
+                        if step == 2 and excursion == 'memory' else usual_pressure)
+
+ticket_starts.time.sleep = advance
+ticket_starts.watch_room(pathlib.Path(sys.argv[2]), os.getppid())
+"""
+    done = subprocess.run(
+        ["python3", "-B", "-c", program, str(_WORKFLOW), str(notes), str(moment), str(excursion)],
+        env={**workflow.env, "WORKFLOW_NOW": str(moment)},
+        cwd=workflow.repo,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+    _pick(workflow, moment + 720)
+
+    assert _labelled(workflow) == (["7"] if excursion is None else [])
+    since, looked = map(int, (notes / "room").read_text().split())
+    assert since == moment + (540 if excursion else 0)
+    assert looked == moment + 720
+
+
+def test_twelve_minutes_without_samples_cannot_start_a_ticket(workflow: Workflow) -> None:
+    _model(workflow)
+    _draft(workflow, 7, "web")
+    moment = _start_now()
+    (_notes(workflow) / "room").write_text(f"{moment} {moment}\n")
+
+    _pick(workflow, moment + 720)
+
+    assert _labelled(workflow) == []
+    assert (_notes(workflow) / "room").read_text().split() == [str(moment + 720)] * 2
+
+
 def test_nothing_starts_within_five_minutes_of_the_last_start(workflow: Workflow) -> None:
     _model(workflow)
     _draft(workflow, 7, "web")
