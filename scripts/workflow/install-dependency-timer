@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Install the model-free dependency watch as a twice-daily systemd user timer.
+set -euo pipefail
+[[ $# == 0 ]] || { echo "usage: install-dependency-timer" >&2; exit 2; }
+umask 077
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$here/launcher-link"
+find_launcher
+remember_config
+config=$(python3 "$here/workflow_config.py" shell)
+eval "$config"
+main=$SHIPLINE_REPO
+units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+
+# Keep another program's units of this name. Unlike tick's historical units there is no
+# repository copy to migrate; uninstall removes only units that run this launcher command.
+if [[ -e $units/dependency-watch.service ]] &&
+   ! grep -q '/bin/shipline" --repo ".*" dependency-watch$' "$units/dependency-watch.service"; then
+  echo "dependency-watch.service already runs another program; nothing was installed" >&2
+  exit 1
+fi
+mkdir -p "$units"
+
+# A fresh user service needs the installing PATH and any explicitly selected GitHub config.
+# Credentials remain in gh's config, never copied into a unit or its log.
+unit_value() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//%/%%}
+  printf '%s' "$value"
+}
+environment() {
+  printf 'Environment="%s=%s"\n' "$1" "$(unit_value "$2")"
+}
+escaped=$(unit_value "$main")
+escaped_launcher=$(unit_value "$launcher")
+command="\"${escaped_launcher//\$/\$\$}\" --repo \"${escaped//\$/\$\$}\" dependency-watch"
+github_config=${GH_CONFIG_DIR:-}
+if [[ -n $github_config && $github_config != /* ]]; then
+  github_config=$PWD/$github_config
+fi
+cat >"$units/dependency-watch.service" <<UNIT
+[Unit]
+Description=Open dependency fix tickets for uncovered advisories on main
+
+[Service]
+Type=oneshot
+WorkingDirectory="$escaped"
+$(environment PATH "$PATH")
+$(config_environment)
+${github_config:+$(environment GH_CONFIG_DIR "$github_config")}
+ExecStart=$command
+TimeoutStartSec=15min
+UNIT
+cat >"$units/dependency-watch.timer" <<'UNIT'
+[Unit]
+Description=Watch dependencies at 03:17 and 15:17 UTC
+
+[Timer]
+OnCalendar=*-*-* 03,15:17:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable --now dependency-watch.timer
+link_launcher
+echo "dependency-watch runs at 03:17 and 15:17 UTC"

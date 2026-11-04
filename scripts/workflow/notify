@@ -62,6 +62,7 @@ exec >/dev/null 2>&1
 # from.
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$here/limit-reset"
+source "$here/screen-borders"
 config=$(python3 "$here/workflow_config.py" shell) || exit 1
 eval "$config"
 # The repository's main checkout, never the checkout these scripts are in.
@@ -159,7 +160,7 @@ ring() {
 # rule, and with more text under them it went on, perhaps to ask something.
 said_finished() {
   local last
-  last=$(LC_ALL=C grep -vE '^[[:space:]]*$' <<<"$2" | tail -n 1)
+  last=$(strip_screen_borders <<<"$2" | LC_ALL=C grep -vE '^[[:space:]]*$' | tail -n 1)
   LC_ALL=C grep -qiE "${FINISHED_LINE/WORDS/$1}" <<<"$last"
 }
 
