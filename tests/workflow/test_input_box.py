@@ -498,7 +498,7 @@ def test_codex_keeps_owner_fields_without_a_nondefault_foreground(
 def test_legacy_reader_does_not_trim_codex_status() -> None:
     screen = f"> Owner draft\n\n{_CODEX_STATUS}\n"
 
-    assert "GPT-6.1-Sol high" in _codex_input(screen, trim_footer=False)
+    assert "Implement pull request 12 · Main [default]" in _codex_input(screen, trim_footer=False)
 
 
 @pytest.mark.parametrize("native", [False, True])
