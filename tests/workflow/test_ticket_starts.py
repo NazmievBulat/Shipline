@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from workflow_harness import Workflow
+from workflow.test_usage import _ANSWER, _usage_answer
 
 _WORKFLOW = Path(__file__).resolve().parents[2] / "scripts/workflow"
 
@@ -343,6 +344,34 @@ def test_nothing_starts_above_85_percent_of_the_usage_window(workflow: Workflow)
 
     assert _labelled(workflow) == []
     assert "7 waits: the 5-hour usage window is 90% used" in printed
+
+
+@pytest.mark.parametrize("source", ["cache", "live"])
+@pytest.mark.parametrize("kind", ["not started", "missing", "non-numeric"])
+def test_ticket_starts_distinguish_not_started_from_unknown_usage(
+    workflow: Workflow, source: str, kind: str
+) -> None:
+    _model(workflow)
+    _draft(workflow, 7, "web")
+    moment = _start_now()
+    _room_since(workflow, moment)
+    answer = {"seven_day": _ANSWER["seven_day"]}
+    if kind != "missing":
+        answer["five_hour"] = {
+            "utilization": 0.0 if kind == "not started" else "0",
+            "resets_at": None,
+        }
+    _usage_answer(workflow, answer, source)
+
+    printed = _tick(workflow, moment)
+
+    assert _labelled(workflow) == (["7"] if kind == "not started" else [])
+    if kind != "not started":
+        assert "7 waits: the 5-hour usage window could not be read" in printed
+    else:
+        # The next tick starts the labelled ticket using tick's own usage reader.
+        _tick(workflow, moment + 180)
+        assert workflow.is_running("ticket-7")
 
 
 def test_a_ticket_with_a_diff_uses_the_diff_without_a_model_call(workflow: Workflow) -> None:

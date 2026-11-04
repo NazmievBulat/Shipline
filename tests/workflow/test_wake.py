@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from workflow_harness import Workflow
+from workflow.test_usage import _ANSWER, _usage_answer
 from workflow.test_ci_proof import _github, _python, _receipt, _API, _SQUASH, _TREE
 
 _NEW_YORK = ZoneInfo("America/New_York")
@@ -291,6 +292,31 @@ def test_at_night_an_idle_orchestrator_gets_a_check_in(night: Workflow) -> None:
     assert "drafts 7; waiting tickets 12; ready medium 9 (checks passing). Log: ~/" in prompt
     assert "asking the owner" not in prompt
     assert "start nothing above 85% of the 5-hour window unless it resets within the hour" in prompt
+
+
+@pytest.mark.parametrize("source", ["cache", "live"])
+@pytest.mark.parametrize("kind", ["not started", "missing", "non-numeric"])
+def test_the_check_in_names_not_started_usage_and_its_start_permission(
+    night: Workflow, source: str, kind: str
+) -> None:
+    night.orchestrator("idle")
+    answer = {"seven_day": _ANSWER["seven_day"]}
+    if kind != "missing":
+        answer["five_hour"] = {
+            "utilization": 0.0 if kind == "not started" else "0",
+            "resets_at": None,
+        }
+    _usage_answer(night, answer, source)
+
+    done = _wake(night)
+
+    assert done.returncode == 0, done.stderr
+    [prompt] = night.sent()
+    expected = "5-hour window 0% used, not started" if kind == "not started" else "5-hour window unknown"
+    assert expected in prompt
+    assert expected in night.wake_log.read_text()
+    gate = "allowed" if kind == "not started" else "unknown"
+    assert f"starts: {gate}" in night.wake_log.read_text()
     assert "never merge, never force-push, never edit code" in prompt
 
 
