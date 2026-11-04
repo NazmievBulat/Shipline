@@ -810,8 +810,10 @@ def test_main_inherits_a_cancellation_still_finishing_only_without_real_failures
 
 @pytest.mark.parametrize("listed", [False, True])
 @pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("conclusion", [None, "cancelled", "failure"])
 def test_a_lender_cancellation_still_finishing_is_pending_only_without_real_failures(
-    gate: Any, monkeypatch: pytest.MonkeyPatch, listed: bool, failed: bool
+    gate: Any, monkeypatch: pytest.MonkeyPatch, listed: bool, failed: bool,
+    conclusion: str | None,
 ) -> None:
     monkeypatch.setattr(gate, "cancelled_inherited", lambda run: False)
 
@@ -824,8 +826,8 @@ def test_a_lender_cancellation_still_finishing_is_pending_only_without_real_fail
         "id": 20,
         "head_sha": "a" * 40,
         "run_attempt": 1,
-        "status": "in_progress",
-        "conclusion": None,
+        "status": "in_progress" if conclusion is None else "completed",
+        "conclusion": conclusion,
     }
     parts = [
         {"name": gate.CI_RESULT, "status": "completed", "conclusion": "cancelled"},
@@ -839,7 +841,7 @@ def test_a_lender_cancellation_still_finishing_is_pending_only_without_real_fail
 
     state, names = gate.verdict(run, parts)
 
-    assert state == ("pending" if listed and not failed else "red")
+    assert state == ("pending" if listed and not failed and conclusion != "failure" else "red")
     if state == "pending":
         assert names == [gate.CI_RESULT]
     elif failed:
