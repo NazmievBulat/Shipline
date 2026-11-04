@@ -2,6 +2,7 @@
 
     ticket_starts.py files <main> <N>          the files of ticket N, one path per line
     ticket_starts.py pick <main> <snapshot>    start the next ticket when one may start
+    ticket_starts.py watch-room <main> <pid>  sample room while the tick lives
 
 The files of a ticket are kept in `.local/workflow/files-N` of the main checkout, one path per
 line, with their source noted in `files-N.source`:
@@ -41,12 +42,14 @@ wording, so a load that comes and goes is not told at every tick; the tick print
 from __future__ import annotations
 
 import bisect
+import fcntl
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,7 +64,9 @@ from github_budget import Limited, call
 ROOM_SECONDS = 10 * 60
 # No automatic start this soon after any start, the tick's or a person's.
 QUIET_SECONDS = 5 * 60
-# The tick looks every 3 minutes. A longer gap between two looks is not known to have had room.
+# Sample throughout a tick, even while its merge train or model calls are running.
+LOOK_SECONDS = 3 * 60
+# A longer gap between observations is not known to have had room.
 LOOK_GAP_SECONDS = 6 * 60
 # Model calls one pick may make: the first pass over many new drafts is spread over ticks.
 MODEL_CALLS_PER_PICK = 3
@@ -444,26 +449,62 @@ def train_numbers(notes: Path) -> set[str]:
     )
 
 
-def machine_wait(notes: Path, moment: int) -> str | None:
-    """Why the machine holds a start now, or None. Counts the minutes of room as it goes."""
-    room = subprocess.run(
-        ["bash", str(here / "session"), "room"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=GIT_SECONDS,
-    )
-    record = notes / "room"
-    try:
-        since, looked = (int(word) for word in record.read_text().split())
-    except OSError, ValueError:
-        since = looked = None
-    if room.returncode != 0:
-        record.unlink(missing_ok=True)
+def observe_room(notes: Path) -> tuple[int, int] | None:
+    """One resource observation, serialized with the sampler and the pick's other looks."""
+    descriptor = os.open(notes / "room.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        record = notes / "room"
+        try:
+            room = subprocess.run(
+                ["bash", str(here / "session"), "room"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=GIT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError):
+            record.unlink(missing_ok=True)
+            raise
+        moment = now()
+        if room.returncode != 0:
+            record.unlink(missing_ok=True)
+            return None
+        try:
+            since, looked = (int(word) for word in record.read_text().split())
+        except OSError, ValueError:
+            since = looked = moment
+        if not since <= looked <= moment or moment - looked > LOOK_GAP_SECONDS:
+            since = moment
+        # A stopped sampler leaves either its last complete observation or the previous one.
+        with tempfile.NamedTemporaryFile(mode="w", dir=notes, prefix=".room-", delete=False) as out:
+            temporary = Path(out.name)
+            try:
+                out.write(f"{since} {moment}\n")
+                out.close()
+                temporary.replace(record)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return since, moment
+
+
+def watch_room(notes: Path, parent: int) -> None:
+    """Observe every three minutes until the tick exits, including a stalled merge train."""
+    while os.getppid() == parent:
+        try:
+            observe_room(notes)
+        except subprocess.TimeoutExpired:
+            # The failed observation cleared the history; later looks can start it anew.
+            print("ticket start: room observation timed out; will retry", file=sys.stderr)
+        time.sleep(LOOK_SECONDS)
+
+
+def machine_wait(notes: Path) -> str | None:
+    """Why the machine holds a start now, or None. Keep the pick's own resource checks too."""
+    observed = observe_room(notes)
+    if observed is None:
         return "memory or load is over the ceilings"
-    if since is None or looked is None or moment - looked > LOOK_GAP_SECONDS:
-        since = moment
-    record.write_text(f"{since} {moment}\n")
+    since, moment = observed
     if moment - since < ROOM_SECONDS:
         return "memory and load have been under the ceilings for less than 10 minutes"
     try:
@@ -712,7 +753,7 @@ def pick(main: Path, snapshot: Path) -> int:
     unfinished = decisions.unfinished(notes)
     queue = Queue.read(main, open_pulls)
     # Measured every pick, so the minutes of room are counted even while nothing waits.
-    machine = machine_wait(notes, moment)
+    machine = machine_wait(notes)
 
     if queue.held_all:
         tell(notes, {"all": "automatic starts are held: hold all in start-plan"}, None)
@@ -757,7 +798,7 @@ def pick(main: Path, snapshot: Path) -> int:
         if machine is None:
             # Finding the files may have taken minutes of fetches and model calls: the machine
             # is looked at again just before the start.
-            machine = machine_wait(notes, now())
+            machine = machine_wait(notes)
         if machine is not None:
             print(f"{number} waits: {machine}")
             lines["next"] = f"{number} waits: {MACHINE_WAIT}"
@@ -801,6 +842,9 @@ if __name__ == "__main__":
             sys.exit(files_of(Path(sys.argv[2]), sys.argv[3]))
         if len(sys.argv) == 4 and sys.argv[1] == "pick":
             sys.exit(pick(Path(sys.argv[2]), Path(sys.argv[3])))
+        if len(sys.argv) == 4 and sys.argv[1] == "watch-room" and sys.argv[3].isdigit():
+            watch_room(Path(sys.argv[2]) / CONFIG.state_folder, int(sys.argv[3]))
+            sys.exit(0)
         print(__doc__.split("\n\n")[0], file=sys.stderr)
         sys.exit(2)
     except Limited:

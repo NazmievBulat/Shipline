@@ -54,20 +54,71 @@ claude_input() {
     <<<"$screen" | nonblank_input "$((top + 1))" "$((bottom - 1))"
 }
 
-# Native Codex and legacy Claude prompt rows. Only native callers trim the shortcuts footer.
+# Native Codex and legacy Claude prompt rows. Only native callers trim Codex footers.
 # Legacy callers pass false to retain every continuation row. Keep
 # styling from the whole capture: a colour may have been set before the prompt row.
 codex_input() {
-  local screen=$1 first last trim_footer=${2:-true}
-  read -r first last < <(strip_ansi <<<"$screen" | LC_ALL=C awk -v trim_footer="$trim_footer" '
+  local screen=$1 first last status_footer trim_footer=${2:-true}
+  read -r first last status_footer < <(strip_ansi <<<"$screen" | LC_ALL=C awk -v trim_footer="$trim_footer" '
     /^(›|>|❯)/ { first = NR }
-    NF { last = NR; footer = $0 }
+    NF { last = NR; footer = $0; separated = blank }
+    { blank = !NF }
     END {
       if (trim_footer == "true" && footer ~ /^[[:space:]]*\? for shortcuts([[:space:]]+[0-9]+% context left)?[[:space:]]*$/) last--
-      print first + 0, last + 0
+      else if (trim_footer == "true" && last > first && separated &&
+               split(footer, parts, / · /) >= 3 &&
+               parts[1] ~ /^[[:blank:]]+[[:alnum:]][[:alnum:]_. -]*$/ &&
+               parts[2] ~ /^(~\/|\/|\.\/|\.\.\/)/ && parts[3] ~ /[^[:blank:]]/)
+        status_footer = 1
+      print first + 0, last + 0, status_footer + 0
     }
   ') || return 1
   ((first > 0 && last >= first)) || return 1
+  # Require separately styled status fields. One foreground code alone can colour
+  # an owner continuation spelling the same model/path/title, even after a blank.
+  # Require a colour at the start of each field as well as the footer structure.
+  # Only the first three fields identify the footer: a plain branch field may follow
+  # the title, and right-aligned notices have their own colours and bold attributes.
+  # Neither the notices nor the branch field is required, or part of the title style.
+  # Never trim the prompt row, an earlier lookalike, or a row joined to the draft.
+  if ((status_footer)) && LC_ALL=C sed -n "${last}p" <<<"$screen" |
+      LC_ALL=C awk '
+    function styled_field(text, escape, count, codes, i, code, colour, fields, foreground) {
+      sub(/^[[:blank:]]*/, "", text)
+      while (match(text, /^\033(\[[0-?]*[ -\/]*[@-~]|\][^\007\033]*(\007|\033\\))/)) {
+        escape = substr(text, 1, RLENGTH)
+        text = substr(text, RLENGTH + 1)
+        if (escape ~ /^\033\[[0-9;:]*m$/) {
+          count = split(substr(escape, 3, length(escape) - 3), codes, ";")
+          if (!count) foreground = 0
+          for (i = 1; i <= count; i++) {
+            if (index(codes[i], ":")) {
+              fields = split(codes[i], colour, ":")
+              if (colour[1] + 0 == 38 &&
+                  ((colour[2] + 0 == 5 && fields == 3) ||
+                   (colour[2] + 0 == 2 && (fields == 5 || fields == 6)))) foreground = 1
+              continue
+            }
+            code = codes[i] + 0
+            # Extended-colour payloads are data, even when a component is 31 or 39.
+            if (code == 38 || code == 48 || code == 58) {
+              if (code == 38 && ((codes[i + 1] == 5 && i + 2 <= count) ||
+                                (codes[i + 1] == 2 && i + 4 <= count))) foreground = 1
+              if (codes[i + 1] == 2) i += 4
+              else if (codes[i + 1] == 5) i += 2
+            } else if (code == 0 || code == 39) foreground = 0
+            else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) foreground = 1
+          }
+        }
+        sub(/^[[:blank:]]*/, "", text)
+      }
+      return foreground
+    }
+    { exit !(split($0, parts, / · /) >= 3 &&
+             styled_field(parts[1]) && styled_field(parts[2]) && styled_field(parts[3])) }
+  '; then
+    last=$((last - 1))
+  fi
   nonblank_input "$first" "$last" <<<"$screen"
 }
 

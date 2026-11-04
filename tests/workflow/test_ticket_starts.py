@@ -1,6 +1,7 @@
 """The tick starts the next draft ticket itself, by priority and age, apart from running files."""
 
 import json
+import shlex
 import subprocess
 import sys
 import time
@@ -311,6 +312,168 @@ def test_a_gap_between_two_looks_starts_the_count_again(workflow: Workflow) -> N
 
     assert _labelled(workflow) == []
     assert (_notes(workflow) / "room").read_text().split() == [str(moment), str(moment)]
+
+
+@pytest.mark.parametrize("excursion", [None, "load", "memory"])
+def test_room_is_sampled_through_a_twelve_minute_tick(
+    workflow: Workflow, excursion: str | None
+) -> None:
+    """Move the sampler's clock, using the real resource check at each observation."""
+    _model(workflow)
+    _draft(workflow, 7, "web")
+    moment = _start_now()
+    notes = _notes(workflow)
+    program = """
+import os, pathlib, sys
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import ticket_starts
+
+moment = int(sys.argv[3])
+excursion = sys.argv[4]
+step = 0
+load = pathlib.Path(os.environ['WORKFLOW_LOADAVG_FILE'])
+pressure = pathlib.Path(os.environ['WORKFLOW_PRESSURE_FILE'])
+usual_load, usual_pressure = load.read_text(), pressure.read_text()
+
+def advance(seconds):
+    global step
+    assert seconds <= 180
+    step += 1
+    if step == 5:
+        raise SystemExit(0)
+    os.environ['WORKFLOW_NOW'] = str(moment + step * 180)
+    load.write_text('6.50 6.40 6.30 1/100 1234\\n'
+                    if step == 2 and excursion == 'load' else usual_load)
+    pressure.write_text('some avg10=50.00 avg60=50.00 avg300=50.00 total=0\\n'
+                        if step == 2 and excursion == 'memory' else usual_pressure)
+
+ticket_starts.time = SimpleNamespace(sleep=advance, time=ticket_starts.time.time)
+ticket_starts.watch_room(pathlib.Path(sys.argv[2]), os.getppid())
+"""
+    done = subprocess.run(
+        ["python3", "-B", "-c", program, str(_WORKFLOW), str(notes), str(moment), str(excursion)],
+        env={**workflow.env, "WORKFLOW_NOW": str(moment)},
+        cwd=workflow.repo,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+    _pick(workflow, moment + 720)
+
+    assert _labelled(workflow) == (["7"] if excursion is None else [])
+    since, looked = map(int, (notes / "room").read_text().split())
+    assert since == moment + (540 if excursion else 0)
+    assert looked == moment + 720
+
+
+@pytest.mark.parametrize("healthy_minutes", [9, 12])
+def test_sampler_recovers_after_a_timeout_without_counting_earlier_room(
+    workflow: Workflow, healthy_minutes: int
+) -> None:
+    """A timeout loses the old history, then the same tick can build a new window."""
+    _model(workflow)
+    _draft(workflow, 7, "web")
+    moment = _start_now()
+    notes = _notes(workflow)
+    program = """
+import os, pathlib, subprocess, sys
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import ticket_starts
+
+notes = pathlib.Path(sys.argv[2])
+moment = int(sys.argv[3])
+finish = 420 + int(sys.argv[4]) * 60
+elapsed = 0
+checks = 0
+real_run = subprocess.run
+
+def resource_check(*args, **kwargs):
+    global checks, elapsed
+    checks += 1
+    if checks == 2:
+        # The first observation succeeded. The next check consumes its full timeout.
+        elapsed += 60
+        os.environ['WORKFLOW_NOW'] = str(moment + elapsed)
+        raise subprocess.TimeoutExpired(args[0], kwargs['timeout'])
+    return real_run(*args, **kwargs)
+
+def advance(seconds):
+    global elapsed
+    assert seconds == 180
+    if checks == 2:
+        assert not (notes / 'room').exists(), 'timeout kept earlier room evidence'
+    elapsed += seconds
+    if elapsed > finish:
+        raise SystemExit(0)
+    os.environ['WORKFLOW_NOW'] = str(moment + elapsed)
+
+ticket_starts.subprocess = SimpleNamespace(
+    run=resource_check, SubprocessError=subprocess.SubprocessError,
+    TimeoutExpired=subprocess.TimeoutExpired,
+)
+ticket_starts.time = SimpleNamespace(sleep=advance, time=ticket_starts.time.time)
+ticket_starts.watch_room(notes, os.getppid())
+"""
+    done = subprocess.run(
+        ["python3", "-B", "-c", program, str(_WORKFLOW), str(notes), str(moment),
+         str(healthy_minutes)],
+        env={**workflow.env, "WORKFLOW_NOW": str(moment)},
+        cwd=workflow.repo,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    final_moment = moment + 420 + healthy_minutes * 60
+
+    _pick(workflow, final_moment)
+
+    assert _labelled(workflow) == (["7"] if healthy_minutes >= 10 else [])
+    assert (notes / "room").read_text().split() == [str(moment + 420), str(final_moment)]
+
+
+def test_twelve_minutes_without_samples_cannot_start_a_ticket(workflow: Workflow) -> None:
+    _model(workflow)
+    _draft(workflow, 7, "web")
+    moment = _start_now()
+    (_notes(workflow) / "room").write_text(f"{moment} {moment}\n")
+
+    _pick(workflow, moment + 720)
+
+    assert _labelled(workflow) == []
+    assert (_notes(workflow) / "room").read_text().split() == [str(moment + 720)] * 2
+
+
+def test_the_tick_samples_room_before_its_github_read_finishes(workflow: Workflow) -> None:
+    """A blocked tick still observes resources, then exits without keeping a sampler alive."""
+    usual = workflow.bin / "gh"
+    (workflow.state / "gh-usual").write_text(usual.read_text())
+    room = _notes(workflow) / "room"
+    watcher = """#!/bin/bash
+if [[ $1 == pr && $2 == list ]]; then
+  for attempt in {1..100}; do
+    if [[ -f @ROOM@ ]]; then
+      cp @ROOM@ "@STATE@/sample-before-pick"
+      break
+    fi
+    /bin/sleep 0.05
+  done
+  [[ -f "@STATE@/sample-before-pick" ]] || exit 1
+fi
+exec bash "@STATE@/gh-usual" "$@"
+"""
+    workflow.fake("gh", watcher.replace("@ROOM@", shlex.quote(str(room))))
+    moment = _start_now()
+
+    _tick(workflow, moment)
+
+    assert (workflow.state / "sample-before-pick").read_text().split() == [str(moment)] * 2
 
 
 def test_nothing_starts_within_five_minutes_of_the_last_start(workflow: Workflow) -> None:

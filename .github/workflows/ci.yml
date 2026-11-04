@@ -86,6 +86,7 @@ jobs:
               tests/workflow/test_merge_train.py
               tests/workflow/test_wake.py
               tests/workflow/test_workflow_commands.py
+              tests/workflow/test_tick_waits.py
           - shard: 2
             files: >-
               tests/runner/test_build_images.py
@@ -136,7 +137,6 @@ jobs:
               tests/workflow/test_push_slots.py
               tests/workflow/test_review_panel.py
               tests/workflow/test_session_start.py
-              tests/workflow/test_tick_waits.py
               tests/workflow/test_train_first.py
               tests/workflow/test_worker_routing.py
           - shard: 4
