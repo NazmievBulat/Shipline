@@ -312,7 +312,10 @@ def test_the_check_in_names_not_started_usage_and_its_start_permission(
 
     assert done.returncode == 0, done.stderr
     [prompt] = night.sent()
-    expected = "5-hour window 0% used, not started" if kind == "not started" else "5-hour window unknown"
+    expected = (
+        "5-hour window 0% used, not started" if kind == "not started"
+        else "5-hour window unknown"
+    )
     assert expected in prompt
     assert expected in night.wake_log.read_text()
     gate = "allowed" if kind == "not started" else "unknown"

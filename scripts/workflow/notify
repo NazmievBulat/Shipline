@@ -276,7 +276,7 @@ SESSION_STOPS='\<(I( am|.m)? stopping|stopping here)\>'
 USAGE_SECONDS=1.5
 
 stopped_on_limit() {
-  local first window percent at now five=() seven=()
+  local first window percent at state now five=() seven=()
   claude_line_reset "$1" "$notes/$name" && return 0
   # A bridge relays Codex's words, and Codex's usage is never read from Claude's figures.
   [[ ! -e $notes/$name.codex ]] || return 1
@@ -288,7 +288,7 @@ stopped_on_limit() {
   five=(0 0)
   seven=(0 0)
   limit_at=""
-  while read -r window percent at; do
+  while read -r window percent at state; do
     case $window in
       five_hour) five=("$percent" "$at") ;;
       seven_day) seven=("$percent" "$at") ;;

@@ -8,9 +8,16 @@ from pathlib import Path
 
 import pytest
 from workflow_harness import Workflow
-from workflow.test_usage import _ANSWER, _usage_answer
+from workflow.test_usage import _ANSWER, _answering, _credentials, _usage_answer
 
 _WORKFLOW = Path(__file__).resolve().parents[2] / "scripts/workflow"
+
+
+@pytest.fixture(autouse=True)
+def _known_usage(workflow: Workflow) -> None:
+    """Ordinary scheduling tests have room even after their simulated cache expires."""
+    _credentials(workflow)
+    _answering(workflow, json.dumps(_ANSWER))
 
 # The model stand-in answers a ticket's question with `answer-<n>` when its description names
 # `TICKET-<n>`, and counts the questions in `model-calls`. Other `claude` calls keep the usual

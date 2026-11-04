@@ -120,6 +120,20 @@ def test_not_started_windows_have_their_full_length_and_an_explicit_marker(
 
 
 @pytest.mark.parametrize("source", ["cache", "live"])
+def test_zero_utilization_with_a_dated_reset_has_started(
+    workflow: Workflow, source: str
+) -> None:
+    _usage_answer(workflow, {
+        "five_hour": {"utilization": 0.0, "resets_at": _FIVE_RESETS},
+    }, source)
+
+    done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "five_hour 0 1791940200\n"
+
+
+@pytest.mark.parametrize("source", ["cache", "live"])
 @pytest.mark.parametrize("window", ["five_hour", "seven_day"])
 @pytest.mark.parametrize("value", [
     None, [], "unknown", 0,
@@ -130,6 +144,7 @@ def test_not_started_windows_have_their_full_length_and_an_explicit_marker(
     {"utilization": "12", "resets_at": _FIVE_RESETS},
     {"utilization": 0, "resets_at": ""},
     {"utilization": 0, "resets_at": "invalid"},
+    {"utilization": 0, "resets_at": "not_started"},
     {"utilization": 0},
 ])
 def test_an_invalid_window_stays_unknown(
