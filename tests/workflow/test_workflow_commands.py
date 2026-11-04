@@ -1,5 +1,7 @@
 """A stopped workflow command takes every process it started with it (real processes, no server)."""
 
+from __future__ import annotations
+
 import fcntl
 import json
 import os
@@ -9,22 +11,38 @@ import subprocess
 import sys
 import time
 from contextlib import suppress
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import pytest
-from workflow_harness import SCRIPTS
-from workflow.merge_gate_fixtures import GitHub, gate
-from workflow.test_merge_driver import (
-    _drop_refresh_pushes,
-    _folder,
-    _note,
-    _stale_refresh,
-    _started,
-    _train,
-    github,
-    handed,
-)
+from workflow_harness import SCRIPTS, Workflow
+
+if TYPE_CHECKING:
+    from workflow.merge_gate_fixtures import GitHub
+
+
+# The merge fixtures import the process helpers below through test_ci_proof. Load them only
+# during fixture setup, after both modules have finished importing.
+@pytest.fixture
+def gate() -> Iterator[Any]:
+    from workflow.merge_gate_fixtures import gate as fixture
+
+    yield from fixture.__wrapped__()
+
+
+@pytest.fixture
+def github(workflow: Workflow) -> Iterator[GitHub]:
+    from workflow.merge_gate_fixtures import github as fixture
+
+    yield from fixture.__wrapped__(workflow)
+
+
+@pytest.fixture
+def handed(github: GitHub) -> GitHub:
+    from workflow.test_merge_driver import handed as fixture
+
+    return fixture.__wrapped__(github)
 
 
 _MERGE_502 = (
@@ -61,6 +79,7 @@ def test_a_client_error_wins_over_github_incident_texts(
 ) -> None:
     assert not gate.transient(error + "\n" + client_error)
     assert not gate.transient(client_error + "\n" + error)
+    assert not gate._transient_refresh_push(error + "\n" + client_error)
 
 
 def _merge_error(github: GitHub, *, completed: bool = False, changed_head: bool = False) -> None:
@@ -88,6 +107,8 @@ def _merge_error(github: GitHub, *, completed: bool = False, changed_head: bool 
 def test_a_failed_merge_is_read_back_before_its_result_is_decided(
     handed: GitHub, completed: bool, changed_head: bool
 ) -> None:
+    from workflow.test_merge_driver import _note, _train
+
     workflow = handed.workflow
     _merge_error(handed, completed=completed, changed_head=changed_head)
     done = workflow.run_script(
@@ -97,6 +118,9 @@ def test_a_failed_merge_is_read_back_before_its_result_is_decided(
     assert done.returncode == (0 if merged else 3), done.stdout + done.stderr
     assert ("7" not in _train(workflow)["waiting"]) == merged
     assert _note(workflow).exists()
+    if merged:
+        receipt = json.loads((_note(workflow).parent / "main-tree-green.json").read_text())
+        assert receipt["main"] == workflow.git("rev-parse", "origin/main")
     if not merged:
         assert "merge waiting:" in done.stderr
         assert _train(workflow)["approved"]["7"] == handed.head
@@ -110,6 +134,8 @@ def test_a_failed_merge_is_read_back_before_its_result_is_decided(
 def test_a_github_push_rejection_keeps_the_refresh_and_handoff(
     handed: GitHub, error: str
 ) -> None:
+    from workflow.test_merge_driver import _folder, _note, _stale_refresh, _started, _train
+
     workflow = handed.workflow
     _stale_refresh(handed)
     # Each rejection is one push's output, including the captured two-line form.
@@ -138,6 +164,8 @@ def test_a_github_push_rejection_keeps_the_refresh_and_handoff(
 
 
 def test_github_server_errors_reach_the_wake_once_across_merge_and_push(handed: GitHub) -> None:
+    from workflow.test_merge_driver import _drop_refresh_pushes, _folder, _stale_refresh
+
     workflow = handed.workflow
     workflow.orchestrator("idle")
     _merge_error(handed)
@@ -156,6 +184,7 @@ def test_github_server_errors_reach_the_wake_once_across_merge_and_push(handed: 
     assert workflow.run_script("tick").returncode == 0
     assert sum(message.count(line) for message in workflow.sent()) == 1
     assert not list((_folder(workflow) / "stuck.pending").glob("*.json"))
+
 
 # The command `test-run` runs: a test in `timeout`'s process group, and a child that starts a
 # session of its own, as Playwright's browsers do. Both hold the output pipes of the gate.
