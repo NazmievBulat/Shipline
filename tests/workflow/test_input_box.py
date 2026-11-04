@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import subprocess
+from pathlib import Path
 
 import pytest
 from workflow_harness import SCRIPTS, Workflow, instruction
@@ -381,6 +382,125 @@ def test_styled_prompt_prefix_preserves_the_owners_quote_mark(
     assert done.stdout.strip() == "> Continue checking example-app."
 
 
+_CODEX_CAPTURE = (
+    Path(__file__).parent / "fixtures" / "screens" / "codex-status.ansi"
+).read_text()
+_CODEX_STATUS = _CODEX_CAPTURE.splitlines()[-1]
+
+
+def _codex_input(screen: str, *, trim_footer: bool = True) -> str:
+    return subprocess.run(
+        ["bash", "-c", 'source "$1"; codex_input "$(cat)" "$2"',
+         "bash", str(SCRIPTS / "input-box"), str(trim_footer).lower()],
+        input=screen, capture_output=True, text=True, check=True,
+    ).stdout
+
+
+@pytest.mark.parametrize("branch", [False, True])
+@pytest.mark.parametrize("notices", [False, True])
+@pytest.mark.parametrize(("draft", "expected"), [
+    (None, ""),
+    ("Review the changes", " Review the changes\n"),
+    ("First · second\n  Third · fourth", " First · second\n  Third · fourth\n"),
+    ("First line\n\n  GPT-6.1-Sol medium · ~/example-app · Owner draft",
+     " First line\n  GPT-6.1-Sol medium · ~/example-app · Owner draft\n"),
+])
+def test_codex_captured_layout_with_optional_branch_and_notices(
+    branch: bool, notices: bool, draft: str | None, expected: str
+) -> None:
+    screen = _CODEX_CAPTURE
+    if not branch:
+        screen = screen.replace(" · Main [default]", "")
+    if not notices:
+        screen = screen.split("⚠", 1)[0].rstrip() + "\n"
+    if draft is not None:
+        screen = screen.replace("\x1b[2mAsk Codex to do anything\x1b[0m", draft)
+
+    assert _codex_input(screen) == expected
+
+
+@pytest.mark.parametrize("footer", [
+    _CODEX_STATUS,
+    "  \x1b[38;2;246;226;183mGPT-6.1-Sol high\x1b[39m · "
+    "\x1b[38;2;171;223;167m~/example-app/.claude/worktrees/ticket-12\x1b[39m · "
+    "\x1b[38;2;116;199;236mReview PR 12 conflict resolution\x1b[39m",
+    "  \x1b[38;5;114mcustom-model medium\x1b[39m · "
+    "\x1b[38;5;117m/workspace/example-app\x1b[39m · \x1b[38;5;180mCheck changes\x1b[0m",
+    "  \x1b[32mcustom-model\x1b[39m · \x1b[34m./example-app\x1b[39m · "
+    "\x1b[35mCheck changes · more details\x1b[0m",
+    "  \x1b[48;5;31;38;5;114mcustom-model\x1b[39m · "
+    "\x1b[58;2;1;32;2;34m./example-app\x1b[39m · \x1b[0;1;35mCheck changes\x1b[0m",
+    "  \x1b[38:5:114mcustom-model\x1b[39m · "
+    "\x1b[38:2::12:34:56m../example-app\x1b[39m · "
+    "\x1b[1;38:2:0:56:34:12mCheck changes\x1b[0m",
+    "  ? for shortcuts",
+    "  ? for shortcuts                 42% context left",
+    "",
+])
+@pytest.mark.parametrize(("draft", "expected"), [
+    ("\x1b[2mAsk Codex to do anything\x1b[0m", ""),
+    ("Review the changes", " Review the changes\n"),
+    ("First · second\n  Third · fourth", " First · second\n  Third · fourth\n"),
+])
+def test_codex_capture_excludes_only_the_footer(footer: str, draft: str, expected: str) -> None:
+    screen = f"Review complete.\n\n\x1b[0m› {draft}\n\n{footer}\n\n"
+
+    assert _codex_input(screen) == expected
+
+
+@pytest.mark.parametrize("draft", [
+    "GPT-6.1-Sol high · ~/example-app · Review PR 12",
+    "First line\n  GPT-6.1-Sol high · ~/example-app · Review PR 12",
+    "First line\n\n  GPT-6.1-Sol high · ~/example-app · Review PR 12",
+])
+@pytest.mark.parametrize("footer", ["", _CODEX_STATUS])
+def test_codex_keeps_owner_text_that_looks_like_status(draft: str, footer: str) -> None:
+    screen = f"› {draft}\n\n{footer}\n"
+
+    assert _codex_input(screen) == " " + draft.replace("\n\n", "\n") + "\n"
+
+
+def test_codex_does_not_trim_a_coloured_status_shape_inside_the_box() -> None:
+    draft = "  \x1b[32mcustom-model · ~/example-app · Owner draft\x1b[39m"
+
+    assert _codex_input(f"› First line\n{draft}\n") == (
+        " First line\n  custom-model · ~/example-app · Owner draft\n"
+    )
+
+
+@pytest.mark.parametrize("style", ["37", "97", "38;5;60", "38;2;12;34;56"])
+@pytest.mark.parametrize("footer", ["", _CODEX_STATUS])
+def test_codex_keeps_a_normally_coloured_owner_continuation_after_a_blank(
+    style: str, footer: str
+) -> None:
+    draft = f"  \x1b[{style}mcustom-model · ~/example-app · Owner draft\x1b[39m"
+
+    assert _codex_input(f"› First line\n\n{draft}\n\n{footer}\n") == (
+        " First line\n  custom-model · ~/example-app · Owner draft\n"
+    )
+
+
+@pytest.mark.parametrize("style", [
+    "48;5;31", "48;2;1;32;2", "58;5;31", "58;2;1;32;2",
+    "31;39", "38;2;12;34;56;39", "31;0",
+])
+@pytest.mark.parametrize("footer", ["", _CODEX_STATUS])
+def test_codex_keeps_owner_fields_without_a_nondefault_foreground(
+    style: str, footer: str
+) -> None:
+    fields = ["custom-model", "~/example-app", "Owner draft"]
+    draft = "  " + " · ".join(f"\x1b[{style}m{field}\x1b[0m" for field in fields)
+    screen = f"› \x1b[2mAsk Codex to do anything\x1b[0m\n\n{draft}\n\n{footer}\n"
+
+    assert _codex_input(screen) == "  custom-model · ~/example-app · Owner draft\n"
+
+
+def test_legacy_reader_does_not_trim_codex_status() -> None:
+    screen = f"> Owner draft\n\n{_CODEX_STATUS}\n"
+
+    assert "Implement pull request 12 · Main [default]" in _codex_input(screen, trim_footer=False)
+
+
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("style", ["", "90", "2"])
 @pytest.mark.parametrize("edited", [False, True])
@@ -435,8 +555,9 @@ def test_retry_with_a_styled_prompt_submits_only_the_recorded_input(
 
 @pytest.mark.parametrize("style", ["2", "90", "38;5;244", "38;2;153;153;153"])
 @pytest.mark.parametrize("typed", ["neither", "native", "bridge"])
+@pytest.mark.parametrize("footer", ["  ? for shortcuts", _CODEX_STATUS])
 def test_a_codex_reviewer_wakes_through_decorations_but_never_through_typed_words(
-    workflow: Workflow, style: str, typed: str
+    workflow: Workflow, style: str, typed: str, footer: str
 ) -> None:
     workflow.add_worktree(7, draft=False)
     workflow.running("review-7")
@@ -454,7 +575,7 @@ def test_a_codex_reviewer_wakes_through_decorations_but_never_through_typed_word
         native = f"\x1b[{style}m{native}\x1b[0m"
     if typed != "bridge":
         bridge = f"\x1b[{style}m{bridge}\x1b[0m"
-    workflow.screen(f"Done.\n› {native}\n\n  ? for shortcuts\n", "codex-7")
+    workflow.screen(f"Done.\n› {native}\n\n{footer}\n", "codex-7")
     rule = "─" * 40
     workflow.screen(f"Done.\n{rule}\n❯\u00a0{bridge}\n{rule}\n", "review-7")
     tmux = workflow.bin / "tmux"
