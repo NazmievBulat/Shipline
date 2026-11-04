@@ -2,9 +2,11 @@
 
 import json
 import re
+import subprocess
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 
@@ -103,16 +105,59 @@ def squash_body(number: str, proof: str) -> Iterator[str]:
         yield body.name
 
 
-def _batch_squash(number: str, head: str, base: str, proof: str) -> str | None:
-    """Squash one member: None once GitHub shows it merged, otherwise why it did not."""
+def squash_attempt(
+    number: str, head: str, proof: str, folder: Path,
+) -> subprocess.CompletedProcess[str]:
+    """Reconcile an uncertain squash before deciding whether the caller should retry."""
     from merge_gate import (
         REPOSITORY,
+        TimedOut,
+        Waiting,
+        _read_pull,
+        command,
+        github_server_error,
+        note_github_server_errors,
+        squash_body,
+        transient,
+    )
+
+    with squash_body(number, proof) as body:
+        try:
+            done = command(
+                "gh", "pr", "merge", number, "-R", REPOSITORY,
+                "--body-file", body, "--squash", "--match-head-commit", head,
+                check=False,
+            )
+        except TimedOut as error:
+            # Cancellation stops the client, not a write the server may have accepted.
+            done = subprocess.CompletedProcess([], 1, "", f"{error}\n{error.output}")
+    if done.returncode:
+        error = "\n".join((done.stdout, done.stderr)).strip()
+        try:
+            merged = _read_pull(number)
+        except Waiting:
+            if github_server_error(error):
+                note_github_server_errors(folder)
+            raise
+        if merged["state"] == "MERGED" and merged["headRefOid"] == head:
+            done.returncode = 0
+        elif transient(error):
+            if github_server_error(error):
+                note_github_server_errors(folder)
+            raise Waiting(f"GitHub merge failed; retrying next tick: {error}")
+    if not done.returncode:
+        (folder / "github-server-errors").unlink(missing_ok=True)
+    return done
+
+
+def _batch_squash(number: str, head: str, base: str, proof: str, folder: Path) -> str | None:
+    """Squash one member: None once GitHub shows it merged, otherwise why it did not."""
+    from merge_gate import (
         SQUASH_ATTEMPTS,
         SQUASH_RETRY_SECONDS,
         command,
         git,
-        read_pull,
-        squash_body,
+        squash_attempt,
     )
 
     reason = ""
@@ -121,22 +166,8 @@ def _batch_squash(number: str, head: str, base: str, proof: str) -> str | None:
         # A retry follows a wait, during which main may have moved to an untested tree.
         if attempt > 1 and git("ls-remote", "origin", "refs/heads/main").split()[0] != base:
             return moved
-        with squash_body(number, proof) as body:
-            done = command(
-                "gh",
-                "pr",
-                "merge",
-                number,
-                "-R",
-                REPOSITORY,
-                "--body-file",
-                body,
-                "--squash",
-                "--match-head-commit",
-                head,
-                check=False,
-            )
-        if not done.returncode or read_pull(number)["state"] == "MERGED":
+        done = squash_attempt(number, head, proof, folder)
+        if not done.returncode:
             return None
         reason = done.stderr.strip() or done.stdout.strip()
         print(f"squash of {number} refused (attempt {attempt}): {reason}", flush=True)

@@ -305,14 +305,30 @@ def run(
     )
 
 
-def transient(error: str) -> bool:
-    # gh says "HTTP 502"; git over HTTPS says "The requested URL returned error: 502".
-    # gh can also report its own HTTP timeout before our process deadline.
-    return not re.search(r"(?:HTTP|returned error:) 4\d\d\b", error) and bool(
+_HTTP_STATUS = r"(?:HTTP(?:/\d(?:\.\d)?)?|returned error:|non-200 OK status code:)\s+"
+
+
+def github_server_error(error: str) -> bool:
+    # Both gh's non-JSON responses and git's receive-pack rejections can omit "HTTP 5xx".
+    # A client error anywhere in the output still wins, including an HTTP debug dump.
+    return not re.search(_HTTP_STATUS + r"4\d\d\b", error, re.IGNORECASE) and bool(
         re.search(
-            r"(?:HTTP|returned error:) 5\d\d\b|timed? out|timeout|context deadline exceeded",
+            _HTTP_STATUS + r"5\d\d\b"
+            r"|^\s*(?:!\s+)?\[remote rejected\][^\n]*"
+            r"\((?:Internal Server Error|Service Unavailable|Bad Gateway)\)\s*$"
+            r"|^\s*remote:\s*Internal Server Error\s*$",
             error,
-            re.IGNORECASE,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    )
+
+
+def transient(error: str) -> bool:
+    # gh can also report its own HTTP timeout before our process deadline.
+    return not re.search(_HTTP_STATUS + r"4\d\d\b", error, re.IGNORECASE) and (
+        github_server_error(error)
+        or bool(
+            re.search(r"timed? out|timeout|context deadline exceeded", error, re.IGNORECASE)
         )
     )
 

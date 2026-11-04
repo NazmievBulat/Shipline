@@ -572,7 +572,9 @@ def note_lost(folder: Path, number: str, head: str, lost: dict[str, Any]) -> Non
         print(f"could not note the lost check for the wake: {error}", flush=True)
 
 
-def rerun_lost(pull: dict[str, Any], train: "Train", number: str, lost: dict[str, Any]) -> int:
+def rerun_lost(
+    pull: dict[str, Any], train: "Train", number: str, lost: dict[str, Any], *, base: str,
+) -> int:
     """One empty commit gets GitHub a new check list; only one per head, so a check lost again
     on the commit pushed for it is reported to the orchestrator and not pushed for."""
     from merge_gate import Refused, Waiting, _commit_and_push, git, note_lost
@@ -598,7 +600,10 @@ def rerun_lost(pull: dict[str, Any], train: "Train", number: str, lost: dict[str
         )
     if git("status", "--porcelain"):
         raise Refused(f"{what}; the pull request worktree has uncommitted changes")
-    _commit_and_push(pull, train, number, f"ci: run CI again, {what}")
+    _commit_and_push(
+        pull, train, number, f"ci: run CI again, {what}",
+        base=base, rerun=True,
+    )
     train.reruns[number] = git("rev-parse", "HEAD")
     train.save()
     print(

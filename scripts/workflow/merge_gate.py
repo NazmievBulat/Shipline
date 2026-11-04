@@ -31,6 +31,7 @@ from workflow_commands import (
     READ_TIMEOUT,
     CommandTimeout,
     github_read,
+    github_server_error,
     install_signal_handlers,
     read_with_retries,
     transient,
@@ -281,6 +282,7 @@ from merge_squash import (
     _taken_migrations,
     changed_files,
     commit_list,
+    squash_attempt,
     squash_body,
     squash_proof,
 )
@@ -488,7 +490,7 @@ def refresh_pull(
 
 def _commit_and_push(
     pull: dict[str, Any], train: "Train", number: str, message: str, *,
-    save: bool = False, base: str | None = None,
+    save: bool = False, base: str | None = None, rerun: bool = False,
 ) -> None:
     git("commit", "--allow-empty", "-m", message)
     clear_generated(Path.cwd())
@@ -502,20 +504,24 @@ def _commit_and_push(
             "commit": git("rev-parse", "HEAD"),
             "base": base,
             "failures": 0,
+            **({"rerun": True} if rerun else {}),
         }
     _push_refreshed(pull, train, number, save=save, refresh=refresh)
 
 
 def _transient_refresh_push(output: str) -> bool:
-    # A remote rejection wins even if an earlier line mentioned a network failure.
+    # A branch/hook rejection wins over a network failure. GitHub's own server rejection
+    # says nothing about the branch and follows the same bounded retry as an HTTP 5xx.
     if re.search(
-        r"\[(?:remote )?rejected\]|non-fast-forward|protected branch|hook (?:declined|rejected)"
+        r"\[remote rejected\](?![^\n]*\((?:Internal Server Error|Service Unavailable|Bad Gateway)\)\s*$)"
+        r"|\[rejected\]|non-fast-forward|protected branch|hook (?:declined|rejected)"
         r"|(?:HTTP(?:/\d(?:\.\d)?)?|returned error:)\s+4\d\d\b"
+        r"|non-200 OK status code:\s+4\d\d\b"
         r"|authentication failed|permission denied",
-        output, re.IGNORECASE,
+        output, re.IGNORECASE | re.MULTILINE,
     ):
         return False
-    return short_of_memory(output) or bool(re.search(
+    return github_server_error(output) or short_of_memory(output) or bool(re.search(
         r"remote end hung up unexpectedly|connection (?:was )?(?:reset|timed out)"
         r"|operation timed out|(?:HTTP(?:/\d(?:\.\d)?)?|returned error:)\s+5\d\d\b"
         r"|could not resolve host|couldn't connect to server|failed to connect to"
@@ -523,6 +529,18 @@ def _transient_refresh_push(output: str) -> bool:
         r"|waiting for a push slot:",
         output, re.IGNORECASE,
     ))
+
+
+def note_github_server_errors(folder: Path) -> None:
+    # Merge and refresh callers hold merge.lock. One marker covers all pull requests and
+    # both operations until a successful merge or push proves that writes work again.
+    marker = folder / "github-server-errors"
+    if marker.exists():
+        return
+    notice = {"line": "GitHub server errors: merges and pushes wait"}
+    # Reuse the wake's operational notices, which stay pending until delivery succeeds.
+    write_json(folder / "stuck.pending" / "github-server-errors.json", notice)
+    write_json(marker, notice)
 
 
 def _push_refreshed(
@@ -539,7 +557,10 @@ def _push_refreshed(
         path.unlink(missing_ok=True)
         raise
     if pushed.returncode:
-        if refresh is not None and _transient_refresh_push(pushed.output):
+        retryable = _transient_refresh_push(pushed.output)
+        if retryable and github_server_error(pushed.output):
+            note_github_server_errors(train.path.parent)
+        if refresh is not None and retryable:
             refresh["failures"] += 1
             if refresh["failures"] < 3:
                 write_json(path, refresh)
@@ -550,11 +571,16 @@ def _push_refreshed(
                 )
         path.unlink(missing_ok=True)
         raise Refused(f"could not push the refreshed branch: {pushed.refusal}")
-    _finish_refresh(train, number, head, save=save)
+    _finish_refresh(train, number, head, save=save, rerun=bool(refresh and refresh.get("rerun")))
 
 
-def _finish_refresh(train: "Train", number: str, head: str, *, save: bool = False) -> None:
-    if save:
+def _finish_refresh(
+    train: "Train", number: str, head: str, *, save: bool = False, rerun: bool = False,
+) -> None:
+    (train.path.parent / "github-server-errors").unlink(missing_ok=True)
+    if rerun:
+        train.reruns[number] = git("rev-parse", "HEAD")
+    if save or rerun:
         train.save()
     note = Handoff.read(train.path.parent, number)
     if note is not None:
@@ -922,7 +948,10 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             train = Train(folder)
             unblocked = train.blocked.pop(number, None) is not None
             train.refreshable.discard(number)
-            _finish_refresh(train, number, pending["head"], save=unblocked)
+            _finish_refresh(
+                train, number, pending["head"], save=unblocked,
+                rerun=bool(pending.get("rerun")),
+            )
             print("the refreshed branch is published; waiting for its CI", flush=True)
             return 2
         # A direct retry can observe recovery before the next tick. Reconcile suspension
@@ -1058,7 +1087,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
                     )
                 lost = lost_check(pull, [ci[0], *images])
                 if lost:
-                    return rerun_lost(pull, train, number, lost)
+                    return rerun_lost(pull, train, number, lost, base=base)
                 raise Waiting(
                     f"check is not passing: {check.get('name', check.get('context', 'unknown'))}"
                 )
@@ -1097,20 +1126,10 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             own = runs("e2e", head, pull=True)[:1]
             if own and whole_suite(own[0], jobs(own[0]), tree):
                 evidence["e2e"] = own[0], jobs(own[0])
-        with squash_body(number, squash_proof(base, tree, evidence)) as body:
-            done = command(
-                "gh",
-                "pr",
-                "merge",
-                number,
-                "-R",
-                REPOSITORY,
-                "--body-file",
-                body,
-                "--squash",
-                "--match-head-commit",
-                head,
-            )
+        done = squash_attempt(number, head, squash_proof(base, tree, evidence), folder)
+        if done.returncode:
+            error = "\n".join((done.stdout, done.stderr)).strip()
+            raise Refused(f"could not merge pull request {number}: {error}")
         train.remove(number)
         try:
             receipt_ci = evidence.get("ci_suite", evidence["ci"])[0] if "server_whole" in CONFIG.checks.prefix_only else ci[0]
