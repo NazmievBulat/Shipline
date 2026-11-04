@@ -1438,6 +1438,7 @@ def _merge_prefixes(
                     for workflow, (run, parts) in found.evidence.items()
                 },
             ),
+            folder,
         )
         if failure:
             _drop_line(train)

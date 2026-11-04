@@ -282,6 +282,7 @@ from merge_squash import (
     _taken_migrations,
     changed_files,
     commit_list,
+    squash_attempt,
     squash_body,
     squash_proof,
 )
@@ -489,7 +490,7 @@ def refresh_pull(
 
 def _commit_and_push(
     pull: dict[str, Any], train: "Train", number: str, message: str, *,
-    save: bool = False, base: str | None = None,
+    save: bool = False, base: str | None = None, rerun: bool = False,
 ) -> None:
     git("commit", "--allow-empty", "-m", message)
     clear_generated(Path.cwd())
@@ -503,6 +504,7 @@ def _commit_and_push(
             "commit": git("rev-parse", "HEAD"),
             "base": base,
             "failures": 0,
+            **({"rerun": True} if rerun else {}),
         }
     _push_refreshed(pull, train, number, save=save, refresh=refresh)
 
@@ -569,12 +571,16 @@ def _push_refreshed(
                 )
         path.unlink(missing_ok=True)
         raise Refused(f"could not push the refreshed branch: {pushed.refusal}")
-    _finish_refresh(train, number, head, save=save)
+    _finish_refresh(train, number, head, save=save, rerun=bool(refresh and refresh.get("rerun")))
 
 
-def _finish_refresh(train: "Train", number: str, head: str, *, save: bool = False) -> None:
+def _finish_refresh(
+    train: "Train", number: str, head: str, *, save: bool = False, rerun: bool = False,
+) -> None:
     (train.path.parent / "github-server-errors").unlink(missing_ok=True)
-    if save:
+    if rerun:
+        train.reruns[number] = git("rev-parse", "HEAD")
+    if save or rerun:
         train.save()
     note = Handoff.read(train.path.parent, number)
     if note is not None:
@@ -942,7 +948,10 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             train = Train(folder)
             unblocked = train.blocked.pop(number, None) is not None
             train.refreshable.discard(number)
-            _finish_refresh(train, number, pending["head"], save=unblocked)
+            _finish_refresh(
+                train, number, pending["head"], save=unblocked,
+                rerun=bool(pending.get("rerun")),
+            )
             print("the refreshed branch is published; waiting for its CI", flush=True)
             return 2
         # A direct retry can observe recovery before the next tick. Reconcile suspension
@@ -1078,7 +1087,7 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
                     )
                 lost = lost_check(pull, [ci[0], *images])
                 if lost:
-                    return rerun_lost(pull, train, number, lost)
+                    return rerun_lost(pull, train, number, lost, base=base)
                 raise Waiting(
                     f"check is not passing: {check.get('name', check.get('context', 'unknown'))}"
                 )
@@ -1117,38 +1126,10 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
             own = runs("e2e", head, pull=True)[:1]
             if own and whole_suite(own[0], jobs(own[0]), tree):
                 evidence["e2e"] = own[0], jobs(own[0])
-        with squash_body(number, squash_proof(base, tree, evidence)) as body:
-            done = command(
-                "gh",
-                "pr",
-                "merge",
-                number,
-                "-R",
-                REPOSITORY,
-                "--body-file",
-                body,
-                "--squash",
-                "--match-head-commit",
-                head,
-                check=False,
-            )
+        done = squash_attempt(number, head, squash_proof(base, tree, evidence), folder)
         if done.returncode:
-            # The write may have completed before the server lost its response. Read it
-            # before classifying the error or changing the train and its authorization.
-            try:
-                merged = _read_pull(number)
-            except Waiting:
-                if github_server_error("\n".join((done.stdout, done.stderr))):
-                    note_github_server_errors(folder)
-                raise
-            if merged["state"] != "MERGED" or merged["headRefOid"] != head:
-                error = "\n".join((done.stdout, done.stderr)).strip()
-                if transient(error):
-                    if github_server_error(error):
-                        note_github_server_errors(folder)
-                    raise Waiting(f"GitHub merge failed; retrying next tick: {error}")
-                raise Refused(f"could not merge pull request {number}: {error}")
-        (folder / "github-server-errors").unlink(missing_ok=True)
+            error = "\n".join((done.stdout, done.stderr)).strip()
+            raise Refused(f"could not merge pull request {number}: {error}")
         train.remove(number)
         try:
             receipt_ci = evidence.get("ci_suite", evidence["ci"])[0] if "server_whole" in CONFIG.checks.prefix_only else ci[0]
