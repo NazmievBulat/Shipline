@@ -14,6 +14,18 @@ _ANSWER = {
     "seven_day": {"utilization": 41.0, "resets_at": _SEVEN_RESETS},
 }
 _LINES = "five_hour 76 1791940200\nseven_day 41 1792134000\n"
+_NOW = 1791940000
+
+
+def _usage_answer(workflow: Workflow, answer: dict[str, object], source: str) -> None:
+    """The same payload, through either the fresh cache or the live endpoint."""
+    cache = workflow.state / "usage-cache.json"
+    workflow.env["WORKFLOW_USAGE_CACHE"] = str(cache)
+    if source == "cache":
+        cache.write_text(json.dumps(answer))
+    else:
+        _credentials(workflow)
+        _answering(workflow, json.dumps(answer))
 
 
 def _answering(workflow: Workflow, answer: str) -> None:
@@ -85,6 +97,75 @@ def test_a_window_without_its_reset_is_left_out(workflow: Workflow) -> None:
     done = workflow.run_script("usage")
 
     assert done.stdout == "five_hour 76 1791940200\n"
+
+
+@pytest.mark.parametrize("source", ["cache", "live"])
+@pytest.mark.parametrize("percent", [0.0, 12.5])
+def test_not_started_windows_have_their_full_length_and_an_explicit_marker(
+    workflow: Workflow, source: str, percent: float
+) -> None:
+    _usage_answer(workflow, {
+        window: {"utilization": percent, "resets_at": None}
+        for window in ("five_hour", "seven_day")
+    }, source)
+
+    done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == (
+        f"five_hour {int(percent)} {_NOW + 5 * 3600} not_started\n"
+        f"seven_day {int(percent)} {_NOW + 7 * 86400} not_started\n"
+    )
+    assert (workflow.state / "curl-args").exists() is (source == "live")
+
+
+@pytest.mark.parametrize("source", ["cache", "live"])
+def test_zero_utilization_with_a_dated_reset_has_started(
+    workflow: Workflow, source: str
+) -> None:
+    _usage_answer(workflow, {
+        "five_hour": {"utilization": 0.0, "resets_at": _FIVE_RESETS},
+    }, source)
+
+    done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "five_hour 0 1791940200\n"
+
+
+@pytest.mark.parametrize("source", ["cache", "live"])
+@pytest.mark.parametrize("window", ["five_hour", "seven_day"])
+@pytest.mark.parametrize("value", [
+    None, [], "unknown", 0,
+    {"resets_at": None},
+    {"utilization": None, "resets_at": None},
+    {"utilization": "0", "resets_at": None},
+    {"utilization": False, "resets_at": None},
+    {"utilization": "12", "resets_at": _FIVE_RESETS},
+    {"utilization": 0, "resets_at": ""},
+    {"utilization": 0, "resets_at": "invalid"},
+    {"utilization": 0, "resets_at": "not_started"},
+    {"utilization": 0},
+])
+def test_an_invalid_window_stays_unknown(
+    workflow: Workflow, source: str, window: str, value: object
+) -> None:
+    _usage_answer(workflow, {window: value}, source)
+
+    done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert done.returncode == 1
+    assert done.stdout == ""
+
+
+@pytest.mark.parametrize("source", ["cache", "live"])
+def test_a_missing_window_is_not_invented(workflow: Workflow, source: str) -> None:
+    _usage_answer(workflow, {"seven_day": _ANSWER["seven_day"]}, source)
+
+    done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == _LINES.splitlines(keepends=True)[1]
 
 
 @pytest.mark.parametrize(("age", "fresh"), [(299, True), (301, False)])

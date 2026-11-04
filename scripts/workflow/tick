@@ -635,8 +635,8 @@ is_over_its_time() {
 # Whether the 5-hour usage window allows a start: not above the ceiling, unless it resets
 # within the hour. A window that cannot be read allows none. Says why not.
 usage_allows_start() {
-  local window percent at
-  while read -r window percent at; do
+  local window percent at state
+  while read -r window percent at state; do
     [[ $window == five_hour && $percent =~ ^[0-9]+$ && $at =~ ^[0-9]+$ ]] || continue
     ((percent <= USAGE_CEILING || at - NOW <= 3600)) && return 0
     echo "the 5-hour usage window is $percent% used"
