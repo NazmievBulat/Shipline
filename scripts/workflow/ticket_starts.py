@@ -491,7 +491,11 @@ def observe_room(notes: Path) -> tuple[int, int] | None:
 def watch_room(notes: Path, parent: int) -> None:
     """Observe every three minutes until the tick exits, including a stalled merge train."""
     while os.getppid() == parent:
-        observe_room(notes)
+        try:
+            observe_room(notes)
+        except subprocess.TimeoutExpired:
+            # The failed observation cleared the history; later looks can start it anew.
+            print("ticket start: room observation timed out; will retry", file=sys.stderr)
         time.sleep(LOOK_SECONDS)
 
 
