@@ -362,6 +362,74 @@ ticket_starts.watch_room(pathlib.Path(sys.argv[2]), os.getppid())
     assert looked == moment + 720
 
 
+@pytest.mark.parametrize("healthy_minutes", [9, 12])
+def test_sampler_recovers_after_a_timeout_without_counting_earlier_room(
+    workflow: Workflow, healthy_minutes: int
+) -> None:
+    """A timeout loses the old history, then the same tick can build a new window."""
+    _model(workflow)
+    _draft(workflow, 7, "web")
+    moment = _start_now()
+    notes = _notes(workflow)
+    program = """
+import os, pathlib, subprocess, sys
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import ticket_starts
+
+notes = pathlib.Path(sys.argv[2])
+moment = int(sys.argv[3])
+finish = 420 + int(sys.argv[4]) * 60
+elapsed = 0
+checks = 0
+real_run = subprocess.run
+
+def resource_check(*args, **kwargs):
+    global checks, elapsed
+    checks += 1
+    if checks == 2:
+        # The first observation succeeded. The next check consumes its full timeout.
+        elapsed += 60
+        os.environ['WORKFLOW_NOW'] = str(moment + elapsed)
+        raise subprocess.TimeoutExpired(args[0], kwargs['timeout'])
+    return real_run(*args, **kwargs)
+
+def advance(seconds):
+    global elapsed
+    assert seconds == 180
+    if checks == 2:
+        assert not (notes / 'room').exists(), 'timeout kept earlier room evidence'
+    elapsed += seconds
+    if elapsed > finish:
+        raise SystemExit(0)
+    os.environ['WORKFLOW_NOW'] = str(moment + elapsed)
+
+ticket_starts.subprocess = SimpleNamespace(
+    run=resource_check, SubprocessError=subprocess.SubprocessError,
+    TimeoutExpired=subprocess.TimeoutExpired,
+)
+ticket_starts.time = SimpleNamespace(sleep=advance, time=ticket_starts.time.time)
+ticket_starts.watch_room(notes, os.getppid())
+"""
+    done = subprocess.run(
+        ["python3", "-B", "-c", program, str(_WORKFLOW), str(notes), str(moment),
+         str(healthy_minutes)],
+        env={**workflow.env, "WORKFLOW_NOW": str(moment)},
+        cwd=workflow.repo,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    final_moment = moment + 420 + healthy_minutes * 60
+
+    _pick(workflow, final_moment)
+
+    assert _labelled(workflow) == (["7"] if healthy_minutes >= 10 else [])
+    assert (notes / "room").read_text().split() == [str(moment + 420), str(final_moment)]
+
+
 def test_twelve_minutes_without_samples_cannot_start_a_ticket(workflow: Workflow) -> None:
     _model(workflow)
     _draft(workflow, 7, "web")
