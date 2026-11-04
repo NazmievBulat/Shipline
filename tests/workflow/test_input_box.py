@@ -403,6 +403,11 @@ def _codex_input(screen: str, *, trim_footer: bool = True) -> str:
     "\x1b[38;5;117m/workspace/example-app\x1b[39m · \x1b[38;5;180mCheck changes\x1b[0m",
     "  \x1b[32mcustom-model\x1b[39m · \x1b[34m./example-app\x1b[39m · "
     "\x1b[35mCheck changes · more details\x1b[0m",
+    "  \x1b[48;5;31;38;5;114mcustom-model\x1b[39m · "
+    "\x1b[58;2;1;32;2;34m./example-app\x1b[39m · \x1b[0;1;35mCheck changes\x1b[0m",
+    "  \x1b[38:5:114mcustom-model\x1b[39m · "
+    "\x1b[38:2::12:34:56m../example-app\x1b[39m · "
+    "\x1b[1;38:2:0:56:34:12mCheck changes\x1b[0m",
     "  ? for shortcuts",
     "  ? for shortcuts                 42% context left",
     "",
@@ -448,6 +453,21 @@ def test_codex_keeps_a_normally_coloured_owner_continuation_after_a_blank(
     assert _codex_input(f"› First line\n\n{draft}\n\n{footer}\n") == (
         " First line\n  custom-model · ~/example-app · Owner draft\n"
     )
+
+
+@pytest.mark.parametrize("style", [
+    "48;5;31", "48;2;1;32;2", "58;5;31", "58;2;1;32;2",
+    "31;39", "38;2;12;34;56;39", "31;0",
+])
+@pytest.mark.parametrize("footer", ["", _CODEX_STATUS])
+def test_codex_keeps_owner_fields_without_a_nondefault_foreground(
+    style: str, footer: str
+) -> None:
+    fields = ["custom-model", "~/example-app", "Owner draft"]
+    draft = "  " + " · ".join(f"\x1b[{style}m{field}\x1b[0m" for field in fields)
+    screen = f"› \x1b[2mAsk Codex to do anything\x1b[0m\n\n{draft}\n\n{footer}\n"
+
+    assert _codex_input(screen) == "  custom-model · ~/example-app · Owner draft\n"
 
 
 def test_legacy_reader_does_not_trim_codex_status() -> None:
