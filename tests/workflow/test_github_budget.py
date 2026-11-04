@@ -639,7 +639,11 @@ def test_github_limit_responses_pause_and_record_the_cause_once(
     assert row["arguments"] == list(arguments)
     assert row["status"] == status
     assert row.get("retry_after") == headers.get("Retry-After")
-    assert row["message"] == message
+    expected = (
+        "API rate limit exceeded for [redacted]"
+        if message == "API rate limit exceeded for this request" else message
+    )
+    assert row["message"] == expected
     assert row["requests"] == 1
 
 

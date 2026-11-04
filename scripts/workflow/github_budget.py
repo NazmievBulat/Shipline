@@ -337,6 +337,18 @@ def _redact(text: str, token: str | None = None) -> str:
     return re.sub(r"(https?://)[^/\s@]+@", r"\1[redacted]@", text, flags=re.I)
 
 
+def _safe_message(message: str, token: str | None = None) -> str:
+    # Primary-limit messages name the caller. Keep the reason, never the subject
+    # or any following details, even when the suffix spans multiple lines.
+    message = re.sub(
+        r"(\bAPI rate limit exceeded)\s+for\b.*",
+        r"\1 for [redacted]",
+        message,
+        flags=re.I | re.S,
+    )
+    return _redact(message, token)[:200]
+
+
 def _safe_arguments(arguments: tuple[str, ...], token: str | None = None) -> list[str]:
     # Never persist field/header values, bodies, file paths or arbitrary option values.
     # Keep the command, endpoint path and routing/method flags useful for tracing a call.
@@ -646,7 +658,7 @@ def call(
                 "throttled": True,
                 "arguments": _safe_arguments(arguments, token),
                 "status": int(throttled["status"]),
-                "message": _redact(message, token)[:200],
+                "message": _safe_message(message, token),
             }
             if "retry-after" in throttled:
                 cause["retry_after"] = _redact(throttled["retry-after"], token)
@@ -753,6 +765,9 @@ def report(seconds: float) -> None:
                         }
                     )
                     if row.get("throttled") is True:
+                        # Older current/rotated logs can predate message sanitization.
+                        if isinstance(row.get("message"), str):
+                            row["message"] = _safe_message(row["message"])
                         throttled.append(row)
     print("program\tHTTP requests\t304\tREST non-304\tGraphQL requests")
     for program, total in sorted(totals.items()):
