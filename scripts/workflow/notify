@@ -343,6 +343,12 @@ on_stop() {
   fi
   rm -f "$job_wait"
   note "$idle" ""
+  # A busy provider is retried by the tick, without a quota reset or an owner question.
+  if [[ -e $notes/$name.codex || ${1:-} == codex ||
+        ( $name == hunt-* && -f $main/.local/hunts/${name#hunt-}/codex.log ) ]] &&
+      LC_ALL=C grep -qE '^[[:space:]]*(■|•)?[[:space:]]*Selected model is at capacity' <<<"${message%%$'\n'*}"; then
+    return 0
+  fi
   if [[ -e $notes/$name.codex ]] && LC_ALL=C grep -qiE "^[[:space:]]*(You.{1,3}ve hit your usage limit|.*(usage|session|weekly) limit.*(reached|hit).*(I am stopping|stopping here))" <<<"${message%%$'\n'*}"; then
     return 0
   fi
