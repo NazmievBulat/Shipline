@@ -443,6 +443,24 @@ refuse_local_work() {
   exit 3
 }
 
+setup_worktree() {
+  local worktree=$1 program message
+  shift
+  # Use the same lookup and selected config as the other installed programs, including
+  # explicit paths and a relative XDG_CONFIG_HOME normalized before changing directory.
+  program=$(env "${session_config[@]}" python3 -B "$script_dir/workflow_config.py" worktree-setup)
+  if [[ -x $program ]]; then
+    (cd "$worktree" && "$program" "$@") >&2
+  elif jq -e 'has("worktree_setup")' <<<"$SHIPLINE_CONFIG_JSON" >/dev/null; then
+    message="worktree setup $SHIPLINE_WORKTREE_SETUP is not executable; setup skipped"
+    echo "$message" >&2
+    (umask 077
+      mkdir -p "$WORKFLOW_LOGS"
+      printf '%s %s: %s\n' "${WORKFLOW_NOW:-$(date +%s)}" "$name" "$message" >>"$WORKFLOW_LOGS/wake.log"
+    )
+  fi
+}
+
 prepare_worktree() {
   local worktree=$1 current other
   # Forget a worktree whose folder was deleted by hand, so it is made again.
@@ -522,10 +540,7 @@ prepare_worktree() {
   # (`scripts/setup-worktree` unless shipline.json names another), when it has one. Repeated
   # on an existing worktree: it is quick when nothing is missing, and it repairs a worktree
   # whose first setup failed.
-  (
-    cd "$worktree"
-    [[ ! -x $SHIPLINE_WORKTREE_SETUP ]] || "./$SHIPLINE_WORKTREE_SETUP"
-  ) >&2
+  setup_worktree "$worktree"
 }
 
 # Reads the link Claude prints for the session from the `tmux` screen and from the lines that
@@ -946,10 +961,7 @@ prepare_hunt_worktree() {
     git worktree add --quiet --detach "$worktree" "$HUNT_REF" >&2 ||
       die "cannot make a worktree of $HUNT_REF"
   fi
-  (
-    cd "$worktree"
-    [[ ! -x $SHIPLINE_WORKTREE_SETUP ]] || "./$SHIPLINE_WORKTREE_SETUP" --no-push
-  ) >&2
+  setup_worktree "$worktree" --no-push
 }
 
 # The screens of a configured area, joined with commas. Fails for any other word.
