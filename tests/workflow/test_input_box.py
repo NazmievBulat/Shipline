@@ -399,8 +399,10 @@ def _codex_input(screen: str, *, trim_footer: bool = True) -> str:
 
 @pytest.mark.parametrize("footer", [
     _CODEX_STATUS,
-    "  \x1b[38;5;114mcustom-model medium · /workspace/example-app · Check changes\x1b[0m",
-    "  \x1b[32mcustom-model · ./example-app · Check changes · more details\x1b[0m",
+    "  \x1b[38;5;114mcustom-model medium\x1b[39m · "
+    "\x1b[38;5;117m/workspace/example-app\x1b[39m · \x1b[38;5;180mCheck changes\x1b[0m",
+    "  \x1b[32mcustom-model\x1b[39m · \x1b[34m./example-app\x1b[39m · "
+    "\x1b[35mCheck changes · more details\x1b[0m",
     "  ? for shortcuts",
     "  ? for shortcuts                 42% context left",
     "",
@@ -432,6 +434,18 @@ def test_codex_does_not_trim_a_coloured_status_shape_inside_the_box() -> None:
     draft = "  \x1b[32mcustom-model · ~/example-app · Owner draft\x1b[39m"
 
     assert _codex_input(f"› First line\n{draft}\n") == (
+        " First line\n  custom-model · ~/example-app · Owner draft\n"
+    )
+
+
+@pytest.mark.parametrize("style", ["37", "97", "38;5;60", "38;2;12;34;56"])
+@pytest.mark.parametrize("footer", ["", _CODEX_STATUS])
+def test_codex_keeps_a_normally_coloured_owner_continuation_after_a_blank(
+    style: str, footer: str
+) -> None:
+    draft = f"  \x1b[{style}mcustom-model · ~/example-app · Owner draft\x1b[39m"
+
+    assert _codex_input(f"› First line\n\n{draft}\n\n{footer}\n") == (
         " First line\n  custom-model · ~/example-app · Owner draft\n"
     )
 

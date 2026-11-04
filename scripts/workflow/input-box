@@ -74,12 +74,15 @@ codex_input() {
     }
   ') || return 1
   ((first > 0 && last >= first)) || return 1
-  # The final status row is outside the box, separated by a blank row and drawn in
-  # foreground colour. Require its styling before the model name as well as its
-  # structure: a plain owner continuation can spell the very same model/path/title.
+  # Status fields are styled separately. One foreground code alone can also colour
+  # an owner continuation spelling the same model/path/title, even after a blank.
+  # Require a colour at the start of each field as well as the footer structure.
   # Never trim the prompt row, an earlier lookalike, or a row joined to the draft.
+  local sgr=$'\x1b\\[[0-9;:]*m'
+  local foreground=$'\x1b\\[([0-9]+;)*(3[0-7]|9[0-7]|38[;:][25][;:])[0-9;:]*m'
+  local field="[[:blank:]]*($sgr[[:blank:]]*)*$foreground"
   if ((status_footer)) && LC_ALL=C sed -n "${last}p" <<<"$screen" |
-      LC_ALL=C grep -qE $'^[[:blank:]]*(\x1b\\[[0-9;:]*m[[:blank:]]*)*\x1b\\[([0-9]+;)*(3[0-7]|9[0-7]|38[;:][25][;:])[0-9;:]*m'; then
+      LC_ALL=C grep -qE "^$field.* · $field.* · $field"; then
     last=$((last - 1))
   fi
   nonblank_input "$first" "$last" <<<"$screen"
