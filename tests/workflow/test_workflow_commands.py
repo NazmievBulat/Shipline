@@ -1,4 +1,4 @@
-"""A stopped workflow command takes every process it started with it (real processes, no server)."""
+"""Bounded workflow commands and GitHub server failures."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import suppress
 from collections.abc import Iterator
+from contextlib import suppress
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from workflow_harness import SCRIPTS, Workflow
@@ -125,8 +125,8 @@ def test_a_failed_merge_is_read_back_before_its_result_is_decided(
         assert "merge waiting:" in done.stderr
         assert _train(workflow)["approved"]["7"] == handed.head
     calls = workflow.calls("gh")
-    merge = next(i for i, call in enumerate(calls) if call.startswith("gh pr merge")) if completed else -1
     if completed:
+        merge = next(i for i, call in enumerate(calls) if call.startswith("gh pr merge"))
         assert calls[merge + 1].startswith("gh pr view 7 ")
 
 
@@ -161,6 +161,7 @@ def test_a_github_push_rejection_keeps_the_refresh_and_handoff(
     assert json.loads(_note(workflow).read_text())["head"] == refreshed
     assert _train(workflow)["waiting"] == ["7", "8"]
     assert _started(workflow) == []
+    assert not (_folder(workflow) / "github-server-errors").exists()
 
 
 def test_github_server_errors_reach_the_wake_once_across_merge_and_push(handed: GitHub) -> None:

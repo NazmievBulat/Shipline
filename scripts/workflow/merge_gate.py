@@ -31,6 +31,7 @@ from workflow_commands import (
     READ_TIMEOUT,
     CommandTimeout,
     github_read,
+    github_server_error,
     install_signal_handlers,
     read_with_retries,
     transient,
@@ -507,15 +508,18 @@ def _commit_and_push(
 
 
 def _transient_refresh_push(output: str) -> bool:
-    # A remote rejection wins even if an earlier line mentioned a network failure.
+    # A branch/hook rejection wins over a network failure. GitHub's own server rejection
+    # says nothing about the branch and follows the same bounded retry as an HTTP 5xx.
     if re.search(
-        r"\[(?:remote )?rejected\]|non-fast-forward|protected branch|hook (?:declined|rejected)"
+        r"\[remote rejected\](?![^\n]*\((?:Internal Server Error|Service Unavailable|Bad Gateway)\)\s*$)"
+        r"|\[rejected\]|non-fast-forward|protected branch|hook (?:declined|rejected)"
         r"|(?:HTTP(?:/\d(?:\.\d)?)?|returned error:)\s+4\d\d\b"
+        r"|non-200 OK status code:\s+4\d\d\b"
         r"|authentication failed|permission denied",
-        output, re.IGNORECASE,
+        output, re.IGNORECASE | re.MULTILINE,
     ):
         return False
-    return short_of_memory(output) or bool(re.search(
+    return github_server_error(output) or short_of_memory(output) or bool(re.search(
         r"remote end hung up unexpectedly|connection (?:was )?(?:reset|timed out)"
         r"|operation timed out|(?:HTTP(?:/\d(?:\.\d)?)?|returned error:)\s+5\d\d\b"
         r"|could not resolve host|couldn't connect to server|failed to connect to"
@@ -523,6 +527,18 @@ def _transient_refresh_push(output: str) -> bool:
         r"|waiting for a push slot:",
         output, re.IGNORECASE,
     ))
+
+
+def note_github_server_errors(folder: Path) -> None:
+    # Merge and refresh callers hold merge.lock. One marker covers all pull requests and
+    # both operations until a successful merge or push proves that writes work again.
+    marker = folder / "github-server-errors"
+    if marker.exists():
+        return
+    notice = {"line": "GitHub server errors: merges and pushes wait"}
+    # Reuse the wake's operational notices, which stay pending until delivery succeeds.
+    write_json(folder / "stuck.pending" / "github-server-errors.json", notice)
+    write_json(marker, notice)
 
 
 def _push_refreshed(
@@ -539,7 +555,10 @@ def _push_refreshed(
         path.unlink(missing_ok=True)
         raise
     if pushed.returncode:
-        if refresh is not None and _transient_refresh_push(pushed.output):
+        retryable = _transient_refresh_push(pushed.output)
+        if retryable and github_server_error(pushed.output):
+            note_github_server_errors(train.path.parent)
+        if refresh is not None and retryable:
             refresh["failures"] += 1
             if refresh["failures"] < 3:
                 write_json(path, refresh)
@@ -554,6 +573,7 @@ def _push_refreshed(
 
 
 def _finish_refresh(train: "Train", number: str, head: str, *, save: bool = False) -> None:
+    (train.path.parent / "github-server-errors").unlink(missing_ok=True)
     if save:
         train.save()
     note = Handoff.read(train.path.parent, number)
@@ -1110,7 +1130,25 @@ def merge(number: str, folder: Path, *, delegated: bool = False) -> int:
                 "--squash",
                 "--match-head-commit",
                 head,
+                check=False,
             )
+        if done.returncode:
+            # The write may have completed before the server lost its response. Read it
+            # before classifying the error or changing the train and its authorization.
+            try:
+                merged = _read_pull(number)
+            except Waiting:
+                if github_server_error("\n".join((done.stdout, done.stderr))):
+                    note_github_server_errors(folder)
+                raise
+            if merged["state"] != "MERGED" or merged["headRefOid"] != head:
+                error = "\n".join((done.stdout, done.stderr)).strip()
+                if transient(error):
+                    if github_server_error(error):
+                        note_github_server_errors(folder)
+                    raise Waiting(f"GitHub merge failed; retrying next tick: {error}")
+                raise Refused(f"could not merge pull request {number}: {error}")
+        (folder / "github-server-errors").unlink(missing_ok=True)
         train.remove(number)
         try:
             receipt_ci = evidence.get("ci_suite", evidence["ci"])[0] if "server_whole" in CONFIG.checks.prefix_only else ci[0]
