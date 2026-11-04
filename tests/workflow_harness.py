@@ -422,8 +422,10 @@ if len(rules) >= 2:
 else:
     prompts = (">", chr(0x276f), chr(0x203a))
     boxes = [i for i, line in enumerate(lines) if line.startswith(prompts)]
-    at = boxes[-1] - len(boxes) + 1 if boxes else len(lines)
-    lines = [line for line in lines if not line.startswith(prompts)]
+    at = boxes[-1] if boxes else len(lines)
+    # Historical submitted prompts remain output, as in a real tmux capture.
+    if boxes:
+        lines.pop(at)
     # The box stays where the prompt was drawn, above the rows of the footer.
     lines[at:at] = ["> " + text]
 print("\\n".join(lines))

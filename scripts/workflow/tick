@@ -977,6 +977,9 @@ if ! python3 "$here/tick_snapshot.py" create "$snapshot" 9>&- || ! pulls=$(label
   # The application an ended hunt left running is stopped all the same.
   session cleanup hunts
   budget_ready || paused
+  # Capacity recovery needs no pull request listing. Leave the other local duties
+  # on their existing paths, including their protections during listing failures.
+  capacity_duties
   exit 1
 fi
 

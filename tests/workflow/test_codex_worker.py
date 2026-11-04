@@ -1601,6 +1601,7 @@ def test_capacity_retries_once_after_five_minutes(workflow: Workflow, kind: str)
     [
         "working", "typed", "wrapped-input", "owner-blocked", "interaction-blocked",
         "asking", "owner-reply", "pushed", "bridge-input", "permission", "old-error", "shell",
+        "shell-with-history",
     ],
 )
 def test_capacity_leaves_busy_or_owner_panes_alone(workflow: Workflow, blocked: str) -> None:
@@ -1617,7 +1618,9 @@ def test_capacity_leaves_busy_or_owner_panes_alone(workflow: Workflow, blocked: 
         workflow.screen(_CAPACITY + "Press enter to confirm or esc to cancel\n", target)
     elif blocked == "old-error":
         workflow.screen(_CAPACITY + "› Continue\n• Done.\n› \n", target)
-    elif blocked == "shell":
+    elif blocked in ("shell", "shell-with-history"):
+        if blocked == "shell-with-history":
+            workflow.scrollback(_CAPACITY, target)
         workflow.screen(_CAPACITY.splitlines()[0] + "\n$ \n", target)
     else:
         (notes / f"{name}.{blocked}").touch()
@@ -1774,15 +1777,19 @@ def test_capacity_observes_codex_even_when_its_bridge_is_on_quota(workflow: Work
     assert not workflow.calls(f"tmux {name} send-keys")
 
 
-def test_capacity_unreadable_pane_does_not_forget_a_sent_retry(workflow: Workflow) -> None:
+@pytest.mark.parametrize("history_only", [False, True])
+def test_capacity_unreadable_pane_does_not_forget_a_sent_retry(
+    workflow: Workflow, history_only: bool
+) -> None:
     _, target, _ = _capacity_session(workflow)
     _capacity_tick(workflow)
     _capacity_tick(workflow, 300)
     tmux = workflow.bin / "tmux"
     failure = workflow.state / "capture-fails"
+    condition = '[[ " $* " != *" -S - "* ]] || ' if history_only else ""
     tmux.write_text(tmux.read_text().replace(
         "  capture-pane)\n",
-        f'  capture-pane)\n    [ ! -e "{failure}" ] || exit 1\n',
+        f'  capture-pane)\n    {condition}[ ! -e "{failure}" ] || exit 1\n',
     ))
     failure.touch()
     _capacity_tick(workflow, 301)
@@ -1802,8 +1809,8 @@ def test_capacity_resize_preserves_the_timer_and_delivery_receipt(
     _capacity_tick(workflow)
     if already_sent:
         _capacity_tick(workflow, 300)
-    # The terminal shrinks: these rows move into tmux history, without new output.
-    workflow.scrollback(history, target)
+    # These rows move into tmux history. Reflow also changes layout padding.
+    workflow.scrollback(history.replace("\n", "   \n\n"), target)
     workflow.screen(_CAPACITY, target)
     _capacity_tick(workflow, 301 if already_sent else 299)
     _capacity_tick(workflow, 1201 if already_sent else 300)
@@ -1825,8 +1832,8 @@ def test_capacity_identical_viewport_retains_new_stop_in_scrollback(workflow: Wo
     _capacity_tick(workflow)
     _capacity_tick(workflow, 300)
     assert len(workflow.calls(f"tmux {target} send-keys")) == 2
-    # The stand-in's input overlay normally removes historical prompt rows. Clear
-    # that overlay to retain the transcript, as a real terminal does after Enter.
+    # Clear the current input overlay before installing the next observation.
+    # Historical prompt rows and all visible output remain unchanged.
     (workflow.state / f"input-{target}").unlink()
     workflow.scrollback(block * 21, target)
     assert (workflow.state / "screen" / target).read_text() == visible
@@ -1836,6 +1843,14 @@ def test_capacity_identical_viewport_retains_new_stop_in_scrollback(workflow: Wo
     _capacity_tick(workflow, 1201)
     _capacity_tick(workflow, 3600)
     assert len(workflow.calls(f"tmux {target} send-keys")) == 4
+
+
+def test_capacity_historical_working_rows_do_not_suppress_a_retry(workflow: Workflow) -> None:
+    _, target, _ = _capacity_session(workflow)
+    workflow.scrollback("• Working (5s • esc to interrupt)\n› Previous instruction\n", target)
+    _capacity_tick(workflow)
+    _capacity_tick(workflow, 300)
+    assert len(workflow.calls(f"tmux {target} send-keys")) == 2
 
 
 @pytest.mark.parametrize("listing_status", [1, 124])

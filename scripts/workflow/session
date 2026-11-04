@@ -2054,14 +2054,19 @@ capacity_target_of() {
   is_running "$capacity_target"
 }
 
-# Only the last output immediately above the current prompt counts. Keep the visible
-# history in the fingerprint: another output block can arrive between two ticks, without
-# either tick seeing the intervening working row. Text inside the input box is excluded.
+# Only the last output immediately above the current prompt counts. Fingerprint the
+# retained history, including rows outside the viewport: a resize moves those rows and
+# identical new output can scroll old rows off screen without a tick seeing work.
+# Text inside the input box is excluded.
 cmd_capacity_stop() {
-  local capacity_target capacity_notes screen output tail sum
+  local capacity_target capacity_notes screen history output tail sum
   capacity_target_of "$1" || return 2
   screen=$(tmux -L "$capacity_target" capture-pane -p -J -t "=$capacity_target:" 2>/dev/null) || return 2
   ! LC_ALL=C grep -qE '^[[:space:]]*(•[[:space:]]*)?Working \(|^• .*\(.*esc to interrupt\)' <<<"$screen" || return 1
+  LC_ALL=C grep -qE '^(›|>|❯)' <<<"$screen" || return 1
+  # Keep the working check above local to the viewport. Historical working rows are
+  # not evidence that Codex is working now. A failed history read is not recovery.
+  history=$(tmux -L "$capacity_target" capture-pane -p -J -S - -t "=$capacity_target:" 2>/dev/null) || return 2
   output=$(LC_ALL=C awk '
     /^(›|>|❯)/ { prompt = NR }
     { lines[NR] = $0 }
@@ -2069,7 +2074,7 @@ cmd_capacity_stop() {
       if (!prompt) exit 1
       for (i = 1; i < prompt; i++) print lines[i]
     }
-  ' <<<"$screen") || return 1
+  ' <<<"$history") || return 1
   tail=$(LC_ALL=C awk '
     /^(›|>|❯)/ { tail = ""; next }
     /^[[:space:]]*(■|•)?[[:space:]]*Selected model is at capacity/ { tail = ""; found = 1 }
@@ -2077,7 +2082,9 @@ cmd_capacity_stop() {
     END { print tail }
   ' <<<"$output")
   LC_ALL=C grep -qE '^[[:space:]]*(■|•)?[[:space:]]*Selected model is at capacity\.?([[:space:]]*Please try a different model\.)?[[:space:]]*$' <<<"$tail" || return 1
-  sum=$(cksum <<<"$output")
+  # Joined rows can retain padding after reflow. Neither padding nor blank layout
+  # rows identify an output occurrence, so resizing cannot change the receipt.
+  sum=$(LC_ALL=C sed '/^[[:space:]]*$/d; s/[[:space:]]*$//' <<<"$output" | cksum)
   echo "${sum%% *}"
 }
 
