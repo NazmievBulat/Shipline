@@ -1,6 +1,7 @@
 """The tick starts the next draft ticket itself, by priority and age, apart from running files."""
 
 import json
+import shlex
 import subprocess
 import sys
 import time
@@ -370,6 +371,32 @@ def test_twelve_minutes_without_samples_cannot_start_a_ticket(workflow: Workflow
 
     assert _labelled(workflow) == []
     assert (_notes(workflow) / "room").read_text().split() == [str(moment + 720)] * 2
+
+
+def test_the_tick_samples_room_before_its_github_read_finishes(workflow: Workflow) -> None:
+    """A blocked tick still observes resources, then exits without keeping a sampler alive."""
+    usual = workflow.bin / "gh"
+    (workflow.state / "gh-usual").write_text(usual.read_text())
+    room = _notes(workflow) / "room"
+    watcher = """#!/bin/bash
+if [[ $1 == pr && $2 == list ]]; then
+  for attempt in {1..100}; do
+    if [[ -f @ROOM@ ]]; then
+      cp @ROOM@ "@STATE@/sample-before-pick"
+      break
+    fi
+    /bin/sleep 0.05
+  done
+  [[ -f "@STATE@/sample-before-pick" ]] || exit 1
+fi
+exec bash "@STATE@/gh-usual" "$@"
+"""
+    workflow.fake("gh", watcher.replace("@ROOM@", shlex.quote(str(room))))
+    moment = _start_now()
+
+    _tick(workflow, moment)
+
+    assert (workflow.state / "sample-before-pick").read_text().split() == [str(moment)] * 2
 
 
 def test_nothing_starts_within_five_minutes_of_the_last_start(workflow: Workflow) -> None:
