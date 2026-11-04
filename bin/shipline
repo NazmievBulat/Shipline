@@ -21,8 +21,10 @@ set -euo pipefail
 COMMANDS=(
   ci-tests-for-changes
   decide
+  dependency-watch
   flow-page
   install
+  install-dependency-timer
   install-flow-page-timer
   install-hooks
   install-timer
@@ -115,6 +117,11 @@ for known in "${CONFIGURED[@]}"; do
   key=${command//-/_}
   declare -n words="SHIPLINE_COMMAND_${key^^}"
   if ((${#words[@]} > 0)); then
+    if [[ $command == hunt-app ]]; then
+      checkout=$(git rev-parse --show-toplevel)
+      exec python3 "$home/scripts/workflow/hunt_settings.py" run \
+        "$checkout/$SHIPLINE_STATE_FOLDER/hunt-settings.json" "${words[@]}" "$@"
+    fi
     exec "${words[@]}" "$@"
   fi
   # Without a selection nothing is selected, and without checks none fails: neither is a

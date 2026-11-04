@@ -56,6 +56,76 @@ def test_tick_hands_finished_worker_to_reviewer(workflow: Workflow) -> None:
     assert merges == []
 
 
+@pytest.mark.parametrize(
+    ("name", "words", "draft"),
+    [
+        ("review-7", "review finished", False),
+        ("review-7", "review sent back", True),
+        ("ticket-7", "worker finished", False),
+    ],
+)
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [("", "│"), ("│ ", " │"), ("╭ │ ", " │ ╯"), ("╿\t", "\t╼ ╽")],
+)
+def test_tick_reads_closing_words_inside_screen_borders(
+    workflow: Workflow, name: str, words: str, draft: bool, left: str, right: str
+) -> None:
+    workflow.add_worktree(7, draft=draft)
+    if words == "review finished":
+        (workflow.state / "base-branch-7").write_text("ticket/parent")
+    workflow.running(name)
+    _idle(workflow, name)
+    screen = f"● Done.\n\n  {words}\n\n✻ Worked for 2m\n\n{'─' * 40}\n❯ \n{'─' * 40}\n"
+    screen += "  ? for shortcuts\n  ● main\n"
+    workflow.screen("\n".join(f"{left}{line:<60}{right}" for line in screen.splitlines()), name)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stderr
+    assert f"{name} stopped" in done.stdout
+    if words == "review sent back":
+        assert workflow.is_running("ticket-7")
+    elif words == "worker finished":
+        assert workflow.is_running("review-7")
+    else:
+        assert not workflow.is_running(name)
+
+
+@pytest.mark.parametrize(
+    ("name", "words"),
+    [
+        ("review-7", "review finished"),
+        ("review-7", "review sent back"),
+        ("ticket-7", "worker finished"),
+    ],
+)
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "I will say {words} when done.",
+        "{words} after the checks pass.",
+        "> {words}",
+        '"{words}"',
+        "{words}\nWhich option?",
+    ],
+)
+def test_tick_does_not_finish_for_bordered_sentences_quotes_or_more_reply(
+    workflow: Workflow, name: str, words: str, reply: str
+) -> None:
+    workflow.add_worktree(7, draft=words == "review sent back")
+    workflow.running(name)
+    _idle(workflow, name)
+    screen = reply.format(words=words) + "\n\n" + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n"
+    workflow.screen("\n".join(f"│ {line:<60} │" for line in screen.splitlines()), name)
+
+    done = workflow.run_script("tick")
+
+    assert done.returncode == 0, done.stderr
+    assert workflow.is_running(name)
+    assert f"{name} stopped" not in done.stdout
+
+
 def test_sent_back_draft_gets_worker_and_next_reviewer_is_new(workflow: Workflow) -> None:
     workflow.add_worktree(7)
     workflow.running("review-7")

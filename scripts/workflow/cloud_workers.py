@@ -217,6 +217,8 @@ def _allowed(scripts: Path) -> bool:
     )
     for line in usage.stdout.splitlines():
         words = line.split()
+        if len(words) == 4 and words[3] == "not_started":
+            words.pop()
         if len(words) == 3 and words[0] == "five_hour" and all(w.isdigit() for w in words[1:]):
             if int(words[1]) <= 85 or int(words[2]) - now <= 3600:
                 return True

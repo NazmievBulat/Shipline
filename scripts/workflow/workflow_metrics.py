@@ -130,6 +130,12 @@ NUMBERED = re.compile(r"\b[0-9a-f]*[0-9][0-9a-f]*\b")
 HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\S")
 FINDINGS = re.compile(r"(\d+)\s+findings?\b|\bfindings?\W+(\d+)", re.IGNORECASE)
+# The generated preamble is metadata, not findings. Backticks in settings are escaped by
+# hunt_settings.header, so a setting cannot close this JSON fence early.
+HUNT_HEADER = re.compile(
+    r"\A# Hunt [^\n]+\n\nArea: [^\n]+\n\n## Settings\n\n```json\n.*?\n```\n\n",
+    re.DOTALL,
+)
 # What of a name read from GitHub may reach a finding, and so the orchestrator's message: words
 # and plain marks, no quotes, backticks, angle brackets or new lines, at most this long.
 NOT_PLAIN = re.compile(r"[^\w .,:;()\[\]/+!#&=%-]")
@@ -481,7 +487,8 @@ def read_hunts(main: Path) -> list[tuple[float, str, int | None]]:
             continue
         report = hunt / "report.md"
         try:
-            top = report.read_text(errors="replace").splitlines()[:10]
+            text = report.read_text(errors="replace")
+            top = HUNT_HEADER.sub("", text, count=1).splitlines()[:10]
             written = report.stat().st_mtime
         except OSError:
             # A hunt without its report, as of when its folder last changed.

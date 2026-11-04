@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from workflow_harness import Workflow, instruction
+from workflow.test_usage import _usage_answer
 
 _WORKER = instruction("Implement pull request 7")
 
@@ -1151,6 +1152,21 @@ def test_the_analyst_waits_while_the_usage_cannot_be_read(workflow: Workflow) ->
     assert done.returncode == 0, done.stderr
     assert _started(workflow) == []
     assert "the daily analyst waits: the 5-hour usage window could not be read" in done.stdout
+
+
+@pytest.mark.parametrize("source", ["cache", "live"])
+def test_a_not_started_usage_window_allows_the_daily_analyst(
+    workflow: Workflow, source: str
+) -> None:
+    _metrics_report(workflow, "2026-10-24")
+    _usage_answer(workflow, {
+        "five_hour": {"utilization": 0.0, "resets_at": None},
+    }, source)
+
+    done = workflow.run_script("tick", env=_at(_EIGHT + 60))
+
+    assert done.returncode == 0, done.stderr
+    assert _started(workflow) == ["analyst-day-2026-10-24"]
 
 
 def test_an_analyst_held_by_the_usage_starts_at_a_later_tick(workflow: Workflow) -> None:

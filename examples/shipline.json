@@ -75,11 +75,32 @@
     "max_changed_lines": 40,
     "program": "claude"
   },
+  "dependency_watch": {
+    "prepare": [
+      "bun install --frozen-lockfile --ignore-scripts"
+    ],
+    "audits": [
+      {
+        "run": "bun audit --audit-level=high --json",
+        "format": "bun-audit",
+        "cwd": ".",
+        "lock_files": [
+          "bun.lock"
+        ]
+      }
+    ],
+    "minimum_severity": "high"
+  },
   "hot_paths": [
     "src/example_app/models.py",
     "web/src/pages/**"
   ],
   "hunts": {
+    "area_settings": {
+      "phone": {
+        "FEATURE_EXAMPLE": "on"
+      }
+    },
     "areas": {
       "phone": [
         "/calls",
@@ -90,7 +111,10 @@
         "/settings/billing"
       ]
     },
-    "plans": "docs/hunt-plans.md"
+    "plans": "docs/hunt-plans.md",
+    "settings": {
+      "FEATURE_EXAMPLE": "off"
+    }
   },
   "install_folder": ".",
   "labels": {

@@ -123,7 +123,10 @@ def checks(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             merged.append(group[0])
             continue
         conclusions = [job.get("conclusion") for job in group]
-        failed = [c for c in conclusions if c not in (None, "success", "skipped")]
+        # Cancellation of one part must not hide an actual failure in another.
+        failed = [c for c in conclusions if c not in (None, "success", "skipped", "cancelled")]
+        if not failed and "cancelled" in conclusions:
+            failed = ["cancelled"]
         dealt = sorted(
             (int(matched[3]), int(matched[2]))
             for matched in (_PART.fullmatch(job.get("name", "")) for job in group)
@@ -168,7 +171,7 @@ def verdict(
     ]
     settled = (None, "success", "skipped", "cancelled")
     if (
-        run.get("conclusion") == "cancelled"
+        run.get("conclusion") in (None, "cancelled")
         and all(job.get("conclusion") in settled for job in parts)
         and lender_replanning(
             str(run["id"]), head=run.get("head_sha"), attempt=run.get("run_attempt", 1)
@@ -176,13 +179,12 @@ def verdict(
     ):
         return "pending", [plan]
     if (
-        run.get("conclusion") == "cancelled"
         # The summary job runs even in a cancelled run, and fails for the jobs cancelled under it.
-        and all(job.get("conclusion") in settled or job["name"] == plan for job in parts)
+        all(job.get("conclusion") in settled or job["name"] == plan for job in parts)
         and cancelled_inherited(run)
     ):
-        # The gate cancelled it, still running, once main inherited its result: that result
-        # stands for it.
+        # The gate lists the attempt before cancelling it. Its inherited result stands
+        # while GitHub is still settling the run and after it finishes.
         return "pending", [plan]
     if failed or run.get("conclusion") not in (None, "success"):
         return "red", failed or [label]

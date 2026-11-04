@@ -85,7 +85,7 @@ _DEFAULTS = {
     "machines": [],
     # The branches the merge gate tests its prefixes on are named by this, then a random name.
     "merge": {"scratch_prefix": "workflow/merge-batch-"},
-    "hunts": {"areas": {}, "plans": None},
+    "hunts": {"areas": {}, "plans": None, "settings": {}, "area_settings": {}},
     # A repository names its own; CI's test job fails without one (ci_proof.py).
     "commands": {
         name: None
@@ -111,6 +111,7 @@ _DEFAULTS = {
     # No hot paths, and the conflict reviewer of today.
     "hot_paths": [],
     "conflict_review": None,
+    "dependency_watch": None,
     "merge_train": {"queued_limit_minutes": 20},
     "cloud_pre_push": {"suites": {}},
 }
@@ -382,14 +383,16 @@ def test_the_example_names_every_key(tmp_path: Path) -> None:
         # The hunt areas and the suites are named by the repository, not by Shipline.
         if (
             not isinstance(value, dict)
-            or prefix in (".hunts.areas", ".cloud_pre_push.suites")
+            or prefix in (".hunts.areas", ".hunts.settings", ".hunts.area_settings", ".cloud_pre_push.suites")
             or prefix.startswith(".commands.")
         ):
             return {prefix}
         return {key for name, inner in value.items() for key in keys(inner, f"{prefix}.{name}")}
 
     # The conflict reviewer is one object, named whole or left out.
-    named = {**_DEFAULTS, "conflict_review": {"effort": "", "model": "", "max_changed_lines": 0, "program": ""}}
+    named = {**_DEFAULTS,
+             "conflict_review": {"effort": "", "model": "", "max_changed_lines": 0, "program": ""},
+             "dependency_watch": {"prepare": [], "audits": [], "minimum_severity": "high"}}
     assert keys(example) == keys(named)
     assert example["hot_paths"]
     assert example["repository"].endswith("/example-app")
@@ -2325,11 +2328,14 @@ def test_generated_config_keeps_original_values_and_documents_command_waits(tmp_
     original = json.loads((_CONFIG_FIXTURES / "example.input.json").read_text())
     waits = {"wait_exit": [75], "wait_output": "^checks temporarily unavailable"}
     original["commands"]["pre_train_checks"].update(waits)
+    original["hunts"].update(settings={"FEATURE_EXAMPLE": "off"},
+                             area_settings={"phone": {"FEATURE_EXAMPLE": "on"}})
     generated = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
     assert generated == original
     _write(repo, generated)
     expected = json.loads((_CONFIG_FIXTURES / "example.json").read_text())
     expected["values"]["commands"]["pre_train_checks"].update(waits)
+    expected["values"]["hunts"].update(original["hunts"])
     assert _as_json(workflow_config.load(repo)) == expected["values"]
 
 
@@ -2439,3 +2445,43 @@ def test_config_sections_keep_existing_positional_constructors() -> None:
         "workflow-tests", "runner-tests", "known"
     )
     assert workflow_config.CloudPrePush().suites == ()
+    hunts = workflow_config.Hunts({"phone": ("/calls",)}, "docs/hunt-plans.md")
+    assert hunts.plans == "docs/hunt-plans.md"
+    assert hunts.settings == hunts.area_settings == {}
+
+
+@pytest.mark.parametrize("key", ["settings", "area_settings"])
+@pytest.mark.parametrize("value", [[], None, "on", {"bad_name": "on"}, {"_FLAG": "on"},
+                                   {"1FLAG": "on"}, {"FLAG": True}, {"FLAG": 1},
+                                   {"FLAG": "on\noff"}, {"FLAG": "on\roff"}, {"FLAG": "on\0off"}])
+def test_invalid_hunt_settings_are_refused_at_load(tmp_path: Path, key: str, value: Any) -> None:
+    repo = _repository(tmp_path)
+    hunts = {"areas": {"phone": ["/calls"]}, key: value if key == "settings" else {"phone": value}}
+    _write(repo, {"hunts": hunts})
+    with pytest.raises(workflow_config.ConfigError, match=f"hunts.{key}"):
+        workflow_config.load(repo)
+
+
+def test_area_settings_require_a_configured_area(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"hunts": {"area_settings": {"missing": {"FLAG": "on"}}}})
+    with pytest.raises(workflow_config.ConfigError, match="hunts.area_settings.*missing"):
+        workflow_config.load(repo)
+
+
+def test_hunt_settings_keep_literal_and_empty_values(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    settings = {"FLAG_2": "", "FEATURE": "a 'quote' $value `word` = \\ end"}
+    _write(repo, {"hunts": {"areas": {"phone": ["/calls"]}, "settings": settings,
+                              "area_settings": {"phone": {"FEATURE": "on"}}}})
+    config = workflow_config.load(repo)
+    assert config.hunts.settings == settings
+    assert config.hunts.area_settings == {"phone": {"FEATURE": "on"}}
+
+
+@pytest.mark.parametrize("value", [[], None, "phone"])
+def test_area_settings_require_an_object(tmp_path: Path, value: Any) -> None:
+    repo = _repository(tmp_path)
+    _write(repo, {"hunts": {"area_settings": value}})
+    with pytest.raises(workflow_config.ConfigError, match="hunts.area_settings"):
+        workflow_config.load(repo)

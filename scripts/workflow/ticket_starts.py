@@ -527,15 +527,20 @@ def usage_wait(moment: int) -> str | None:
     )
     for line in usage.stdout.splitlines():
         words = line.split()
-        if not (len(words) == 3 and words[0] == "five_hour" and words[1].isdigit()):
+        if len(words) == 4 and words[3] == "not_started":
+            words.pop()
+        if not (
+            len(words) == 3 and words[0] == "five_hour"
+            and all(word.isdigit() for word in words[1:])
+        ):
             continue
         if (
-            words[2].isdigit()
-            and int(words[1]) > USAGE_CEILING
+            int(words[1]) > USAGE_CEILING
             and (int(words[2]) - moment > USAGE_RESET_SECONDS)
         ):
             return f"the 5-hour usage window is {words[1]}% used"
-    return None
+        return None
+    return "the 5-hour usage window could not be read"
 
 
 def tell(notes: Path, lines: dict[str, str], started: str | None) -> None:

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Screen decoration shared by tick's closing words and last line, and notify's closing words.
+# U+2500..U+257F as complete UTF-8 sequences, including under LC_ALL=C.
+SCREEN_BOX_DRAWING=$'\xe2[\x94\x95][\x80-\xbf]'
+# Unicode White_Space, read byte by byte as nonblank_input in input-box reads it.
+SCREEN_BORDER_SPACE=$'([[:space:]]|\xc2\x85|\xc2\xa0|\xe1\x9a\x80|\xe2\x80[\x80-\x8a\xa8\xa9\xaf]|\xe2\x81\x9f|\xe3\x80\x80)'
+# Find input-box rules before stripping borders. Keep the ordinary left-edge rule and
+# recognize a framed rule made entirely of borders and whitespace, with a horizontal stroke.
+SCREEN_INPUT_RULE="^─|^${SCREEN_BORDER_SPACE}*(${SCREEN_BOX_DRAWING}${SCREEN_BORDER_SPACE}*)*─(${SCREEN_BOX_DRAWING}${SCREEN_BORDER_SPACE}*)*$"
+
+# Remove only edge runs of borders and their padding; keep line numbers and interior text.
+strip_screen_borders() {
+  local edge="(${SCREEN_BORDER_SPACE}*${SCREEN_BOX_DRAWING})+${SCREEN_BORDER_SPACE}*"
+  LC_ALL=C sed -E "s/^${edge}//; s/${edge}$//"
+}

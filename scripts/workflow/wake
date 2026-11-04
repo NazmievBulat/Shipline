@@ -480,10 +480,15 @@ duration() {
 }
 
 usage_line() {
-  local window percent at five="" seven=""
-  while read -r window percent at; do
+  local window percent at state five="" seven=""
+  while read -r window percent at state; do
     case $window in
-      five_hour) five="5-hour window $percent% used, resets in $(duration $((at - NOW)))" ;;
+      five_hour)
+        if [[ $state == not_started ]]; then
+          five="5-hour window $percent% used, not started"
+        else
+          five="5-hour window $percent% used, resets in $(duration $((at - NOW)))"
+        fi ;;
       seven_day) seven="weekly $percent%" ;;
     esac
   done < <(bash "$here/usage" 2>/dev/null)
@@ -492,8 +497,8 @@ usage_line() {
 }
 
 starts_allowed() {
-  local window percent at
-  while read -r window percent at; do
+  local window percent at state
+  while read -r window percent at state; do
     [[ $window == five_hour ]] || continue
     if ((percent > 85 && at - NOW > 3600)); then echo held; else echo allowed; fi
     return

@@ -62,6 +62,7 @@ exec >/dev/null 2>&1
 # from.
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$here/limit-reset"
+source "$here/screen-borders"
 config=$(python3 "$here/workflow_config.py" shell) || exit 1
 eval "$config"
 # The repository's main checkout, never the checkout these scripts are in.
@@ -159,7 +160,7 @@ ring() {
 # rule, and with more text under them it went on, perhaps to ask something.
 said_finished() {
   local last
-  last=$(LC_ALL=C grep -vE '^[[:space:]]*$' <<<"$2" | tail -n 1)
+  last=$(strip_screen_borders <<<"$2" | LC_ALL=C grep -vE '^[[:space:]]*$' | tail -n 1)
   LC_ALL=C grep -qiE "${FINISHED_LINE/WORDS/$1}" <<<"$last"
 }
 
@@ -276,7 +277,7 @@ SESSION_STOPS='\<(I( am|.m)? stopping|stopping here)\>'
 USAGE_SECONDS=1.5
 
 stopped_on_limit() {
-  local first window percent at now five=() seven=()
+  local first window percent at state now five=() seven=()
   claude_line_reset "$1" "$notes/$name" && return 0
   # A bridge relays Codex's words, and Codex's usage is never read from Claude's figures.
   [[ ! -e $notes/$name.codex ]] || return 1
@@ -288,7 +289,7 @@ stopped_on_limit() {
   five=(0 0)
   seven=(0 0)
   limit_at=""
-  while read -r window percent at; do
+  while read -r window percent at state; do
     case $window in
       five_hour) five=("$percent" "$at") ;;
       seven_day) seven=("$percent" "$at") ;;
