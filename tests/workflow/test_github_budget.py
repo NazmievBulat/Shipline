@@ -763,7 +763,8 @@ def test_primary_limit_caller_is_removed_before_telemetry_is_written(
     path = host / ".local/state/workflow/github-budget"
     [row] = [json.loads(line) for line in (path / "requests.jsonl").read_text().splitlines()]
     # A fixed expectation keeps even synthetic caller details out of failure output.
-    assert row["message"] == "API rate limit exceeded for [redacted]"
+    sanitized = row["message"] == "API rate limit exceeded for [redacted]"
+    assert sanitized, "primary-limit caller retained in telemetry"
     assert row["throttled"] is True
     assert row["status"] == status
     _module().report(60)
@@ -791,7 +792,8 @@ def test_report_removes_primary_limit_callers_from_existing_logs(
     output = capsys.readouterr().out
     assert "example-app\t1\t0\t1\t0" in output
     [shown] = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
-    assert shown["message"] == "API rate limit exceeded for [redacted]"
+    sanitized = shown["message"] == "API rate limit exceeded for [redacted]"
+    assert sanitized, "primary-limit caller retained in report"
     assert shown == {**row, "message": shown["message"]}
 
 
