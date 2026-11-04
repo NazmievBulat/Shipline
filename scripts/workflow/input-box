@@ -77,6 +77,9 @@ codex_input() {
   # Require separately styled status fields. One foreground code alone can colour
   # an owner continuation spelling the same model/path/title, even after a blank.
   # Require a colour at the start of each field as well as the footer structure.
+  # Only the first three fields identify the footer: a plain branch field may follow
+  # the title, and right-aligned notices have their own colours and bold attributes.
+  # Neither the notices nor the branch field is required, or part of the title style.
   # Never trim the prompt row, an earlier lookalike, or a row joined to the draft.
   if ((status_footer)) && LC_ALL=C sed -n "${last}p" <<<"$screen" |
       LC_ALL=C awk '

@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import subprocess
+from pathlib import Path
 
 import pytest
 from workflow_harness import SCRIPTS, Workflow, instruction
@@ -381,12 +382,10 @@ def test_styled_prompt_prefix_preserves_the_owners_quote_mark(
     assert done.stdout.strip() == "> Continue checking example-app."
 
 
-_CODEX_STATUS = (
-    "  \x1b[38;2;246;226;183mGPT-6.1-Sol high\x1b[39m · "
-    "\x1b[38;2;166;218;149m~/example-app/.claude/worktrees/ticket-12\x1b[39m · "
-    "\x1b[38;2;138;173;244mReview PR 12 conflict resolution\x1b[39m"
-    "        \x1b[38;2;238;212;159m⚠ 1 warning · f2 to view\x1b[39m"
-)
+_CODEX_CAPTURE = (
+    Path(__file__).parent / "fixtures" / "screens" / "codex-status.ansi"
+).read_text()
+_CODEX_STATUS = _CODEX_CAPTURE.splitlines()[-1]
 
 
 def _codex_input(screen: str, *, trim_footer: bool = True) -> str:
@@ -397,8 +396,34 @@ def _codex_input(screen: str, *, trim_footer: bool = True) -> str:
     ).stdout
 
 
+@pytest.mark.parametrize("branch", [False, True])
+@pytest.mark.parametrize("notices", [False, True])
+@pytest.mark.parametrize(("draft", "expected"), [
+    (None, ""),
+    ("Review the changes", " Review the changes\n"),
+    ("First · second\n  Third · fourth", " First · second\n  Third · fourth\n"),
+    ("First line\n\n  GPT-6.1-Sol medium · ~/example-app · Owner draft",
+     " First line\n  GPT-6.1-Sol medium · ~/example-app · Owner draft\n"),
+])
+def test_codex_captured_layout_with_optional_branch_and_notices(
+    branch: bool, notices: bool, draft: str | None, expected: str
+) -> None:
+    screen = _CODEX_CAPTURE
+    if not branch:
+        screen = screen.replace(" · Main [default]", "")
+    if not notices:
+        screen = screen.split("⚠", 1)[0].rstrip() + "\n"
+    if draft is not None:
+        screen = screen.replace("\x1b[2mAsk Codex to do anything\x1b[0m", draft)
+
+    assert _codex_input(screen) == expected
+
+
 @pytest.mark.parametrize("footer", [
     _CODEX_STATUS,
+    "  \x1b[38;2;246;226;183mGPT-6.1-Sol high\x1b[39m · "
+    "\x1b[38;2;171;223;167m~/example-app/.claude/worktrees/ticket-12\x1b[39m · "
+    "\x1b[38;2;116;199;236mReview PR 12 conflict resolution\x1b[39m",
     "  \x1b[38;5;114mcustom-model medium\x1b[39m · "
     "\x1b[38;5;117m/workspace/example-app\x1b[39m · \x1b[38;5;180mCheck changes\x1b[0m",
     "  \x1b[32mcustom-model\x1b[39m · \x1b[34m./example-app\x1b[39m · "
