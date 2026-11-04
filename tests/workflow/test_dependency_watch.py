@@ -211,6 +211,70 @@ def test_label_failure_is_retried_without_another_ticket(watch: Workflow) -> Non
     assert len(_calls(watch, suffix="/labels")) == 2
 
 
+@pytest.mark.parametrize("next_report", ["clean", "no-fix", "different"])
+@pytest.mark.parametrize("dry", [False, True])
+def test_label_recovery_does_not_need_the_original_finding(
+    watch: Workflow, next_report: str, dry: bool,
+) -> None:
+    (watch.state / "fail-labels").touch()
+    assert watch.shipline("dependency-watch").returncode != 0
+    (watch.state / "fail-labels").unlink()
+    if next_report == "clean":
+        (watch.state / "bun.json").write_text('{"advisories": {}}')
+    elif next_report == "no-fix":
+        _report(watch, fixed="<0.0.0")
+    else:
+        _report(watch, package="example-other")
+
+    done = watch.shipline("dependency-watch", *(["--dry-run"] if dry else []))
+
+    assert done.returncode == 0, done.stderr
+    if dry:
+        assert "would label draft #19: workflow, priority: high" in done.stdout
+        assert len(_calls(watch, suffix="/labels")) == 1
+        assert len(_calls(watch, suffix="/pulls")) == 1
+    else:
+        labels = _calls(watch, suffix="/labels")
+        assert len(labels) == (3 if next_report == "different" else 2)
+        assert labels[1][2]["labels"] == ["workflow", "priority: high"]
+        assert len(_calls(watch, suffix="/pulls")) == (2 if next_report == "different" else 1)
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_bare_python_auditor_never_uses_inherited_environment(watch: Workflow, prepared: bool) -> None:
+    # The inherited auditor is valid but clean; selecting it would silently miss the advisory.
+    watch.fake("pip-audit", '#!/bin/sh\nprintf \'%s\\n\' \'{"dependencies": []}\'\n')
+    watch.fake("prepare-python-watch", '''#!/usr/bin/env python3
+import json
+from pathlib import Path
+program = Path("backend/.venv/bin/pip-audit")
+program.parent.mkdir(parents=True)
+report = {"dependencies": [{"name": "example-python", "vulns": [{
+    "id": "PYSEC-2026-123", "fix_versions": ["2.0.1"],
+}]}]}
+program.write_text("#!/usr/bin/env python3\\nimport json, sys\\n"
+                   "assert sys.argv[1:] == ['--skip-editable', '--format', 'json']\\n"
+                   "print(" + repr(json.dumps(report)) + ")\\n")
+program.chmod(0o700)
+''')
+    _config(watch, prepare=["prepare-python-watch"] if prepared else [], audits=[{
+        "run": "pip-audit --skip-editable --format json", "format": "pip-audit", "cwd": "backend",
+    }])
+    temporary = watch.root / "python snapshots"
+    temporary.mkdir()
+    done = watch.shipline("dependency-watch", env={"TMPDIR": str(temporary)})
+    if prepared:
+        assert done.returncode == 0, done.stderr
+        created = _calls(watch, suffix="/pulls")
+        assert len(created) == 1
+        assert "PYSEC-2026-123" in created[0][2]["body"]
+        assert "backend/uv.lock" in created[0][2]["body"]
+    else:
+        assert done.returncode != 0
+        assert not _calls(watch)
+    assert not list(temporary.iterdir())
+
+
 def test_no_fix_is_reported_without_opening_a_ticket(watch: Workflow) -> None:
     _report(watch, fixed="<0.0.0")
     done = watch.shipline("dependency-watch")
