@@ -206,6 +206,33 @@ def test_resend_refuses_an_incomplete_redraw_before_pressing_enter(
     assert (notes / "ticket-7.typed").read_text() == "previous automation"
 
 
+@pytest.mark.parametrize("rule", ["", "─" * 40 + "\n"])
+@pytest.mark.parametrize("action", ["resend", "bridge-empty"])
+@pytest.mark.parametrize("addition", ["Owner addition", "? for shortcuts", "? for shortcuts 42% context left"])
+def test_legacy_input_readers_keep_every_owner_continuation_row(
+    workflow: Workflow, rule: str, action: str, addition: str
+) -> None:
+    workflow.add_worktree(7)
+    workflow.running("ticket-7")
+    notes = workflow.notes(7)
+    notes.mkdir(parents=True)
+    (notes / "ticket-7.idle").touch()
+    (notes / "ticket-7.limit").write_text("0\n")
+    (notes / "ticket-7.typed").write_text("previous automation")
+    first = "previous automation" if action == "resend" else ""
+    workflow.screen(rule + f"> {first}\n  {addition}\n", "ticket-7")
+
+    done = (
+        workflow.run("resend", "ticket-7")
+        if action == "resend"
+        else workflow.run_script("bridge-empty", "ticket-7")
+    )
+
+    assert done.returncode != 0
+    assert workflow.calls("tmux ticket-7 send-keys") == []
+    assert (notes / "ticket-7.typed").read_text() == "previous automation"
+
+
 @pytest.mark.parametrize("footer", ["rules", "inline"])
 def test_wake_last_line_stops_at_the_input_box_before_status_rules(
     workflow: Workflow, footer: str

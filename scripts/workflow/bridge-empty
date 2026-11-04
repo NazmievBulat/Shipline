@@ -12,10 +12,5 @@ else
   # An incomplete ruled box is not evidence that the bridge is empty.
   [[ $? == 1 ]] || exit 1
 fi
-top=$(strip_ansi <<<"$screen" | LC_ALL=C awk '
-  /^─/ { above = last; last = NR }
-  END { print above ? above : (last ? last : NR + 1) }
-')
-typed=$(LC_ALL=C sed -n "$((top + 1)),\$p" <<<"$screen" | LC_ALL=C sed -E $'/^(\\x1b\\[[0-?]*[ -/]*[@-~])*─/,$d' |
-  nonblank_input)
+typed=$(codex_input "$screen" false) || exit 1
 [[ -z $typed ]]

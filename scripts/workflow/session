@@ -1168,7 +1168,7 @@ protect_hunt() {
 # Sets limit to the name of the limit ("session limit"), resets to when it resets, as the
 # line says it, or to nothing, and typed to what stands in the box, or to nothing.
 stopped_on_limit() {
-  local screen whole top bottom framed ruled said after notes at limit_at
+  local screen whole top bottom framed rules said after notes at limit_at
   limit="" resets="" typed=""
   local target=$1
   if [[ -e $(worktree_of "$1")/$SHIPLINE_STATE_FOLDER/$1.codex ]]; then
@@ -1176,7 +1176,7 @@ stopped_on_limit() {
     codex_limit "$target" && return 0
   fi
   whole=$(tmux -L "$1" capture-pane -p -e -t "=$1:" 2>/dev/null) || return 1
-  read -r top bottom framed ruled < <(input_box_bounds <<<"$whole") || return 1
+  read -r top bottom framed rules < <(input_box_bounds <<<"$whole") || return 1
   if ((top == 0)); then
     top=$(strip_ansi <<<"$whole" | LC_ALL=C awk '
       /^─/ { above = last; last = NR }
@@ -1383,12 +1383,7 @@ read_prompt_box() {
   else
     [[ $? == 1 ]] || die "cannot find the input box of $name"
     [[ ${sending_resend:-false} == true ]] || die "cannot find the input box of $name"
-    local row
-    row=$(strip_ansi <<<"$screen" | LC_ALL=C awk '/^›|^>|^❯/ { row = NR } END { print row + 0 }')
-    typed=""
-    if ((row)); then
-      typed=$(LC_ALL=C sed "${row}s/›/>/" <<<"$screen" | nonblank_input "$row" "$row")
-    fi
+    typed=$(codex_input "$screen" false) || die "cannot find the input box of $name"
   fi
   # The separator after the prompt is decoration, including Claude's no-break space.
   typed=$(LC_ALL=C sed -E $'1s/^([[:blank:]]|\xc2\xa0)*//; s/[[:blank:]]+$//' <<<"$typed")
