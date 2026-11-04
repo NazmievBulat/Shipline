@@ -108,7 +108,7 @@ def _merge_error(
         + (f"{shlex.quote(sys.executable)} -c {shlex.quote(patch)} "
            f"{shlex.quote(str(workflow.state / 'github.json'))}\n" if changed_head else "")
         + 'touch "@STATE@/merge-response-lost"\n'
-        + ('exec sleep 600\n' if hang else "")
+        + ('exec /bin/sleep 600\n' if hang else "")
         + f"printf '%s\\n' {shlex.quote(_MERGE_502)} >&2\nexit 1\nfi\n"
         + 'if [[ "$1 $2" == "pr view" && -e "@STATE@/merge-response-lost" ]]; then\n'
         + 'echo "$3" >> "@STATE@/merge-readbacks"\nfi\n'
