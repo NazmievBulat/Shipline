@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from workflow_harness import SESSION_LINK, Workflow, instruction
+from workflow_harness import SCRIPTS, SESSION_LINK, Workflow, instruction
 
 _WORKER = instruction("Implement pull request 7")
 
@@ -97,6 +97,47 @@ def _real_scopes(workflow: Workflow) -> None:
     workflow.env["XDG_RUNTIME_DIR"] = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     workflow.env["WORKFLOW_CGROUP_ROOT"] = "/sys/fs/cgroup"
     workflow.env["WORKFLOW_PROC_ROOT"] = "/proc"
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_a_real_capture_keeps_owner_quotes_after_a_grey_prompt(
+    real_tmux: Workflow, native: bool
+) -> None:
+    rule = "─" * 40
+    mark = "›" if native else "❯"
+    owner_text = "> Continue checking example-app."
+    prompt = f"\x1b[90m{mark} \x1b[39m{owner_text}"
+    display = real_tmux.state / "display"
+    display.write_text(
+        f"Waiting.\n{prompt}\n\n  ? for shortcuts\n"
+        if native else f"{rule}\n{prompt}\n{rule}\n"
+    )
+    env = {**real_tmux.env, "WORKFLOW_DISPLAY": str(display)}
+    env.pop("TMUX", None)
+    subprocess.run(
+        [str(_TMUX), "-L", "example-app", "new-session", "-d", "-x", "120", "-y", "24",
+         "-s", "example-app", "bash", "-c", 'cat "$WORKFLOW_DISPLAY"; exec /bin/sleep 600'],
+        env=env, capture_output=True, text=True, check=True, timeout=5,
+    )
+    deadline = time.monotonic() + 5
+    while True:
+        captured = subprocess.run(
+            [str(_TMUX), "-L", "example-app", "capture-pane", "-p", "-e", "-t", "=example-app:"],
+            env=env, capture_output=True, text=True, check=True, timeout=5,
+        ).stdout
+        if owner_text in captured:
+            break
+        assert time.monotonic() < deadline, "the pane did not draw its input"
+        time.sleep(0.01)
+    reader = "codex_input" if native else "claude_input"
+
+    done = subprocess.run(
+        ["bash", "-c", f'source "$1"; {reader} "$(cat)"',
+         "bash", str(SCRIPTS / "input-box")],
+        input=captured, capture_output=True, text=True, check=True, timeout=5,
+    )
+
+    assert done.stdout.strip() == owner_text
 
 
 def test_a_cloud_launch_has_a_terminal_and_survives_its_panes_immediate_exit(

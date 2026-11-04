@@ -360,6 +360,79 @@ def test_box_input_retains_style_set_before_its_opening_rule(style: str, typed: 
     assert done.stdout.strip() == ("continue" if typed else "")
 
 
+@pytest.mark.parametrize("reader", ["claude_input", "codex_input"])
+@pytest.mark.parametrize("style", ["", "90", "2", "38;5;244"])
+@pytest.mark.parametrize("mark", [">", "❯"])
+def test_styled_prompt_prefix_preserves_the_owners_quote_mark(
+    reader: str, style: str, mark: str
+) -> None:
+    prefix = f"\x1b[{style}m{mark} \x1b[0m" if style else mark + " "
+    rule = "─" * 40
+    screen = f"{rule}\n{prefix}> Continue checking example-app.\n{rule}\n"
+    if reader == "codex_input":
+        screen = f"Waiting.\n{prefix}> Continue checking example-app.\n\n  ? for shortcuts\n"
+
+    done = subprocess.run(
+        ["bash", "-c", f'source "$1"; {reader} "$(cat)"',
+         "bash", str(SCRIPTS / "input-box")],
+        input=screen, capture_output=True, text=True, check=True,
+    )
+
+    assert done.stdout.strip() == "> Continue checking example-app."
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("style", ["", "90", "2"])
+@pytest.mark.parametrize("edited", [False, True])
+def test_retry_with_a_styled_prompt_submits_only_the_recorded_input(
+    workflow: Workflow, native: bool, style: str, edited: bool
+) -> None:
+    workflow.add_worktree(7, draft=False)
+    workflow.running("review-7")
+    notes = workflow.notes(7)
+    notes.mkdir(parents=True)
+    (notes / "review-7.idle").touch()
+    target = "codex-7" if native else "review-7"
+    prompt = "Continue checking example-app."
+    typed = ("> " if edited else "") + prompt
+    (notes / f"{target}.typed").write_text(prompt)
+    mark = "›" if native else "❯"
+    prefix = f"\x1b[{style}m{mark} \x1b[0m" if style else mark + " "
+    rule = "─" * 40
+    screen = f"Waiting.\n{rule}\n{prefix}{typed}\n{rule}\n"
+    if native:
+        workflow.running(target)
+        for marker in ("codex", "checks-wait", "bridge-stopped"):
+            (notes / f"review-7.{marker}").touch()
+        turn = '{"last-assistant-message":"Waiting for checks","turn-id":"one"}'
+        (notes / "review-7.codex-turn.json").write_text(turn)
+        (notes / "review-7.codex-delivered").write_text(turn)
+        workflow.screen(f"Done.\n{rule}\n> \n{rule}\n", "review-7")
+        screen = f"Waiting.\n{prefix}{typed}\n\n  ? for shortcuts\n"
+    workflow.screen(screen, target)
+    tmux = workflow.bin / "tmux"
+    tmux.write_text(tmux.read_text().replace(
+        '    cat "$screen"',
+        '    case " $* " in\n'
+        '      *" -e "*) cat "$screen" ;;\n'
+        "      *) sed -E 's/\\x1b\\[[0-?]*[ -/]*[@-~]//g' \"$screen\" ;;\n"
+        "    esac",
+    ))
+
+    done = workflow.run("checks-finished", "review-7", "a" * 40)
+
+    calls = workflow.calls(f"tmux {target} send-keys")
+    if edited:
+        assert done.returncode != 0
+        assert calls == []
+        assert (notes / f"{target}.typed").read_text() == prompt
+        assert (workflow.state / "screen" / target).read_text() == screen
+    else:
+        assert done.returncode == 0, done.stderr
+        assert calls == [f"tmux {target} send-keys -t ={target}: Enter"]
+        assert not (notes / f"{target}.typed").exists()
+
+
 @pytest.mark.parametrize("style", ["2", "90", "38;5;244", "38;2;153;153;153"])
 @pytest.mark.parametrize("typed", ["neither", "native", "bridge"])
 def test_a_codex_reviewer_wakes_through_decorations_but_never_through_typed_words(
