@@ -112,13 +112,39 @@ shadow=${SHIPLINE_SHADOW:-}
 [[ -n $shadow ]] || unset SHIPLINE_SHADOW_NOTES
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# The state folder and the labels (`workflow_config.py`), read once; priority.jq reads the
-# label names from SHIPLINE_CONFIG_JSON.
-config=$(python3 "$here/workflow_config.py" shell) || exit 1
-eval "$config"
-export SHIPLINE_CONFIG_JSON
-# The repository's main checkout, never the checkout these scripts are in.
-main=$SHIPLINE_REPO
+# Result reporting must survive a bad configuration. Ordinary check-ins still refuse it;
+# only the alarm path may recover the main checkout through Git and a prior valid folder.
+if [[ ${1:-} == --tick-result ]]; then
+  [[ -z $shadow ]] || exit 0
+  [[ $# == 3 && $2 =~ ^[0-9]+$ ]] || exit 2
+  case $2 in 129 | 130 | 143) exit 0 ;; esac
+fi
+config_loaded=1
+if [[ ${1:-} == --tick-result ]]; then
+  config=$(python3 "$here/workflow_config.py" shell 2>/dev/null) || config_loaded=0
+else
+  config=$(python3 "$here/workflow_config.py" shell) || exit 1
+fi
+if ((config_loaded)); then
+  eval "$config"
+  export SHIPLINE_CONFIG_JSON
+  main=$SHIPLINE_REPO
+else
+  # The same Git-common-directory parent used by workflow_config.main_checkout; never
+  # infer the repository from the folder these scripts are installed in.
+  common=$(git -C "${SHIPLINE_REPO:-.}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 1
+  main=$(dirname "$common")
+  SHIPLINE_STATE_FOLDER=.local/workflow
+  record=$common/shipline-alert-state-folder
+  cached_folder=""
+  # One NUL-terminated relative folder, never sourced or evaluated. Apply the same lexical
+  # checks as workflow_config._relative: no absolute path, parent part or checkout root.
+  if [[ -f $record && ! -L $record ]] && IFS= read -r -d '' cached_folder <"$record" &&
+      [[ -n $cached_folder && $cached_folder != /* && "/$cached_folder/" != *"/../"* &&
+         ! $cached_folder =~ ^([.]/|/)*[.]?$ ]]; then
+    SHIPLINE_STATE_FOLDER=$cached_folder
+  fi
+fi
 
 log() {
   printf '%s\n' "$@" >>"$LOG"
@@ -177,15 +203,27 @@ $message
 # precedes check-in pacing and GitHub reads: a broken GitHub read must not hide its alert.
 # The tick holds its lock through this call; the extra lock also serializes direct callers.
 if [[ ${1:-} == --tick-result ]]; then
-  [[ -z $shadow ]] || exit 0
-  [[ $# == 3 && $2 =~ ^[0-9]+$ ]] || exit 2
-  # The self-update watcher also leaves an interrupted tick uncounted.
-  case $2 in 129 | 130 | 143) exit 0 ;; esac
   notes=$main/$SHIPLINE_STATE_FOLDER
   mkdir -p "$notes" "$STATE"
   umask 077
   exec 8>"$notes/workflow-alert.lock"
   flock --timeout "$LIST_SECONDS" 8 || exit 1
+  if ((config_loaded)); then
+    # Preserve only the validated relative folder in private Git metadata. A cache failure
+    # must not prevent reporting this tick through the configuration we already read.
+    if common=$(git -C "$main" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+        context_tmp=$(mktemp "$common/shipline-alert-state-folder.XXXXXX" 2>/dev/null); then
+      if ! { printf '%s\0' "$SHIPLINE_STATE_FOLDER" >"$context_tmp" &&
+          mv -T -- "$context_tmp" "$common/shipline-alert-state-folder"; }; then
+        rm -f "$context_tmp"
+        log "  could not keep the alert state folder; result reporting continues"
+      fi
+    else
+      log "  could not keep the alert state folder; result reporting continues"
+    fi
+  else
+    log "  configuration could not be read; alert uses the last valid or default state folder: $SHIPLINE_STATE_FOLDER"
+  fi
   alert_files=()
   alert_lines=()
   untold_lines=()

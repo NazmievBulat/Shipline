@@ -212,7 +212,7 @@ tick_ended() {
   # Lock contention and the operator's stops are neither success nor failure, as in
   # self_update.py. Keep the tick lock through counting and delivery so the next real
   # tick cannot overtake this one's result.
-  if [[ -z $tick_skipped && -n ${main:-} ]] && ((status != 129 && status != 130 && status != 143)); then
+  if [[ -z $tick_skipped ]] && ((status != 129 && status != 130 && status != 143)); then
     bash "$here/wake" --tick-result "$status" "$error" 9>&- || true
   fi
   if [[ -n $tick_watched ]]; then
