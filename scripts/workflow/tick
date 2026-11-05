@@ -604,6 +604,11 @@ asks_owner() {
   local screen message top
   screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 0
   top=$(LC_ALL=C awk '/^─/ { above = last; last = NR } END { print above + 0 }' <<<"$screen")
+  if ((top == 0)) && [[ ${2:-} == after-reset ]]; then
+    # Resend also supports legacy limit prompts with zero or one rule. The last
+    # prompt begins that input; keep every earlier reply for the same question check.
+    top=$(LC_ALL=C awk '/^(>|❯)/ { prompt = NR } END { print prompt + 0 }' <<<"$screen")
+  fi
   ((top > 0)) || return 0
   message=$(LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" | LC_ALL=C awk '
     /^[[:space:]]*●/ { reply = "" }
@@ -892,7 +897,7 @@ retry_status() {
     ((shadow)) || rm -f "$retry"
     return 1
   fi
-  bash "$here/session" status-pending "$name" 9>&- || return 1
+  bash "$here/session" status-pending "$name" "${mode[@]}" 9>&- || return 1
   [[ $status_pending != *" $name "* ]] || return 0
   # Even an edited draft or a temporarily blocked recovery belongs to this path alone.
   # A checks wake, finish message or stuck nudge must not bypass its safety checks or bound.
@@ -900,7 +905,7 @@ retry_status() {
   status_pending+="$name "
   said_finished "$name" && return 0
   said_finished "$name" "review sent back" && return 0
-  asks_owner "$name" && return 0
+  asks_owner "$name" "${mode[@]}" && return 0
   bash "$here/session" would-retry-status "$name" "${mode[@]}" 9>&- || return 0
   identity=$(stat -c '%i:%y' "$typed_note" 9>&- | cksum) || { failed=1; return 0; }
   identity=${identity%% *}

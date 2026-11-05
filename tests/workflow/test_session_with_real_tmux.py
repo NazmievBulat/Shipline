@@ -186,10 +186,11 @@ def test_real_tmux_recovers_a_status_retained_after_submit_removed_wait_notes(
         "import os, sys, tty\nfrom pathlib import Path\n"
         "tty.setraw(sys.stdin.fileno())\ntext = ''\nenters = 0\n"
         "def draw():\n"
-        f"    sys.stdout.write('\\x1b[2J\\x1b[HRemote Control: {SESSION_LINK}\\r\\n' "
-        "+ '─' * 190 + '\\r\\n> ' + text + '\\r\\n' + '─' * 190 + '\\r\\n')\n"
+        "    sys.stdout.write('\\x1b[3;3H' + text + '\\x1b[K')\n"
         "    sys.stdout.flush()\n"
-        "draw()\nwhile True:\n"
+        f"sys.stdout.write('\\x1b[2J\\x1b[HRemote Control: {SESSION_LINK}\\r\\n' "
+        "+ '─' * 190 + '\\r\\n> \\r\\n' + '─' * 190 + '\\r\\n')\n"
+        "sys.stdout.flush()\nwhile True:\n"
         "    char = os.read(sys.stdin.fileno(), 1).decode()\n"
         "    if char in ('\\r', '\\n'):\n"
         "        enters += 1\n"
@@ -204,6 +205,18 @@ def test_real_tmux_recovers_a_status_retained_after_submit_removed_wait_notes(
     real_tmux.fake("claude", f"#!/bin/bash\nexec python3 {shlex.quote(str(terminal))}\n")
     started = real_tmux.run("start", "worker", "7")
     assert started.returncode == 0, started.stderr
+    # The session link can become visible before tmux finishes drawing the first box.
+    # Keep its rules fixed afterward: this test models retained Enters, not redraws.
+    deadline = time.monotonic() + 5
+    while True:
+        captured = subprocess.run(
+            [str(_TMUX), "-L", "ticket-7", "capture-pane", "-p", "-t", "=ticket-7:"],
+            env=real_tmux.env, capture_output=True, text=True, check=True, timeout=5,
+        ).stdout
+        if captured.count("─" * 190) == 2:
+            break
+        assert time.monotonic() < deadline, "the initial input box did not finish drawing"
+        time.sleep(0.01)
     (notes / "ticket-7.job-wait").touch()
 
     first = real_tmux.run("status-check", "ticket-7")

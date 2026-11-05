@@ -216,11 +216,17 @@ def test_a_fast_answer_to_recovery_does_not_mark_its_new_wait_kept_alive(
     assert _keys(workflow, "ticket-7") == ["Enter", _STATUS, "Enter"]
 
 
+def _status_limit_screen(rules: int) -> str:
+    box = _BOX if rules == 2 else ("─" * 40 + "\n" if rules else "") + "> \n"
+    return "  ⎿  You've hit your session limit · resets 4:10pm (America/New_York)\n" + box
+
+
+@pytest.mark.parametrize("rules", [0, 1, 2])
 @pytest.mark.parametrize("exhausted", [False, True])
 def test_a_usage_reset_keeps_the_same_status_retry_bound(
-    workflow: Workflow, exhausted: bool
+    workflow: Workflow, exhausted: bool, rules: int
 ) -> None:
-    from test_tick_limit import _at, _stopped
+    from test_tick_limit import _at
 
     now = int(_at(16, 10)["WORKFLOW_NOW"])
     notes = _session(workflow)
@@ -231,7 +237,9 @@ def test_a_usage_reset_keeps_the_same_status_retry_bound(
         for n in range(3):
             done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(now - 1800 + 180 * n)})
             assert done.returncode == 1
-    workflow.screen(_stopped("4:10pm (America/New_York)"), "ticket-7")
+    _written(notes.with_suffix(".idle"), now - 600)
+    notes.with_suffix(".limit").write_text(str(now))
+    workflow.screen(_status_limit_screen(rules), "ticket-7")
     _tick(workflow, now - 60)
     assert _keys(workflow, "ticket-7") == (["Enter"] * 3 if exhausted else [])
 
@@ -245,16 +253,20 @@ def test_a_usage_reset_keeps_the_same_status_retry_bound(
     ]
 
 
+@pytest.mark.parametrize("rules", [0, 1, 2])
 @pytest.mark.parametrize("shadow", [False, True])
 def test_status_delivery_after_reset_is_single_and_shadow_presses_nothing(
-    workflow: Workflow, shadow: bool
+    workflow: Workflow, shadow: bool, rules: int
 ) -> None:
-    from test_tick_limit import _at, _stopped
+    from test_tick_limit import _at
 
     notes = _session(workflow)
     notes.with_suffix(".typed").write_text(_STATUS)
     (workflow.state / "input-ticket-7").write_text(_STATUS)
-    workflow.screen(_stopped("4:10pm (America/New_York)"), "ticket-7")
+    now = int(_at(16, 10)["WORKFLOW_NOW"])
+    _written(notes.with_suffix(".idle"), now - 600)
+    notes.with_suffix(".limit").write_text(str(now))
+    workflow.screen(_status_limit_screen(rules), "ticket-7")
 
     for minute in (10, 13):
         done = workflow.run_script("tick", *(["--shadow"] if shadow else []), env=_at(16, minute))
@@ -262,6 +274,44 @@ def test_status_delivery_after_reset_is_single_and_shadow_presses_nothing(
 
     assert _keys(workflow, "ticket-7") == ([] if shadow else ["Enter"])
     assert notes.with_suffix(".typed").exists() == shadow
+
+
+@pytest.mark.parametrize("rules", [0, 1, 2])
+@pytest.mark.parametrize("text", ["Owner draft", _STATUS + " more", _STATUS + "\n  Owner addition"])
+def test_reset_status_recovery_keeps_owner_continuations(
+    workflow: Workflow, rules: int, text: str
+) -> None:
+    from test_tick_limit import _at
+
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    _written(notes.with_suffix(".idle"), _NOW)
+    notes.with_suffix(".limit").write_text(_at(16, 10)["WORKFLOW_NOW"])
+    (workflow.state / "input-ticket-7").write_text(text)
+    workflow.screen(_status_limit_screen(rules), "ticket-7")
+
+    done = workflow.run_script("tick", env=_at(16, 10))
+
+    assert done.returncode == 0, done.stderr
+    assert _keys(workflow, "ticket-7") == []
+    assert (workflow.state / "input-ticket-7").read_text() == text
+
+
+@pytest.mark.parametrize("rules", [0, 1, 2])
+def test_reset_status_recovery_keeps_unnoted_owner_questions(workflow: Workflow, rules: int) -> None:
+    from test_tick_limit import _at
+
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    _written(notes.with_suffix(".idle"), _NOW)
+    notes.with_suffix(".limit").write_text(_at(16, 10)["WORKFLOW_NOW"])
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    workflow.screen("● Reply 1 or 2.\n" + _status_limit_screen(rules), "ticket-7")
+
+    done = workflow.run_script("tick", env=_at(16, 10))
+
+    assert done.returncode == 0, done.stderr
+    assert _keys(workflow, "ticket-7") == []
 
 
 def test_escape_restoring_own_status_is_recovered_on_the_next_tick(workflow: Workflow) -> None:
