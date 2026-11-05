@@ -63,8 +63,8 @@ def _repair_step(workflow: Workflow, *command: str) -> subprocess.CompletedProce
 def test_empty_branch_is_repaired_and_only_empty_objects_are_quarantined(workflow: Workflow) -> None:
     kept = workflow.git("commit-tree", workflow.git("rev-parse", "main^{tree}"),
                         "-p", "main", "-m", "feat: kept history")
-    workflow.git("update-ref", "refs/heads/kept", kept)
-    workflow.git("update-ref", "refs/heads/kept", workflow.git("rev-parse", "main"))
+    workflow.git("update-ref", "-m", "kept history", "refs/heads/kept", kept)
+    workflow.git("update-ref", "-m", "returned to main", "refs/heads/kept", workflow.git("rev-parse", "main"))
     kept_log = workflow.repo / ".git/logs/refs/heads/kept"
     old_entries = []
     for row in kept_log.read_bytes().splitlines(keepends=True):
