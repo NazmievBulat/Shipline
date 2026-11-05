@@ -238,7 +238,7 @@ def test_a_usage_reset_keeps_the_same_status_retry_bound(
             done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(now - 1800 + 180 * n)})
             assert done.returncode == 1
     _written(notes.with_suffix(".idle"), now - 600)
-    notes.with_suffix(".limit").write_text(str(now))
+    notes.with_suffix(".limit").write_text(f"{now}\n")
     workflow.screen(_status_limit_screen(rules), "ticket-7")
     _tick(workflow, now - 60)
     assert _keys(workflow, "ticket-7") == (["Enter"] * 3 if exhausted else [])
@@ -265,7 +265,7 @@ def test_status_delivery_after_reset_is_single_and_shadow_presses_nothing(
     (workflow.state / "input-ticket-7").write_text(_STATUS)
     now = int(_at(16, 10)["WORKFLOW_NOW"])
     _written(notes.with_suffix(".idle"), now - 600)
-    notes.with_suffix(".limit").write_text(str(now))
+    notes.with_suffix(".limit").write_text(f"{now}\n")
     workflow.screen(_status_limit_screen(rules), "ticket-7")
 
     for minute in (10, 13):
@@ -286,7 +286,7 @@ def test_reset_status_recovery_keeps_owner_continuations(
     notes = _session(workflow)
     notes.with_suffix(".typed").write_text(_STATUS)
     _written(notes.with_suffix(".idle"), _NOW)
-    notes.with_suffix(".limit").write_text(_at(16, 10)["WORKFLOW_NOW"])
+    notes.with_suffix(".limit").write_text(_at(16, 10)["WORKFLOW_NOW"] + "\n")
     (workflow.state / "input-ticket-7").write_text(text)
     workflow.screen(_status_limit_screen(rules), "ticket-7")
 
@@ -304,7 +304,7 @@ def test_reset_status_recovery_keeps_unnoted_owner_questions(workflow: Workflow,
     notes = _session(workflow)
     notes.with_suffix(".typed").write_text(_STATUS)
     _written(notes.with_suffix(".idle"), _NOW)
-    notes.with_suffix(".limit").write_text(_at(16, 10)["WORKFLOW_NOW"])
+    notes.with_suffix(".limit").write_text(_at(16, 10)["WORKFLOW_NOW"] + "\n")
     (workflow.state / "input-ticket-7").write_text(_STATUS)
     workflow.screen("● Reply 1 or 2.\n" + _status_limit_screen(rules), "ticket-7")
 
