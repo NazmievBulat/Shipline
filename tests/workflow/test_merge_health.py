@@ -5,8 +5,120 @@ import json
 import subprocess
 from copy import deepcopy
 from typing import Any
+from pathlib import Path
 
 import pytest
+from workflow_harness import Workflow
+
+
+def _empty_branch(workflow: Workflow, *, pushed: bool = True) -> tuple[str, Path]:
+    base = workflow.git("rev-parse", "main")
+    if pushed:
+        workflow.git("push", "--quiet", "origin", "main:repair")
+    head = workflow.git("commit-tree", workflow.git("rev-parse", "main^{tree}"),
+                        "-p", base, "-m", "fix: interrupted write")
+    workflow.git("update-ref", "refs/heads/repair", head)
+    path = workflow.repo / ".git/objects" / head[:2] / head[2:]
+    path.write_bytes(b"")
+    return head, path
+
+
+def _repair_step(workflow: Workflow, *command: str) -> subprocess.CompletedProcess[str]:
+    return workflow.run_python(
+        "merge_health.py", "--repair-step", str(workflow.repo),
+        str(workflow.repo / ".local/workflow"), str(workflow.state / "repair-attempt"),
+        *(command or ("git", "fetch", "origin", "main")),
+    )
+
+
+def test_empty_branch_is_repaired_and_only_empty_objects_are_quarantined(workflow: Workflow) -> None:
+    head, empty = _empty_branch(workflow)
+    objects = workflow.repo / ".git/objects"
+    before = {path: path.read_bytes() for path in objects.glob("??/*") if path.stat().st_size}
+    done = _repair_step(workflow)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not empty.exists()
+    assert workflow.git("rev-parse", "repair") == workflow.git("rev-parse", "origin/repair")
+    saved = list((workflow.repo / ".local/workflow/git-repairs").glob(f"*/objects/{head[:2]}/{head[2:]}"))
+    assert len(saved) == 1 and saved[0].read_bytes() == b""
+    assert all(path.read_bytes() == content for path, content in before.items())
+    assert head not in (workflow.repo / ".git/logs/refs/heads/repair").read_text()
+    assert "refs/heads/repair -> refs/remotes/origin/repair" in done.stderr
+
+
+def test_repair_names_an_unpushed_branch_without_moving_it(workflow: Workflow) -> None:
+    head, empty = _empty_branch(workflow, pushed=False)
+    done = _repair_step(workflow)
+    assert done.returncode != 0
+    assert workflow.git("rev-parse", "repair") == head
+    assert not empty.exists()
+    assert "refs/heads/repair" in done.stderr and "no usable pushed head" in done.stderr
+    assert "could not finish" in done.stderr
+
+
+def test_a_healthy_read_and_an_unrelated_failure_run_no_repair(workflow: Workflow) -> None:
+    assert _repair_step(workflow).returncode == 0
+    assert _repair_step(workflow, "git", "show", "unknown-ref").returncode != 0
+    assert not (workflow.state / "repair-attempt").exists()
+    assert not (workflow.repo / ".local/workflow/git-repairs").exists()
+
+
+def test_repair_never_writes_while_the_merge_lock_is_held(workflow: Workflow) -> None:
+    _, empty = _empty_branch(workflow)
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "merge.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        done = _repair_step(workflow)
+    assert done.returncode != 0
+    assert empty.exists()
+    assert "merge lock" in done.stderr
+
+
+def test_a_failed_repair_is_reported_once_per_stretch(workflow: Workflow) -> None:
+    _empty_branch(workflow, pushed=False)
+    _repair_step(workflow)
+    folder = workflow.repo / ".local/workflow/git-repair.pending"
+    events = {path.name: path.read_bytes() for path in folder.glob("*.json")}
+    assert len(events) == 1
+    (workflow.state / "repair-attempt").unlink()
+    _repair_step(workflow)
+    assert {path.name: path.read_bytes() for path in folder.glob("*.json")} == events
+
+
+def test_repair_rebuilds_only_a_broken_worktree_cache_tree_and_keeps_changes(workflow: Workflow) -> None:
+    worktree = workflow.add_worktree(7)
+    source = worktree / "example.txt"
+    source.write_text("committed\n")
+    workflow.git("add", "example.txt", cwd=worktree)
+    workflow.git("commit", "--quiet", "-m", "feat: example", cwd=worktree)
+    workflow.git("push", "--quiet", "origin", workflow.branch(7), cwd=worktree)
+    workflow.git("fetch", "--quiet", "origin")
+    source.write_text("uncommitted\n")
+    # A staged tree not reachable from a commit, as an interrupted commit can leave it.
+    workflow.git("add", "example.txt", cwd=worktree)
+    tree = workflow.git("write-tree", cwd=worktree)
+    source.write_text("uncommitted and unstaged\n")
+    object_file = workflow.repo / ".git/objects" / tree[:2] / tree[2:]
+    object_file.write_bytes(b"")
+    _empty_branch(workflow)
+    done = _repair_step(workflow)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert source.read_text() == "uncommitted and unstaged\n"
+    assert "example.txt" in workflow.git("diff", "--name-only", cwd=worktree)
+    assert workflow.git("diff", "--cached", "--name-only", cwd=worktree) == ""
+    assert "rebuilt index .claude/worktrees/ticket-7" in done.stderr
+
+
+def test_repair_is_attempted_at_most_once_for_a_tick(workflow: Workflow) -> None:
+    _empty_branch(workflow, pushed=False)
+    _repair_step(workflow)
+    objects = workflow.repo / ".git/objects/ab"
+    objects.mkdir(exist_ok=True)
+    second = objects / ("c" * 38)
+    second.write_bytes(b"")
+    assert _repair_step(workflow).returncode != 0
+    assert second.exists()
 
 from workflow.merge_gate_fixtures import (
     GitHub,
