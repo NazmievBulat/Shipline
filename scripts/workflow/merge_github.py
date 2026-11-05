@@ -99,6 +99,7 @@ def repository_command(
         MachineWaiting,
         PackagesWaiting,
         Refused,
+        TimedOut,
         Waiting,
         command,
         machine_error,
@@ -112,6 +113,13 @@ def repository_command(
         return None
     try:
         done = command(*words, *args, check=False, input=input or "", errors=errors)
+    except TimedOut as error:
+        if (
+            name != "push_checkout" or len(args) != 2 or args[0] != "install"
+            or not machine_error(error.output, Path(args[1]))
+        ):
+            raise
+        done = subprocess.CompletedProcess([], 124, error.output, "")
     except OSError as error:
         raise Refused(
             f"cannot run the repository's {name} command, {shlex.join(words)}: {error}"

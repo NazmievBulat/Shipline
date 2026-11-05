@@ -546,33 +546,48 @@ def note_github_server_errors(folder: Path) -> None:
     write_json(marker, notice)
 
 
+@contextmanager
+def _machine_errors_lock(folder: Path) -> Iterator[None]:
+    # Restack pushes hold a start lock rather than merge.lock. All callers serialize this
+    # state independently, without trying to take a merge lock they may already hold.
+    folder.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(folder / "machine-errors.lock", os.O_CREAT | os.O_RDWR, 0o600), "r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def note_machine_result(folder: Path, error: str | None) -> None:
-    # Callers hold merge.lock. One outage covers all pull requests and local commands.
-    # A successful command cannot clear a failure from another command in the same tick.
-    marker = folder / "machine-errors"
-    tick = os.environ.get("WORKFLOW_MACHINE_ERROR_TICK", "")
-    if error is not None:
-        if marker.exists():
-            notice = json.loads(marker.read_text())
-        else:
-            notice = {"line": f"Machine error: {error}; gate commands wait"}
-            write_json(folder / "stuck.pending" / f"machine-errors-{uuid.uuid4().hex}.json", notice)
-        write_json(marker, {**notice, "tick": tick, "event": uuid.uuid4().hex})
-    elif tick and marker.exists():
-        observed = json.loads(marker.read_text())
-        write_json(folder / "machine-errors-checked", {"tick": tick, "event": observed["event"]})
+    # One outage covers all pull requests and local commands. A successful command cannot
+    # clear a failure from another command in the same tick.
+    with _machine_errors_lock(folder):
+        marker = folder / "machine-errors"
+        tick = os.environ.get("WORKFLOW_MACHINE_ERROR_TICK", "")
+        if error is not None:
+            if marker.exists():
+                notice = json.loads(marker.read_text())
+            else:
+                notice = {"line": f"Machine error: {error}; gate commands wait"}
+                write_json(folder / "stuck.pending" / f"machine-errors-{uuid.uuid4().hex}.json", notice)
+            write_json(marker, {**notice, "tick": tick, "event": uuid.uuid4().hex})
+        elif tick and marker.exists():
+            observed = json.loads(marker.read_text())
+            write_json(folder / "machine-errors-checked", {"tick": tick, "event": observed["event"]})
 
 
 def finish_machine_error_tick(folder: Path, tick: str) -> None:
-    marker = folder / "machine-errors"
-    checked = folder / "machine-errors-checked"
-    if marker.exists() and checked.exists():
+    with _machine_errors_lock(folder):
+        marker = folder / "machine-errors"
+        checked = folder / "machine-errors-checked"
+        if not checked.exists():
+            return
         observed = json.loads(checked.read_text())
-        active = json.loads(marker.read_text())
-        if (observed["tick"] == tick and active["tick"] != tick
-                and observed["event"] == active["event"]):
-            marker.unlink()
-    checked.unlink(missing_ok=True)
+        if observed["tick"] != tick:
+            return
+        if marker.exists():
+            active = json.loads(marker.read_text())
+            if active["tick"] != tick and observed["event"] == active["event"]:
+                marker.unlink()
+        checked.unlink(missing_ok=True)
 
 
 def _push_refreshed(

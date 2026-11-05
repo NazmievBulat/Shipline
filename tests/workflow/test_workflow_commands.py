@@ -11,8 +11,10 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import suppress
 from pathlib import Path
+from threading import Event
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -166,12 +168,50 @@ def test_machine_notice_rearms_only_after_an_observed_clean_tick(
     assert marker.exists()  # a newer direct failure cannot be cleared by an older pass
     monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "fourth")
     gate.note_machine_result(tmp_path, None)
+    gate.finish_machine_error_tick(tmp_path, "another-driver")
+    assert marker.exists()
     gate.finish_machine_error_tick(tmp_path, "fourth")
     assert not marker.exists()
     monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "fifth")
     gate.note_machine_result(tmp_path, "No space left on device; free disk space")
     assert len(list(notices.glob("*.json"))) == 2
     assert all(path.stat().st_mode & 0o077 == 0 for path in notices.glob("*.json"))
+
+
+def test_a_handoff_and_restack_machine_error_queue_one_notice(
+    gate: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered, release = Event(), Event()
+    write = gate.write_json
+
+    def pause_first_notice(path: Path, value: object) -> None:
+        if path.parent.name == "stuck.pending" and not entered.is_set():
+            entered.set()
+            assert release.wait(10), "first notice was not released"
+        write(path, value)
+
+    monkeypatch.setattr(gate, "write_json", pause_first_notice)
+
+    def handoff() -> None:
+        with (tmp_path / "merge.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(handoff)
+        try:
+            assert entered.wait(10), "first notice was not attempted"
+            # A restack owns its own start lock, without merge.lock.
+            second = pool.submit(gate.note_machine_result, tmp_path,
+                                 "No space left on device; free disk space")
+            with suppress(FutureTimeout):
+                second.result(timeout=1)
+        finally:
+            release.set()
+        first.result(timeout=10)
+        second.result(timeout=10)
+    assert len(list((tmp_path / "stuck.pending").glob("*.json"))) == 1
+    assert (tmp_path / "machine-errors.lock").stat().st_mode & 0o077 == 0
 
 
 @pytest.mark.parametrize("error", _SERVER_ERRORS)

@@ -194,6 +194,33 @@ def test_checkout_machine_errors_keep_the_handoff_and_reach_the_wake(
     assert "\n".join(workflow.sent()).count("Machine error: OSError: Read-only file system") == 1
 
 
+def test_checkout_machine_output_before_a_deadline_keeps_the_handoff(handed: GitHub) -> None:
+    from workflow.test_commands import _configure, _gate
+
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    _configure(workflow, push_checkout="example-checkout")
+    workflow.fake("example-checkout", "#!/bin/bash\n"
+                  "echo 'OSError: No space left on device' >&2\nexec /bin/sleep 30\n")
+    before = _note(workflow).read_bytes()
+    done = _gate(workflow, """
+        g.COMMAND_TIMEOUT = 5
+        sys.argv = ['merge-when-current', '--drive', '7']
+        sys.exit(g.main())
+    """, cwd=workflow.worktree(7))
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "merge waiting: OSError: No space left on device" in done.stderr
+    assert _note(workflow).read_bytes() == before
+    assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
+    assert _started(workflow) == []
+    workflow.fake("example-checkout", "#!/bin/bash\nexit 0\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert json.loads(_note(workflow).read_text())["head"] != handed.head
+    assert _started(workflow) == []
+    assert not (_folder(workflow) / "machine-errors").exists()
+
+
 def test_the_tick_drives_a_red_main_fix_handed_off_behind_another_pull(handed: GitHub) -> None:
     workflow = handed.workflow
     second = workflow.worktree(8)
