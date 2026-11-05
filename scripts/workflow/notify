@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rings the owner's phone when a workflow session is blocked on him, and only then.
+# Rings the owner's phone for blocked sessions and persistent workflow faults.
 #
 # Called by four hooks in `~/.claude/settings.json` (`install-hooks` adds them), with the
 # hook's JSON on standard input:
@@ -20,7 +20,8 @@
 #                       waiting, so the tick can wake it when its checks finish, and every
 #                       session notes when it began to wait, so the tick can keep its cache
 #
-# It does nothing unless WORKFLOW_SESSION names a worker (`ticket-N`), an audit (`audit-N`) or
+# `notify workflow` reads a persistent workflow fault from stdin, without WORKFLOW_SESSION.
+# Other modes do nothing unless WORKFLOW_SESSION names a worker (`ticket-N`), an audit (`audit-N`) or
 # a hunt (`hunt-<name>`), so the orchestrator and sessions started by hand never ring. A hook must never block or fail
 # a session: this always exits 0, prints nothing, and gives GitHub and Pushover a few seconds
 # each.
@@ -38,6 +39,66 @@ KEYS_FILE=$HOME/agents/.env
 MISSED_LOG=$HOME/.local/state/workflow/missed-pushes.log
 # The line a session ends with, WORDS standing for its words. `tick` reads it the same way.
 FINISHED_LINE='^[[:space:]]*(●|[*-])?[[:space:]]*[*_]*WORDS[.!]?[*_]*[[:space:]]*$'
+
+# Reads one key from the owner's file. The file is read, never run.
+key() {
+  local value
+  value=$(sed -n "s/^\(export \)\{0,1\}$1=//p" "$KEYS_FILE" 2>/dev/null | tail -n 1)
+  value=${value#[\"\']}
+  value=${value%[\"\']}
+  [[ $value =~ ^[A-Za-z0-9]+$ ]] && echo "$value"
+}
+
+# Sends the push. The keys go to `curl` on its standard input and the rest in files, so none
+# of it shows in the list of running programs.
+send() {
+  local title=$1 message=$2 link=$3 token user parts sent=1
+  local -a with_link=()
+  token=$(key PUSHOVER_TOKEN) && user=$(key PUSHOVER_USER) || return 1
+  parts=$(mktemp -d) || return 1
+  printf '%s' "$title" >"$parts/title"
+  printf '%s' "$message" >"$parts/message"
+  if [[ -n $link ]]; then
+    printf '%s' "$link" >"$parts/url"
+    with_link=(--data-urlencode "url@$parts/url")
+  fi
+  timeout "$ANSWER_SECONDS" curl --silent --fail --max-time "$ANSWER_SECONDS" --config - \
+    --data-urlencode "title@$parts/title" \
+    --data-urlencode "message@$parts/message" \
+    "${with_link[@]}" \
+    "$PUSHOVER" <<EOF && sent=0
+data-urlencode = "token=$token"
+data-urlencode = "user=$user"
+EOF
+  rm -rf "$parts"
+  return "$sent"
+}
+
+# A push that could not be sent is written down for the owner to find.
+push_or_log() {
+  local title=$1 message=$2 link=$3
+  send "$title" "$message" "$link" && return 0
+  mkdir -p "$(dirname "$MISSED_LOG")"
+  echo "$(date '+%Y-%m-%d %H:%M:%S')  $title  ${message//$'\n'/ }  $link" >>"$MISSED_LOG"
+  return 1
+}
+
+# Rings the phone for a session.
+ring() {
+  local message=$1 title="$name needs you" link=""
+  [[ -n $message ]] || message="The session stopped without a message."
+  [[ ! -r $notes/$name.url ]] || read -r link <"$notes/$name.url" || true
+  push_or_log "$title" "$message" "$link"
+}
+
+# Persistent workflow faults are reported by the tick, independently of any session or
+# its worktree. Do not read config here: a broken config may be what stopped the tick.
+if [[ ${1:-} == workflow ]]; then
+  exec >/dev/null 2>&1
+  message=$(cat)
+  [[ -z $message ]] || push_or_log "Workflow needs you" "$message" "" || true
+  exit 0
+fi
 
 name=${WORKFLOW_SESSION:-}
 [[ $name =~ ^((ticket|audit|review|cloud)-[0-9]+|hunt-[a-z0-9][a-z0-9-]*)$ ]] || exit 0
@@ -107,51 +168,6 @@ beginning_of() {
 note() {
   [[ -d $worktree ]] || return 1
   mkdir -p "$notes" && printf '%s\n' "$2" >"$1"
-}
-
-# Reads one key from the owner's file. The file is read, never run.
-key() {
-  local value
-  value=$(sed -n "s/^\(export \)\{0,1\}$1=//p" "$KEYS_FILE" 2>/dev/null | tail -n 1)
-  value=${value#[\"\']}
-  value=${value%[\"\']}
-  [[ $value =~ ^[A-Za-z0-9]+$ ]] && echo "$value"
-}
-
-# Sends the push. The keys go to `curl` on its standard input and the rest in files, so none
-# of it shows in the list of running programs.
-send() {
-  local title=$1 message=$2 link=$3 token user parts sent=1
-  local -a with_link=()
-  token=$(key PUSHOVER_TOKEN) && user=$(key PUSHOVER_USER) || return 1
-  parts=$(mktemp -d) || return 1
-  printf '%s' "$title" >"$parts/title"
-  printf '%s' "$message" >"$parts/message"
-  if [[ -n $link ]]; then
-    printf '%s' "$link" >"$parts/url"
-    with_link=(--data-urlencode "url@$parts/url")
-  fi
-  timeout "$ANSWER_SECONDS" curl --silent --fail --max-time "$ANSWER_SECONDS" --config - \
-    --data-urlencode "title@$parts/title" \
-    --data-urlencode "message@$parts/message" \
-    "${with_link[@]}" \
-    "$PUSHOVER" <<EOF && sent=0
-data-urlencode = "token=$token"
-data-urlencode = "user=$user"
-EOF
-  rm -rf "$parts"
-  return "$sent"
-}
-
-# Rings the phone. A push that could not be sent is written down for the owner to find.
-ring() {
-  local message=$1 title="$name needs you" link=""
-  [[ -n $message ]] || message="The session stopped without a message."
-  [[ ! -r $notes/$name.url ]] || read -r link <"$notes/$name.url" || true
-  send "$title" "$message" "$link" && return 0
-  mkdir -p "$(dirname "$MISSED_LOG")"
-  echo "$(date '+%Y-%m-%d %H:%M:%S')  $title  ${message//$'\n'/ }  $link" >>"$MISSED_LOG"
-  return 1
 }
 
 # A session is blocked unless the last line of its last message says its words: "worker

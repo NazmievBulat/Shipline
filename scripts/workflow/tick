@@ -189,8 +189,27 @@ if ((shadow == 0)); then
     exec 7>&2 2> >(python3 -B "$here/self_update.py" watch "$$" 2>&7 >&7 7>&-)
   fi
 fi
+tick_errors=""
+tick_error_reader=""
+if ((shadow == 0)); then
+  tick_errors=$(mktemp)
+  exec 6>&2 2> >(tee "$tick_errors" >&6)
+  tick_error_reader=$!
+fi
 tick_ended() {
+  local status=$1 error=""
   ((shadow == 0)) || return 0
+  if [[ -n $tick_error_reader ]]; then
+    exec 2>&6 6>&-
+    wait "$tick_error_reader" || true
+    IFS= read -r -n 300 error <"$tick_errors" || true
+    rm -f "$tick_errors"
+  fi
+  # Lock contention is neither success nor failure. Keep the tick lock through counting
+  # and delivery so the next real tick cannot overtake this one's result.
+  if [[ -z $tick_skipped && -n ${main:-} ]]; then
+    bash "$here/wake" --tick-result "$status" "$error" 9>&- || true
+  fi
   if [[ -n $tick_watched ]]; then
     # Everything printed before this line was read; what follows goes straight out. A watch
     # that is gone must not end the tick before its end is counted.

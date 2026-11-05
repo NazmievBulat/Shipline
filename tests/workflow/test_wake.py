@@ -1222,10 +1222,12 @@ def test_three_failed_ticks_without_an_orchestrator_ring_once(
     keys = night.root / "home/agents/.env"
     keys.parent.mkdir(exist_ok=True)
     keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    night.orchestrator("idle", name="available")
     folder = night.repo / ".local/workflow"
-    folder.mkdir(parents=True, exist_ok=True)
     (folder / "main-status").write_text("main: green\n")
-    if registration != "missing":
+    if registration == "missing":
+        (folder / "orchestrator").unlink()
+    else:
         (folder / "orchestrator").write_text("" if registration == "empty" else "closed\n")
     error = "fatal: cannot fetch main\nMore detail that must not ring."
     for _ in range(2):
@@ -1258,6 +1260,24 @@ def test_persistent_failure_tells_the_open_orchestrator_without_a_phone_push(
     [message] = night.sent()
     assert "fatal: cannot fetch main" in message
     assert night.pushes() == []
+    assert not night.missed_pushes.exists()
+
+
+def test_losing_the_orchestrator_during_a_failure_stretch_still_rings(night: Workflow) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = night.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    night.orchestrator("busy")
+    for _ in range(3):
+        night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    assert len(night.sent()) == 1
+    assert night.pushes() == []
+    (night.state / "agents.json").write_text("[]")
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    assert len(night.pushes()) == 1
 
 
 def test_unknown_main_has_its_own_stretch_and_readable_main_resets_it(night: Workflow) -> None:
@@ -1292,3 +1312,30 @@ def test_shadow_result_neither_counts_nor_rings(night: Workflow) -> None:
     assert night.pushes() == []
     assert not (night.repo / ".local/workflow/tick-failures").exists()
     assert night.sent() == []
+
+
+
+def test_a_missed_phone_push_is_logged_once_per_stretch(night: Workflow) -> None:
+    for _ in range(4):
+        done = night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+        assert done.returncode == 0, done.stderr
+    assert night.pushes() == []
+    [line] = night.missed_pushes.read_text().splitlines()
+    assert "Workflow needs you" in line
+    assert "cannot fetch main" in line
+    assert "orchestrator" in line
+
+
+def test_an_undelivered_alert_to_an_open_orchestrator_is_retried(night: Workflow) -> None:
+    night.orchestrator("busy")
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    (night.state / "send-fails").touch()
+    failed = night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    assert failed.returncode == 1
+    (night.state / "send-fails").unlink()
+    delivered = night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    assert delivered.returncode == 0, delivered.stderr
+    assert len(night.sent()) == 2
+    assert night.pushes() == []
+    assert not night.missed_pushes.exists()

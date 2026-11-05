@@ -1774,6 +1774,9 @@ def test_failed_tick_alert_survives_early_exit_and_skips_overlapping_ticks(workf
     with lock.open("w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         assert workflow.run_script("tick").returncode == 0
+    shadow = workflow.run_script("tick", "--shadow")
+    assert shadow.returncode != 0
+    assert workflow.pushes() == []
     third = workflow.run_script("tick")
     assert third.returncode != 0
     [push] = workflow.pushes()
