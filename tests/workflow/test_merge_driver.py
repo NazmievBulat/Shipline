@@ -111,17 +111,20 @@ def test_machine_checks_keep_the_handoff_on_repeated_ticks_and_then_merge(
     assert not (_folder(workflow) / "machine-errors").exists()
 
 
-@pytest.mark.parametrize("output", [
-    _PYTEST_OWNERSHIP + "\nFAILED tests/test_example.py::test_example - assertion failed",
-    "inventory is stale",
+@pytest.mark.parametrize("output,code", [
+    (_PYTEST_OWNERSHIP + "\nFAILED tests/test_example.py::test_example - assertion failed", 1),
+    (_PYTEST_OWNERSHIP + "\nFAILED tests/test_example.py::test_example - assertion failed", 75),
+    ("inventory is stale", 1),
 ])
-def test_a_local_test_or_inventory_failure_still_hands_back(handed: GitHub, output: str) -> None:
+def test_a_local_test_or_inventory_failure_still_hands_back(
+    handed: GitHub, output: str, code: int,
+) -> None:
     workflow = handed.workflow
     # Test names on stdout must win over machine diagnostics on stderr.
     workflow.fake("pre-train-checks", "#!/bin/bash\n"
                   + f"printf '%s\\n' {shlex.quote(output)}\n"
                   + f"printf '%s\\n' {shlex.quote(_PYTEST_OWNERSHIP if 'FAILED' in output else '')} >&2\n"
-                  + "exit 1\n")
+                  + f"exit {code}\n")
     done = workflow.run_script("tick")
     assert done.returncode == 0, done.stdout + done.stderr
     assert not _note(workflow).exists()
@@ -147,6 +150,24 @@ def test_refresh_push_machine_errors_retry_without_spending_the_three_attempts(h
     assert done.returncode == 0, done.stdout + done.stderr
     assert json.loads(_note(workflow).read_text())["head"] != handed.head
     assert _started(workflow) == []
+    assert not (_folder(workflow) / "machine-errors").exists()
+
+
+def test_a_named_failing_test_in_a_refresh_push_still_hands_back(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    workflow.fake("git", '''#!/bin/bash
+if [[ $1 == push ]]; then
+  echo 'OSError: No space left on device'
+  echo 'FAILED tests/test_example.py::test_example - assertion failed'
+  exit 1
+fi
+exec /usr/bin/git "$@"
+''')
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
     assert not (_folder(workflow) / "machine-errors").exists()
 
 

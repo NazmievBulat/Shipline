@@ -42,6 +42,10 @@ class PushWaiting(Waiting):
     commit it made for the push."""
 
 
+class MachineWaiting(PushWaiting):
+    """A local machine error found nothing wrong with the branch; retry next tick."""
+
+
 class ServiceWaiting(PushWaiting):
     """The pre-push scan could not reach a package advisory service."""
 
@@ -201,6 +205,7 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     a scan that could not reach an advisory service after its own tries, is a wait."""
     from merge_gate import (
         CONFIG,
+        MachineWaiting,
         PUSH_RETRY_SECONDS,
         PackagesWaiting,
         Pushed,
@@ -209,6 +214,8 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         command,
         git,
         main_checkout,
+        machine_error,
+        note_machine_result,
         note_service_down,
         note_service_up,
         push_failure,
@@ -219,10 +226,15 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     )
 
     checkout = where or Path.cwd()
+    folder = main_checkout() / CONFIG.state_folder
     if CONFIG.command("push_checkout") is not None:
         checkout = Path(git("-C", str(checkout), "rev-parse", "--show-toplevel"))
         installed = repository_command("push_checkout", "install", str(checkout))
         if installed and installed.returncode:
+            error = machine_error(installed.stdout + "\n" + installed.stderr, checkout)
+            note_machine_result(folder, error)
+            if error:
+                raise MachineWaiting(error)
             raise PackagesWaiting(said(installed))
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
     merged = ("env", "EIO_BACKEND=posix", "sh", "-c", 'exec "$@" 2>&1', "push", *git_args)
@@ -231,6 +243,10 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         command("sleep", str(PUSH_RETRY_SECONDS))
         done, timeout = _push_once(merged)
     output = done.stdout
+    error = machine_error(output, checkout) if done.returncode else None
+    note_machine_result(folder, error)
+    if error:
+        raise MachineWaiting(error)
     pushed = Pushed(
         done.returncode,
         output,
@@ -239,7 +255,6 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     )
     if CONFIG.command("advisory_watch") is None:
         return pushed
-    folder = main_checkout() / CONFIG.state_folder
     # A scan stopped at the deadline never concluded that a service was out.
     service = (
         unreachable_service(output) if pushed.returncode and not pushed.timed_out else None

@@ -308,6 +308,50 @@ def run(
 _HTTP_STATUS = r"(?:HTTP(?:/\d(?:\.\d)?)?|returned error:|non-200 OK status code:)\s+"
 
 
+def named_test_failure(output: str) -> bool:
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+    return bool(re.search(r"^\s*FAILED\s+[^\r\n]+::\S+", output, re.MULTILINE))
+
+
+def machine_error(output: str, worktree: Path) -> str | None:
+    """The first local machine error and its remedy; a named failing test always wins."""
+    if named_test_failure(output):
+        return None
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+    # Recognized forms: pytest's /tmp/pytest-of-<user> not owned by the current user;
+    # no space left on device; too many open files; cannot allocate memory; read-only
+    # file system; permission denied with an absolute path outside this worktree.
+    # Permission paths may precede the error (shell/coreutils) or follow it (Python).
+    patterns = (
+        (r"/tmp/pytest-of-\S+[^\n]*not owned by the current user",
+         "give the temporary folder back to the user, or remove it"),
+        (r"\bno space left on device\b", "free disk space or file slots"),
+        (r"\btoo many open files\b", "close unused files or raise the open-file limit"),
+        (r"\bcannot allocate memory\b", "free memory or raise the memory limit"),
+        (r"\bread-only file system\b", "restore write access to the filesystem"),
+    )
+    for line in output.splitlines():
+        for pattern, remedy in patterns:
+            if re.search(pattern, line, re.IGNORECASE):
+                return f"{line.strip()}; {remedy}"
+        if not re.search(r"\bpermission denied\b", line, re.IGNORECASE):
+            continue
+        path = re.search(
+            r"permission denied:\s*(?:'(/[^']*)'|\"(/[^\"]*)\"|(/[^\s:]+))"
+            r"|(?:'(/[^']*)'|\"(/[^\"]*)\"|(/[^\s:]+)):\s*permission denied\b",
+            line, re.IGNORECASE,
+        )
+        if path:
+            denied = Path(next(group for group in path.groups() if group is not None))
+            try:
+                outside = not denied.resolve().is_relative_to(worktree.resolve())
+            except OSError, RuntimeError:
+                outside = False
+            if outside:
+                return f"{line.strip()}; restore access to the path outside the worktree"
+    return None
+
+
 def github_server_error(error: str) -> bool:
     # Both gh's non-JSON responses and git's receive-pack rejections can omit "HTTP 5xx".
     # A client error anywhere in the output still wins, including an HTTP debug dump.

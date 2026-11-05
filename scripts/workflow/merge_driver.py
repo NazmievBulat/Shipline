@@ -450,6 +450,26 @@ def _drive_gate(folder: Path, number: str) -> bool:
 
 
 def drive(folder: Path) -> None:
+    # Nested gate processes share this observation token, including all refreshes. Only
+    # a complete tick with a local result and no machine error re-arms the wake notice.
+    folder.mkdir(parents=True, exist_ok=True)
+    tick = uuid.uuid4().hex
+    previous = os.environ.get("WORKFLOW_MACHINE_ERROR_TICK")
+    os.environ["WORKFLOW_MACHINE_ERROR_TICK"] = tick
+    try:
+        _drive(folder)
+        if (folder / "machine-errors-checked").exists():
+            with (folder / "merge.lock").open("w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                gate.finish_machine_error_tick(folder, tick)
+    finally:
+        if previous is None:
+            os.environ.pop("WORKFLOW_MACHINE_ERROR_TICK", None)
+        else:
+            os.environ["WORKFLOW_MACHINE_ERROR_TICK"] = previous
+
+
+def _drive(folder: Path) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     if not any(folder.glob("merge-wanted-*")) and not any(folder.glob("merge-review-*")):
         return

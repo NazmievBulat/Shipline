@@ -80,6 +80,7 @@ _MACHINE_ERRORS = [
     "PermissionError: [Errno 13] Permission denied: '/tmp/example-cache'",
     "bash: /tmp/example-cache: Permission denied",
     "mkdir: cannot create directory '/tmp/example cache': Permission denied",
+    "PermissionError: Permission denied: '/work/example-app-other/cache'",
 ]
 
 
@@ -108,6 +109,69 @@ def test_a_named_failing_test_wins_over_a_machine_error(gate: Any, error: str) -
 ])
 def test_other_failures_are_not_machine_errors(gate: Any, error: str) -> None:
     assert gate.machine_error(error, Path("/work/example-app")) is None
+
+
+def test_color_does_not_hide_a_named_failing_test(gate: Any) -> None:
+    assert gate.machine_error(
+        "No space left on device\n\x1b[31mFAILED\x1b[0m tests/test_example.py::test_example",
+        Path("/work/example-app"),
+    ) is None
+    assert not gate._transient_refresh_push(
+        "No space left on device\nConnection reset by peer\n"
+        "FAILED tests/test_example.py::test_example"
+    )
+    assert gate.machine_error(
+        "No space left on device\nFAILED tests/test example.py::test_example",
+        Path("/work/example-app"),
+    ) is None
+
+
+def test_permission_paths_follow_symlinks(gate: Any, tmp_path: Path) -> None:
+    worktree = tmp_path / "example-app"
+    worktree.mkdir()
+    outside = tmp_path / "cache"
+    outside.mkdir()
+    (worktree / "cache").symlink_to(outside, target_is_directory=True)
+    (tmp_path / "inside").symlink_to(worktree, target_is_directory=True)
+    assert gate.machine_error(f"Permission denied: '{worktree / 'cache'}'", worktree)
+    assert gate.machine_error(f"Permission denied: '{tmp_path / 'inside' / 'cache-file'}'", worktree) is None
+
+
+def test_machine_notice_rearms_only_after_an_observed_clean_tick(
+    gate: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "machine-errors"
+    notices = tmp_path / "stuck.pending"
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "first")
+    gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+    gate.note_machine_result(tmp_path, None)  # another pull request's command passed
+    gate.finish_machine_error_tick(tmp_path, "first")
+    assert marker.exists()
+    gate.finish_machine_error_tick(tmp_path, "no-command")
+    assert marker.exists()
+    monkeypatch.delenv("WORKFLOW_MACHINE_ERROR_TICK")
+    gate.note_machine_result(tmp_path, None)
+    assert marker.exists()  # a direct call cannot prove a whole clean tick
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "second")
+    gate.note_machine_result(tmp_path, None)  # pre-train passes before a push fails
+    gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+    gate.finish_machine_error_tick(tmp_path, "second")
+    assert marker.exists()
+    assert len(list(notices.glob("*.json"))) == 1
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "third")
+    gate.note_machine_result(tmp_path, None)
+    monkeypatch.delenv("WORKFLOW_MACHINE_ERROR_TICK")
+    gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+    gate.finish_machine_error_tick(tmp_path, "third")
+    assert marker.exists()  # a newer direct failure cannot be cleared by an older pass
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "fourth")
+    gate.note_machine_result(tmp_path, None)
+    gate.finish_machine_error_tick(tmp_path, "fourth")
+    assert not marker.exists()
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "fifth")
+    gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+    assert len(list(notices.glob("*.json"))) == 2
+    assert all(path.stat().st_mode & 0o077 == 0 for path in notices.glob("*.json"))
 
 
 @pytest.mark.parametrize("error", _SERVER_ERRORS)

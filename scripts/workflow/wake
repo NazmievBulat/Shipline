@@ -30,6 +30,8 @@
 # each: `shipline rolled back: <bad sha> -> <good sha>, <reason>`, a checkout it left alone for
 # its local changes, and a pin that stops it. When several repositories share that checkout,
 # the first wake to send tells it.
+# Local gate machine errors use the same notices: one first error line and remedy across
+# pull requests and ticks, re-armed only after a tick observed no machine error.
 #
 # What the tick's automatic ticket start did, and why the next ticket waits, rides with the
 # next check-in, a line each, once per change (`ticket_starts.py` notes them): `started 611
