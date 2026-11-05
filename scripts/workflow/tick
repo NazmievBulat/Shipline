@@ -310,7 +310,7 @@ trap 'tick_cleanup $?' EXIT
 # all children and command substitutions, so no later step repairs again this tick.
 git_step() {
   if ((shadow)); then
-    "$@"
+    command "$@"
   else
     python3 -B "$here/merge_health.py" --repair-step "$main" "$main/$SHIPLINE_STATE_FOLDER" \
       "$WORKFLOW_TRAIN_TICK/git-repair.attempted" "$@"
