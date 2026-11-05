@@ -196,6 +196,22 @@ def test_a_new_status_after_delivery_gets_a_fresh_retry_budget(workflow: Workflo
     assert _keys(workflow, "ticket-7") == ["Enter", "Enter"]
 
 
+def test_a_fast_answer_to_recovery_does_not_mark_its_new_wait_kept_alive(
+    workflow: Workflow,
+) -> None:
+    notes = _waiting(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    waiting = shlex.quote(str(notes.with_suffix(".job-wait")))
+    (workflow.state / "on-sleep").write_text(f"touch -d @{_NOW} {waiting}\n")
+
+    _tick(workflow, _NOW)
+    (workflow.state / "on-sleep").unlink()
+    _tick(workflow, _NOW + 3000)
+
+    assert _keys(workflow, "ticket-7") == ["Enter", _STATUS, "Enter"]
+
+
 def test_escape_restoring_own_status_is_recovered_on_the_next_tick(workflow: Workflow) -> None:
     _still(workflow)
     (workflow.notes(7) / "ticket-7.typed").write_text(_STATUS)
@@ -322,6 +338,28 @@ def test_a_reviewer_woken_for_its_checks_gets_no_status_check_in_the_same_tick(
 
     assert len(_typed(workflow, "review-7", "The checks on ")) == 1
     assert _typed(workflow, "review-7", "Status") == []
+
+
+def test_a_checks_wake_cannot_bypass_the_status_retry_path(workflow: Workflow) -> None:
+    notes = _session(workflow, "review-7", draft=False)
+    _written(notes.with_suffix(".started"), _NOW - 7200)
+    _written(notes.with_suffix(".checks-wait"), _NOW - 3000)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-review-7").write_text(_STATUS)
+    (workflow.state / "swallow-enter-review-7").write_text("100")
+    (workflow.state / "rollup-7.json").write_text(json.dumps([
+        {"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": "SUCCESS"}
+        for name in ("CI result", "Docker images: what to run")
+    ]))
+
+    for n in range(6):
+        workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)})
+
+    assert _keys(workflow, "review-7") == ["Enter"] * 3
+    assert not list((workflow.repo / ".local/workflow").glob("review-7.checks-nudged-*"))
+    assert _pending(workflow) == [
+        "stuck? review-7 (status message not taken; its text stays in the box)"
+    ]
 
 
 def test_an_idle_session_waiting_for_nothing_named_is_not_kept_alive(
@@ -627,6 +665,7 @@ def test_text_that_escape_puts_back_in_the_box_is_not_sent(workflow: Workflow) -
     (workflow.state / "input-after-escape-ticket-7").write_text("and then the docs")
 
     _tick(workflow, _NOW + 2700)
+    _tick(workflow, _NOW + 2880)
 
     assert _keys(workflow, "ticket-7") == ["Escape"]
     assert (workflow.state / "input-ticket-7").read_text() == "and then the docs"
