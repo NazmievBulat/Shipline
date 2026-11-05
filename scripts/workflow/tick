@@ -306,6 +306,17 @@ tick_cleanup() {
   tick_ended "$1"
 }
 trap 'tick_cleanup $?' EXIT
+# Retry a Git-dependent step only after it released its own locks. The marker is shared by
+# all children and command substitutions, so no later step repairs again this tick.
+git_step() {
+  if ((shadow)); then
+    "$@"
+  else
+    python3 -B "$here/merge_health.py" --repair-step "$main" "$main/$SHIPLINE_STATE_FOLDER" \
+      "$WORKFLOW_TRAIN_TICK/git-repair.attempted" "$@"
+  fi
+}
+git() { git_step git "$@"; }
 # The pick's resource history must keep moving while this tick drives the train. The
 # sampler closes the tick's lock, stops on exit, and never runs for a shadow tick.
 if ((shadow == 0)); then
@@ -523,7 +534,10 @@ session() {
   if ((shadow)); then
     shadow_session "$@"
   else
-    bash "$here/session" "$@" 9>&- 8>&- 7>&-
+    case $1 in
+      start | cleanup) git_step bash "$here/session" "$@" 9>&- 8>&- 7>&- ;;
+      *) bash "$here/session" "$@" 9>&- 8>&- 7>&- ;;
+    esac
   fi
 }
 
@@ -1121,7 +1135,7 @@ local_duties
 # The tick alone requests one failed-job retry, after verifying home-runner evidence. A shadow
 # tick reads the report as the real tick left it.
 if ((shadow == 0)); then
-  WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/main-status" --tick-main-status 9>&- || failed=1
+  WORKFLOW_BACKGROUND_GITHUB=1 git_step bash "$here/main-status" --tick-main-status 9>&- || failed=1
   budget_ready || paused
 fi
 
@@ -1130,7 +1144,7 @@ fi
 # test of a handoff's own makes it a draft, which a worker below fixes in its line place; its
 # runners' failure is re-run once (`check_repair.py`).
 if ((shadow == 0)); then
-  WORKFLOW_BACKGROUND_GITHUB=1 python3 -B "$here/merge_driver.py" 9>&- || failed=1
+  WORKFLOW_BACKGROUND_GITHUB=1 git_step python3 -B "$here/merge_driver.py" 9>&- || failed=1
   budget_ready || paused
 fi
 running=$(session list) || failed=1
@@ -1141,7 +1155,7 @@ running=$(session list) || failed=1
 # finished; failures are finished too.
 # The sessions given a message in this tick: step 8 gives them no second one.
 nudged=" "
-if train=$(WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/merge-when-current" --train-status 9>&-); then
+if train=$(WORKFLOW_BACKGROUND_GITHUB=1 git_step bash "$here/merge-when-current" --train-status 9>&-); then
 # A shadow tick notes the line it read whenever it changed: it explains a decision that differs.
 if ((shadow)); then
   last=$(tac "$SHIPLINE_SHADOW" | grep -m 1 -E '^[0-9]+ train status: ' | cut -d ' ' -f 2-)
@@ -1767,7 +1781,7 @@ if ((answer_after > 0)); then
 fi
 
 # Record reviewer-start notices before waking the orchestrator. Their reviewers start below.
-((shadow)) || python3 -B "$here/merge_driver.py" --hand-backs 9>&- || failed=1
+((shadow)) || git_step python3 -B "$here/merge_driver.py" --hand-backs 9>&- || failed=1
 running=$(session list) || failed=1
 
 # The program the orchestrator recorded for ticket N in `worker-program-N`, in `recorded`, or
@@ -1869,7 +1883,7 @@ while read -r number draft base; do
   ! grep -qxF "$number" <<<"$unfinished" || continue
   if ((local_starts_held)); then
     if ((shadow == 0)) && [[ -e $main/$SHIPLINE_STATE_FOLDER/merge-review-$number ]]; then
-      python3 -B "$here/merge_driver.py" --wait-hand-back "$number" 9>&- || failed=1
+      git_step python3 -B "$here/merge_driver.py" --wait-hand-back "$number" 9>&- || failed=1
     fi
     [[ $draft == true ]] && cloud_candidate "$number" || continue
   fi
@@ -1882,7 +1896,7 @@ while read -r number draft base; do
     if ((shadow)); then
       shadow_hand_back "$number"
     else
-      python3 -B "$here/merge_driver.py" --start-hand-back "$number" 9>&-
+      git_step python3 -B "$here/merge_driver.py" --start-hand-back "$number" 9>&-
     fi
     started=$?
     ((started == 0 || started == 75)) || failed=1
@@ -1950,7 +1964,7 @@ while read -r number draft base; do
         "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&- &&
         shadow_start review "$number"
     else
-      python3 -B "$here/reviewer_start.py" "$main/$SHIPLINE_STATE_FOLDER" "$number" "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&-
+      git_step python3 -B "$here/reviewer_start.py" "$main/$SHIPLINE_STATE_FOLDER" "$number" "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&-
     fi
     started=$?
     ((started == 0 || started == 2)) || failed=1
@@ -1963,7 +1977,7 @@ if ((shadow == 0)); then
   # After this tick's own starts, which count as starts too: the next draft ticket gets the label
   # when one may start, and the next tick starts its worker.
   if ((starts_go)); then
-    python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
+    git_step python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
       failed=1
   fi
 fi

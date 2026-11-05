@@ -4,6 +4,9 @@ import fcntl
 import json
 import os
 import re
+import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -867,3 +870,259 @@ def _refresh_health(folder: Path, *, retry: bool = False) -> tuple[str, Health]:
     if context := train_reads.tick():
         train_reads.save(context / "main.json", {"head": head})
     return head, health
+
+
+# These are object failures, not an unknown revision, a network outage or a bad pack.
+_BROKEN_OBJECT = re.compile(
+    r"object file .+ is empty|bad object refs/[^\s]+|"
+    r"unable to read (?:sha1 file of |tree |object )?[0-9a-f]{40,64}|"
+    r"invalid sha1 pointer|invalid (?:object|commit) [0-9a-f]{40,64}|"
+    r"(?:missing|bad) (?:blob|tree|commit|object)(?: object)? [0-9a-f]{40,64}|"
+    r"could not (?:read|parse) (?:object |commit |tree )?[0-9a-f]{40,64}|"
+    r"reference is not a tree: [0-9a-f]{40,64}", re.I,
+)
+
+
+class RepairFailed(Exception):
+    """A repair step stopped; later steps must not run."""
+
+
+def _repair_command(
+    main: Path, *args: str, check: bool = True, input: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(main), *args], capture_output=True, text=True,
+            timeout=120 if args[0] == "fetch" else 60, input=input,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except subprocess.TimeoutExpired:
+        raise RepairFailed(f"git {args[0]} timed out") from None
+    if check and done.returncode:
+        # Remote URLs, paths and Git's own arbitrary text never enter a wake message.
+        raise RepairFailed(f"git {args[0]} failed (exit {done.returncode})")
+    return done
+
+
+def _repair_directory(path: Path) -> None:
+    if any(parent.is_symlink() for parent in (path, *path.parents)):
+        raise RepairFailed("repair path is a symbolic link")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
+def _repair_note(folder: Path, name: str, value: dict[str, Any]) -> None:
+    _repair_directory(folder)
+    with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as output:
+        json.dump(value, output)
+        output.write("\n")
+    os.replace(output.name, folder / name)
+
+
+def _repair_repository(main: Path, folder: Path, backup: Path, lines: list[str]) -> None:
+    """Called only with merge.lock held. Backups precede all changes to repository data."""
+    common = Path(_repair_command(main, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
+    objects = common / "objects"
+    _repair_directory(objects)
+    _repair_directory(backup)
+    moved = 0
+    lines.append(f"moved 0 empty object files to {backup.relative_to(main)}")
+    for path in sorted(objects.glob("??/*")):
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", path.parent.name + path.name):
+            continue
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size:
+            continue
+        _repair_directory(path.parent)
+        destination = backup / "objects" / path.parent.name / path.name
+        _repair_directory(destination.parent)
+        path.rename(destination)
+        moved += 1
+        lines[0] = f"moved {moved} empty object files to {backup.relative_to(main)}"
+
+    def present(head: str) -> bool:
+        answer = _repair_command(main, "cat-file", "--batch-check", input=head + "\n").stdout.strip()
+        # A corrupt non-empty object or a permission error fails the command, rather than
+        # authorizing a ref move as though the object were absent.
+        return answer != f"{head} missing"
+
+    refs = _repair_command(main, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads").stdout
+    for line in refs.splitlines():
+        ref, head = line.split()
+        if present(head):
+            continue
+        pushed = "refs/remotes/origin/" + ref.removeprefix("refs/heads/")
+        remote = _repair_command(main, "rev-parse", "--verify", pushed, check=False)
+        target = remote.stdout.strip()
+        if remote.returncode or not present(target):
+            lines.append(f"{ref}: no usable pushed head; left alone")
+            continue
+        _repair_command(main, "update-ref", ref, target, head)
+        lines.append(f"{ref} -> {pushed} ({target})")
+
+    # Only entries naming an absent object are removed, including linked-worktree logs.
+    # A byte-for-byte backup keeps even these otherwise unusable entries recoverable.
+    logs = [common / "logs", *sorted((common / "worktrees").glob("*/logs"))]
+    known: dict[str, bool] = {}
+    for logs_root in logs:
+        if not logs_root.exists():
+            continue
+        _repair_directory(logs_root)
+        for path in sorted(logs_root.rglob("*")):
+            if path.is_symlink():
+                raise RepairFailed("reflog path is a symbolic link")
+            if not path.is_file():
+                continue
+            original = path.read_bytes()
+            kept = []
+            for entry in original.splitlines(keepends=True):
+                heads = entry.split(maxsplit=2)[:2]
+                if len(heads) != 2 or any(not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", head) for head in heads):
+                    raise RepairFailed("malformed reflog entry")
+                missing = False
+                for raw in heads:
+                    head = raw.decode("ascii")
+                    if set(head) == {"0"}:
+                        continue
+                    if head not in known:
+                        known[head] = present(head)
+                    missing |= not known[head]
+                if not missing:
+                    kept.append(entry)
+            if b"".join(kept) == original:
+                continue
+            destination = backup / "reflogs" / path.relative_to(common)
+            _repair_directory(destination.parent)
+            shutil.copy2(path, destination)
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as output:
+                output.write(b"".join(kept))
+            os.replace(output.name, path)
+
+    listing = _repair_command(main, "worktree", "list", "--porcelain", "-z").stdout
+    allowed = main / ".claude/worktrees"
+    indexes: dict[Path, Path] = {}
+    for field in listing.split("\0"):
+        if not field.startswith("worktree "):
+            continue
+        worktree = Path(field.removeprefix("worktree "))
+        if not worktree.is_relative_to(allowed):
+            continue
+        # Do not cross links or repair another checkout through one.
+        if not worktree.exists():
+            continue
+        if worktree.resolve() != worktree or not worktree.is_dir():
+            raise RepairFailed("registered worktree path is unavailable or linked")
+        index = Path(_repair_command(worktree, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.strip())
+        indexes[index] = worktree
+    if indexes:
+        # fsck checks every registered index, even when run in just one worktree. Match
+        # each error to its index before resetting, so a different worktree stays untouched.
+        checked = _repair_command(main, "fsck", "--cache", "--no-reflogs", "--connectivity-only", "--no-dangling", check=False)
+        broken = re.findall(
+            r"^error: ([0-9a-f]{40,64}): invalid sha1 pointer in cache-tree of (.+)$",
+            checked.stdout + checked.stderr, re.M,
+        )
+        reset: set[Path] = set()
+        for head, raw_path in broken:
+            index = Path(os.path.abspath(main / raw_path))
+            if index not in indexes or index in reset:
+                continue
+            if present(head):
+                raise RepairFailed("cache-tree object exists but cannot be read")
+            worktree = indexes[index]
+            if index.is_symlink():
+                raise RepairFailed("worktree index is a symbolic link")
+            _repair_directory(index.parent)
+            destination = backup / "indexes" / worktree.relative_to(allowed) / "index"
+            _repair_directory(destination.parent)
+            shutil.copy2(index, destination)
+            _repair_command(worktree, "reset", "-q")
+            lines.append(f"rebuilt index {worktree.relative_to(main)}")
+            reset.add(index)
+        if checked.returncode and not broken:
+            raise RepairFailed("worktree object check failed outside its cache-tree")
+    _repair_command(main, "fetch", "--no-auto-maintenance", "origin")
+
+
+def repair_repository(main: Path, folder: Path, marker: Path) -> bool:
+    """At most one attempt per tick, including subshells; never wait behind an active gate."""
+    _repair_directory(folder)
+    _repair_directory(marker.parent)
+    try:
+        descriptor = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+    except FileExistsError:
+        return False
+    now = float(os.environ.get("WORKFLOW_NOW") or time.time())
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now)) + f"-{time.time_ns()}"
+    backup = folder / "git-repairs" / stamp
+    lines: list[str] = []
+    complete = False
+    if (folder / "merge.lock").is_symlink():
+        raise RepairFailed("merge lock is a symbolic link")
+    with (folder / "merge.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _repair_repository(main, folder, backup, lines)
+            complete = True
+        except BlockingIOError:
+            lines.append("could not finish: merge lock is busy")
+        except (RepairFailed, OSError) as error:
+            reason = str(error) if isinstance(error, RepairFailed) else f"file operation failed (errno {error.errno})"
+            lines.append(f"could not finish: {reason}")
+        line = "git repository repair: " + "; ".join(lines)
+        print(line, file=sys.stderr, flush=True)
+        failed = folder / "git-repair.failed"
+        if complete or not failed.exists():
+            _repair_note(folder / "git-repair.pending", f"{stamp}.json", {"line": line})
+        if complete:
+            failed.unlink(missing_ok=True)
+        elif not failed.exists():
+            _repair_note(folder, failed.name, {"since": stamp})
+    return complete
+
+
+def repair_step(main: Path, folder: Path, marker: Path, command: list[str]) -> int:
+    """Retry only this step, after its own locks are released, and hide the recovered error."""
+    def run() -> tuple[int, bytes, bytes]:
+        # A detached child cannot hold an output pipe open after the step exits.
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            done = subprocess.run(command, stdout=out, stderr=err)
+            out.seek(0)
+            err.seek(0)
+            return done.returncode, out.read(), err.read()
+
+    code, out, err = run()
+    text = (out + err).decode(errors="replace")
+    broken = bool(_BROKEN_OBJECT.search(text))
+    if not broken and code and re.search(r"cannot fetch .*from origin", text):
+        # Session setup suppresses Git's stderr. Confirm an object failure before repairing.
+        try:
+            probe = _repair_command(main, "fetch", "origin", check=False)
+            broken = bool(_BROKEN_OBJECT.search(probe.stdout + probe.stderr))
+        except RepairFailed:
+            pass
+    if not broken and code == 0 and (
+        command[:2] == ["git", "fetch"]
+        or re.search(r"^main: (green|pending|red|advisory)\b", text, re.M)
+    ):
+        # A manual recovery ends a failed stretch too; ordinary unrelated successes do not.
+        (folder / "git-repair.failed").unlink(missing_ok=True)
+    if broken and repair_repository(main, folder, marker):
+        code, out, err = run()
+    elif broken:
+        code = code or 1
+    sys.stdout.buffer.write(out)
+    sys.stderr.buffer.write(err)
+    return code
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 6 or sys.argv[1] != "--repair-step":
+        raise SystemExit("usage: merge_health.py --repair-step MAIN STATE MARKER COMMAND...")
+    try:
+        code = repair_step(*(Path(word) for word in sys.argv[2:5]), sys.argv[5:])
+    except (RepairFailed, OSError) as error:
+        reason = str(error) if isinstance(error, RepairFailed) else f"file operation failed (errno {error.errno})"
+        print(f"git repository repair could not finish: {reason}", file=sys.stderr)
+        code = 1
+    raise SystemExit(code)

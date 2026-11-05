@@ -11,8 +11,33 @@ from pathlib import Path
 import pytest
 from workflow_harness import Workflow, instruction
 from workflow.test_usage import _usage_answer
+from workflow.test_merge_health import _empty_branch
 
 _WORKER = instruction("Implement pull request 7")
+
+
+def test_tick_repairs_empty_objects_and_starts_its_ticket(workflow: Workflow) -> None:
+    workflow.add_pull_request(7)
+    _, empty = _empty_branch(workflow)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.is_running("ticket-7")
+    assert not empty.exists()
+    assert workflow.git("rev-parse", "repair") == workflow.git("rev-parse", "origin/repair")
+    assert len(list((workflow.repo / ".local/workflow/git-repairs").iterdir())) == 1
+
+
+def test_a_healthy_tick_does_not_repair_objects(workflow: Workflow) -> None:
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stderr
+    assert not (workflow.repo / ".local/workflow/git-repairs").exists()
+
+
+def test_a_shadow_tick_does_not_repair_empty_objects(workflow: Workflow) -> None:
+    _, empty = _empty_branch(workflow)
+    workflow.run_script("tick", "--shadow")
+    assert empty.exists()
+    assert not (workflow.repo / ".local/workflow/git-repairs").exists()
 
 _MB = 1024 * 1024
 _SAID_FINISHED = "● Merged as one commit, and 9 is based on main now.\n\n  Audit finished.\n\n> \n"

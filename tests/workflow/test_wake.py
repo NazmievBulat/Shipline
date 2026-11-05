@@ -38,6 +38,26 @@ def _wake(
     return workflow.run_script("wake", *woken, env=at or _at(23, 0))
 
 
+def test_git_repair_is_delivered_once_in_daylight_even_when_busy(night: Workflow) -> None:
+    night.orchestrator("busy")
+    pending = night.repo / ".local/workflow/git-repair.pending"
+    pending.mkdir(parents=True)
+    line = "git repository repair: moved 1 empty object files to .local/workflow/git-repairs/example"
+    event = pending / "example.json"
+    event.write_text(json.dumps({"line": line}))
+    (night.state / "send-fails").touch()
+    assert _wake(night, at=_at(12, 0)).returncode == 1
+    assert event.exists()
+    (night.state / "send-fails").unlink()
+    assert _wake(night, at=_at(12, 6)).returncode == 0
+    assert line in night.sent()[-1]
+    assert not event.exists()
+    assert (night.repo / ".local/workflow/git-repair.sent/example.json").exists()
+    sent = len(night.sent())
+    _wake(night, at=_at(12, 12))
+    assert len(night.sent()) == sent
+
+
 def _savings_day(workflow: Workflow) -> None:
     """One merged PR, three ready/push/refresh runs, a duplicate ID and a skipped draft."""
     groups = ["images", "browser_whole", "server_whole"]
