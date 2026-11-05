@@ -135,12 +135,37 @@ def test_a_healthy_fetch_ends_a_failed_repair_stretch(workflow: Workflow) -> Non
     _empty_branch(workflow, pushed=False)
     _repair_step(workflow)
     workflow.git("update-ref", "refs/heads/repair", workflow.git("rev-parse", "main"))
+    workflow.git("reflog", "expire", "--expire=never", "--expire-unreachable=never", "--stale-fix", "--all")
     (workflow.state / "repair-attempt").unlink()
     assert _repair_step(workflow).returncode == 0
     assert not (workflow.repo / ".local/workflow/git-repair.failed").exists()
     _empty_branch(workflow, pushed=False)
     assert _repair_step(workflow).returncode != 0
     assert len(list((workflow.repo / ".local/workflow/git-repair.pending").glob("*.json"))) == 2
+
+
+def test_a_healthy_fetch_does_not_end_a_still_broken_index_stretch(workflow: Workflow) -> None:
+    worktree = workflow.add_worktree(7)
+    (worktree / "example.txt").write_text("staged\n")
+    workflow.git("add", "example.txt", cwd=worktree)
+    tree = workflow.git("write-tree", cwd=worktree)
+    index = Path(workflow.git("rev-parse", "--path-format=absolute", "--git-path", "index", cwd=worktree))
+    object_file = workflow.repo / ".git/objects" / tree[:2] / tree[2:]
+    object_file.chmod(0o600)
+    object_file.write_bytes(b"")
+    _empty_branch(workflow)
+    index.with_name("index.lock").touch()
+    first = _repair_step(workflow)
+    assert first.returncode != 0
+    assert "git reset failed" in first.stderr
+    failed = workflow.repo / ".local/workflow/git-repair.failed"
+    assert failed.exists()
+    pending = workflow.repo / ".local/workflow/git-repair.pending"
+    events = {path.name: path.read_bytes() for path in pending.glob("*.json")}
+    (workflow.state / "repair-attempt").unlink()
+    assert _repair_step(workflow).returncode == 0
+    assert failed.exists()
+    assert {path.name: path.read_bytes() for path in pending.glob("*.json")} == events
 
 
 def test_repair_rebuilds_only_a_broken_worktree_cache_tree_and_keeps_changes(workflow: Workflow) -> None:
