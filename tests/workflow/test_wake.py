@@ -1211,3 +1211,84 @@ def test_a_prefix_queue_warning_is_told_once_and_kept_until_delivery(night: Work
     assert f"\n{line}\n" in night.sent()[-1]
     assert not event.exists()
     assert (pending.with_name("prefix-queues.sent") / event.name).exists()
+
+
+@pytest.mark.parametrize("registration", ["missing", "empty", "closed"])
+def test_three_failed_ticks_without_an_orchestrator_ring_once(
+    night: Workflow, registration: str,
+) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = night.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    folder = night.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "main-status").write_text("main: green\n")
+    if registration != "missing":
+        (folder / "orchestrator").write_text("" if registration == "empty" else "closed\n")
+    error = "fatal: cannot fetch main\nMore detail that must not ring."
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", error, env=_at(12))
+    assert night.pushes() == []
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", error, env=_at(12))
+    [push] = night.pushes()
+    assert "fatal: cannot fetch main" in push.message
+    assert "More detail" not in push.message
+    assert "write the open session's name to .local/workflow/orchestrator" in push.message
+    assert "main checkout" in push.message
+    assert "phone" in night.wake_log.read_text()
+    assert night.sent() == []
+
+    night.run_script("wake", "--tick-result", "0", "", env=_at(12))
+    for _ in range(3):
+        night.run_script("wake", "--tick-result", "1", error, env=_at(12))
+    assert len(night.pushes()) == 2
+
+
+@pytest.mark.parametrize("status", ["idle", "busy"])
+def test_persistent_failure_tells_the_open_orchestrator_without_a_phone_push(
+    night: Workflow, status: str,
+) -> None:
+    night.orchestrator(status)
+    for _ in range(4):
+        done = night.run_script("wake", "--tick-result", "1", "fatal: cannot fetch main", env=_at(12))
+        assert done.returncode == 0, done.stderr
+    [message] = night.sent()
+    assert "fatal: cannot fetch main" in message
+    assert night.pushes() == []
+
+
+def test_unknown_main_has_its_own_stretch_and_readable_main_resets_it(night: Workflow) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = night.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    folder = night.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    report = folder / "main-status"
+    report.write_text("main: unknown, cannot read CI\n")
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "0", "", env=_at(12))
+    assert night.pushes() == []
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "0", "", env=_at(12))
+    [push] = night.pushes()
+    assert "main: unknown, cannot read CI" in push.message
+    report.write_text("main: pending\n")
+    night.run_script("wake", "--tick-result", "1", "another failure", env=_at(12))
+    report.write_text("main: unknown, cannot read CI\n")
+    for _ in range(3):
+        night.run_script("wake", "--tick-result", "0", "", env=_at(12))
+    assert len(night.pushes()) == 2
+
+
+def test_shadow_result_neither_counts_nor_rings(night: Workflow) -> None:
+    for _ in range(4):
+        night.run_script("wake", "--tick-result", "1", "failure",
+                         env={**_at(12), "SHIPLINE_SHADOW": str(night.root / "shadow.log")})
+    assert night.pushes() == []
+    assert not (night.repo / ".local/workflow/tick-failures").exists()
+    assert night.sent() == []

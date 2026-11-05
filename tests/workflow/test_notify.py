@@ -1405,3 +1405,36 @@ def test_no_question_note_for_a_bridge_a_stop_that_asks_nothing_or_a_hunt(
         assert not (session.hunt_worktree("plan-1") / ".local/workflow/hunt-plan-1.question").exists()
     else:
         assert _question(session) is None
+
+
+@pytest.mark.parametrize("named", ["", "ticket-7", "cloud-7"])
+def test_workflow_alert_needs_no_session_and_uses_the_same_keys(
+    session: Workflow, named: str,
+) -> None:
+    message = "Tick failed: cannot fetch main. Write the open session's name to the orchestrator file."
+    done = session.run_script("notify", "workflow", stdin=message,
+                              env={"WORKFLOW_SESSION": named})
+
+    assert done.returncode == 0
+    assert done.stdout == done.stderr == ""
+    [push] = session.pushes()
+    assert push.title == "Workflow needs you"
+    assert push.message == message
+    assert push.url is None
+    assert f'"token={_TOKEN}"' in push.input
+    assert f'"user={_USER}"' in push.input
+    assert session.calls("gh") == []
+    assert not _idle(session).exists()
+
+
+def test_workflow_alert_keeps_the_push_time_limit_and_missed_log(session: Workflow) -> None:
+    session.trace_timeouts()
+    session.fake("curl", HANGING_CALL)
+
+    done = session.run_script("notify", "workflow", stdin="Tick failed: cannot fetch main.",
+                              env={"WORKFLOW_NOTIFY_SECONDS": "1"})
+
+    assert done.returncode == 0
+    assert 0 < session.timeout_budget() <= 4
+    assert session.calls("interrupted-curl") == ["interrupted-curl"]
+    assert "Workflow needs you  Tick failed: cannot fetch main." in session.missed_pushes.read_text()

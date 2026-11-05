@@ -1756,3 +1756,54 @@ def test_a_question_answered_or_changed_meanwhile_is_passed_over_quietly(
 
     assert done.returncode == 3, done.stderr
     assert workflow.calls("tmux ticket-7 send-keys") == []
+
+
+
+def test_failed_tick_alert_survives_early_exit_and_skips_overlapping_ticks(workflow: Workflow) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = workflow.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    (workflow.state / "fail-gh-list").touch()
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode != 0
+    assert workflow.pushes() == []
+    lock = workflow.repo / ".git/shipline-tick.lock"
+    with lock.open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert workflow.run_script("tick").returncode == 0
+    third = workflow.run_script("tick")
+    assert third.returncode != 0
+    [push] = workflow.pushes()
+    assert third.stderr.splitlines()[0] in push.message
+    workflow.run_script("tick")
+    assert len(workflow.pushes()) == 1
+    (workflow.state / "fail-gh-list").unlink()
+    success = workflow.run_script("tick")
+    assert success.returncode == 0, success.stderr
+    (workflow.state / "fail-gh-list").touch()
+    for _ in range(3):
+        workflow.run_script("tick")
+    assert len(workflow.pushes()) == 2
+
+
+def test_tick_counts_unknown_main_once_per_tick(workflow: Workflow) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = workflow.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "main-status").write_text("main: unknown, cannot read CI\n")
+    workflow.script.with_name("main-status").write_text("#!/bin/bash\nexit 0\n")
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stderr
+    assert workflow.pushes() == []
+    for _ in range(2):
+        workflow.run_script("tick")
+    [push] = workflow.pushes()
+    assert "main: unknown, cannot read CI" in push.message
