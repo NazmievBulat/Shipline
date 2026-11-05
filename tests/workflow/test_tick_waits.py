@@ -152,6 +152,50 @@ def test_status_recovery_does_not_send_another_recorded_message(workflow: Workfl
     assert _keys(workflow, "ticket-7") == []
 
 
+def test_failed_status_is_recovered_even_when_submit_removed_the_wait_notes(
+    workflow: Workflow,
+) -> None:
+    notes = _waiting(workflow)
+    (workflow.state / "swallow-enter-ticket-7").write_text("2")
+    (workflow.state / "on-sleep").write_text(
+        f"if [[ -e {shlex.quote(str(notes.with_suffix('.typed')))} ]]; then "
+        f"rm -f {shlex.quote(str(notes.with_suffix('.job-wait')))}; fi\n"
+    )
+
+    first = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW)})
+    assert first.returncode == 1
+    assert not notes.with_suffix(".job-wait").exists()
+    _tick(workflow, _NOW + 180)
+
+    assert _keys(workflow, "ticket-7") == [_STATUS, "Enter", "Enter", "Enter"]
+    assert not notes.with_suffix(".typed").exists()
+
+
+def test_shadow_status_recovery_presses_nothing_and_keeps_retry_notes(
+    workflow: Workflow,
+) -> None:
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+
+    done = workflow.run_script("tick", "--shadow", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert done.returncode == 0, done.stderr
+    assert _keys(workflow, "ticket-7") == []
+    assert notes.with_suffix(".typed").read_text() == _STATUS
+    assert not (workflow.repo / ".local/workflow/ticket-7.status-retry").exists()
+
+
+def test_a_new_status_after_delivery_gets_a_fresh_retry_budget(workflow: Workflow) -> None:
+    notes = _session(workflow)
+    for at in (_NOW, _NOW + 180):
+        notes.with_suffix(".typed").write_text(_STATUS)
+        (workflow.state / "input-ticket-7").write_text(_STATUS)
+        _tick(workflow, at)
+
+    assert _keys(workflow, "ticket-7") == ["Enter", "Enter"]
+
+
 def test_escape_restoring_own_status_is_recovered_on_the_next_tick(workflow: Workflow) -> None:
     _still(workflow)
     (workflow.notes(7) / "ticket-7.typed").write_text(_STATUS)

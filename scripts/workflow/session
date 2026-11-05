@@ -61,6 +61,12 @@
 #                               whether that wait is over (the tick does this, to keep its cache)
 #   session finish-ready <ticket-N>
 #                               tell an idle worker whose pull request is ready to finish
+#   session retry-status <ticket-N|review-N>
+#                               send only its unchanged, unsent status text, with one Enter
+#   session would-retry-status <ticket-N|review-N>
+#                               retry-status's checks alone, pressing nothing
+#   session status-pending <ticket-N|review-N>
+#                               whether its recorded draft is the status message
 #   session nudge-busy <ticket-N|review-N> <still|loop> [again]
 #                               press Escape in a busy Claude session whose screen has not
 #                               changed for 45 minutes, or whose wait loop finds itself, and
@@ -183,6 +189,7 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session lost-check <review-N> <head>
        session batch-merged <review-N> <squash>
        session status-check <ticket-N|review-N>
+       session retry-status|would-retry-status|status-pending <ticket-N|review-N>
        session finish-ready <ticket-N>
        session nudge-busy <ticket-N|review-N> <still|loop> [again]
        session would-nudge <ticket-N|review-N> <still|loop> [again]
@@ -1450,9 +1457,14 @@ holds_own_text() {
 # Keep ownership until delivery is observed. A later tick may submit precisely this
 # input, but must never append to or submit different text left by the owner.
 send_prompt() {
-  local name=$1 prompt=$2 typed notes attempt poll appeared=false
+  local name=$1 prompt=$2 attempts=${3:-2} typed notes attempt poll appeared=false
   notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
   read_prompt_box
+  if ((attempts == 1)); then
+    # A recovery only submits an existing draft; never recreate one that vanished or
+    # submit a different note written between the ownership check and this capture.
+    [[ -n $typed && -r $notes.typed && $(cat "$notes.typed") == "$prompt" ]] || return 3
+  fi
   if [[ -n $typed ]]; then
     [[ -r $notes.typed ]] && prompt_box_matches "$(cat "$notes.typed")" ||
       die "$name has text in its box that was not sent; nothing was typed into it"
@@ -1471,7 +1483,8 @@ send_prompt() {
   [[ $appeared == true ]] || die "$name automation text did not appear in its input box within 2 seconds"
   # Even after the text is drawn, let the terminal's paste burst settle before Enter.
   sleep 0.2
-  for attempt in 1 2; do
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if ((attempts == 1)); then status_retry_checks "$name" || return $?; fi
     read_prompt_box
     prompt_box_matches "$prompt" || die "$name input changed before Enter; nothing was sent"
     tmux -L "$name" send-keys -t "=$name:" Enter 2>/dev/null ||
@@ -1483,6 +1496,9 @@ send_prompt() {
       sleep 0.1
     done
   done
+  if ((attempts == 1)); then
+    die "$name still has automation text in its input box after one Enter attempt"
+  fi
   die "$name still has automation text in its input box after two Enter attempts"
 }
 
@@ -1584,6 +1600,25 @@ cmd_checks_finished() {
 # refuses in send_prompt). A worker's stop on a ready pull request always rings the phone, so
 # there its notes say nothing of a question: the tick reads the words on its screen instead.
 # Text of someone else's in the box exits 3, so that the tick passes over the session quietly.
+status_message() {
+  printf '%s' "Status check: if what you were waiting for is done, carry on; if not, run \`$notify_waiting\` and end your turn."
+}
+
+# A submit hook may remove every wait note before the input is actually delivered. Recovery
+# therefore checks ownership and the current screen, without requiring an idle or wait note.
+status_retry_checks() {
+  local name=$1 notes screen
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  require_running "$name"
+  [[ ! -e $notes.codex && ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked &&
+     ! -e $notes.asking ]] || return 3
+  [[ -r $notes.typed && $(cat "$notes.typed") == "$(status_message)" ]] || return 3
+  ! stopped_on_limit "$name" || return 3
+  screen=$(tmux -L "$name" capture-pane -p -t "=$name:" 2>/dev/null) || return 1
+  if LC_ALL=C grep -qE '^[[:space:]│]*Do you want to [^?]*\?' <<<"$screen"; then return 3; fi
+  holds_own_text "$name" || return 3
+}
+
 cmd_nudge_idle() {
   local name=$1 kind=$2 notes typed
   notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
@@ -1598,9 +1633,11 @@ cmd_nudge_idle() {
     exit 3
   fi
   if [[ $kind == status ]]; then
+    # Another automation message is not this status check's to submit.
+    [[ -z $typed || $(cat "$notes.typed") == "$(status_message)" ]] || return 3
     [[ ! -e $notes.asking ]] || die "$name is waiting for the owner"
     [[ -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]] || die "$name is busy"
-    send_prompt "$name" "Status check: if what you were waiting for is done, carry on; if not, run \`$notify_waiting\` and end your turn."
+    send_prompt "$name" "$(status_message)"
     return
   fi
   [[ -e $notes.idle ]] || die "$name is busy"
@@ -2266,6 +2303,17 @@ case ${1:-} in
     [[ $# -eq 2 && $2 =~ ^(ticket|review)-[0-9]+$ ]] || usage
     find_main_checkout
     cmd_nudge_idle "$2" status
+    ;;
+  retry-status | would-retry-status | status-pending)
+    [[ $# -eq 2 && $2 =~ ^(ticket|review)-[0-9]+$ ]] || usage
+    find_main_checkout
+    if [[ $1 == status-pending ]]; then
+      notes=$(worktree_of "$2")/$SHIPLINE_STATE_FOLDER/$2
+      [[ ! -e $notes.codex && -r $notes.typed && $(cat "$notes.typed") == "$(status_message)" ]] || exit 3
+      exit 0
+    fi
+    status_retry_checks "$2" || exit $?
+    [[ $1 == would-retry-status ]] || send_prompt "$2" "$(status_message)" 1
     ;;
   finish-ready)
     [[ $# -eq 2 && $2 =~ ^ticket-[0-9]+$ ]] || usage

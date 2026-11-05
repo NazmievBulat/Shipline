@@ -125,6 +125,21 @@ def test_bordered_status_recovery_without_wait_notes(workflow: Workflow, text: s
     )
 
 
+@pytest.mark.parametrize("text", ["", "Owner draft", _STATUS + " more"])
+def test_recovery_rechecks_the_box_after_settling(workflow: Workflow, text: str) -> None:
+    _bordered_input(workflow, text=_STATUS)
+    (workflow.notes(7) / "review-7.typed").write_text(_STATUS)
+    visible = workflow.state / "input-review-7"
+    (workflow.state / "on-sleep").write_text(
+        f"printf '%s' {shlex.quote(text)} > {shlex.quote(str(visible))}\n"
+    )
+
+    done = workflow.run("retry-status", "review-7")
+
+    assert done.returncode != 0
+    assert workflow.calls("tmux review-7 send-keys") == []
+
+
 def test_owner_edits_in_a_bordered_box_during_paste_settling_are_not_submitted(
     workflow: Workflow,
 ) -> None:

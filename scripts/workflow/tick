@@ -513,6 +513,7 @@ shadow_session() {
     # An answer for the owner too, as `session answer-for-owner` would type it.
     answer-for-owner) bash "$here/session" would-answer "${@:2}" 9>&- ;;
     capacity-retry) bash "$here/session" would-capacity-retry "${@:2}" 9>&- ;;
+    retry-status) bash "$here/session" would-retry-status "${@:2}" 9>&- ;;
     *) shadow_note "session $*" ;;
   esac
 }
@@ -1141,6 +1142,69 @@ running=$(session list) || failed=1
 # finished; failures are finished too.
 # The sessions given a message in this tick: step 8 gives them no second one.
 nudged=" "
+status_pending=" "
+# Recover a status before any other wake can submit it as if it were a different message.
+# The note's identity keeps an exhausted draft exhausted until a new status is typed.
+while read -r name state _; do
+  [[ $state != limit && $name =~ ^(ticket|review)-([0-9]+)$ ]] || continue
+  number=${BASH_REMATCH[2]}
+  session_current "$name" || continue
+  typed_note=$main/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER/$name.typed
+  retry=$main/$SHIPLINE_STATE_FOLDER/$name.status-retry
+  if [[ ! -e $typed_note ]]; then
+    ((shadow)) || rm -f "$retry"
+    continue
+  fi
+  bash "$here/session" status-pending "$name" 9>&- || continue
+  # Even an edited draft or a temporarily blocked recovery belongs to this path alone.
+  # A checks wake, finish message or stuck nudge must not bypass its safety checks or bound.
+  nudged+="$name "
+  status_pending+="$name "
+  said_finished "$name" && continue
+  said_finished "$name" "review sent back" && continue
+  asks_owner "$name" && continue
+  bash "$here/session" would-retry-status "$name" 9>&- || continue
+  identity=$(stat -c '%i:%y' "$typed_note" 9>&- | cksum) || { failed=1; continue; }
+  identity=${identity%% *}
+  previous="" tries=0 named=0
+  { read -r previous tries named <"$retry"; } 2>/dev/null || true
+  if [[ $previous != "$identity" || ! $tries =~ ^[0-9]+$ || ! $named =~ ^[01]$ ]]; then
+    tries=0 named=0
+  fi
+  if ((tries >= NUDGE_RETRIES)); then
+    if ((named == 0)); then
+      line="stuck? $name (status message not taken; its text stays in the box)"
+      if note_for_wake "$name-status-$identity" "$line"; then
+        write_session_note "$name" "$retry" "$identity $tries 1" || failed=1
+        wake_log "$line" || failed=1
+      else
+        failed=1
+      fi
+    fi
+    continue
+  fi
+  # Count before sending, so a partial run cannot get unbounded extra key presses.
+  write_session_note "$name" "$retry" "$identity $((tries + 1)) 0" || { failed=1; continue; }
+  delivery=$(session retry-status "$name" 2>&1)
+  sent=$?
+  if ((sent == 0)); then
+    ((shadow)) || rm -f "$retry"
+    wake_log "$name status check sent again after its Enter was not taken" || failed=1
+    # If the hook has not removed the old wait yet, do not send its status again next tick.
+    for suffix in job-wait checks-wait idle; do
+      wait_note=${typed_note%.typed}.$suffix
+      if [[ -e $wait_note ]]; then
+        since=$(stat -c %Y "$wait_note" 9>&-) || continue
+        write_session_note "$name" "$main/$SHIPLINE_STATE_FOLDER/$name.kept-alive" "$since" || failed=1
+        break
+      fi
+    done
+  elif ((sent != 3)); then
+    echo "$delivery" >&2
+    wake_log "$name status check retry failed: $delivery"
+    failed=1
+  fi
+done <<<"$running"
 if train=$(WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/merge-when-current" --train-status 9>&-); then
 # A shadow tick notes the line it read whenever it changed: it explains a decision that differs.
 if ((shadow)); then
@@ -1151,6 +1215,7 @@ while read -r name state _; do
   [[ $state != limit && $name =~ ^(review|audit)-([0-9]+)$ ]] || continue
   number=${BASH_REMATCH[2]}
   session_current "$name" || continue
+  [[ $nudged != *" $name "* ]] || continue
   # Another member's gate call merged this one in a batch: it is no longer open or in the
   # train, and its own session still owes the after-merge duties.
   batch_merged=$main/$SHIPLINE_STATE_FOLDER/batch-merged-$number
@@ -1413,6 +1478,10 @@ nudge_busy() {
     outcome="; nudge sent"
   elif ((sent == 4)); then
     nudged+="$name "
+    if bash "$here/session" would-retry-status "$name" 9>&-; then
+      outcome="; interrupted, status text will be retried"
+      return 0
+    fi
     outcome="; interrupted, text left in its box"
   elif ((sent != 3)); then
     nudged+="$name "
@@ -1503,6 +1572,7 @@ while read -r name state _; do
   notes=$main/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER/$name
   [[ ! -e $notes.codex ]] || continue
   [[ ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked ]] || continue
+  [[ $status_pending != *" $name "* ]] || continue
 
   # Waiting for its own job, or a reviewer for its turn in the merge train. The stretch begins
   # at the stop that started the wait, and a message the session answers begins another.
@@ -1621,6 +1691,7 @@ while read -r name state _; do
             fi
           fi
         fi
+        [[ $outcome != "; interrupted, status text will be retried" ]] || continue
         line="wait loop finds itself? $name (running: $loop)$outcome"
         if [[ $later == true ]]; then
           :
@@ -1680,6 +1751,7 @@ while read -r name state _; do
   asks_permission "$name" && continue
   [[ ! -r $mark || $(<"$mark") != "$last_since $head" ]] || continue
   nudge_busy "$name" still stuck
+  [[ $outcome != "; interrupted, status text will be retried" ]] || continue
   line="stuck? $name ($(((NOW - last_since) / 60)) min, running: ${what:-no command})$outcome"
   if note_for_wake "$name-stuck-$last_since-$NOW" "$line"; then
     write_session_note "$name" "$mark" "$last_since $head" || failed=1
