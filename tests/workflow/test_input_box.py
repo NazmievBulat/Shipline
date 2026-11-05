@@ -110,6 +110,21 @@ def test_bordered_owner_text_is_never_submitted_even_with_an_automation_note(
     assert (workflow.state / "input-review-7").read_text() == text
 
 
+@pytest.mark.parametrize("text", [_STATUS, _STATUS + " more", "Owner draft"])
+def test_bordered_status_recovery_without_wait_notes(workflow: Workflow, text: str) -> None:
+    _bordered_input(workflow, text=text)
+    notes = workflow.notes(7)
+    (notes / "review-7.idle").unlink()
+    (notes / "review-7.typed").write_text(_STATUS)
+
+    done = workflow.run("retry-status", "review-7")
+
+    assert done.returncode == (0 if text == _STATUS else 3), done.stderr
+    assert workflow.calls("tmux review-7 send-keys") == (
+        ["tmux review-7 send-keys -t =review-7: Enter"] if text == _STATUS else []
+    )
+
+
 def test_owner_edits_in_a_bordered_box_during_paste_settling_are_not_submitted(
     workflow: Workflow,
 ) -> None:

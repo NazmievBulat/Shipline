@@ -95,6 +95,92 @@ def test_a_status_check_typed_but_not_sent_is_sent_at_the_next_tick(workflow: Wo
     assert "status check sent" in workflow.wake_log.read_text()
 
 
+@pytest.mark.parametrize("name", ["ticket-7", "review-7"])
+def test_own_status_without_wait_notes_is_sent_on_the_next_tick(
+    workflow: Workflow, name: str
+) -> None:
+    notes = _session(workflow, name)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / f"input-{name}").write_text(_STATUS)
+
+    _tick(workflow, _NOW)
+
+    assert _keys(workflow, name) == ["Enter"]
+    assert not notes.with_suffix(".typed").exists()
+    assert _pending(workflow) == []
+
+
+@pytest.mark.parametrize("wait_note", [False, True])
+def test_unsent_status_has_three_single_enter_retries_and_is_named_once(
+    workflow: Workflow, wait_note: bool
+) -> None:
+    notes = _waiting(workflow) if wait_note else _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    (workflow.state / "swallow-enter-ticket-7").write_text("100")
+
+    codes = [workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)}).returncode
+             for n in range(7)]
+
+    assert codes == [1, 1, 1, 0, 0, 0, 0]
+    assert _keys(workflow, "ticket-7") == ["Enter"] * 3
+    line = "stuck? ticket-7 (status message not taken; its text stays in the box)"
+    assert _pending(workflow) == [line]
+    assert workflow.wake_log.read_text().count(line) == 1
+
+
+@pytest.mark.parametrize("text", ["Owner draft", _STATUS + " more", "A different tick message"])
+def test_status_recovery_never_touches_changed_text(workflow: Workflow, text: str) -> None:
+    notes = _waiting(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(text)
+
+    _tick(workflow, _NOW)
+    _tick(workflow, _NOW + 3600)
+
+    assert _keys(workflow, "ticket-7") == []
+    assert (workflow.state / "input-ticket-7").read_text() == text
+
+
+def test_status_recovery_does_not_send_another_recorded_message(workflow: Workflow) -> None:
+    notes = _waiting(workflow)
+    notes.with_suffix(".typed").write_text("A different tick message")
+    (workflow.state / "input-ticket-7").write_text("A different tick message")
+
+    _tick(workflow, _NOW)
+
+    assert _keys(workflow, "ticket-7") == []
+
+
+def test_escape_restoring_own_status_is_recovered_on_the_next_tick(workflow: Workflow) -> None:
+    _still(workflow)
+    (workflow.notes(7) / "ticket-7.typed").write_text(_STATUS)
+    (workflow.state / "input-after-escape-ticket-7").write_text(_STATUS)
+
+    _tick(workflow, _NOW + 2700)
+    assert _keys(workflow, "ticket-7") == ["Escape"]
+    assert _pending(workflow) == []
+    _tick(workflow, _NOW + 2880)
+
+    assert _keys(workflow, "ticket-7") == ["Escape", "Enter"]
+    assert _pending(workflow) == []
+
+
+@pytest.mark.parametrize("case", ["asking", "owner-blocked", "interaction-blocked", "codex", "permission"])
+def test_status_recovery_keeps_existing_safety_guards(workflow: Workflow, case: str) -> None:
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    if case == "permission":
+        workflow.screen("Do you want to run this command?\n" + _BOX, "ticket-7")
+    else:
+        notes.with_suffix(f".{case}").touch()
+
+    _tick(workflow, _NOW)
+
+    assert _keys(workflow, "ticket-7") == []
+
+
 @pytest.mark.parametrize("kind", ["status", "finish"])
 def test_owner_text_over_a_stale_note_of_the_tick_is_left_alone(
     workflow: Workflow, kind: str
@@ -587,7 +673,7 @@ def test_a_nudge_that_is_never_taken_is_tried_three_more_times_then_named(
     assert "stuck? ticket-7 (nudge not taken; its text stays in the box)" in _pending(workflow)
 
 
-def test_a_message_of_the_tick_left_in_the_box_is_not_sent_for_a_nudge(
+def test_a_status_left_in_the_box_is_sent_before_a_nudge(
     workflow: Workflow,
 ) -> None:
     _still(workflow)
@@ -599,8 +685,8 @@ def test_a_message_of_the_tick_left_in_the_box_is_not_sent_for_a_nudge(
 
     _tick(workflow, _NOW + 2700)
 
-    assert _keys(workflow, "ticket-7") == []
-    assert _pending(workflow) == ["stuck? ticket-7 (45 min, running: pytest tests)"]
+    assert _keys(workflow, "ticket-7") == ["Enter"]
+    assert _pending(workflow) == []
 
 
 def test_a_session_that_turns_busy_starts_its_45_minutes_then(workflow: Workflow) -> None:
