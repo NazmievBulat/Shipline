@@ -512,7 +512,7 @@ def rerun(folder: Path, diagnosis: Diagnosis) -> str | None:
         folder.mkdir(parents=True, exist_ok=True)
         # Claimed before GitHub is asked: an interrupted request is never sent twice.
         try:
-            with claim.open("x", opener=lambda name, flags: os.open(name, flags, 0o600)) as output:
+            with open(claim, "x", opener=lambda name, flags: os.open(name, flags, 0o600)) as output:
                 json.dump({
                     "state": "claim", "downloads": diagnosis.downloads.get(found["id"], []),
                 }, output)
