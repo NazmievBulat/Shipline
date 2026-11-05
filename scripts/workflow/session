@@ -61,9 +61,10 @@
 #                               whether that wait is over (the tick does this, to keep its cache)
 #   session finish-ready <ticket-N>
 #                               tell an idle worker whose pull request is ready to finish
-#   session retry-status <ticket-N|review-N>
+#   session retry-status <ticket-N|review-N> [after-reset]
 #                               send only its unchanged, unsent status text, with one Enter
-#   session would-retry-status <ticket-N|review-N>
+#                               after-reset: the tick has checked the usage reset passed
+#   session would-retry-status <ticket-N|review-N> [after-reset]
 #                               retry-status's checks alone, pressing nothing
 #   session status-pending <ticket-N|review-N>
 #                               whether a recorded status still has input to protect
@@ -189,7 +190,8 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session lost-check <review-N> <head>
        session batch-merged <review-N> <squash>
        session status-check <ticket-N|review-N>
-       session retry-status|would-retry-status|status-pending <ticket-N|review-N>
+       session retry-status|would-retry-status <ticket-N|review-N> [after-reset]
+       session status-pending <ticket-N|review-N>
        session finish-ready <ticket-N>
        session nudge-busy <ticket-N|review-N> <still|loop> [again]
        session would-nudge <ticket-N|review-N> <still|loop> [again]
@@ -1613,7 +1615,9 @@ status_retry_checks() {
   [[ ! -e $notes.codex && ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked &&
      ! -e $notes.asking ]] || return 3
   [[ -r $notes.typed && $(cat "$notes.typed") == "$(status_message)" ]] || return 3
-  ! stopped_on_limit "$name" || return 3
+  if [[ ${status_after_reset:-false} != true ]]; then
+    ! stopped_on_limit "$name" || return 3
+  fi
   screen=$(tmux -L "$name" capture-pane -p -t "=$name:" 2>/dev/null) || return 1
   if LC_ALL=C grep -qE '^[[:space:]│]*Do you want to [^?]*\?' <<<"$screen"; then return 3; fi
   holds_own_text "$name" || return 3
@@ -2305,7 +2309,8 @@ case ${1:-} in
     cmd_nudge_idle "$2" status
     ;;
   retry-status | would-retry-status | status-pending)
-    [[ $# -eq 2 && $2 =~ ^(ticket|review)-[0-9]+$ ]] || usage
+    [[ ($# -eq 2 || ($# -eq 3 && $1 != status-pending && $3 == after-reset)) &&
+       $2 =~ ^(ticket|review)-[0-9]+$ ]] || usage
     find_main_checkout
     if [[ $1 == status-pending ]]; then
       notes=$(worktree_of "$2")/$SHIPLINE_STATE_FOLDER/$2
@@ -2315,6 +2320,8 @@ case ${1:-} in
       [[ -n $typed ]] || exit 3
       exit 0
     fi
+    status_after_reset=false
+    [[ ${3:-} != after-reset ]] || status_after_reset=true
     status_retry_checks "$2" || exit $?
     [[ $1 == would-retry-status ]] || send_prompt "$2" "$(status_message)" 1
     ;;

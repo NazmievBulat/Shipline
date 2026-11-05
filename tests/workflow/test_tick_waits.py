@@ -216,6 +216,54 @@ def test_a_fast_answer_to_recovery_does_not_mark_its_new_wait_kept_alive(
     assert _keys(workflow, "ticket-7") == ["Enter", _STATUS, "Enter"]
 
 
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_a_usage_reset_keeps_the_same_status_retry_bound(
+    workflow: Workflow, exhausted: bool
+) -> None:
+    from test_tick_limit import _at, _stopped
+
+    now = int(_at(16, 10)["WORKFLOW_NOW"])
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    (workflow.state / "swallow-enter-ticket-7").write_text("100")
+    if exhausted:
+        for n in range(3):
+            done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(now - 1800 + 180 * n)})
+            assert done.returncode == 1
+    workflow.screen(_stopped("4:10pm (America/New_York)"), "ticket-7")
+    _tick(workflow, now - 60)
+    assert _keys(workflow, "ticket-7") == (["Enter"] * 3 if exhausted else [])
+
+    codes = [workflow.run_script("tick", env={"WORKFLOW_NOW": str(now + 180 * n)}).returncode
+             for n in range(7)]
+
+    assert codes == ([0] * 7 if exhausted else [1, 1, 1, 0, 0, 0, 0])
+    assert _keys(workflow, "ticket-7") == ["Enter"] * 3
+    assert _pending(workflow) == [
+        "stuck? ticket-7 (status message not taken; its text stays in the box)"
+    ]
+
+
+@pytest.mark.parametrize("shadow", [False, True])
+def test_status_delivery_after_reset_is_single_and_shadow_presses_nothing(
+    workflow: Workflow, shadow: bool
+) -> None:
+    from test_tick_limit import _at, _stopped
+
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    workflow.screen(_stopped("4:10pm (America/New_York)"), "ticket-7")
+
+    for minute in (10, 13):
+        done = workflow.run_script("tick", *(["--shadow"] if shadow else []), env=_at(16, minute))
+        assert done.returncode == 0, done.stderr
+
+    assert _keys(workflow, "ticket-7") == ([] if shadow else ["Enter"])
+    assert notes.with_suffix(".typed").exists() == shadow
+
+
 def test_escape_restoring_own_status_is_recovered_on_the_next_tick(workflow: Workflow) -> None:
     _still(workflow)
     (workflow.notes(7) / "ticket-7.typed").write_text(_STATUS)
