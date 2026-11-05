@@ -49,6 +49,7 @@ def _session(workflow: Workflow, name: str = "ticket-7", *, draft: bool = True) 
     workflow.add_worktree(7, draft=draft)
     workflow.running(name)
     workflow.screen("● Waiting for the full Python run in the background.\n" + _BOX, name)
+    workflow.notes(7).mkdir(parents=True, exist_ok=True)
     return workflow.notes(7) / name
 
 
@@ -126,7 +127,8 @@ def test_unsent_status_has_three_single_enter_retries_and_is_named_once(
     assert _keys(workflow, "ticket-7") == ["Enter"] * 3
     line = "stuck? ticket-7 (status message not taken; its text stays in the box)"
     assert _pending(workflow) == [line]
-    assert workflow.wake_log.read_text().count(line) == 1
+    assert [row for row in workflow.wake_log.read_text().splitlines()
+            if row.split(" ", 1)[-1] == line] == [f"{_NOW + 540} {line}"]
 
 
 @pytest.mark.parametrize("text", ["Owner draft", _STATUS + " more", "A different tick message"])
