@@ -171,6 +171,29 @@ exec /usr/bin/git "$@"
     assert not (_folder(workflow) / "machine-errors").exists()
 
 
+@pytest.mark.parametrize("code", [1, 75])
+def test_checkout_machine_errors_keep_the_handoff_and_reach_the_wake(
+    handed: GitHub, code: int,
+) -> None:
+    from workflow.test_commands import _configure
+
+    workflow = handed.workflow
+    workflow.orchestrator("busy")
+    _stale_refresh(handed)
+    _configure(workflow, push_checkout="example-checkout")
+    workflow.fake("example-checkout", "#!/bin/bash\n"
+                  "echo 'OSError: Read-only file system' >&2\n"
+                  f"exit {code}\n")
+    before = _note(workflow).read_bytes()
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert _note(workflow).read_bytes() == before
+        assert _started(workflow) == []
+        assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
+    assert "\n".join(workflow.sent()).count("Machine error: OSError: Read-only file system") == 1
+
+
 def test_the_tick_drives_a_red_main_fix_handed_off_behind_another_pull(handed: GitHub) -> None:
     workflow = handed.workflow
     second = workflow.worktree(8)

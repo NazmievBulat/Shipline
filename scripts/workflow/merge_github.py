@@ -94,7 +94,17 @@ def repository_command(
     folder and bounded like every command; None when the repository names none. It reads
     `input`, and never the gate's own standard input. A command that is named but cannot start
     stops the gate's call."""
-    from merge_gate import CONFIG, PackagesWaiting, Refused, Waiting, command
+    from merge_gate import (
+        CONFIG,
+        MachineWaiting,
+        PackagesWaiting,
+        Refused,
+        Waiting,
+        command,
+        machine_error,
+        main_checkout,
+        note_machine_result,
+    )
     from workflow_config import pass_fail_command
 
     words = CONFIG.command(name)
@@ -106,6 +116,11 @@ def repository_command(
         raise Refused(
             f"cannot run the repository's {name} command, {shlex.join(words)}: {error}"
         ) from error
+    if name == "push_checkout" and len(args) == 2 and args[0] == "install" and done.returncode:
+        error = machine_error(done.stdout + "\n" + done.stderr, Path(args[1]))
+        note_machine_result(main_checkout() / CONFIG.state_folder, error)
+        if error:
+            raise MachineWaiting(error)
     if name != "pre_train_checks" and done.returncode == 75 and pass_fail_command(name, args):
         waiting = PackagesWaiting if name == "push_checkout" else Waiting
         raise waiting(f"{name} waits: {said(done)}")
@@ -231,10 +246,6 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         checkout = Path(git("-C", str(checkout), "rev-parse", "--show-toplevel"))
         installed = repository_command("push_checkout", "install", str(checkout))
         if installed and installed.returncode:
-            error = machine_error(installed.stdout + "\n" + installed.stderr, checkout)
-            note_machine_result(folder, error)
-            if error:
-                raise MachineWaiting(error)
             raise PackagesWaiting(said(installed))
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
     merged = ("env", "EIO_BACKEND=posix", "sh", "-c", 'exec "$@" 2>&1', "push", *git_args)
