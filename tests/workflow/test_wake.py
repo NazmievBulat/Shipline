@@ -1315,15 +1315,26 @@ def test_shadow_result_neither_counts_nor_rings(night: Workflow) -> None:
 
 
 
-def test_a_missed_phone_push_is_logged_once_per_stretch(night: Workflow) -> None:
-    for _ in range(4):
+def test_a_missed_phone_push_is_retried_until_delivered_once(night: Workflow) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = night.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    (night.state / "pushover-fails").touch()
+    failed = night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    assert failed.returncode == 1
+    assert len(night.pushes()) == 1
+    [line] = night.missed_pushes.read_text().splitlines()
+    assert "Workflow needs you" in line and "cannot fetch main" in line
+    assert "orchestrator" in line
+    (night.state / "pushover-fails").unlink()
+    for _ in range(2):
         done = night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
         assert done.returncode == 0, done.stderr
-    assert night.pushes() == []
-    [line] = night.missed_pushes.read_text().splitlines()
-    assert "Workflow needs you" in line
-    assert "cannot fetch main" in line
-    assert "orchestrator" in line
+    assert len(night.pushes()) == 2  # one failed attempt, then one delivered push
 
 
 def test_an_undelivered_alert_to_an_open_orchestrator_is_retried(night: Workflow) -> None:

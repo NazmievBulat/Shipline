@@ -23,8 +23,8 @@
 # `notify workflow` reads a persistent workflow fault from stdin, without WORKFLOW_SESSION.
 # Other modes do nothing unless WORKFLOW_SESSION names a worker (`ticket-N`), an audit (`audit-N`) or
 # a hunt (`hunt-<name>`), so the orchestrator and sessions started by hand never ring. A hook must never block or fail
-# a session: this always exits 0, prints nothing, and gives GitHub and Pushover a few seconds
-# each.
+# a session: hooks always exit 0, print nothing, and give GitHub and Pushover a few seconds
+# each. Workflow mode reports a failed push to its caller so the next tick can retry.
 #
 # `gh`, `curl`, `jq`, `git` and `timeout` are found on the PATH, so a test can replace them, and
 # WORKFLOW_NOW can name the time.
@@ -96,8 +96,9 @@ ring() {
 if [[ ${1:-} == workflow ]]; then
   exec >/dev/null 2>&1
   message=$(cat)
-  [[ -z $message ]] || push_or_log "Workflow needs you" "$message" "" || true
-  exit 0
+  [[ -n $message ]] || exit 0
+  push_or_log "Workflow needs you" "$message" ""
+  exit "$?"
 fi
 
 name=${WORKFLOW_SESSION:-}

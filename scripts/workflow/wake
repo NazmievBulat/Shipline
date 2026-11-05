@@ -235,11 +235,14 @@ if [[ ${1:-} == --tick-result ]]; then
     result="3 0 1"
   else
     fix="To restore check-ins, write the open session's name to $SHIPLINE_STATE_FOLDER/orchestrator in the main checkout."
-    bash "$here/notify" workflow <<<"$message"$'\n'"$fix" 8>&- 9>&- || exit 1
-    log "  persistent workflow alert sent to phone (failed pushes are in missed-pushes.log): $message; $fix"
+    if ! bash "$here/notify" workflow <<<"$message"$'\n'"$fix" 8>&- 9>&-; then
+      log "  persistent workflow phone push failed; see missed-pushes.log; the next tick retries: $message; $fix"
+      exit 1
+    fi
+    log "  persistent workflow alert sent to phone: $message; $fix"
     result="3 1 0"
   fi
-  # An attempted phone push is once per stretch even when it was logged as missed.
+  # Only a confirmed delivery acknowledges the stretch, as for session pushes in notify.
   # Recheck availability after telling the orchestrator: if it disappears before recovery,
   # the owner must still hear about the same continuing fault.
   for file in "${alert_files[@]}"; do

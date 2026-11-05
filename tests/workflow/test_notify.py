@@ -1434,7 +1434,7 @@ def test_workflow_alert_keeps_the_push_time_limit_and_missed_log(session: Workfl
     done = session.run_script("notify", "workflow", stdin="Tick failed: cannot fetch main.",
                               env={"WORKFLOW_NOTIFY_SECONDS": "1"})
 
-    assert done.returncode == 0
+    assert done.returncode == 1
     assert 0 < session.timeout_budget() <= 4
     assert session.calls("interrupted-curl") == ["interrupted-curl"]
     assert "Workflow needs you  Tick failed: cannot fetch main." in session.missed_pushes.read_text()
