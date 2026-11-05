@@ -1339,3 +1339,18 @@ def test_an_undelivered_alert_to_an_open_orchestrator_is_retried(night: Workflow
     assert len(night.sent()) == 2
     assert night.pushes() == []
     assert not night.missed_pushes.exists()
+
+
+@pytest.mark.parametrize("status", ["129", "130", "143"])
+def test_an_operator_stop_neither_advances_nor_resets_a_failure_stretch(
+    night: Workflow, status: str,
+) -> None:
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    for _ in range(3):
+        done = night.run_script("wake", "--tick-result", status, "stopped", env=_at(12))
+        assert done.returncode == 0, done.stderr
+    assert not night.missed_pushes.exists()
+    night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    [line] = night.missed_pushes.read_text().splitlines()
+    assert "Tick failed 3 runs in a row: cannot fetch main" in line

@@ -179,6 +179,8 @@ $message
 if [[ ${1:-} == --tick-result ]]; then
   [[ -z $shadow ]] || exit 0
   [[ $# == 3 && $2 =~ ^[0-9]+$ ]] || exit 2
+  # The self-update watcher also leaves an interrupted tick uncounted.
+  case $2 in 129 | 130 | 143) exit 0 ;; esac
   notes=$main/$SHIPLINE_STATE_FOLDER
   mkdir -p "$notes" "$STATE"
   umask 077
