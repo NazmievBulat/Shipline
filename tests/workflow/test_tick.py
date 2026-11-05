@@ -1847,3 +1847,82 @@ while [[ ! -e $WORKFLOW_ALERT_TEST_STATE/release-metrics ]]; do /bin/sleep 0.05;
         if tick.poll() is None:
             tick.kill()
         tick.communicate(timeout=10)
+
+
+@pytest.mark.parametrize(
+    ("state_folder", "problem", "established", "open_orchestrator"),
+    [
+        (".local/workflow", "malformed", False, False),
+        (".local/named-state", "malformed", True, False),
+        (".local/named-state", "missing", True, False),
+        (".local/named-state", "unreadable", True, False),
+        (".local/named-state", "malformed", True, True),
+    ],
+    ids=["first-config", "custom-json", "custom-missing", "custom-unreadable", "open"],
+)
+def test_configuration_failures_count_before_tick_startup_and_recover(
+    workflow: Workflow, state_folder: str, problem: str,
+    established: bool, open_orchestrator: bool,
+) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = workflow.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    _readable_main(workflow)
+    notes = workflow.repo / state_folder
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "main-status").write_text("main: green\n")
+    values = json.loads((workflow.repo / "shipline.json").read_text())
+    values["state_folder"] = state_folder
+    valid = json.dumps(values)
+    selected = workflow.repo / ".local/alert-config.json"
+    selected.write_text(valid)
+    env = {"SHIPLINE_CONFIG": str(selected)}
+    if open_orchestrator:
+        workflow.orchestrator("busy")
+        registration = workflow.repo / ".local/workflow/orchestrator"
+        registration.rename(notes / "orchestrator")
+    if established:
+        done = workflow.run_script("tick", env=env)
+        assert done.returncode == 0, done.stderr
+    told_before = len(workflow.sent())
+
+    def break_config() -> None:
+        if problem == "malformed":
+            selected.write_text("{")
+        else:
+            selected.unlink()
+            if problem == "unreadable":
+                selected.mkdir()
+
+    break_config()
+    for _ in range(2):
+        assert workflow.run_script("tick", env=env).returncode != 0
+    assert workflow.pushes() == []
+    assert len(workflow.sent()) == told_before
+    for _ in range(2):
+        assert workflow.run_script("tick", env=env).returncode != 0
+    if open_orchestrator:
+        assert workflow.pushes() == []
+        assert len(workflow.sent()) == told_before + 1
+        message = workflow.sent()[-1]
+    else:
+        [push] = workflow.pushes()
+        assert f"{state_folder}/orchestrator" in push.message
+        message = push.message
+    assert ("not JSON" if problem == "malformed" else "cannot be read") in message
+
+    if selected.is_dir():
+        selected.rmdir()
+    selected.write_text(valid)
+    recovered = workflow.run_script("tick", env=env)
+    assert recovered.returncode == 0, recovered.stderr
+    break_config()
+    for _ in range(3):
+        workflow.run_script("tick", env=env)
+    if open_orchestrator:
+        assert len(workflow.sent()) == told_before + 2
+        assert workflow.pushes() == []
+    else:
+        assert len(workflow.pushes()) == 2
