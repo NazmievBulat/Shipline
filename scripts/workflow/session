@@ -66,7 +66,7 @@
 #   session would-retry-status <ticket-N|review-N>
 #                               retry-status's checks alone, pressing nothing
 #   session status-pending <ticket-N|review-N>
-#                               whether its recorded draft is the status message
+#                               whether a recorded status still has input to protect
 #   session nudge-busy <ticket-N|review-N> <still|loop> [again]
 #                               press Escape in a busy Claude session whose screen has not
 #                               changed for 45 minutes, or whose wait loop finds itself, and
@@ -2310,6 +2310,9 @@ case ${1:-} in
     if [[ $1 == status-pending ]]; then
       notes=$(worktree_of "$2")/$SHIPLINE_STATE_FOLDER/$2
       [[ ! -e $notes.codex && -r $notes.typed && $(cat "$notes.typed") == "$(status_message)" ]] || exit 3
+      name=$2
+      read_prompt_box
+      [[ -n $typed ]] || exit 3
       exit 0
     fi
     status_retry_checks "$2" || exit $?

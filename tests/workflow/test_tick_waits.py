@@ -363,6 +363,15 @@ def test_a_checks_wake_cannot_bypass_the_status_retry_path(workflow: Workflow) -
         "stuck? review-7 (status message not taken; its text stays in the box)"
     ]
 
+    # The owner submits it by hand after the bound. A stale .typed note must not
+    # block the checks wake once the input is empty.
+    (workflow.state / "input-review-7").write_text("")
+    (workflow.state / "swallow-enter-review-7").unlink()
+    _tick(workflow, _NOW + 1080)
+
+    assert len(_typed(workflow, "review-7", "The checks on ")) == 1
+    assert len(list((workflow.repo / ".local/workflow").glob("review-7.checks-nudged-*"))) == 1
+
 
 def test_an_idle_session_waiting_for_nothing_named_is_not_kept_alive(
     workflow: Workflow,
