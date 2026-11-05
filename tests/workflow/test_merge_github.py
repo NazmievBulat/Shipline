@@ -824,9 +824,11 @@ def test_a_refresh_push_short_of_memory_is_retried_a_minute_later(
 
 
 @pytest.mark.parametrize("stream", [1, 2])
-@pytest.mark.parametrize("message", MEMORY_SHORTAGES)
-def test_a_refresh_push_that_fails_twice_is_refused_naming_the_error(
-    github: GitHub, message: str, stream: int
+@pytest.mark.parametrize("message,machine", [
+    (MEMORY_SHORTAGES[0], True), (MEMORY_SHORTAGES[1], False),
+])
+def test_a_refresh_push_short_of_memory_names_the_error_and_waits_for_machine_errors(
+    github: GitHub, message: str, machine: bool, stream: int
 ) -> None:
     _stale(github)
     short_of_memory(github.workflow, message, times=2, stream=stream)
@@ -836,8 +838,12 @@ def test_a_refresh_push_that_fails_twice_is_refused_naming_the_error(
     assert done.returncode == 1, done.stdout + done.stderr
     # The scan's own words on the line the wake shows, not "$ sh scripts/security-scan.sh all".
     refusal = _refusal(done)
-    assert refusal.startswith("merge refused: could not push the refreshed branch: "), refusal
-    assert message in refusal and "a minute apart" in refusal, refusal
+    if machine:
+        assert refusal.startswith("merge waiting: " + message), refusal
+        assert "free memory or raise the memory limit" in refusal
+    else:
+        assert refusal.startswith("merge refused: could not push the refreshed branch: "), refusal
+        assert message in refusal and "a minute apart" in refusal, refusal
     assert len(github.workflow.calls("sleep 60")) == 1
     assert (
         github.workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0]
@@ -846,18 +852,22 @@ def test_a_refresh_push_that_fails_twice_is_refused_naming_the_error(
     assert hook_runs(github.workflow) == ["EIO_BACKEND=posix"] * 2
 
 
-# Any other program out of memory (lint, the web tests) is not the scan's locked memory: a
-# retry would not help, and a batch would wait on it for ever.
+# Other failures get no scan-specific retry inside the call. A machine allocation failure
+# waits for the next tick; a finding still needs the branch to change.
 @pytest.mark.parametrize(
-    "message", ["secret found in config.py", "bash: fork: Cannot allocate memory"]
+    "message,waiting", [("secret found in config.py", False),
+                        ("bash: fork: Cannot allocate memory", True)]
 )
-def test_a_push_failing_for_another_reason_is_not_retried(github: GitHub, message: str) -> None:
+def test_a_push_failing_for_another_reason_is_not_retried_inside_the_call(
+    github: GitHub, message: str, waiting: bool,
+) -> None:
     _stale(github)
     short_of_memory(github.workflow, message, times=1)
 
     done = github.run()
 
     assert done.returncode == 1 and message in done.stderr, done.stdout + done.stderr
+    assert ("merge waiting" if waiting else "merge refused") in done.stderr
     assert hook_runs(github.workflow) == ["EIO_BACKEND=posix"]
     assert github.workflow.calls("sleep 60") == []
 
@@ -884,18 +894,22 @@ def test_a_batch_push_the_hook_keeps_refusing_is_refused_on_the_third_call(
     assert github.workflow.calls("gh workflow run") == []
 
 
-def test_a_batch_push_that_stalls_past_its_deadline_waits_for_the_next_call(
-    github: GitHub,
+@pytest.mark.parametrize("message,machine", [
+    (MEMORY_SHORTAGES[0], True), (MEMORY_SHORTAGES[1], False),
+])
+def test_a_batch_push_deadline_spends_a_retry_only_without_a_machine_error(
+    github: GitHub, message: str, machine: bool,
 ) -> None:
     _batch_setup(github)
     workflow = github.workflow
     hooks = workflow.bin / "hooks"
     stalled = workflow.state / "stalled"
     hooks.mkdir(exist_ok=True)
-    # Its scan ran short of memory first: a stall counts all the same, and is never retried.
+    # A printed allocation error stays a machine wait even at the deadline. Without that
+    # evidence, a stalled scan still spends a retry, including a locked-memory warning.
     (hooks / "pre-push").write_text(
         f'#!/bin/bash\n[ -e "{stalled}" ] && exit 0\ntouch "{stalled}"\n'
-        f"echo {json.dumps(MEMORY_SHORTAGES[0])}\nexec /bin/sleep 30\n"
+        f"echo {json.dumps(message)}\nexec /bin/sleep 30\n"
     )
     (hooks / "pre-push").chmod(0o755)
     workflow.git("config", "core.hooksPath", str(hooks))
@@ -921,7 +935,8 @@ def test_a_batch_push_that_stalls_past_its_deadline_waits_for_the_next_call(
     assert done.returncode == 1 and "merge waiting" in done.stderr, done.stdout + done.stderr
     batch = _scratch(github)
     assert batch is not None
-    assert batch["pushed"] is False and batch["push_failures"] == 1
+    assert batch["pushed"] is False
+    assert batch.get("push_failures", 0) == (0 if machine else 1)
     assert workflow.calls("sleep 60") == []
     assert _batch_call(github).returncode == 3
     assert all(member["scratch"]["pushed"] for member in _prefixes(github))
