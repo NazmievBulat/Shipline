@@ -102,15 +102,19 @@ def image_download(diagnostics: str) -> dict[str, str] | None:
         if line == "##[endgroup]":
             preamble = False
             continue
-        if _CONTAINER_OUTPUT.search(line):
-            continue
         if not preamble and _PULL_COMPLETE.search(line):
             pulling = False
+        pull_command = _PULL_COMMAND.search(line)
         # GitHub prints the entire shell script before running it. A later test command
         # in that preamble does not mean tests started before the pull failed.
-        if (not preamble or group) and (first_test(line) or _TEST_START.search(line)):
+        if (
+            (not preamble or group) and not pull_command
+            and (first_test(line) or _TEST_START.search(line))
+        ):
             return None
-        if _PULL_COMMAND.search(line):
+        if _CONTAINER_OUTPUT.search(line):
+            continue
+        if pull_command:
             pulling = True
         if pulling and not preamble and (found := _DOWNLOAD.search(line)):
             return {"form": found[0].split(":", 1)[0].lower(), "line": found[0]}

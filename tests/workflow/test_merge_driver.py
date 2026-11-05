@@ -3538,6 +3538,7 @@ def test_repeated_image_download_waits_only_for_the_same_runner_and_failure(
 @pytest.mark.parametrize("log", [
     "##[group]Run docker compose up -d database\npytest\n##[endgroup]\n" + _DOWNLOAD_LINE + "\n" + _FAILED_TEST,
     "Run docker pull example-app\nunexpected EOF\n" + _FAILED_TEST,
+    "Run docker pull playwright\nunexpected EOF\n" + _FAILED_TEST,
 ])
 def test_download_order_uses_execution_output_after_the_command_preamble(
     handed: GitHub, log: str
@@ -3560,6 +3561,7 @@ def test_download_order_uses_execution_output_after_the_command_preamble(
     "Run docker compose up database\nexample-app | toomanyrequests\n" + _FAILED_TEST,
     "Run docker compose up -d database\nContainer example-app Started\n" + _DOWNLOAD_LINE + "\n" + _FAILED_TEST,
     "Run docker pull example-app\nStatus: Image is up to date for example-app\nunexpected EOF\n" + _FAILED_TEST,
+    "Run docker compose up database\nexample-app | " + _FAILED_TEST + _COMPOSE_DOWNLOAD,
     "##[group]Run docker compose up -d database\necho toomanyrequests\n##[endgroup]\n" + _FAILED_TEST,
 ])
 def test_download_context_does_not_override_tests_that_already_started(
