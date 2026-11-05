@@ -21,6 +21,14 @@ _WORKER_SAID_FINISHED = (
 )
 
 
+def _readable_main(workflow: Workflow) -> None:
+    """Keep main readable in scenarios whose GitHub stand-ins supply no main CI data."""
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "main-status").write_text("main: green\n")
+    workflow.script.with_name("main-status").write_text("#!/bin/bash\nexit 0\n")
+
+
 def _started(workflow: Workflow) -> list[str]:
     return [call.split()[1] for call in workflow.calls("tmux") if " new-session " in call]
 
