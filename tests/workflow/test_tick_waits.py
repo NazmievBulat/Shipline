@@ -156,6 +156,7 @@ def test_failed_status_is_recovered_even_when_submit_removed_the_wait_notes(
     workflow: Workflow,
 ) -> None:
     notes = _waiting(workflow)
+    _tick(workflow, _NOW - 2700)
     (workflow.state / "swallow-enter-ticket-7").write_text("2")
     (workflow.state / "on-sleep").write_text(
         f"if [[ -e {shlex.quote(str(notes.with_suffix('.typed')))} ]]; then "
@@ -165,6 +166,7 @@ def test_failed_status_is_recovered_even_when_submit_removed_the_wait_notes(
     first = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW)})
     assert first.returncode == 1
     assert not notes.with_suffix(".job-wait").exists()
+    assert _pending(workflow) == []
     _tick(workflow, _NOW + 180)
 
     assert _keys(workflow, "ticket-7") == [_STATUS, "Enter", "Enter", "Enter"]

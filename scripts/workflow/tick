@@ -1593,6 +1593,7 @@ while read -r name state _; do
       [[ ! -r $mark || $(<"$mark") != "$since" ]] && quiet "$name"; then
     delivery=$(session status-check "$name" 2>&1)
     sent=$?
+    ((sent == 3)) || nudged+="$name "
     if ((sent == 0)); then
       write_session_note "$name" "$mark" "$since" || failed=1
       wake_log "$name idle $(((NOW - since) / 60)) min waiting for its own job or turn; status check sent" ||
@@ -1602,6 +1603,9 @@ while read -r name state _; do
       wake_log "$name status check failed: $delivery"
       failed=1
     fi
+    # The submit hook can remove the wait while this call is still polling. Its new
+    # draft belongs to next tick's recovery, not this tick's busy detector.
+    ((sent == 3)) || continue
   elif ((shadow)) && [[ $since =~ ^[0-9]+$ && ! -e $notes.asking ]] &&
       ((NOW - since < KEEP_ALIVE_AFTER_SECONDS)) &&
       [[ ! -r $mark || $(<"$mark") != "$since" ]] && quiet "$name"; then
