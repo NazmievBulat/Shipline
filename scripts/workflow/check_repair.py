@@ -8,6 +8,7 @@ cannot be read, and a second failing test in a row are judged by a fresh reviewe
 """
 
 import json
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass, field
@@ -54,6 +55,66 @@ _BUILD_TRANSPORT = re.compile(
     re.IGNORECASE,
 )
 _VERTEX = re.compile(r"(?<!\w)#(\d+)\s+")
+# Docker pull/Compose setup failures, scoped to the command's step and before tests:
+# short read: expected <n> bytes but got <n>[: unexpected EOF], unexpected EOF,
+# failed to copy: httpReadSeeker, and toomanyrequests. Keep only these diagnostic
+# words (and byte counts), never a registry URL, credentials or an image reference.
+_DOWNLOAD = re.compile(
+    r"short read(?:: expected \d+ bytes but got \d+)?(?:: unexpected EOF)?"
+    r"|unexpected EOF|failed to copy:\s*httpReadSeeker|toomanyrequests",
+    re.IGNORECASE,
+)
+_PULL_COMMAND = re.compile(
+    r"^(?:##\[group\])?(?:Run\s+)?(?:sudo\s+)?docker\s+"
+    r"(?:pull\b|compose\b[^\n]*\b(?:up|pull)\b)", re.IGNORECASE
+)
+_TEST_START = re.compile(
+    r"(?:^|\s)(?:pytest|vitest|playwright|npm (?:run )?test|pnpm (?:run )?test)\b"
+    r"|test session starts", re.IGNORECASE
+)
+_CONTAINER_OUTPUT = re.compile(r"^\S+\s+\|")  # Compose's application output, not Docker's.
+_PULL_COMPLETE = re.compile(
+    r"^Status: (?:Downloaded newer image|Image is up to date)\b"
+    r"|^(?:Container\s+)?\S+\s+(?:Started|Running|Healthy)\b", re.IGNORECASE
+)
+
+
+def image_download(diagnostics: str) -> dict[str, str] | None:
+    """Read log order, not appended annotations: only an explicit Docker setup command
+    authorizes a download failure. A new GitHub step/Run command or test start ends it.
+    Errors after the setup failure can name tests that never had working services."""
+    pulling = False
+    preamble = False
+    step: str | None = None
+    for raw in diagnostics.splitlines():
+        fields = raw.split("\t", 2)  # gh --log-failed: job, step, timestamp + output
+        current = fields[1] if len(fields) == 3 else None
+        line = fields[-1] if len(fields) == 3 else raw
+        line = re.sub(r"^\d{4}-\d\d-\d\dT\S+\s+", "", line).strip()
+        if current != step:
+            pulling = False
+            preamble = False
+        step = current
+        group = line.startswith("##[group]Run ")
+        if group or line.startswith("Run "):
+            pulling = False
+            preamble = group
+        if line == "##[endgroup]":
+            preamble = False
+            continue
+        if _CONTAINER_OUTPUT.search(line):
+            continue
+        if not preamble and _PULL_COMPLETE.search(line):
+            pulling = False
+        # GitHub prints the entire shell script before running it. A later test command
+        # in that preamble does not mean tests started before the pull failed.
+        if (not preamble or group) and (first_test(line) or _TEST_START.search(line)):
+            return None
+        if _PULL_COMMAND.search(line):
+            pulling = True
+        if pulling and not preamble and (found := _DOWNLOAD.search(line)):
+            return {"form": found[0].split(":", 1)[0].lower(), "line": found[0]}
+    return None
 
 
 NOT_REPORTED = "not reported"
@@ -154,6 +215,7 @@ class Diagnosis:
     reason: str
     repair: Repair | None = None
     runs: list[tuple[dict[str, Any], list[dict[str, Any]]]] = field(default_factory=list)
+    downloads: dict[int, list[dict[str, str]]] = field(default_factory=dict)
 
 
 def _failed_log(gate: Any, run_id: int, job_id: int) -> str:
@@ -204,6 +266,7 @@ def diagnose_runs(
     # Why a reviewer judges it, unless a job named a failing test of its own.
     judgments: list[str] = []
     infrastructure: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    downloads: dict[int, list[dict[str, str]]] = {}
     for found, parts in failed_runs:
         if found.get("status") != "completed" or any(
             job.get("status") != "completed" for job in parts
@@ -218,21 +281,36 @@ def diagnose_runs(
         runners_only = bool(failed)
         runners = False
         cancelled: list[str] = []
+        run_downloads = []
+        downloads_only = True
         for job in failed:
             notes = gate.api(f"{gate.API}/check-runs/{job['id']}/annotations?per_page=100")
+            log = _failed_log(gate, found["id"], job["id"])
             diagnostics = "\n".join(
                 [
-                    _failed_log(gate, found["id"], job["id"]),
+                    log,
                     *(f"{note.get('title') or ''} {note.get('message') or ''}" for note in notes),
                 ]
             )
             test = first_test(diagnostics)
+            download = image_download(log)
+            if download:
+                runners = True
+                runner = job.get("runner_name")
+                if isinstance(runner, str) and runner and not re.search(r"[\r\n]", runner):
+                    run_downloads.append({
+                        **download, "runner": runner, "job": job.get("name", ""),
+                    })
+                else:
+                    downloads_only = False  # Unknown machines cannot be blamed on a repeat.
+                continue
             if test is None and (
                 job["conclusion"] == "timed_out"
                 or _INFRASTRUCTURE.search(diagnostics)
                 or transport_error(diagnostics)
             ):
                 runners = True
+                downloads_only = False
                 continue
             name = safe(job.get("name", "")) or f"job {job['id']}"
             if job["conclusion"] != "failure" and test is None:
@@ -254,6 +332,8 @@ def diagnose_runs(
             judgments.extend(cancelled)
         if runners_only:
             infrastructure.append((found, parts))
+            if downloads_only and run_downloads:
+                downloads[found["id"]] = run_downloads
     if own:
         # A job that names its failing test goes before one that does not.
         return Diagnosis(
@@ -264,7 +344,9 @@ def diagnose_runs(
     if judgments:
         return Diagnosis("judgment", judgments[0])
     if infrastructure and len(infrastructure) == len(failed_runs):
-        return Diagnosis("infrastructure", "its runners failed it", runs=infrastructure)
+        return Diagnosis(
+            "infrastructure", "its runners failed it", runs=infrastructure, downloads=downloads
+        )
     return Diagnosis("judgment", "no failed job of its latest runs could be judged")
 
 
@@ -339,6 +421,10 @@ def repeated(folder: Path, run_id: int) -> bool:
     return _state(marker(folder, run_id)) == "repeated"
 
 
+def _download_signatures(items: list[dict[str, str]]) -> list[tuple[str, str, str]]:
+    return sorted((item["job"], item["runner"], item["form"]) for item in items)
+
+
 def rerun_running(folder: Path, pull: dict[str, Any]) -> str | None:
     """Why a handoff whose checks no longer show a failure waits: a re-run the tick asked for
     still runs, or passed and is the line's to judge. None when no such re-run is known."""
@@ -359,12 +445,42 @@ def rerun(folder: Path, diagnosis: Diagnosis) -> str | None:
     import merge_gate as gate
 
     waits = []
+    notices: dict[int, str] = {}
     for found, parts in diagnosis.runs:
         claim = marker(folder, found["id"])
         if claim.exists():
             if _state(claim) != "refused" and found.get("run_attempt") == 1:
                 # Sent, or perhaps sent when interrupted: never asked for twice.
                 waits.append(_REQUESTED.format(run=found["id"]))
+                continue
+            # Only the same job, machine and download form qualify for a cache wait.
+            # Job IDs change on a re-run; names identify matrix parts across attempts.
+            try:
+                previous = json.loads(claim.read_text())
+                earlier_downloads = _download_signatures(previous.get("downloads", []))
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                previous = {}
+                earlier_downloads = []
+            current = diagnosis.downloads.get(found["id"], [])
+            if (
+                previous.get("state") in ("claim", "requested", "download repeated")
+                and type(found.get("run_attempt")) is int
+                and found["run_attempt"] >= 2
+                and current
+                and set(_download_signatures(current)).issubset(earlier_downloads)
+            ):
+                by_runner: dict[str, list[str]] = {}
+                for item in current:
+                    lines = by_runner.setdefault(item["runner"], [])
+                    if item["line"] not in lines:
+                        lines.append(item["line"])
+                lines = [
+                    f"Runner {runner} failed image downloads again in run {found['id']}: "
+                    f"{' / '.join(errors)}; repair its cache"
+                    for runner, errors in by_runner.items()
+                ]
+                notices[found["id"]] = "; ".join(lines)
+                waits.append(f"run {found['id']} waits for its runner's image cache to be repaired")
                 continue
             # Its one re-run failed again, or was refused: a reviewer judges it.
             if _state(claim) != "refused":
@@ -377,13 +493,25 @@ def rerun(folder: Path, diagnosis: Diagnosis) -> str | None:
             return None
     for found, _ in diagnosis.runs:
         claim = marker(folder, found["id"])
+        if line := notices.get(found["id"]):
+            event = f"{found['id']}.json"
+            # Queue before changing the claim: interrupted delivery is recovered, and a
+            # sent receipt prevents a later tick from waking for the same run again.
+            if not (folder / "runner-downloads.sent" / event).exists():
+                write_json(folder / "runner-downloads.pending" / event, {"line": line})
+            previous = json.loads(claim.read_text())
+            previous["state"] = "download repeated"
+            write_json(claim, previous)
+            continue
         if claim.exists():
             continue
         folder.mkdir(parents=True, exist_ok=True)
         # Claimed before GitHub is asked: an interrupted request is never sent twice.
         try:
-            with claim.open("x") as output:
-                json.dump({"state": "claim"}, output)
+            with claim.open("x", opener=lambda name, flags: os.open(name, flags, 0o600)) as output:
+                json.dump({
+                    "state": "claim", "downloads": diagnosis.downloads.get(found["id"], []),
+                }, output)
         except FileExistsError:
             waits.append(_REQUESTED.format(run=found["id"]))
             continue
@@ -413,7 +541,9 @@ def rerun(folder: Path, diagnosis: Diagnosis) -> str | None:
             write_json(claim, {"state": "refused", "error": error})
             gate.wake_log(f"automatic retry of run {found['id']} refused: {error}")
             return None
-        write_json(claim, {"state": "requested"})
+        write_json(claim, {
+            "state": "requested", "downloads": diagnosis.downloads.get(found["id"], []),
+        })
         note = f"automatically re-ran failed jobs of run {found['id']} once: its runners failed it"
         gate.wake_log(note)
         waits.append(note)
