@@ -1810,3 +1810,32 @@ def test_tick_counts_unknown_main_once_per_tick(workflow: Workflow) -> None:
         workflow.run_script("tick")
     [push] = workflow.pushes()
     assert "main: unknown, cannot read CI" in push.message
+
+
+
+def test_background_metrics_does_not_hold_the_ticks_output_open(workflow: Workflow) -> None:
+    metrics = workflow.script.with_name("workflow-metrics")
+    metrics.write_text("""#!/bin/bash
+[[ ${1:-} == --daily ]] || exit 0
+printf '%s\\n' "$$" > "$WORKFLOW_ALERT_TEST_STATE/metrics.pid"
+while [[ ! -e $WORKFLOW_ALERT_TEST_STATE/release-metrics ]]; do /bin/sleep 0.05; done
+""")
+    release = workflow.state / "release-metrics"
+    tick = subprocess.Popen(
+        ["bash", str(workflow.script.with_name("tick"))],
+        cwd=workflow.repo,
+        env={**workflow.env, "WORKFLOW_METRICS_DAILY_AT": "00:00",
+             "WORKFLOW_ALERT_TEST_STATE": str(workflow.state)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        stdout, stderr = tick.communicate(timeout=30)
+        assert tick.returncode == 0, stdout + stderr
+        assert (workflow.state / "metrics.pid").exists()
+        # The job is still running; its redirected output must not keep the tick's pipes open.
+        os.kill(int((workflow.state / "metrics.pid").read_text()), 0)
+    finally:
+        release.touch()
+        if tick.poll() is None:
+            tick.kill()
+        tick.communicate(timeout=10)

@@ -191,9 +191,8 @@ if ((shadow == 0)); then
 fi
 tick_errors=""
 tick_error_reader=""
-if ((shadow == 0)); then
-  tick_errors=$(mktemp)
-  exec 6>&2 2> >(tee "$tick_errors" >&6)
+if ((shadow == 0)) && tick_errors=$(mktemp); then
+  exec 6>&2 2> >(tee "$tick_errors" >&6 6>&-)
   tick_error_reader=$!
 fi
 tick_ended() {
@@ -328,7 +327,7 @@ trap 'tick_cleanup $?' EXIT
 # The pick's resource history must keep moving while this tick drives the train. The
 # sampler closes the tick's lock, stops on exit, and never runs for a shadow tick.
 if ((shadow == 0)); then
-  python3 -B "$here/ticket_starts.py" watch-room "$main" "$$" </dev/null >/dev/null 7>&- 9>&- &
+  python3 -B "$here/ticket_starts.py" watch-room "$main" "$$" </dev/null >/dev/null 6>&- 7>&- 9>&- &
   room_sampler=$!
 fi
 
@@ -542,7 +541,7 @@ session() {
   if ((shadow)); then
     shadow_session "$@"
   else
-    bash "$here/session" "$@" 9>&- 8>&- 7>&-
+    bash "$here/session" "$@" 9>&- 8>&- 7>&- 6>&-
   fi
 }
 
@@ -995,7 +994,7 @@ if ((shadow == 0)) && [[ $METRICS_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] &&
   if mkdir -p "$HOME/.local/state/workflow"; then
     env -u WORKFLOW_TRAIN_TICK -u WORKFLOW_SESSION_SNAPSHOT -u WORKFLOW_DEFER_START \
       WORKFLOW_NOW="$NOW" setsid bash "$here/workflow-metrics" --daily </dev/null \
-      >>"$HOME/.local/state/workflow/metrics.log" 2>&1 7>&- 9>&- &
+      >>"$HOME/.local/state/workflow/metrics.log" 2>&1 6>&- 7>&- 9>&- &
   else
     failed=1
   fi
@@ -1059,7 +1058,7 @@ while read -r name state _; do
     # and later ticks can service other conflicts while its reviewers run.
     (umask 077
       setsid python3 -B "$here/conflict_review.py" run-panel "$folder" "$number" "$panel_head" \
-        </dev/null >>"$folder/$name.panel-log-$panel_head" 2>&1 9>&- 8>&- 7>&- &
+        </dev/null >>"$folder/$name.panel-log-$panel_head" 2>&1 9>&- 8>&- 7>&- 6>&- &
     )
     continue
   fi
