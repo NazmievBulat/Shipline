@@ -959,10 +959,9 @@ def _repair_repository(main: Path, folder: Path, backup: Path, lines: list[str])
         _repair_command(main, "update-ref", ref, target, head)
         lines.append(f"{ref} -> {pushed} ({target})")
 
-    # Only entries naming an absent object are removed, including linked-worktree logs.
-    # A byte-for-byte backup keeps even these otherwise unusable entries recoverable.
+    # Git takes each ref's own lock, so an ordinary worker's concurrent commit cannot
+    # lose a valid reflog entry. Disable age expiry: stale-fix alone drops broken entries.
     logs = [common / "logs", *sorted((common / "worktrees").glob("*/logs"))]
-    known: dict[str, bool] = {}
     for logs_root in logs:
         if not logs_root.exists():
             continue
@@ -970,32 +969,14 @@ def _repair_repository(main: Path, folder: Path, backup: Path, lines: list[str])
         for path in sorted(logs_root.rglob("*")):
             if path.is_symlink():
                 raise RepairFailed("reflog path is a symbolic link")
-            if not path.is_file():
-                continue
-            original = path.read_bytes()
-            kept = []
-            for entry in original.splitlines(keepends=True):
-                heads = entry.split(maxsplit=2)[:2]
-                if len(heads) != 2 or any(not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", head) for head in heads):
-                    raise RepairFailed("malformed reflog entry")
-                missing = False
-                for raw in heads:
-                    head = raw.decode("ascii")
-                    if set(head) == {"0"}:
-                        continue
-                    if head not in known:
-                        known[head] = present(head)
-                    missing |= not known[head]
-                if not missing:
-                    kept.append(entry)
-            if b"".join(kept) == original:
-                continue
-            destination = backup / "reflogs" / path.relative_to(common)
-            _repair_directory(destination.parent)
-            shutil.copy2(path, destination)
-            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as output:
-                output.write(b"".join(kept))
-            os.replace(output.name, path)
+            if path.is_file():
+                destination = backup / "reflogs" / path.relative_to(common)
+                _repair_directory(destination.parent)
+                shutil.copy2(path, destination)
+    _repair_command(
+        main, "reflog", "expire", "--expire=never", "--expire-unreachable=never",
+        "--stale-fix", "--all",
+    )
 
     listing = _repair_command(main, "worktree", "list", "--porcelain", "-z").stdout
     allowed = main / ".claude/worktrees"

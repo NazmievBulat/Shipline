@@ -61,9 +61,23 @@ def _repair_step(workflow: Workflow, *command: str) -> subprocess.CompletedProce
 
 
 def test_empty_branch_is_repaired_and_only_empty_objects_are_quarantined(workflow: Workflow) -> None:
+    kept = workflow.git("commit-tree", workflow.git("rev-parse", "main^{tree}"),
+                        "-p", "main", "-m", "feat: kept history")
+    workflow.git("update-ref", "refs/heads/kept", kept)
+    workflow.git("update-ref", "refs/heads/kept", workflow.git("rev-parse", "main"))
+    kept_log = workflow.repo / ".git/logs/refs/heads/kept"
+    old_entries = []
+    for row in kept_log.read_bytes().splitlines(keepends=True):
+        metadata, message = row.split(b"\t", 1)
+        identity, _, zone = metadata.rsplit(b" ", 2)
+        old_entries.append(identity + b" 1 " + zone + b"\t" + message)
+    kept_before = b"".join(old_entries)
+    kept_log.write_bytes(kept_before)
     head, empty = _empty_branch(workflow)
     objects = workflow.repo / ".git/objects"
     before = {path: path.read_bytes() for path in objects.glob("??/*") if path.stat().st_size}
+    healthy_log = workflow.repo / ".git/logs/refs/heads/main"
+    healthy_before = healthy_log.read_bytes()
     done = _repair_step(workflow)
     assert done.returncode == 0, done.stdout + done.stderr
     assert not empty.exists()
@@ -72,6 +86,8 @@ def test_empty_branch_is_repaired_and_only_empty_objects_are_quarantined(workflo
     assert len(saved) == 1 and saved[0].read_bytes() == b""
     assert all(path.read_bytes() == content for path, content in before.items())
     assert head not in (workflow.repo / ".git/logs/refs/heads/repair").read_text()
+    assert healthy_log.read_bytes() == healthy_before
+    assert kept_log.read_bytes() == kept_before
     assert "refs/heads/repair -> refs/remotes/origin/repair" in done.stderr
 
 
