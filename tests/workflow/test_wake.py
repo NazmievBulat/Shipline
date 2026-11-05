@@ -367,6 +367,24 @@ def test_an_unreachable_advisory_service_is_told_once_at_any_hour(night: Workflo
     assert len(night.sent()) == 2  # one failed attempt, then one delivered message
 
 
+def test_machine_error_notice_waits_for_delivery_and_is_told_once(night: Workflow) -> None:
+    night.orchestrator("busy")
+    folder = night.repo / ".local/workflow/stuck.pending"
+    folder.mkdir(parents=True, exist_ok=True)
+    notice = folder / "machine-errors-example.json"
+    line = "Machine error: No space left on device; free disk space; gate commands wait"
+    notice.write_text(json.dumps({"line": line}))
+    (night.state / "send-fails").touch()
+    assert _wake(night, at=_at(12, 0)).returncode == 1
+    assert notice.exists()
+    (night.state / "send-fails").unlink()
+    assert _wake(night, at=_at(12, 5)).returncode == 0
+    assert line in night.sent()[-1]
+    assert not notice.exists()
+    assert _wake(night, at=_at(12, 10)).returncode == 0
+    assert len(night.sent()) == 2
+
+
 def test_main_with_only_an_advisory_is_named_on_its_main_line_at_any_hour(
     night: Workflow,
 ) -> None:

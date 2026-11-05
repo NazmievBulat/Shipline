@@ -71,6 +71,45 @@ def test_github_incident_texts_are_transient(gate: Any, error: str) -> None:
     assert gate.transient(error)
 
 
+_MACHINE_ERRORS = [
+    "OSError: The temporary directory /tmp/pytest-of-example is not owned by the current user. Fix this and try again.",
+    "OSError: [Errno 28] No space left on device",
+    "OSError: [Errno 24] Too many open files",
+    "OSError: [Errno 12] Cannot allocate memory",
+    "OSError: [Errno 30] Read-only file system",
+    "PermissionError: [Errno 13] Permission denied: '/tmp/example-cache'",
+    "bash: /tmp/example-cache: Permission denied",
+    "mkdir: cannot create directory '/tmp/example cache': Permission denied",
+]
+
+
+@pytest.mark.parametrize("error", _MACHINE_ERRORS)
+def test_local_machine_errors_name_the_error_and_a_remedy(gate: Any, error: str) -> None:
+    notice = gate.machine_error("checking...\n" + error, Path("/work/example-app"))
+    assert notice is not None and error in notice
+    assert "; " in notice
+
+
+@pytest.mark.parametrize("error", _MACHINE_ERRORS)
+def test_a_named_failing_test_wins_over_a_machine_error(gate: Any, error: str) -> None:
+    assert gate.machine_error(
+        error + "\nFAILED tests/test_example.py::test_example - assertion failed\n",
+        Path("/work/example-app"),
+    ) is None
+
+
+@pytest.mark.parametrize("error", [
+    "Permission denied (publickey).",
+    "PermissionError: Permission denied: '/work/example-app/cache'",
+    "bash: /work/example-app/cache: Permission denied",
+    "PermissionError: Permission denied: 'cache'",
+    "PermissionError: Permission denied: '/work/example-app'",
+    "inventory is stale",
+])
+def test_other_failures_are_not_machine_errors(gate: Any, error: str) -> None:
+    assert gate.machine_error(error, Path("/work/example-app")) is None
+
+
 @pytest.mark.parametrize("error", _SERVER_ERRORS)
 @pytest.mark.parametrize("client_error", [
     "gh: forbidden (HTTP 403)",
