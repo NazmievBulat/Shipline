@@ -2745,6 +2745,15 @@ _FAILED_TEST = (
     " - AssertionError: assert 28 == 29\n"
 )
 
+# Docker Compose's pull-through-cache failure, with neutral service and step names.
+_DOWNLOAD_LINE = "short read: expected 1048576 bytes but got 0: unexpected EOF"
+_COMPOSE_DOWNLOAD = (
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z ##[group]Run docker compose up -d database\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z ##[endgroup]\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:01Z  database Pulling\n"
+    f"CI: server tests\tStart services\t2026-11-04T10:00:02Z { _DOWNLOAD_LINE }\n"
+)
+
 
 def _fail(
     github: GitHub,
@@ -3414,3 +3423,90 @@ def test_successful_retry_jobs_wait_for_the_run_metadata_before_handing_back(
     assert (workflow.state / "merged").exists(), done.stdout + done.stderr + str(_train(workflow))
     assert (workflow.state / "merged").read_text() == "7"
     assert len(workflow.calls("gh run rerun")) == 1
+
+
+@pytest.mark.parametrize("error", [
+    _DOWNLOAD_LINE, "unexpected EOF", "failed to copy: httpReadSeeker: unexpected status",
+    "toomanyrequests: download rate limit exceeded",
+])
+@pytest.mark.parametrize("command", ["docker compose up -d database", "docker pull example-app"])
+def test_image_download_before_test_errors_is_retried(
+    handed: GitHub, error: str, command: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    log = _COMPOSE_DOWNLOAD.replace("docker compose up -d database", command).replace(
+        _DOWNLOAD_LINE, error
+    ) + _FAILED_TEST
+    _fail(handed, log=log)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("gh run rerun")) == 1
+    assert _note(workflow).exists()
+    assert workflow.calls("gh pr ready") == []
+    assert _started(workflow) == []
+
+
+@pytest.mark.parametrize("error", [
+    _DOWNLOAD_LINE, "unexpected EOF", "failed to copy: httpReadSeeker", "toomanyrequests",
+])
+def test_image_download_words_in_tests_still_go_to_a_worker(handed: GitHub, error: str) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    log = (
+        "CI: server tests\tStart services\t2026-11-04T10:00:00Z ##[group]Run docker compose up -d database\n"
+        "CI: server tests\tStart services\t2026-11-04T10:00:01Z database Started\n"
+        "CI: server tests\tTests\t2026-11-04T10:00:02Z ##[group]Run pytest\n"
+        f"CI: server tests\tTests\t2026-11-04T10:00:03Z server under test: {error}\n"
+    ) + _FAILED_TEST
+    _fail(handed, log=log)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh run rerun") == []
+    assert not _note(workflow).exists()
+    assert len(workflow.calls("gh pr ready")) == 1
+
+
+@pytest.mark.parametrize("second", ["same", "another runner", "another error", "own test"])
+def test_repeated_image_download_waits_only_for_the_same_runner_and_failure(
+    handed: GitHub, second: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log=_COMPOSE_DOWNLOAD + _FAILED_TEST)
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    jobs[-1]["runner_name"] = "example-runner"
+    handed.save()
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _note(workflow).exists()
+    run = handed.api[_RUNS.format(head=handed.head)]["workflow_runs"][0]
+    run["run_attempt"] = 2
+    jobs[-1]["id"] = 99  # A re-run assigns new job IDs.
+    handed.api["repos/example-org/example-app/check-runs/99/annotations?per_page=100"] = []
+    log = _COMPOSE_DOWNLOAD + _FAILED_TEST
+    if second == "another runner":
+        jobs[-1]["runner_name"] = "example-runner-2"
+    elif second == "another error":
+        log = _COMPOSE_DOWNLOAD.replace(_DOWNLOAD_LINE, "toomanyrequests") + _FAILED_TEST
+    elif second == "own test":
+        log = _FAILED_TEST
+    (workflow.state / "job-logs/99").write_text(log)
+    handed.save()
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("gh run rerun")) == 1
+    if second == "same":
+        assert _note(workflow).exists()
+        assert workflow.calls("gh pr ready") == []
+        assert _started(workflow) == []
+        pending = list((_folder(workflow) / "runner-downloads.pending").glob("*.json"))
+        assert len(pending) == 1
+        line = json.loads(pending[0].read_text())["line"]
+        assert "example-runner" in line and _DOWNLOAD_LINE in line
+        assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+    else:
+        assert not _note(workflow).exists()
+        assert not list((_folder(workflow) / "runner-downloads.pending").glob("*.json"))
+        assert bool(workflow.calls("gh pr ready")) == (second == "own test")

@@ -1211,3 +1211,29 @@ def test_a_prefix_queue_warning_is_told_once_and_kept_until_delivery(night: Work
     assert f"\n{line}\n" in night.sent()[-1]
     assert not event.exists()
     assert (pending.with_name("prefix-queues.sent") / event.name).exists()
+
+
+def test_a_runner_download_notice_is_delivered_once_and_retained_on_failure(night: Workflow) -> None:
+    night.orchestrator("busy")
+    folder = night.repo / ".local/workflow"
+    pending = folder / "runner-downloads.pending/20.json"
+    pending.parent.mkdir(parents=True)
+    line = (
+        "Runner example-runner failed image downloads again in run 20: "
+        "short read: expected 1048576 bytes but got 0: unexpected EOF; repair its cache"
+    )
+    pending.write_text(json.dumps({"line": line}))
+    (night.state / "send-fails").touch()
+    done = _wake(night, at=_at(11))
+    assert done.returncode == 1
+    assert pending.exists()
+    (night.state / "send-fails").unlink()
+    done = _wake(night, at=_at(11, 6))
+    assert done.returncode == 0, done.stderr
+    assert night.sent()[-1].count(line) == 1
+    assert not pending.exists()
+    assert (folder / "runner-downloads.sent/20.json").exists()
+    count = len(night.sent())
+    done = _wake(night, at=_at(11, 12))
+    assert done.returncode == 0, done.stderr
+    assert len(night.sent()) == count
