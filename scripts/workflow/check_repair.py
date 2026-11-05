@@ -10,6 +10,7 @@ cannot be read, and a second failing test in a row are judged by a fresh reviewe
 import json
 import os
 import re
+import shlex
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -64,10 +65,11 @@ _DOWNLOAD = re.compile(
     r"|unexpected EOF|failed to copy:\s*httpReadSeeker|toomanyrequests",
     re.IGNORECASE,
 )
-_PULL_COMMAND = re.compile(
-    r"^(?:##\[group\])?(?:Run\s+)?(?:sudo\s+)?docker\s+"
-    r"(?:pull\b|compose\b[^\n]*\b(?:up|pull)\b)", re.IGNORECASE
-)
+_COMPOSE_VALUES = {
+    "-f", "--file", "-p", "--project-name", "--project-directory", "--env-file",
+    "--profile", "--ansi", "--progress", "--parallel",
+}
+_COMPOSE_SWITCHES = {"--all-resources", "--compatibility", "--dry-run"}
 _TEST_START = re.compile(
     r"(?:^|\s)(?:pytest|vitest|playwright|npm (?:run )?test|pnpm (?:run )?test)\b"
     r"|test session starts", re.IGNORECASE
@@ -77,6 +79,32 @@ _PULL_COMPLETE = re.compile(
     r"^Status: (?:Downloaded newer image|Image is up to date)\b"
     r"|^(?:Container\s+)?\S+\s+(?:Started|Running|Healthy)\b", re.IGNORECASE
 )
+
+
+def is_pull_command(line: str) -> bool:
+    """Read the actual Docker subcommand without executing any shell text. Unknown
+    Compose options cannot authorize blaming a runner; arguments of run/exec never do."""
+    line = line.removeprefix("##[group]").removeprefix("Run ")
+    try:
+        words = shlex.split(line)
+    except ValueError:
+        return False
+    if words[:1] == ["sudo"]:
+        words = words[1:]
+    if words[:2] == ["docker", "pull"]:
+        return True
+    if words[:2] != ["docker", "compose"]:
+        return False
+    index = 2
+    while index < len(words):
+        option, equals, _ = words[index].partition("=")
+        if option in _COMPOSE_VALUES:
+            index += 1 if equals else 2
+        elif words[index] in _COMPOSE_SWITCHES:
+            index += 1
+        else:
+            return words[index] in ("up", "pull")
+    return False
 
 
 def image_download(diagnostics: str) -> dict[str, str] | None:
@@ -110,11 +138,11 @@ def image_download(diagnostics: str) -> dict[str, str] | None:
         if not preamble and _PULL_COMPLETE.search(line):
             pulling = False
             failure = None  # Docker recovered before handing control to tests.
-        pull_command = _PULL_COMMAND.search(line)
+        pull_command = is_pull_command(line)
         # GitHub prints the entire shell script before running it. A later test command
         # in that preamble does not mean tests started before the pull failed.
         if (
-            (not preamble or group) and not pull_command
+            (not preamble or group or not pulling) and not pull_command
             and (first_test(line) or _TEST_START.search(line))
         ):
             return failure

@@ -3539,6 +3539,7 @@ def test_repeated_image_download_waits_only_for_the_same_runner_and_failure(
     "##[group]Run docker compose up -d database\npytest\n##[endgroup]\n" + _DOWNLOAD_LINE + "\n" + _FAILED_TEST,
     "Run docker pull example-app\nunexpected EOF\n" + _FAILED_TEST,
     "Run docker pull playwright\nunexpected EOF\n" + _FAILED_TEST,
+    'Run docker compose -f "example app.yml" --profile=tests up -d database\nunexpected EOF\n' + _FAILED_TEST,
 ])
 def test_download_order_uses_execution_output_after_the_command_preamble(
     handed: GitHub, log: str
@@ -3565,6 +3566,11 @@ def test_download_order_uses_execution_output_after_the_command_preamble(
     _COMPOSE_DOWNLOAD + "CI: server tests\tStart services\t2026-11-04T10:00:03Z Container example-app Started\n" + _FAILED_TEST,
     "Run docker pull example-app\nunexpected EOF\nStatus: Downloaded newer image for example-app\n" + _FAILED_TEST,
     "##[group]Run docker compose up -d database\necho toomanyrequests\n##[endgroup]\n" + _FAILED_TEST,
+    "Run docker compose run --rm tests pytest -k pull\nunexpected EOF\n" + _FAILED_TEST,
+    "Run docker compose exec example-app npm test -- --grep up\ntoomanyrequests\n" + _FAILED_TEST,
+    "##[group]Run set -e\npytest -q\ndocker pull example-app\n##[endgroup]\nunexpected EOF\n" + _FAILED_TEST,
+    "##[group]Run set -e\nnpm test\ndocker compose up database\n##[endgroup]\ntoomanyrequests\n" + _FAILED_TEST,
+    "Run docker compose --unknown example-app up\nunexpected EOF\n" + _FAILED_TEST,
 ])
 def test_download_context_does_not_override_tests_that_already_started(
     handed: GitHub, log: str
