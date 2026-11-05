@@ -85,6 +85,7 @@ def image_download(diagnostics: str) -> dict[str, str] | None:
     Errors after the setup failure can name tests that never had working services."""
     pulling = False
     preamble = False
+    failure: dict[str, str] | None = None
     step: str | None = None
     for raw in diagnostics.splitlines():
         fields = raw.split("\t", 2)  # gh --log-failed: job, step, timestamp + output
@@ -92,11 +93,15 @@ def image_download(diagnostics: str) -> dict[str, str] | None:
         line = fields[-1] if len(fields) == 3 else raw
         line = re.sub(r"^\d{4}-\d\d-\d\dT\S+\s+", "", line).strip()
         if current != step:
+            if failure:
+                return failure
             pulling = False
             preamble = False
         step = current
         group = line.startswith("##[group]Run ")
         if group or line.startswith("Run "):
+            if failure:
+                return failure
             pulling = False
             preamble = group
         if line == "##[endgroup]":
@@ -104,6 +109,7 @@ def image_download(diagnostics: str) -> dict[str, str] | None:
             continue
         if not preamble and _PULL_COMPLETE.search(line):
             pulling = False
+            failure = None  # Docker recovered before handing control to tests.
         pull_command = _PULL_COMMAND.search(line)
         # GitHub prints the entire shell script before running it. A later test command
         # in that preamble does not mean tests started before the pull failed.
@@ -111,14 +117,14 @@ def image_download(diagnostics: str) -> dict[str, str] | None:
             (not preamble or group) and not pull_command
             and (first_test(line) or _TEST_START.search(line))
         ):
-            return None
+            return failure
         if _CONTAINER_OUTPUT.search(line):
             continue
         if pull_command:
             pulling = True
         if pulling and not preamble and (found := _DOWNLOAD.search(line)):
-            return {"form": found[0].split(":", 1)[0].lower(), "line": found[0]}
-    return None
+            failure = {"form": found[0].split(":", 1)[0].lower(), "line": found[0]}
+    return failure
 
 
 NOT_REPORTED = "not reported"

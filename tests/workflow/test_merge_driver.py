@@ -3562,6 +3562,8 @@ def test_download_order_uses_execution_output_after_the_command_preamble(
     "Run docker compose up -d database\nContainer example-app Started\n" + _DOWNLOAD_LINE + "\n" + _FAILED_TEST,
     "Run docker pull example-app\nStatus: Image is up to date for example-app\nunexpected EOF\n" + _FAILED_TEST,
     "Run docker compose up database\nexample-app | " + _FAILED_TEST + _COMPOSE_DOWNLOAD,
+    _COMPOSE_DOWNLOAD + "CI: server tests\tStart services\t2026-11-04T10:00:03Z Container example-app Started\n" + _FAILED_TEST,
+    "Run docker pull example-app\nunexpected EOF\nStatus: Downloaded newer image for example-app\n" + _FAILED_TEST,
     "##[group]Run docker compose up -d database\necho toomanyrequests\n##[endgroup]\n" + _FAILED_TEST,
 ])
 def test_download_context_does_not_override_tests_that_already_started(
