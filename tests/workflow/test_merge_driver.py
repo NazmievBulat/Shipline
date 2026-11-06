@@ -22,7 +22,7 @@ from workflow.test_merge_when_current import (
 from workflow.test_merge_when_current import (
     github as github_fixture,
 )
-from workflow_harness import Workflow, instruction, session_arguments
+from workflow_harness import SCRIPTS, Workflow, instruction, session_arguments
 
 github = github_fixture
 
@@ -3546,6 +3546,17 @@ def test_repeated_image_download_waits_only_for_the_same_runner_and_failure(
     "Status: Image is up to date for example-app\nUsing default tag: latest\nunexpected EOF\n",
     "##[group]Run docker compose \\\n  --file example.yml \\\n  up -d database\n##[endgroup]\n"
     "database Pulling\nunexpected EOF\n",
+    "##[group]Run docker compose up --build -d database\n##[endgroup]\n"
+    "#2 [internal] load metadata for example-database\n"
+    "#2 ERROR: failed to copy: httpReadSeeker\n",
+    "##[group]Run docker compose up -d database cache\ndocker pull example-app\n##[endgroup]\n"
+    "Container database Started\nContainer cache Started\nunexpected EOF\n",
+    # Shell removes backslash-newline without inserting a space; retain indentation.
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z ##[group]Run docker compose\\\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z   --file example.yml\\\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z   up -d database\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z ##[endgroup]\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:01Z unexpected EOF\n",
 ])
 def test_download_order_uses_execution_output_after_the_command_preamble(
     handed: GitHub, log: str
@@ -3581,6 +3592,16 @@ def test_download_order_uses_execution_output_after_the_command_preamble(
     "##[group]Run docker compose up --build -d example-app\n##[endgroup]\n"
     "#7 [example-app 3/3] RUN python build.py\n#7 0.123 RuntimeError: unexpected EOF\n"
     '#7 ERROR: process "/bin/sh -c python build.py" did not complete successfully: exit code: 1\n',
+    # Download context from one vertex must never authorize another vertex's RUN.
+    "Run docker compose up --build -d example-app\n"
+    "#2 [internal] load metadata for example-app\n#2 DONE 0.1s\n"
+    "#7 [example-app 3/3] RUN python build.py\n#7 0.123 RuntimeError: unexpected EOF\n",
+    # Once both planned pulls finish, unrelated EOF output is no download evidence.
+    "##[group]Run docker pull example-app\ndocker pull example-database\n##[endgroup]\n"
+    "Status: Image is up to date for example-app\n"
+    "Status: Downloaded newer image for example-database\nunexpected EOF\n" + _FAILED_TEST,
+    "##[group]Run pytest \\\n  -q\ndocker compose \\\n  up -d database\n##[endgroup]\n"
+    "unexpected EOF\n" + _FAILED_TEST,
 ])
 def test_download_context_does_not_override_tests_that_already_started(
     handed: GitHub, log: str
@@ -3593,3 +3614,22 @@ def test_download_context_does_not_override_tests_that_already_started(
     assert workflow.calls("gh run rerun") == []
     assert not _note(workflow).exists()
     assert len(workflow.calls("gh pr ready")) == 1
+
+
+@pytest.mark.parametrize("error", ["unexpected EOF", "toomanyrequests", "failed to copy: httpReadSeeker"])
+def test_dockerfile_command_summaries_are_not_download_evidence(
+    monkeypatch: pytest.MonkeyPatch, error: str
+) -> None:
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    from check_repair import image_download
+
+    # The existing transport fallback may retry this once. It must never record
+    # download evidence that could hold the handoff waiting for a cache repair.
+    log = (
+        "Run docker compose up --build -d example-app\n"
+        "#7 [example-app 3/3] RUN echo " + error + " && exit 1\n"
+        "#7 0.123 " + error + "\n"
+        'failed to solve: process "/bin/sh -c echo ' + error
+        + ' && exit 1" did not complete successfully: exit code: 1\n'
+    )
+    assert image_download(log) is None

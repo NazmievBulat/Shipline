@@ -79,22 +79,29 @@ _PULL_COMPLETE = re.compile(
     r"^Status: (?:Downloaded newer image|Image is up to date)\b"
     r"|^(?:Container\s+)?\S+\s+(?:Started|Running|Healthy)\b", re.IGNORECASE
 )
+# Only BuildKit's download vertex headers supply context, never a RUN's output.
+_DOWNLOAD_VERTEX = re.compile(
+    r"#(\d+)\s+(?:\[[^\]\n]+\]\s+)?(?:FROM\s+|load metadata for\b)", re.IGNORECASE
+)
+_BUILD_COMMAND_FAILURE = re.compile(
+    r'failed to solve:\s*process\b[^\n]*did not complete successfully', re.IGNORECASE
+)
 
 
-def is_pull_command(line: str) -> bool:
+def pull_command(line: str) -> str | None:
     """Read the actual Docker subcommand without executing any shell text. Unknown
     Compose options cannot authorize blaming a runner; arguments of run/exec never do."""
     line = line.removeprefix("##[group]").removeprefix("Run ")
     try:
         words = shlex.split(line)
     except ValueError:
-        return False
+        return None
     if words[:1] == ["sudo"]:
         words = words[1:]
     if words[:2] == ["docker", "pull"]:
-        return True
+        return "docker"
     if words[:2] != ["docker", "compose"]:
-        return False
+        return None
     index = 2
     while index < len(words):
         option, equals, _ = words[index].partition("=")
@@ -103,54 +110,89 @@ def is_pull_command(line: str) -> bool:
         elif words[index] in _COMPOSE_SWITCHES:
             index += 1
         else:
-            return words[index] in ("up", "pull")
-    return False
+            return "compose" if words[index] in ("up", "pull") else None
+    return None
 
 
 def image_download(diagnostics: str) -> dict[str, str] | None:
     """Read log order, not appended annotations: only an explicit Docker setup command
     authorizes a download failure. A new GitHub step/Run command or test start ends it.
     Errors after the setup failure can name tests that never had working services."""
-    pulling = False
+    pulls = 0
+    composing = False
     preamble = False
+    continuation = ""
+    download_vertices: set[str] = set()
     failure: dict[str, str] | None = None
     step: str | None = None
     for raw in diagnostics.splitlines():
         fields = raw.split("\t", 2)  # gh --log-failed: job, step, timestamp + output
         current = fields[1] if len(fields) == 3 else None
         line = fields[-1] if len(fields) == 3 else raw
-        line = re.sub(r"^\d{4}-\d\d-\d\dT\S+\s+", "", line).strip()
+        # Remove only the timestamp separator; command indentation matters when a
+        # backslash joins physical shell lines without inserting another character.
+        line = re.sub(r"^\d{4}-\d\d-\d\dT\S+[ \t]", "", line)
         if current != step:
             if failure:
                 return failure
-            pulling = False
+            pulls = 0
+            composing = False
             preamble = False
+            continuation = ""
+            download_vertices.clear()
         step = current
-        group = line.startswith("##[group]Run ")
-        if group or line.startswith("Run "):
+        group = line.lstrip().startswith("##[group]Run ")
+        if group or line.lstrip().startswith("Run "):
             if failure:
                 return failure
-            pulling = False
+            pulls = 0
+            composing = False
             preamble = group
-        if line == "##[endgroup]":
+            continuation = ""
+            download_vertices.clear()
+        if line.strip() == "##[endgroup]":
             preamble = False
+            continuation = ""
             continue
+        # The preamble is a shell script: a backslash-newline continues its command.
+        # Never join execution output, where the same characters can be application data.
+        if preamble or line.lstrip().startswith("Run ") or continuation:
+            if (len(line) - len(line.rstrip("\\"))) % 2:
+                continuation += line[:-1]
+                continue
+            line = continuation + line
+            continuation = ""
+        line = line.strip()
         if not preamble and _PULL_COMPLETE.search(line):
-            pulling = False
+            if line.lower().startswith("status:"):
+                pulls = max(0, pulls - 1)
+            else:
+                composing = False  # Several containers can start for one Compose command.
             failure = None  # Docker recovered before handing control to tests.
-        pull_command = is_pull_command(line)
+        pull = pull_command(line)
         # GitHub prints the entire shell script before running it. A later test command
         # in that preamble does not mean tests started before the pull failed.
         if (
-            (not preamble or group or not pulling) and not pull_command
+            (not preamble or group or not (pulls or composing)) and not pull
             and (first_test(line) or _TEST_START.search(line))
         ):
             return failure
         if _CONTAINER_OUTPUT.search(line):
             continue
-        if pull_command:
-            pulling = True
-        if pulling and not preamble and (found := _DOWNLOAD.search(line)):
+        if pull == "docker":
+            # GitHub prints all commands before execution, so each planned pull needs
+            # its own completion. The first success must not clear a later pull.
+            pulls = pulls + 1 if preamble else max(1, pulls)
+        elif pull == "compose":
+            composing = True
+        if not preamble and (vertex := _VERTEX.match(line)):
+            if _DOWNLOAD_VERTEX.match(line):
+                download_vertices.add(vertex[1])
+            if vertex[1] not in download_vertices:
+                continue
+        if _BUILD_COMMAND_FAILURE.search(line):
+            continue  # A summary can quote download words inside the failing RUN command.
+        if (pulls or composing) and not preamble and (found := _DOWNLOAD.search(line)):
             failure = {"form": found[0].split(":", 1)[0].lower(), "line": found[0]}
     return failure
 
