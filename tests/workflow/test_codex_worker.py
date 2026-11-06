@@ -1590,6 +1590,9 @@ _CAPACITY_NOW = 1_792_080_000
 
 
 def _capacity_session(workflow: Workflow, kind: str = "ticket") -> tuple[str, str, Path]:
+    from workflow.test_tick import _readable_main
+
+    _readable_main(workflow)
     if kind == "hunt":
         worktree = workflow.add_hunt("example")
         (workflow.hunt_report("example") / "codex.log").touch()
