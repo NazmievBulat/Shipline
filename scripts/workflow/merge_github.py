@@ -317,6 +317,7 @@ def push_failure(output: str, checkout: Path, timeout: float | None = None) -> s
     from merge_gate import (
         REFUSAL_LINES,
         TIMEOUT_REFUSAL_LINES,
+        named_test_failure,
         nonblank_lines,
         repository_command,
         short_of_memory,
@@ -334,7 +335,7 @@ def push_failure(output: str, checkout: Path, timeout: float | None = None) -> s
         (line.strip() for line in output.splitlines() if short_of_memory(line)),
         None,
     )
-    if shortage is None:
+    if shortage is None or named_test_failure(output):
         return refusal
     return f"the security scan was short of locked memory twice, a minute apart: {shortage}\n{refusal}"
 

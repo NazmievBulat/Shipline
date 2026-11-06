@@ -761,6 +761,7 @@ def test_a_named_test_failure_is_not_masked_by_a_memory_retry(
 
     assert done.returncode == 1, done.stdout + done.stderr
     assert "merge refused:" in done.stderr and failed in done.stderr
+    assert "twice, a minute apart" not in done.stderr
     assert hook_runs(workflow) == ["EIO_BACKEND=posix"]
     assert workflow.calls("sleep 60") == []
     assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == github.head
