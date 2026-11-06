@@ -23,7 +23,7 @@ from workflow.test_merge_when_current import (
 from workflow.test_merge_when_current import (
     github as github_fixture,
 )
-from workflow_harness import Workflow, instruction, session_arguments
+from workflow_harness import SCRIPTS, Workflow, instruction, session_arguments
 
 github = github_fixture
 
@@ -2908,6 +2908,15 @@ _FAILED_TEST = (
     " - AssertionError: assert 28 == 29\n"
 )
 
+# Docker Compose's pull-through-cache failure, with neutral service and step names.
+_DOWNLOAD_LINE = "short read: expected 1048576 bytes but got 0: unexpected EOF"
+_COMPOSE_DOWNLOAD = (
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z ##[group]Run docker compose up -d database\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z ##[endgroup]\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:01Z  database Pulling\n"
+    f"CI: server tests\tStart services\t2026-11-04T10:00:02Z {_DOWNLOAD_LINE}\n"
+)
+
 
 def _fail(
     github: GitHub,
@@ -3577,3 +3586,213 @@ def test_successful_retry_jobs_wait_for_the_run_metadata_before_handing_back(
     assert (workflow.state / "merged").exists(), done.stdout + done.stderr + str(_train(workflow))
     assert (workflow.state / "merged").read_text() == "7"
     assert len(workflow.calls("gh run rerun")) == 1
+
+
+@pytest.mark.parametrize("error", [
+    _DOWNLOAD_LINE, "unexpected EOF", "failed to copy: httpReadSeeker: unexpected status",
+    "toomanyrequests: download rate limit exceeded",
+])
+@pytest.mark.parametrize("command", ["docker compose up -d database", "docker pull example-app"])
+def test_image_download_before_test_errors_is_retried(
+    handed: GitHub, error: str, command: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    log = _COMPOSE_DOWNLOAD.replace("docker compose up -d database", command).replace(
+        _DOWNLOAD_LINE, error
+    ) + _FAILED_TEST
+    _fail(handed, log=log)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("gh run rerun")) == 1
+    assert _note(workflow).exists()
+    assert workflow.calls("gh pr ready") == []
+    assert _started(workflow) == []
+
+
+@pytest.mark.parametrize("error", [
+    _DOWNLOAD_LINE, "unexpected EOF", "failed to copy: httpReadSeeker", "toomanyrequests",
+])
+def test_image_download_words_in_tests_still_go_to_a_worker(handed: GitHub, error: str) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    log = (
+        "CI: server tests\tStart services\t2026-11-04T10:00:00Z ##[group]Run docker compose up -d database\n"
+        "CI: server tests\tStart services\t2026-11-04T10:00:01Z database Started\n"
+        "CI: server tests\tTests\t2026-11-04T10:00:02Z ##[group]Run pytest\n"
+        f"CI: server tests\tTests\t2026-11-04T10:00:03Z server under test: {error}\n"
+    ) + _FAILED_TEST
+    _fail(handed, log=log)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh run rerun") == []
+    assert not _note(workflow).exists()
+    assert len(workflow.calls("gh pr ready")) == 1
+
+
+@pytest.mark.parametrize("second", [
+    "same", "another job recovered", "interrupted claim", "runner not reported",
+    "another runner", "another error", "own test",
+])
+def test_repeated_image_download_waits_only_for_the_same_runner_and_failure(
+    handed: GitHub, second: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log=_COMPOSE_DOWNLOAD)
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    jobs[-1]["runner_name"] = "example-runner"
+    if second == "another job recovered":
+        jobs.insert(-1, {**jobs[-1], "id": 98, "name": "CI: browser tests"})
+        handed.api["repos/example-org/example-app/check-runs/98/annotations?per_page=100"] = []
+        (workflow.state / "job-logs/98").write_text(_COMPOSE_DOWNLOAD)
+    handed.save()
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _note(workflow).exists()
+    if second == "interrupted claim":
+        claim = _folder(workflow) / "check-rerun-20.json"
+        saved = json.loads(claim.read_text())
+        saved["state"] = "claim"
+        claim.write_text(json.dumps(saved))
+    run = handed.api[_RUNS.format(head=handed.head)]["workflow_runs"][0]
+    run["run_attempt"] = 2
+    if second == "another job recovered":
+        jobs[-2]["conclusion"] = "success"
+    jobs[-1]["id"] = 99  # A re-run assigns new job IDs.
+    handed.api["repos/example-org/example-app/check-runs/99/annotations?per_page=100"] = []
+    log = _COMPOSE_DOWNLOAD + _FAILED_TEST
+    if second == "another runner":
+        jobs[-1]["runner_name"] = "example-runner-2"
+    elif second == "runner not reported":
+        jobs[-1].pop("runner_name")
+    elif second == "another error":
+        log = _COMPOSE_DOWNLOAD.replace(_DOWNLOAD_LINE, "toomanyrequests") + _FAILED_TEST
+    elif second == "own test":
+        log = _FAILED_TEST
+    (workflow.state / "job-logs/99").write_text(log)
+    handed.save()
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("gh run rerun")) == 1
+    if second in ("same", "another job recovered", "interrupted claim"):
+        assert _note(workflow).exists()
+        assert workflow.calls("gh pr ready") == []
+        assert _started(workflow) == []
+        pending = list((_folder(workflow) / "runner-downloads.pending").glob("*.json"))
+        assert len(pending) == 1
+        line = json.loads(pending[0].read_text())["line"]
+        assert "example-runner" in line and _DOWNLOAD_LINE in line
+        assert not list((_folder(workflow) / "merge-handbacks.pending").glob("*"))
+        sent = _folder(workflow) / "runner-downloads.sent" / pending[0].name
+        sent.parent.mkdir()
+        pending[0].rename(sent)
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert not list(pending[0].parent.glob("*.json"))
+        assert _note(workflow).exists()
+    else:
+        assert not _note(workflow).exists()
+        assert not list((_folder(workflow) / "runner-downloads.pending").glob("*.json"))
+        assert bool(workflow.calls("gh pr ready")) == (second == "own test")
+
+
+@pytest.mark.parametrize("log", [
+    "##[group]Run docker compose up -d database\npytest\n##[endgroup]\n" + _DOWNLOAD_LINE + "\n" + _FAILED_TEST,
+    "Run docker pull example-app\nunexpected EOF\n" + _FAILED_TEST,
+    "Run docker pull playwright\nunexpected EOF\n" + _FAILED_TEST,
+    'Run docker compose -f "example app.yml" --profile=tests up -d database\nunexpected EOF\n' + _FAILED_TEST,
+    # GitHub prints both pulls once, before either executes. Completing the first
+    # must leave the second download in context.
+    "##[group]Run docker pull example-app\ndocker pull example-database\n##[endgroup]\n"
+    "Status: Image is up to date for example-app\nUsing default tag: latest\nunexpected EOF\n",
+    "##[group]Run docker compose \\\n  --file example.yml \\\n  up -d database\n##[endgroup]\n"
+    "database Pulling\nunexpected EOF\n",
+    "##[group]Run docker compose up --build -d database\n##[endgroup]\n"
+    "#2 [internal] load metadata for example-database\n"
+    "#2 ERROR: failed to copy: httpReadSeeker\n",
+    "##[group]Run docker compose up -d database cache\ndocker pull example-app\n##[endgroup]\n"
+    "Container database Started\nContainer cache Started\nunexpected EOF\n",
+    # Shell removes backslash-newline without inserting a space; retain indentation.
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z ##[group]Run docker compose\\\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z   --file example.yml\\\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z   up -d database\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:00Z ##[endgroup]\n"
+    "CI: server tests\tStart services\t2026-11-04T10:00:01Z unexpected EOF\n",
+])
+def test_download_order_uses_execution_output_after_the_command_preamble(
+    handed: GitHub, log: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log=log)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("gh run rerun")) == 1
+    assert _note(workflow).exists()
+
+
+@pytest.mark.parametrize("log", [
+    _FAILED_TEST + _COMPOSE_DOWNLOAD,
+    "Run pytest\n" + _COMPOSE_DOWNLOAD + _FAILED_TEST,
+    "Run docker compose up -d database\ndatabase Started\nRun pytest\n" + _DOWNLOAD_LINE + "\n" + _FAILED_TEST,
+    "Run docker build .\nfailed to copy: httpReadSeeker\n" + _FAILED_TEST,
+    "Run docker compose up database\nexample-app | unexpected EOF\n" + _FAILED_TEST,
+    "Run docker compose up database\nexample-app | toomanyrequests\n" + _FAILED_TEST,
+    "Run docker compose up -d database\nContainer example-app Started\n" + _DOWNLOAD_LINE + "\n" + _FAILED_TEST,
+    "Run docker pull example-app\nStatus: Image is up to date for example-app\nunexpected EOF\n" + _FAILED_TEST,
+    "Run docker compose up database\nexample-app | " + _FAILED_TEST + _COMPOSE_DOWNLOAD,
+    _COMPOSE_DOWNLOAD + "CI: server tests\tStart services\t2026-11-04T10:00:03Z Container example-app Started\n" + _FAILED_TEST,
+    "Run docker pull example-app\nunexpected EOF\nStatus: Downloaded newer image for example-app\n" + _FAILED_TEST,
+    "##[group]Run docker compose up -d database\necho toomanyrequests\n##[endgroup]\n" + _FAILED_TEST,
+    "Run docker compose run --rm tests pytest -k pull\nunexpected EOF\n" + _FAILED_TEST,
+    "Run docker compose exec example-app npm test -- --grep up\ntoomanyrequests\n" + _FAILED_TEST,
+    "##[group]Run set -e\npytest -q\ndocker pull example-app\n##[endgroup]\nunexpected EOF\n" + _FAILED_TEST,
+    "##[group]Run set -e\nnpm test\ndocker compose up database\n##[endgroup]\ntoomanyrequests\n" + _FAILED_TEST,
+    "Run docker compose --unknown example-app up\nunexpected EOF\n" + _FAILED_TEST,
+    # A Compose build's RUN output is application code, even before services start.
+    "##[group]Run docker compose up --build -d example-app\n##[endgroup]\n"
+    "#7 [example-app 3/3] RUN python build.py\n#7 0.123 RuntimeError: unexpected EOF\n"
+    '#7 ERROR: process "/bin/sh -c python build.py" did not complete successfully: exit code: 1\n',
+    # Download context from one vertex must never authorize another vertex's RUN.
+    "Run docker compose up --build -d example-app\n"
+    "#2 [internal] load metadata for example-app\n#2 DONE 0.1s\n"
+    "#7 [example-app 3/3] RUN python build.py\n#7 0.123 RuntimeError: unexpected EOF\n",
+    # Once both planned pulls finish, unrelated EOF output is no download evidence.
+    "##[group]Run docker pull example-app\ndocker pull example-database\n##[endgroup]\n"
+    "Status: Image is up to date for example-app\n"
+    "Status: Downloaded newer image for example-database\nunexpected EOF\n" + _FAILED_TEST,
+    "##[group]Run pytest \\\n  -q\ndocker compose \\\n  up -d database\n##[endgroup]\n"
+    "unexpected EOF\n" + _FAILED_TEST,
+])
+def test_download_context_does_not_override_tests_that_already_started(
+    handed: GitHub, log: str
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log=log)
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("gh run rerun") == []
+    assert not _note(workflow).exists()
+    assert len(workflow.calls("gh pr ready")) == 1
+
+
+@pytest.mark.parametrize("error", ["unexpected EOF", "toomanyrequests", "failed to copy: httpReadSeeker"])
+def test_dockerfile_command_summaries_are_not_download_evidence(
+    monkeypatch: pytest.MonkeyPatch, error: str
+) -> None:
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    from check_repair import image_download
+
+    # The existing transport fallback may retry this once. It must never record
+    # download evidence that could hold the handoff waiting for a cache repair.
+    log = (
+        "Run docker compose up --build -d example-app\n"
+        "#7 [example-app 3/3] RUN echo " + error + " && exit 1\n"
+        "#7 0.123 " + error + "\n"
+        'failed to solve: process "/bin/sh -c echo ' + error
+        + ' && exit 1" did not complete successfully: exit code: 1\n'
+    )
+    assert image_download(log) is None
