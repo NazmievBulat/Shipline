@@ -836,10 +836,10 @@ def test_a_refresh_push_short_of_memory_names_the_error_and_waits_for_machine_er
     done = github.run()
 
     assert done.returncode == 1, done.stdout + done.stderr
-    # The scan's own words on the line the wake shows, not "$ sh scripts/security-scan.sh all".
+    # Machine errors use safe wording; other failures retain the scan's own words.
     refusal = _refusal(done)
     if machine:
-        assert refusal.startswith("merge waiting: " + message), refusal
+        assert refusal.startswith("merge waiting: Cannot allocate memory; "), refusal
         assert "free memory or raise the memory limit" in refusal
     else:
         assert refusal.startswith("merge refused: could not push the refreshed branch: "), refusal
@@ -866,7 +866,8 @@ def test_a_push_failing_for_another_reason_is_not_retried_inside_the_call(
 
     done = github.run()
 
-    assert done.returncode == 1 and message in done.stderr, done.stdout + done.stderr
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert ("Cannot allocate memory; " if waiting else message) in done.stderr
     assert ("merge waiting" if waiting else "merge refused") in done.stderr
     assert hook_runs(github.workflow) == ["EIO_BACKEND=posix"]
     assert github.workflow.calls("sleep 60") == []
