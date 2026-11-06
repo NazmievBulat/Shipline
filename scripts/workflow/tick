@@ -954,6 +954,17 @@ retry_status() {
   return 0
 }
 
+# Owned status drafts need no GitHub response. Share this pass between local duties
+# and listing failures so neither can strand text or bypass the per-tick retry bound.
+status_duties() {
+  local name state
+  while read -r name state _; do
+    [[ $state != limit && $name =~ ^(ticket|review)-[0-9]+$ ]] || continue
+    session_current "$name" || continue
+    retry_status "$name" || true
+  done <<<"$running"
+}
+
 # GitHub pauses do not hold back what needs no GitHub: squeezing and resending after a
 # usage reset, then local alerts and pending owner/cloud notifications in the wake.
 paused() {
@@ -1004,6 +1015,7 @@ local_duties() {
       failed=1
     fi
   done <<<"$running"
+  status_duties
   capacity_duties
 }
 
@@ -1083,8 +1095,9 @@ if ! python3 "$here/tick_snapshot.py" create "$snapshot" 9>&- || ! pulls=$(label
   # The application an ended hunt left running is stopped all the same.
   session cleanup hunts
   budget_ready || paused
-  # Capacity recovery needs no pull request listing. Leave the other local duties
-  # on their existing paths, including their protections during listing failures.
+  # Status and capacity recovery need no pull request listing. Leave the other
+  # local duties on their existing paths, including their protections on failures.
+  status_duties
   capacity_duties
   exit 1
 fi
@@ -1228,13 +1241,8 @@ running=$(session list) || failed=1
 # after its session started, on the head or an ancestor. Unknown or empty checks are not
 # finished; failures are finished too.
 # The sessions given a message in this tick: step 8 gives them no second one.
-# Recover a status before a check wake can submit it as a different message. The
-# local usage-reset duties above use the same function and per-tick ownership list.
-while read -r name state _; do
-  [[ $state != limit && $name =~ ^(ticket|review)-[0-9]+$ ]] || continue
-  session_current "$name" || continue
-  retry_status "$name" || true
-done <<<"$running"
+# Local duties recover status drafts before competing wakes, sharing their
+# per-tick ownership list with usage-reset recovery and stuck detection below.
 if train=$(WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/merge-when-current" --train-status 9>&-); then
 # A shadow tick notes the line it read whenever it changed: it explains a decision that differs.
 if ((shadow)); then

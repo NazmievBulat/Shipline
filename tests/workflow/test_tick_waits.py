@@ -5,6 +5,7 @@ wake, and names an idle session that no rule covers."""
 import json
 import os
 import shlex
+import time
 from pathlib import Path
 
 import pytest
@@ -109,6 +110,76 @@ def test_own_status_without_wait_notes_is_sent_on_the_next_tick(
     assert _keys(workflow, name) == ["Enter"]
     assert not notes.with_suffix(".typed").exists()
     assert _pending(workflow) == []
+
+
+def _github_unavailable(workflow: Workflow, failure: str) -> Path:
+    if failure == "budget-pause":
+        budget = Path(workflow.env["HOME"]) / ".local/state/workflow/github-budget"
+        budget.mkdir(parents=True, exist_ok=True)
+        marker = budget / "budget.json"
+        marker.write_text(json.dumps({
+            "core": {"remaining": 499, "reset": int(time.time()) + 3600}
+        }))
+    else:
+        marker = workflow.state / "fail-gh-list"
+        marker.touch()
+    return marker
+
+
+@pytest.mark.parametrize("failure", ["budget-pause", "listing-failure"])
+@pytest.mark.parametrize("name", ["ticket-7", "review-7"])
+def test_status_recovery_needs_no_github(workflow: Workflow, failure: str, name: str) -> None:
+    notes = _session(workflow, name)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / f"input-{name}").write_text(_STATUS)
+    _github_unavailable(workflow, failure)
+
+    for n in range(3):
+        done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)})
+        assert done.returncode == (0 if failure == "budget-pause" else 1), done.stderr
+
+    assert _keys(workflow, name) == ["Enter"]
+    assert not notes.with_suffix(".typed").exists()
+
+
+@pytest.mark.parametrize("failure", ["budget-pause", "listing-failure"])
+@pytest.mark.parametrize("restore", [False, True])
+def test_local_status_recovery_shares_its_bound_and_alert(
+    workflow: Workflow, failure: str, restore: bool
+) -> None:
+    notes = _session(workflow, "review-7")
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-review-7").write_text(_STATUS)
+    (workflow.state / "swallow-enter-review-7").write_text("100")
+    marker = _github_unavailable(workflow, failure)
+
+    for n in range(7):
+        if restore and n == 2:
+            marker.unlink()
+        workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)})
+        assert _keys(workflow, "review-7") == ["Enter"] * min(n + 1, 3)
+
+    line = "stuck? review-7 (status message not taken; its text stays in the box)"
+    assert _pending(workflow) == [line]
+    assert [row for row in workflow.wake_log.read_text().splitlines()
+            if row.split(" ", 1)[-1] == line] == [f"{_NOW + 540} {line}"]
+
+
+@pytest.mark.parametrize("failure", ["budget-pause", "listing-failure"])
+@pytest.mark.parametrize("text", ["Owner draft", _STATUS + " more", _STATUS + "\n  Owner addition"])
+def test_local_status_recovery_preserves_changed_input(
+    workflow: Workflow, failure: str, text: str
+) -> None:
+    notes = _session(workflow, "review-7")
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-review-7").write_text(text)
+    _github_unavailable(workflow, failure)
+
+    for n in range(2):
+        workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)})
+
+    assert _keys(workflow, "review-7") == []
+    assert (workflow.state / "input-review-7").read_text() == text
 
 
 @pytest.mark.parametrize("wait_note", [False, True])
