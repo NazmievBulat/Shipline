@@ -120,6 +120,25 @@ def test_not_started_windows_have_their_full_length_and_an_explicit_marker(
 
 
 @pytest.mark.parametrize("source", ["cache", "live"])
+@pytest.mark.parametrize("windows", [("five_hour",), ("seven_day",), ("five_hour", "seven_day")])
+def test_null_windows_have_zero_usage_and_have_not_started(
+    workflow: Workflow, source: str, windows: tuple[str, ...]
+) -> None:
+    _usage_answer(workflow, {**_ANSWER, **dict.fromkeys(windows)}, source)
+
+    done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "".join(
+        f"{window} 0 {_NOW + length} not_started\n" if window in windows else line
+        for window, length, line in zip(
+            ("five_hour", "seven_day"), (5 * 3600, 7 * 86400), _LINES.splitlines(keepends=True)
+        )
+    )
+    assert (workflow.state / "curl-args").exists() is (source == "live")
+
+
+@pytest.mark.parametrize("source", ["cache", "live"])
 def test_zero_utilization_with_a_dated_reset_has_started(
     workflow: Workflow, source: str
 ) -> None:
@@ -136,7 +155,7 @@ def test_zero_utilization_with_a_dated_reset_has_started(
 @pytest.mark.parametrize("source", ["cache", "live"])
 @pytest.mark.parametrize("window", ["five_hour", "seven_day"])
 @pytest.mark.parametrize("value", [
-    None, [], "unknown", 0,
+    [], "unknown", 0, False,
     {"resets_at": None},
     {"utilization": None, "resets_at": None},
     {"utilization": "0", "resets_at": None},
@@ -166,6 +185,21 @@ def test_a_missing_window_is_not_invented(workflow: Workflow, source: str) -> No
 
     assert done.returncode == 0, done.stderr
     assert done.stdout == _LINES.splitlines(keepends=True)[1]
+
+
+@pytest.mark.parametrize("source", ["cache", "live"])
+def test_a_non_json_answer_fails_and_prints_nothing(workflow: Workflow, source: str) -> None:
+    _credentials(workflow)
+    _answering(workflow, "not JSON")
+    cache = workflow.state / "usage-cache.json"
+    workflow.env["WORKFLOW_USAGE_CACHE"] = str(cache)
+    if source == "cache":
+        cache.write_text("not JSON")
+
+    done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert done.returncode == 1
+    assert done.stdout == ""
 
 
 @pytest.mark.parametrize(("age", "fresh"), [(299, True), (301, False)])
