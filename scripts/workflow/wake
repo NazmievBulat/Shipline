@@ -3,6 +3,8 @@
 # orchestrator stops with it when the usage limit stops it; this runs from the tick, which the
 # systemd timer runs every 3 minutes.
 #
+#   wake --tick-result <exit> <error>  count a real tick and alert after 3 failures or unknowns
+#
 #   wake [<name> ...]   the names are the sessions the tick has just sent their instruction
 #                       again, after the reset of the limit that stopped them
 #
@@ -110,15 +112,185 @@ shadow=${SHIPLINE_SHADOW:-}
 [[ -n $shadow ]] || unset SHIPLINE_SHADOW_NOTES
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Result reporting must survive a bad configuration. Ordinary check-ins still refuse it;
+# only the alarm path may recover the main checkout through Git and a prior valid folder.
+if [[ ${1:-} == --tick-result ]]; then
+  [[ -z $shadow ]] || exit 0
+  [[ $# == 3 && $2 =~ ^[0-9]+$ ]] || exit 2
+  case $2 in 129 | 130 | 143) exit 0 ;; esac
+fi
+config_loaded=1
+if [[ ${1:-} == --tick-result ]]; then
+  config=$(python3 "$here/workflow_config.py" shell 2>/dev/null) || config_loaded=0
+else
+  config=$(python3 "$here/workflow_config.py" shell) || exit 1
+fi
+if ((config_loaded)); then
+  eval "$config"
+  export SHIPLINE_CONFIG_JSON
+  main=$SHIPLINE_REPO
+else
+  # The same Git-common-directory parent used by workflow_config.main_checkout; never
+  # infer the repository from the folder these scripts are installed in.
+  common=$(git -C "${SHIPLINE_REPO:-.}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 1
+  main=$(dirname "$common")
+  SHIPLINE_STATE_FOLDER=.local/workflow
+  record=$common/shipline-alert-state-folder
+  cached_folder=""
+  # One NUL-terminated relative folder, never sourced or evaluated. Apply the same lexical
+  # checks as workflow_config._relative: no absolute path, parent part or checkout root.
+  if [[ -f $record && ! -L $record ]] && IFS= read -r -d '' cached_folder <"$record" &&
+      [[ -n $cached_folder && $cached_folder != /* && "/$cached_folder/" != *"/../"* &&
+         ! $cached_folder =~ ^([.]/|/)*[.]?$ ]]; then
+    SHIPLINE_STATE_FOLDER=$cached_folder
+  fi
+fi
+
+log() {
+  printf '%s\n' "$@" >>"$LOG"
+}
+
+# The registered orchestrator: its name and whether it is idle. Never pick another session.
+find_orchestrator() {
+  local registration=$main/$SHIPLINE_STATE_FOLDER/orchestrator name="" found
+  if [[ ! -r $registration ]]; then
+    log "  orchestrator registration could not be read: $registration; nobody was told"
+    return 1
+  fi
+  IFS= read -r name <"$registration" || true
+  if [[ -z $name ]]; then
+    log "  orchestrator registration is empty: $registration; nobody was told"
+    return 1
+  fi
+  found=$(timeout "$LIST_SECONDS" claude agents --json 2>/dev/null 9>&- | jq -r \
+    --arg main "$main" --arg name "$name" '
+    [.[] | select(.kind == "interactive" and .cwd == $main and .name == $name)][0]
+    | select(. != null) | "\(.status // "unknown")\t\(.name)"') || {
+      log "  orchestrator sessions could not be read; nobody was told"
+      return 1
+    }
+  if [[ -z $found ]]; then
+    log "  named orchestrator ($name) is not open in the main checkout; nobody was told"
+    return 1
+  fi
+  printf '%s\n' "$found"
+}
+
+# Sends the message and checks that the tool said it was delivered. What Claude answered is
+# kept in wake.send.log, for when it was not. Its standard input is closed: with none, Claude
+# waits 3 seconds for it and says so.
+send_to() {
+  local to=$1 message=$2 answer
+  [[ -z $shadow ]] || return 0
+  answer=$(cd "$STATE" && timeout "$SEND_SECONDS" claude -p --model "$CHAT_MODEL" --setting-sources "" \
+    --tools SendMessage --output-format stream-json --verbose \
+    --system-prompt "You deliver one message between Claude sessions. Call SendMessage exactly once, with the recipient and the text given, the text unchanged. Then answer with one word: sent." \
+    "Recipient: $to
+Text, between the lines of dashes:
+----------
+$message
+----------" </dev/null 2>"$STATE/wake.send.err" 9>&-) || true
+  { printf '%s\n' "$answer" && cat "$STATE/wake.send.err"; } >"$STATE/wake.send.log" 2>/dev/null
+  rm -f "$STATE/wake.send.err"
+  jq -R 'fromjson? // empty' <<<"$answer" 2>/dev/null | jq -e -s '
+    ([.[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use" and .name == "SendMessage") | .id]) as $sent
+    | [.[] | select(.type == "user") | .message.content[]? | select(.type == "tool_result" and (.tool_use_id | IN($sent[])) and (.is_error | not))]
+    | length > 0' >/dev/null 2>&1
+}
+
+
+# A completed real tick reports exactly once, including on an early failure. This path
+# precedes check-in pacing and GitHub reads: a broken GitHub read must not hide its alert.
+# The tick holds its lock through this call; the extra lock also serializes direct callers.
+if [[ ${1:-} == --tick-result ]]; then
+  notes=$main/$SHIPLINE_STATE_FOLDER
+  mkdir -p "$notes" "$STATE"
+  umask 077
+  exec 8>"$notes/workflow-alert.lock"
+  flock --timeout "$LIST_SECONDS" 8 || exit 1
+  if ((config_loaded)); then
+    # Preserve only the validated relative folder in private Git metadata. A cache failure
+    # must not prevent reporting this tick through the configuration we already read.
+    if common=$(git -C "$main" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+        context_tmp=$(mktemp "$common/shipline-alert-state-folder.XXXXXX" 2>/dev/null); then
+      if ! { printf '%s\0' "$SHIPLINE_STATE_FOLDER" >"$context_tmp" &&
+          mv -T -- "$context_tmp" "$common/shipline-alert-state-folder"; }; then
+        rm -f "$context_tmp"
+        log "  could not keep the alert state folder; result reporting continues"
+      fi
+    else
+      log "  could not keep the alert state folder; result reporting continues"
+    fi
+  else
+    log "  configuration could not be read; alert uses the last valid or default state folder: $SHIPLINE_STATE_FOLDER"
+  fi
+  alert_files=()
+  alert_lines=()
+  untold_lines=()
+  tick_error=${3%%$'\n'*}
+  [[ -n $tick_error ]] || tick_error="tick exited with status $2 without an error line"
+  main_line=""
+  [[ ! -r $notes/main-status ]] || IFS= read -r main_line <"$notes/main-status" || true
+  [[ -n $main_line ]] || main_line="main: unknown, main status report is missing or unreadable"
+  for kind in tick-failures main-unknown-ticks; do
+    bad=0
+    if [[ $kind == tick-failures ]]; then
+      (($2 == 0)) || bad=1
+      line="Tick failed 3 runs in a row: ${tick_error:0:300}"
+    else
+      [[ $main_line != 'main: unknown'* ]] || bad=1
+      line="Main unknown for 3 ticks in a row: ${main_line:0:300}"
+    fi
+    file=$notes/$kind
+    if ((bad == 0)); then
+      rm -f "$file"
+      continue
+    fi
+    count=0
+    rang=0
+    told=0
+    [[ ! -r $file ]] || read -r count rang told <"$file" || true
+    [[ $count =~ ^[0-3]$ && $rang =~ ^[01]$ && $told =~ ^[01]$ ]] || { count=0; rang=0; told=0; }
+    ((count >= 3)) || count=$((count + 1))
+    printf '%s %s %s\n' "$count" "$rang" "$told" >"$file.tmp" && mv -- "$file.tmp" "$file" || exit 1
+    if ((count >= 3 && rang == 0)); then
+      alert_files+=("$file")
+      alert_lines+=("$line")
+      ((told)) || untold_lines+=("$line")
+    fi
+  done
+  ((${#alert_lines[@]})) || exit 0
+  message=$(printf '%s\n' "${alert_lines[@]}")
+  if orchestrator=$(find_orchestrator) && [[ -n $orchestrator ]]; then
+    ((${#untold_lines[@]})) || exit 0
+    message=$(printf '%s\n' "${untold_lines[@]}")
+    name=${orchestrator#*$'\t'}
+    if ! send_to "$name" "$message"; then
+      log "  persistent workflow alert could not be sent to $name; the next tick retries"
+      exit 1
+    fi
+    log "  persistent workflow alert told $name: $message"
+    result="3 0 1"
+  else
+    fix="To restore check-ins, write the open session's name to $SHIPLINE_STATE_FOLDER/orchestrator in the main checkout."
+    if ! bash "$here/notify" workflow <<<"$message"$'\n'"$fix" 8>&- 9>&-; then
+      log "  persistent workflow phone push failed; see missed-pushes.log; the next tick retries: $message; $fix"
+      exit 1
+    fi
+    log "  persistent workflow alert sent to phone: $message; $fix"
+    result="3 1 0"
+  fi
+  # Only a confirmed delivery acknowledges the stretch, as for session pushes in notify.
+  # Recheck availability after telling the orchestrator: if it disappears before recovery,
+  # the owner must still hear about the same continuing fault.
+  for file in "${alert_files[@]}"; do
+    printf '%s\n' "$result" >"$file.tmp" && mv -- "$file.tmp" "$file" || exit 1
+  done
+  exit 0
+fi
+
 github_ready=1
 python3 "$here/github_budget.py" ready wake || github_ready=0
-# The state folder and the labels (`workflow_config.py`), read once; priority.jq reads the
-# label names from SHIPLINE_CONFIG_JSON.
-config=$(python3 "$here/workflow_config.py" shell) || exit 1
-eval "$config"
-export SHIPLINE_CONFIG_JSON
-# The repository's main checkout, never the checkout these scripts are in.
-main=$SHIPLINE_REPO
 saved_line=""
 saved_day=$(date -u -d "@$((NOW - 86400))" +%F)
 saved_sent=$main/$SHIPLINE_STATE_FOLDER/prefix-savings.sent
@@ -469,9 +641,6 @@ fi
 # Written down before anything can fail; removed once the orchestrator was told.
 [[ -n $shadow ]] || ((${#resent[@]} == 0)) || printf '%s\n' "${resent[@]}" >"$PENDING"
 
-log() {
-  printf '%s\n' "$@" >>"$LOG"
-}
 
 # "2h17m" from seconds.
 duration() {
@@ -534,53 +703,6 @@ sessions_line() {
   awk '{ printf "%s%s %s", (NR > 1 ? ", " : ""), $1, $2 }' <<<"$1"
 }
 
-# The registered orchestrator: its name and whether it is idle. Never pick another session.
-find_orchestrator() {
-  local registration=$main/$SHIPLINE_STATE_FOLDER/orchestrator name="" found
-  if [[ ! -r $registration ]]; then
-    log "  orchestrator registration could not be read: $registration; nobody was told"
-    return 1
-  fi
-  IFS= read -r name <"$registration" || true
-  if [[ -z $name ]]; then
-    log "  orchestrator registration is empty: $registration; nobody was told"
-    return 1
-  fi
-  found=$(timeout "$LIST_SECONDS" claude agents --json 2>/dev/null 9>&- | jq -r \
-    --arg main "$main" --arg name "$name" '
-    [.[] | select(.kind == "interactive" and .cwd == $main and .name == $name)][0]
-    | select(. != null) | "\(.status // "unknown")\t\(.name)"') || {
-      log "  orchestrator sessions could not be read; nobody was told"
-      return 1
-    }
-  if [[ -z $found ]]; then
-    log "  named orchestrator ($name) is not open in the main checkout; nobody was told"
-    return 1
-  fi
-  printf '%s\n' "$found"
-}
-
-# Sends the message and checks that the tool said it was delivered. What Claude answered is
-# kept in wake.send.log, for when it was not. Its standard input is closed: with none, Claude
-# waits 3 seconds for it and says so.
-send_to() {
-  local to=$1 message=$2 answer
-  [[ -z $shadow ]] || return 0
-  answer=$(cd "$STATE" && timeout "$SEND_SECONDS" claude -p --model "$CHAT_MODEL" --setting-sources "" \
-    --tools SendMessage --output-format stream-json --verbose \
-    --system-prompt "You deliver one message between Claude sessions. Call SendMessage exactly once, with the recipient and the text given, the text unchanged. Then answer with one word: sent." \
-    "Recipient: $to
-Text, between the lines of dashes:
-----------
-$message
-----------" </dev/null 2>"$STATE/wake.send.err" 9>&-) || true
-  { printf '%s\n' "$answer" && cat "$STATE/wake.send.err"; } >"$STATE/wake.send.log" 2>/dev/null
-  rm -f "$STATE/wake.send.err"
-  jq -R 'fromjson? // empty' <<<"$answer" 2>/dev/null | jq -e -s '
-    ([.[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use" and .name == "SendMessage") | .id]) as $sent
-    | [.[] | select(.type == "user") | .message.content[]? | select(.type == "tool_result" and (.tool_use_id | IN($sent[])) and (.is_error | not))]
-    | length > 0' >/dev/null 2>&1
-}
 
 failed=0
 [[ $sessions_read == true ]] || read_sessions

@@ -283,6 +283,9 @@ def test_the_phone_rings_for_the_owners_permitted_reply_formats(
 
 
 def test_failed_phone_delivery_is_retried_without_replaying_the_comment(workflow: Workflow) -> None:
+    from workflow.test_tick import _readable_main
+
+    _readable_main(workflow)
     workflow.add_pull_request(7)
     record = _record(workflow)
     _keys(workflow)
@@ -300,6 +303,9 @@ def test_failed_phone_delivery_is_retried_without_replaying_the_comment(workflow
 
 
 def test_a_blocker_is_told_once_and_retained_until_delivery(workflow: Workflow) -> None:
+    from workflow.test_tick import _readable_main
+
+    _readable_main(workflow)
     workflow.add_pull_request(7, labels=())
     _record(workflow)
     workflow.orchestrator("busy")

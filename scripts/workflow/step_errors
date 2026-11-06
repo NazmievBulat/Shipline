@@ -1,0 +1,46 @@
+# Capture a command's error separately from earlier successful diagnostics. Nested commands
+# can supply a more specific error (for example setup versus launch within session start).
+# With no result file, including ordinary session calls and shadow ticks, run as before.
+workflow_step() {
+  local result_file=${WORKFLOW_STEP_ERROR:-} parts status
+  if [[ -z $result_file ]]; then
+    "$@"
+    return $?
+  fi
+  parts=$(mktemp -d "${result_file%/*}/step.XXXXXX" 2>/dev/null) || {
+    rm -f -- "$result_file" 2>/dev/null || true
+    "$@"
+    return $?
+  }
+  rm -f -- "$result_file" 2>/dev/null || true
+  if ! (umask 077; : >"$parts/stderr"); then
+    rm -rf -- "$parts" 2>/dev/null || true
+    "$@"
+    return $?
+  fi
+  if WORKFLOW_STEP_ERROR="$parts/reason" "$@" 2>"$parts/stderr"; then
+    status=0
+  else
+    status=$?
+  fi
+  cat -- "$parts/stderr" >&2 || true
+  if ((status)); then
+    if [[ -s $parts/reason ]]; then
+      cp -- "$parts/reason" "$result_file" || true
+    else
+      # stdout can contain progress even when the command fails; only stderr is an error.
+      (umask 077; head -n 1 -- "$parts/stderr" | cut -c 1-300 >"$result_file") || true
+      if [[ ! -s $result_file ]]; then
+        (umask 077; printf 'step exited with status %s without an error line\n' "$status" >"$result_file") || true
+      fi
+    fi
+  fi
+  rm -rf -- "$parts" 2>/dev/null || true
+  return "$status"
+}
+
+# A script's explicit refusal is already the error of the failing step.
+workflow_step_error() {
+  [[ -n ${WORKFLOW_STEP_ERROR:-} ]] || return 0
+  (umask 077; printf '%s\n' "${1:0:300}" >"$WORKFLOW_STEP_ERROR") || true
+}
