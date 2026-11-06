@@ -151,6 +151,9 @@ def test_an_interrupted_index_repair_resumes_on_a_later_tick(workflow: Workflow,
     healthy_index = Path(workflow.git("rev-parse", "--path-format=absolute", "--git-path", "index", cwd=healthy))
     healthy_before = healthy_index.read_bytes()
     source = worktree / "example.txt"
+    source.write_text("committed\n")
+    workflow.git("add", "example.txt", cwd=worktree)
+    workflow.git("commit", "--quiet", "-m", "feat: example", cwd=worktree)
     source.write_text("staged\n")
     workflow.git("add", "example.txt", cwd=worktree)
     tree = workflow.git("write-tree", cwd=worktree)
