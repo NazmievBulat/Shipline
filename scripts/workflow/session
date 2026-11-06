@@ -196,6 +196,10 @@ EOF
 }
 
 die() {
+  # Loaded by find_main_checkout before any start can fail.
+  if declare -F workflow_step_error >/dev/null; then
+    workflow_step_error "$*"
+  fi
   echo "$*" >&2
   exit 1
 }
@@ -223,6 +227,7 @@ find_main_checkout() {
   local here
   here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   script_dir=$here
+  source "$here/step_errors"
   # Its `bin`, for `shipline` in what a session runs, when this checkout has the launcher.
   shipline_bin=$(cd "$here/../.." && pwd)/bin
   # How a sentence names `notify waiting`: by the launcher's absolute path, which a session
@@ -444,6 +449,7 @@ cmd_load() {
 
 # Exit 3 identifies local work that needs judgment; resource/setup failures remain retryable.
 refuse_local_work() {
+  workflow_step_error "$*"
   echo "$*" >&2
   exit 3
 }
@@ -455,7 +461,7 @@ setup_worktree() {
   # explicit paths and a relative XDG_CONFIG_HOME normalized before changing directory.
   program=$(env "${session_config[@]}" python3 -B "$script_dir/workflow_config.py" worktree-setup)
   if [[ -x $program ]]; then
-    (cd "$worktree" && "$program" "$@") >&2
+    (cd "$worktree" && workflow_step "$program" "$@") >&2
   elif jq -e 'has("worktree_setup")' <<<"$SHIPLINE_CONFIG_JSON" >/dev/null; then
     message="worktree setup $SHIPLINE_WORKTREE_SETUP is not executable; setup skipped"
     echo "$message" >&2
@@ -770,6 +776,7 @@ wait_for_resources() {
     # The tick must release its lock so later ticks can still maintain sessions.
     # Manual starts retain their existing wait; deferred starts are tried next tick.
     if [[ ${WORKFLOW_DEFER_START:-0} == 1 ]]; then
+      workflow_step_error "$reason; the next tick tries this start again"
       echo "$reason; the next tick tries this start again" >&2
       exit 75
     fi
@@ -903,7 +910,7 @@ launch() {
   # A clean environment: the caller's own CLAUDE_* variables must not reach the session.
   # TMUX_TMPDIR goes along when the caller has one, or the new server would put its socket
   # where the other commands of this script do not look.
-  env -i \
+  workflow_step env -i \
     HOME="$HOME" \
     USER="${USER:-$(id -un)}" \
     SHELL="${SHELL:-/bin/bash}" \
@@ -923,13 +930,13 @@ launch() {
     8>&- || return $?
   # A cloud launch's pane ends as soon as it has launched; the record of its launch is read
   # instead, and its scope's check still keeps the launcher from running without the limits.
-  [[ $name == cloud-* ]] || await_limits "$name" "$note" || return 1
+  [[ $name == cloud-* ]] || workflow_step await_limits "$name" "$note" || return 1
   snapshot_busy "$name"
 }
 
 save_link() {
   local name=$1 worktree=$2 on_failure=${3:-stop}
-  if ! wait_for_link "$name"; then
+  if ! workflow_step wait_for_link "$name"; then
     [[ $on_failure != stop ]] || { stop_session "$name"; exit 1; }
     # Only this session ends; a Codex worker beside it goes on.
     tmux -L "$name" kill-server 2>/dev/null || true

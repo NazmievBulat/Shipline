@@ -1820,7 +1820,7 @@ def test_tick_counts_unknown_main_once_per_tick(workflow: Workflow) -> None:
     assert "main: unknown, cannot read CI" in push.message
 
 
-@pytest.mark.parametrize("failure", ["launch", "setup", "configuration"])
+@pytest.mark.parametrize("failure", ["launch", "setup", "configuration", "main", "poll", "limits"])
 def test_tick_alert_reports_the_failed_start_step_after_successful_output(
     workflow: Workflow, failure: str,
 ) -> None:
@@ -1853,8 +1853,28 @@ def test_tick_alert_reports_the_failed_start_step_after_successful_output(
             f'#!/bin/bash\necho "setup progress"\necho "{error}" >&2\n'
             'echo "setup details" >&2\nexit 19\n',
         )
-    else:
+    elif failure == "configuration":
         error = "WORKFLOW_LOAD_PER_PROCESSOR is 'invalid', not a number above 0"
+    elif failure == "main":
+        error = "cannot read main checks"
+        workflow.script.with_name("main-status").write_text(
+            f'#!/bin/bash\necho "{error}" >&2\necho "check details" >&2\nexit 1\n'
+        )
+    elif failure == "poll":
+        error = "cannot poll cloud workers"
+        workflow.script.with_name("cloud_workers.py").write_text(
+            'import sys\nif sys.argv[1] == "poll":\n'
+            f'    print("{error}", file=sys.stderr)\n'
+            '    print("poll details", file=sys.stderr)\n    sys.exit(1)\n'
+        )
+    else:
+        error = (
+            "ticket-7 was not started: its scope does not hold its memory limits of "
+            "8 GB and 4 GB of swap (memory.max max, memory.swap.max max)"
+        )
+        (workflow.state / "limits-not-set-ticket-7").write_text(
+            "memory.max max, memory.swap.max max\n"
+        )
     env = {"WORKFLOW_LOAD_PER_PROCESSOR": "invalid"} if failure == "configuration" else None
     for _ in range(3):
         done = workflow.run_script("tick", env=env)
