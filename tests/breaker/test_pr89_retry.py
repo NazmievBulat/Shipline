@@ -1,5 +1,6 @@
 """Independent retry, interruption, concurrency and private-state probes for PR 89."""
 
+import fcntl
 import importlib
 import json
 import stat
@@ -117,6 +118,29 @@ def test_two_calls_while_first_request_is_held_send_only_once(setup):
             release.set()
         assert first.result(timeout=5)
     assert len(s.calls) == 1
+
+
+def test_retry_can_progress_while_another_call_holds_the_merge_lock(setup):
+    s = setup
+    s.folder.mkdir()
+    with (s.folder / "merge.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(s.repair.rerun, s.folder, s.diagnosis())
+            try:
+                assert future.result(timeout=2)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    assert len(s.calls) == 1
+
+
+def test_partial_rerun_still_running_is_not_judged_early(setup):
+    s = setup
+    diagnosis = s.diagnosis(2)
+    diagnosis.runs[0][1][0]["status"] = "in_progress"
+    with pytest.raises(s.github.Waiting, match="still running"):
+        s.repair.diagnose_runs("a" * 40, diagnosis.runs)
+    assert s.calls == []
 
 
 def test_timeout_claim_keeps_evidence_and_recovers_when_attempt_two_appears(setup):

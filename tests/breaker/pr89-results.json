@@ -11,7 +11,7 @@
     },
     {
       "command": "python -m pytest tests/breaker/test_pr89_retry.py --tb=short -q",
-      "result": "17 passed in 0.07s"
+      "result": "19 passed in 0.07s"
     },
     {
       "command": "python -m pytest tests/breaker/test_pr89_wake.py --tb=short -q",
@@ -49,7 +49,7 @@
     "Application output and recovered pulls followed by failing tests",
     "Missing runner evidence, shell syntax in logs, diagnostic redaction, and runner line-break rejection",
     "One retry, same-runner repeat, changed job/runner/error, partial recovery, private file modes, and sent receipts",
-    "Two concurrent calls with the first request held, an ambiguous timeout, a budget pause, and malformed claim files",
+    "A held merge lock, two concurrent calls with the first request held, an in-progress partial rerun, an ambiguous timeout, a budget pause, and malformed claim files",
     "Missing or timed-out logs and ineligible runner labels",
     "Busy daytime wake, failed-send recovery, missing orchestrator, and co-delivery with a lost check"
   ],
