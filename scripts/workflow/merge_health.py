@@ -1087,15 +1087,17 @@ def repair_step(main: Path, folder: Path, marker: Path, command: list[str]) -> i
         (command[0] == "git" and "fetch" in command[1:])
         or re.search(r"^main:", text, re.M)
     ):
-        # Fetch alone says nothing about a still-broken index. A manual recovery ends
-        # the failed stretch only when Git's read-only object and index check passes.
+        # Fetch alone says nothing about a still-broken index. Resume an interrupted
+        # repair on an object diagnostic; only a healthy check ends the failed stretch.
         try:
-            healthy = _repair_command(
+            checked = _repair_command(
                 main, "fsck", "--cache", "--connectivity-only",
                 "--no-dangling", check=False,
-            ).returncode == 0
-            if healthy:
+            )
+            if checked.returncode == 0:
                 failed.unlink(missing_ok=True)
+            else:
+                broken = bool(_BROKEN_OBJECT.search(checked.stdout + checked.stderr))
         except RepairFailed:
             pass
     if broken and repair_repository(main, folder, marker):
