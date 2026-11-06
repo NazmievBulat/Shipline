@@ -1820,7 +1820,9 @@ def test_tick_counts_unknown_main_once_per_tick(workflow: Workflow) -> None:
     assert "main: unknown, cannot read CI" in push.message
 
 
-@pytest.mark.parametrize("failure", ["launch", "setup", "configuration", "main", "poll", "limits"])
+@pytest.mark.parametrize(
+    "failure", ["launch", "setup", "configuration", "main", "poll", "limits", "priority"],
+)
 def test_tick_alert_reports_the_failed_start_step_after_successful_output(
     workflow: Workflow, failure: str,
 ) -> None:
@@ -1867,6 +1869,9 @@ def test_tick_alert_reports_the_failed_start_step_after_successful_output(
             f'    print("{error}", file=sys.stderr)\n'
             '    print("poll details", file=sys.stderr)\n    sys.exit(1)\n'
         )
+    elif failure == "priority":
+        error = "jq: error: module not found: priority"
+        workflow.script.with_name("priority.jq").unlink()
     else:
         error = (
             "ticket-7 was not started: its scope does not hold its memory limits of "
