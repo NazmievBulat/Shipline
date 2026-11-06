@@ -3540,6 +3540,12 @@ def test_repeated_image_download_waits_only_for_the_same_runner_and_failure(
     "Run docker pull example-app\nunexpected EOF\n" + _FAILED_TEST,
     "Run docker pull playwright\nunexpected EOF\n" + _FAILED_TEST,
     'Run docker compose -f "example app.yml" --profile=tests up -d database\nunexpected EOF\n' + _FAILED_TEST,
+    # GitHub prints both pulls once, before either executes. Completing the first
+    # must leave the second download in context.
+    "##[group]Run docker pull example-app\ndocker pull example-database\n##[endgroup]\n"
+    "Status: Image is up to date for example-app\nUsing default tag: latest\nunexpected EOF\n",
+    "##[group]Run docker compose \\\n  --file example.yml \\\n  up -d database\n##[endgroup]\n"
+    "database Pulling\nunexpected EOF\n",
 ])
 def test_download_order_uses_execution_output_after_the_command_preamble(
     handed: GitHub, log: str
@@ -3571,6 +3577,10 @@ def test_download_order_uses_execution_output_after_the_command_preamble(
     "##[group]Run set -e\npytest -q\ndocker pull example-app\n##[endgroup]\nunexpected EOF\n" + _FAILED_TEST,
     "##[group]Run set -e\nnpm test\ndocker compose up database\n##[endgroup]\ntoomanyrequests\n" + _FAILED_TEST,
     "Run docker compose --unknown example-app up\nunexpected EOF\n" + _FAILED_TEST,
+    # A Compose build's RUN output is application code, even before services start.
+    "##[group]Run docker compose up --build -d example-app\n##[endgroup]\n"
+    "#7 [example-app 3/3] RUN python build.py\n#7 0.123 RuntimeError: unexpected EOF\n"
+    '#7 ERROR: process "/bin/sh -c python build.py" did not complete successfully: exit code: 1\n',
 ])
 def test_download_context_does_not_override_tests_that_already_started(
     handed: GitHub, log: str
