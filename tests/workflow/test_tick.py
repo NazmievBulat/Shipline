@@ -1820,6 +1820,55 @@ def test_tick_counts_unknown_main_once_per_tick(workflow: Workflow) -> None:
     assert "main: unknown, cannot read CI" in push.message
 
 
+@pytest.mark.parametrize("failure", ["launch", "setup", "configuration"])
+def test_tick_alert_reports_the_failed_start_step_after_successful_output(
+    workflow: Workflow, failure: str,
+) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = workflow.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    _readable_main(workflow)
+    workflow.add_pull_request(7)
+    # A successful earlier tick step can also write diagnostics.
+    workflow.script.with_name("workflow-metrics").write_text(
+        '#!/bin/bash\necho "metrics sample ready" >&2\nexit 0\n'
+    )
+    workflow.fake("worktree-setup", '#!/bin/bash\necho "worktree dependencies ready"\nexit 0\n')
+    if failure == "launch":
+        error = "cannot launch worker: session service unavailable"
+        original = (workflow.bin / "tmux").read_text()
+        workflow.fake("tmux-before-failure", original)
+        workflow.fake(
+            "tmux",
+            '#!/bin/bash\nif [[ ${3:-} == new-session ]]; then\n'
+            f'  echo "{error}" >&2\n  echo "launch details" >&2\n  exit 1\nfi\n'
+            'exec "$(dirname "$0")/tmux-before-failure" "$@"\n',
+        )
+    elif failure == "setup":
+        error = "cannot install worktree dependencies"
+        workflow.fake(
+            "worktree-setup",
+            f'#!/bin/bash\necho "setup progress"\necho "{error}" >&2\n'
+            'echo "setup details" >&2\nexit 19\n',
+        )
+    else:
+        error = "WORKFLOW_LOAD_PER_PROCESSOR is 'invalid', not a number above 0"
+    env = {"WORKFLOW_LOAD_PER_PROCESSOR": "invalid"} if failure == "configuration" else None
+    for _ in range(3):
+        done = workflow.run_script("tick", env=env)
+        assert done.returncode != 0
+        assert error in done.stderr
+        assert "metrics sample ready" in done.stderr
+    [push] = workflow.pushes()
+    assert f"Tick failed 3 runs in a row: {error}\n" in push.message
+    assert "metrics sample ready" not in push.message
+    assert "worktree dependencies ready" not in push.message
+    assert "setup progress" not in push.message
+    assert "details" not in push.message
+
+
 
 def test_background_metrics_does_not_hold_the_ticks_output_open(workflow: Workflow) -> None:
     metrics = workflow.script.with_name("workflow-metrics")
