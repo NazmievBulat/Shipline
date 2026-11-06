@@ -1,0 +1,57 @@
+{
+  "pull_request": 89,
+  "tested_head": "57f8e6e5b67631986c93cf1bfc5e6aba0883caeb",
+  "branch": "break/89",
+  "verdict": "broke",
+  "scope": "Independent local log replays and state-machine tests; GitHub and messenger calls are stand-ins. No existing test suite was run.",
+  "runs": [
+    {
+      "command": "python -m pytest tests/breaker/test_pr89_logs.py --tb=short -q",
+      "result": "3 failed, 30 passed in 0.06s"
+    },
+    {
+      "command": "python -m pytest tests/breaker/test_pr89_retry.py --tb=short -q",
+      "result": "17 passed in 0.07s"
+    },
+    {
+      "command": "python -m pytest tests/breaker/test_pr89_wake.py --tb=short -q",
+      "result": "4 passed in 0.66s"
+    }
+  ],
+  "findings": [
+    {
+      "priority": "P2",
+      "test": "tests/breaker/test_pr89_logs.py::test_two_pulls_in_one_step_second_download_fails",
+      "trigger": "One GitHub shell step pulls two images. The first succeeds, and the second ends with unexpected EOF.",
+      "cause": "The full script preamble sets one pulling flag; the first success clears it, and the second command is not echoed again during execution.",
+      "impact": "A real image download failure receives no infrastructure retry and can be sent to a worker as a code failure.",
+      "last_lines": ["E   AssertionError: the second image download must receive its retry", "E   assert 'own' == 'infrastructure'"]
+    },
+    {
+      "priority": "P2",
+      "test": "tests/breaker/test_pr89_logs.py::test_multiline_compose_command_download_fails",
+      "trigger": "A valid Compose setup command uses shell backslash continuations and its download ends with unexpected EOF.",
+      "cause": "Each physical log line is tokenized independently, so the trailing backslash raises ValueError and no pull context is established.",
+      "impact": "A real Compose setup download failure receives no infrastructure retry and can be sent to a worker as a code failure.",
+      "last_lines": ["E   AssertionError: shell continuation must preserve the setup command", "E   assert 'own' == 'infrastructure'"]
+    },
+    {
+      "priority": "P2",
+      "test": "tests/breaker/test_pr89_logs.py::test_compose_build_failure_is_not_an_image_download",
+      "trigger": "Compose up --build runs a Dockerfile RUN command whose application build raises RuntimeError: unexpected EOF.",
+      "cause": "Setup context also covers BuildKit RUN output, and a matching substring is treated as image download evidence without checking the build phase.",
+      "impact": "A Dockerfile code failure is retried as infrastructure; matching repeats can then retain the handoff indefinitely as a cache problem.",
+      "last_lines": ["E   AssertionError: a Dockerfile command failure must not be blamed on the runner", "E   assert 'infrastructure' == 'own'"]
+    }
+  ],
+  "survived": [
+    "All four required download forms and supported setup command variants, with later failing-test annotations",
+    "Application output and recovered pulls followed by failing tests",
+    "Missing runner evidence, shell syntax in logs, diagnostic redaction, and runner line-break rejection",
+    "One retry, same-runner repeat, changed job/runner/error, partial recovery, private file modes, and sent receipts",
+    "Two concurrent calls with the first request held, an ambiguous timeout, a budget pause, and malformed claim files",
+    "Missing or timed-out logs and ineligible runner labels",
+    "Busy daytime wake, failed-send recovery, missing orchestrator, and co-delivery with a lost check"
+  ],
+  "choices": "Treat ordinary multiline shell commands, sequential image pulls, and Compose builds as reachable uses. No production code, model text, product behavior, or pull-request branch was changed."
+}
