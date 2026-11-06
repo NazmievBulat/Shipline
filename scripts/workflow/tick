@@ -1032,7 +1032,7 @@ snapshot=$WORKFLOW_TRAIN_TICK/pulls.json
 # The labelled pull requests, as "<number> <draft> <base>". Starts go in the order the merge
 # train serves: by priority, then the older ticket.
 labelled_pulls() {
-  jq -r -L "$here" 'include "priority";
+  workflow_step command jq -r -L "$here" 'include "priority";
     [.[] | select(any(.labels[]; .name == workflow_label))] | sort_by(priority_rank, .number) |
     .[] | "\(.number) \(.isDraft) \(.baseRefName)"' "$snapshot"
 }
