@@ -100,7 +100,8 @@ def test_machine_checks_keep_the_handoff_on_repeated_ticks_and_then_merge(
         assert "second" not in json.loads((_folder(workflow) / "pre-train-wait-7.json").read_text())
         assert _started(workflow) == []
     messages = "\n".join(workflow.sent())
-    assert messages.count(_PYTEST_OWNERSHIP) == 1
+    assert messages.count("pytest temporary folder is not owned by the current user") == 1
+    assert "/tmp/pytest-of-example" not in messages
     assert "give the temporary folder back to the user, or remove it" in messages
 
     workflow.fake("pre-train-checks", "#!/bin/bash\nexit 0\n")
@@ -130,6 +131,23 @@ def test_a_local_test_or_inventory_failure_still_hands_back(
     assert not _note(workflow).exists()
     assert _started(workflow) == ["review-7"]
     assert not (_folder(workflow) / "machine-errors").exists()
+
+
+def test_machine_context_is_not_persisted_or_sent(handed: GitHub) -> None:
+    workflow = handed.workflow
+    workflow.orchestrator("busy")
+    context = "credential=example-sensitive-value"
+    output = f"{context} OSError: No space left on device; {context}"
+    workflow.fake("pre-train-checks", "#!/bin/bash\n"
+                  + f"printf '%s\\n' {shlex.quote(output)} >&2\nexit 1\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _note(workflow).exists()
+    for text in [done.stdout, done.stderr, *workflow.sent(),
+                 (_folder(workflow) / "machine-errors").read_text(),
+                 (_folder(workflow) / "pre-train-wait-7.json").read_text()]:
+        assert context not in text
+    assert "No space left on device; free disk space or file slots" in "\n".join(workflow.sent())
 
 
 def test_refresh_push_machine_errors_retry_without_spending_the_three_attempts(handed: GitHub) -> None:
@@ -191,7 +209,7 @@ def test_checkout_machine_errors_keep_the_handoff_and_reach_the_wake(
         assert _note(workflow).read_bytes() == before
         assert _started(workflow) == []
         assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
-    assert "\n".join(workflow.sent()).count("Machine error: OSError: Read-only file system") == 1
+    assert "\n".join(workflow.sent()).count("Machine error: Read-only file system") == 1
 
 
 def test_checkout_machine_output_before_a_deadline_keeps_the_handoff(handed: GitHub) -> None:
@@ -209,7 +227,7 @@ def test_checkout_machine_output_before_a_deadline_keeps_the_handoff(handed: Git
         sys.exit(g.main())
     """, cwd=workflow.worktree(7))
     assert done.returncode == 3, done.stdout + done.stderr
-    assert "merge waiting: OSError: No space left on device" in done.stderr
+    assert "merge waiting: No space left on device" in done.stderr
     assert _note(workflow).read_bytes() == before
     assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
     assert _started(workflow) == []

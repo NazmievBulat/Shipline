@@ -568,7 +568,13 @@ def note_machine_result(folder: Path, error: str | None) -> None:
             else:
                 notice = {"line": f"Machine error: {error}; gate commands wait"}
                 write_json(folder / "stuck.pending" / f"machine-errors-{uuid.uuid4().hex}.json", notice)
-            write_json(marker, {**notice, "tick": tick, "event": uuid.uuid4().hex})
+            # A direct handoff can overwrite the latest event between this tick's
+            # failure and a later success. Keep each tick's failure independently.
+            failed_ticks = set(notice.get("failed_ticks", [notice.get("tick", "")])) - {""}
+            if tick:
+                failed_ticks.add(tick)
+            write_json(marker, {**notice, "tick": tick, "event": uuid.uuid4().hex,
+                                "failed_ticks": sorted(failed_ticks)})
         elif tick and marker.exists():
             observed = json.loads(marker.read_text())
             write_json(folder / "machine-errors-checked", {"tick": tick, "event": observed["event"]})
@@ -578,16 +584,21 @@ def finish_machine_error_tick(folder: Path, tick: str) -> None:
     with _machine_errors_lock(folder):
         marker = folder / "machine-errors"
         checked = folder / "machine-errors-checked"
-        if not checked.exists():
-            return
-        observed = json.loads(checked.read_text())
-        if observed["tick"] != tick:
-            return
+        observed = json.loads(checked.read_text()) if checked.exists() else None
         if marker.exists():
             active = json.loads(marker.read_text())
-            if active["tick"] != tick and observed["event"] == active["event"]:
+            failed_ticks = set(active.get("failed_ticks", [active.get("tick", "")])) - {""}
+            failed = tick in failed_ticks
+            if (
+                observed is not None and observed["tick"] == tick
+                and not failed and observed["event"] == active["event"]
+            ):
                 marker.unlink()
-        checked.unlink(missing_ok=True)
+            elif failed:
+                failed_ticks.remove(tick)
+                write_json(marker, {**active, "failed_ticks": sorted(failed_ticks)})
+        if observed is not None and observed["tick"] == tick:
+            checked.unlink(missing_ok=True)
 
 
 def _push_refreshed(
@@ -710,7 +721,7 @@ def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> str |
         else:
             head = git("rev-parse", "HEAD")
             output = done.stdout + done.stderr
-            first_line = next(iter(output.splitlines()), f"command exited {done.returncode}")
+            first_line = error or next(iter(output.splitlines()), f"command exited {done.returncode}")
             outcome = f"exit {done.returncode}: {first_line}"
             if error is not None or (
                 done.returncode == 75

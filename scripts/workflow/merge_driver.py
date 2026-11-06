@@ -458,8 +458,7 @@ def drive(folder: Path) -> None:
     os.environ["WORKFLOW_MACHINE_ERROR_TICK"] = tick
     try:
         _drive(folder)
-        if (folder / "machine-errors-checked").exists():
-            gate.finish_machine_error_tick(folder, tick)
+        gate.finish_machine_error_tick(folder, tick)
     finally:
         if previous is None:
             os.environ.pop("WORKFLOW_MACHINE_ERROR_TICK", None)

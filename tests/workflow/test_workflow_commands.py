@@ -89,8 +89,30 @@ _MACHINE_ERRORS = [
 @pytest.mark.parametrize("error", _MACHINE_ERRORS)
 def test_local_machine_errors_name_the_error_and_a_remedy(gate: Any, error: str) -> None:
     notice = gate.machine_error("checking...\n" + error, Path("/work/example-app"))
-    assert notice is not None and error in notice
+    assert notice is not None
     assert "; " in notice
+
+
+@pytest.mark.parametrize("error", _MACHINE_ERRORS)
+def test_machine_notices_omit_arbitrary_diagnostic_context(
+    gate: Any, tmp_path: Path, error: str,
+) -> None:
+    context = "credential=example-sensitive-value"
+    diagnostic = f"{context} {error}; {context}"
+    notice = gate.machine_error(diagnostic, Path("/work/example-app"))
+    assert notice is not None
+    gate.note_machine_result(tmp_path, notice)
+    for path in [tmp_path / "machine-errors", *(tmp_path / "stuck.pending").glob("*.json")]:
+        saved = path.read_text()
+        assert context not in saved
+        assert "/tmp/" not in saved
+        assert "/work/" not in saved
+    assert context not in notice
+
+
+def test_machine_notice_names_the_first_matching_error(gate: Any) -> None:
+    notice = gate.machine_error("Too many open files\nNo space left on device", Path("/work/example-app"))
+    assert notice == "Too many open files; close unused files or raise the open-file limit"
 
 
 @pytest.mark.parametrize("error", _MACHINE_ERRORS)
@@ -212,6 +234,45 @@ def test_a_handoff_and_restack_machine_error_queue_one_notice(
         second.result(timeout=10)
     assert len(list((tmp_path / "stuck.pending").glob("*.json"))) == 1
     assert (tmp_path / "machine-errors.lock").stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.parametrize("pass_first", [False, True])
+def test_a_direct_handoff_cannot_erase_a_ticks_machine_failure(
+    gate: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pass_first: bool,
+) -> None:
+    marker = tmp_path / "machine-errors"
+    error = "No space left on device; free disk space"
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "first")
+    gate.note_machine_result(tmp_path, error)
+    if pass_first:
+        gate.note_machine_result(tmp_path, None)
+    monkeypatch.delenv("WORKFLOW_MACHINE_ERROR_TICK")
+    gate.note_machine_result(tmp_path, error)
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "first")
+    gate.note_machine_result(tmp_path, None)
+    gate.finish_machine_error_tick(tmp_path, "first")
+    assert marker.exists()
+    monkeypatch.delenv("WORKFLOW_MACHINE_ERROR_TICK")
+    gate.note_machine_result(tmp_path, error)
+    assert len(list((tmp_path / "stuck.pending").glob("*.json"))) == 1
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "recovered")
+    gate.note_machine_result(tmp_path, None)
+    gate.finish_machine_error_tick(tmp_path, "recovered")
+    assert not marker.exists()
+
+
+def test_interleaved_driver_observations_keep_each_ticks_failure(
+    gate: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for tick in ["first", "second"]:
+        monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", tick)
+        gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+    for tick in ["first", "second"]:
+        monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", tick)
+        gate.note_machine_result(tmp_path, None)
+        gate.finish_machine_error_tick(tmp_path, tick)
+        assert (tmp_path / "machine-errors").exists()
+    assert json.loads((tmp_path / "machine-errors").read_text())["failed_ticks"] == []
 
 
 @pytest.mark.parametrize("error", _SERVER_ERRORS)

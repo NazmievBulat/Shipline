@@ -314,7 +314,7 @@ def named_test_failure(output: str) -> bool:
 
 
 def machine_error(output: str, worktree: Path) -> str | None:
-    """The first local machine error and its remedy; a named failing test always wins."""
+    """The first local machine error, in safe words, and its remedy; named tests win."""
     if named_test_failure(output):
         return None
     output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
@@ -322,18 +322,22 @@ def machine_error(output: str, worktree: Path) -> str | None:
     # no space left on device; too many open files; cannot allocate memory; read-only
     # file system; permission denied with an absolute path outside this worktree.
     # Permission paths may precede the error (shell/coreutils) or follow it (Python).
+    # Only fixed wording leaves this classifier: diagnostic context, including paths,
+    # user names and credentials, must never reach the persisted notice or the wake.
     patterns = (
         (r"/tmp/pytest-of-\S+[^\n]*not owned by the current user",
+         "pytest temporary folder is not owned by the current user",
          "give the temporary folder back to the user, or remove it"),
-        (r"\bno space left on device\b", "free disk space or file slots"),
-        (r"\btoo many open files\b", "close unused files or raise the open-file limit"),
-        (r"\bcannot allocate memory\b", "free memory or raise the memory limit"),
-        (r"\bread-only file system\b", "restore write access to the filesystem"),
+        (r"\bno space left on device\b", "No space left on device", "free disk space or file slots"),
+        (r"\btoo many open files\b", "Too many open files",
+         "close unused files or raise the open-file limit"),
+        (r"\bcannot allocate memory\b", "Cannot allocate memory", "free memory or raise the memory limit"),
+        (r"\bread-only file system\b", "Read-only file system", "restore write access to the filesystem"),
     )
     for line in output.splitlines():
-        for pattern, remedy in patterns:
+        for pattern, message, remedy in patterns:
             if re.search(pattern, line, re.IGNORECASE):
-                return f"{line.strip()}; {remedy}"
+                return f"{message}; {remedy}"
         if not re.search(r"\bpermission denied\b", line, re.IGNORECASE):
             continue
         path = re.search(
@@ -348,7 +352,7 @@ def machine_error(output: str, worktree: Path) -> str | None:
             except OSError, RuntimeError:
                 outside = False
             if outside:
-                return f"{line.strip()}; restore access to the path outside the worktree"
+                return "Permission denied outside the worktree; restore access to the path outside the worktree"
     return None
 
 
