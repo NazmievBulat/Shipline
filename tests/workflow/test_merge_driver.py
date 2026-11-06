@@ -3,6 +3,7 @@
 import fcntl
 import json
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -74,6 +75,168 @@ def handed(github: GitHub) -> GitHub:
     github.driver_mode = True
     github.save()
     return github
+
+
+_PYTEST_OWNERSHIP = (
+    "OSError: The temporary directory /tmp/pytest-of-example is not owned by the current user. "
+    "Fix this and try again."
+)
+
+
+@pytest.mark.parametrize("code", [1, 75, 124])
+def test_machine_checks_keep_the_handoff_on_repeated_ticks_and_then_merge(
+    handed: GitHub, code: int,
+) -> None:
+    workflow = handed.workflow
+    workflow.orchestrator("busy")
+    before = _note(workflow).read_bytes()
+    workflow.fake("pre-train-checks", "#!/bin/bash\necho 'checking...'\n"
+                  + f"printf '%s\\n' {shlex.quote(_PYTEST_OWNERSHIP)} >&2\nexit {code}\n")
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert _note(workflow).read_bytes() == before, done.stdout
+        assert _train(workflow)["waiting"] == ["7"]
+        assert "second" not in json.loads((_folder(workflow) / "pre-train-wait-7.json").read_text())
+        assert _started(workflow) == []
+    messages = "\n".join(workflow.sent())
+    assert messages.count("pytest temporary folder is not owned by the current user") == 1
+    assert "/tmp/pytest-of-example" not in messages
+    assert "give the temporary folder back to the user, or remove it" in messages
+
+    workflow.fake("pre-train-checks", "#!/bin/bash\nexit 0\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "merged").read_text() == "7"
+    assert _started(workflow) == []
+    assert not (_folder(workflow) / "machine-errors").exists()
+
+
+@pytest.mark.parametrize("output,code", [
+    (_PYTEST_OWNERSHIP + "\nFAILED tests/test_example.py::test_example - assertion failed", 1),
+    (_PYTEST_OWNERSHIP + "\nFAILED tests/test_example.py::test_example - assertion failed", 75),
+    ("inventory is stale", 1),
+])
+def test_a_local_test_or_inventory_failure_still_hands_back(
+    handed: GitHub, output: str, code: int,
+) -> None:
+    workflow = handed.workflow
+    # Test names on stdout must win over machine diagnostics on stderr.
+    workflow.fake("pre-train-checks", "#!/bin/bash\n"
+                  + f"printf '%s\\n' {shlex.quote(output)}\n"
+                  + f"printf '%s\\n' {shlex.quote(_PYTEST_OWNERSHIP if 'FAILED' in output else '')} >&2\n"
+                  + f"exit {code}\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
+    assert not (_folder(workflow) / "machine-errors").exists()
+
+
+def test_machine_context_is_not_persisted_or_sent(handed: GitHub) -> None:
+    workflow = handed.workflow
+    workflow.orchestrator("busy")
+    context = "credential=example-sensitive-value"
+    output = f"{context} OSError: No space left on device; {context}"
+    workflow.fake("pre-train-checks", "#!/bin/bash\n"
+                  + f"printf '%s\\n' {shlex.quote(output)} >&2\nexit 1\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _note(workflow).exists()
+    for text in [done.stdout, done.stderr, *workflow.sent(),
+                 (_folder(workflow) / "machine-errors").read_text(),
+                 (_folder(workflow) / "pre-train-wait-7.json").read_text()]:
+        assert context not in text
+    assert "No space left on device; free disk space or file slots" in "\n".join(workflow.sent())
+
+
+def test_refresh_push_machine_errors_retry_without_spending_the_three_attempts(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    _drop_refresh_pushes(workflow, ["OSError: No space left on device"] * 4)
+    before = _note(workflow).read_bytes()
+    waiting = _train(workflow)["waiting"]
+    for _ in range(4):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert _note(workflow).read_bytes() == before, done.stdout
+        assert _train(workflow)["waiting"] == waiting
+        assert _started(workflow) == []
+        assert not (_folder(workflow) / "merge-refresh-7.json").exists()
+        assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert json.loads(_note(workflow).read_text())["head"] != handed.head
+    assert _started(workflow) == []
+    assert not (_folder(workflow) / "machine-errors").exists()
+
+
+def test_a_named_failing_test_in_a_refresh_push_still_hands_back(handed: GitHub) -> None:
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    workflow.fake("git", '''#!/bin/bash
+if [[ $1 == push ]]; then
+  echo 'OSError: No space left on device'
+  echo 'FAILED tests/test_example.py::test_example - assertion failed'
+  exit 1
+fi
+exec /usr/bin/git "$@"
+''')
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
+    assert not (_folder(workflow) / "machine-errors").exists()
+
+
+@pytest.mark.parametrize("code", [1, 75])
+def test_checkout_machine_errors_keep_the_handoff_and_reach_the_wake(
+    handed: GitHub, code: int,
+) -> None:
+    from workflow.test_commands import _configure
+
+    workflow = handed.workflow
+    workflow.orchestrator("busy")
+    _stale_refresh(handed)
+    _configure(workflow, push_checkout="example-checkout")
+    workflow.fake("example-checkout", "#!/bin/bash\n"
+                  "echo 'OSError: Read-only file system' >&2\n"
+                  f"exit {code}\n")
+    before = _note(workflow).read_bytes()
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert _note(workflow).read_bytes() == before
+        assert _started(workflow) == []
+        assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
+    assert "\n".join(workflow.sent()).count("Machine error: Read-only file system") == 1
+
+
+def test_checkout_machine_output_before_a_deadline_keeps_the_handoff(handed: GitHub) -> None:
+    from workflow.test_commands import _configure, _gate
+
+    workflow = handed.workflow
+    _stale_refresh(handed)
+    _configure(workflow, push_checkout="example-checkout")
+    workflow.fake("example-checkout", "#!/bin/bash\n"
+                  "echo 'OSError: No space left on device' >&2\nexec /bin/sleep 30\n")
+    before = _note(workflow).read_bytes()
+    done = _gate(workflow, """
+        g.COMMAND_TIMEOUT = 5
+        sys.argv = ['merge-when-current', '--drive', '7']
+        sys.exit(g.main())
+    """, cwd=workflow.worktree(7))
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "merge waiting: No space left on device" in done.stderr
+    assert _note(workflow).read_bytes() == before
+    assert workflow.git("rev-parse", "HEAD", cwd=workflow.worktree(7)) == handed.head
+    assert _started(workflow) == []
+    workflow.fake("example-checkout", "#!/bin/bash\nexit 0\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert json.loads(_note(workflow).read_text())["head"] != handed.head
+    assert _started(workflow) == []
+    assert not (_folder(workflow) / "machine-errors").exists()
 
 
 def test_the_tick_drives_a_red_main_fix_handed_off_behind_another_pull(handed: GitHub) -> None:

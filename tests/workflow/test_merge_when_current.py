@@ -815,3 +815,19 @@ def test_a_read_made_old_by_a_long_wait_for_the_lock_is_made_again(
         assert (workflow.repo / ".local/workflow/merge-wanted-7").exists()
         assert _waiting(workflow) == ["7"]
     assert all(held < 5 for held in _held(workflow))
+
+
+def test_a_new_handoff_waits_for_a_machine_error_without_repeating_the_review(github: "GitHub") -> None:
+    from workflow.test_merge_driver import _note, _publish
+
+    workflow = github.workflow
+    _publish(github)
+    workflow.fake("pre-train-checks", "#!/bin/bash\n"
+                  "echo 'OSError: The temporary directory /tmp/pytest-of-example is not owned by the current user.' >&2\n"
+                  "exit 1\n")
+    done = workflow.run_script("merge-when-current", "--handoff", "7")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _note(workflow).exists()
+    train = json.loads((_note(workflow).parent / "merge-train.json").read_text())
+    assert "7" in train["waiting"]
+    assert "7" not in train["approved"]

@@ -42,6 +42,10 @@ class PushWaiting(Waiting):
     commit it made for the push."""
 
 
+class MachineWaiting(PushWaiting):
+    """A local machine error found nothing wrong with the branch; retry next tick."""
+
+
 class ServiceWaiting(PushWaiting):
     """The pre-push scan could not reach a package advisory service."""
 
@@ -90,7 +94,18 @@ def repository_command(
     folder and bounded like every command; None when the repository names none. It reads
     `input`, and never the gate's own standard input. A command that is named but cannot start
     stops the gate's call."""
-    from merge_gate import CONFIG, PackagesWaiting, Refused, Waiting, command
+    from merge_gate import (
+        CONFIG,
+        MachineWaiting,
+        PackagesWaiting,
+        Refused,
+        TimedOut,
+        Waiting,
+        command,
+        machine_error,
+        main_checkout,
+        note_machine_result,
+    )
     from workflow_config import pass_fail_command
 
     words = CONFIG.command(name)
@@ -98,10 +113,22 @@ def repository_command(
         return None
     try:
         done = command(*words, *args, check=False, input=input or "", errors=errors)
+    except TimedOut as error:
+        if (
+            name != "push_checkout" or len(args) != 2 or args[0] != "install"
+            or not machine_error(error.output, Path(args[1]))
+        ):
+            raise
+        done = subprocess.CompletedProcess([], 124, error.output, "")
     except OSError as error:
         raise Refused(
             f"cannot run the repository's {name} command, {shlex.join(words)}: {error}"
         ) from error
+    if name == "push_checkout" and len(args) == 2 and args[0] == "install" and done.returncode:
+        error = machine_error(done.stdout + "\n" + done.stderr, Path(args[1]))
+        note_machine_result(main_checkout() / CONFIG.state_folder, error)
+        if error:
+            raise MachineWaiting(error)
     if name != "pre_train_checks" and done.returncode == 75 and pass_fail_command(name, args):
         waiting = PackagesWaiting if name == "push_checkout" else Waiting
         raise waiting(f"{name} waits: {said(done)}")
@@ -201,6 +228,7 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     a scan that could not reach an advisory service after its own tries, is a wait."""
     from merge_gate import (
         CONFIG,
+        MachineWaiting,
         PUSH_RETRY_SECONDS,
         PackagesWaiting,
         Pushed,
@@ -209,6 +237,9 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         command,
         git,
         main_checkout,
+        machine_error,
+        named_test_failure,
+        note_machine_result,
         note_service_down,
         note_service_up,
         push_failure,
@@ -219,6 +250,7 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     )
 
     checkout = where or Path.cwd()
+    folder = main_checkout() / CONFIG.state_folder
     if CONFIG.command("push_checkout") is not None:
         checkout = Path(git("-C", str(checkout), "rev-parse", "--show-toplevel"))
         installed = repository_command("push_checkout", "install", str(checkout))
@@ -227,10 +259,21 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
     merged = ("env", "EIO_BACKEND=posix", "sh", "-c", 'exec "$@" 2>&1', "push", *git_args)
     done, timeout = _push_once(merged)
-    if done.returncode and timeout is None and short_of_memory(done.stdout):
+    if (
+        done.returncode and timeout is None and not named_test_failure(done.stdout)
+        and short_of_memory(done.stdout)
+    ):
+        # The backoff's second attempt cannot erase a machine failure this tick saw,
+        # even if that retry succeeds. Named test failures never enter the retry.
+        if first_error := machine_error(done.stdout, checkout):
+            note_machine_result(folder, first_error)
         command("sleep", str(PUSH_RETRY_SECONDS))
         done, timeout = _push_once(merged)
     output = done.stdout
+    error = machine_error(output, checkout) if done.returncode else None
+    note_machine_result(folder, error)
+    if error:
+        raise MachineWaiting(error)
     pushed = Pushed(
         done.returncode,
         output,
@@ -239,7 +282,6 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     )
     if CONFIG.command("advisory_watch") is None:
         return pushed
-    folder = main_checkout() / CONFIG.state_folder
     # A scan stopped at the deadline never concluded that a service was out.
     service = (
         unreachable_service(output) if pushed.returncode and not pushed.timed_out else None
@@ -275,6 +317,7 @@ def push_failure(output: str, checkout: Path, timeout: float | None = None) -> s
     from merge_gate import (
         REFUSAL_LINES,
         TIMEOUT_REFUSAL_LINES,
+        named_test_failure,
         nonblank_lines,
         repository_command,
         short_of_memory,
@@ -292,7 +335,7 @@ def push_failure(output: str, checkout: Path, timeout: float | None = None) -> s
         (line.strip() for line in output.splitlines() if short_of_memory(line)),
         None,
     )
-    if shortage is None:
+    if shortage is None or named_test_failure(output):
         return refusal
     return f"the security scan was short of locked memory twice, a minute apart: {shortage}\n{refusal}"
 
