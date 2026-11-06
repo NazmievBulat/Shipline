@@ -5,6 +5,7 @@ Only `claude` is replaced, by a script that prints a session link and stays open
 """
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -171,6 +172,64 @@ def test_a_start_reads_the_link_from_a_real_screen(real_tmux: Workflow) -> None:
     assert (real_tmux.state / "claude-ran").read_text() == (
         f"ticket-7: --effort medium --remote-control ticket-7 {_WORKER}\n"
     )
+
+
+def test_real_tmux_recovers_a_status_retained_after_submit_removed_wait_notes(
+    real_tmux: Workflow,
+) -> None:
+    """Model a submit that clears notes but keeps the draft; this is not a diagnosis of Claude."""
+    real_tmux.add_pull_request(7)
+    notes = real_tmux.notes(7)
+    received = real_tmux.state / "received-status"
+    terminal = real_tmux.state / "retained-input.py"
+    terminal.write_text(
+        "import os, sys, tty\nfrom pathlib import Path\n"
+        "tty.setraw(sys.stdin.fileno())\ntext = ''\nenters = 0\n"
+        "def draw():\n"
+        "    sys.stdout.write('\\x1b[3;3H' + text + '\\x1b[K')\n"
+        "    sys.stdout.flush()\n"
+        f"sys.stdout.write('\\x1b[2J\\x1b[HRemote Control: {SESSION_LINK}\\r\\n' "
+        "+ '─' * 190 + '\\r\\n> \\r\\n' + '─' * 190 + '\\r\\n')\n"
+        "sys.stdout.flush()\nwhile True:\n"
+        "    char = os.read(sys.stdin.fileno(), 1).decode()\n"
+        "    if char in ('\\r', '\\n'):\n"
+        "        enters += 1\n"
+        "        for suffix in ('idle', 'job-wait', 'checks-wait'):\n"
+        f"            (Path({str(notes)!r}) / ('ticket-7.' + suffix)).unlink(missing_ok=True)\n"
+        "        if enters == 3:\n"
+        f"            Path({str(received)!r}).write_text(text)\n"
+        "            text = ''\n"
+        "    else:\n        text += char\n"
+        "    draw()\n"
+    )
+    real_tmux.fake("claude", f"#!/bin/bash\nexec python3 {shlex.quote(str(terminal))}\n")
+    started = real_tmux.run("start", "worker", "7")
+    assert started.returncode == 0, started.stderr
+    # The session link can become visible before tmux finishes drawing the first box.
+    # Keep its rules fixed afterward: this test models retained Enters, not redraws.
+    deadline = time.monotonic() + 5
+    while True:
+        captured = subprocess.run(
+            [str(_TMUX), "-L", "ticket-7", "capture-pane", "-p", "-t", "=ticket-7:"],
+            env=real_tmux.env, capture_output=True, text=True, check=True, timeout=5,
+        ).stdout
+        if captured.count("─" * 190) == 2:
+            break
+        assert time.monotonic() < deadline, "the initial input box did not finish drawing"
+        time.sleep(0.01)
+    (notes / "ticket-7.job-wait").touch()
+
+    first = real_tmux.run("status-check", "ticket-7")
+
+    assert first.returncode != 0
+    assert "after two Enter attempts" in first.stderr
+    assert not (notes / "ticket-7.job-wait").exists()
+    status = (notes / "ticket-7.typed").read_text()
+    recovered = real_tmux.run("retry-status", "ticket-7")
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert received.read_text() == status
+    assert not (notes / "ticket-7.typed").exists()
 
 
 def test_a_real_window_is_200_by_50(real_tmux: Workflow) -> None:

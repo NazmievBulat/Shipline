@@ -5,6 +5,7 @@ wake, and names an idle session that no rule covers."""
 import json
 import os
 import shlex
+import time
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,7 @@ def _session(workflow: Workflow, name: str = "ticket-7", *, draft: bool = True) 
     workflow.add_worktree(7, draft=draft)
     workflow.running(name)
     workflow.screen("● Waiting for the full Python run in the background.\n" + _BOX, name)
+    workflow.notes(7).mkdir(parents=True, exist_ok=True)
     return workflow.notes(7) / name
 
 
@@ -93,6 +95,323 @@ def test_a_status_check_typed_but_not_sent_is_sent_at_the_next_tick(workflow: Wo
     assert workflow.calls("tmux ticket-7 send-keys")[-1].endswith(" Enter")
     assert (workflow.state / "input-ticket-7").read_text() == ""
     assert "status check sent" in workflow.wake_log.read_text()
+
+
+@pytest.mark.parametrize("name", ["ticket-7", "review-7"])
+def test_own_status_without_wait_notes_is_sent_on_the_next_tick(
+    workflow: Workflow, name: str
+) -> None:
+    notes = _session(workflow, name)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / f"input-{name}").write_text(_STATUS)
+
+    _tick(workflow, _NOW)
+
+    assert _keys(workflow, name) == ["Enter"]
+    assert not notes.with_suffix(".typed").exists()
+    assert _pending(workflow) == []
+
+
+def _github_unavailable(workflow: Workflow, failure: str) -> Path:
+    if failure == "budget-pause":
+        budget = Path(workflow.env["HOME"]) / ".local/state/workflow/github-budget"
+        budget.mkdir(parents=True, exist_ok=True)
+        marker = budget / "budget.json"
+        marker.write_text(json.dumps({
+            "core": {"remaining": 499, "reset": int(time.time()) + 3600}
+        }))
+    else:
+        marker = workflow.state / "fail-gh-list"
+        marker.touch()
+    return marker
+
+
+@pytest.mark.parametrize("failure", ["budget-pause", "listing-failure"])
+@pytest.mark.parametrize("name", ["ticket-7", "review-7"])
+def test_status_recovery_needs_no_github(workflow: Workflow, failure: str, name: str) -> None:
+    notes = _session(workflow, name)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / f"input-{name}").write_text(_STATUS)
+    _github_unavailable(workflow, failure)
+
+    for n in range(3):
+        done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)})
+        assert done.returncode == (0 if failure == "budget-pause" else 1), done.stderr
+
+    assert _keys(workflow, name) == ["Enter"]
+    assert not notes.with_suffix(".typed").exists()
+
+
+@pytest.mark.parametrize("failure", ["budget-pause", "listing-failure"])
+@pytest.mark.parametrize("restore", [False, True])
+def test_local_status_recovery_shares_its_bound_and_alert(
+    workflow: Workflow, failure: str, restore: bool
+) -> None:
+    notes = _session(workflow, "review-7")
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-review-7").write_text(_STATUS)
+    (workflow.state / "swallow-enter-review-7").write_text("100")
+    marker = _github_unavailable(workflow, failure)
+
+    for n in range(7):
+        if restore and n == 2:
+            marker.unlink()
+        workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)})
+        assert _keys(workflow, "review-7") == ["Enter"] * min(n + 1, 3)
+
+    line = "stuck? review-7 (status message not taken; its text stays in the box)"
+    assert _pending(workflow) == [line]
+    assert [row for row in workflow.wake_log.read_text().splitlines()
+            if row.split(" ", 1)[-1] == line] == [f"{_NOW + 540} {line}"]
+
+
+@pytest.mark.parametrize("failure", ["budget-pause", "listing-failure"])
+@pytest.mark.parametrize("text", ["Owner draft", _STATUS + " more", _STATUS + "\n  Owner addition"])
+def test_local_status_recovery_preserves_changed_input(
+    workflow: Workflow, failure: str, text: str
+) -> None:
+    notes = _session(workflow, "review-7")
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-review-7").write_text(text)
+    _github_unavailable(workflow, failure)
+
+    for n in range(2):
+        workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)})
+
+    assert _keys(workflow, "review-7") == []
+    assert (workflow.state / "input-review-7").read_text() == text
+
+
+@pytest.mark.parametrize("wait_note", [False, True])
+def test_unsent_status_has_three_single_enter_retries_and_is_named_once(
+    workflow: Workflow, wait_note: bool
+) -> None:
+    notes = _waiting(workflow) if wait_note else _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    (workflow.state / "swallow-enter-ticket-7").write_text("100")
+
+    codes = [workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)}).returncode
+             for n in range(7)]
+
+    assert codes == [1, 1, 1, 0, 0, 0, 0]
+    assert _keys(workflow, "ticket-7") == ["Enter"] * 3
+    line = "stuck? ticket-7 (status message not taken; its text stays in the box)"
+    assert _pending(workflow) == [line]
+    assert [row for row in workflow.wake_log.read_text().splitlines()
+            if row.split(" ", 1)[-1] == line] == [f"{_NOW + 540} {line}"]
+
+
+@pytest.mark.parametrize("text", ["Owner draft", _STATUS + " more", "A different tick message"])
+def test_status_recovery_never_touches_changed_text(workflow: Workflow, text: str) -> None:
+    notes = _waiting(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(text)
+
+    _tick(workflow, _NOW)
+    _tick(workflow, _NOW + 3600)
+
+    assert _keys(workflow, "ticket-7") == []
+    assert (workflow.state / "input-ticket-7").read_text() == text
+
+
+def test_status_recovery_does_not_send_another_recorded_message(workflow: Workflow) -> None:
+    notes = _waiting(workflow)
+    notes.with_suffix(".typed").write_text("A different tick message")
+    (workflow.state / "input-ticket-7").write_text("A different tick message")
+
+    _tick(workflow, _NOW)
+
+    assert _keys(workflow, "ticket-7") == []
+
+
+def test_failed_status_is_recovered_even_when_submit_removed_the_wait_notes(
+    workflow: Workflow,
+) -> None:
+    notes = _waiting(workflow)
+    _tick(workflow, _NOW - 2700)
+    (workflow.state / "swallow-enter-ticket-7").write_text("2")
+    (workflow.state / "on-sleep").write_text(
+        f"if [[ -e {shlex.quote(str(notes.with_suffix('.typed')))} ]]; then "
+        f"rm -f {shlex.quote(str(notes.with_suffix('.job-wait')))}; fi\n"
+    )
+
+    first = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW)})
+    assert first.returncode == 1
+    assert not notes.with_suffix(".job-wait").exists()
+    assert _pending(workflow) == []
+    _tick(workflow, _NOW + 180)
+
+    assert _keys(workflow, "ticket-7") == [_STATUS, "Enter", "Enter", "Enter"]
+    assert not notes.with_suffix(".typed").exists()
+
+
+def test_shadow_status_recovery_presses_nothing_and_keeps_retry_notes(
+    workflow: Workflow,
+) -> None:
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+
+    done = workflow.run_script("tick", "--shadow", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert done.returncode == 0, done.stderr
+    assert _keys(workflow, "ticket-7") == []
+    assert notes.with_suffix(".typed").read_text() == _STATUS
+    assert not (workflow.repo / ".local/workflow/ticket-7.status-retry").exists()
+
+
+def test_a_new_status_after_delivery_gets_a_fresh_retry_budget(workflow: Workflow) -> None:
+    notes = _session(workflow)
+    for at in (_NOW, _NOW + 180):
+        notes.with_suffix(".typed").write_text(_STATUS)
+        (workflow.state / "input-ticket-7").write_text(_STATUS)
+        _tick(workflow, at)
+
+    assert _keys(workflow, "ticket-7") == ["Enter", "Enter"]
+
+
+def test_a_fast_answer_to_recovery_does_not_mark_its_new_wait_kept_alive(
+    workflow: Workflow,
+) -> None:
+    notes = _waiting(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    waiting = shlex.quote(str(notes.with_suffix(".job-wait")))
+    (workflow.state / "on-sleep").write_text(f"touch -d @{_NOW} {waiting}\n")
+
+    _tick(workflow, _NOW)
+    (workflow.state / "on-sleep").unlink()
+    _tick(workflow, _NOW + 3000)
+
+    assert _keys(workflow, "ticket-7") == ["Enter", _STATUS, "Enter"]
+
+
+def _status_limit_screen(rules: int) -> str:
+    box = _BOX if rules == 2 else ("─" * 40 + "\n" if rules else "") + "> \n"
+    return "  ⎿  You've hit your session limit · resets 4:10pm (America/New_York)\n" + box
+
+
+@pytest.mark.parametrize("rules", [0, 1, 2])
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_a_usage_reset_keeps_the_same_status_retry_bound(
+    workflow: Workflow, exhausted: bool, rules: int
+) -> None:
+    from test_tick_limit import _at
+
+    now = int(_at(16, 10)["WORKFLOW_NOW"])
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    (workflow.state / "swallow-enter-ticket-7").write_text("100")
+    if exhausted:
+        for n in range(3):
+            done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(now - 1800 + 180 * n)})
+            assert done.returncode == 1
+    _written(notes.with_suffix(".idle"), now - 600)
+    notes.with_suffix(".limit").write_text(f"{now}\n")
+    workflow.screen(_status_limit_screen(rules), "ticket-7")
+    _tick(workflow, now - 60)
+    assert _keys(workflow, "ticket-7") == (["Enter"] * 3 if exhausted else [])
+
+    codes = [workflow.run_script("tick", env={"WORKFLOW_NOW": str(now + 180 * n)}).returncode
+             for n in range(7)]
+
+    assert codes == ([0] * 7 if exhausted else [1, 1, 1, 0, 0, 0, 0])
+    assert _keys(workflow, "ticket-7") == ["Enter"] * 3
+    assert _pending(workflow) == [
+        "stuck? ticket-7 (status message not taken; its text stays in the box)"
+    ]
+
+
+@pytest.mark.parametrize("rules", [0, 1, 2])
+@pytest.mark.parametrize("shadow", [False, True])
+def test_status_delivery_after_reset_is_single_and_shadow_presses_nothing(
+    workflow: Workflow, shadow: bool, rules: int
+) -> None:
+    from test_tick_limit import _at
+
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    now = int(_at(16, 10)["WORKFLOW_NOW"])
+    _written(notes.with_suffix(".idle"), now - 600)
+    notes.with_suffix(".limit").write_text(f"{now}\n")
+    workflow.screen(_status_limit_screen(rules), "ticket-7")
+
+    for minute in (10, 13):
+        done = workflow.run_script("tick", *(["--shadow"] if shadow else []), env=_at(16, minute))
+        assert done.returncode == 0, done.stderr
+
+    assert _keys(workflow, "ticket-7") == ([] if shadow else ["Enter"])
+    assert notes.with_suffix(".typed").exists() == shadow
+
+
+@pytest.mark.parametrize("rules", [0, 1, 2])
+@pytest.mark.parametrize("text", ["Owner draft", _STATUS + " more", _STATUS + "\n  Owner addition"])
+def test_reset_status_recovery_keeps_owner_continuations(
+    workflow: Workflow, rules: int, text: str
+) -> None:
+    from test_tick_limit import _at
+
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    _written(notes.with_suffix(".idle"), _NOW)
+    notes.with_suffix(".limit").write_text(_at(16, 10)["WORKFLOW_NOW"] + "\n")
+    (workflow.state / "input-ticket-7").write_text(text)
+    workflow.screen(_status_limit_screen(rules), "ticket-7")
+
+    done = workflow.run_script("tick", env=_at(16, 10))
+
+    assert done.returncode == 0, done.stderr
+    assert _keys(workflow, "ticket-7") == []
+    assert (workflow.state / "input-ticket-7").read_text() == text
+
+
+@pytest.mark.parametrize("rules", [0, 1, 2])
+def test_reset_status_recovery_keeps_unnoted_owner_questions(workflow: Workflow, rules: int) -> None:
+    from test_tick_limit import _at
+
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    _written(notes.with_suffix(".idle"), _NOW)
+    notes.with_suffix(".limit").write_text(_at(16, 10)["WORKFLOW_NOW"] + "\n")
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    workflow.screen("● Reply 1 or 2.\n" + _status_limit_screen(rules), "ticket-7")
+
+    done = workflow.run_script("tick", env=_at(16, 10))
+
+    assert done.returncode == 0, done.stderr
+    assert _keys(workflow, "ticket-7") == []
+
+
+def test_escape_restoring_own_status_is_recovered_on_the_next_tick(workflow: Workflow) -> None:
+    _still(workflow)
+    (workflow.notes(7) / "ticket-7.typed").write_text(_STATUS)
+    (workflow.state / "input-after-escape-ticket-7").write_text(_STATUS)
+
+    _tick(workflow, _NOW + 2700)
+    assert _keys(workflow, "ticket-7") == ["Escape"]
+    assert _pending(workflow) == []
+    _tick(workflow, _NOW + 2880)
+
+    assert _keys(workflow, "ticket-7") == ["Escape", "Enter"]
+    assert _pending(workflow) == []
+
+
+@pytest.mark.parametrize("case", ["asking", "owner-blocked", "interaction-blocked", "codex", "permission"])
+def test_status_recovery_keeps_existing_safety_guards(workflow: Workflow, case: str) -> None:
+    notes = _session(workflow)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-ticket-7").write_text(_STATUS)
+    if case == "permission":
+        workflow.screen("Do you want to run this command?\n" + _BOX, "ticket-7")
+    else:
+        notes.with_suffix(f".{case}").touch()
+
+    _tick(workflow, _NOW)
+
+    assert _keys(workflow, "ticket-7") == []
 
 
 @pytest.mark.parametrize("kind", ["status", "finish"])
@@ -192,6 +511,37 @@ def test_a_reviewer_woken_for_its_checks_gets_no_status_check_in_the_same_tick(
 
     assert len(_typed(workflow, "review-7", "The checks on ")) == 1
     assert _typed(workflow, "review-7", "Status") == []
+
+
+def test_a_checks_wake_cannot_bypass_the_status_retry_path(workflow: Workflow) -> None:
+    notes = _session(workflow, "review-7", draft=False)
+    _written(notes.with_suffix(".started"), _NOW - 7200)
+    _written(notes.with_suffix(".checks-wait"), _NOW - 3000)
+    notes.with_suffix(".typed").write_text(_STATUS)
+    (workflow.state / "input-review-7").write_text(_STATUS)
+    (workflow.state / "swallow-enter-review-7").write_text("100")
+    (workflow.state / "rollup-7.json").write_text(json.dumps([
+        {"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": "SUCCESS"}
+        for name in ("CI result", "Docker images: what to run")
+    ]))
+
+    for n in range(6):
+        workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)})
+
+    assert _keys(workflow, "review-7") == ["Enter"] * 3
+    assert not list((workflow.repo / ".local/workflow").glob("review-7.checks-nudged-*"))
+    assert _pending(workflow) == [
+        "stuck? review-7 (status message not taken; its text stays in the box)"
+    ]
+
+    # The owner submits it by hand after the bound. A stale .typed note must not
+    # block the checks wake once the input is empty.
+    (workflow.state / "input-review-7").write_text("")
+    (workflow.state / "swallow-enter-review-7").unlink()
+    _tick(workflow, _NOW + 1080)
+
+    assert len(_typed(workflow, "review-7", "The checks on ")) == 1
+    assert len(list((workflow.repo / ".local/workflow").glob("review-7.checks-nudged-*"))) == 1
 
 
 def test_an_idle_session_waiting_for_nothing_named_is_not_kept_alive(
@@ -497,6 +847,7 @@ def test_text_that_escape_puts_back_in_the_box_is_not_sent(workflow: Workflow) -
     (workflow.state / "input-after-escape-ticket-7").write_text("and then the docs")
 
     _tick(workflow, _NOW + 2700)
+    _tick(workflow, _NOW + 2880)
 
     assert _keys(workflow, "ticket-7") == ["Escape"]
     assert (workflow.state / "input-ticket-7").read_text() == "and then the docs"
@@ -587,7 +938,7 @@ def test_a_nudge_that_is_never_taken_is_tried_three_more_times_then_named(
     assert "stuck? ticket-7 (nudge not taken; its text stays in the box)" in _pending(workflow)
 
 
-def test_a_message_of_the_tick_left_in_the_box_is_not_sent_for_a_nudge(
+def test_a_status_left_in_the_box_is_sent_before_a_nudge(
     workflow: Workflow,
 ) -> None:
     _still(workflow)
@@ -599,8 +950,8 @@ def test_a_message_of_the_tick_left_in_the_box_is_not_sent_for_a_nudge(
 
     _tick(workflow, _NOW + 2700)
 
-    assert _keys(workflow, "ticket-7") == []
-    assert _pending(workflow) == ["stuck? ticket-7 (45 min, running: pytest tests)"]
+    assert _keys(workflow, "ticket-7") == ["Enter"]
+    assert _pending(workflow) == []
 
 
 def test_a_session_that_turns_busy_starts_its_45_minutes_then(workflow: Workflow) -> None:

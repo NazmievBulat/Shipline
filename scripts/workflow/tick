@@ -559,6 +559,7 @@ shadow_session() {
     # An answer for the owner too, as `session answer-for-owner` would type it.
     answer-for-owner) bash "$here/session" would-answer "${@:2}" 9>&- ;;
     capacity-retry) bash "$here/session" would-capacity-retry "${@:2}" 9>&- ;;
+    retry-status) bash "$here/session" would-retry-status "${@:2}" 9>&- ;;
     *) shadow_note "session $*" ;;
   esac
 }
@@ -649,6 +650,11 @@ asks_owner() {
   local screen message top
   screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 0
   top=$(LC_ALL=C awk '/^─/ { above = last; last = NR } END { print above + 0 }' <<<"$screen")
+  if ((top == 0)) && [[ ${2:-} == after-reset ]]; then
+    # Resend also supports legacy limit prompts with zero or one rule. The last
+    # prompt begins that input; keep every earlier reply for the same question check.
+    top=$(LC_ALL=C awk '/^(>|❯)/ { prompt = NR } END { print prompt + 0 }' <<<"$screen")
+  fi
   ((top > 0)) || return 0
   message=$(LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" | LC_ALL=C awk '
     /^[[:space:]]*●/ { reply = "" }
@@ -839,6 +845,9 @@ failed=0
 woken=()
 wake_done=0
 local_done=0
+# Sessions whose delivery path has already been handled in this tick.
+nudged=" "
+status_pending=" "
 budget_ready() {
   python3 "$here/github_budget.py" ready tick
 }
@@ -919,6 +928,89 @@ capacity_duties() {
   done <<<"$running"
 }
 
+# One bounded recovery path, including usage resets in the GitHub-independent duties.
+# Return 0 when a status draft owns this session; return 1 for the ordinary send paths.
+retry_status() {
+  local name=$1 typed_note retry identity previous tries named line waiting_since
+  local suffix wait_note delivery sent
+  local -a mode=()
+  [[ ${2:-} != after-reset ]] || mode=(after-reset)
+  status_delivered=false
+  [[ $name =~ ^(ticket|review)-[0-9]+$ ]] || return 1
+  typed_note=$main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name.typed
+  retry=$main/$SHIPLINE_STATE_FOLDER/$name.status-retry
+  if [[ ! -e $typed_note ]]; then
+    ((shadow)) || rm -f "$retry"
+    return 1
+  fi
+  bash "$here/session" status-pending "$name" "${mode[@]}" 9>&- || return 1
+  [[ $status_pending != *" $name "* ]] || return 0
+  # Even an edited draft or a temporarily blocked recovery belongs to this path alone.
+  # A checks wake, finish message or stuck nudge must not bypass its safety checks or bound.
+  nudged+="$name "
+  status_pending+="$name "
+  said_finished "$name" && return 0
+  said_finished "$name" "review sent back" && return 0
+  asks_owner "$name" "${mode[@]}" && return 0
+  bash "$here/session" would-retry-status "$name" "${mode[@]}" 9>&- || return 0
+  identity=$(stat -c '%i:%y' "$typed_note" 9>&- | cksum) || { tick_failed; return 0; }
+  identity=${identity%% *}
+  previous="" tries=0 named=0
+  { read -r previous tries named <"$retry"; } 2>/dev/null || true
+  if [[ $previous != "$identity" || ! $tries =~ ^[0-9]+$ || ! $named =~ ^[01]$ ]]; then
+    tries=0 named=0
+  fi
+  if ((tries >= NUDGE_RETRIES)); then
+    if ((named == 0)); then
+      line="stuck? $name (status message not taken; its text stays in the box)"
+      if note_for_wake "$name-status-$identity" "$line"; then
+        write_session_note "$name" "$retry" "$identity $tries 1" || tick_failed
+        wake_log "$line" || tick_failed
+      else
+        tick_failed
+      fi
+    fi
+    return 0
+  fi
+  # Count before sending, so a partial run cannot get unbounded extra key presses.
+  write_session_note "$name" "$retry" "$identity $((tries + 1)) 0" || { tick_failed; return 0; }
+  waiting_since=""
+  for suffix in job-wait checks-wait idle; do
+    wait_note=${typed_note%.typed}.$suffix
+    if [[ -e $wait_note ]]; then
+      waiting_since=$(stat -c %Y "$wait_note" 9>&-) || waiting_since=""
+      break
+    fi
+  done
+  delivery=$(session retry-status "$name" "${mode[@]}" 2>&1)
+  sent=$?
+  if ((sent == 0)); then
+    status_delivered=true
+    ((shadow)) || rm -f "$retry"
+    wake_log "$name status check sent again after its Enter was not taken" || tick_failed
+    # If the hook has not removed the old wait yet, do not send its status again next tick.
+    if [[ $waiting_since =~ ^[0-9]+$ ]]; then
+      write_session_note "$name" "$main/$SHIPLINE_STATE_FOLDER/$name.kept-alive" "$waiting_since" || tick_failed
+    fi
+  elif ((sent != 3)); then
+    echo "$delivery" >&2
+    wake_log "$name status check retry failed: $delivery"
+    tick_failed
+  fi
+  return 0
+}
+
+# Owned status drafts need no GitHub response. Share this pass between local duties
+# and listing failures so neither can strand text or bypass the per-tick retry bound.
+status_duties() {
+  local name state
+  while read -r name state _; do
+    [[ $state != limit && $name =~ ^(ticket|review)-[0-9]+$ ]] || continue
+    session_current "$name" || continue
+    retry_status "$name" || true
+  done <<<"$running"
+}
+
 # GitHub pauses do not hold back what needs no GitHub: squeezing and resending after a
 # usage reset, then local alerts and pending owner/cloud notifications in the wake.
 paused() {
@@ -955,6 +1047,13 @@ local_duties() {
     fi
     [[ ! -r $mark || $(<"$mark") != "$reset_at" ]] || continue
     ((shadow)) || mkdir -p "${mark%/*}" || { tick_failed; continue; }
+    if retry_status "$name" after-reset; then
+      if [[ $status_delivered == true ]]; then
+        write_session_note "$name" "$mark" "$reset_at" || { tick_failed; continue; }
+        woken+=("$name")
+      fi
+      continue
+    fi
     if session resend "$name"; then
       write_session_note "$name" "$mark" "$reset_at" || { tick_failed; continue; }
       woken+=("$name")
@@ -962,6 +1061,7 @@ local_duties() {
       tick_failed
     fi
   done <<<"$running"
+  status_duties
   capacity_duties
 }
 
@@ -1042,8 +1142,9 @@ if ! python3 "$here/tick_snapshot.py" create "$snapshot" 9>&- || ! pulls=$(label
   # The application an ended hunt left running is stopped all the same.
   session cleanup hunts
   budget_ready || paused
-  # Capacity recovery needs no pull request listing. Leave the other local duties
-  # on their existing paths, including their protections during listing failures.
+  # Status and capacity recovery need no pull request listing. Leave the other
+  # local duties on their existing paths, including their protections on failures.
+  status_duties
   capacity_duties
   exit 1
 fi
@@ -1187,7 +1288,8 @@ running=$(session list) || tick_failed
 # after its session started, on the head or an ancestor. Unknown or empty checks are not
 # finished; failures are finished too.
 # The sessions given a message in this tick: step 8 gives them no second one.
-nudged=" "
+# Local duties recover status drafts before competing wakes, sharing their
+# per-tick ownership list with usage-reset recovery and stuck detection below.
 if train=$(WORKFLOW_BACKGROUND_GITHUB=1 bash "$here/merge-when-current" --train-status 9>&-); then
 # A shadow tick notes the line it read whenever it changed: it explains a decision that differs.
 if ((shadow)); then
@@ -1198,6 +1300,7 @@ while read -r name state _; do
   [[ $state != limit && $name =~ ^(review|audit)-([0-9]+)$ ]] || continue
   number=${BASH_REMATCH[2]}
   session_current "$name" || continue
+  [[ $nudged != *" $name "* ]] || continue
   # Another member's gate call merged this one in a batch: it is no longer open or in the
   # train, and its own session still owes the after-merge duties.
   batch_merged=$main/$SHIPLINE_STATE_FOLDER/batch-merged-$number
@@ -1460,6 +1563,10 @@ nudge_busy() {
     outcome="; nudge sent"
   elif ((sent == 4)); then
     nudged+="$name "
+    if bash "$here/session" would-retry-status "$name" 9>&-; then
+      outcome="; interrupted, status text will be retried"
+      return 0
+    fi
     outcome="; interrupted, text left in its box"
   elif ((sent != 3)); then
     nudged+="$name "
@@ -1550,6 +1657,7 @@ while read -r name state _; do
   notes=$main/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER/$name
   [[ ! -e $notes.codex ]] || continue
   [[ ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked ]] || continue
+  [[ $status_pending != *" $name "* ]] || continue
 
   # Waiting for its own job, or a reviewer for its turn in the merge train. The stretch begins
   # at the stop that started the wait, and a message the session answers begins another.
@@ -1567,6 +1675,7 @@ while read -r name state _; do
       [[ ! -r $mark || $(<"$mark") != "$since" ]] && quiet "$name"; then
     delivery=$(session status-check "$name" 2>&1)
     sent=$?
+    ((sent == 3)) || nudged+="$name "
     if ((sent == 0)); then
       write_session_note "$name" "$mark" "$since" || tick_failed
       wake_log "$name idle $(((NOW - since) / 60)) min waiting for its own job or turn; status check sent" ||
@@ -1576,6 +1685,9 @@ while read -r name state _; do
       wake_log "$name status check failed: $delivery"
       tick_failed
     fi
+    # The submit hook can remove the wait while this call is still polling. Its new
+    # draft belongs to next tick's recovery, not this tick's busy detector.
+    ((sent == 3)) || continue
   elif ((shadow)) && [[ $since =~ ^[0-9]+$ && ! -e $notes.asking ]] &&
       ((NOW - since < KEEP_ALIVE_AFTER_SECONDS)) &&
       [[ ! -r $mark || $(<"$mark") != "$since" ]] && quiet "$name"; then
@@ -1668,6 +1780,7 @@ while read -r name state _; do
             fi
           fi
         fi
+        [[ $outcome != "; interrupted, status text will be retried" ]] || continue
         line="wait loop finds itself? $name (running: $loop)$outcome"
         if [[ $later == true ]]; then
           :
@@ -1727,6 +1840,7 @@ while read -r name state _; do
   asks_permission "$name" && continue
   [[ ! -r $mark || $(<"$mark") != "$last_since $head" ]] || continue
   nudge_busy "$name" still stuck
+  [[ $outcome != "; interrupted, status text will be retried" ]] || continue
   line="stuck? $name ($(((NOW - last_since) / 60)) min, running: ${what:-no command})$outcome"
   if note_for_wake "$name-stuck-$last_since-$NOW" "$line"; then
     write_session_note "$name" "$mark" "$last_since $head" || tick_failed
