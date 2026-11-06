@@ -743,6 +743,29 @@ def test_a_batch_push_short_of_memory_is_retried_a_minute_later(
     assert len(github.workflow.calls("sleep 60")) == 1
 
 
+@pytest.mark.parametrize("stream", [1, 2])
+@pytest.mark.parametrize("message", MEMORY_SHORTAGES)
+def test_a_named_test_failure_is_not_masked_by_a_memory_retry(
+    github: GitHub, message: str, stream: int,
+) -> None:
+    _stale(github)
+    workflow = github.workflow
+    short_of_memory(workflow, message, times=1, stream=stream)
+    hook = workflow.bin / "hooks" / "pre-push"
+    failed = "FAILED tests/test_example.py::test_example - assertion failed"
+    hook.write_text(hook.read_text().replace(
+        "  exit 1\n", f"  printf '%s\\n' '{failed}' >&2\n  exit 1\n",
+    ))
+
+    done = github.run()
+
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "merge refused:" in done.stderr and failed in done.stderr
+    assert hook_runs(workflow) == ["EIO_BACKEND=posix"]
+    assert workflow.calls("sleep 60") == []
+    assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == github.head
+
+
 def test_a_batch_push_that_fails_twice_keeps_the_batch_for_the_next_call(github: GitHub) -> None:
     _batch_setup(github)
     short_of_memory(github.workflow, MEMORY_SHORTAGES[1], times=2)

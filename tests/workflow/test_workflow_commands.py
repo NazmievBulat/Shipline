@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import suppress
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -273,6 +274,42 @@ def test_interleaved_driver_observations_keep_each_ticks_failure(
         gate.finish_machine_error_tick(tmp_path, tick)
         assert (tmp_path / "machine-errors").exists()
     assert json.loads((tmp_path / "machine-errors").read_text())["failed_ticks"] == []
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_a_successful_memory_retry_does_not_hide_its_first_machine_failure(
+    gate: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active: bool,
+) -> None:
+    monkeypatch.setattr(gate, "CONFIG", SimpleNamespace(command=lambda name: None, state_folder="state"))
+    monkeypatch.setattr(gate, "main_checkout", lambda: tmp_path)
+    results = iter([
+        subprocess.CompletedProcess([], 1, "io_uring_queue_init: Cannot allocate memory", ""),
+        subprocess.CompletedProcess([], 0, "", ""),
+        subprocess.CompletedProcess([], 0, "", ""),
+    ])
+    monkeypatch.setattr(gate, "_push_once", lambda args: (next(results), None))
+    waits = []
+
+    def command(*args: str) -> subprocess.CompletedProcess[str]:
+        waits.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(gate, "command", command)
+    folder = tmp_path / "state"
+    marker = folder / "machine-errors"
+    monkeypatch.delenv("WORKFLOW_MACHINE_ERROR_TICK", raising=False)
+    if active:
+        gate.note_machine_result(folder, "No space left on device; free disk space")
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "retry")
+    assert gate.push("origin", "HEAD:ticket/example").returncode == 0
+    gate.finish_machine_error_tick(folder, "retry")
+    assert marker.exists()
+    assert len(list((folder / "stuck.pending").glob("*.json"))) == 1
+    assert waits == [("sleep", str(gate.PUSH_RETRY_SECONDS))]
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "recovered")
+    assert gate.push("origin", "HEAD:ticket/example").returncode == 0
+    gate.finish_machine_error_tick(folder, "recovered")
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("error", _SERVER_ERRORS)

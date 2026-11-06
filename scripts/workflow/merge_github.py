@@ -238,6 +238,7 @@ def push(*args: str, where: Path | None = None) -> Pushed:
         git,
         main_checkout,
         machine_error,
+        named_test_failure,
         note_machine_result,
         note_service_down,
         note_service_up,
@@ -258,7 +259,14 @@ def push(*args: str, where: Path | None = None) -> Pushed:
     git_args = ("git", *(("-C", str(where)) if where else ()), "push", *args)
     merged = ("env", "EIO_BACKEND=posix", "sh", "-c", 'exec "$@" 2>&1', "push", *git_args)
     done, timeout = _push_once(merged)
-    if done.returncode and timeout is None and short_of_memory(done.stdout):
+    if (
+        done.returncode and timeout is None and not named_test_failure(done.stdout)
+        and short_of_memory(done.stdout)
+    ):
+        # The backoff's second attempt cannot erase a machine failure this tick saw,
+        # even if that retry succeeds. Named test failures never enter the retry.
+        if first_error := machine_error(done.stdout, checkout):
+            note_machine_result(folder, first_error)
         command("sleep", str(PUSH_RETRY_SECONDS))
         done, timeout = _push_once(merged)
     output = done.stdout
