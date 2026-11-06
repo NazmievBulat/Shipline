@@ -144,17 +144,25 @@ def test_a_healthy_fetch_ends_a_failed_repair_stretch(workflow: Workflow) -> Non
     assert len(list((workflow.repo / ".local/workflow/git-repair.pending").glob("*.json"))) == 2
 
 
-def test_a_healthy_fetch_does_not_end_a_still_broken_index_stretch(workflow: Workflow) -> None:
+@pytest.mark.parametrize("step", ["fetch", "main-status"])
+def test_an_interrupted_index_repair_resumes_on_a_later_tick(workflow: Workflow, step: str) -> None:
     worktree = workflow.add_worktree(7)
-    (worktree / "example.txt").write_text("staged\n")
+    healthy = workflow.add_worktree(8)
+    healthy_index = Path(workflow.git("rev-parse", "--path-format=absolute", "--git-path", "index", cwd=healthy))
+    healthy_before = healthy_index.read_bytes()
+    source = worktree / "example.txt"
+    source.write_text("staged\n")
     workflow.git("add", "example.txt", cwd=worktree)
     tree = workflow.git("write-tree", cwd=worktree)
+    source.write_text("uncommitted and unstaged\n")
     index = Path(workflow.git("rev-parse", "--path-format=absolute", "--git-path", "index", cwd=worktree))
+    before = index.read_bytes()
     object_file = workflow.repo / ".git/objects" / tree[:2] / tree[2:]
     object_file.chmod(0o600)
     object_file.write_bytes(b"")
     _empty_branch(workflow)
-    index.with_name("index.lock").touch()
+    lock = index.with_name("index.lock")
+    lock.touch()
     first = _repair_step(workflow)
     assert first.returncode != 0
     assert "git reset failed" in first.stderr
@@ -162,10 +170,32 @@ def test_a_healthy_fetch_does_not_end_a_still_broken_index_stretch(workflow: Wor
     assert failed.exists()
     pending = workflow.repo / ".local/workflow/git-repair.pending"
     events = {path.name: path.read_bytes() for path in pending.glob("*.json")}
+    command = (("git", "fetch", "origin", "main") if step == "fetch"
+               else ("bash", str(workflow.script.parent / "main-status")))
     (workflow.state / "repair-attempt").unlink()
-    assert _repair_step(workflow).returncode == 0
+    assert _repair_step(workflow, *command).returncode != 0
     assert failed.exists()
     assert {path.name: path.read_bytes() for path in pending.glob("*.json")} == events
+    assert index.read_bytes() == before
+
+    lock.unlink()
+    # Releasing the lock does not authorize a second attempt in the same tick.
+    backups = set((workflow.repo / ".local/workflow/git-repairs").iterdir())
+    assert _repair_step(workflow, *command).returncode != 0
+    assert set((workflow.repo / ".local/workflow/git-repairs").iterdir()) == backups
+    assert index.read_bytes() == before
+
+    (workflow.state / "repair-attempt").unlink()
+    done = _repair_step(workflow, *command)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "rebuilt index .claude/worktrees/ticket-7" in done.stderr
+    assert not failed.exists()
+    assert len(list(pending.glob("*.json"))) == len(events) + 1
+    assert all((pending / name).read_bytes() == content for name, content in events.items())
+    assert source.read_text() == "uncommitted and unstaged\n"
+    assert "example.txt" in workflow.git("diff", "--name-only", cwd=worktree)
+    assert healthy_index.read_bytes() == healthy_before
+    workflow.git("fsck", "--cache", "--connectivity-only", "--no-dangling")
 
 
 def test_repair_rebuilds_only_a_broken_worktree_cache_tree_and_keeps_changes(workflow: Workflow) -> None:
