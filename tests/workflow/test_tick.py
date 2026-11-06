@@ -21,6 +21,14 @@ _WORKER_SAID_FINISHED = (
 )
 
 
+def _readable_main(workflow: Workflow) -> None:
+    """Keep main readable in scenarios whose GitHub stand-ins supply no main CI data."""
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "main-status").write_text("main: green\n")
+    workflow.script.with_name("main-status").write_text("#!/bin/bash\nexit 0\n")
+
+
 def _started(workflow: Workflow) -> list[str]:
     return [call.split()[1] for call in workflow.calls("tmux") if " new-session " in call]
 
@@ -1756,3 +1764,239 @@ def test_a_question_answered_or_changed_meanwhile_is_passed_over_quietly(
 
     assert done.returncode == 3, done.stderr
     assert workflow.calls("tmux ticket-7 send-keys") == []
+
+
+
+def test_failed_tick_alert_survives_early_exit_and_skips_overlapping_ticks(workflow: Workflow) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = workflow.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    (workflow.state / "fail-gh-list").touch()
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode != 0
+    assert workflow.pushes() == []
+    lock = workflow.repo / ".git/shipline-tick.lock"
+    with lock.open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert workflow.run_script("tick").returncode == 0
+    shadow = workflow.run_script("tick", "--shadow")
+    assert shadow.returncode != 0
+    assert workflow.pushes() == []
+    third = workflow.run_script("tick")
+    assert third.returncode != 0
+    [push] = workflow.pushes()
+    assert third.stderr.splitlines()[0] in push.message
+    workflow.run_script("tick")
+    assert len(workflow.pushes()) == 1
+    (workflow.state / "fail-gh-list").unlink()
+    success = workflow.run_script("tick")
+    assert success.returncode == 0, success.stderr
+    (workflow.state / "fail-gh-list").touch()
+    for _ in range(3):
+        workflow.run_script("tick")
+    assert len(workflow.pushes()) == 2
+
+
+def test_tick_counts_unknown_main_once_per_tick(workflow: Workflow) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = workflow.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    folder = workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "main-status").write_text("main: unknown, cannot read CI\n")
+    workflow.script.with_name("main-status").write_text("#!/bin/bash\nexit 0\n")
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stderr
+    assert workflow.pushes() == []
+    for _ in range(2):
+        workflow.run_script("tick")
+    [push] = workflow.pushes()
+    assert "main: unknown, cannot read CI" in push.message
+
+
+@pytest.mark.parametrize(
+    "failure", ["launch", "setup", "configuration", "main", "poll", "limits", "priority"],
+)
+def test_tick_alert_reports_the_failed_start_step_after_successful_output(
+    workflow: Workflow, failure: str,
+) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = workflow.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    _readable_main(workflow)
+    workflow.add_pull_request(7)
+    # A successful earlier tick step can also write diagnostics.
+    workflow.script.with_name("workflow-metrics").write_text(
+        '#!/bin/bash\necho "metrics sample ready" >&2\nexit 0\n'
+    )
+    workflow.fake("worktree-setup", '#!/bin/bash\necho "worktree dependencies ready"\nexit 0\n')
+    if failure == "launch":
+        error = "cannot launch worker: session service unavailable"
+        original = (workflow.bin / "tmux").read_text()
+        workflow.fake("tmux-before-failure", original)
+        workflow.fake(
+            "tmux",
+            '#!/bin/bash\nif [[ ${3:-} == new-session ]]; then\n'
+            f'  echo "{error}" >&2\n  echo "launch details" >&2\n  exit 1\nfi\n'
+            'exec "$(dirname "$0")/tmux-before-failure" "$@"\n',
+        )
+    elif failure == "setup":
+        error = "cannot install worktree dependencies"
+        workflow.fake(
+            "worktree-setup",
+            f'#!/bin/bash\necho "setup progress"\necho "{error}" >&2\n'
+            'echo "setup details" >&2\nexit 19\n',
+        )
+    elif failure == "configuration":
+        error = "WORKFLOW_LOAD_PER_PROCESSOR is 'invalid', not a number above 0"
+    elif failure == "main":
+        error = "cannot read main checks"
+        workflow.script.with_name("main-status").write_text(
+            f'#!/bin/bash\necho "{error}" >&2\necho "check details" >&2\nexit 1\n'
+        )
+    elif failure == "poll":
+        error = "cannot poll cloud workers"
+        workflow.script.with_name("cloud_workers.py").write_text(
+            'import sys\nif sys.argv[1] == "poll":\n'
+            f'    print("{error}", file=sys.stderr)\n'
+            '    print("poll details", file=sys.stderr)\n    sys.exit(1)\n'
+        )
+    elif failure == "priority":
+        error = "jq: error: module not found: priority"
+        workflow.script.with_name("priority.jq").unlink()
+    else:
+        error = (
+            "ticket-7 was not started: its scope does not hold its memory limits of "
+            "8 GB and 4 GB of swap (memory.max max, memory.swap.max max)"
+        )
+        (workflow.state / "limits-not-set-ticket-7").write_text(
+            "memory.max max, memory.swap.max max\n"
+        )
+    env = {"WORKFLOW_LOAD_PER_PROCESSOR": "invalid"} if failure == "configuration" else None
+    for _ in range(3):
+        done = workflow.run_script("tick", env=env)
+        assert done.returncode != 0
+        assert error in done.stderr
+        assert "metrics sample ready" in done.stderr
+    [push] = workflow.pushes()
+    assert f"Tick failed 3 runs in a row: {error}\n" in push.message
+    assert "metrics sample ready" not in push.message
+    assert "worktree dependencies ready" not in push.message
+    assert "setup progress" not in push.message
+    assert "details" not in push.message
+
+
+
+def test_background_metrics_does_not_hold_the_ticks_output_open(workflow: Workflow) -> None:
+    metrics = workflow.script.with_name("workflow-metrics")
+    metrics.write_text("""#!/bin/bash
+[[ ${1:-} == --daily ]] || exit 0
+printf '%s\\n' "$$" > "$WORKFLOW_ALERT_TEST_STATE/metrics.pid"
+while [[ ! -e $WORKFLOW_ALERT_TEST_STATE/release-metrics ]]; do /bin/sleep 0.05; done
+""")
+    release = workflow.state / "release-metrics"
+    tick = subprocess.Popen(
+        ["bash", str(workflow.script.with_name("tick"))],
+        cwd=workflow.repo,
+        env={**workflow.env, "WORKFLOW_METRICS_DAILY_AT": "00:00",
+             "WORKFLOW_ALERT_TEST_STATE": str(workflow.state)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        stdout, stderr = tick.communicate(timeout=30)
+        assert tick.returncode == 0, stdout + stderr
+        assert (workflow.state / "metrics.pid").exists()
+        # The job is still running; its redirected output must not keep the tick's pipes open.
+        os.kill(int((workflow.state / "metrics.pid").read_text()), 0)
+    finally:
+        release.touch()
+        if tick.poll() is None:
+            tick.kill()
+        tick.communicate(timeout=10)
+
+
+@pytest.mark.parametrize(
+    ("state_folder", "problem", "established", "open_orchestrator"),
+    [
+        (".local/workflow", "malformed", False, False),
+        (".local/named-state", "malformed", True, False),
+        (".local/named-state", "missing", True, False),
+        (".local/named-state", "unreadable", True, False),
+        (".local/named-state", "malformed", True, True),
+    ],
+    ids=["first-config", "custom-json", "custom-missing", "custom-unreadable", "open"],
+)
+def test_configuration_failures_count_before_tick_startup_and_recover(
+    workflow: Workflow, state_folder: str, problem: str,
+    established: bool, open_orchestrator: bool,
+) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = workflow.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    _readable_main(workflow)
+    notes = workflow.repo / state_folder
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "main-status").write_text("main: green\n")
+    values = json.loads((workflow.repo / "shipline.json").read_text())
+    values["state_folder"] = state_folder
+    valid = json.dumps(values)
+    selected = workflow.repo / ".local/alert-config.json"
+    selected.write_text(valid)
+    env = {"SHIPLINE_CONFIG": str(selected)}
+    if open_orchestrator:
+        workflow.orchestrator("busy")
+        registration = workflow.repo / ".local/workflow/orchestrator"
+        registration.rename(notes / "orchestrator")
+    if established:
+        done = workflow.run_script("tick", env=env)
+        assert done.returncode == 0, done.stderr
+    told_before = len(workflow.sent())
+
+    def break_config() -> None:
+        if problem == "malformed":
+            selected.write_text("{")
+        else:
+            selected.unlink()
+            if problem == "unreadable":
+                selected.mkdir()
+
+    break_config()
+    for _ in range(2):
+        assert workflow.run_script("tick", env=env).returncode != 0
+    assert workflow.pushes() == []
+    assert len(workflow.sent()) == told_before
+    for _ in range(2):
+        assert workflow.run_script("tick", env=env).returncode != 0
+    if open_orchestrator:
+        assert workflow.pushes() == []
+        assert len(workflow.sent()) == told_before + 1
+        message = workflow.sent()[-1]
+    else:
+        [push] = workflow.pushes()
+        assert f"{state_folder}/orchestrator" in push.message
+        message = push.message
+    assert ("not JSON" if problem == "malformed" else "cannot be read") in message
+
+    if selected.is_dir():
+        selected.rmdir()
+    selected.write_text(valid)
+    recovered = workflow.run_script("tick", env=env)
+    assert recovered.returncode == 0, recovered.stderr
+    break_config()
+    for _ in range(3):
+        workflow.run_script("tick", env=env)
+    if open_orchestrator:
+        assert len(workflow.sent()) == told_before + 2
+        assert workflow.pushes() == []
+    else:
+        assert len(workflow.pushes()) == 2
