@@ -4,8 +4,8 @@
 #   five_hour <per cent used> <reset, in seconds since 1970>
 #   seven_day <per cent used> <reset, in seconds since 1970>
 #
-# A numeric utilization with an explicit null reset has not started. Its reset is provisionally
-# now plus the window's length, and a fourth field, `not_started`, distinguishes that state.
+# A null window, or numeric utilization with an explicit null reset, has not started. Its reset
+# is provisionally now plus the window's length; a fourth field, `not_started`, marks that state.
 # Readers use the first three fields as usual and may use the fourth to describe the window.
 #
 # The figures are those the status line shows ("USE: 5H: 76% 1h9m"). They are read from the
@@ -29,8 +29,10 @@ NOW=${WORKFLOW_NOW:-$(date +%s)}
 lines_of() {
   local window percent at state printed=1
   for window in five_hour seven_day; do
-    read -r percent state at < <(jq -r --arg window "$window" \
-      '.[$window] | select(type == "object") | select(.utilization | type == "number")
+    read -r percent state at < <(jq -sr --arg window "$window" \
+      'select(length == 1) | .[0] | select(type == "object" and has($window))
+       | .[$window] | if . == null then {utilization: 0, resets_at: null} else . end
+       | select(type == "object") | select(.utilization | type == "number")
        | "\(.utilization) \(if has("resets_at") and .resets_at == null
            then "not_started" else "started" end) \(.resets_at // "")"' \
       <<<"$1" 2>/dev/null) || continue

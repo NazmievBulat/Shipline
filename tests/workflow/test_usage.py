@@ -188,13 +188,20 @@ def test_a_missing_window_is_not_invented(workflow: Workflow, source: str) -> No
 
 
 @pytest.mark.parametrize("source", ["cache", "live"])
-def test_a_non_json_answer_fails_and_prints_nothing(workflow: Workflow, source: str) -> None:
+@pytest.mark.parametrize("answer", [
+    "not JSON",
+    '{"five_hour": null, "seven_day": null} trailing',
+    '{"five_hour": null}\n{"seven_day": null}',
+])
+def test_a_non_json_answer_fails_and_prints_nothing(
+    workflow: Workflow, source: str, answer: str
+) -> None:
     _credentials(workflow)
-    _answering(workflow, "not JSON")
+    _answering(workflow, answer)
     cache = workflow.state / "usage-cache.json"
     workflow.env["WORKFLOW_USAGE_CACHE"] = str(cache)
     if source == "cache":
-        cache.write_text("not JSON")
+        cache.write_text(answer)
 
     done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW)})
 
