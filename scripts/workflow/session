@@ -61,6 +61,13 @@
 #                               whether that wait is over (the tick does this, to keep its cache)
 #   session finish-ready <ticket-N>
 #                               tell an idle worker whose pull request is ready to finish
+#   session retry-status <ticket-N|review-N> [after-reset]
+#                               send only its unchanged, unsent status text, with one Enter
+#                               after-reset: the tick has checked the usage reset passed
+#   session would-retry-status <ticket-N|review-N> [after-reset]
+#                               retry-status's checks alone, pressing nothing
+#   session status-pending <ticket-N|review-N> [after-reset]
+#                               whether a recorded status still has input to protect
 #   session nudge-busy <ticket-N|review-N> <still|loop> [again]
 #                               press Escape in a busy Claude session whose screen has not
 #                               changed for 45 minutes, or whose wait loop finds itself, and
@@ -183,6 +190,8 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session lost-check <review-N> <head>
        session batch-merged <review-N> <squash>
        session status-check <ticket-N|review-N>
+       session retry-status|would-retry-status <ticket-N|review-N> [after-reset]
+       session status-pending <ticket-N|review-N> [after-reset]
        session finish-ready <ticket-N>
        session nudge-busy <ticket-N|review-N> <still|loop> [again]
        session would-nudge <ticket-N|review-N> <still|loop> [again]
@@ -196,6 +205,10 @@ EOF
 }
 
 die() {
+  # Loaded by find_main_checkout before any start can fail.
+  if declare -F workflow_step_error >/dev/null; then
+    workflow_step_error "$*"
+  fi
   echo "$*" >&2
   exit 1
 }
@@ -223,6 +236,7 @@ find_main_checkout() {
   local here
   here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   script_dir=$here
+  source "$here/step_errors"
   # Its `bin`, for `shipline` in what a session runs, when this checkout has the launcher.
   shipline_bin=$(cd "$here/../.." && pwd)/bin
   # How a sentence names `notify waiting`: by the launcher's absolute path, which a session
@@ -444,6 +458,7 @@ cmd_load() {
 
 # Exit 3 identifies local work that needs judgment; resource/setup failures remain retryable.
 refuse_local_work() {
+  workflow_step_error "$*"
   echo "$*" >&2
   exit 3
 }
@@ -455,7 +470,7 @@ setup_worktree() {
   # explicit paths and a relative XDG_CONFIG_HOME normalized before changing directory.
   program=$(env "${session_config[@]}" python3 -B "$script_dir/workflow_config.py" worktree-setup)
   if [[ -x $program ]]; then
-    (cd "$worktree" && "$program" "$@") >&2
+    (cd "$worktree" && workflow_step "$program" "$@") >&2
   elif jq -e 'has("worktree_setup")' <<<"$SHIPLINE_CONFIG_JSON" >/dev/null; then
     message="worktree setup $SHIPLINE_WORKTREE_SETUP is not executable; setup skipped"
     echo "$message" >&2
@@ -770,6 +785,7 @@ wait_for_resources() {
     # The tick must release its lock so later ticks can still maintain sessions.
     # Manual starts retain their existing wait; deferred starts are tried next tick.
     if [[ ${WORKFLOW_DEFER_START:-0} == 1 ]]; then
+      workflow_step_error "$reason; the next tick tries this start again"
       echo "$reason; the next tick tries this start again" >&2
       exit 75
     fi
@@ -903,7 +919,7 @@ launch() {
   # A clean environment: the caller's own CLAUDE_* variables must not reach the session.
   # TMUX_TMPDIR goes along when the caller has one, or the new server would put its socket
   # where the other commands of this script do not look.
-  env -i \
+  workflow_step env -i \
     HOME="$HOME" \
     USER="${USER:-$(id -un)}" \
     SHELL="${SHELL:-/bin/bash}" \
@@ -923,13 +939,13 @@ launch() {
     8>&- || return $?
   # A cloud launch's pane ends as soon as it has launched; the record of its launch is read
   # instead, and its scope's check still keeps the launcher from running without the limits.
-  [[ $name == cloud-* ]] || await_limits "$name" "$note" || return 1
+  [[ $name == cloud-* ]] || workflow_step await_limits "$name" "$note" || return 1
   snapshot_busy "$name"
 }
 
 save_link() {
   local name=$1 worktree=$2 on_failure=${3:-stop}
-  if ! wait_for_link "$name"; then
+  if ! workflow_step wait_for_link "$name"; then
     [[ $on_failure != stop ]] || { stop_session "$name"; exit 1; }
     # Only this session ends; a Codex worker beside it goes on.
     tmux -L "$name" kill-server 2>/dev/null || true
@@ -1450,9 +1466,14 @@ holds_own_text() {
 # Keep ownership until delivery is observed. A later tick may submit precisely this
 # input, but must never append to or submit different text left by the owner.
 send_prompt() {
-  local name=$1 prompt=$2 typed notes attempt poll appeared=false
+  local name=$1 prompt=$2 attempts=${3:-2} typed notes attempt poll appeared=false
   notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
   read_prompt_box
+  if ((attempts == 1)); then
+    # A recovery only submits an existing draft; never recreate one that vanished or
+    # submit a different note written between the ownership check and this capture.
+    [[ -n $typed && -r $notes.typed && $(cat "$notes.typed") == "$prompt" ]] || return 3
+  fi
   if [[ -n $typed ]]; then
     [[ -r $notes.typed ]] && prompt_box_matches "$(cat "$notes.typed")" ||
       die "$name has text in its box that was not sent; nothing was typed into it"
@@ -1471,7 +1492,8 @@ send_prompt() {
   [[ $appeared == true ]] || die "$name automation text did not appear in its input box within 2 seconds"
   # Even after the text is drawn, let the terminal's paste burst settle before Enter.
   sleep 0.2
-  for attempt in 1 2; do
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if ((attempts == 1)); then status_retry_checks "$name" || return $?; fi
     read_prompt_box
     prompt_box_matches "$prompt" || die "$name input changed before Enter; nothing was sent"
     tmux -L "$name" send-keys -t "=$name:" Enter 2>/dev/null ||
@@ -1483,6 +1505,9 @@ send_prompt() {
       sleep 0.1
     done
   done
+  if ((attempts == 1)); then
+    die "$name still has automation text in its input box after one Enter attempt"
+  fi
   die "$name still has automation text in its input box after two Enter attempts"
 }
 
@@ -1584,6 +1609,27 @@ cmd_checks_finished() {
 # refuses in send_prompt). A worker's stop on a ready pull request always rings the phone, so
 # there its notes say nothing of a question: the tick reads the words on its screen instead.
 # Text of someone else's in the box exits 3, so that the tick passes over the session quietly.
+status_message() {
+  printf '%s' "Status check: if what you were waiting for is done, carry on; if not, run \`$notify_waiting\` and end your turn."
+}
+
+# A submit hook may remove every wait note before the input is actually delivered. Recovery
+# therefore checks ownership and the current screen, without requiring an idle or wait note.
+status_retry_checks() {
+  local name=$1 notes screen
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  require_running "$name"
+  [[ ! -e $notes.codex && ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked &&
+     ! -e $notes.asking ]] || return 3
+  [[ -r $notes.typed && $(cat "$notes.typed") == "$(status_message)" ]] || return 3
+  if [[ ${status_after_reset:-false} != true ]]; then
+    ! stopped_on_limit "$name" || return 3
+  fi
+  screen=$(tmux -L "$name" capture-pane -p -t "=$name:" 2>/dev/null) || return 1
+  if LC_ALL=C grep -qE '^[[:space:]│]*Do you want to [^?]*\?' <<<"$screen"; then return 3; fi
+  holds_own_text "$name" || return 3
+}
+
 cmd_nudge_idle() {
   local name=$1 kind=$2 notes typed
   notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
@@ -1598,9 +1644,11 @@ cmd_nudge_idle() {
     exit 3
   fi
   if [[ $kind == status ]]; then
+    # Another automation message is not this status check's to submit.
+    [[ -z $typed || $(cat "$notes.typed") == "$(status_message)" ]] || return 3
     [[ ! -e $notes.asking ]] || die "$name is waiting for the owner"
     [[ -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]] || die "$name is busy"
-    send_prompt "$name" "Status check: if what you were waiting for is done, carry on; if not, run \`$notify_waiting\` and end your turn."
+    send_prompt "$name" "$(status_message)"
     return
   fi
   [[ -e $notes.idle ]] || die "$name is busy"
@@ -2266,6 +2314,28 @@ case ${1:-} in
     [[ $# -eq 2 && $2 =~ ^(ticket|review)-[0-9]+$ ]] || usage
     find_main_checkout
     cmd_nudge_idle "$2" status
+    ;;
+  retry-status | would-retry-status | status-pending)
+    [[ ($# -eq 2 || ($# -eq 3 && $3 == after-reset)) &&
+       $2 =~ ^(ticket|review)-[0-9]+$ ]] || usage
+    find_main_checkout
+    status_after_reset=false
+    if [[ ${3:-} == after-reset ]]; then
+      status_after_reset=true
+      # Use the same legacy limit-input reader as cmd_resend. Incomplete modern
+      # boxes still return 2 from claude_input and never use the legacy fallback.
+      sending_resend=true
+    fi
+    if [[ $1 == status-pending ]]; then
+      notes=$(worktree_of "$2")/$SHIPLINE_STATE_FOLDER/$2
+      [[ ! -e $notes.codex && -r $notes.typed && $(cat "$notes.typed") == "$(status_message)" ]] || exit 3
+      name=$2
+      read_prompt_box
+      [[ -n $typed ]] || exit 3
+      exit 0
+    fi
+    status_retry_checks "$2" || exit $?
+    [[ $1 == would-retry-status ]] || send_prompt "$2" "$(status_message)" 1
     ;;
   finish-ready)
     [[ $# -eq 2 && $2 =~ ^ticket-[0-9]+$ ]] || usage

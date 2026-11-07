@@ -33,6 +33,8 @@ from workflow_commands import (
     github_read,
     github_server_error,
     install_signal_handlers,
+    machine_error,
+    named_test_failure,
     read_with_retries,
     transient,
 )
@@ -158,6 +160,7 @@ if __name__ == "__main__":
 from merge_github import (
     BudgetWaiting,
     MEMORY_SHORTAGE,
+    MachineWaiting,
     PUSH_RETRY_SECONDS,
     PackagesWaiting,
     PushWaiting,
@@ -512,7 +515,7 @@ def _commit_and_push(
 def _transient_refresh_push(output: str) -> bool:
     # A branch/hook rejection wins over a network failure. GitHub's own server rejection
     # says nothing about the branch and follows the same bounded retry as an HTTP 5xx.
-    if re.search(
+    if named_test_failure(output) or re.search(
         r"\[remote rejected\](?![^\n]*\((?:Internal Server Error|Service Unavailable|Bad Gateway)\)\s*$)"
         r"|\[rejected\]|non-fast-forward|protected branch|hook (?:declined|rejected)"
         r"|(?:HTTP(?:/\d(?:\.\d)?)?|returned error:)\s+4\d\d\b"
@@ -541,6 +544,61 @@ def note_github_server_errors(folder: Path) -> None:
     # Reuse the wake's operational notices, which stay pending until delivery succeeds.
     write_json(folder / "stuck.pending" / "github-server-errors.json", notice)
     write_json(marker, notice)
+
+
+@contextmanager
+def _machine_errors_lock(folder: Path) -> Iterator[None]:
+    # Restack pushes hold a start lock rather than merge.lock. All callers serialize this
+    # state independently, without trying to take a merge lock they may already hold.
+    folder.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(folder / "machine-errors.lock", os.O_CREAT | os.O_RDWR, 0o600), "r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def note_machine_result(folder: Path, error: str | None) -> None:
+    # One outage covers all pull requests and local commands. A successful command cannot
+    # clear a failure from another command in the same tick.
+    with _machine_errors_lock(folder):
+        marker = folder / "machine-errors"
+        tick = os.environ.get("WORKFLOW_MACHINE_ERROR_TICK", "")
+        if error is not None:
+            if marker.exists():
+                notice = json.loads(marker.read_text())
+            else:
+                notice = {"line": f"Machine error: {error}; gate commands wait"}
+                write_json(folder / "stuck.pending" / f"machine-errors-{uuid.uuid4().hex}.json", notice)
+            # A direct handoff can overwrite the latest event between this tick's
+            # failure and a later success. Keep each tick's failure independently.
+            failed_ticks = set(notice.get("failed_ticks", [notice.get("tick", "")])) - {""}
+            if tick:
+                failed_ticks.add(tick)
+            write_json(marker, {**notice, "tick": tick, "event": uuid.uuid4().hex,
+                                "failed_ticks": sorted(failed_ticks)})
+        elif tick and marker.exists():
+            observed = json.loads(marker.read_text())
+            write_json(folder / "machine-errors-checked", {"tick": tick, "event": observed["event"]})
+
+
+def finish_machine_error_tick(folder: Path, tick: str) -> None:
+    with _machine_errors_lock(folder):
+        marker = folder / "machine-errors"
+        checked = folder / "machine-errors-checked"
+        observed = json.loads(checked.read_text()) if checked.exists() else None
+        if marker.exists():
+            active = json.loads(marker.read_text())
+            failed_ticks = set(active.get("failed_ticks", [active.get("tick", "")])) - {""}
+            failed = tick in failed_ticks
+            if (
+                observed is not None and observed["tick"] == tick
+                and not failed and observed["event"] == active["event"]
+            ):
+                marker.unlink()
+            elif failed:
+                failed_ticks.remove(tick)
+                write_json(marker, {**active, "failed_ticks": sorted(failed_ticks)})
+        if observed is not None and observed["tick"] == tick:
+            checked.unlink(missing_ok=True)
 
 
 def _push_refreshed(
@@ -625,20 +683,36 @@ def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> str |
 
     A repository that names no `pre_train_checks` command has none to fail. A caller that does
     not hold the merge lock (a handoff) takes it only to record or clear an outcome. A first
-    wait keeps its line entry but withdraws batch approval until the next call passes."""
+    wait keeps its line entry but withdraws batch approval until the next call passes.
+    Machine errors keep waiting on the same head without spending that retry."""
     path = folder / f"pre-train-wait-{number}.json"
     try:
         observed = json.loads(path.read_text())
     except FileNotFoundError:
         observed = None
-    done = repository_command("pre_train_checks")
-    if (done is None or done.returncode == 0) and not path.exists():
+    try:
+        done = repository_command("pre_train_checks")
+    except TimedOut as error:
+        if not machine_error(error.output, Path.cwd()):
+            raise
+        done = subprocess.CompletedProcess([], 124, error.output, "")
+    if (
+        (done is None or done.returncode == 0)
+        and not path.exists()
+        and not (folder / "machine-errors").exists()
+    ):
         if done is not None:
             print(done.stdout, end="", flush=True)
             print(done.stderr, end="", file=sys.stderr, flush=True)
         return None
     with nullcontext() if locked else handoff_lock(folder, number):
         previous = json.loads(path.read_text()) if path.exists() else None
+        error = (
+            machine_error(done.stdout + "\n" + done.stderr, Path.cwd())
+            if done and done.returncode else None
+        )
+        if done is not None:
+            note_machine_result(folder, error)
         if done is None or done.returncode == 0:
             # A pass may clear only the outcome it retried. Another gate can record a
             # newer wait while this command runs or while this handoff waits for the lock.
@@ -647,17 +721,26 @@ def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> str |
         else:
             head = git("rev-parse", "HEAD")
             output = done.stdout + done.stderr
-            first_line = next(iter(output.splitlines()), f"command exited {done.returncode}")
+            first_line = error or next(iter(output.splitlines()), f"command exited {done.returncode}")
             outcome = f"exit {done.returncode}: {first_line}"
-            if done.returncode == 75:
-                if previous is None or previous["head"] != head:
+            if error is not None or (
+                done.returncode == 75
+                and not named_test_failure(done.stdout + "\n" + done.stderr)
+            ):
+                if (
+                    error is not None or previous is None
+                    or previous["head"] != head or previous.get("machine")
+                ):
                     # Approval goes first: a batch reads it, not this record. A stop between
                     # the two writes leaves an unapproved member, which a pass approves again.
                     train = Train(folder)
                     train.approved.pop(number, None)
                     train.save()
-                    write_json(path, {"head": head, "outcome": outcome, "event": uuid.uuid4().hex})
-                    wait = f"pre-train checks of {number} wait: {first_line}"
+                    write_json(path, {
+                        "head": head, "outcome": outcome, "event": uuid.uuid4().hex,
+                        **({"machine": True} if error is not None else {}),
+                    })
+                    wait = f"pre-train checks of {number} wait: {error or first_line}"
                     print(wait, flush=True)
                     return wait
                 reason = (

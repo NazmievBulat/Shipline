@@ -387,6 +387,24 @@ def test_an_unreachable_advisory_service_is_told_once_at_any_hour(night: Workflo
     assert len(night.sent()) == 2  # one failed attempt, then one delivered message
 
 
+def test_machine_error_notice_waits_for_delivery_and_is_told_once(night: Workflow) -> None:
+    night.orchestrator("busy")
+    folder = night.repo / ".local/workflow/stuck.pending"
+    folder.mkdir(parents=True, exist_ok=True)
+    notice = folder / "machine-errors-example.json"
+    line = "Machine error: No space left on device; free disk space; gate commands wait"
+    notice.write_text(json.dumps({"line": line}))
+    (night.state / "send-fails").touch()
+    assert _wake(night, at=_at(12, 0)).returncode == 1
+    assert notice.exists()
+    (night.state / "send-fails").unlink()
+    assert _wake(night, at=_at(12, 5)).returncode == 0
+    assert line in night.sent()[-1]
+    assert not notice.exists()
+    assert _wake(night, at=_at(12, 10)).returncode == 0
+    assert len(night.sent()) == 2
+
+
 def test_main_with_only_an_advisory_is_named_on_its_main_line_at_any_hour(
     night: Workflow,
 ) -> None:
@@ -1231,3 +1249,183 @@ def test_a_prefix_queue_warning_is_told_once_and_kept_until_delivery(night: Work
     assert f"\n{line}\n" in night.sent()[-1]
     assert not event.exists()
     assert (pending.with_name("prefix-queues.sent") / event.name).exists()
+
+
+def test_a_runner_download_notice_is_delivered_once_and_retained_on_failure(night: Workflow) -> None:
+    night.orchestrator("busy")
+    folder = night.repo / ".local/workflow"
+    pending = folder / "runner-downloads.pending/20.json"
+    pending.parent.mkdir(parents=True)
+    line = (
+        "Runner example-runner failed image downloads again in run 20: "
+        "short read: expected 1048576 bytes but got 0: unexpected EOF; repair its cache"
+    )
+    pending.write_text(json.dumps({"line": line}))
+    (night.state / "send-fails").touch()
+    done = _wake(night, at=_at(11))
+    assert done.returncode == 1
+    assert pending.exists()
+    (night.state / "send-fails").unlink()
+    done = _wake(night, at=_at(11, 6))
+    assert done.returncode == 0, done.stderr
+    assert night.sent()[-1].count(line) == 1
+    assert not pending.exists()
+    assert (folder / "runner-downloads.sent/20.json").exists()
+    count = len(night.sent())
+    done = _wake(night, at=_at(11, 12))
+    assert done.returncode == 0, done.stderr
+    assert len(night.sent()) == count
+
+
+@pytest.mark.parametrize("registration", ["missing", "empty", "closed"])
+def test_three_failed_ticks_without_an_orchestrator_ring_once(
+    night: Workflow, registration: str,
+) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = night.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    night.orchestrator("idle", name="available")
+    folder = night.repo / ".local/workflow"
+    (folder / "main-status").write_text("main: green\n")
+    if registration == "missing":
+        (folder / "orchestrator").unlink()
+    else:
+        (folder / "orchestrator").write_text("" if registration == "empty" else "closed\n")
+    error = "fatal: cannot fetch main\nMore detail that must not ring."
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", error, env=_at(12))
+    assert night.pushes() == []
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", error, env=_at(12))
+    [push] = night.pushes()
+    assert "fatal: cannot fetch main" in push.message
+    assert "More detail" not in push.message
+    assert "write the open session's name to .local/workflow/orchestrator" in push.message
+    assert "main checkout" in push.message
+    assert "phone" in night.wake_log.read_text()
+    assert night.sent() == []
+
+    night.run_script("wake", "--tick-result", "0", "", env=_at(12))
+    for _ in range(3):
+        night.run_script("wake", "--tick-result", "1", error, env=_at(12))
+    assert len(night.pushes()) == 2
+
+
+@pytest.mark.parametrize("status", ["idle", "busy"])
+def test_persistent_failure_tells_the_open_orchestrator_without_a_phone_push(
+    night: Workflow, status: str,
+) -> None:
+    night.orchestrator(status)
+    for _ in range(4):
+        done = night.run_script("wake", "--tick-result", "1", "fatal: cannot fetch main", env=_at(12))
+        assert done.returncode == 0, done.stderr
+    [message] = night.sent()
+    assert "fatal: cannot fetch main" in message
+    assert night.pushes() == []
+    assert not night.missed_pushes.exists()
+
+
+def test_losing_the_orchestrator_during_a_failure_stretch_still_rings(night: Workflow) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = night.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    night.orchestrator("busy")
+    for _ in range(3):
+        night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    assert len(night.sent()) == 1
+    assert night.pushes() == []
+    (night.state / "agents.json").write_text("[]")
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    assert len(night.pushes()) == 1
+
+
+def test_unknown_main_has_its_own_stretch_and_readable_main_resets_it(night: Workflow) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = night.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    folder = night.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    report = folder / "main-status"
+    report.write_text("main: unknown, cannot read CI\n")
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "0", "", env=_at(12))
+    assert night.pushes() == []
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "0", "", env=_at(12))
+    [push] = night.pushes()
+    assert "main: unknown, cannot read CI" in push.message
+    report.write_text("main: pending\n")
+    night.run_script("wake", "--tick-result", "1", "another failure", env=_at(12))
+    report.write_text("main: unknown, cannot read CI\n")
+    for _ in range(3):
+        night.run_script("wake", "--tick-result", "0", "", env=_at(12))
+    assert len(night.pushes()) == 2
+
+
+def test_shadow_result_neither_counts_nor_rings(night: Workflow) -> None:
+    for _ in range(4):
+        night.run_script("wake", "--tick-result", "1", "failure",
+                         env={**_at(12), "SHIPLINE_SHADOW": str(night.root / "shadow.log")})
+    assert night.pushes() == []
+    assert not (night.repo / ".local/workflow/tick-failures").exists()
+    assert night.sent() == []
+
+
+
+def test_a_missed_phone_push_is_retried_until_delivered_once(night: Workflow) -> None:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = night.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    (night.state / "pushover-fails").touch()
+    failed = night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    assert failed.returncode == 1
+    assert len(night.pushes()) == 1
+    [line] = night.missed_pushes.read_text().splitlines()
+    assert "Workflow needs you" in line and "cannot fetch main" in line
+    assert "orchestrator" in line
+    (night.state / "pushover-fails").unlink()
+    for _ in range(2):
+        done = night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+        assert done.returncode == 0, done.stderr
+    assert len(night.pushes()) == 2  # one failed attempt, then one delivered push
+
+
+def test_an_undelivered_alert_to_an_open_orchestrator_is_retried(night: Workflow) -> None:
+    night.orchestrator("busy")
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    (night.state / "send-fails").touch()
+    failed = night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    assert failed.returncode == 1
+    (night.state / "send-fails").unlink()
+    delivered = night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    assert delivered.returncode == 0, delivered.stderr
+    assert len(night.sent()) == 2
+    assert night.pushes() == []
+    assert not night.missed_pushes.exists()
+
+
+@pytest.mark.parametrize("status", ["129", "130", "143"])
+def test_an_operator_stop_neither_advances_nor_resets_a_failure_stretch(
+    night: Workflow, status: str,
+) -> None:
+    for _ in range(2):
+        night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    for _ in range(3):
+        done = night.run_script("wake", "--tick-result", status, "stopped", env=_at(12))
+        assert done.returncode == 0, done.stderr
+    assert not night.missed_pushes.exists()
+    night.run_script("wake", "--tick-result", "1", "cannot fetch main", env=_at(12))
+    [line] = night.missed_pushes.read_text().splitlines()
+    assert "Tick failed 3 runs in a row: cannot fetch main" in line

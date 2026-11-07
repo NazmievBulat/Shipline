@@ -11,8 +11,11 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import suppress
 from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -69,6 +72,244 @@ def _folder(workflow: Workflow) -> Path:
 @pytest.mark.parametrize("error", _SERVER_ERRORS)
 def test_github_incident_texts_are_transient(gate: Any, error: str) -> None:
     assert gate.transient(error)
+
+
+_MACHINE_ERRORS = [
+    "OSError: The temporary directory /tmp/pytest-of-example is not owned by the current user. Fix this and try again.",
+    "OSError: [Errno 28] No space left on device",
+    "OSError: [Errno 24] Too many open files",
+    "OSError: [Errno 12] Cannot allocate memory",
+    "OSError: [Errno 30] Read-only file system",
+    "PermissionError: [Errno 13] Permission denied: '/tmp/example-cache'",
+    "bash: /tmp/example-cache: Permission denied",
+    "mkdir: cannot create directory '/tmp/example cache': Permission denied",
+    "PermissionError: Permission denied: '/work/example-app-other/cache'",
+]
+
+
+@pytest.mark.parametrize("error", _MACHINE_ERRORS)
+def test_local_machine_errors_name_the_error_and_a_remedy(gate: Any, error: str) -> None:
+    notice = gate.machine_error("checking...\n" + error, Path("/work/example-app"))
+    assert notice is not None
+    assert "; " in notice
+
+
+@pytest.mark.parametrize("error", _MACHINE_ERRORS)
+def test_machine_notices_omit_arbitrary_diagnostic_context(
+    gate: Any, tmp_path: Path, error: str,
+) -> None:
+    context = "credential=example-sensitive-value"
+    diagnostic = f"{context} {error}; {context}"
+    notice = gate.machine_error(diagnostic, Path("/work/example-app"))
+    assert notice is not None
+    gate.note_machine_result(tmp_path, notice)
+    for path in [tmp_path / "machine-errors", *(tmp_path / "stuck.pending").glob("*.json")]:
+        saved = path.read_text()
+        assert context not in saved
+        assert "/tmp/" not in saved
+        assert "/work/" not in saved
+    assert context not in notice
+
+
+def test_machine_notice_names_the_first_matching_error(gate: Any) -> None:
+    notice = gate.machine_error("Too many open files\nNo space left on device", Path("/work/example-app"))
+    assert notice == "Too many open files; close unused files or raise the open-file limit"
+
+
+@pytest.mark.parametrize("error", _MACHINE_ERRORS)
+def test_a_named_failing_test_wins_over_a_machine_error(gate: Any, error: str) -> None:
+    assert gate.machine_error(
+        error + "\nFAILED tests/test_example.py::test_example - assertion failed\n",
+        Path("/work/example-app"),
+    ) is None
+
+
+@pytest.mark.parametrize("error", [
+    "Permission denied (publickey).",
+    "PermissionError: Permission denied: '/work/example-app/cache'",
+    "bash: /work/example-app/cache: Permission denied",
+    "PermissionError: Permission denied: 'cache'",
+    "PermissionError: Permission denied: '/work/example-app'",
+    "inventory is stale",
+])
+def test_other_failures_are_not_machine_errors(gate: Any, error: str) -> None:
+    assert gate.machine_error(error, Path("/work/example-app")) is None
+
+
+def test_color_does_not_hide_a_named_failing_test(gate: Any) -> None:
+    assert gate.machine_error(
+        "No space left on device\n\x1b[31mFAILED\x1b[0m tests/test_example.py::test_example",
+        Path("/work/example-app"),
+    ) is None
+    assert not gate._transient_refresh_push(
+        "No space left on device\nConnection reset by peer\n"
+        "FAILED tests/test_example.py::test_example"
+    )
+    assert gate.machine_error(
+        "No space left on device\nFAILED tests/test example.py::test_example",
+        Path("/work/example-app"),
+    ) is None
+
+
+def test_permission_paths_follow_symlinks(gate: Any, tmp_path: Path) -> None:
+    worktree = tmp_path / "example-app"
+    worktree.mkdir()
+    outside = tmp_path / "cache"
+    outside.mkdir()
+    (worktree / "cache").symlink_to(outside, target_is_directory=True)
+    (tmp_path / "inside").symlink_to(worktree, target_is_directory=True)
+    assert gate.machine_error(f"Permission denied: '{worktree / 'cache'}'", worktree)
+    assert gate.machine_error(f"Permission denied: '{tmp_path / 'inside' / 'cache-file'}'", worktree) is None
+
+
+def test_machine_notice_rearms_only_after_an_observed_clean_tick(
+    gate: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "machine-errors"
+    notices = tmp_path / "stuck.pending"
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "first")
+    gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+    gate.note_machine_result(tmp_path, None)  # another pull request's command passed
+    gate.finish_machine_error_tick(tmp_path, "first")
+    assert marker.exists()
+    gate.finish_machine_error_tick(tmp_path, "no-command")
+    assert marker.exists()
+    monkeypatch.delenv("WORKFLOW_MACHINE_ERROR_TICK")
+    gate.note_machine_result(tmp_path, None)
+    assert marker.exists()  # a direct call cannot prove a whole clean tick
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "second")
+    gate.note_machine_result(tmp_path, None)  # pre-train passes before a push fails
+    gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+    gate.finish_machine_error_tick(tmp_path, "second")
+    assert marker.exists()
+    assert len(list(notices.glob("*.json"))) == 1
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "third")
+    gate.note_machine_result(tmp_path, None)
+    monkeypatch.delenv("WORKFLOW_MACHINE_ERROR_TICK")
+    gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+    gate.finish_machine_error_tick(tmp_path, "third")
+    assert marker.exists()  # a newer direct failure cannot be cleared by an older pass
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "fourth")
+    gate.note_machine_result(tmp_path, None)
+    gate.finish_machine_error_tick(tmp_path, "another-driver")
+    assert marker.exists()
+    gate.finish_machine_error_tick(tmp_path, "fourth")
+    assert not marker.exists()
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "fifth")
+    gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+    assert len(list(notices.glob("*.json"))) == 2
+    assert all(path.stat().st_mode & 0o077 == 0 for path in notices.glob("*.json"))
+
+
+def test_a_handoff_and_restack_machine_error_queue_one_notice(
+    gate: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered, release = Event(), Event()
+    write = gate.write_json
+
+    def pause_first_notice(path: Path, value: object) -> None:
+        if path.parent.name == "stuck.pending" and not entered.is_set():
+            entered.set()
+            assert release.wait(10), "first notice was not released"
+        write(path, value)
+
+    monkeypatch.setattr(gate, "write_json", pause_first_notice)
+
+    def handoff() -> None:
+        with (tmp_path / "merge.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(handoff)
+        try:
+            assert entered.wait(10), "first notice was not attempted"
+            # A restack owns its own start lock, without merge.lock.
+            second = pool.submit(gate.note_machine_result, tmp_path,
+                                 "No space left on device; free disk space")
+            with suppress(FutureTimeout):
+                second.result(timeout=1)
+        finally:
+            release.set()
+        first.result(timeout=10)
+        second.result(timeout=10)
+    assert len(list((tmp_path / "stuck.pending").glob("*.json"))) == 1
+    assert (tmp_path / "machine-errors.lock").stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.parametrize("pass_first", [False, True])
+def test_a_direct_handoff_cannot_erase_a_ticks_machine_failure(
+    gate: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pass_first: bool,
+) -> None:
+    marker = tmp_path / "machine-errors"
+    error = "No space left on device; free disk space"
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "first")
+    gate.note_machine_result(tmp_path, error)
+    if pass_first:
+        gate.note_machine_result(tmp_path, None)
+    monkeypatch.delenv("WORKFLOW_MACHINE_ERROR_TICK")
+    gate.note_machine_result(tmp_path, error)
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "first")
+    gate.note_machine_result(tmp_path, None)
+    gate.finish_machine_error_tick(tmp_path, "first")
+    assert marker.exists()
+    monkeypatch.delenv("WORKFLOW_MACHINE_ERROR_TICK")
+    gate.note_machine_result(tmp_path, error)
+    assert len(list((tmp_path / "stuck.pending").glob("*.json"))) == 1
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "recovered")
+    gate.note_machine_result(tmp_path, None)
+    gate.finish_machine_error_tick(tmp_path, "recovered")
+    assert not marker.exists()
+
+
+def test_interleaved_driver_observations_keep_each_ticks_failure(
+    gate: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for tick in ["first", "second"]:
+        monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", tick)
+        gate.note_machine_result(tmp_path, "No space left on device; free disk space")
+    for tick in ["first", "second"]:
+        monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", tick)
+        gate.note_machine_result(tmp_path, None)
+        gate.finish_machine_error_tick(tmp_path, tick)
+        assert (tmp_path / "machine-errors").exists()
+    assert json.loads((tmp_path / "machine-errors").read_text())["failed_ticks"] == []
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_a_successful_memory_retry_does_not_hide_its_first_machine_failure(
+    gate: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active: bool,
+) -> None:
+    monkeypatch.setattr(gate, "CONFIG", SimpleNamespace(command=lambda name: None, state_folder="state"))
+    monkeypatch.setattr(gate, "main_checkout", lambda: tmp_path)
+    results = iter([
+        subprocess.CompletedProcess([], 1, "io_uring_queue_init: Cannot allocate memory", ""),
+        subprocess.CompletedProcess([], 0, "", ""),
+        subprocess.CompletedProcess([], 0, "", ""),
+    ])
+    monkeypatch.setattr(gate, "_push_once", lambda args: (next(results), None))
+    waits = []
+
+    def command(*args: str) -> subprocess.CompletedProcess[str]:
+        waits.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(gate, "command", command)
+    folder = tmp_path / "state"
+    marker = folder / "machine-errors"
+    monkeypatch.delenv("WORKFLOW_MACHINE_ERROR_TICK", raising=False)
+    if active:
+        gate.note_machine_result(folder, "No space left on device; free disk space")
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "retry")
+    assert gate.push("origin", "HEAD:ticket/example").returncode == 0
+    gate.finish_machine_error_tick(folder, "retry")
+    assert marker.exists()
+    assert len(list((folder / "stuck.pending").glob("*.json"))) == 1
+    assert waits == [("sleep", str(gate.PUSH_RETRY_SECONDS))]
+    monkeypatch.setenv("WORKFLOW_MACHINE_ERROR_TICK", "recovered")
+    assert gate.push("origin", "HEAD:ticket/example").returncode == 0
+    gate.finish_machine_error_tick(folder, "recovered")
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("error", _SERVER_ERRORS)

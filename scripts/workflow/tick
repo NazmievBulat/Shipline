@@ -189,8 +189,54 @@ if ((shadow == 0)); then
     exec 7>&2 2> >(python3 -B "$here/self_update.py" watch "$$" 2>&7 >&7 7>&-)
   fi
 fi
+unset WORKFLOW_STEP_ERROR
+tick_errors=""
+tick_error_reader=""
+if ((shadow == 0)) && tick_errors=$(mktemp -d); then
+  exec 6>&2 2> >(
+    # Like the self-update watch, drain stderr through a group stop. Killing the reader
+    # first would turn the tick's final writes into SIGPIPE instead of its shutdown status.
+    trap '' HUP INT TERM
+    exec tee "$tick_errors/stderr" >&6 6>&-
+  )
+  tick_error_reader=$!
+  export WORKFLOW_STEP_ERROR=$tick_errors/last-step
+fi
+source "$here/step_errors"
+# Keep the first failing step only when the tick marks it failed. Expected refusals and
+# probes may return nonzero without failing the tick and must not replace its diagnosis.
+tick_failed() {
+  failed=1
+  if [[ -n $tick_errors && ! -s $tick_errors/first-failure && -s ${WORKFLOW_STEP_ERROR:-} ]]; then
+    cp -- "$WORKFLOW_STEP_ERROR" "$tick_errors/first-failure"
+  fi
+  return 0
+}
+python3() { workflow_step command python3 "$@"; }
+bash() { workflow_step command bash "$@"; }
+git() { workflow_step command git "$@"; }
 tick_ended() {
+  local status=$1 error=""
   ((shadow == 0)) || return 0
+  if [[ -n $tick_error_reader ]]; then
+    exec 2>&6 6>&-
+    wait "$tick_error_reader" || true
+    if [[ -s $tick_errors/first-failure ]]; then
+      IFS= read -r -n 300 error <"$tick_errors/first-failure" || true
+    elif [[ -s $tick_errors/last-step ]]; then
+      IFS= read -r -n 300 error <"$tick_errors/last-step" || true
+    else
+      IFS= read -r -n 300 error <"$tick_errors/stderr" || true
+    fi
+    rm -rf -- "$tick_errors"
+  fi
+  unset WORKFLOW_STEP_ERROR
+  # Lock contention and the operator's stops are neither success nor failure, as in
+  # self_update.py. Keep the tick lock through counting and delivery so the next real
+  # tick cannot overtake this one's result.
+  if [[ -z $tick_skipped ]] && ((status != 129 && status != 130 && status != 143)); then
+    bash "$here/wake" --tick-result "$status" "$error" 9>&- || true
+  fi
   if [[ -n $tick_watched ]]; then
     # Everything printed before this line was read; what follows goes straight out. A watch
     # that is gone must not end the tick before its end is counted.
@@ -320,7 +366,7 @@ git() { git_step git "$@"; }
 # The pick's resource history must keep moving while this tick drives the train. The
 # sampler closes the tick's lock, stops on exit, and never runs for a shadow tick.
 if ((shadow == 0)); then
-  python3 -B "$here/ticket_starts.py" watch-room "$main" "$$" </dev/null >/dev/null 7>&- 9>&- &
+  env -u WORKFLOW_STEP_ERROR python3 -B "$here/ticket_starts.py" watch-room "$main" "$$" </dev/null >/dev/null 6>&- 7>&- 9>&- &
   room_sampler=$!
 fi
 
@@ -524,6 +570,7 @@ shadow_session() {
     # An answer for the owner too, as `session answer-for-owner` would type it.
     answer-for-owner) bash "$here/session" would-answer "${@:2}" 9>&- ;;
     capacity-retry) bash "$here/session" would-capacity-retry "${@:2}" 9>&- ;;
+    retry-status) bash "$here/session" would-retry-status "${@:2}" 9>&- ;;
     *) shadow_note "session $*" ;;
   esac
 }
@@ -535,8 +582,8 @@ session() {
     shadow_session "$@"
   else
     case $1 in
-      start | cleanup) git_step bash "$here/session" "$@" 9>&- 8>&- 7>&- ;;
-      *) bash "$here/session" "$@" 9>&- 8>&- 7>&- ;;
+      start | cleanup) git_step bash "$here/session" "$@" 9>&- 8>&- 7>&- 6>&- ;;
+      *) bash "$here/session" "$@" 9>&- 8>&- 7>&- 6>&- ;;
     esac
   fi
 }
@@ -617,6 +664,11 @@ asks_owner() {
   local screen message top
   screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 0
   top=$(LC_ALL=C awk '/^─/ { above = last; last = NR } END { print above + 0 }' <<<"$screen")
+  if ((top == 0)) && [[ ${2:-} == after-reset ]]; then
+    # Resend also supports legacy limit prompts with zero or one rule. The last
+    # prompt begins that input; keep every earlier reply for the same question check.
+    top=$(LC_ALL=C awk '/^(>|❯)/ { prompt = NR } END { print prompt + 0 }' <<<"$screen")
+  fi
   ((top > 0)) || return 0
   message=$(LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" | LC_ALL=C awk '
     /^[[:space:]]*●/ { reply = "" }
@@ -807,6 +859,9 @@ failed=0
 woken=()
 wake_done=0
 local_done=0
+# Sessions whose delivery path has already been handled in this tick.
+nudged=" "
+status_pending=" "
 budget_ready() {
   python3 "$here/github_budget.py" ready tick
 }
@@ -847,13 +902,13 @@ capacity_duties() {
     if ((result != 0)); then
       # An unreadable pane is no evidence of recovery; keep its delivery receipt.
       if [[ $result == 1 && $previous != - ]]; then
-        write_session_note "$name" "$mark" "$tries 0 - 0 0" || failed=1
+        write_session_note "$name" "$mark" "$tries 0 - 0 0" || tick_failed
       fi
       continue
     fi
     if [[ $sum != "$previous" ]]; then
       since=$NOW sent=0 named=0
-      write_session_note "$name" "$mark" "$tries $since $sum $sent $named" || { failed=1; continue; }
+      write_session_note "$name" "$mark" "$tries $since $sum $sent $named" || { tick_failed; continue; }
     fi
     ((sent == 0)) || continue
     case $tries in
@@ -868,9 +923,9 @@ capacity_duties() {
     if ((tries > 0 && named == 0)); then
       if note_for_wake "$name-capacity-$since-$sum" "codex at capacity: $name ($minutes min)"; then
         named=1
-        write_session_note "$name" "$mark" "$tries $since $sum $sent $named" || { failed=1; continue; }
+        write_session_note "$name" "$mark" "$tries $since $sum $sent $named" || { tick_failed; continue; }
       else
-        failed=1
+        tick_failed
         continue
       fi
     fi
@@ -878,12 +933,95 @@ capacity_duties() {
     result=$?
     if ((result == 0)); then
       ((tries >= 3)) || tries=$((tries + 1))
-      write_session_note "$name" "$mark" "$tries $since $sum 1 $named" || failed=1
-      wake_log "$name capacity retry sent" || failed=1
+      write_session_note "$name" "$mark" "$tries $since $sum 1 $named" || tick_failed
+      wake_log "$name capacity retry sent" || tick_failed
     elif ((result != 3)); then
       echo "$delivery" >&2
-      failed=1
+      tick_failed
     fi
+  done <<<"$running"
+}
+
+# One bounded recovery path, including usage resets in the GitHub-independent duties.
+# Return 0 when a status draft owns this session; return 1 for the ordinary send paths.
+retry_status() {
+  local name=$1 typed_note retry identity previous tries named line waiting_since
+  local suffix wait_note delivery sent
+  local -a mode=()
+  [[ ${2:-} != after-reset ]] || mode=(after-reset)
+  status_delivered=false
+  [[ $name =~ ^(ticket|review)-[0-9]+$ ]] || return 1
+  typed_note=$main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name.typed
+  retry=$main/$SHIPLINE_STATE_FOLDER/$name.status-retry
+  if [[ ! -e $typed_note ]]; then
+    ((shadow)) || rm -f "$retry"
+    return 1
+  fi
+  bash "$here/session" status-pending "$name" "${mode[@]}" 9>&- || return 1
+  [[ $status_pending != *" $name "* ]] || return 0
+  # Even an edited draft or a temporarily blocked recovery belongs to this path alone.
+  # A checks wake, finish message or stuck nudge must not bypass its safety checks or bound.
+  nudged+="$name "
+  status_pending+="$name "
+  said_finished "$name" && return 0
+  said_finished "$name" "review sent back" && return 0
+  asks_owner "$name" "${mode[@]}" && return 0
+  bash "$here/session" would-retry-status "$name" "${mode[@]}" 9>&- || return 0
+  identity=$(stat -c '%i:%y' "$typed_note" 9>&- | cksum) || { tick_failed; return 0; }
+  identity=${identity%% *}
+  previous="" tries=0 named=0
+  { read -r previous tries named <"$retry"; } 2>/dev/null || true
+  if [[ $previous != "$identity" || ! $tries =~ ^[0-9]+$ || ! $named =~ ^[01]$ ]]; then
+    tries=0 named=0
+  fi
+  if ((tries >= NUDGE_RETRIES)); then
+    if ((named == 0)); then
+      line="stuck? $name (status message not taken; its text stays in the box)"
+      if note_for_wake "$name-status-$identity" "$line"; then
+        write_session_note "$name" "$retry" "$identity $tries 1" || tick_failed
+        wake_log "$line" || tick_failed
+      else
+        tick_failed
+      fi
+    fi
+    return 0
+  fi
+  # Count before sending, so a partial run cannot get unbounded extra key presses.
+  write_session_note "$name" "$retry" "$identity $((tries + 1)) 0" || { tick_failed; return 0; }
+  waiting_since=""
+  for suffix in job-wait checks-wait idle; do
+    wait_note=${typed_note%.typed}.$suffix
+    if [[ -e $wait_note ]]; then
+      waiting_since=$(stat -c %Y "$wait_note" 9>&-) || waiting_since=""
+      break
+    fi
+  done
+  delivery=$(session retry-status "$name" "${mode[@]}" 2>&1)
+  sent=$?
+  if ((sent == 0)); then
+    status_delivered=true
+    ((shadow)) || rm -f "$retry"
+    wake_log "$name status check sent again after its Enter was not taken" || tick_failed
+    # If the hook has not removed the old wait yet, do not send its status again next tick.
+    if [[ $waiting_since =~ ^[0-9]+$ ]]; then
+      write_session_note "$name" "$main/$SHIPLINE_STATE_FOLDER/$name.kept-alive" "$waiting_since" || tick_failed
+    fi
+  elif ((sent != 3)); then
+    echo "$delivery" >&2
+    wake_log "$name status check retry failed: $delivery"
+    tick_failed
+  fi
+  return 0
+}
+
+# Owned status drafts need no GitHub response. Share this pass between local duties
+# and listing failures so neither can strand text or bypass the per-tick retry bound.
+status_duties() {
+  local name state
+  while read -r name state _; do
+    [[ $state != limit && $name =~ ^(ticket|review)-[0-9]+$ ]] || continue
+    session_current "$name" || continue
+    retry_status "$name" || true
   done <<<"$running"
 }
 
@@ -899,11 +1037,11 @@ paused() {
 }
 local_duties() {
   local_done=1
-  running=$(session list) || failed=1
+  running=$(session list) || tick_failed
 
   while read -r name state held _; do
     if [[ $state =~ ^(idle|limit)$ && $held =~ ^[0-9]+$ ]] && ((held > SQUEEZE_ABOVE_MB)); then
-      session squeeze "$name" || failed=1
+      session squeeze "$name" || tick_failed
     fi
   done <<<"$running"
 
@@ -922,14 +1060,22 @@ local_duties() {
       continue
     fi
     [[ ! -r $mark || $(<"$mark") != "$reset_at" ]] || continue
-    ((shadow)) || mkdir -p "${mark%/*}" || { failed=1; continue; }
+    ((shadow)) || mkdir -p "${mark%/*}" || { tick_failed; continue; }
+    if retry_status "$name" after-reset; then
+      if [[ $status_delivered == true ]]; then
+        write_session_note "$name" "$mark" "$reset_at" || { tick_failed; continue; }
+        woken+=("$name")
+      fi
+      continue
+    fi
     if session resend "$name"; then
-      write_session_note "$name" "$mark" "$reset_at" || { failed=1; continue; }
+      write_session_note "$name" "$mark" "$reset_at" || { tick_failed; continue; }
       woken+=("$name")
     else
-      failed=1
+      tick_failed
     fi
   done <<<"$running"
+  status_duties
   capacity_duties
 }
 
@@ -942,10 +1088,10 @@ fi
 program=${program:-claude}
 [[ $program =~ ^(claude|codex|cloud)$ ]] || { echo "invalid worker program: $program" >&2; exit 1; }
 listed=-
-running=$(session list) || { failed=1; listed=unread; }
+running=$(session list) || { tick_failed; listed=unread; }
 # From the sessions just listed: the sample asks GitHub nothing and lists nothing again.
 ((shadow)) ||
-  bash "$here/workflow-metrics" --sample --sessions "$listed" <<<"$running" 9>&- || failed=1
+  bash "$here/workflow-metrics" --sample --sessions "$listed" <<<"$running" 9>&- || tick_failed
 
 # Before GitHub is asked anything: a hunt or an analyst has no pull request, and its time runs
 # out whether or not GitHub answers. An analyst's closing line is read whatever its state: it
@@ -953,7 +1099,7 @@ running=$(session list) || { failed=1; listed=unread; }
 while read -r name _; do
   if [[ $name == hunt-* ]] && is_over_its_time "$name" "$HUNT_STOPPED_AFTER_MINUTES"; then
     say "$name is over its time"
-    session stop "$name" || failed=1
+    session stop "$name" || tick_failed
   elif [[ $name == hunt-* ]]; then
     shadow_over_due "$name" "$HUNT_STOPPED_AFTER_MINUTES"
   elif [[ $name == analyst-* ]]; then
@@ -965,7 +1111,7 @@ while read -r name _; do
         continue
       fi
     fi
-    session stop "$name" || failed=1
+    session stop "$name" || tick_failed
   fi
 done <<<"$running"
 
@@ -976,7 +1122,7 @@ if ! budget_ready; then
 fi
 
 # Poll every cloud record, including unlabelled tickets, before the ordinary ready path.
-((shadow)) || python3 -B "$here/cloud_workers.py" poll "$main" 9>&- || failed=1
+((shadow)) || python3 -B "$here/cloud_workers.py" poll "$main" 9>&- || tick_failed
 budget_ready || paused
 
 # The daily metrics read a week of runs from GitHub, minutes on a first run: they run detached,
@@ -988,11 +1134,11 @@ if ((shadow == 0)) && [[ $METRICS_DAILY_AT =~ ^([0-9]{2}):([0-9]{2})$ ]] &&
     ((10#$(date -u -d "@$NOW" +%H%M) >= 10#${BASH_REMATCH[1]}${BASH_REMATCH[2]})) &&
     [[ ! -e $main/.local/analyses/metrics-$(date -u -d "@$NOW" +%F).md ]]; then
   if mkdir -p "$HOME/.local/state/workflow"; then
-    env -u WORKFLOW_TRAIN_TICK -u WORKFLOW_SESSION_SNAPSHOT -u WORKFLOW_DEFER_START \
+    env -u WORKFLOW_TRAIN_TICK -u WORKFLOW_SESSION_SNAPSHOT -u WORKFLOW_DEFER_START -u WORKFLOW_STEP_ERROR \
       WORKFLOW_NOW="$NOW" setsid bash "$here/workflow-metrics" --daily </dev/null \
-      >>"$HOME/.local/state/workflow/metrics.log" 2>&1 7>&- 9>&- &
+      >>"$HOME/.local/state/workflow/metrics.log" 2>&1 6>&- 7>&- 9>&- &
   else
-    failed=1
+    tick_failed
   fi
 fi
 
@@ -1000,17 +1146,19 @@ snapshot=$WORKFLOW_TRAIN_TICK/pulls.json
 # The labelled pull requests, as "<number> <draft> <base>". Starts go in the order the merge
 # train serves: by priority, then the older ticket.
 labelled_pulls() {
-  jq -r -L "$here" 'include "priority";
+  workflow_step command jq -r -L "$here" 'include "priority";
     [.[] | select(any(.labels[]; .name == workflow_label))] | sort_by(priority_rank, .number) |
     .[] | "\(.number) \(.isDraft) \(.baseRefName)"' "$snapshot"
 }
 if ! python3 "$here/tick_snapshot.py" create "$snapshot" 9>&- || ! pulls=$(labelled_pulls); then
+  tick_failed
   echo "cannot list the pull requests; the next tick tries again" >&2
   # The application an ended hunt left running is stopped all the same.
   session cleanup hunts
   budget_ready || paused
-  # Capacity recovery needs no pull request listing. Leave the other local duties
-  # on their existing paths, including their protections during listing failures.
+  # Status and capacity recovery need no pull request listing. Leave the other
+  # local duties on their existing paths, including their protections on failures.
+  status_duties
   capacity_duties
   exit 1
 fi
@@ -1024,11 +1172,11 @@ conflicts=$(jq -r '.[] | select(.state == "OPEN" and .baseRefName == "main" and
   (.mergeable == "CONFLICTING" or .mergeStateStatus == "DIRTY")) |
   select(.number | tostring | test("^[0-9]+$")) |
   select(.headRefOid | strings | test("^[0-9a-f]{40}$")) |
-  "\(.number) \(.headRefOid)"' "$snapshot") || { failed=1; conflicts=""; }
+  "\(.number) \(.headRefOid)"' "$snapshot") || { tick_failed; conflicts=""; }
 while read -r number head; do
   [[ -n $number ]] || continue
   seen=$main/$SHIPLINE_STATE_FOLDER/review-$number.conflict-seen-$head
-  [[ -e $seen ]] || (umask 077; keep "$seen" "$conflicts_seen_at") || failed=1
+  [[ -e $seen ]] || (umask 077; keep "$seen" "$conflicts_seen_at") || tick_failed
 done <<<"$conflicts"
 
 # A resolver queues the pushed head and waits. Only this unsandboxed tick runs its panel.
@@ -1041,7 +1189,7 @@ while read -r name state _; do
   request=$folder/$name.panel-request.json
   [[ -e $request && -e $main/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER/$name.codex ]] || continue
   panel_head=$(jq -er --arg number "$number" 'select(.number == $number and
-    (.full_review | type == "boolean")) | .head | select(test("^[0-9a-f]{40}$"))' "$request") || { failed=1; continue; }
+    (.full_review | type == "boolean")) | .head | select(test("^[0-9a-f]{40}$"))' "$request") || { tick_failed; continue; }
   [[ $(git -C "$main/.claude/worktrees/ticket-$number" rev-parse HEAD) == "$panel_head" ]] || continue
   grep -qxF "$number false main" <<<"$pulls" || continue
   if ((shadow)); then
@@ -1053,43 +1201,43 @@ while read -r name state _; do
     # The runner keeps its own per-head lock. A long panel holds no tick or decide lock,
     # and later ticks can service other conflicts while its reviewers run.
     (umask 077
-      setsid python3 -B "$here/conflict_review.py" run-panel "$folder" "$number" "$panel_head" \
-        </dev/null >>"$folder/$name.panel-log-$panel_head" 2>&1 9>&- 8>&- 7>&- &
+      env -u WORKFLOW_STEP_ERROR setsid python3 -B "$here/conflict_review.py" run-panel "$folder" "$number" "$panel_head" \
+        </dev/null >>"$folder/$name.panel-log-$panel_head" 2>&1 9>&- 8>&- 7>&- 6>&- &
     )
     continue
   fi
-  result=$(cat "$result_note") || { failed=1; continue; }
+  result=$(cat "$result_note") || { tick_failed; continue; }
   if [[ $result == 2 ]]; then
     # The scope refusal is for this kept head; normal starts below now select Claude.
-    session stop "$name" || failed=1
+    session stop "$name" || tick_failed
     continue
   fi
   if [[ $result != 0 && ! -e $folder/$name.panel-failed-$panel_head ]]; then
     echo "$name panel failed on $panel_head; no conflict round may be published" >&2
-    wake_log "$name panel failed on $panel_head; no conflict round may be published" || failed=1
-    keep "$folder/$name.panel-failed-$panel_head" "$panel_head" || failed=1
-    failed=1
+    wake_log "$name panel failed on $panel_head; no conflict round may be published" || tick_failed
+    keep "$folder/$name.panel-failed-$panel_head" "$panel_head" || tick_failed
+    tick_failed
   fi
   [[ ! -e $folder/$name.panel-woken-$panel_head ]] || continue
   if delivery=$(session panel-finished "$name" "$panel_head" 2>&1); then
-    keep "$folder/$name.panel-woken-$panel_head" "$panel_head" || failed=1
-    wake_log "$name panel reports ready on $panel_head; resolver nudged" || failed=1
+    keep "$folder/$name.panel-woken-$panel_head" "$panel_head" || tick_failed
+    wake_log "$name panel reports ready on $panel_head; resolver nudged" || tick_failed
   fi
 done <<<"$running"
 
-running=$(session list) || failed=1
+running=$(session list) || tick_failed
 while read -r name state _; do
   # Codex's latest turn is authoritative even if its bridge never ran the Stop hook.
   if [[ $name =~ ^(ticket|review)- && -e $main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name.codex ]]; then
     if { [[ $name != ticket-* ]] || ! grep -qE "^${name#ticket-} true " <<<"$pulls"; } && said_finished "$name"; then
       if [[ $name == review-* ]] && grep -qxF "${name#review-} false main" <<<"$pulls"; then
-        note_rule_break "${name#review-}" || { failed=1; continue; }
+        note_rule_break "${name#review-}" || { tick_failed; continue; }
       fi
-      session stop "$name" || failed=1
+      session stop "$name" || tick_failed
       continue
     fi
     if bridge_parse_failed "$name"; then
-      session bridge "$name" || failed=1
+      session bridge "$name" || tick_failed
       continue
     fi
   fi
@@ -1101,7 +1249,7 @@ while read -r name state _; do
   if [[ $name =~ ^(ticket|review)- && -e $main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name.codex ]] &&
       ! tmux -L "$name" has-session -t "=$name" 2>/dev/null 9>&- &&
       { { [[ $name == ticket-* ]] && grep -qE "^${name#ticket-} true " <<<"$pulls"; } || ! said_finished "$name"; }; then
-    session bridge "$name" || failed=1
+    session bridge "$name" || tick_failed
     continue
   fi
   # A draft without a session gets a worker below, so the worker of a draft is never stopped
@@ -1109,25 +1257,25 @@ while read -r name state _; do
   [[ $name != ticket-* ]] || ! grep -qE "^${name#ticket-} true " <<<"$pulls" || continue
   if [[ $name == review-* ]] && said_finished "$name" "review sent back"; then
     if grep -qE "^${name#review-} true " <<<"$pulls"; then
-      session stop "$name" || failed=1
+      session stop "$name" || tick_failed
     fi
   elif said_finished "$name"; then
     if [[ $name == review-* ]] && grep -qE "^${name#review-} false " <<<"$pulls" &&
         ! grep -qxF "${name#review-} false main" <<<"$pulls"; then
       # A reviewed stack member waits for its base; do not start it every three minutes.
       head=$(git -C "$main/.claude/worktrees/ticket-${name#review-}" rev-parse HEAD 9>&-) ||
-        { failed=1; continue; }
-      write_session_note "$name" "$main/$SHIPLINE_STATE_FOLDER/$name.head" "$head" || { failed=1; continue; }
+        { tick_failed; continue; }
+      write_session_note "$name" "$main/$SHIPLINE_STATE_FOLDER/$name.head" "$head" || { tick_failed; continue; }
     fi
     if [[ $name == review-* ]] && grep -qxF "${name#review-} false main" <<<"$pulls"; then
       # Unread, the break would be lost with the session: it waits for the next tick.
-      note_rule_break "${name#review-}" || { failed=1; continue; }
+      note_rule_break "${name#review-}" || { tick_failed; continue; }
     fi
-    session stop "$name" || failed=1
+    session stop "$name" || tick_failed
   fi
 done <<<"$running"
 
-WORKFLOW_PR_SNAPSHOT=$snapshot session cleanup || failed=1
+WORKFLOW_PR_SNAPSHOT=$snapshot session cleanup || tick_failed
 
 local_duties
 
@@ -1135,7 +1283,7 @@ local_duties
 # The tick alone requests one failed-job retry, after verifying home-runner evidence. A shadow
 # tick reads the report as the real tick left it.
 if ((shadow == 0)); then
-  WORKFLOW_BACKGROUND_GITHUB=1 git_step bash "$here/main-status" --tick-main-status 9>&- || failed=1
+  WORKFLOW_BACKGROUND_GITHUB=1 git_step bash "$here/main-status" --tick-main-status 9>&- || tick_failed
   budget_ready || paused
 fi
 
@@ -1144,17 +1292,18 @@ fi
 # test of a handoff's own makes it a draft, which a worker below fixes in its line place; its
 # runners' failure is re-run once (`check_repair.py`).
 if ((shadow == 0)); then
-  WORKFLOW_BACKGROUND_GITHUB=1 git_step python3 -B "$here/merge_driver.py" 9>&- || failed=1
+  WORKFLOW_BACKGROUND_GITHUB=1 git_step python3 -B "$here/merge_driver.py" 9>&- || tick_failed
   budget_ready || paused
 fi
-running=$(session list) || failed=1
+running=$(session list) || tick_failed
 
 # A stopped watch needs no shell restarted. A check-wait note is enough, even before the
 # reviewer publishes its round. An idle reviewer without that note still needs its own round
 # after its session started, on the head or an ancestor. Unknown or empty checks are not
 # finished; failures are finished too.
 # The sessions given a message in this tick: step 8 gives them no second one.
-nudged=" "
+# Local duties recover status drafts before competing wakes, sharing their
+# per-tick ownership list with usage-reset recovery and stuck detection below.
 if train=$(WORKFLOW_BACKGROUND_GITHUB=1 git_step bash "$here/merge-when-current" --train-status 9>&-); then
 # A shadow tick notes the line it read whenever it changed: it explains a decision that differs.
 if ((shadow)); then
@@ -1165,6 +1314,7 @@ while read -r name state _; do
   [[ $state != limit && $name =~ ^(review|audit)-([0-9]+)$ ]] || continue
   number=${BASH_REMATCH[2]}
   session_current "$name" || continue
+  [[ $nudged != *" $name "* ]] || continue
   # Another member's gate call merged this one in a batch: it is no longer open or in the
   # train, and its own session still owes the after-merge duties.
   batch_merged=$main/$SHIPLINE_STATE_FOLDER/batch-merged-$number
@@ -1199,19 +1349,19 @@ while read -r name state _; do
     [[ ! -e $mark ]] || continue
     # The squash commit, or the merged head when the gate could not read main after it.
     squash=$(jq -er '(.squash // .head) | select(type == "string" and test("^[0-9a-f]{40}$"))' \
-      "$batch_merged") || { failed=1; continue; }
+      "$batch_merged") || { tick_failed; continue; }
     if delivery=$(session batch-merged "$name" "$squash" 2>&1); then
       nudged+="$name "
-      write_session_note "$name" "$mark" "$squash" || { failed=1; continue; }
-      wake_log "$name merged in a batch as $squash; session nudged" || failed=1
+      write_session_note "$name" "$mark" "$squash" || { tick_failed; continue; }
+      wake_log "$name merged in a batch as $squash; session nudged" || tick_failed
     else
       echo "$delivery" >&2
-      failed=1
+      tick_failed
     fi
     continue
   fi
   if ! pull=$(python3 "$here/tick_snapshot.py" view "$snapshot" "$number" 9>&-); then
-    failed=1
+    tick_failed
     continue
   fi
   if ! head=$(jq -er 'select(.state == "OPEN" and .isDraft == false) | .headRefOid |
@@ -1242,11 +1392,11 @@ while read -r name state _; do
     fi
     if delivery=$(session conflict-found "$name" "$head" 2>&1); then
       nudged+="$name "
-      write_session_note "$name" "$mark" "$head" || { failed=1; continue; }
-      wake_log "$name merge conflict on $head; reviewer nudged" || failed=1
+      write_session_note "$name" "$mark" "$head" || { tick_failed; continue; }
+      wake_log "$name merge conflict on $head; reviewer nudged" || tick_failed
     else
       echo "$delivery" >&2
-      failed=1
+      tick_failed
     fi
     continue
   fi
@@ -1256,7 +1406,7 @@ while read -r name state _; do
     # A turn can arrive after this head's checks already woke the reviewer. Persist a
     # separate token so restarting the tick neither loses the turn nor repeats it.
     turn=$(jq -r '.turn' <<<"$train")
-    health=$(sha256sum "$main/$SHIPLINE_STATE_FOLDER/main-status") || { failed=1; continue; }
+    health=$(sha256sum "$main/$SHIPLINE_STATE_FOLDER/main-status") || { tick_failed; continue; }
     mark=$main/$SHIPLINE_STATE_FOLDER/$name.train-nudged-$turn-${health%% *}-$head
   fi
   # A check GitHub lost after its run finished never completes: the gate runs CI again for it.
@@ -1304,7 +1454,7 @@ while read -r name state _; do
       lost=failed
       mark=$main/$SHIPLINE_STATE_FOLDER/$name.checks-nudged-$head
     else
-      ((found == 0)) || { failed=1; continue; }
+      ((found == 0)) || { tick_failed; continue; }
       lost=true
       mark=$main/$SHIPLINE_STATE_FOLDER/$name.lost-nudged-$head
     fi
@@ -1312,7 +1462,7 @@ while read -r name state _; do
   if [[ ! -e $notes.checks-wait ]]; then
     started=$(stat -c %Y "$notes.started" 9>&-) || continue
     if ! reviews=$(gh api --paginate "repos/$SHIPLINE_REPOSITORY/pulls/$number/reviews" 9>&-); then
-      failed=1
+      tick_failed
       continue
     fi
     rounds=$(jq -sr --argjson started "$started" '.[][] |
@@ -1324,7 +1474,7 @@ while read -r name state _; do
     # A head pushed from elsewhere is fetched once; a branch rewritten past the round has no
     # path back to it and is not woken.
     git -C "$worktree" cat-file -e "$head^{commit}" 2>/dev/null 9>&- ||
-      git -C "$worktree" fetch --quiet origin 9>&- || { failed=1; continue; }
+      git -C "$worktree" fetch --quiet origin 9>&- || { tick_failed; continue; }
     own=false
     while read -r round; do
       if git -C "$worktree" merge-base --is-ancestor "$round" "$head" 2>/dev/null 9>&-; then
@@ -1338,17 +1488,17 @@ while read -r name state _; do
   [[ $lost != true ]] || wake=lost-check
   if delivery=$(session "$wake" "$name" "$head" 2>&1); then
     nudged+="$name "
-    write_session_note "$name" "$mark" "$head" || { failed=1; continue; }
-    wake_log "$name ${wake//-/ } on $head; reviewer nudged" || failed=1
+    write_session_note "$name" "$mark" "$head" || { tick_failed; continue; }
+    wake_log "$name ${wake//-/ } on $head; reviewer nudged" || tick_failed
   else
     echo "$delivery" >&2
     wake_log "$name wake failed: $delivery"
-    failed=1
+    tick_failed
   fi
 done <<<"$running"
 else
   echo "cannot read the merge train; reviewer nudges wait for the next tick" >&2
-  failed=1
+  tick_failed
 fi
 
 # Step 8.
@@ -1427,6 +1577,10 @@ nudge_busy() {
     outcome="; nudge sent"
   elif ((sent == 4)); then
     nudged+="$name "
+    if bash "$here/session" would-retry-status "$name" 9>&-; then
+      outcome="; interrupted, status text will be retried"
+      return 0
+    fi
     outcome="; interrupted, text left in its box"
   elif ((sent != 3)); then
     nudged+="$name "
@@ -1434,7 +1588,7 @@ nudge_busy() {
     wake_log "$name $3 nudge failed: $delivery"
     outcome="; nudge failed"
     write_session_note "$name" "$main/$SHIPLINE_STATE_FOLDER/$name.nudge-retry" "$kind 0" || true
-    failed=1
+    tick_failed
   fi
 }
 
@@ -1451,9 +1605,9 @@ retry_nudge() {
   if ((tries >= NUDGE_RETRIES)); then
     if note_for_wake "$name-retry-$NOW" "stuck? $name (nudge not taken; its text stays in the box)"; then
       ((shadow)) || rm -f "$note"
-      wake_log "$name $kind nudge not taken after $tries more tries" || failed=1
+      wake_log "$name $kind nudge not taken after $tries more tries" || tick_failed
     else
-      failed=1
+      tick_failed
     fi
     return 0
   fi
@@ -1462,15 +1616,15 @@ retry_nudge() {
   if ((sent == 0)); then
     nudged+="$name "
     ((shadow)) || rm -f "$note"
-    wake_log "$name $kind nudge sent again after its Enter was not taken" || failed=1
+    wake_log "$name $kind nudge sent again after its Enter was not taken" || tick_failed
   elif ((sent == 3)); then
     ((shadow)) || rm -f "$note"
   else
     nudged+="$name "
-    write_session_note "$name" "$note" "$kind $((tries + 1))" || failed=1
+    write_session_note "$name" "$note" "$kind $((tries + 1))" || tick_failed
     echo "$delivery" >&2
     wake_log "$name $kind nudge failed again: $delivery"
-    failed=1
+    tick_failed
   fi
 }
 
@@ -1480,7 +1634,7 @@ holds_own_nudge() {
     ! bash "$here/bridge-empty" "$1" 9>&-
 }
 
-running=$(session list) || failed=1
+running=$(session list) || tick_failed
 
 # Where the tick notes when a session's screen last changed. A shadow tick notes it in its own
 # notes for the rest of its run, and reads the real tick's until it has.
@@ -1503,9 +1657,9 @@ while read -r name state _; do
   if [[ $last_sum != "$sum" || ! $last_since =~ ^[0-9]+$ ]]; then
     seen=$(screen_seen "$name" write)
     if ((shadow)); then
-      mkdir -p "${seen%/*}" && echo "$sum $NOW" >"$seen" || failed=1
+      mkdir -p "${seen%/*}" && echo "$sum $NOW" >"$seen" || tick_failed
     else
-      write_session_note "$name" "$seen" "$sum $NOW" || failed=1
+      write_session_note "$name" "$seen" "$sum $NOW" || tick_failed
     fi
   fi
 done <<<"$running"
@@ -1517,6 +1671,7 @@ while read -r name state _; do
   notes=$main/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER/$name
   [[ ! -e $notes.codex ]] || continue
   [[ ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked ]] || continue
+  [[ $status_pending != *" $name "* ]] || continue
 
   # Waiting for its own job, or a reviewer for its turn in the merge train. The stretch begins
   # at the stop that started the wait, and a message the session answers begins another.
@@ -1534,15 +1689,19 @@ while read -r name state _; do
       [[ ! -r $mark || $(<"$mark") != "$since" ]] && quiet "$name"; then
     delivery=$(session status-check "$name" 2>&1)
     sent=$?
+    ((sent == 3)) || nudged+="$name "
     if ((sent == 0)); then
-      write_session_note "$name" "$mark" "$since" || failed=1
+      write_session_note "$name" "$mark" "$since" || tick_failed
       wake_log "$name idle $(((NOW - since) / 60)) min waiting for its own job or turn; status check sent" ||
-        failed=1
+        tick_failed
     elif ((sent != 3)); then
       echo "$delivery" >&2
       wake_log "$name status check failed: $delivery"
-      failed=1
+      tick_failed
     fi
+    # The submit hook can remove the wait while this call is still polling. Its new
+    # draft belongs to next tick's recovery, not this tick's busy detector.
+    ((sent == 3)) || continue
   elif ((shadow)) && [[ $since =~ ^[0-9]+$ && ! -e $notes.asking ]] &&
       ((NOW - since < KEEP_ALIVE_AFTER_SECONDS)) &&
       [[ ! -r $mark || $(<"$mark") != "$since" ]] && quiet "$name"; then
@@ -1554,7 +1713,7 @@ while read -r name state _; do
   # above if it had said so. Ready is counted from when the tick first saw it ready.
   ready=$main/$SHIPLINE_STATE_FOLDER/$name.ready-seen
   if [[ $name == ticket-* ]] && grep -qE "^$number false " <<<"$pulls"; then
-    [[ -r $ready ]] || write_session_note "$name" "$ready" "$NOW" || failed=1
+    [[ -r $ready ]] || write_session_note "$name" "$ready" "$NOW" || tick_failed
     # A shadow tick counts from now what the real tick notes now.
     ready_at=""
     ((shadow == 0)) || ready_at=$NOW
@@ -1568,13 +1727,13 @@ while read -r name state _; do
       delivery=$(session finish-ready "$name" 2>&1)
       sent=$?
       if ((sent == 0)); then
-        write_session_note "$name" "$mark" "$ready_at" || failed=1
+        write_session_note "$name" "$mark" "$ready_at" || tick_failed
         wake_log "$name idle on ready pull request $number without worker finished; told to finish" ||
-          failed=1
+          tick_failed
       elif ((sent != 3)); then
         echo "$delivery" >&2
         wake_log "$name finish message failed: $delivery"
-        failed=1
+        tick_failed
       fi
     elif ((shadow)) && [[ $ready_at =~ ^[0-9]+$ && $idle_at =~ ^[0-9]+$ ]] &&
         [[ ! -r $mark || $(<"$mark") != "$ready_at" ]] && quiet "$name"; then
@@ -1614,7 +1773,7 @@ while read -r name state _; do
         { read -r first_at first_loop <"$first"; } 2>/dev/null || first_loop=""
         if [[ $first_loop != "$loop" || ! $first_at =~ ^[0-9]+$ ]]; then
           first_at=$NOW
-          write_session_note "$name" "$first" "$NOW $loop" || failed=1
+          write_session_note "$name" "$first" "$NOW $loop" || tick_failed
         fi
         if [[ $busy == true && $(jq -r '.running // ""' <<<"$activity") == "$loop" &&
               $nudged != *" $name "* ]] && ! asks_permission "$name" && quiet "$name"; then
@@ -1635,14 +1794,15 @@ while read -r name state _; do
             fi
           fi
         fi
+        [[ $outcome != "; interrupted, status text will be retried" ]] || continue
         line="wait loop finds itself? $name (running: $loop)$outcome"
         if [[ $later == true ]]; then
           :
         elif note_for_wake "$name-loop-$NOW" "$line"; then
-          write_session_note "$name" "$mark" "$loop" || failed=1
-          wake_log "$line" || failed=1
+          write_session_note "$name" "$mark" "$loop" || tick_failed
+          wake_log "$line" || tick_failed
         else
-          failed=1
+          tick_failed
         fi
       fi
     fi
@@ -1668,10 +1828,10 @@ while read -r name state _; do
     if [[ ! -r $mark || $(<"$mark") != "$head" ]] && quiet "$name"; then
       line="idle, no rule: $name ($(((NOW - idle_at) / 60)) min, last line: $(last_line "$name"))"
       if note_for_wake "$name-idle-$NOW" "$line"; then
-        write_session_note "$name" "$mark" "$head" || failed=1
-        wake_log "$line" || failed=1
+        write_session_note "$name" "$mark" "$head" || tick_failed
+        wake_log "$line" || tick_failed
       else
-        failed=1
+        tick_failed
       fi
     fi
   fi
@@ -1694,19 +1854,20 @@ while read -r name state _; do
   asks_permission "$name" && continue
   [[ ! -r $mark || $(<"$mark") != "$last_since $head" ]] || continue
   nudge_busy "$name" still stuck
+  [[ $outcome != "; interrupted, status text will be retried" ]] || continue
   line="stuck? $name ($(((NOW - last_since) / 60)) min, running: ${what:-no command})$outcome"
   if note_for_wake "$name-stuck-$last_since-$NOW" "$line"; then
-    write_session_note "$name" "$mark" "$last_since $head" || failed=1
-    wake_log "$line" || failed=1
+    write_session_note "$name" "$mark" "$last_since $head" || tick_failed
+    wake_log "$line" || tick_failed
   else
-    failed=1
+    tick_failed
   fi
 done <<<"$running"
 
 # A cloud worker whose draft had no push and no report for `cloud_wake_after_minutes`, with no
 # open question, is woken once per quiet stretch, and one whose question was answered at once.
 # A shadow tick wakes none: the wake is sent and noted by `cloud_workers.py` itself.
-((shadow)) || python3 -B "$here/cloud_workers.py" wake "$main" "$snapshot" 9>&- || failed=1
+((shadow)) || python3 -B "$here/cloud_workers.py" wake "$main" "$snapshot" 9>&- || tick_failed
 
 # A question to the owner marked `Owner only: no` gets its recommended reply once it has waited,
 # from the notes the stop hook wrote (`notify`): the time it was asked and the reply. Once for
@@ -1717,7 +1878,7 @@ done <<<"$running"
 # never answer. 0 minutes in the config turns it all off.
 answer_after=$((10#${SHIPLINE_ANSWER_FOR_OWNER_AFTER_MINUTES:-15} * 60))
 if ((answer_after > 0)); then
-  running=$(session list) || failed=1
+  running=$(session list) || tick_failed
   while read -r name state _; do
     [[ $state == idle && $name =~ ^(ticket|review|audit)-([0-9]+)$ ]] || continue
     notes=$main/.claude/worktrees/ticket-${BASH_REMATCH[2]}/$SHIPLINE_STATE_FOLDER/$name
@@ -1736,10 +1897,10 @@ if ((answer_after > 0)); then
       what="without a reply word"
       [[ $owner_only != missing ]] || what="without the Owner only line"
       if note_for_wake "$name-owner-question-$asked_at" "owner question $what: $name"; then
-        write_session_note "$name" "$mark" "$asked" || failed=1
-        wake_log "$name asks the owner $what; it waits for him" || failed=1
+        write_session_note "$name" "$mark" "$asked" || tick_failed
+        wake_log "$name asks the owner $what; it waits for him" || tick_failed
       else
-        failed=1
+        tick_failed
       fi
       continue
     fi
@@ -1762,8 +1923,8 @@ if ((answer_after > 0)); then
     delivery=$(session answer-for-owner "$name" "$asked" 2>&1)
     sent=$?
     if ((sent == 0)); then
-      write_session_note "$name" "$mark" "${asked#* }" || failed=1
-      wake_log "answered for the owner: $name, \"$reply\"" || failed=1
+      write_session_note "$name" "$mark" "${asked#* }" || tick_failed
+      wake_log "answered for the owner: $name, \"$reply\"" || tick_failed
       # For the wake's check-in, which lists them so the owner can overrule them; a shadow
       # tick's for its own wake.
       answered=$main/$SHIPLINE_STATE_FOLDER/answered-for-owner.pending
@@ -1771,18 +1932,18 @@ if ((answer_after > 0)); then
       mkdir -p "$answered" &&
         jq -n --arg name "$name" --arg reply "$reply" --argjson at "$NOW" \
           '{name: $name, reply: $reply, at: $at}' >"$answered/.$NOW-$name.tmp" &&
-        mv -- "$answered/.$NOW-$name.tmp" "$answered/$NOW-$name.json" || failed=1
+        mv -- "$answered/.$NOW-$name.tmp" "$answered/$NOW-$name.json" || tick_failed
     elif ((sent != 3)); then
       echo "$delivery" >&2
       wake_log "$name answer for the owner failed: $delivery"
-      failed=1
+      tick_failed
     fi
   done <<<"$running"
 fi
 
 # Record reviewer-start notices before waking the orchestrator. Their reviewers start below.
-((shadow)) || git_step python3 -B "$here/merge_driver.py" --hand-backs 9>&- || failed=1
-running=$(session list) || failed=1
+((shadow)) || git_step python3 -B "$here/merge_driver.py" --hand-backs 9>&- || tick_failed
+running=$(session list) || tick_failed
 
 # The program the orchestrator recorded for ticket N in `worker-program-N`, in `recorded`, or
 # nothing. A record that names no program is read as none, and named in the wake once for
@@ -1804,10 +1965,10 @@ recorded_program() {
   [[ ! -r $record.noted || $(<"$record.noted") != "$sum" ]] || return 0
   line="worker-program-$1 names no worker program (cloud, claude or codex); read as no record"
   if note_for_wake "worker-program-$1-$sum" "$line"; then
-    keep "$record.noted" "$sum" || failed=1
-    wake_log "$line" || failed=1
+    keep "$record.noted" "$sum" || tick_failed
+    wake_log "$line" || tick_failed
   else
-    failed=1
+    tick_failed
   fi
 }
 
@@ -1857,7 +2018,7 @@ if ((shadow)) || flock --timeout 60 8; then
       echo "cannot list the pull requests again after a decision; starts wait for the next tick" >&2
       pulls=""
       starts_go=0
-      failed=1
+      tick_failed
     fi
   fi
   # A ticket whose decision is not finished waits for the next call of `decide` to finish it.
@@ -1865,7 +2026,7 @@ if ((shadow)) || flock --timeout 60 8; then
     echo "cannot read the decisions; starts wait for the next tick" >&2
     pulls=""
     starts_go=0
-    failed=1
+    tick_failed
   fi
 else
   echo "a decision holds the lock of decide; starts wait for the next tick"
@@ -1883,7 +2044,7 @@ while read -r number draft base; do
   ! grep -qxF "$number" <<<"$unfinished" || continue
   if ((local_starts_held)); then
     if ((shadow == 0)) && [[ -e $main/$SHIPLINE_STATE_FOLDER/merge-review-$number ]]; then
-      git_step python3 -B "$here/merge_driver.py" --wait-hand-back "$number" 9>&- || failed=1
+      git_step python3 -B "$here/merge_driver.py" --wait-hand-back "$number" 9>&- || tick_failed
     fi
     [[ $draft == true ]] && cloud_candidate "$number" || continue
   fi
@@ -1899,7 +2060,7 @@ while read -r number draft base; do
       git_step python3 -B "$here/merge_driver.py" --start-hand-back "$number" 9>&-
     fi
     started=$?
-    ((started == 0 || started == 75)) || failed=1
+    ((started == 0 || started == 75)) || tick_failed
     continue
   fi
   [[ ! -e $main/$SHIPLINE_STATE_FOLDER/merge-wanted-$number &&
@@ -1910,7 +2071,7 @@ while read -r number draft base; do
   if ! now=$(list_pull_requests); then
     echo "cannot list the pull requests; the next tick tries again" >&2
     # The wake below still tells the orchestrator whom this tick resent.
-    failed=1
+    tick_failed
     break
   fi
   grep -qxF "$number $draft $base" <<<"$now" || continue
@@ -1932,14 +2093,14 @@ while read -r number draft base; do
       session start worker "$number"
     fi
     started=$?
-    ((started == 0)) || failed=1
+    ((started == 0)) || tick_failed
   elif [[ $draft == false ]]; then
     ((local_starts_held == 0)) || continue
     head=$(gh pr view "$number" --json state,headRefName,headRefOid \
-      --jq '"\(.state) \(.headRefName) \(.headRefOid)"' 9>&-) || { failed=1; continue; }
+      --jq '"\(.state) \(.headRefName) \(.headRefOid)"' 9>&-) || { tick_failed; continue; }
     mark=$main/$SHIPLINE_STATE_FOLDER/review-$number.head
     if [[ $base == main ]]; then
-      ((shadow)) || rm -f "$mark" || { failed=1; continue; }
+      ((shadow)) || rm -f "$mark" || { tick_failed; continue; }
     else
       [[ ! -r $mark || $(<"$mark") != "${head##* }" ]] || continue
     fi
@@ -1947,14 +2108,14 @@ while read -r number draft base; do
     # for the exact next round may exceed the two-round limit.
     if ! reviews=$(gh api --paginate "repos/$SHIPLINE_REPOSITORY/pulls/$number/reviews" 9>&-); then
       echo "cannot read reviews for pull request $number; the next tick tries again" >&2
-      failed=1
+      tick_failed
       continue
     fi
     if ! history=$(jq -scr '[.[][] | (.body // "") |
       capture("^<!-- workflow-review round=(?<round>[0-9]+)( result=(?<result>sent-back|passed))? -->")? |
       {round: (.round | tonumber), result: (.result // "sent-back")}] |
       [(map(.round) | max // 0), (map(select(.result == "sent-back")) | length)] | @tsv' <<<"$reviews"); then
-      failed=1
+      tick_failed
       continue
     fi
     read -r round sent_back <<<"$history"
@@ -1967,25 +2128,25 @@ while read -r number draft base; do
       git_step python3 -B "$here/reviewer_start.py" "$main/$SHIPLINE_STATE_FOLDER" "$number" "${head##* }" "$((round + 1))" "$sent_back" "${branch% *}" 9>&-
     fi
     started=$?
-    ((started == 0 || started == 2)) || failed=1
+    ((started == 0 || started == 2)) || tick_failed
   fi
 done <<<"$pulls"
 
 if ((shadow == 0)); then
-  python3 -B "$here/reviewer_start.py" --reconcile "$main/$SHIPLINE_STATE_FOLDER" 9>&- || failed=1
+  python3 -B "$here/reviewer_start.py" --reconcile "$main/$SHIPLINE_STATE_FOLDER" 9>&- || tick_failed
 
   # After this tick's own starts, which count as starts too: the next draft ticket gets the label
   # when one may start, and the next tick starts its worker.
   if ((starts_go)); then
     git_step python3 -B "$here/ticket_starts.py" pick "$main" "$snapshot" 9>&- ||
-      failed=1
+      tick_failed
   fi
 fi
 exec 8>&-
 
 # Step 11, after the starts the tickets wait for, and not while one waits for memory.
 if ((local_starts_held == 0 && started != 75)); then
-  start_daily_analyst || failed=1
+  start_daily_analyst || tick_failed
 fi
 
 # Step 12, after this tick's starts: the CI demand on its way, for the runner balancer. A shadow
@@ -1996,9 +2157,9 @@ elif running=$(session list); then
   # Unavailable reads keep the last forecast and succeed; local faults still fail.
   # 75: the GitHub budget is paused; the forecast is written again at a later tick.
   python3 -B "$here/ci_demand.py" write "$main" "$snapshot" <<<"$running" 9>&- ||
-    (($? == 75)) || failed=1
+    (($? == 75)) || tick_failed
 else
-  failed=1
+  tick_failed
 fi
 # The last change of this machine's runner balancer, once, for the wake's next check-in. One
 # older than a day (a first tick after an install, say) is no news. A shadow tick notes it for its
@@ -2014,14 +2175,14 @@ if [[ -s $balance_log ]] && balance_line=$(tail -n 1 "$balance_log") &&
   if mkdir -p "$balance_pending" &&
       jq -n --arg line "$balance_line" '{line: $line}' >"$balance_pending/.balance.json" &&
       mv -- "$balance_pending/.balance.json" "$balance_pending/balance.json"; then
-    keep "$balance_told" "$balance_line" || failed=1
+    keep "$balance_told" "$balance_line" || tick_failed
   else
-    failed=1
+    tick_failed
   fi
 fi
 
 wake_done=1
-bash "$here/wake" "${woken[@]}" 9>&- || failed=1
+bash "$here/wake" "${woken[@]}" 9>&- || tick_failed
 
 budget_ready || paused
 exit "$failed"
