@@ -509,6 +509,16 @@ for folder in "$stuck" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/stuck.pe
     fi
   done < <(find "$folder" -type f -name '*.json' -print0 | sort -z)
 done
+# Repository repairs use the same durable, any-hour delivery as stalled-session notes.
+repairs=$main/$SHIPLINE_STATE_FOLDER/git-repair.pending
+if [[ -d $repairs ]]; then
+  while IFS= read -r -d '' event; do
+    if line=$(jq -er '.line | strings' "$event"); then
+      stuck_files+=("$event")
+      stuck_lines+=("$line")
+    fi
+  done < <(find "$repairs" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+fi
 # The self-update's notes are in the Shipline checkout these scripts are in, not the repository's.
 shipline=$(cd "$here/../.." && pwd)/.local/shipline/wake.pending
 if [[ -d $shipline ]]; then
