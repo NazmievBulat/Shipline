@@ -517,7 +517,7 @@ def test_nothing_starts_above_85_percent_of_the_usage_window(workflow: Workflow)
 
 
 @pytest.mark.parametrize("source", ["cache", "live"])
-@pytest.mark.parametrize("kind", ["not started", "missing", "non-numeric"])
+@pytest.mark.parametrize("kind", ["not started", "null", "missing", "non-numeric"])
 def test_ticket_starts_distinguish_not_started_from_unknown_usage(
     workflow: Workflow, source: str, kind: str
 ) -> None:
@@ -526,7 +526,9 @@ def test_ticket_starts_distinguish_not_started_from_unknown_usage(
     moment = _start_now()
     _room_since(workflow, moment)
     answer = {"seven_day": _ANSWER["seven_day"]}
-    if kind != "missing":
+    if kind == "null":
+        answer["five_hour"] = None
+    elif kind != "missing":
         answer["five_hour"] = {
             "utilization": 0.0 if kind == "not started" else "0",
             "resets_at": None,
@@ -535,8 +537,8 @@ def test_ticket_starts_distinguish_not_started_from_unknown_usage(
 
     printed = _tick(workflow, moment)
 
-    assert _labelled(workflow) == (["7"] if kind == "not started" else [])
-    if kind != "not started":
+    assert _labelled(workflow) == (["7"] if kind in ("not started", "null") else [])
+    if kind not in ("not started", "null"):
         assert "7 waits: the 5-hour usage window could not be read" in printed
     else:
         # The next tick starts the labelled ticket using tick's own usage reader.
