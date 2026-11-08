@@ -30,8 +30,10 @@
 # `idle, no rule: ticket-426 (50 min, last line: <line>)`.
 # So is what the tick's self-update of Shipline's own checkout (`self_update.py`) notes, once
 # each: `shipline rolled back: <bad sha> -> <good sha>, <reason>`, a checkout it left alone for
-# its local changes, and a pin that stops it. When several repositories share that checkout,
-# the first wake to send tells it.
+# its local changes, a pin that stops it, and `shipline update waits: <sha> CI <conclusion>,
+# installed <sha>` when main has waited over an hour for passed CI. When several repositories
+# share that checkout, the first wake to send tells it. Each check-in also names the installed
+# version as `shipline: <short sha>`.
 # Local gate machine errors use the same notices: one first error line and remedy across
 # pull requests and ticks, re-armed only after a tick observed no machine error.
 #
@@ -732,7 +734,13 @@ usage+="; $tmp_slots; $(bash "$here/session" load 2>/dev/null || echo "load coul
 # Whether the orchestrator may start sessions by its rule: not above 85% of the 5-hour window,
 # unless the window resets within the hour. When that changes, so does what it can do.
 gate=$(starts_allowed)
-seen="sessions: $(sessions_line "$sessions"); pull requests: $pulls; starts: $gate; tmp pressure: $tmp_warning"
+installed=$(
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES
+  git -C "$here/../.." rev-parse --short HEAD 2>/dev/null
+) || installed=unknown
+[[ $installed =~ ^[0-9a-f]+$ ]] || installed=unknown
+seen="sessions: $(sessions_line "$sessions"); pull requests: $pulls; starts: $gate; tmp pressure: $tmp_warning; shipline: $installed"
 
 reason="every 20 minutes"
 ((${#resent[@]} == 0)) || reason="after a reset"
@@ -773,7 +781,7 @@ for line in "${lost_lines[@]}" "${stuck_lines[@]}" "${answer_lines[@]}"; do
   [[ $between_lines == *$'\n' ]] || between_lines=$'\n'
   between_lines+="$line"$'\n'
 done
-message="Wake check-in, $(date -d "@$NOW" '+%H:%M')${resent[*]:+, after a reset}. Usage: $usage.${resent[*]:+ Sent their instruction again: ${resent[*]}.} Sessions: $(sessions_line "$sessions"). Open pull requests: $pulls.${between_lines}Log: ~/.local/state/workflow/wake.log. Do what needs judgment by AGENTS.md, For the orchestrator session; start nothing above 85% of the 5-hour window unless it resets within the hour; never merge, never force-push, never edit code."
+message="Wake check-in, $(date -d "@$NOW" '+%H:%M')${resent[*]:+, after a reset}. shipline: $installed. Usage: $usage.${resent[*]:+ Sent their instruction again: ${resent[*]}.} Sessions: $(sessions_line "$sessions"). Open pull requests: $pulls.${between_lines}Log: ~/.local/state/workflow/wake.log. Do what needs judgment by AGENTS.md, For the orchestrator session; start nothing above 85% of the 5-hour window unless it resets within the hour; never merge, never force-push, never edit code."
 if ((${#handback_lines[@]})); then
   message+=" Merge hand-backs for judgment: ${handback_lines[*]}"
 fi
