@@ -407,3 +407,30 @@ def test_kept_null_window_is_still_not_started(workflow: Workflow) -> None:
     assert done.returncode == 0, done.stderr
     assert done.stdout == f"five_hour 0 {_NOW + 120 + 5 * 3600} not_started\n"
     assert _requests(workflow) == 1
+
+
+@pytest.mark.parametrize("kept", [True, False])
+def test_shadow_ticks_read_usage_without_changing_live_state(workflow: Workflow, kept: bool) -> None:
+    folder = _service(workflow)
+    if kept:
+        assert workflow.run_script("usage").stdout == _LINES
+
+    def snapshot() -> tuple[bool, dict[str, tuple[bytes, int]]]:
+        return folder.exists(), {
+            file.name: (file.read_bytes(), file.stat().st_mtime_ns)
+            for file in folder.glob("*")
+        }
+
+    before = snapshot()
+    done = workflow.run_script("usage", env={
+        "WORKFLOW_NOW": str(_NOW + 301),
+        "SHIPLINE_SHADOW": str(workflow.repo / ".local" / "shipline" / "shadow.log"),
+    })
+
+    assert done.returncode == (0 if kept else 1), done.stderr
+    assert done.stdout == (_LINES if kept else "")
+    assert snapshot() == before
+    if kept:
+        assert _requests(workflow) == 1
+    else:
+        assert not (workflow.state / "requests").exists()

@@ -104,6 +104,11 @@ shared_answer() (
   config=$(python3 -B "$(dirname "${BASH_SOURCE[0]}")/workflow_config.py" shell) || return 1
   eval "$config"
   folder=$SHIPLINE_REPO/$SHIPLINE_STATE_FOLDER
+  # A shadow tick changes no live state, including request admission or a lock file.
+  if [[ -n ${SHIPLINE_SHADOW:-} ]]; then
+    from_kept
+    return "$?"
+  fi
   umask 077
   mkdir -p "$folder" || return 1
   exec 8>"$folder/usage-request.lock" || return 1
