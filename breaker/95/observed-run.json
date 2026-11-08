@@ -1,0 +1,110 @@
+{
+  "conclusion": "success",
+  "event": "pull_request",
+  "head_sha": "0c1c3d11f75fd54f58fdcc61cc7889365fe7c81c",
+  "id": 42483227551,
+  "run_attempt": 1,
+  "status": "completed",
+  "jobs": [
+    {
+      "completed_at": "2026-11-08T13:05:03Z",
+      "conclusion": "success",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "CI: what to run",
+      "started_at": "2026-11-08T13:04:57Z",
+      "status": "completed"
+    },
+    {
+      "completed_at": "2026-11-08T13:20:35Z",
+      "conclusion": "success",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "CI: server tests (1 of 8)",
+      "started_at": "2026-11-08T13:05:04Z",
+      "status": "completed"
+    },
+    {
+      "completed_at": "2026-11-08T13:23:13Z",
+      "conclusion": "success",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "CI: server tests (4 of 8)",
+      "started_at": "2026-11-08T13:05:05Z",
+      "status": "completed"
+    },
+    {
+      "completed_at": "2026-11-08T13:16:57Z",
+      "conclusion": "success",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "CI: server tests (6 of 8)",
+      "started_at": "2026-11-08T13:05:05Z",
+      "status": "completed"
+    },
+    {
+      "completed_at": "2026-11-08T13:19:42Z",
+      "conclusion": "success",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "CI: server tests (2 of 8)",
+      "started_at": "2026-11-08T13:05:05Z",
+      "status": "completed"
+    },
+    {
+      "completed_at": "2026-11-08T13:16:54Z",
+      "conclusion": "success",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "CI: server tests (3 of 8)",
+      "started_at": "2026-11-08T13:05:05Z",
+      "status": "completed"
+    },
+    {
+      "completed_at": "2026-11-08T13:16:49Z",
+      "conclusion": "success",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "CI: server tests (5 of 8)",
+      "started_at": "2026-11-08T13:05:04Z",
+      "status": "completed"
+    },
+    {
+      "completed_at": "2026-11-08T13:17:18Z",
+      "conclusion": "success",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "CI: server tests (8 of 8)",
+      "started_at": "2026-11-08T13:05:05Z",
+      "status": "completed"
+    },
+    {
+      "completed_at": "2026-11-08T13:20:15Z",
+      "conclusion": "success",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "CI: server tests (7 of 8)",
+      "started_at": "2026-11-08T13:05:05Z",
+      "status": "completed"
+    },
+    {
+      "completed_at": "2026-11-08T13:23:17Z",
+      "conclusion": "success",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "name": "CI",
+      "started_at": "2026-11-08T13:23:15Z",
+      "status": "completed"
+    }
+  ]
+}
