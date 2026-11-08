@@ -1482,6 +1482,12 @@ def test_with_the_defaults_the_texts_sent_to_models_are_as_before(workflow: Work
         "You are an independent reviewer of pull request 9 in NazmievBulat/Shipline."
     )
     assert "ready high 12" in texts["wake"]
+    # The installed commit is an approved, variable addition; keep the original digest's
+    # guard on every other word sent to a model.
+    installed = workflow.git("rev-parse", "--short", "HEAD")
+    field = f" shipline: {installed}."
+    assert field in texts["wake"]
+    texts["wake"] = texts["wake"].replace(field, "", 1)
     hashes = {name: hashlib.sha256(text.encode()).hexdigest() for name, text in texts.items()}
     assert hashes == _TEXTS_BEFORE
 
