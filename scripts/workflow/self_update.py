@@ -655,26 +655,28 @@ def update(repository: str, current: str, pid: int) -> bool:
         print(f"cannot fetch Shipline's main: {done.stderr.strip()}", file=sys.stderr)
         return False
     target = git("rev-parse", "--verify", "refs/remotes/origin/main").stdout.strip()
-    if not SHA.fullmatch(target) or target == current or target in read_lines("bad"):
+    if not SHA.fullmatch(target) or target == current:
         return False
     if not clean() or git("merge-base", "--is-ancestor", current, target).returncode:
         local_changes()
         return False
     (NOTES / "local-changes-noted").unlink(missing_ok=True)
     main_head = target
-    head_run = ci_run(repository, target)
+    bad = read_lines("bad")
+    # Skip known-bad candidates without reading their CI, but still search older commits.
+    head_run = {} if target in bad else ci_run(repository, target)
     if not passed(head_run):
         retry_ci(repository, head_run)
         line = git("rev-list", "--first-parent", f"{current}..{target}")
         if line.returncode:
             return False
-        bad = read_lines("bad")
         target = next((sha for sha in line.stdout.splitlines()
                        if SHA.fullmatch(sha) and sha != main_head and sha not in bad
                        and git("merge-base", "--is-ancestor", current, sha).returncode == 0
                        and passed(ci_run(repository, sha))), "")
         if not target:
-            update_waits(main_head, head_run, current)
+            if main_head not in bad:
+                update_waits(main_head, head_run, current)
             return False
     # Asked again under the lock every tick takes to note its start: a tick that started while
     # this one fetched is seen.
@@ -688,7 +690,7 @@ def update(repository: str, current: str, pid: int) -> bool:
             return False
         write_trial(new_trial(target, current))
         write(run_note(pid), f"{target} {started_at(pid)}\n")
-    if target != main_head:
+    if target != main_head and main_head not in bad:
         update_waits(main_head, head_run, target)
     print(f"shipline updated: {current} -> {target}", flush=True)
     return True
