@@ -270,6 +270,23 @@ def test_ten_calls_share_one_service_answer(workflow: Workflow) -> None:
     assert _requests(workflow) == 1
 
 
+def test_worktrees_share_the_configured_installation_state(workflow: Workflow) -> None:
+    _service(workflow)
+    config_file = workflow.repo / "shipline.json"
+    config = json.loads(config_file.read_text())
+    config["state_folder"] = ".local/usage state"
+    config_file.write_text(json.dumps(config))
+    worktree = workflow.worktree(7)
+    workflow.git("worktree", "add", "--quiet", "--detach", str(worktree), "HEAD")
+
+    assert workflow.run_script("usage").stdout == _LINES
+    assert workflow.run_script("usage", cwd=worktree).stdout == _LINES
+
+    assert _requests(workflow) == 1
+    assert (workflow.repo / config["state_folder"] / "usage-answer.json").is_file()
+    assert not (worktree / config["state_folder"]).exists()
+
+
 @pytest.mark.parametrize("retry_after", ["92", "600", "Wed, 14 Oct 2026 01:21:40 GMT"])
 def test_failure_honors_retry_after_and_keeps_the_good_answer(
     workflow: Workflow, retry_after: str

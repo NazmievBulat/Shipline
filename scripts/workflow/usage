@@ -10,8 +10,9 @@
 #
 # The figures are those the status line shows ("USE: 5H: 76% 1h9m"). They are read from the
 # file the status line keeps when it is at most 5 minutes old, and otherwise asked of
-# Anthropic with the token Claude Code signed in with, as the status line does. Nothing is
-# written. Fails, printing nothing, when neither answers.
+# Anthropic with the token Claude Code signed in with, as the status line does. All callers
+# share a kept answer and a request pause in the main checkout's configured state folder.
+# Fails, printing nothing, when neither the status line nor a recent kept answer is usable.
 #
 # `curl`, `jq` and `date` are found on the PATH, and the paths below can be pointed elsewhere,
 # so a test can replace all of them.
@@ -21,6 +22,10 @@ CACHE=${WORKFLOW_USAGE_CACHE:-$HOME/.claude/MEMORY/STATE/usage-cache.json}
 CREDENTIALS=${WORKFLOW_CREDENTIALS:-$HOME/.claude/.credentials.json}
 ADDRESS=${WORKFLOW_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}
 FRESH_SECONDS=300
+# Share one request at most every 5 minutes, even after a short Retry-After. A longer
+# Retry-After extends that pause. Keep good figures usable for 30 minutes during failures.
+REQUEST_SECONDS=300
+KEPT_SECONDS=1800
 ANSWER_SECONDS=${WORKFLOW_USAGE_SECONDS:-4}
 NOW=${WORKFLOW_NOW:-$(date +%s)}
 
@@ -61,19 +66,106 @@ from_cache() {
   lines_of "$(<"$CACHE")"
 }
 
-# The token goes to `curl` on its standard input, so it does not show in the list of running
-# programs.
-from_anthropic() {
-  local token answer
-  token=$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDENTIALS" 2>/dev/null)
-  [[ -n $token ]] || return 1
-  answer=$(curl --silent --fail --max-time "$ANSWER_SECONDS" --config - \
-    -H "Content-Type: application/json" -H "anthropic-beta: oauth-2025-04-20" \
-    "$ADDRESS" <<EOF
-header = "Authorization: Bearer $token"
-EOF
-  ) || return 1
-  lines_of "$answer"
+# Replace beside the destination, so readers see a whole file, private even with a loose
+# caller umask. Only parsed figures and timestamps are kept, never the service's raw body.
+save() {
+  local destination=$1 value=$2 temporary
+  temporary=$(mktemp "$destination.XXXXXX") || return 1
+  printf '%s\n' "$value" >"$temporary" && mv -f "$temporary" "$destination" || {
+    rm -f "$temporary"
+    return 1
+  }
 }
 
-from_cache || from_anthropic
+from_kept() {
+  local lines window percent at state
+  lines=$(jq -ser --argjson now "$NOW" --argjson age "$KEPT_SECONDS" '
+    select(length == 1) | .[0] | select(.received_at | type == "number")
+    | select(.received_at <= $now and $now - .received_at <= $age)
+    | .lines | select(type == "string" and length > 0)
+  ' "$folder/usage-answer.json" 2>/dev/null) || return 1
+  while read -r window percent at state; do
+    # A null window has still not started; its provisional reset is relative to this read.
+    if [[ $state == not_started ]]; then
+      case $window in
+        five_hour) at=$((NOW + 5 * 3600)) ;;
+        seven_day) at=$((NOW + 7 * 86400)) ;;
+      esac
+      state=" not_started"
+    fi
+    printf '%s %s %s%s\n' "$window" "$percent" "$at" "$state"
+  done <<<"$lines"
+}
+
+# The lock is nonblocking: callers with short hook deadlines use kept figures immediately.
+# Admission is saved before curl, so an interrupted request cannot cause an immediate retry.
+shared_answer() (
+  local config folder next=0 token answer lines="" headers retry until record
+  config=$(python3 -B "$(dirname "${BASH_SOURCE[0]}")/workflow_config.py" shell) || return 1
+  eval "$config"
+  folder=$SHIPLINE_REPO/$SHIPLINE_STATE_FOLDER
+  umask 077
+  mkdir -p "$folder" || return 1
+  exec 8>"$folder/usage-request.lock" || return 1
+  if ! flock --nonblock 8; then
+    from_kept
+    return "$?"
+  fi
+  if [[ -r $folder/usage-next-request ]]; then
+    read -r next <"$folder/usage-next-request" || next=0
+  fi
+  [[ $next =~ ^[0-9]+$ ]] || next=0
+  if ((NOW < next)); then
+    from_kept
+    return "$?"
+  fi
+  token=$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDENTIALS" 2>/dev/null)
+  if [[ -z $token ]]; then
+    from_kept
+    return "$?"
+  fi
+  next=$((NOW + REQUEST_SECONDS))
+  save "$folder/usage-next-request" "$next" || return 1
+  headers=$(mktemp "$folder/usage-headers.XXXXXX") || return 1
+  trap 'rm -f "$headers"' EXIT
+  # The token goes to curl on standard input, never its argv or a kept file.
+  if answer=$(curl --silent --fail --max-time "$ANSWER_SECONDS" --config - \
+    --dump-header "$headers" \
+    -H "Content-Type: application/json" -H "anthropic-beta: oauth-2025-04-20" "$ADDRESS" <<EOF
+header = "Authorization: Bearer $token"
+EOF
+  ); then
+    NOW=${WORKFLOW_NOW:-$(date +%s)}
+    lines=$(lines_of "$answer") || lines=""
+  fi
+  if [[ -n $lines ]]; then
+    record=$(jq -n --argjson at "$NOW" --arg lines "$lines" '{received_at: $at, lines: $lines}') || return 1
+    save "$folder/usage-answer.json" "$record" || return 1
+    printf '%s\n' "$lines"
+    return 0
+  fi
+  retry=$(awk '
+    /^HTTP\// { value = "" }
+    tolower($0) ~ /^retry-after:/ {
+      sub(/^[^:]*:[[:space:]]*/, ""); sub(/[[:space:]]*$/, ""); value = $0
+    }
+    END { print value }
+  ' "$headers")
+  # Retry-After may be seconds or an HTTP date. Invalid/missing headers keep the 5-minute pause.
+  NOW=${WORKFLOW_NOW:-$(date +%s)}
+  until=$((NOW + REQUEST_SECONDS))
+  if [[ $retry =~ ^[0-9]+$ && ${#retry} -le 18 ]]; then
+    retry=$((NOW + 10#$retry))
+  elif [[ -n $retry ]]; then
+    retry=$(date -d "$retry" +%s 2>/dev/null) || retry=0
+  else
+    retry=0
+  fi
+  ((retry <= until)) || until=$retry
+  if ((until > next)); then
+    save "$folder/usage-next-request" "$until" || return 1
+  fi
+  from_kept
+)
+
+from_cache || shared_answer
