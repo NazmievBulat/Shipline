@@ -8,7 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
-from workflow_harness import Workflow
+from workflow_harness import Workflow, install_shipline
 from workflow.test_usage import _ANSWER, _usage_answer
 from workflow.test_ci_proof import _github, _python, _receipt, _API, _SQUASH, _TREE
 
@@ -36,6 +36,18 @@ def _wake(
     workflow: Workflow, *woken: str, at: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     return workflow.run_script("wake", *woken, env=at or _at(23, 0))
+
+
+def test_check_in_names_the_installed_shipline_commit(night: Workflow) -> None:
+    home = install_shipline(night)
+    sha = subprocess.run(
+        ["git", "-C", str(home), "rev-parse", "--short", "HEAD"],
+        env=night.env, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    night.orchestrator("idle")
+    done = _wake(night)
+    assert done.returncode == 0, done.stderr
+    assert f"shipline: {sha}" in night.sent()[-1]
 
 
 def test_git_repair_is_delivered_once_in_daylight_even_when_busy(night: Workflow) -> None:
