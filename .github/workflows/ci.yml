@@ -142,6 +142,7 @@ jobs:
           - shard: 4
             files: >-
               tests/runner/test_balance_runners.py
+              tests/workflow/test_break_93.py
               tests/workflow/test_checks_finished.py
               tests/workflow/test_dependency_watch.py
               tests/workflow/test_flow_page.py
