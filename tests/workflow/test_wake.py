@@ -548,8 +548,8 @@ def test_the_log_says_what_was_seen_and_what_was_done(night: Workflow) -> None:
     )
     assert log[2] == (
         "  sessions: ticket-7 busy; pull requests: drafts 7; waiting tickets 12;"
-        " ready medium 9 (checks passing); starts: allowed; tmp pressure: false"
-        f"; shipline: {night.git('rev-parse', '--short', 'HEAD')}"
+        " ready medium 9 (checks passing); starts: allowed"
+        f"; shipline: {night.git('rev-parse', '--short', 'HEAD')}; tmp pressure: false"
     )
     assert log[3].startswith("  told Check-in: Wake check-in, 23:00.")
 

@@ -740,7 +740,7 @@ installed=$(
   git -C "$here/../.." rev-parse --short HEAD 2>/dev/null
 ) || installed=unknown
 [[ $installed =~ ^[0-9a-f]+$ ]] || installed=unknown
-seen="sessions: $(sessions_line "$sessions"); pull requests: $pulls; starts: $gate; tmp pressure: $tmp_warning; shipline: $installed"
+seen="sessions: $(sessions_line "$sessions"); pull requests: $pulls; starts: $gate; shipline: $installed; tmp pressure: $tmp_warning"
 
 reason="every 20 minutes"
 ((${#resent[@]} == 0)) || reason="after a reset"
