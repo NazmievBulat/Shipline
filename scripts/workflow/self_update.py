@@ -558,8 +558,9 @@ def retry_ci(repository: str, run: dict[str, Any]) -> None:
             or any(not isinstance(job, dict) or job.get("status") != "completed" for job in jobs)):
         return
     failed = [job for job in jobs if job.get("conclusion") not in ("success", "skipped")]
-    # CI is just the result aggregator: its failed step follows a failed or cancelled shard.
-    causes = [job for job in failed if job.get("name") != "CI"]
+    # CI follows a failed shard, but may also lose its own runner after every shard passed.
+    # Diagnose it only when it is the sole failure, so a logical result cannot hide a test.
+    causes = [job for job in failed if job.get("name") != "CI"] or failed
     if not causes:
         return
     for job in causes:
