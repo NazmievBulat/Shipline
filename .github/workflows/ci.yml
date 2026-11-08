@@ -55,7 +55,7 @@ jobs:
         run: python3 scripts/workflow/ci_proof.py inherited ci
 
   tests:
-    name: "CI: server tests (${{ matrix.shard }} of 4)"
+    name: "CI: server tests (${{ matrix.shard }} of 8)"
     needs: plan
     # Skipped while the pull request is a draft; no other run is filtered by that check.
     # Folded: the job's name holds a colon, which a plain YAML value may not.
@@ -73,95 +73,103 @@ jobs:
         include:
           - shard: 1
             files: >-
-              tests/workflow/test_commands.py
-              tests/workflow/test_break_52.py
-              tests/workflow/test_decisions.py
-              tests/workflow/test_merge_when_current.py
-              tests/workflow/test_merge_github.py
-              tests/workflow/test_merge_checks.py
-              tests/workflow/test_merge_health.py
-              tests/workflow/test_merge_images.py
-              tests/workflow/test_merge_squash.py
-              tests/workflow/test_merge_scratch.py
+              tests/runner/test_build_images.py
+              tests/runner/test_layout.py
+              tests/tools/test_parity.py
+              tests/workflow/test_ci_demand.py
+              tests/workflow/test_merge_driver.py
               tests/workflow/test_merge_train.py
-              tests/workflow/test_wake.py
-              tests/workflow/test_workflow_commands.py
-              tests/workflow/test_tick_waits.py
+              tests/workflow/test_session_stop_and_cleanup.py
+              tests/workflow/test_stand_alone.py
+              tests/workflow/test_weaker_tests.py
           - shard: 2
             files: >-
-              tests/runner/test_build_images.py
-              tests/runner/test_install.py
-              tests/runner/test_layout.py
               tests/runner/test_lend_runners.py
-              tests/runner/test_ordinary_slots.py
-              tests/runner/test_programs.py
-              tests/runner/test_rendering.py
-              tests/tools/test_parity.py
-              tests/workflow/test_break_35.py
-              tests/workflow/test_break_45.py
-              tests/workflow/test_browser_test_slots.py
-              tests/workflow/test_github_identity.py
-              tests/workflow/test_install_hooks.py
-              tests/workflow/test_limit_in_own_words.py
-              tests/workflow/test_merge_driver.py
-              tests/workflow/test_break_55.py
-              tests/workflow/test_notify.py
-              tests/workflow/test_priority.py
-              tests/workflow/test_review_effort.py
-              tests/workflow/test_self_update.py
-              tests/workflow/test_session_memory.py
+              tests/workflow/test_ci_minutes.py
+              tests/workflow/test_ci_tests_for_changes.py
+              tests/workflow/test_dependency_watch.py
+              tests/workflow/test_merge_health.py
+              tests/workflow/test_merge_scratch.py
+              tests/workflow/test_merge_when_current.py
+              tests/workflow/test_path_filter.py
+              tests/workflow/test_session_limit.py
               tests/workflow/test_session_setup.py
-              tests/workflow/test_session_stop_and_cleanup.py
-              tests/workflow/test_shadow_run.py
-              tests/workflow/test_ticket_starts.py
-              tests/workflow/test_train_reads.py
-              tests/workflow/test_usage.py
-              tests/workflow/test_weekly_limit.py
-              tests/workflow/test_workflow_config.py
-              tests/workflow/test_workflow_metrics.py
           - shard: 3
             files: >-
-              tests/workflow/test_break_4_switch.py
-              tests/workflow/test_check_parts.py
-              tests/workflow/test_ci.py
-              tests/workflow/test_ci_demand.py
-              tests/workflow/test_ci_tests_for_changes.py
-              tests/workflow/test_cloud_workers.py
-              tests/workflow/test_codex_worker.py
+              tests/runner/test_ordinary_slots.py
+              tests/workflow/test_break_55.py
+              tests/workflow/test_ci_runner_choice.py
               tests/workflow/test_conflict_review.py
-              tests/workflow/test_github_budget.py
-              tests/workflow/test_input_box.py
-              tests/workflow/test_install_path.py
-              tests/workflow/test_install_timer.py
-              tests/workflow/test_path_filter.py
-              tests/workflow/test_push_slots.py
-              tests/workflow/test_review_panel.py
-              tests/workflow/test_session_start.py
-              tests/workflow/test_train_first.py
-              tests/workflow/test_worker_routing.py
+              tests/workflow/test_getting_started.py
+              tests/workflow/test_github_identity.py
+              tests/workflow/test_merge_checks.py
+              tests/workflow/test_merge_squash.py
+              tests/workflow/test_session_with_real_tmux.py
+              tests/workflow/test_workflow_config.py
           - shard: 4
             files: >-
-              tests/runner/test_balance_runners.py
-              tests/workflow/test_checks_finished.py
-              tests/workflow/test_dependency_watch.py
-              tests/workflow/test_flow_page.py
-              tests/workflow/test_ci_minutes.py
+              tests/workflow/test_break_4_switch.py
+              tests/workflow/test_break_52.py
+              tests/workflow/test_check_parts.py
               tests/workflow/test_ci_proof.py
-              tests/workflow/test_ci_runner_choice.py
-              tests/workflow/test_getting_started.py
-              tests/workflow/test_independent_review.py
-              tests/workflow/test_lost_check.py
-              tests/workflow/test_merge_train_metrics.py
-              tests/workflow/test_running_command.py
+              tests/workflow/test_commands.py
+              tests/workflow/test_flow_page.py
+              tests/workflow/test_push_slots.py
               tests/workflow/test_session_hunt.py
-              tests/workflow/test_session_limit.py
-              tests/workflow/test_session_with_real_tmux.py
-              tests/workflow/test_stand_alone.py
               tests/workflow/test_test_run.py
-              tests/workflow/test_tick.py
-              tests/workflow/test_tick_limit.py
+              tests/workflow/test_ticket_starts.py
               tests/workflow/test_tmp_slots.py
-              tests/workflow/test_weaker_tests.py
+          - shard: 5
+            files: >-
+              tests/runner/test_balance_runners.py
+              tests/runner/test_rendering.py
+              tests/workflow/test_browser_test_slots.py
+              tests/workflow/test_checks_finished.py
+              tests/workflow/test_ci.py
+              tests/workflow/test_install_timer.py
+              tests/workflow/test_limit_in_own_words.py
+              tests/workflow/test_lost_check.py
+              tests/workflow/test_self_update.py
+              tests/workflow/test_session_memory.py
+              tests/workflow/test_tick.py
+          - shard: 6
+            files: >-
+              tests/runner/test_install.py
+              tests/workflow/test_codex_worker.py
+              tests/workflow/test_merge_github.py
+              tests/workflow/test_review_effort.py
+              tests/workflow/test_tick_limit.py
+              tests/workflow/test_tick_waits.py
+              tests/workflow/test_train_first.py
+              tests/workflow/test_train_reads.py
+              tests/workflow/test_worker_routing.py
+              tests/workflow/test_workflow_commands.py
+          - shard: 7
+            files: >-
+              tests/runner/test_programs.py
+              tests/workflow/test_break_35.py
+              tests/workflow/test_break_45.py
+              tests/workflow/test_cloud_workers.py
+              tests/workflow/test_decisions.py
+              tests/workflow/test_github_budget.py
+              tests/workflow/test_independent_review.py
+              tests/workflow/test_input_box.py
+              tests/workflow/test_merge_train_metrics.py
+              tests/workflow/test_review_panel.py
+              tests/workflow/test_wake.py
+          - shard: 8
+            files: >-
+              tests/workflow/test_install_hooks.py
+              tests/workflow/test_install_path.py
+              tests/workflow/test_merge_images.py
+              tests/workflow/test_notify.py
+              tests/workflow/test_priority.py
+              tests/workflow/test_running_command.py
+              tests/workflow/test_session_start.py
+              tests/workflow/test_shadow_run.py
+              tests/workflow/test_usage.py
+              tests/workflow/test_weekly_limit.py
+              tests/workflow/test_workflow_metrics.py
     steps:
       - uses: actions/checkout@v5
         with:
@@ -243,12 +251,12 @@ jobs:
       - name: Tests
         run: >-
           python3 scripts/workflow/ci_proof.py test
-          -n 4 --dist worksteal -m "not serial" ${{ matrix.files }}
+          -n 4 --dist worksteal --durations=0 -m "not serial" ${{ matrix.files }}
       # The tests that cannot run beside others, one at a time, in one shard.
       - name: Tests that run alone
         if: matrix.shard == 1
         # Exit code 5: none is marked so.
-        run: python3 scripts/workflow/ci_proof.py test -p no:xdist -m serial || [ $? -eq 5 ]
+        run: python3 scripts/workflow/ci_proof.py test -p no:xdist --durations=0 -m serial || [ $? -eq 5 ]
 
   ci:
     # The check the merge queue requires, by this name: it passes only when every job that ran
