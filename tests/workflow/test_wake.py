@@ -8,7 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
-from workflow_harness import Workflow
+from workflow_harness import Workflow, install_shipline
 from workflow.test_usage import _ANSWER, _usage_answer
 from workflow.test_ci_proof import _github, _python, _receipt, _API, _SQUASH, _TREE
 
@@ -36,6 +36,34 @@ def _wake(
     workflow: Workflow, *woken: str, at: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     return workflow.run_script("wake", *woken, env=at or _at(23, 0))
+
+
+@pytest.mark.parametrize("git_environment", [False, True])
+def test_check_in_names_the_installed_shipline_commit(night: Workflow, git_environment: bool) -> None:
+    home = install_shipline(night)
+    sha = subprocess.run(
+        ["git", "-C", str(home), "rev-parse", "--short", "HEAD"],
+        env=night.env, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    night.orchestrator("idle")
+    env = _at(23, 0)
+    if git_environment:
+        env.update(GIT_DIR=str(night.repo / ".git"), GIT_WORK_TREE=str(night.repo))
+    done = _wake(night, at=env)
+    assert done.returncode == 0, done.stderr
+    assert f"shipline: {sha}" in night.sent()[-1]
+    subprocess.run(
+        ["git", "-C", str(home), "commit", "--quiet", "--allow-empty", "-m", "fix: next"],
+        env=night.env, capture_output=True, text=True, check=True,
+    )
+    next_sha = subprocess.run(
+        ["git", "-C", str(home), "rev-parse", "--short", "HEAD"],
+        env=night.env, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    done = _wake(night, at=_at(23, 21))
+    assert done.returncode == 0, done.stderr
+    assert len(night.sent()) == 2
+    assert f"shipline: {next_sha}" in night.sent()[-1]
 
 
 def test_git_repair_is_delivered_once_in_daylight_even_when_busy(night: Workflow) -> None:
@@ -520,7 +548,8 @@ def test_the_log_says_what_was_seen_and_what_was_done(night: Workflow) -> None:
     )
     assert log[2] == (
         "  sessions: ticket-7 busy; pull requests: drafts 7; waiting tickets 12;"
-        " ready medium 9 (checks passing); starts: allowed; tmp pressure: false"
+        " ready medium 9 (checks passing); starts: allowed"
+        f"; shipline: {night.git('rev-parse', '--short', 'HEAD')}; tmp pressure: false"
     )
     assert log[3].startswith("  told Check-in: Wake check-in, 23:00.")
 

@@ -55,7 +55,7 @@ jobs:
         run: python3 scripts/workflow/ci_proof.py inherited ci
 
   tests:
-    name: "CI: server tests (${{ matrix.shard }} of 4)"
+    name: "CI: server tests (${{ matrix.shard }} of 8)"
     needs: plan
     # Skipped while the pull request is a draft; no other run is filtered by that check.
     # Folded: the job's name holds a colon, which a plain YAML value may not.
@@ -66,102 +66,216 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      # The test files, split by their measured time so each shard takes about as long; a new
-      # file is added to the lightest shard (tests/workflow/test_ci.py checks that each file is
-      # in exactly one).
+      # File measurements from passed CI run 42481788763.
+      # Worker seconds sum pytest setup, call and teardown across workers.
+      # Largest files are placed first in the group with the earliest projected finish.
+      # Projections divide measured worker seconds by workers; CI validates contention.
+      # Tick waits retain four workers; the other groups use six, below the failed eight.
+      # A new file goes in the lightest shard; test_ci.py checks each file is listed once.
       matrix:
         include:
           - shard: 1
+            workers: 6
+            # Projected test time 620.12s; 3720.72 measured worker-s.
+            # tests/tools/test_parity.py: 17.49s
+            # tests/workflow/test_ci_tests_for_changes.py: 30.30s
+            # tests/workflow/test_cloud_workers.py: 3096.59s
+            # tests/workflow/test_commands.py: 264.83s
+            # tests/workflow/test_running_command.py: 5.17s
+            # tests/workflow/test_session_with_real_tmux.py: 93.33s
+            # tests/workflow/test_train_reads.py: 58.50s
+            # tests/workflow/test_wake.py: 154.51s
             files: >-
+              tests/tools/test_parity.py
+              tests/workflow/test_ci_tests_for_changes.py
+              tests/workflow/test_cloud_workers.py
               tests/workflow/test_commands.py
-              tests/workflow/test_break_52.py
-              tests/workflow/test_decisions.py
-              tests/workflow/test_merge_when_current.py
-              tests/workflow/test_merge_github.py
-              tests/workflow/test_merge_checks.py
-              tests/workflow/test_merge_health.py
-              tests/workflow/test_merge_images.py
-              tests/workflow/test_merge_squash.py
-              tests/workflow/test_merge_scratch.py
-              tests/workflow/test_merge_train.py
+              tests/workflow/test_running_command.py
+              tests/workflow/test_session_with_real_tmux.py
+              tests/workflow/test_train_reads.py
               tests/workflow/test_wake.py
-              tests/workflow/test_workflow_commands.py
-              tests/workflow/test_tick_waits.py
           - shard: 2
+            workers: 4
+            # Projected test time 620.05s; 2480.18 measured worker-s.
+            # tests/runner/test_build_images.py: 5.17s
+            # tests/runner/test_rendering.py: 0.68s
+            # tests/workflow/test_break_93.py: not yet measured
+            # tests/workflow/test_decisions.py: 63.50s
+            # tests/workflow/test_flow_page.py: 31.79s
+            # tests/workflow/test_tick_waits.py: 2358.78s
+            # tests/workflow/test_tmp_slots.py: 20.26s
             files: >-
               tests/runner/test_build_images.py
+              tests/runner/test_rendering.py
+              tests/workflow/test_break_93.py
+              tests/workflow/test_decisions.py
+              tests/workflow/test_flow_page.py
+              tests/workflow/test_tick_waits.py
+              tests/workflow/test_tmp_slots.py
+          - shard: 3
+            workers: 6
+            # Projected test time 620.05s; 3720.29 measured worker-s.
+            # tests/runner/test_install.py: 102.89s
+            # tests/workflow/test_check_parts.py: 0.07s
+            # tests/workflow/test_checks_finished.py: 1121.78s
+            # tests/workflow/test_ci_minutes.py: 2.50s
+            # tests/workflow/test_conflict_review.py: 796.89s
+            # tests/workflow/test_dependency_watch.py: 69.70s
+            # tests/workflow/test_github_identity.py: 29.82s
+            # tests/workflow/test_install_path.py: 33.17s
+            # tests/workflow/test_install_timer.py: 15.13s
+            # tests/workflow/test_merge_squash.py: 155.55s
+            # tests/workflow/test_shadow_run.py: 382.29s
+            # tests/workflow/test_tick_limit.py: 701.22s
+            # tests/workflow/test_weaker_tests.py: 1.05s
+            # tests/workflow/test_workflow_commands.py: 308.23s
+            files: >-
               tests/runner/test_install.py
+              tests/workflow/test_check_parts.py
+              tests/workflow/test_checks_finished.py
+              tests/workflow/test_ci_minutes.py
+              tests/workflow/test_conflict_review.py
+              tests/workflow/test_dependency_watch.py
+              tests/workflow/test_github_identity.py
+              tests/workflow/test_install_path.py
+              tests/workflow/test_install_timer.py
+              tests/workflow/test_merge_squash.py
+              tests/workflow/test_shadow_run.py
+              tests/workflow/test_tick_limit.py
+              tests/workflow/test_weaker_tests.py
+              tests/workflow/test_workflow_commands.py
+          - shard: 4
+            workers: 6
+            # Projected test time 620.04s; 3720.27 measured worker-s.
+            # tests/runner/test_programs.py: 0.13s
+            # tests/workflow/test_break_45.py: 332.24s
+            # tests/workflow/test_install_hooks.py: 11.67s
+            # tests/workflow/test_merge_driver.py: 2937.77s
+            # tests/workflow/test_merge_train_metrics.py: 0.74s
+            # tests/workflow/test_merge_when_current.py: 102.85s
+            # tests/workflow/test_review_effort.py: 24.32s
+            # tests/workflow/test_self_update.py: 220.90s
+            # tests/workflow/test_session_limit.py: 30.53s
+            # tests/workflow/test_stand_alone.py: 59.12s
+            files: >-
+              tests/runner/test_programs.py
+              tests/workflow/test_break_45.py
+              tests/workflow/test_install_hooks.py
+              tests/workflow/test_merge_driver.py
+              tests/workflow/test_merge_train_metrics.py
+              tests/workflow/test_merge_when_current.py
+              tests/workflow/test_review_effort.py
+              tests/workflow/test_self_update.py
+              tests/workflow/test_session_limit.py
+              tests/workflow/test_stand_alone.py
+          - shard: 5
+            workers: 6
+            # Projected test time 620.11s; 3720.67 measured worker-s.
+            # tests/workflow/test_break_35.py: 21.11s
+            # tests/workflow/test_ci_demand.py: 133.54s
+            # tests/workflow/test_github_budget.py: 63.50s
+            # tests/workflow/test_merge_checks.py: 156.61s
+            # tests/workflow/test_merge_health.py: 331.10s
+            # tests/workflow/test_merge_train.py: 609.32s
+            # tests/workflow/test_path_filter.py: 0.58s
+            # tests/workflow/test_push_slots.py: 6.31s
+            # tests/workflow/test_session_hunt.py: 56.94s
+            # tests/workflow/test_tick.py: 2340.15s
+            # tests/workflow/test_train_first.py: 1.51s
+            files: >-
+              tests/workflow/test_break_35.py
+              tests/workflow/test_ci_demand.py
+              tests/workflow/test_github_budget.py
+              tests/workflow/test_merge_checks.py
+              tests/workflow/test_merge_health.py
+              tests/workflow/test_merge_train.py
+              tests/workflow/test_path_filter.py
+              tests/workflow/test_push_slots.py
+              tests/workflow/test_session_hunt.py
+              tests/workflow/test_tick.py
+              tests/workflow/test_train_first.py
+          - shard: 6
+            workers: 6
+            # Projected test time 620.04s; 3720.24 measured worker-s.
+            # tests/runner/test_layout.py: 0.00s
+            # tests/runner/test_lend_runners.py: 0.00s
+            # tests/runner/test_ordinary_slots.py: 36.69s
+            # tests/workflow/test_browser_test_slots.py: 1.47s
+            # tests/workflow/test_ci.py: 0.01s
+            # tests/workflow/test_ci_runner_choice.py: 0.00s
+            # tests/workflow/test_limit_in_own_words.py: 114.65s
+            # tests/workflow/test_lost_check.py: 368.30s
+            # tests/workflow/test_merge_images.py: 232.84s
+            # tests/workflow/test_merge_scratch.py: 2174.77s
+            # tests/workflow/test_priority.py: 0.08s
+            # tests/workflow/test_review_panel.py: 29.18s
+            # tests/workflow/test_session_setup.py: 14.78s
+            # tests/workflow/test_session_start.py: 61.24s
+            # tests/workflow/test_weekly_limit.py: 686.23s
+            files: >-
               tests/runner/test_layout.py
               tests/runner/test_lend_runners.py
               tests/runner/test_ordinary_slots.py
-              tests/runner/test_programs.py
-              tests/runner/test_rendering.py
-              tests/tools/test_parity.py
-              tests/workflow/test_break_35.py
-              tests/workflow/test_break_45.py
               tests/workflow/test_browser_test_slots.py
-              tests/workflow/test_github_identity.py
-              tests/workflow/test_install_hooks.py
+              tests/workflow/test_ci.py
+              tests/workflow/test_ci_runner_choice.py
               tests/workflow/test_limit_in_own_words.py
-              tests/workflow/test_merge_driver.py
-              tests/workflow/test_break_55.py
-              tests/workflow/test_notify.py
+              tests/workflow/test_lost_check.py
+              tests/workflow/test_merge_images.py
+              tests/workflow/test_merge_scratch.py
               tests/workflow/test_priority.py
-              tests/workflow/test_review_effort.py
-              tests/workflow/test_self_update.py
-              tests/workflow/test_session_memory.py
+              tests/workflow/test_review_panel.py
               tests/workflow/test_session_setup.py
-              tests/workflow/test_session_stop_and_cleanup.py
-              tests/workflow/test_shadow_run.py
-              tests/workflow/test_ticket_starts.py
-              tests/workflow/test_train_reads.py
-              tests/workflow/test_usage.py
+              tests/workflow/test_session_start.py
               tests/workflow/test_weekly_limit.py
-              tests/workflow/test_workflow_config.py
-              tests/workflow/test_workflow_metrics.py
-          - shard: 3
+          - shard: 7
+            workers: 6
+            # Projected test time 620.25s; 3721.50 measured worker-s.
+            # tests/workflow/test_break_4_switch.py: 31.45s
+            # tests/workflow/test_ci_proof.py: 29.10s
+            # tests/workflow/test_independent_review.py: 892.13s
+            # tests/workflow/test_input_box.py: 129.38s
+            # tests/workflow/test_merge_driver_repairs.py: 1484.56s
+            # tests/workflow/test_merge_github.py: 319.60s
+            # tests/workflow/test_notify.py: 185.49s
+            # tests/workflow/test_ticket_starts.py: 578.86s
+            # tests/workflow/test_usage.py: 11.50s
+            # tests/workflow/test_workflow_metrics.py: 59.43s
             files: >-
               tests/workflow/test_break_4_switch.py
-              tests/workflow/test_check_parts.py
-              tests/workflow/test_ci.py
-              tests/workflow/test_ci_demand.py
-              tests/workflow/test_ci_tests_for_changes.py
-              tests/workflow/test_cloud_workers.py
-              tests/workflow/test_codex_worker.py
-              tests/workflow/test_conflict_review.py
-              tests/workflow/test_github_budget.py
+              tests/workflow/test_ci_proof.py
+              tests/workflow/test_independent_review.py
               tests/workflow/test_input_box.py
-              tests/workflow/test_install_path.py
-              tests/workflow/test_install_timer.py
-              tests/workflow/test_path_filter.py
-              tests/workflow/test_push_slots.py
-              tests/workflow/test_review_panel.py
-              tests/workflow/test_session_start.py
-              tests/workflow/test_train_first.py
-              tests/workflow/test_worker_routing.py
-          - shard: 4
+              tests/workflow/test_merge_driver_repairs.py
+              tests/workflow/test_merge_github.py
+              tests/workflow/test_notify.py
+              tests/workflow/test_ticket_starts.py
+              tests/workflow/test_usage.py
+              tests/workflow/test_workflow_metrics.py
+          - shard: 8
+            workers: 6
+            # Projected test time 620.21s; 3721.25 measured worker-s.
+            # tests/runner/test_balance_runners.py: 76.10s
+            # tests/workflow/test_break_52.py: 295.52s
+            # tests/workflow/test_break_55.py: 508.31s
+            # tests/workflow/test_codex_worker.py: 1483.64s
+            # tests/workflow/test_getting_started.py: 59.42s
+            # tests/workflow/test_session_memory.py: 30.69s
+            # tests/workflow/test_session_stop_and_cleanup.py: 10.08s
+            # tests/workflow/test_test_run.py: 28.11s
+            # tests/workflow/test_worker_routing.py: 1091.67s
+            # tests/workflow/test_workflow_config.py: 137.71s
             files: >-
               tests/runner/test_balance_runners.py
-              tests/workflow/test_checks_finished.py
-              tests/workflow/test_dependency_watch.py
-              tests/workflow/test_flow_page.py
-              tests/workflow/test_ci_minutes.py
-              tests/workflow/test_ci_proof.py
-              tests/workflow/test_ci_runner_choice.py
+              tests/workflow/test_break_52.py
+              tests/workflow/test_break_55.py
+              tests/workflow/test_codex_worker.py
               tests/workflow/test_getting_started.py
-              tests/workflow/test_independent_review.py
-              tests/workflow/test_lost_check.py
-              tests/workflow/test_merge_train_metrics.py
-              tests/workflow/test_running_command.py
-              tests/workflow/test_session_hunt.py
-              tests/workflow/test_session_limit.py
-              tests/workflow/test_session_with_real_tmux.py
-              tests/workflow/test_stand_alone.py
+              tests/workflow/test_session_memory.py
+              tests/workflow/test_session_stop_and_cleanup.py
               tests/workflow/test_test_run.py
-              tests/workflow/test_tick.py
-              tests/workflow/test_tick_limit.py
-              tests/workflow/test_tmp_slots.py
-              tests/workflow/test_weaker_tests.py
+              tests/workflow/test_worker_routing.py
+              tests/workflow/test_workflow_config.py
     steps:
       - uses: actions/checkout@v5
         with:
@@ -243,12 +357,12 @@ jobs:
       - name: Tests
         run: >-
           python3 scripts/workflow/ci_proof.py test
-          -n 4 --dist worksteal -m "not serial" ${{ matrix.files }}
+          -n ${{ matrix.workers }} --dist worksteal --durations=0 --durations-min=0 -m "not serial" ${{ matrix.files }}
       # The tests that cannot run beside others, one at a time, in one shard.
       - name: Tests that run alone
         if: matrix.shard == 1
         # Exit code 5: none is marked so.
-        run: python3 scripts/workflow/ci_proof.py test -p no:xdist -m serial || [ $? -eq 5 ]
+        run: python3 scripts/workflow/ci_proof.py test -p no:xdist --durations=0 --durations-min=0 -m serial || [ $? -eq 5 ]
 
   ci:
     # The check the merge queue requires, by this name: it passes only when every job that ran
