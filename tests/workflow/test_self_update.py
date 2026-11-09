@@ -4,6 +4,7 @@ moves back to the last good commit by itself when the new one fails 3 times in a
 stops it."""
 
 import json
+from datetime import datetime, timezone
 import os
 import shutil
 import subprocess
@@ -19,33 +20,51 @@ _START = 1_790_000_000
 _MOVED = 10
 _NOT_KEPT = 11
 
-# Answers only the question the self-update asks: the CI runs of one commit of Shipline's main.
-# `ci/<sha>` holds "<status> <conclusion>"; without it no run exists yet.
-_FAKE_GH = """#!/bin/bash
-echo "gh $*" >> "@STATE@/gh.log"
-prefix="api repos/example-owner/shipline/actions/runs?head_sha="
-case "$1 $2" in
-  "$prefix"*) ;;
-  *) [ -x "@STATE@/gh-harness" ] && exec "@STATE@/gh-harness" "$@"; exit 1 ;;
-esac
-[ ! -e "@STATE@/ci-unreadable" ] || exit 1
-sha=${2#*head_sha=}
-sha=${sha%%&*}
-case "$2" in *"&event=push"*) ;; *) exit 1 ;; esac
-if [ -f "@STATE@/ci/$sha" ]; then
-  read -r status conclusion < "@STATE@/ci/$sha"
-  jq -n --arg sha "$sha" --arg status "$status" --arg conclusion "$conclusion" \\
-    '{total_count: 2, workflow_runs: [
-      {id: 7, run_number: 7, path: ".github/workflows/other.yml", head_sha: $sha,
-       event: "push", status: "completed", conclusion: "success",
-       created_at: "2026-10-24T10:00:00Z"},
-      {id: 8, run_number: 8, path: ".github/workflows/ci.yml", head_sha: $sha,
-       event: "push", status: $status,
-       conclusion: (if $conclusion == "-" then null else $conclusion end),
-       created_at: "2026-10-24T10:00:00Z"}]}'
-else
-  echo '{"total_count": 0, "workflow_runs": []}'
-fi
+# The updater's CI list, jobs, annotations and retry requests; everything else falls back
+# to the workflow harness when the checkout is used by an integration test.
+_FAKE_GH = """#!/usr/bin/env python3
+import json, os, subprocess, sys
+from pathlib import Path
+state = Path("@STATE@")
+args = sys.argv[1:]
+with (state / "gh.log").open("a") as output:
+    output.write("gh " + " ".join(args) + "\\n")
+if (state / "ci-unreadable").exists():
+    sys.exit(1)
+prefix = "repos/example-owner/shipline/actions/runs?head_sha="
+if args[:1] == ["api"] and args[1].startswith(prefix):
+    sha = args[1].split("head_sha=", 1)[1].split("&", 1)[0]
+    result = state / "ci" / sha
+    runs = []
+    if result.exists():
+        status, conclusion = result.read_text().split()
+        run = json.loads((state / ("run-" + sha + ".json")).read_text())
+        run.update(status=status, conclusion=None if conclusion == "-" else conclusion)
+        runs = [{**run, "id": 7, "path": ".github/workflows/other.yml",
+                 "status": "completed", "conclusion": "success"}, run]
+    print(json.dumps({"total_count": len(runs), "workflow_runs": runs}))
+elif args[:2] == ["run", "rerun"]:
+    sys.exit(1 if (state / "rerun-fails").exists() else 0)
+elif args[:1] == ["api"]:
+    fixture = state / "ci-api.json"
+    data = json.loads(fixture.read_text()) if fixture.exists() else {}
+    url = next((arg for arg in args[1:] if arg.startswith("repos/")), "")
+    if url not in data:
+        harness = state / "gh-harness"
+        sys.exit(subprocess.call([str(harness), *args]) if harness.exists() else 1)
+    value = data[url]
+    if isinstance(value, dict) and "pages" in value:
+        print(json.dumps(value["pages"]))
+    else:
+        print(json.dumps([value] if "--slurp" in args else value))
+elif args[:2] == ["run", "view"]:
+    log = state / "failed-log"
+    if not log.exists():
+        sys.exit(1)
+    print(log.read_text())
+else:
+    harness = state / "gh-harness"
+    sys.exit(subprocess.call([str(harness), *args]) if harness.exists() else 1)
 """
 
 
@@ -137,6 +156,23 @@ class Shipline:
 
     def ci(self, sha: str, result: str) -> None:
         (self.state / "ci" / sha).write_text(result + "\n")
+        path = self.state / f"run-{sha}.json"
+        if not path.exists():
+            path.write_text(json.dumps({
+                "id": 100 + int(_git(self.dev, self.env, "rev-list", "--count", sha)),
+                "path": ".github/workflows/ci.yml", "head_sha": sha,
+                "head_branch": "main", "event": "push", "run_attempt": 1,
+                "created_at": datetime.fromtimestamp(self.now, timezone.utc).isoformat(),
+            }))
+
+    def failed_jobs(self, sha: str, jobs: list[dict], *, log: str = "") -> int:
+        run = json.loads((self.state / f"run-{sha}.json").read_text())["id"]
+        data = {f"repos/{_SLUG}/actions/runs/{run}/jobs?per_page=100": {"jobs": jobs}}
+        for job in jobs:
+            data[f"repos/{_SLUG}/check-runs/{job['id']}/annotations?per_page=100"] = []
+        (self.state / "ci-api.json").write_text(json.dumps(data))
+        (self.state / "failed-log").write_text(log)
+        return run
 
     def later(self, minutes: int) -> None:
         self.now += minutes * 60
@@ -230,6 +266,216 @@ def test_main_is_not_taken_while_its_ci_cannot_be_read(shipline: Shipline) -> No
 
     assert shipline.tick() == 0
 
+    assert shipline.head == shipline.first
+
+
+def test_newest_passed_first_parent_is_taken_then_head_when_it_passes(shipline: Shipline) -> None:
+    shipline.tick()
+    shipline.land()
+    newest_passed = shipline.land()
+    head = shipline.land("completed failure")
+    shipline.later(10)
+
+    assert shipline.tick() == _MOVED
+    assert shipline.head == newest_passed
+    assert shipline.git("status", "--porcelain") == ""
+    assert json.loads((shipline.notes / "trial.json").read_text())["sha"] == newest_passed
+
+    shipline.ci(head, "completed success")
+    shipline.later(10)
+    assert shipline.tick() == _MOVED
+    assert shipline.head == head
+
+
+@pytest.mark.parametrize("ci, conclusion", [
+    ("completed failure", "failure"), ("in_progress -", "in_progress"),
+    ("completed cancelled", "cancelled"), (None, "missing"),
+])
+def test_a_head_without_passed_ci_is_named_after_an_hour_once(
+    shipline: Shipline, ci: str | None, conclusion: str,
+) -> None:
+    shipline.tick()
+    head = shipline.land(ci)
+    shipline.later(10)
+    assert shipline.tick() == 0
+    shipline.later(47)
+    assert shipline.tick() == 0
+    assert shipline.notices() == []
+    shipline.later(10)
+    assert shipline.tick() == 0
+    assert shipline.head == shipline.first
+    assert shipline.notices() == [
+        f"shipline update waits: {head} CI {conclusion}, installed {shipline.first}"
+    ]
+    shipline.later(70)
+    assert shipline.tick() == 0
+    assert len(shipline.notices()) == 1
+
+    next_head = shipline.land(ci)
+    shipline.later(10)
+    assert shipline.tick() == 0
+    shipline.later(70)
+    assert shipline.tick() == 0
+    assert len(shipline.notices()) == 2
+    assert next_head in shipline.notices()[-1]
+
+
+def test_wait_notice_names_the_commit_actually_installed(shipline: Shipline) -> None:
+    shipline.tick()
+    passed = shipline.land()
+    head = shipline.land("completed failure")
+    shipline.later(70)
+    assert shipline.tick() == _MOVED
+    assert shipline.notices() == [f"shipline update waits: {head} CI failure, installed {passed}"]
+
+
+@pytest.mark.parametrize("conclusion, step", [
+    ("cancelled", "cancelled"), ("failure", "cancelled"), ("timed_out", "cancelled"),
+])
+def test_a_runner_failure_is_retried_once_even_when_github_still_shows_attempt_one(
+    shipline: Shipline, conclusion: str, step: str,
+) -> None:
+    shipline.tick()
+    sha = shipline.land(f"completed {conclusion}")
+    run = shipline.failed_jobs(sha, [
+        {"id": 81, "name": "CI: server tests (1 of 4)", "status": "completed",
+         "conclusion": conclusion, "steps": [{"name": "Tests", "conclusion": step}]},
+        {"id": 82, "name": "CI", "status": "completed", "conclusion": "failure",
+         "steps": [{"name": "Every job that ran passed", "conclusion": "failure"}]},
+    ], log="The runner has lost communication." if conclusion == "failure" else "")
+    for _ in range(3):
+        shipline.later(10)
+        assert shipline.tick() == 0
+    assert [read for read in shipline.ci_reads() if "run rerun" in read] == [
+        f"gh run rerun {run} -R {_SLUG} --failed"
+    ]
+
+
+@pytest.mark.parametrize("unreadable, step, log", [
+    (False, "failure", "The runner has lost communication."),
+    (False, "cancelled", "FAILED tests/test_example.py::test_example - AssertionError"),
+    (True, "cancelled", ""),
+])
+def test_failed_tests_and_unreadable_jobs_are_never_retried(
+    shipline: Shipline, unreadable: bool, step: str, log: str,
+) -> None:
+    shipline.tick()
+    sha = shipline.land("completed cancelled")
+    shipline.failed_jobs(sha, [
+        {"id": 81, "name": "CI: server tests (1 of 4)", "status": "completed",
+         "conclusion": "cancelled", "steps": [{"name": "Tests", "conclusion": step}]},
+    ], log=log)
+    if unreadable:
+        (shipline.state / "ci-api.json").unlink()
+    shipline.later(10)
+    assert shipline.tick() == 0
+    assert not any("run rerun" in read for read in shipline.ci_reads())
+
+
+def test_a_rolled_back_ancestor_is_not_a_fallback_target(shipline: Shipline) -> None:
+    shipline.tick()
+    bad = shipline.land()
+    (shipline.notes / "bad").write_text(bad + "\n")
+    shipline.land("completed failure")
+    shipline.later(10)
+    assert shipline.tick() == 0
+    assert shipline.head == shipline.first
+
+
+def test_a_passed_side_branch_is_not_on_the_first_parent_update_line(shipline: Shipline) -> None:
+    shipline.tick()
+    _git(shipline.dev, shipline.env, "checkout", "--quiet", "-b", "side")
+    _git(shipline.dev, shipline.env, "commit", "--quiet", "--allow-empty", "-m", "fix: side")
+    side = shipline.head_of(shipline.dev)
+    _git(shipline.dev, shipline.env, "checkout", "--quiet", "main")
+    shipline.land("completed failure")
+    _git(shipline.dev, shipline.env, "merge", "--quiet", "--no-ff", "side", "-m", "fix: merge side")
+    _git(shipline.dev, shipline.env, "push", "--quiet", "origin", "main")
+    shipline.ci(shipline.head_of(shipline.dev), "completed failure")
+    shipline.ci(side, "completed success")
+    shipline.later(10)
+    assert shipline.tick() == 0
+    assert shipline.head == shipline.first
+    assert not any(side in read for read in shipline.ci_reads())
+
+
+@pytest.mark.parametrize("attempt, refused, no_log", [(1, True, False), (1, False, True), (2, False, False)])
+def test_retry_refusals_missing_logs_and_later_attempts(
+    shipline: Shipline, attempt: int, refused: bool, no_log: bool,
+) -> None:
+    shipline.tick()
+    sha = shipline.land("completed cancelled")
+    run = shipline.failed_jobs(sha, [
+        {"id": 81, "name": "CI: server tests (1 of 4)", "status": "completed",
+         "conclusion": "cancelled", "steps": []},
+    ])
+    metadata = shipline.state / f"run-{sha}.json"
+    metadata.write_text(json.dumps({**json.loads(metadata.read_text()), "run_attempt": attempt}))
+    if refused:
+        (shipline.state / "rerun-fails").touch()
+    if no_log:
+        (shipline.state / "failed-log").unlink()
+    for _ in range(2):
+        shipline.later(10)
+        assert shipline.tick() == 0
+    retries = [read for read in shipline.ci_reads() if "run rerun" in read]
+    assert len(retries) == (1 if attempt == 1 else 0)
+    if attempt == 1:
+        assert (shipline.notes / f"ci-rerun-{run}").stat().st_mode & 0o777 == 0o600
+
+
+def test_a_failed_test_on_a_later_jobs_page_prevents_a_runner_retry(shipline: Shipline) -> None:
+    shipline.tick()
+    sha = shipline.land("completed failure")
+    cancelled = {"id": 81, "name": "CI: server tests (1 of 4)", "status": "completed",
+                 "conclusion": "cancelled", "steps": []}
+    failed = {"id": 82, "name": "CI: server tests (2 of 4)", "status": "completed",
+              "conclusion": "failure", "steps": [{"name": "Tests", "conclusion": "failure"}]}
+    run = shipline.failed_jobs(sha, [cancelled, failed])
+    fixture = shipline.state / "ci-api.json"
+    data = json.loads(fixture.read_text())
+    data[f"repos/{_SLUG}/actions/runs/{run}/jobs?per_page=100"] = {
+        "pages": [{"jobs": [cancelled]}, {"jobs": [failed]}],
+    }
+    fixture.write_text(json.dumps(data))
+    shipline.later(10)
+    assert shipline.tick() == 0
+    assert not any("run rerun" in read for read in shipline.ci_reads())
+
+
+@pytest.mark.parametrize("conclusion, log, retries", [
+    ("cancelled", "", 1),
+    ("failure", "The runner has lost communication.", 1),
+    ("failure", "a job ended: failure", 0),
+])
+def test_the_summary_jobs_own_runner_failure_is_retried(
+    shipline: Shipline, conclusion: str, log: str, retries: int,
+) -> None:
+    shipline.tick()
+    sha = shipline.land(f"completed {conclusion}")
+    shipline.failed_jobs(sha, [
+        {"id": 81, "name": "CI: server tests (1 of 4)", "status": "completed",
+         "conclusion": "success", "steps": [{"name": "Tests", "conclusion": "success"}]},
+        {"id": 82, "name": "CI", "status": "completed", "conclusion": conclusion,
+         "steps": [{"name": "Every job that ran passed", "conclusion": conclusion}]},
+    ], log=log)
+    for _ in range(2):
+        shipline.later(10)
+        assert shipline.tick() == 0
+    assert len([read for read in shipline.ci_reads() if "run rerun" in read]) == retries
+
+
+@pytest.mark.parametrize("field, value", [("event", "pull_request"), ("head_branch", "side"),
+                                          ("head_sha", "a" * 40), ("path", ".github/workflows/other.yml")])
+def test_only_main_push_ci_of_the_exact_commit_authorizes_an_update(
+    shipline: Shipline, field: str, value: str,
+) -> None:
+    shipline.tick()
+    sha = shipline.land()
+    metadata = shipline.state / f"run-{sha}.json"
+    metadata.write_text(json.dumps({**json.loads(metadata.read_text()), field: value}))
+    shipline.later(10)
+    assert shipline.tick() == 0
     assert shipline.head == shipline.first
 
 
@@ -574,6 +820,10 @@ def _harness_shipline(workflow: Workflow, upstream_ci: str) -> tuple[Path, str]:
     workflow.fake("gh", _FAKE_GH)
     (workflow.state / "ci").mkdir()
     (workflow.state / "ci" / landed).write_text(upstream_ci + "\n")
+    (workflow.state / f"run-{landed}.json").write_text(json.dumps({
+        "id": 8, "path": ".github/workflows/ci.yml", "head_sha": landed,
+        "head_branch": "main", "event": "push", "run_attempt": 1,
+    }))
     return home, landed
 
 
