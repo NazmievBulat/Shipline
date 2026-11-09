@@ -99,6 +99,7 @@ jobs:
             # Projected test time 620.05s; 2480.18 measured worker-s.
             # tests/runner/test_build_images.py: 5.17s
             # tests/runner/test_rendering.py: 0.68s
+            # tests/workflow/test_break_93.py: not yet measured
             # tests/workflow/test_decisions.py: 63.50s
             # tests/workflow/test_flow_page.py: 31.79s
             # tests/workflow/test_tick_waits.py: 2358.78s
@@ -106,6 +107,7 @@ jobs:
             files: >-
               tests/runner/test_build_images.py
               tests/runner/test_rendering.py
+              tests/workflow/test_break_93.py
               tests/workflow/test_decisions.py
               tests/workflow/test_flow_page.py
               tests/workflow/test_tick_waits.py

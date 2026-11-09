@@ -15,9 +15,11 @@ when a new version crashes.
                                              it started on; a skipped tick counts neither way
     self_update.py gate <exit> <stderr>      a run of the merge gate by the tick's merge driver
 
-At most once every 10 minutes the tick fetches Shipline's `main`. When `main` moved and the CI
-run of `.github/workflows/ci.yml` on that very commit passed, the checkout is moved there: only
-a fast-forward of a clean checkout of `main`. A checkout with local changes (files changed, a
+At most once every 10 minutes the tick fetches Shipline's `main`. It takes the newest commit
+on main's first-parent line after the current commit whose CI run of
+`.github/workflows/ci.yml` passed: only a fast-forward of a clean checkout of `main`. A head
+without passed CI for over an hour is named in the wake once. A cancelled or runner-failed
+run with no failed test step is re-run once; a failed test is never re-run. A checkout with local changes (files changed, a
 commit of its own, another branch) is left alone and named in the wake once.
 
 Only a crash counts against a version; a failure the tick or the gate handles and reports (a
@@ -60,6 +62,7 @@ import subprocess
 import sys
 import time
 import traceback
+from datetime import datetime
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -70,6 +73,7 @@ import workflow_config
 HOME = Path(__file__).resolve().parents[2]
 NOTES = HOME / ".local" / "shipline"
 FETCH_EVERY_SECONDS = 10 * 60
+UPDATE_WAITS_SECONDS = 60 * 60
 GOOD_AFTER_TICKS = 5
 ROLL_BACK_AFTER = 3
 KEEP_GOOD = 3
@@ -485,37 +489,157 @@ def roll_back(current: str) -> bool:
     return True
 
 
-def ci_passed(repository: str, sha: str) -> bool:
-    """Whether the CI run of that very commit of `main` passed. Unreadable is not passed."""
+def ci_call(*args: str) -> subprocess.CompletedProcess[str] | None:
+    """Keep an unavailable GitHub read or retry routine, as the fetch already is."""
     from github_budget import Limited, call
 
-    url = f"repos/{repository}/actions/runs?head_sha={sha}&event=push&per_page=100"
     try:
-        done = call("tick", "api", url, timeout=CI_SECONDS)
-    except (Limited, OSError, subprocess.TimeoutExpired) as error:
-        print(f"cannot read Shipline's CI for {sha}: {error}", file=sys.stderr)
-        return False
+        done = call("tick", *args, timeout=CI_SECONDS)
+    except (Limited, OSError, subprocess.TimeoutExpired):
+        return None
+    return done if done.returncode == 0 else None
+
+
+def ci_api(repository: str, path: str, key: str | None = None, *, pages: bool = False) -> Any:
+    args = ("--paginate", "--slurp") if pages else ()
+    done = ci_call("api", f"repos/{repository}/{path}", *args)
+    if done is None:
+        return None
     try:
-        listed = json.loads(done.stdout)["workflow_runs"] if done.returncode == 0 else None
+        value = json.loads(done.stdout)
+        if not pages:
+            return value[key] if key else value
+        if not isinstance(value, list):
+            return None
+        parts = [page[key] if key else page for page in value]
+        if not all(isinstance(part, list) for part in parts):
+            return None
+        return [item for part in parts for item in part]
     except ValueError, KeyError, TypeError:
-        listed = None
+        return None
+
+
+def ci_run(repository: str, sha: str) -> dict[str, Any]:
+    """The latest push CI run of this exact commit, or a bounded missing/unreadable status."""
+    listed = ci_api(repository, f"actions/runs?head_sha={sha}&event=push&per_page=100",
+                    "workflow_runs")
     if not isinstance(listed, list):
-        print(f"cannot read Shipline's CI for {sha}", file=sys.stderr)
-        return False
+        return {"status": "unreadable"}
     own = [
-        run
-        for run in listed
-        if isinstance(run, dict) and run.get("path") == CI_WORKFLOW and run.get("head_sha") == sha
+        run for run in listed
+        if isinstance(run, dict) and run.get("path") == CI_WORKFLOW
+        and run.get("head_sha") == sha and run.get("event") == "push"
+        and run.get("head_branch") == "main" and type(run.get("id")) is int
     ]
-    if not own:
-        return False
-    latest = max(own, key=lambda run: (str(run.get("created_at")), int(run.get("id") or 0)))
-    return latest.get("status") == "completed" and latest.get("conclusion") == "success"
+    return max(own, key=lambda run: (str(run.get("created_at")), run["id"]),
+               default={"status": "missing"})
+
+
+def passed(run: dict[str, Any]) -> bool:
+    return run.get("status") == "completed" and run.get("conclusion") == "success"
+
+
+def retry_ci(repository: str, run: dict[str, Any]) -> None:
+    """Claim a runner retry before sending it, including while GitHub still shows attempt 1.
+
+    This checkout's CI uses hosted runners. The merge gate's retry is scoped to the runners of
+    the repository it works on; reuse its diagnostics, but keep this checkout's claim here.
+    """
+    from check_repair import _INFRASTRUCTURE, first_test
+
+    if (run.get("status") != "completed" or run.get("run_attempt") != 1
+            or run.get("conclusion") not in ("cancelled", "failure", "timed_out")):
+        return
+    claim = NOTES / f"ci-rerun-{run['id']}"
+    if claim.exists():
+        return
+    jobs = ci_api(repository, f"actions/runs/{run['id']}/jobs?per_page=100", "jobs", pages=True)
+    if (not isinstance(jobs, list) or not jobs
+            or any(not isinstance(job, dict) or job.get("status") != "completed" for job in jobs)):
+        return
+    failed = [job for job in jobs if job.get("conclusion") not in ("success", "skipped")]
+    # CI follows a failed shard, but may also lose its own runner after every shard passed.
+    # Diagnose it only when it is the sole failure, so a logical result cannot hide a test.
+    causes = [job for job in failed if job.get("name") != "CI"] or failed
+    if not causes:
+        return
+    for job in causes:
+        if job.get("conclusion") not in ("failure", "cancelled", "timed_out"):
+            return
+        if (type(job.get("id")) is not int or not isinstance(job.get("steps"), list)
+                or any(not isinstance(step, dict) for step in job["steps"])):
+            return
+        if any(step.get("name") in ("Tests", "Tests that run alone")
+               and step.get("conclusion") in ("failure", "timed_out") for step in job["steps"]):
+            return
+        log = ci_call("run", "view", str(run["id"]), "-R", repository,
+                      "--job", str(job["id"]), "--log-failed")
+        notes = ci_api(repository, f"check-runs/{job['id']}/annotations?per_page=100", pages=True)
+        if not isinstance(notes, list) or any(not isinstance(n, dict) for n in notes):
+            return
+        # A runner cancelled before it started may have no log. Explicit failed steps still
+        # decide below; a failure needs positive runner evidence in its log or annotations.
+        diagnostics = "\n".join([
+            log.stdout if log else "",
+            *(f"{n.get('title') or ''} {n.get('message') or ''}" for n in notes),
+        ])
+        if first_test(diagnostics):
+            return
+        if job.get("conclusion") not in ("cancelled", "timed_out") and not _INFRASTRUCTURE.search(diagnostics):
+            return
+        # A cancelled job with an explicitly failed step is not merely a runner cancellation.
+        if job.get("conclusion") == "cancelled" and any(
+            step.get("conclusion") == "failure" for step in job["steps"]
+        ):
+            return
+    # update.lock serializes callers; exclusive creation also survives an interrupted request.
+    try:
+        with open(claim, "x", opener=lambda name, flags: os.open(name, flags, 0o600)) as output:
+            output.write("claimed\n")
+    except FileExistsError:
+        return
+    from github_budget import Limited, call
+
+    try:
+        call("tick", "run", "rerun", str(run["id"]), "-R", repository, "--failed",
+             timeout=CI_SECONDS)
+    except Limited:
+        # The budget refused before any request was sent: leave the retry available.
+        claim.unlink()
+    except OSError, subprocess.TimeoutExpired:
+        # The request may have reached GitHub; keep the claim rather than send it twice.
+        pass
+
+
+def update_waits(target: str, run: dict[str, Any], installed: str) -> None:
+    """Use the push run's creation time; with no run, count from the first observation."""
+    path = NOTES / "update-head.json"
+    try:
+        seen = json.loads(path.read_text())
+    except FileNotFoundError, ValueError:
+        seen = None
+    if not isinstance(seen, dict) or seen.get("sha") != target or type(seen.get("since")) is not int:
+        seen = {"sha": target, "since": now()}
+    try:
+        created = int(datetime.fromisoformat(run.get("created_at", "")).timestamp())
+        seen["since"] = min(seen["since"], created)
+    except ValueError, TypeError, OverflowError:
+        pass
+    write(path, json.dumps(seen) + "\n")
+    if now() - seen["since"] <= UPDATE_WAITS_SECONDS:
+        return
+    # These lines reach a model: no unbounded GitHub text or diagnostic is copied.
+    conclusion = run.get("conclusion") or run.get("status")
+    if conclusion not in ("failure", "cancelled", "timed_out", "action_required", "neutral",
+                          "skipped", "stale", "startup_failure", "queued", "in_progress",
+                          "waiting", "pending", "requested", "missing", "unreadable"):
+        conclusion = "unknown"
+    tell_once("update-waits-noted", target, "update-waits",
+              f"shipline update waits: {target} CI {conclusion}, installed {installed}")
 
 
 def update(repository: str, current: str, pid: int) -> bool:
-    """Fetches `main` when it is due and fast-forwards to it once its CI passed. True when the
-    checkout moved."""
+    """Fetches when due, then takes the newest passed first-parent commit. True when moved."""
     try:
         fetched = int((NOTES / "fetched").read_text())
     except FileNotFoundError, ValueError:
@@ -531,14 +655,29 @@ def update(repository: str, current: str, pid: int) -> bool:
         print(f"cannot fetch Shipline's main: {done.stderr.strip()}", file=sys.stderr)
         return False
     target = git("rev-parse", "--verify", "refs/remotes/origin/main").stdout.strip()
-    if not SHA.fullmatch(target) or target == current or target in read_lines("bad"):
+    if not SHA.fullmatch(target) or target == current:
         return False
     if not clean() or git("merge-base", "--is-ancestor", current, target).returncode:
         local_changes()
         return False
     (NOTES / "local-changes-noted").unlink(missing_ok=True)
-    if not ci_passed(repository, target):
-        return False
+    main_head = target
+    bad = read_lines("bad")
+    # Skip known-bad candidates without reading their CI, but still search older commits.
+    head_run = {} if target in bad else ci_run(repository, target)
+    if not passed(head_run):
+        retry_ci(repository, head_run)
+        line = git("rev-list", "--first-parent", f"{current}..{target}")
+        if line.returncode:
+            return False
+        target = next((sha for sha in line.stdout.splitlines()
+                       if SHA.fullmatch(sha) and sha != main_head and sha not in bad
+                       and git("merge-base", "--is-ancestor", current, sha).returncode == 0
+                       and passed(ci_run(repository, sha))), "")
+        if not target:
+            if main_head not in bad:
+                update_waits(main_head, head_run, current)
+            return False
     # Asked again under the lock every tick takes to note its start: a tick that started while
     # this one fetched is seen.
     with locked():
@@ -551,6 +690,8 @@ def update(repository: str, current: str, pid: int) -> bool:
             return False
         write_trial(new_trial(target, current))
         write(run_note(pid), f"{target} {started_at(pid)}\n")
+    if target != main_head and main_head not in bad:
+        update_waits(main_head, head_run, target)
     print(f"shipline updated: {current} -> {target}", flush=True)
     return True
 
