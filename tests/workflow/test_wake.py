@@ -1477,16 +1477,18 @@ def held_starts(workflow: Workflow) -> Workflow:
     return workflow
 
 
-def _held_pick(workflow: Workflow, minute: int) -> None:
+def _held_pick(workflow: Workflow, minute: int, *, hour: int = 12) -> None:
     from workflow.test_ticket_starts import _pick, _room_since
 
-    moment = int(_at(12)["WORKFLOW_NOW"]) + minute * 60
+    moment = int(_at(hour)["WORKFLOW_NOW"]) + minute * 60
     _room_since(workflow, moment)
     _pick(workflow, moment)
 
 
-def _held_wake(workflow: Workflow, minute: int, **extra: str) -> subprocess.CompletedProcess[str]:
-    at = {**_at(12), **extra}
+def _held_wake(
+    workflow: Workflow, minute: int, *, hour: int = 12, **extra: str
+) -> subprocess.CompletedProcess[str]:
+    at = {**_at(hour), **extra}
     at["WORKFLOW_NOW"] = str(int(at["WORKFLOW_NOW"]) + minute * 60)
     return _wake(workflow, at=at)
 
@@ -1500,10 +1502,13 @@ def test_unread_usage_is_quiet_for_the_first_hour(held_starts: Workflow, minutes
     assert held_starts.pushes() == []
 
 
-def test_unread_usage_tells_a_busy_orchestrator_once_in_daylight(held_starts: Workflow) -> None:
-    for minute in (0, 61, 67, 95):
-        _held_pick(held_starts, minute)
-        done = _held_wake(held_starts, minute)
+@pytest.mark.parametrize("hour", [0, 12])
+def test_unread_usage_tells_a_busy_orchestrator_once_at_any_hour(
+    held_starts: Workflow, hour: int,
+) -> None:
+    for minute in (0, 59, 61, 67, 95):
+        _held_pick(held_starts, minute, hour=hour)
+        done = _held_wake(held_starts, minute, hour=hour)
         assert done.returncode == 0, done.stderr
     [message] = held_starts.sent()
     assert "starts held: usage unread for 1 h, 2 tickets waiting" in message
@@ -1591,3 +1596,67 @@ def test_shadow_wake_neither_rings_nor_acknowledges_the_alarm(held_starts: Workf
     assert _held_wake(held_starts, 120).returncode == 0
     assert "starts held:" in held_starts.sent()[-1]
     assert len(held_starts.pushes()) == 1
+
+
+def test_another_hold_interrupts_the_unread_stretch(held_starts: Workflow) -> None:
+    _held_pick(held_starts, 0)
+    _held_pick(held_starts, 59)
+    held_starts.loadavg_file.write_text("9.00 9.00 9.00 1/100 1234\n")
+    _held_pick(held_starts, 61)
+    held_starts.loadavg_file.write_text("0.50 0.40 0.30 1/100 1234\n")
+    for minute in (70, 129):
+        _held_pick(held_starts, minute)
+        assert _held_wake(held_starts, minute).returncode == 0
+    assert held_starts.sent() == []
+    _held_pick(held_starts, 131)
+    assert _held_wake(held_starts, 131).returncode == 0
+    assert "usage unread for 1 h" in held_starts.sent()[-1]
+    assert held_starts.pushes() == []
+
+
+def test_the_phone_alarm_does_not_need_an_open_orchestrator(held_starts: Workflow) -> None:
+    (held_starts.state / "agents.json").write_text("[]")
+    for minute in (0, 120, 126):
+        _held_pick(held_starts, minute)
+        assert _held_wake(held_starts, minute).returncode == 0
+    assert held_starts.sent() == []
+    assert len(held_starts.pushes()) == 1
+    held_starts.orchestrator("busy")
+    assert _held_wake(held_starts, 132).returncode == 0
+    assert "starts held:" in held_starts.sent()[-1]
+
+
+def test_parallel_wakes_ring_the_unread_usage_alarm_once(held_starts: Workflow) -> None:
+    for minute in (0, 61):
+        _held_pick(held_starts, minute)
+        assert _held_wake(held_starts, minute).returncode == 0
+    _held_pick(held_starts, 120)
+    env = {**held_starts.env, **_at(14)}
+    command = ["bash", str(held_starts.script.parent / "wake")]
+    first = subprocess.Popen(command, cwd=held_starts.repo, env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    second = subprocess.Popen(command, cwd=held_starts.repo, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        for process in (first, second):
+            stdout, stderr = process.communicate(timeout=60)
+            assert process.returncode == 0, stdout + stderr
+    finally:
+        for process in (first, second):
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+    assert len(held_starts.pushes()) == 1
+
+
+def test_a_failed_phone_push_does_not_silence_the_orchestrator_alert(held_starts: Workflow) -> None:
+    for minute in (0, 120):
+        _held_pick(held_starts, minute)
+    (held_starts.state / "pushover-fails").touch()
+    assert _held_wake(held_starts, 120).returncode == 1
+    [message] = held_starts.sent()
+    assert "starts held: usage unread for 2 h, 2 tickets waiting" in message
+    (held_starts.state / "pushover-fails").unlink()
+    assert _held_wake(held_starts, 126).returncode == 0
+    assert len(held_starts.pushes()) == 2
+    assert len(held_starts.sent()) == 1
