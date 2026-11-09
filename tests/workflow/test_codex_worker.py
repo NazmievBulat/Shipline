@@ -1684,6 +1684,8 @@ def test_capacity_rechecks_owner_state_at_delivery(workflow: Workflow) -> None:
     assert len(workflow.calls(f"tmux {target} send-keys")) == 2
 
 
+# Twelve full ticks took 90.54s in CI and exceeded 120s with six workers; allow headroom.
+@pytest.mark.timeout(240)
 def test_capacity_backoff_and_wake_are_once_per_stop(workflow: Workflow) -> None:
     name, target, _ = _capacity_session(workflow)
     workflow.orchestrator(status="busy")
