@@ -232,12 +232,16 @@ def test_the_gate_reads_the_notes_as_written(workflow: Workflow) -> None:
 
 
 @pytest.mark.parametrize(
-    ("shards", "whole"), [([1, 2, 3, 4], True), ([1, 2, 4], False), ([1, 2, 2, 3, 4], False)]
+    ("shards", "whole"), [
+        (list(range(1, 9)), True),
+        (list(range(1, 8)), False),
+        ([*range(1, 9), 8], False),
+    ]
 )
 def test_the_gate_takes_server_tests_in_parts_as_ci_proof_does(
     workflow: Workflow, shards: list[int], whole: bool
 ) -> None:
-    """Shipline's own CI runs `CI: server tests (N of 4)`: the gate's whole-suite proof takes
+    """Shipline's own CI runs `CI: server tests (N of 8)`: the gate's whole-suite proof takes
     the parts as the one job, as `passed_jobs` does, and only when each part ran once."""
     done = subprocess.run(
         [
@@ -256,7 +260,7 @@ def test_the_gate_takes_server_tests_in_parts_as_ci_proof_does(
                 g.api = lambda path, key=None, **given: notes
                 ok = {"status": "completed", "conclusion": "success"}
                 parts = [{"id": 1, "name": "CI: what to run", **ok},
-                         *({"id": 10 + n, "name": f"CI: server tests ({n} of 4)", **ok}
+                         *({"id": 10 + n, "name": f"CI: server tests ({n} of 8)", **ok}
                            for n in shards),
                          {"id": 2, "name": "CI result", **ok}]
                 print(json.dumps(["CI: server tests" in p.passed_jobs(parts),
@@ -403,6 +407,33 @@ def test_a_proof_on_the_identical_tree_lets_main_inherit_the_jobs_that_passed(
 
     assert _inherited(workflow, github) == {"CI result": 20, "CI: server tests": 20, "CI: web": 20}
     assert _inherited(workflow, github, "e2e") == {"E2E: what to run": 30, "playwright": 30}
+
+
+@pytest.mark.parametrize("invalid", [None, "missing", "duplicate", "failure", "cancelled", "skipped"])
+def test_main_inherits_eight_server_shards_only_when_each_passed_once(
+    workflow: Workflow, invalid: str | None,
+) -> None:
+    github = _github(_receipt())
+    jobs = github[f"{_API}/actions/runs/20/jobs?per_page=100"]["jobs"]
+    jobs[:] = [job for job in jobs if not job["name"].startswith("CI: server tests (")]
+    shards = [
+        {"id": 100 + n, "name": f"CI: server tests ({n} of 8)",
+         "status": "completed", "conclusion": "success"}
+        for n in range(1, 9)
+    ]
+    if invalid == "missing":
+        shards.pop()
+    elif invalid == "duplicate":
+        shards.append({**shards[-1], "id": 200})
+    elif invalid is not None:
+        shards[-1]["conclusion"] = invalid
+    jobs.extend(shards)
+
+    inherited = _inherited(workflow, github)
+
+    assert ("CI: server tests" in inherited) == (invalid is None)
+    assert inherited["CI result"] == 20
+    assert inherited["CI: web"] == 20
 
 
 @pytest.mark.parametrize("suite,key,name", [

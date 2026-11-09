@@ -47,9 +47,17 @@ def _shards() -> dict[int, list[str]]:
     return shards
 
 
-def test_ci_runs_four_shards() -> None:
-    assert sorted(_shards()) == [1, 2, 3, 4]
+def test_ci_runs_eight_shards() -> None:
+    assert sorted(_shards()) == list(range(1, 9))
     assert all(_shards().values())
+
+
+def test_each_shard_keeps_its_timeout_and_runs_after_another_fails() -> None:
+    tests = _job(_CI, "tests")
+
+    assert 'name: "CI: server tests (${{ matrix.shard }} of 8)"' in tests
+    assert re.search(r"^    timeout-minutes: 30$", tests, re.M)
+    assert re.search(r"^      fail-fast: false$", tests, re.M)
 
 
 def _test_files(root: Path) -> list[str]:
@@ -427,9 +435,9 @@ def _verdict(gate: Any, run: str, jobs: str, result: str) -> str:
     gate requires."""
     parts = [{"id": 2, "name": "CI: what to run", "status": "completed", "conclusion": jobs}]
     parts += [
-        {"id": 3, "name": f"CI: server tests ({shard} of 4)", "status": "completed",
+        {"id": 3, "name": f"CI: server tests ({shard} of 8)", "status": "completed",
          "conclusion": jobs}
-        for shard in range(1, 5)
+        for shard in range(1, 9)
     ]
     parts.append({"id": 4, "name": gate.CI_RESULT, "status": "completed", "conclusion": result})
     state, _ = gate.verdict(
