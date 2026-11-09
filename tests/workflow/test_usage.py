@@ -3,6 +3,8 @@
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 from workflow_harness import Workflow
@@ -219,3 +221,216 @@ def test_the_file_counts_as_fresh_for_5_minutes(workflow: Workflow, age: int, fr
     done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(changed + age)})
 
     assert (done.returncode == 0) == fresh
+
+
+def _service(workflow: Workflow) -> Path:
+    """A stale status cache and an endpoint with controllable headers and failures."""
+    cache = workflow.state / "usage-cache.json"
+    cache.write_text(json.dumps({"five_hour": {"utilization": 10, "resets_at": _FIVE_RESETS}}))
+    os.utime(cache, (_NOW - 600, _NOW - 600))
+    workflow.env.update(WORKFLOW_USAGE_CACHE=str(cache), WORKFLOW_NOW=str(_NOW))
+    _credentials(workflow)
+    (workflow.state / "answer").write_text(json.dumps(_ANSWER))
+    workflow.fake("curl", """#!/bin/bash
+echo curl >> "@STATE@/requests"
+cat >/dev/null
+while (( $# )); do
+  if [[ $1 == --dump-header ]]; then
+    if [[ -f "@STATE@/headers" ]]; then cat "@STATE@/headers" >"$2"; fi
+    shift
+  fi
+  shift
+done
+if [[ -f "@STATE@/hold" ]]; then
+  touch "@STATE@/in-flight"
+  for ((i=0; i<500; i++)); do
+    [[ -f "@STATE@/hold" ]] || break
+    sleep 0.01
+  done
+  [[ ! -f "@STATE@/hold" ]] || exit 28
+fi
+[[ ! -f "@STATE@/fail" ]] || exit 22
+cat "@STATE@/answer"
+""")
+    return workflow.repo / ".local" / "workflow"
+
+
+def _requests(workflow: Workflow) -> int:
+    return len((workflow.state / "requests").read_text().splitlines())
+
+
+def test_ten_calls_share_one_service_answer(workflow: Workflow) -> None:
+    _service(workflow)
+
+    for _ in range(10):
+        done = workflow.run_script("usage")
+        assert done.returncode == 0, done.stderr
+        assert done.stdout == _LINES
+
+    assert _requests(workflow) == 1
+
+
+def test_worktrees_share_the_configured_installation_state(workflow: Workflow) -> None:
+    _service(workflow)
+    config_file = workflow.repo / "shipline.json"
+    config = json.loads(config_file.read_text())
+    config["state_folder"] = ".local/usage state"
+    config_file.write_text(json.dumps(config))
+    worktree = workflow.worktree(7)
+    workflow.git("worktree", "add", "--quiet", "--detach", str(worktree), "HEAD")
+
+    assert workflow.run_script("usage").stdout == _LINES
+    assert workflow.run_script("usage", cwd=worktree).stdout == _LINES
+
+    assert _requests(workflow) == 1
+    assert (workflow.repo / config["state_folder"] / "usage-answer.json").is_file()
+    assert not (worktree / config["state_folder"]).exists()
+
+
+@pytest.mark.parametrize("retry_after", ["92", "600", "Wed, 14 Oct 2026 01:21:40 GMT"])
+def test_failure_honors_retry_after_and_keeps_the_good_answer(
+    workflow: Workflow, retry_after: str
+) -> None:
+    _service(workflow)
+    assert workflow.run_script("usage").stdout == _LINES
+    failed_at = _NOW + 300
+    (workflow.state / "fail").touch()
+    (workflow.state / "headers").write_text(
+        f"HTTP/2 429\r\nrEtRy-AfTeR: {retry_after}\r\n\r\n"
+    )
+
+    assert workflow.run_script("usage", env={"WORKFLOW_NOW": str(failed_at)}).stdout == _LINES
+    (workflow.state / "fail").unlink()
+    pause = 300 if retry_after == "92" else 600
+    for elapsed in (0, 91, 92, pause - 1):
+        done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(failed_at + elapsed)})
+        assert done.returncode == 0, done.stderr
+        assert done.stdout == _LINES
+        assert _requests(workflow) == 2
+
+    done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(failed_at + pause)})
+    assert done.stdout == _LINES
+    assert _requests(workflow) == 3
+
+
+@pytest.mark.parametrize("failure", ["http", "invalid"])
+def test_failure_without_retry_after_waits_five_minutes(workflow: Workflow, failure: str) -> None:
+    _service(workflow)
+    if failure == "http":
+        (workflow.state / "fail").touch()
+    else:
+        (workflow.state / "answer").write_text('{"error": {"type": "authentication_error"}}')
+
+    for elapsed in (0, 1, 299, 300):
+        done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW + elapsed)})
+        assert done.returncode == 1
+        assert done.stdout == ""
+        assert _requests(workflow) == (2 if elapsed == 300 else 1)
+
+
+@pytest.mark.parametrize(("age", "usable"), [(1800, True), (1801, False)])
+def test_kept_answer_expires_after_thirty_minutes(
+    workflow: Workflow, age: int, usable: bool
+) -> None:
+    _service(workflow)
+    assert workflow.run_script("usage").stdout == _LINES
+    (workflow.state / "fail").touch()
+
+    done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW + age)})
+
+    assert done.returncode == (0 if usable else 1), done.stderr
+    assert done.stdout == (_LINES if usable else "")
+
+
+@pytest.mark.parametrize("kept", [True, False])
+def test_concurrent_callers_do_not_wait_for_or_repeat_a_request(
+    workflow: Workflow, kept: bool
+) -> None:
+    _service(workflow)
+    if kept:
+        assert workflow.run_script("usage").stdout == _LINES
+    workflow.env["WORKFLOW_NOW"] = str(_NOW + 300)
+    hold = workflow.state / "hold"
+    hold.touch()
+    with ThreadPoolExecutor(max_workers=10) as callers:
+        request = callers.submit(workflow.run_script, "usage")
+        try:
+            deadline = time.monotonic() + 10
+            while not (workflow.state / "in-flight").exists():
+                assert time.monotonic() < deadline, "the usage request did not start"
+                time.sleep(0.01)
+            others = [callers.submit(workflow.run_script, "usage") for _ in range(9)]
+            for caller in others:
+                done = caller.result(timeout=4)
+                assert done.returncode == (0 if kept else 1), done.stderr
+                assert done.stdout == (_LINES if kept else "")
+            assert _requests(workflow) == (2 if kept else 1)
+        finally:
+            hold.unlink()
+        assert request.result(timeout=10).stdout == _LINES
+
+
+def test_kept_answer_is_private_and_holds_only_usage_figures(workflow: Workflow) -> None:
+    folder = _service(workflow)
+    (workflow.state / "answer").write_text(json.dumps({**_ANSWER, "extra": "tokenOfTheOwner"}))
+
+    assert workflow.run_script("usage").stdout == _LINES
+
+    kept = folder / "usage-answer.json"
+    assert kept.is_file()
+    assert kept.stat().st_mode & 0o777 == 0o600
+    for file in folder.glob("usage-*"):
+        assert "tokenOfTheOwner" not in file.read_text()
+        assert file.stat().st_mode & 0o777 == 0o600
+
+
+def test_fresh_status_cache_is_preferred_to_a_kept_answer(workflow: Workflow) -> None:
+    _service(workflow)
+    assert workflow.run_script("usage").stdout == _LINES
+    cache = Path(workflow.env["WORKFLOW_USAGE_CACHE"])
+    cache.write_text(json.dumps({"five_hour": {"utilization": 10, "resets_at": _FIVE_RESETS}}))
+    os.utime(cache, (_NOW + 301, _NOW + 301))
+
+    done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW + 301)})
+
+    assert done.stdout == "five_hour 10 1791940200\n"
+    assert _requests(workflow) == 1
+
+
+def test_kept_null_window_is_still_not_started(workflow: Workflow) -> None:
+    _service(workflow)
+    (workflow.state / "answer").write_text('{"five_hour": null}')
+    assert workflow.run_script("usage").returncode == 0
+
+    done = workflow.run_script("usage", env={"WORKFLOW_NOW": str(_NOW + 120)})
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == f"five_hour 0 {_NOW + 120 + 5 * 3600} not_started\n"
+    assert _requests(workflow) == 1
+
+
+@pytest.mark.parametrize("kept", [True, False])
+def test_shadow_ticks_read_usage_without_changing_live_state(workflow: Workflow, kept: bool) -> None:
+    folder = _service(workflow)
+    if kept:
+        assert workflow.run_script("usage").stdout == _LINES
+
+    def snapshot() -> tuple[bool, dict[str, tuple[bytes, int]]]:
+        return folder.exists(), {
+            file.name: (file.read_bytes(), file.stat().st_mtime_ns)
+            for file in folder.glob("*")
+        }
+
+    before = snapshot()
+    done = workflow.run_script("usage", env={
+        "WORKFLOW_NOW": str(_NOW + 301),
+        "SHIPLINE_SHADOW": str(workflow.repo / ".local" / "shipline" / "shadow.log"),
+    })
+
+    assert done.returncode == (0 if kept else 1), done.stderr
+    assert done.stdout == (_LINES if kept else "")
+    assert snapshot() == before
+    if kept:
+        assert _requests(workflow) == 1
+    else:
+        assert not (workflow.state / "requests").exists()
