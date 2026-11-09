@@ -42,6 +42,9 @@
 # (priority high)`, `608 waits: shares scripts/workflow/merge_gate.py with 563`, and, for a hot
 # path of shipline.json, `612 waits: hot path web/src/pages/** with 598`. Such a line counts as
 # a change for a check-in, and does not by itself make the wake look in the day.
+# A start held only by unread usage for over an hour is an exception: at any hour, busy or
+# not, `starts held: usage unread for <n> h, <k> tickets waiting`, once per stretch, followed
+# by `starts resumed` when it ends. After two hours, notify rings once for the same stretch.
 #
 # So do the orchestrator's decisions (`decide` records them): each ticket still held with its
 # reason and age, `38 held after 37: shares scripts/workflow/tick (2h10m)`, and the answers given
@@ -293,6 +296,35 @@ if [[ ${1:-} == --tick-result ]]; then
   exit 0
 fi
 
+# The pick queues the phone alarm independently of orchestrator delivery. Process it before
+# check-in pacing and GitHub reads, so neither can silence it. Parallel wakes share this lock;
+# a confirmed push moves its event to a receipt before releasing it, as other notices do.
+failed=0
+phone=$main/$SHIPLINE_STATE_FOLDER/ticket-starts-phone.pending
+if [[ -z $shadow && -d $phone ]]; then
+  mkdir -p "$STATE"
+  (umask 077; touch "$main/$SHIPLINE_STATE_FOLDER/ticket-starts-phone.lock")
+  exec 7>"$main/$SHIPLINE_STATE_FOLDER/ticket-starts-phone.lock"
+  if flock -n 7; then
+    while IFS= read -r -d '' event; do
+      line=$(jq -er '.line | strings | select(length > 0)' "$event") || continue
+      if ! bash "$here/notify" workflow <<<"$line" 7>&- 8>&- 9>&-; then
+        log "  ticket starts phone push failed; the next wake retries: $line"
+        failed=1
+        continue
+      fi
+      sent=${phone%.pending}.sent
+      mkdir -p "$sent"
+      if ! mv -- "$event" "$sent/${event##*/}"; then
+        failed=1
+        continue
+      fi
+      log "  ticket starts alert sent to phone: $line"
+    done < <(find "$phone" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+  fi
+  exec 7>&-
+fi
+
 github_ready=1
 python3 "$here/github_budget.py" ready wake || github_ready=0
 saved_line=""
@@ -513,14 +545,21 @@ for folder in "$stuck" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/stuck.pe
 done
 # Repository repairs use the same durable, any-hour delivery as stalled-session notes.
 repairs=$main/$SHIPLINE_STATE_FOLDER/git-repair.pending
-if [[ -d $repairs ]]; then
+start_alerts=$main/$SHIPLINE_STATE_FOLDER/ticket-starts-alert.pending
+start_alert_at=0
+for folder in "$repairs" "$start_alerts"; do
+  [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '.line | strings' "$event"); then
       stuck_files+=("$event")
       stuck_lines+=("$line")
+      if [[ $folder == "$start_alerts" ]]; then
+        at=$(jq -er '.at | numbers | floor' "$event") || at=0
+        ((at <= start_alert_at)) || start_alert_at=$at
+      fi
     fi
-  done < <(find "$repairs" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
-fi
+  done < <(find "$folder" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+done
 # The self-update's notes are in the Shipline checkout these scripts are in, not the repository's.
 shipline=$(cd "$here/../.." && pwd)/.local/shipline/wake.pending
 if [[ -d $shipline ]]; then
@@ -639,12 +678,16 @@ looked_before() {
   due="due within $wait s: "
 }
 if ((${#resent[@]} == 0)); then
-  if [[ -s $PENDING || -s $main_pending || -n $service_line || ${#handback_files[@]} -gt 0 || ${#cloud_files[@]} -gt 0 || ${#analysis_files[@]} -gt 0 || ${#lost_files[@]} -gt 0 || ${#stuck_files[@]} -gt 0 || ${#answer_files[@]} -gt 0 || $tmp_alert == true || -n $untold ]]; then
-    looked_before "$RETRY_SECONDS" || exit 0
+  if ((start_alert_at > NOW - $(since_last_look))); then
+    # A routine look just before the threshold must not postpone this new alert.
+    # Once attempted, LOOKED advances and failed delivery uses the usual retry pacing.
+    :
+  elif [[ -s $PENDING || -s $main_pending || -n $service_line || ${#handback_files[@]} -gt 0 || ${#cloud_files[@]} -gt 0 || ${#analysis_files[@]} -gt 0 || ${#lost_files[@]} -gt 0 || ${#stuck_files[@]} -gt 0 || ${#answer_files[@]} -gt 0 || $tmp_alert == true || -n $untold ]]; then
+    looked_before "$RETRY_SECONDS" || exit "$failed"
   else
     night=$(night_in "$NOW")
-    ((night == 0 || ahead)) || exit 0
-    looked_before "$LOOK_EVERY_SECONDS" "$night" || exit 0
+    ((night == 0 || ahead)) || exit "$failed"
+    looked_before "$LOOK_EVERY_SECONDS" "$night" || exit "$failed"
     if [[ -n $shadow && $night == 0 && $(night_in "$real_from") != 0 ]]; then
       due="ends within $((real_from - NOW)) s: "
     fi
@@ -722,7 +765,6 @@ sessions_line() {
 }
 
 
-failed=0
 [[ $sessions_read == true ]] || read_sessions
 # "review-156 (8 min), review-208 (15 min)"
 asking_line=$(awk -v now="$NOW" 'NF >= 2 {

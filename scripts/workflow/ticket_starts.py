@@ -82,6 +82,7 @@ GIT_SECONDS = 60
 # The usage rule the orchestrator kept for its starts (AGENTS.md, the wake's check-in).
 USAGE_CEILING = 85
 USAGE_RESET_SECONDS = 3600
+USAGE_UNREAD = "the 5-hour usage window could not be read"
 # What the wake is told while the machine holds the next start, whichever of its rules does.
 MACHINE_WAIT = (
     "the machine (a start needs 10 minutes of room, 5 minutes since the last start and the "
@@ -540,7 +541,69 @@ def usage_wait(moment: int) -> str | None:
         ):
             return f"the 5-hour usage window is {words[1]}% used"
         return None
-    return "the 5-hour usage window could not be read"
+    return USAGE_UNREAD
+
+
+def write_hold_note(path: Path, value: dict[str, Any]) -> None:
+    """Publish a private, complete record, as the room sampler does."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=path.parent, prefix=".usage-hold-", delete=False
+    ) as out:
+        temporary = Path(out.name)
+        try:
+            out.write(json.dumps(value) + "\n")
+            out.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def note_usage_hold(notes: Path, moment: int, waiting: int) -> None:
+    """A stretch counts only while a ticket could start but for unread usage."""
+    record = notes / "ticket-starts-usage.json"
+    try:
+        held = json.loads(record.read_text())
+        if not (
+            isinstance(held, dict) and type(held.get("since")) is int
+            and 0 <= held["since"] <= moment
+            and type(held.get("told")) is bool and type(held.get("phone")) is bool
+        ):
+            held = None
+    except OSError, ValueError:
+        held = None
+    if held is None:
+        held = {"since": moment, "told": False, "phone": False}
+
+    def event(kind: str, phase: int, line: str) -> None:
+        name = f"{held['since']}-{phase}.json"
+        pending = notes / f"ticket-starts-{kind}.pending" / name
+        sent = notes / f"ticket-starts-{kind}.sent" / name
+        # If a pick stopped after publishing but before recording its flags, keep the
+        # original event or its receipt rather than telling the same stretch twice.
+        if not pending.exists() and not sent.exists():
+            write_hold_note(pending, {"line": line, "at": moment})
+
+    if not waiting:
+        # Publication can precede an interrupted flag save. Its receipt still means
+        # this stretch raised an alert, whether delivery is pending or complete.
+        alert = f"{held['since']}-0.json"
+        if held["told"] or any(
+            (notes / f"ticket-starts-alert.{state}" / alert).exists()
+            for state in ("pending", "sent")
+        ):
+            event("alert", 2, "starts resumed")
+        record.unlink(missing_ok=True)
+        return
+    age = moment - held["since"]
+    line = f"starts held: usage unread for {age // 3600} h, {waiting} tickets waiting"
+    if age > 3600 and not held["told"]:
+        event("alert", 0, line)
+        held["told"] = True
+    if age >= 2 * 3600 and not held["phone"]:
+        event("phone", 1, line)
+        held["phone"] = True
+    write_hold_note(record, held)
 
 
 def tell(notes: Path, lines: dict[str, str], started: str | None) -> None:
@@ -756,15 +819,18 @@ def pick(main: Path, snapshot: Path) -> int:
     machine = machine_wait(notes)
 
     if queue.held_all:
+        note_usage_hold(notes, moment, 0)
         tell(notes, {"all": "automatic starts are held: hold all in start-plan"}, None)
         return 0
     if queue.unclear:
+        note_usage_hold(notes, moment, 0)
         # A rule mistyped may be a hold: nothing starts until it is written so it is understood.
         line = f"automatic starts are held: start-plan line not understood: {queue.unclear[0]}"
         tell(notes, {"all": line}, None)
         return 0
 
     if not queue.candidates:
+        note_usage_hold(notes, moment, 0)
         # Nothing waits: the files of running tickets matter only beside a draft's.
         tell(notes, {}, None)
         return 0
@@ -799,6 +865,9 @@ def pick(main: Path, snapshot: Path) -> int:
             # Finding the files may have taken minutes of fetches and model calls: the machine
             # is looked at again just before the start.
             machine = machine_wait(notes)
+        note_usage_hold(
+            notes, now(), len(queue.candidates) if machine == USAGE_UNREAD else 0
+        )
         if machine is not None:
             print(f"{number} waits: {machine}")
             lines["next"] = f"{number} waits: {MACHINE_WAIT}"
@@ -813,6 +882,8 @@ def pick(main: Path, snapshot: Path) -> int:
             )
             tell(notes, lines, None)
             return 1
+    else:
+        note_usage_hold(notes, now(), 0)
     tell(notes, lines, started)
     return 0
 
