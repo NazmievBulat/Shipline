@@ -585,7 +585,13 @@ def note_usage_hold(notes: Path, moment: int, waiting: int) -> None:
             write_hold_note(pending, {"line": line, "at": moment})
 
     if not waiting:
-        if held["told"]:
+        # Publication can precede an interrupted flag save. Its receipt still means
+        # this stretch raised an alert, whether delivery is pending or complete.
+        alert = f"{held['since']}-0.json"
+        if held["told"] or any(
+            (notes / f"ticket-starts-alert.{state}" / alert).exists()
+            for state in ("pending", "sent")
+        ):
             event("alert", 2, "starts resumed")
         record.unlink(missing_ok=True)
         return
