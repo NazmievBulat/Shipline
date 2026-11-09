@@ -1547,6 +1547,29 @@ def test_readable_usage_ends_the_alarm_once_and_a_new_stretch_rearms(held_starts
     assert len(held_starts.pushes()) == 1
 
 
+@pytest.mark.parametrize("delivered", [False, True])
+def test_an_interrupted_usage_alert_still_reports_the_end(
+    held_starts: Workflow, delivered: bool,
+) -> None:
+    _held_pick(held_starts, 0)
+    record = held_starts.repo / ".local/workflow/ticket-starts-usage.json"
+    before_alert = record.read_text()
+    _held_pick(held_starts, 61)
+    # Publication succeeded, but the pick stopped before saving its new flags.
+    record.write_text(before_alert)
+    if delivered:
+        assert _held_wake(held_starts, 61).returncode == 0
+    Path(held_starts.env["WORKFLOW_USAGE_CACHE"]).write_text(json.dumps({"five_hour": {
+        "utilization": 95, "resets_at": "2026-10-14T05:10:00+00:00",
+    }}))
+    for minute in (67, 73):
+        _held_pick(held_starts, minute)
+        assert _held_wake(held_starts, minute).returncode == 0
+    assert sum("starts held:" in message for message in held_starts.sent()) == 1
+    assert sum("starts resumed" in message for message in held_starts.sent()) == 1
+    assert held_starts.pushes() == []
+
+
 @pytest.mark.parametrize("reason", ["no tickets", "load", "plan", "ticket plan", "ceiling"])
 def test_other_start_holds_never_raise_the_unread_alarm(held_starts: Workflow, reason: str) -> None:
     if reason == "no tickets":
