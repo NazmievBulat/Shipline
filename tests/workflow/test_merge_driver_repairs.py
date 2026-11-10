@@ -196,7 +196,13 @@ def test_a_repaired_fix_on_older_main_is_still_handed_back_when_its_own_test_fai
     assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
 
 @pytest.mark.parametrize("rerun", ["fails again", "passes"])
-@pytest.mark.parametrize("failure", ["runner shut down", "timed out", "layer download"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "runner shut down", "timed out", "layer download",
+        "setup HTTP 500", "setup HTTP 502", "setup HTTP 504", "setup HTTP 599",
+    ],
+)
 def test_a_runner_error_is_rerun_once_then_handed_back_to_a_reviewer(
     handed: GitHub, failure: str, rerun: str
 ) -> None:
@@ -206,6 +212,15 @@ def test_a_runner_error_is_rerun_once_then_handed_back_to_a_reviewer(
         _fail(handed, conclusion="timed_out", log=None)
     elif failure == "layer download":
         _fail(handed, log="failed to solve: failed to compute cache key: short read: unexpected EOF\n")
+    elif failure.startswith("setup HTTP "):
+        status = failure.rsplit(" ", 1)[1]
+        _fail(
+            handed,
+            log=(
+                "CI: server tests\tSet up Go\t##[error]Failed to run: Error: "
+                f"Unexpected HTTP response: {status}, Error: Unexpected HTTP response: {status}\n"
+            ),
+        )
     else:
         _fail(handed, log="##[error]The runner has received a shutdown signal.\n")
 
@@ -369,6 +384,15 @@ def test_a_failed_job_with_nothing_to_read_goes_to_a_reviewer(handed: GitHub) ->
             "tests/test_quote.py::test_reads[ (id) id ]",
         ),
         ("Error: Process completed with exit code 1.\n", "not reported"),
+        (
+            "##[error]Failed to run: Error: Unexpected HTTP response: 404, "
+            "Error: Unexpected HTTP response: 404\n",
+            "not reported",
+        ),
+        (
+            "##[error]Failed to run: Error: Unexpected HTTP response: 5000\n",
+            "not reported",
+        ),
         (
             "FAILED tests/test_dates.py::test_totals[two items] - assert 3 == 4\n",
             "tests/test_dates.py::test_totals[two items]",
