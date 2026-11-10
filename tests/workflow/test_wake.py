@@ -952,6 +952,108 @@ def day(night: Workflow) -> Workflow:
     return night
 
 
+@pytest.fixture
+def phone(day: Workflow) -> Workflow:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = day.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    return day
+
+
+def _close_orchestrator(workflow: Workflow) -> None:
+    (workflow.state / "agents.json").write_text("[]")
+
+
+@pytest.mark.parametrize("hour", [0, 12])
+def test_closed_orchestrator_rings_each_question_once_and_later_delivers(
+    phone: Workflow, hour: int,
+) -> None:
+    _close_orchestrator(phone)
+    # Record the questions without a Stop-hook push, to isolate wake's fallback.
+    notes = phone.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "review-7.idle").touch()
+    (notes / "review-7.asking").write_text(f"{_at(hour)['WORKFLOW_NOW']}\n")
+    for minute in (8, 14, 20):
+        done = _wake(phone, at=_at(hour, minute))
+        assert done.returncode == 0, done.stderr
+    [first] = phone.pushes()
+    assert first.title == "Workflow needs you"
+    assert first.message == "Orchestrator is not open.\nasking the owner: review-7 (8 min)"
+    assert phone.sent() == []
+
+    # A second question in the same session is new even though its first line is unchanged.
+    (notes / "review-7.asking").write_text(f"{_at(hour, 21)['WORKFLOW_NOW']}\n")
+    for minute in (26, 32):
+        assert _wake(phone, at=_at(hour, minute)).returncode == 0
+    assert len(phone.pushes()) == 2
+    assert phone.pushes()[1].message == "asking the owner: review-7 (5 min)"
+
+    phone.orchestrator("busy")
+    assert _wake(phone, at=_at(hour, 38)).returncode == 0
+    assert len(phone.pushes()) == 2
+    [prompt] = phone.sent()
+    assert "asking the owner: review-7 (17 min)" in prompt
+
+    _close_orchestrator(phone)
+    (notes / "review-7.asking").write_text(f"{_at(hour, 39)['WORKFLOW_NOW']}\n")
+    assert _wake(phone, at=_at(hour, 44)).returncode == 0
+    assert len(phone.pushes()) == 3
+    assert phone.pushes()[-1].message.startswith("Orchestrator is not open.\n")
+
+
+def test_closed_orchestrator_plain_check_ins_do_not_ring(phone: Workflow) -> None:
+    _close_orchestrator(phone)
+    for minute in (0, 21, 42):
+        assert _wake(phone, at=_at(23, minute)).returncode == 0
+    assert phone.pushes() == []
+    phone.orchestrator("idle")
+    assert _wake(phone, at=_at(0, 3, day=14)).returncode == 0
+    assert len(phone.sent()) == 1
+    assert phone.pushes() == []
+
+
+def test_closed_orchestrator_rings_each_pending_message_first_line(phone: Workflow) -> None:
+    _close_orchestrator(phone)
+    folder = phone.repo / ".local/workflow/stuck.pending"
+    folder.mkdir()
+    lines = ["stuck? ticket-7 (45 min)", "starts held: usage unread for 1 h, 2 tickets waiting"]
+    for index, line in enumerate(lines):
+        (folder / f"{index}.json").write_text(json.dumps({"line": line + "\nMore detail"}))
+    for minute in (0, 6, 12):
+        assert _wake(phone, at=_at(12, minute)).returncode == 0
+    assert [push.message for push in phone.pushes()] == [
+        "Orchestrator is not open.\n" + lines[0], lines[1],
+    ]
+    assert len(list(folder.iterdir())) == 2  # Phone receipts do not consume session delivery.
+    phone.orchestrator("busy")
+    assert _wake(phone, at=_at(12, 18)).returncode == 0
+    assert all(line in phone.sent()[0] for line in lines)
+    assert list(folder.iterdir()) == []
+    assert len(phone.pushes()) == 2
+
+
+def test_closed_orchestrator_failed_push_is_retried_and_shadow_does_not_acknowledge(
+    phone: Workflow,
+) -> None:
+    _close_orchestrator(phone)
+    folder = phone.repo / ".local/workflow/stuck.pending"
+    folder.mkdir()
+    (folder / "example.json").write_text(json.dumps({"line": "stuck? ticket-7 (45 min)"}))
+    shadow = phone.root / "shadow.log"
+    assert _wake(phone, at={**_at(12), "SHIPLINE_SHADOW": str(shadow)}).returncode == 0
+    assert phone.pushes() == []
+    (phone.state / "pushover-fails").touch()
+    assert _wake(phone, at=_at(12)).returncode == 1
+    (phone.state / "pushover-fails").unlink()
+    for minute in (6, 12):
+        assert _wake(phone, at=_at(12, minute)).returncode == 0
+    assert len(phone.pushes()) == 2  # One failed attempt, then one successful delivery.
+    assert all(push.message.startswith("Orchestrator is not open.\n") for push in phone.pushes())
+
+
 def test_a_question_to_the_owner_is_named_once_at_any_hour(day: Workflow) -> None:
     _stop(day, "review-7", "Merge it or send it back?\n\nReply 1 or 2", _at(10, 0))
 
