@@ -71,6 +71,7 @@ def _codex_waiting(workflow: Workflow, since: int = _NOW - 3000) -> Path:
     notes.with_suffix(".codex-turn.json").write_text(json.dumps({
         "last-assistant-message": "Waiting for the background job.", "turn-id": "wait-1",
     }))
+    notes.with_suffix(".codex-delivered").write_bytes(notes.with_suffix(".codex-turn.json").read_bytes())
     workflow.running("codex-7")
     workflow.screen("• Waiting for the background job.\n\n› \n\n  ? for shortcuts\n", "codex-7")
     return notes
@@ -198,7 +199,30 @@ def test_codex_status_spanning_a_quota_reset_keeps_its_retry_budget(
         assert _pending(workflow) == ["stuck? ticket-7 (status message not taken; its text stays in the box)"]
 
 
-@pytest.mark.parametrize("change", ["native input", "bridge input", "asking", "running"])
+@pytest.mark.parametrize("case", ["not delivered", "bridge running"])
+def test_codex_status_waits_for_the_current_turn_to_be_relayed(workflow: Workflow, case: str) -> None:
+    notes = _codex_waiting(workflow)
+    turn = notes.with_suffix(".codex-turn.json")
+    turn.write_text(json.dumps({
+        "last-assistant-message": "Which limit should I use?", "turn-id": "question-2",
+    }))
+    if case == "bridge running":
+        notes.with_suffix(".codex-delivered").write_bytes(turn.read_bytes())
+        notes.with_suffix(".bridge-stopped").unlink()
+    delivered = notes.with_suffix(".codex-delivered").read_bytes()
+
+    _tick(workflow, _NOW)
+
+    assert workflow.calls("tmux codex-7 send-keys") == []
+    assert notes.with_suffix(".job-wait").exists()
+    assert notes.with_suffix(".codex-delivered").read_bytes() == delivered
+    assert not notes.with_suffix(".codex-followed-up").exists()
+    assert not notes.with_suffix(".codex-answered").exists()
+
+
+@pytest.mark.parametrize("change", [
+    "native input", "bridge input", "asking", "running", "bridge running", "new native turn",
+])
 def test_codex_status_rechecks_before_enter(workflow: Workflow, change: str) -> None:
     notes = _codex_waiting(workflow)
     if change in ("native input", "bridge input"):
@@ -206,6 +230,13 @@ def test_codex_status_rechecks_before_enter(workflow: Workflow, change: str) -> 
         action = f"printf '%s' 'Owner draft' > {shlex.quote(str(workflow.state / f'input-{target}'))}"
     elif change == "asking":
         action = f"touch {shlex.quote(str(notes.with_suffix('.asking')))}"
+    elif change == "bridge running":
+        action = f"rm -f {shlex.quote(str(notes.with_suffix('.bridge-stopped')))}"
+    elif change == "new native turn":
+        question = shlex.quote(json.dumps({
+            "last-assistant-message": "Which limit should I use?", "turn-id": "question-2",
+        }))
+        action = f"printf '%s' {question} > {shlex.quote(str(notes.with_suffix('.codex-turn.json')))}"
     else:
         screen = shlex.quote(str(workflow.state / "screen/codex-7"))
         action = f"printf '• Working (1m • esc to interrupt)\\n\\n› \\n' > {screen}"
@@ -217,6 +248,7 @@ def test_codex_status_rechecks_before_enter(workflow: Workflow, change: str) -> 
 
     assert _keys(workflow, "codex-7") == [_STATUS]
     assert notes.with_suffix(".job-wait").exists()
+    assert not notes.with_suffix(".codex-followed-up").exists()
     assert not notes.with_suffix(".codex-answered").exists()
 
 

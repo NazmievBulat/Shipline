@@ -1658,6 +1658,10 @@ codex_status_checks() {
   require_running "$target"
   [[ ! -e $notes.asking && ! -e $notes.owner-blocked &&
      ! -e $notes.interaction-blocked && ! -e $notes.owner-reply ]] || return 3
+  # A fresh native turn can contain a question the relay has not shown yet. Its
+  # completed relay, not an old waiting reply still on the screen, settles that.
+  [[ -e $notes.bridge-stopped ]] || return 3
+  cmp -s "$notes.codex-turn.json" "$notes.codex-delivered" || return 3
   # A quota line remains on the pane after its reset. Only the tick's confirmed
   # reset path may recover an owned status draft through that historical line.
   if [[ ${status_after_reset:-false} != true ]]; then
