@@ -57,8 +57,10 @@
 #   session batch-merged <review-N> <squash>
 #                               wake a reviewer waiting for checks, preserving unsent input
 #   session status-check <ticket-N|review-N>
-#                               ask a Claude session waiting for its own job or its turn
+#                               ask a Claude session or native Codex worker waiting for its job
 #                               whether that wait is over (the tick does this, to keep its cache)
+#   session would-status-check <ticket-N|review-N>
+#                               status-check's checks alone, pressing nothing
 #   session finish-ready <ticket-N>
 #                               tell an idle worker whose pull request is ready to finish
 #   session retry-status <ticket-N|review-N> [after-reset]
@@ -189,7 +191,7 @@ usage: session start <worker|audit|review> <N> [low|medium|high|xhigh|max] [opus
        session panel-finished <review-N> <head>
        session lost-check <review-N> <head>
        session batch-merged <review-N> <squash>
-       session status-check <ticket-N|review-N>
+       session status-check|would-status-check <ticket-N|review-N>
        session retry-status|would-retry-status <ticket-N|review-N> [after-reset]
        session status-pending <ticket-N|review-N> [after-reset]
        session finish-ready <ticket-N>
@@ -1293,7 +1295,7 @@ cmd_list() {
 }
 
 list_sessions() {
-  local name group held swapped state limit resets typed stopped
+  local name group held swapped state limit resets typed stopped notes screen
   while read -r name; do
     [[ -n $name ]] || continue
     state=busy
@@ -1301,6 +1303,18 @@ list_sessions() {
       state=idle
     fi
     [[ ! -e $(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name.idle ]] || state=idle
+    notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+    if [[ $name == ticket-* && -e $notes.codex &&
+          ( -e $notes.job-wait || -e $notes.checks-wait ) ]]; then
+      # A background wait ended the native turn, even while its relay remains open.
+      # A stale wait must not hide a new turn already running in Codex.
+      state=busy
+      if is_running "codex-${name##*-}" &&
+          screen=$(tmux -L "codex-${name##*-}" capture-pane -p -J -t "=codex-${name##*-}:" 2>/dev/null) &&
+          ! LC_ALL=C grep -qE '^• .*\(.*esc to interrupt\)' <<<"$screen"; then
+        state=idle
+      fi
+    fi
     local browser_lock
     browser_lock=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/browser-tests.lock
     if [[ -e $browser_lock ]] && ! flock -n -x "$browser_lock" true; then
@@ -1493,7 +1507,11 @@ send_prompt() {
   # Even after the text is drawn, let the terminal's paste burst settle before Enter.
   sleep 0.2
   for ((attempt=1; attempt<=attempts; attempt++)); do
-    if ((attempts == 1)); then status_retry_checks "$name" || return $?; fi
+    if [[ -n ${codex_status_session:-} ]]; then
+      codex_status_checks "$codex_status_session" || return $?
+    elif ((attempts == 1)); then
+      status_retry_checks "$name" || return $?
+    fi
     read_prompt_box
     prompt_box_matches "$prompt" || die "$name input changed before Enter; nothing was sent"
     tmux -L "$name" send-keys -t "=$name:" Enter 2>/dev/null ||
@@ -1516,12 +1534,17 @@ send_prompt() {
 send_codex_prompt() {
   local name=$1 prompt=$2 mode=${3:-resend} target=codex-${1##*-}
   local relay_notes=$main/.claude/worktrees/ticket-${1##*-}/$SHIPLINE_STATE_FOLDER/$1
-  local backup suffix screen sending_resend=true
+  local backup suffix screen sending_resend=true attempts=2 codex_status_session=""
   (
     mkdir -p "$main/$SHIPLINE_STATE_FOLDER"
     exec 6>"$main/$SHIPLINE_STATE_FOLDER/start-${name##*-}.lock"
     flock --nonblock 6 || die "another action for pull request ${name##*-} is under way"
     require_running "$target"
+    if [[ $mode == status || $mode == status-retry ]]; then
+      codex_status_session=$name
+      codex_status_ready "$name" "$mode" || exit $?
+      [[ $mode != status-retry ]] || attempts=1
+    fi
     [[ ! -e $relay_notes.owner-reply ]] || die "$name has a pending owner reply"
     if ! bash "$script_dir/bridge-empty" "$name"; then
       [[ $mode == resend ]] && holds_own_text "$name" ||
@@ -1561,7 +1584,7 @@ send_codex_prompt() {
     done
     [[ ! -r $relay_notes.codex-turn.json ]] || cp -- "$relay_notes.codex-turn.json" "$backup/turn" || exit 1
     rm -f "$relay_notes.waiting" "$relay_notes.checks-wait" "$relay_notes.job-wait" "$relay_notes.idle"
-    send_prompt "$target" "$prompt"
+    send_prompt "$target" "$prompt" "$attempts"
     [[ ! -e $backup/turn ]] || mv -- "$backup/turn" "$relay_notes.codex-followed-up"
   )
 }
@@ -1604,7 +1627,7 @@ cmd_checks_finished() {
   send_reviewer_update "$name" "The checks on $head have finished. Read them once and go on by the rules: merge when they all passed, fix or send back when one failed."
 }
 
-# The tick's two messages to a Claude worker or reviewer that sits with nothing to do. Never to
+# The tick's waiting status (also for native Codex workers) and Claude finish message. Never to
 # one that waits for the owner, is stopped on the usage limit or has text in its box (that
 # refuses in send_prompt). A worker's stop on a ready pull request always rings the phone, so
 # there its notes say nothing of a question: the tick reads the words on its screen instead.
@@ -1613,11 +1636,65 @@ status_message() {
   printf '%s' "Status check: if what you were waiting for is done, carry on; if not, run \`$notify_waiting\` and end your turn."
 }
 
+# Native status messages are workflow work, never a recorded owner answer. Check both
+# panes again before each Enter, including a retry after the wait notes were cleared.
+codex_status_checks() {
+  local name=$1 notes target=codex-${1##*-} screen
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  [[ $name == ticket-* && -e $notes.codex ]] || return 3
+  require_running "$target"
+  [[ ! -e $notes.asking && ! -e $notes.owner-blocked &&
+     ! -e $notes.interaction-blocked && ! -e $notes.owner-reply ]] || return 3
+  # A fresh native turn can contain a question the relay has not shown yet. Its
+  # completed relay, not an old waiting reply still on the screen, settles that.
+  [[ -e $notes.bridge-stopped ]] || return 3
+  cmp -s "$notes.codex-turn.json" "$notes.codex-delivered" || return 3
+  # A quota line remains on the pane after its reset. Only the tick's confirmed
+  # reset path may recover an owned status draft through that historical line.
+  if [[ ${status_after_reset:-false} != true ]]; then
+    ! stopped_on_limit "$name" || return 3
+  fi
+  bash "$script_dir/bridge-empty" "$name" || return 3
+  screen=$(tmux -L "$target" capture-pane -p -J -t "=$target:" 2>/dev/null) || return 1
+  screen=${screen%"${screen##*[![:space:]]}"}
+  [[ $screen != *"Press enter to confirm or esc to cancel" ]] || return 3
+  ! LC_ALL=C grep -qE '^• .*\(.*esc to interrupt\)' <<<"$screen" || return 3
+}
+
+# The same read-only admission for a native send and a shadow decision. Only an
+# unchanged draft of this fixed status may be submitted; no other input is ours.
+codex_status_ready() {
+  local name=$1 mode=${2:-status} notes typed
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  codex_status_checks "$name" || return $?
+  if [[ $mode == status ]]; then
+    [[ -e $notes.job-wait || -e $notes.checks-wait ]] || return 3
+  fi
+  name=codex-${name##*-}
+  notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  read_prompt_box
+  if [[ -n $typed ]]; then
+    [[ -r $notes.typed && $(cat "$notes.typed") == "$(status_message)" ]] &&
+      holds_own_text "$name" || return 3
+  elif [[ $mode == status-retry ]]; then
+    return 3
+  fi
+  return 0
+}
+
 # A submit hook may remove every wait note before the input is actually delivered. Recovery
 # therefore checks ownership and the current screen, without requiring an idle or wait note.
 status_retry_checks() {
   local name=$1 notes screen
   notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  if [[ -e $notes.codex && $name == ticket-* ]]; then
+    codex_status_checks "$name" || return $?
+    name=codex-${name##*-}
+    notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+    [[ -r $notes.typed && $(cat "$notes.typed") == "$(status_message)" ]] || return 3
+    holds_own_text "$name" || return 3
+    return 0
+  fi
   require_running "$name"
   [[ ! -e $notes.codex && ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked &&
      ! -e $notes.asking ]] || return 3
@@ -1631,8 +1708,16 @@ status_retry_checks() {
 }
 
 cmd_nudge_idle() {
-  local name=$1 kind=$2 notes typed
+  local name=$1 kind=$2 would=${3:-false} notes typed
   notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+  if [[ $kind == status && $name == ticket-* && -e $notes.codex ]]; then
+    if [[ $would == true ]]; then
+      codex_status_ready "$name"
+    else
+      send_codex_prompt "$name" "$(status_message)" status
+    fi
+    return $?
+  fi
   require_running "$name"
   [[ ! -e $notes.codex ]] || die "$name is a Codex worker; its bridge relays"
   [[ ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked ]] ||
@@ -1648,7 +1733,7 @@ cmd_nudge_idle() {
     [[ -z $typed || $(cat "$notes.typed") == "$(status_message)" ]] || return 3
     [[ ! -e $notes.asking ]] || die "$name is waiting for the owner"
     [[ -e $notes.idle || -e $notes.job-wait || -e $notes.checks-wait ]] || die "$name is busy"
-    send_prompt "$name" "$(status_message)"
+    [[ $would == true ]] || send_prompt "$name" "$(status_message)"
     return
   fi
   [[ -e $notes.idle ]] || die "$name is busy"
@@ -2186,7 +2271,7 @@ cmd_capacity_retry() {
 }
 
 # A shadow run (`tick --shadow`) reads the sessions and changes none, whoever calls this.
-if [[ -n ${SHIPLINE_SHADOW:-} && ! ${1:-} =~ ^(list|running|load|room|would-nudge|would-answer|capacity-stop|would-capacity-retry)$ ]]; then
+if [[ -n ${SHIPLINE_SHADOW:-} && ! ${1:-} =~ ^(list|running|load|room|would-status-check|would-nudge|would-answer|capacity-stop|would-capacity-retry)$ ]]; then
   echo "a shadow run does not run session ${1:-}" >&2
   exit 1
 fi
@@ -2310,10 +2395,12 @@ case ${1:-} in
       send_reviewer_update "$2" "The independent conflict panel on $3 failed. Read its reports in $main/$SHIPLINE_STATE_FOLDER/reviews/${2#review-}/$3 and report the failure. Do not publish a conflict round."
     fi
     ;;
-  status-check)
+  status-check | would-status-check)
     [[ $# -eq 2 && $2 =~ ^(ticket|review)-[0-9]+$ ]] || usage
     find_main_checkout
-    cmd_nudge_idle "$2" status
+    would=false
+    [[ $1 != would-status-check ]] || would=true
+    cmd_nudge_idle "$2" status "$would"
     ;;
   retry-status | would-retry-status | status-pending)
     [[ ($# -eq 2 || ($# -eq 3 && $3 == after-reset)) &&
@@ -2328,14 +2415,26 @@ case ${1:-} in
     fi
     if [[ $1 == status-pending ]]; then
       notes=$(worktree_of "$2")/$SHIPLINE_STATE_FOLDER/$2
-      [[ ! -e $notes.codex && -r $notes.typed && $(cat "$notes.typed") == "$(status_message)" ]] || exit 3
       name=$2
+      if [[ -e $notes.codex ]]; then
+        [[ $name == ticket-* ]] || exit 3
+        name=codex-${name##*-}
+        notes=$(worktree_of "$name")/$SHIPLINE_STATE_FOLDER/$name
+      fi
+      [[ -r $notes.typed && $(cat "$notes.typed") == "$(status_message)" ]] || exit 3
       read_prompt_box
       [[ -n $typed ]] || exit 3
       exit 0
     fi
     status_retry_checks "$2" || exit $?
-    [[ $1 == would-retry-status ]] || send_prompt "$2" "$(status_message)" 1
+    if [[ $1 != would-retry-status ]]; then
+      notes=$(worktree_of "$2")/$SHIPLINE_STATE_FOLDER/$2
+      if [[ -e $notes.codex ]]; then
+        send_codex_prompt "$2" "$(status_message)" status-retry
+      else
+        send_prompt "$2" "$(status_message)" 1
+      fi
+    fi
     ;;
   finish-ready)
     [[ $# -eq 2 && $2 =~ ^ticket-[0-9]+$ ]] || usage

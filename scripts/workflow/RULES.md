@@ -871,8 +871,8 @@ and active native work are protected. Codex's next completed turn wakes the rela
 Bridge startup and recovery preserve a declared background wait and the native review's start
 time, including a wait declared before the bridge first connected.
 
-The tick also keeps waits moving, for Claude workers and reviewers only (never Codex bridges,
-hunts or audits), and never answers a question. It never interrupts a running command but in
+The tick also keeps waits moving, for Claude workers and reviewers and native Codex workers
+(never bridges, hunts or audits), and never answers a question. It never interrupts a running command but in
 two cases, a still screen and a wait loop that finds itself (below); the full table is in
 `docs/nudge-rules.md`:
 
@@ -882,17 +882,20 @@ two cases, a still screen and a wait loop that finds itself (below); the full ta
   `shipline notify waiting` and end your turn." Its cached context lasts an hour after
   its last turn, so the answer is cheap. Never one waiting for the owner, a finished one, one
   stopped on the usage limit, or one with unsent text in its box.
-- A worker idle 15 minutes on a pull request that has been ready as long, without
+  A Codex worker gets this fixed message directly in its native pane after its `notify waiting`
+  stop, with both input boxes protected. It answers no question, approves nothing and is never
+  recorded as an owner answer. Its ended turn is listed idle in `session list` and the wake.
+- A Claude worker idle 15 minutes on a pull request that has been ready as long, without
   `worker finished`, is told once to finish by its rules. Its stop on a ready pull request
   rings the phone either way, so only the words of its last reply tell a question apart: a
   reply that asks the owner is left alone.
-- A busy session whose screen (without the input box, the status line, the spinner and its
+- A busy Claude session whose screen (without the input box, the status line, the spinner and its
   clock) has not changed for 45 minutes is nudged once per stretch and head: the tick presses
   Escape, checks that the box is empty, and types "The command has produced nothing for 45
   minutes. Check whether it is still running and go on." It is named in the wake as
   `stuck? ticket-N (45 min, running: <first line of the running command>); nudge sent`.
   `session list` shows when each screen last changed.
-- A busy session whose running wait loop has a `pgrep -f` or `ps | grep` pattern that matches
+- A busy Claude session whose running wait loop has a `pgrep -f` or `ps | grep` pattern that matches
   its own shell, which never ends, is nudged once per loop the same way, with "That loop finds
   its own command line and never ends. Check the process by its number." It is named as
   `wait loop finds itself? ticket-N (running: ...); nudge sent`.

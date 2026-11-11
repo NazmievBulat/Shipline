@@ -28,7 +28,7 @@ key that sends it follows only when the box holds exactly that text. Each one is
 | Merge conflict | the same | GitHub reports a conflict on the head, once per head | "GitHub reports a merge conflict on `<head>` (CONFLICTING or DIRTY). Merge current main into this branch by the rules, ..." | |
 | Lost check | the same | the merge gate noted a check GitHub lost, once per head | "GitHub lost a check on `<head>`: ... Call the merge gate again by the rules; ..." | |
 | Merged in a batch | a reviewer or audit | another member's gate call merged its pull request, once | "Pull request N was merged by the merge train, in a batch (commit `<squash>`). Do not call the gate again. ..." | |
-| Waiting for its own job or turn | Claude workers and reviewers | idle 50 minutes after `notify waiting`, or a reviewer idle for its turn in the line; once per idle stretch | "Status check: if what you were waiting for is done, carry on; if not, run `scripts/workflow/notify waiting` and end your turn." | one with an asking note |
+| Waiting for its own job or turn | Claude workers and reviewers; native Codex workers | idle 50 minutes after `notify waiting`, or a Claude reviewer idle for its turn in the line; once per idle stretch | "Status check: if what you were waiting for is done, carry on; if not, run `scripts/workflow/notify waiting` and end your turn." | one with an asking note; for Codex, either input box containing unsent text, a pending owner reply, a permission prompt or a running native turn |
 | Ready but not finished | Claude workers | idle 15 minutes on a pull request ready as long, without `worker finished`; once per ready stretch | "Pull request N is ready, but you have not finished. Finish by the rules: ..." | a draft pull request |
 | Still screen | busy Claude workers and reviewers | the screen, without the box, the status line, the spinner and its clock, unchanged for 45 minutes since it last changed or the session turned busy; once per stretch and head | Escape, then "The command has produced nothing for 45 minutes. Check whether it is still running and go on." | a permission prompt; a session that ended its turn to wait (idle, job-wait or check-wait note); a message queued under the spinner (a `❯ ` line after the spinner, above the box); any text in the box; after Escape, a message it put back into the box (nothing is typed) |
 | Wait loop finds itself | busy Claude workers and reviewers | the `pgrep -f` or `ps \| grep` loop it started last matches its own shell, and the screen has stood still for 5 minutes; once per loop | Escape, then "That loop finds its own command line and never ends. Check the process by its number." | the same as a still screen; a loop while another command runs, or while the screen moves (it is named when the screen stands still, the turn ends or 15 minutes have passed) |
@@ -39,6 +39,9 @@ the retry; after the third, the wake is told
 `stuck? <session> (nudge not taken; its text stays in the box)`.
 
 Codex bridges, hunts, audits and analysts get none of the last four.
+Native Codex workers get only the waiting status, directly in their pane. This workflow message
+answers no question and approves nothing; it is never recorded as an owner's bridge reply.
+Their ended `notify waiting` turns are shown as idle by `session list` and the wake.
 
 ## Named in the wake, not typed
 

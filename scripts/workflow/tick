@@ -563,7 +563,8 @@ shadow_session() {
     # The worktrees of finished work stay: removing them decides nothing the real tick logs.
     cleanup) [[ ${2:-} == hunts ]] || shadow_cleanup ;;
     # The tick itself logs each message it would have typed, in the wake log's words.
-    checks-finished | conflict-found | lost-check | batch-merged | panel-finished | status-check | finish-ready) ;;
+    checks-finished | conflict-found | lost-check | batch-merged | panel-finished | finish-ready) ;;
+    status-check) bash "$here/session" would-status-check "${@:2}" 9>&- ;;
     # A nudge goes as `session nudge-busy` would send it, pressing nothing: it presses nothing
     # either in the states it checks (exit 3).
     nudge-busy) bash "$here/session" would-nudge "${@:2}" 9>&- ;;
@@ -945,13 +946,16 @@ capacity_duties() {
 # One bounded recovery path, including usage resets in the GitHub-independent duties.
 # Return 0 when a status draft owns this session; return 1 for the ordinary send paths.
 retry_status() {
-  local name=$1 typed_note retry identity previous tries named line waiting_since
+  local name=$1 typed_note retry identity previous tries named line waiting_since notes
   local suffix wait_note delivery sent
   local -a mode=()
   [[ ${2:-} != after-reset ]] || mode=(after-reset)
   status_delivered=false
   [[ $name =~ ^(ticket|review)-[0-9]+$ ]] || return 1
-  typed_note=$main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name.typed
+  notes=$main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name
+  typed_note=$notes.typed
+  [[ ! -e $notes.codex || $name != ticket-* ]] ||
+    typed_note=${notes%/*}/codex-${name##*-}.typed
   retry=$main/$SHIPLINE_STATE_FOLDER/$name.status-retry
   if [[ ! -e $typed_note ]]; then
     ((shadow)) || rm -f "$retry"
@@ -990,7 +994,7 @@ retry_status() {
   write_session_note "$name" "$retry" "$identity $((tries + 1)) 0" || { tick_failed; return 0; }
   waiting_since=""
   for suffix in job-wait checks-wait idle; do
-    wait_note=${typed_note%.typed}.$suffix
+    wait_note=$notes.$suffix
     if [[ -e $wait_note ]]; then
       waiting_since=$(stat -c %Y "$wait_note" 9>&-) || waiting_since=""
       break
@@ -1669,7 +1673,7 @@ while read -r name state _; do
   number=${BASH_REMATCH[2]}
   session_current "$name" || continue
   notes=$main/.claude/worktrees/ticket-$number/$SHIPLINE_STATE_FOLDER/$name
-  [[ ! -e $notes.codex ]] || continue
+  [[ ! -e $notes.codex || ( $name == ticket-* && $state == idle ) ]] || continue
   [[ ! -e $notes.owner-blocked && ! -e $notes.interaction-blocked ]] || continue
   [[ $status_pending != *" $name "* ]] || continue
 
@@ -1704,10 +1708,15 @@ while read -r name state _; do
     ((sent == 3)) || continue
   elif ((shadow)) && [[ $since =~ ^[0-9]+$ && ! -e $notes.asking ]] &&
       ((NOW - since < KEEP_ALIVE_AFTER_SECONDS)) &&
-      [[ ! -r $mark || $(<"$mark") != "$since" ]] && quiet "$name"; then
+      [[ ! -r $mark || $(<"$mark") != "$since" ]] && quiet "$name" &&
+      bash "$here/session" would-status-check "$name" >/dev/null 2>&1 9>&-; then
     shadow_due $((since + KEEP_ALIVE_AFTER_SECONDS - NOW)) "$name idle" \
       "$((KEEP_ALIVE_AFTER_SECONDS / 60)) min waiting for its own job or turn; status check sent"
   fi
+
+  # Only the fixed waiting status goes to native Codex; the remaining nudge rules
+  # still apply to Claude workers and reviewers alone.
+  [[ ! -e $notes.codex ]] || continue
 
   # A worker whose pull request is ready, idle without "worker finished": the tick stopped it
   # above if it had said so. Ready is counted from when the tick first saw it ready.
