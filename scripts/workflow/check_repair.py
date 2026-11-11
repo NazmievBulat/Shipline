@@ -38,6 +38,7 @@ _INFRASTRUCTURE = re.compile(
     r"|\b(?:lost|unable to contact)\b[^\n]*\brunner"
     r"|\bjob\b[^\n]*\bexceeded\b[^\n]*\b(?:time|maximum execution)"
     r"|Failed to download action"
+    r"|Failed to run: Error: Unexpected HTTP response: 5[0-9]{2}\b"
     # GitHub's, not an HTTP status a server under test answered ("500 Internal Server Error")
     r"|(?<![0-9] )(?<![0-9] \()Internal server error",
     re.IGNORECASE,
