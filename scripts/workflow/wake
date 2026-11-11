@@ -737,7 +737,7 @@ holding_versions=()
 holding_lines=()
 holding_at=0
 read_idle_holding() {
-  local groups holder tickets name notes idle at version
+  local groups holder tickets name notes idle at version current_sessions
   holding_names=()
   holding_versions=()
   holding_lines=()
@@ -748,12 +748,18 @@ read_idle_holding() {
     "\(.[0].holder)\t\(map(.ticket) | unique | sort_by(tonumber) | join(", "))"' \
     "$main/$SHIPLINE_STATE_FOLDER/start-status.json" 2>/dev/null) || return 0
   [[ -n $groups ]] || return 0
-  [[ $sessions_read == true ]] || read_sessions
-  [[ -z ${unread:-} ]] || return 0
+  if [[ ${1:-} == fresh ]]; then
+    # The tick's shared session snapshot can predate a holder's exit too.
+    current_sessions=$(env -u WORKFLOW_SESSION_SNAPSHOT bash "$here/session" list 2>/dev/null 6>&- 9>&-) || return 0
+  else
+    [[ $sessions_read == true ]] || read_sessions
+    [[ -z ${unread:-} ]] || return 0
+    current_sessions=$sessions
+  fi
   while IFS=$'\t' read -r holder tickets; do
     name=ticket-$holder
     awk -v name="$name" '$1 == name && $2 == "idle" { found=1 } END { exit !found }' \
-      <<<"$sessions" || continue
+      <<<"$current_sessions" || continue
     notes=$main/.claude/worktrees/$name/$SHIPLINE_STATE_FOLDER/$name
     idle=$notes.idle
     [[ -f $idle && ! -e $notes.waiting && ! -e $notes.job-wait && ! -e $notes.checks-wait ]] || continue
@@ -917,8 +923,8 @@ if [[ -z $shadow ]]; then
   lock_phone || exit 1
 fi
 # A parallel wake may have delivered this stretch while this one waited for the lock.
-# Recheck idle markers and waits too, before sending a notice from an earlier snapshot.
-read_idle_holding
+# Recheck running sessions, idle markers and waits before sending an earlier snapshot.
+read_idle_holding fresh
 
 orchestrator=$(find_orchestrator)
 orchestrator_result=$?
