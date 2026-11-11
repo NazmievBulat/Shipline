@@ -1158,6 +1158,43 @@ def test_a_draft_workers_last_paragraph_asks_the_owner(
     assert _asked_at(session) == _AT_NINE["WORKFLOW_NOW"]
 
 
+@pytest.mark.parametrize("owner_only", ["yes", "no"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Reply refresh or leave draft.",
+        'Reply "refresh" or "leave draft".',
+        "Reply 1 or 2.",
+        "",
+    ],
+    ids=["unquoted", "quoted", "digit", "no reply line"],
+)
+@pytest.mark.parametrize("bridge", [False, True])
+def test_an_owner_only_line_rings_once_and_keeps_the_asking_note(
+    session: Workflow, owner_only: str, reply: str, bridge: bool
+) -> None:
+    if bridge:
+        (session.notes(7) / "ticket-7.codex").touch()
+    message = (
+        "Recommended: merge main, keep main's implementation, and keep this fix.\n"
+        f"Owner only: {owner_only}\n{reply}"
+    ).rstrip()
+
+    assert session.notify(_stop(message), env=_AT_NINE).returncode == 0
+    asked = _asking(session).read_text()
+    session.notify({**_PROMPT, "source": "background_task_output"})
+    assert session.notify(_stop(message), env=_AT_TEN).returncode == 0
+
+    [push] = session.pushes()
+    assert push.message == message
+    assert _asking(session).read_text() == asked
+    assert _asked_at(session) == _AT_NINE["WORKFLOW_NOW"]
+    if not bridge:
+        question = _question(session)
+        assert question is not None
+        assert question["owner_only"] == owner_only
+
+
 @pytest.mark.parametrize(
     "report",
     [
@@ -1173,6 +1210,12 @@ def test_a_draft_workers_last_paragraph_asks_the_owner(
         "I will reply with a progress report.",
         "Next step: write `test_notify.py` and push.",
         "Coverage: type 1 remaining.",
+        "Recommended: merge main, keep main's implementation, and keep this fix.\n"
+        "I will write the tests and push the branch.",
+        "Owner only: yes\nReply refresh or leave draft.\n\nThe owner answered; tests passed.",
+        "The Owner only: yes line will be included in the question.",
+        "Owner only: yesterday\nThe tests passed.",
+        "Owner only: yes, the owner answered.\nThe tests passed.",
         "",
         " \n\n ",
     ],
