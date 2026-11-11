@@ -601,8 +601,11 @@ def test_successful_retry_jobs_wait_for_the_run_metadata_before_handing_back(
     assert len(workflow.calls("gh run rerun")) == 1
 
 @pytest.mark.parametrize("claim_state", ["requested", "claim"])
+@pytest.mark.parametrize("run_url", [
+    "", "https://github.com/example-org/example-app/actions/runs/20/job/22",
+], ids=["name-only", "run-url"])
 def test_a_successful_retry_with_late_rollup_keeps_review_authorization(
-    handed: GitHub, claim_state: str
+    handed: GitHub, claim_state: str, run_url: str
 ) -> None:
     workflow = handed.workflow
     original = handed.head
@@ -626,6 +629,7 @@ def test_a_successful_retry_with_late_rollup_keeps_review_authorization(
     jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
     for job in jobs:
         job.update(status="completed", conclusion="success")
+    handed.pulls["7"]["statusCheckRollup"][0]["detailsUrl"] = run_url
     handed.save()  # The PR check summary still reports the previous failure.
     for _ in range(2):
         done = workflow.run_script("tick")
@@ -655,7 +659,9 @@ def test_a_successful_retry_with_late_rollup_keeps_review_authorization(
     {"__typename": "CheckRun", "name": "CI result", "status": "COMPLETED",
      "conclusion": "FAILURE",
      "detailsUrl": "https://github.com/example-org/example-app/actions/runs/30/job/32"},
-], ids=["status-context", "unrelated-job", "same-name-other-run"])
+    {"__typename": "CheckRun", "name": "CI result", "status": "COMPLETED",
+     "conclusion": "FAILURE", "detailsUrl": "https://example.com/checks/22"},
+], ids=["status-context", "unrelated-job", "same-name-other-run", "same-name-external-check"])
 def test_a_successful_retry_does_not_hide_an_unrelated_failed_check(
     handed: GitHub, check: dict
 ) -> None:
