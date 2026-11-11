@@ -7,6 +7,7 @@ import signal
 import subprocess
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 
@@ -1113,6 +1114,109 @@ def test_the_bridges_own_relay_prompt_is_no_answer_and_keeps_the_question(
     session.notify(_stop("Codex asks: which limit, 500 or 1,000?"), env=_AT_TEN)
 
     assert _asked_at(session) == "1792000000"
+
+
+@pytest.mark.parametrize("reply", ["Reply refresh or leave draft.", 'Reply "refresh" or "leave draft".'])
+def test_native_codex_callback_then_bridge_stop_keeps_the_question(
+    session: Workflow, reply: str,
+) -> None:
+    """The native callback saves a turn; bridge recovery replays it without an answer."""
+    notes = session.notes(7)
+    (notes / "ticket-7.codex").touch()
+    message = f"Recommended: refresh example-app.\nOwner only: yes\n{reply}"
+    payload = {"type": "agent-turn-complete", "last-assistant-message": message,
+               "turn-id": "example-turn", "thread-id": "example-thread"}
+    done = session.run_script(
+        "notify", "codex", json.dumps(payload),
+        env={"WORKFLOW_SESSION": "ticket-7", "WORKFLOW_CODEX_BRIDGE": "1"},
+    )
+    assert done.returncode == 0 and done.stdout == done.stderr == ""
+    assert session.pushes() == []
+    turn = json.loads((notes / "ticket-7.codex-turn.json").read_text())
+    assert turn["last-assistant-message"] == message
+    session.notify(_stop(turn["last-assistant-message"]), env=_AT_NINE)
+    before = _asking(session).read_text()
+
+    session.notify({**_PROMPT, "prompt": "__WORKFLOW_CODEX_TURN__"})
+    session.notify(_stop(message), env=_AT_TEN)
+
+    assert _asking(session).read_text() == before
+    assert _idle(session).exists()
+    assert len(session.pushes()) == 1
+    assert (notes / "ticket-7.pushed").read_text().strip() == message
+    assert not (notes / "ticket-7.owner-reply").exists()
+    session.notify({**_PROMPT, "prompt": "refresh"})
+    session.notify(_stop(message), env=_AT_TEN)
+    assert len(session.pushes()) == 2
+    assert _asked_at(session) == _AT_TEN["WORKFLOW_NOW"]
+
+
+# Record each send independently, then let concurrent calls meet before returning success.
+# Unlike a barrier that fails with just one arrival, a single guarded send must succeed too.
+_OVERLAPPING_PUSH = '''#!/usr/bin/env python3
+import json, pathlib, sys, tempfile, time
+state = pathlib.Path("@STATE@")
+sys.stdin.read()
+record = {}
+for argument in sys.argv[1:]:
+    if "@" in argument and argument.split("@", 1)[0] in ("title", "message", "url"):
+        field, filename = argument.split("@", 1)
+        record[field] = pathlib.Path(filename).read_text()
+call = pathlib.Path(tempfile.mkdtemp(prefix="delivery-", dir=state))
+(call / "record.json").write_text(json.dumps(record))
+deadline = time.monotonic() + 0.5
+while len(list(state.glob("delivery-*/record.json"))) < 2 and time.monotonic() < deadline:
+    time.sleep(0.01)
+raise SystemExit(22 if (state / "pushover-fails").exists() else 0)
+'''
+
+
+@pytest.mark.parametrize("reply", ["Reply refresh or leave draft.", 'Reply "refresh" or "leave draft".'])
+def test_two_overlapping_deliveries_of_one_stop_ring_once(
+    session: Workflow, reply: str,
+) -> None:
+    session.fake("curl", _OVERLAPPING_PUSH)
+    message = f"Recommended: refresh example-app.\nOwner only: yes\n{reply}"
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        calls = [workers.submit(session.notify, _stop(message), env=_AT_NINE) for _ in range(2)]
+        for call in calls:
+            done = call.result(timeout=30)
+            assert done.returncode == 0 and done.stdout == done.stderr == ""
+
+    assert _asked_at(session) == _AT_NINE["WORKFLOW_NOW"]
+    assert len(list(session.state.glob("delivery-*/record.json"))) == 1
+    assert (session.notes(7) / "ticket-7.pushed").read_text().strip() == message
+
+
+def test_overlapping_stops_with_a_failed_push_leave_the_question_for_retry(session: Workflow) -> None:
+    session.fake("curl", _OVERLAPPING_PUSH)
+    (session.state / "pushover-fails").touch()
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        calls = [workers.submit(session.notify, _stop(), env=_AT_NINE) for _ in range(2)]
+        for call in calls:
+            assert call.result(timeout=30).returncode == 0
+    assert not (session.notes(7) / "ticket-7.pushed").exists()
+    assert _asked_at(session) == _AT_NINE["WORKFLOW_NOW"]
+    attempts = len(list(session.state.glob("delivery-*/record.json")))
+    (session.state / "pushover-fails").unlink()
+
+    session.notify(_stop(), env=_AT_TEN)
+    session.notify(_stop(), env=_AT_TEN)
+
+    assert len(list(session.state.glob("delivery-*/record.json"))) == attempts + 1
+    assert _asked_at(session) == _AT_NINE["WORKFLOW_NOW"]
+
+
+def test_overlapping_stops_for_different_sessions_ring_independently(session: Workflow) -> None:
+    session.fake("curl", _OVERLAPPING_PUSH)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        calls = [workers.submit(session.notify, _stop(), session=name)
+                 for name in ("ticket-7", "audit-7")]
+        for call in calls:
+            assert call.result(timeout=30).returncode == 0
+
+    records = [json.loads(path.read_text()) for path in session.state.glob("delivery-*/record.json")]
+    assert {record["title"] for record in records} == {"ticket-7 needs you", "audit-7 needs you"}
 
 
 @pytest.mark.parametrize(
