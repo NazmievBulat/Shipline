@@ -900,7 +900,8 @@ def test_without_a_registered_open_session_pending_messages_are_kept(
 
     done = _wake(night, "ticket-7", at=_at(10, 0))
 
-    assert done.returncode == 1  # No phone keys: the fallback fails without consuming delivery.
+    # A named but closed session tries the phone (no keys here); no registration stays quiet.
+    assert done.returncode == int(bool(registration)), done.stderr
     assert night.sent() == []
     assert night.wake_log.with_name("wake.pending").read_text() == "ticket-7\n"
     assert not night.wake_log.with_name("wake.told").exists()

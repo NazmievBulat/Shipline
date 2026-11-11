@@ -165,12 +165,12 @@ find_orchestrator() {
   local registration=$main/$SHIPLINE_STATE_FOLDER/orchestrator name="" found
   if [[ ! -r $registration ]]; then
     log "  orchestrator registration could not be read: $registration; nobody was told"
-    return 1
+    return 2
   fi
   IFS= read -r name <"$registration" || true
   if [[ -z $name ]]; then
     log "  orchestrator registration is empty: $registration; nobody was told"
-    return 1
+    return 2
   fi
   found=$(timeout "$LIST_SECONDS" claude agents --json 2>/dev/null 9>&- | jq -r \
     --arg main "$main" --arg name "$name" '
@@ -838,7 +838,12 @@ ring_file() {
   ring_notice "file:$event:$version:$line" "$line"
 }
 
-if ! orchestrator=$(find_orchestrator) || [[ -z $orchestrator ]]; then
+orchestrator=$(find_orchestrator)
+orchestrator_result=$?
+if ((orchestrator_result)) || [[ -z $orchestrator ]]; then
+  # This fallback concerns a registered session that is closed. An installation without
+  # an orchestrator registration retains its existing quiet check-in behavior.
+  ((orchestrator_result != 2)) || exit "$failed"
   # Shadow delivery must neither ring nor acknowledge anything.
   [[ -z $shadow ]] || exit "$failed"
   for kind in handback cloud lost stuck analysis answer; do
