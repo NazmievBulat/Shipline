@@ -38,6 +38,7 @@ _INFRASTRUCTURE = re.compile(
     r"|\b(?:lost|unable to contact)\b[^\n]*\brunner"
     r"|\bjob\b[^\n]*\bexceeded\b[^\n]*\b(?:time|maximum execution)"
     r"|Failed to download action"
+    r"|Failed to run: Error: Unexpected HTTP response: 5[0-9]{2}\b"
     # GitHub's, not an HTTP status a server under test answered ("500 Internal Server Error")
     r"|(?<![0-9] )(?<![0-9] \()Internal server error",
     re.IGNORECASE,
@@ -311,6 +312,17 @@ def _failed_log(gate: Any, run_id: int, job_id: int) -> str:
     return _COLOUR.sub("", done.stdout)
 
 
+def _retry_check_passed(check: dict[str, Any], passed_jobs: dict[int, set[str]]) -> bool:
+    """A stale summary entry must belong to a successful retry, not an unrelated check."""
+    if check.get("__typename") == "StatusContext" or not (name := check.get("name")):
+        return False
+    if details := check.get("detailsUrl"):
+        match = re.search(r"/actions/runs/(\d+)(?:/|$)", details)
+        return bool(match and name in passed_jobs.get(int(match[1]), set()))
+    # Some check summaries omit the run URL; match their names against its actual jobs.
+    return any(name in names for names in passed_jobs.values())
+
+
 def diagnose(pull: dict[str, Any], *, folder: Path | None = None) -> Diagnosis:
     """Read the latest CI, image and E2E runs of the pull request's head: each failed job's
     failed log and annotations. Raises Waiting while one of those runs is still running."""
@@ -318,6 +330,7 @@ def diagnose(pull: dict[str, Any], *, folder: Path | None = None) -> Diagnosis:
 
     head = pull["headRefOid"]
     failed_runs = []
+    passed_retries = []
     for workflow in ("ci", "images", "e2e"):
         latest = gate.runs(workflow, head, pull=True)[:1]
         for found in latest:
@@ -327,6 +340,31 @@ def diagnose(pull: dict[str, Any], *, folder: Path | None = None) -> Diagnosis:
                 raise gate.Waiting(f"run {found['id']} of the failed head is still running")
             if found.get("conclusion") not in ("success", "skipped", "neutral"):
                 failed_runs.append(found)
+            elif (
+                found.get("conclusion") == "success"
+                and folder is not None
+                and (claim := marker(folder, found["id"])).exists()
+                and _state(claim) in ("claim", "requested")
+            ):
+                passed_retries.append(found)
+    if not failed_runs and passed_retries:
+        # Run metadata can finish before the PR check summary drops its old failure.
+        # Every failed summary entry must belong to a successful retry's passing jobs.
+        passed_jobs = {
+            found["id"]: {
+                job["name"]
+                for job in gate.api(f"{gate.API}/actions/runs/{found['id']}/jobs?per_page=100", "jobs")
+                if job.get("status") == "completed"
+                and job.get("conclusion") in ("success", "skipped", "neutral")
+            }
+            for found in passed_retries
+        }
+        failed_checks = gate._failed_rollup(pull)
+        if failed_checks and all(_retry_check_passed(check, passed_jobs) for check in failed_checks):
+            raise gate.Waiting(
+                f"the re-run of run {passed_retries[0]['id']} passed; "
+                "waiting for pull request checks to catch up"
+            )
     return diagnose_runs(
         head,
         [
