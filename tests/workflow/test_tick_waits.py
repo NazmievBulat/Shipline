@@ -166,6 +166,38 @@ def test_codex_status_recovers_after_enter_was_not_taken(workflow: Workflow) -> 
     assert not notes.with_suffix(".owner-reply").exists()
 
 
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_codex_status_spanning_a_quota_reset_keeps_its_retry_budget(
+    workflow: Workflow, exhausted: bool,
+) -> None:
+    notes = _codex_waiting(workflow)
+    (workflow.notes(7) / "codex-7.typed").write_text(_STATUS)
+    (workflow.state / "input-codex-7").write_text(_STATUS)
+    if exhausted:
+        (workflow.state / "swallow-enter-codex-7").write_text("100")
+        for n in range(3):
+            done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)})
+            assert done.returncode != 0
+    workflow.screen(
+        "■ You've hit your usage limit. Try again at 2026-10-15 16:00 UTC.\n› \n",
+        "codex-7",
+    )
+    reset = 1_792_080_000
+    before = ["Enter"] * 3 if exhausted else []
+    _tick(workflow, reset - 60)
+    assert _keys(workflow, "codex-7") == before
+
+    _tick(workflow, reset)
+    _tick(workflow, reset + 180)
+
+    assert _keys(workflow, "codex-7") == (["Enter"] * 3 if exhausted else ["Enter"])
+    assert (workflow.notes(7) / "codex-7.typed").exists() == exhausted
+    assert not notes.with_suffix(".codex-answered").exists()
+    assert not notes.with_suffix(".owner-reply").exists()
+    if exhausted:
+        assert _pending(workflow) == ["stuck? ticket-7 (status message not taken; its text stays in the box)"]
+
+
 @pytest.mark.parametrize("change", ["native input", "bridge input", "asking", "running"])
 def test_codex_status_rechecks_before_enter(workflow: Workflow, change: str) -> None:
     notes = _codex_waiting(workflow)

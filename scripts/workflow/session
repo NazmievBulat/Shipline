@@ -57,7 +57,7 @@
 #   session batch-merged <review-N> <squash>
 #                               wake a reviewer waiting for checks, preserving unsent input
 #   session status-check <ticket-N|review-N>
-#                               ask a Claude session waiting for its own job or its turn
+#                               ask a Claude session or native Codex worker waiting for its job
 #                               whether that wait is over (the tick does this, to keep its cache)
 #   session finish-ready <ticket-N>
 #                               tell an idle worker whose pull request is ready to finish
@@ -1658,7 +1658,11 @@ codex_status_checks() {
   require_running "$target"
   [[ ! -e $notes.asking && ! -e $notes.owner-blocked &&
      ! -e $notes.interaction-blocked && ! -e $notes.owner-reply ]] || return 3
-  ! stopped_on_limit "$name" || return 3
+  # A quota line remains on the pane after its reset. Only the tick's confirmed
+  # reset path may recover an owned status draft through that historical line.
+  if [[ ${status_after_reset:-false} != true ]]; then
+    ! stopped_on_limit "$name" || return 3
+  fi
   bash "$script_dir/bridge-empty" "$name" || return 3
   screen=$(tmux -L "$target" capture-pane -p -J -t "=$target:" 2>/dev/null) || return 1
   screen=${screen%"${screen##*[![:space:]]}"}
