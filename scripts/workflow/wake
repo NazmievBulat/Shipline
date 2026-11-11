@@ -660,9 +660,10 @@ tmp_slots_line() {
 tmp_slots=$(tmp_slots_line)
 tmp_warning=false
 [[ $tmp_slots != *WARNING* ]] || tmp_warning=true
-# Re-arm a cleared pressure stretch before quiet daytime or pacing exits. Only an
-# existing receipt needs the lock; shadow observations never change real delivery state.
-if [[ -z $shadow && $tmp_warning == false ]]; then
+# Re-arm a cleared pressure stretch before quiet daytime or pacing exits. Unreadable
+# slots cannot confirm recovery. Only an existing receipt needs the lock; shadow
+# observations never change real delivery state.
+if [[ -z $shadow && $tmp_warning == false && $tmp_slots != *'could not be read'* ]]; then
   receipt=$(printf '%s' 'tmp pressure' | sha256sum)
   receipt=$phone_receipts/${receipt%% *}
   if [[ -e $receipt ]]; then
