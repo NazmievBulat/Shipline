@@ -175,6 +175,67 @@ def test_parallel_wakes_report_an_idle_holding_stretch_once(night: Workflow) -> 
     assert sum("idle and holding:" in message for message in night.sent()) == 1
 
 
+@pytest.mark.parametrize("snapshot", [False, True])
+@pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.parametrize("change", ["waiters-cleared", "holder-exits", "background-job-started", "unchanged"])
+def test_idle_holding_state_changes_while_delivery_lock_is_held(
+    phone: Workflow, change: str, closed: bool, snapshot: bool,
+) -> None:
+    import fcntl
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    idle = _idle_holding(phone)
+    if closed:
+        _close_orchestrator(phone)
+    env = _at(12)
+    if snapshot:
+        cached = phone.root / "sessions.txt"
+        listed = phone.run_script("session", "list")
+        assert listed.returncode == 0, listed.stderr
+        assert "ticket-7" in listed.stdout
+        cached.write_text(listed.stdout)
+        env["WORKFLOW_SESSION_SNAPSHOT"] = str(cached)
+    lock = phone.repo / ".local/workflow/wake-phone.lock"
+    with lock.open("w") as stream, ThreadPoolExecutor(max_workers=1) as pool:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        call = pool.submit(_wake, phone, at=env)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if phone.wake_log.exists() and "every 20 minutes" in phone.wake_log.read_text():
+                break
+            time.sleep(0.02)
+        else:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+            pytest.fail("Wake did not reach delivery before deadline")
+        if change == "waiters-cleared":
+            (lock.parent / "start-status.json").write_text("{}")
+        elif change == "holder-exits":
+            # A terminal/server exit leaves the idle marker behind.
+            result = subprocess.run(
+                ["tmux", "-L", "ticket-7", "kill-server"], env=phone.env,
+                capture_output=True, text=True, timeout=5,
+            )
+            assert result.returncode == 0, result.stderr
+            assert idle.exists()
+        elif change == "background-job-started":
+            idle.with_suffix(".job-wait").touch()
+        fcntl.flock(stream, fcntl.LOCK_UN)
+        done = call.result()
+        assert done.returncode == 0, done.stderr
+    notices = [message for message in phone.sent() if "idle and holding:" in message]
+    notices += [push.message for push in phone.pushes() if "idle and holding:" in push.message]
+    receipt = lock.parent / "wake-idle-holding.sent/ticket-7"
+    if change == "unchanged":
+        assert len(notices) == 1
+        assert "idle and holding: ticket-7 (120 min) holds 9, 12" in notices[0]
+        assert receipt.exists() == (not closed)
+    else:
+        assert notices == [], "Do not report a holder after its session or wait has ended"
+        assert not receipt.exists()
+        assert list((lock.parent / "wake-phone.sent").iterdir()) == []
+
+
 def test_closed_orchestrator_rings_idle_holding_once_then_delivers_to_session(phone: Workflow) -> None:
     _idle_holding(phone)
     _close_orchestrator(phone)
