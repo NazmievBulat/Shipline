@@ -226,6 +226,8 @@ def test_native_status_shadow_checks_delivery_and_upcoming_delivery_without_writ
     workflow: Workflow, age: int, case: str,
 ) -> None:
     notes = _codex_waiting(workflow, since=_NOW - age)
+    # A real tick creates the main state folder; shadow only reads an existing one.
+    (workflow.repo / ".local/workflow").mkdir(parents=True, exist_ok=True)
     if case == "native input":
         (workflow.state / "input-codex-7").write_text("Owner draft")
     elif case == "permission":
