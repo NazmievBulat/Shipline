@@ -220,6 +220,37 @@ def test_codex_status_waits_for_the_current_turn_to_be_relayed(workflow: Workflo
     assert not notes.with_suffix(".codex-answered").exists()
 
 
+@pytest.mark.parametrize("age", [2999, 3000])
+@pytest.mark.parametrize("case", ["eligible", "native input", "permission", "unrelayed turn"])
+def test_native_status_shadow_checks_delivery_and_upcoming_delivery_without_writing(
+    workflow: Workflow, age: int, case: str,
+) -> None:
+    notes = _codex_waiting(workflow, since=_NOW - age)
+    if case == "native input":
+        (workflow.state / "input-codex-7").write_text("Owner draft")
+    elif case == "permission":
+        workflow.screen("› \nPress enter to confirm or esc to cancel\n", "codex-7")
+    elif case == "unrelayed turn":
+        notes.with_suffix(".codex-turn.json").write_text(json.dumps({
+            "last-assistant-message": "Which limit should I use?", "turn-id": "question-2",
+        }))
+    before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in notes.parent.iterdir()}
+
+    checked = workflow.run("would-status-check", "ticket-7")
+    assert checked.returncode == (0 if case == "eligible" else 3), checked.stderr
+    done = workflow.run_script("tick", "--shadow", env={"WORKFLOW_NOW": str(_NOW)})
+    assert done.returncode == 0, done.stderr
+
+    log = (workflow.repo / ".local/shipline/shadow.log").read_text()
+    assert ("status check sent" in log) == (case == "eligible")
+    if case == "eligible" and age == 2999:
+        assert "due within 1 s: ticket-7 idle 50 min" in log
+    assert workflow.calls("tmux codex-7 send-keys") == []
+    assert workflow.calls("tmux ticket-7 send-keys") == []
+    assert {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in notes.parent.iterdir()} == before
+    assert not (workflow.repo / ".local/workflow/ticket-7.kept-alive").exists()
+
+
 @pytest.mark.parametrize("change", [
     "native input", "bridge input", "asking", "running", "bridge running", "new native turn",
 ])
