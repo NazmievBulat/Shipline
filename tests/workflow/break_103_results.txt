@@ -1,0 +1,46 @@
+PR 103 independent breaker results
+Tested head: f7a82de5627cae7e4df81193487687e17449f60e
+Prerequisite PR 99 was merged before testing.
+Production files were unchanged. Only the two new test files were run, separately.
+Python 3.14; dependencies installed from requirements-test.txt with hash verification.
+
+Primary command:
+  python -m pytest tests/workflow/test_break_103.py -q --tb=short
+Result: 3 failed, 21 passed.
+
+Recovery command:
+  python -m pytest tests/workflow/test_break_103_recovery.py -q --tb=short
+Result: 9 passed.
+
+Failure: ordinary native wait states produce false shadow delivery decisions.
+  test_status_shadow_matches_real_refusal_of_a_blocked_native_wait[native-draft]
+  test_status_shadow_matches_real_refusal_of_a_blocked_native_wait[permission]
+  test_status_shadow_matches_real_refusal_of_a_blocked_native_wait[unrelayed-turn]
+
+Each reproduction first verifies an eligible shadow status, then applies the block.
+The real tick sends no native input. The shadow tick nevertheless logs:
+  ticket-7 idle 53 min waiting for its own job or turn; status check sent
+
+Failing assertion, reproduced after limiting diagnostic output:
+  E   AssertionError: shadow claims delivery that the real tick refuses
+  E   assert not True
+  3 failed, 21 deselected
+
+Cause: scripts/workflow/tick admits native workers to the status rule at line 1675,
+but shadow_session treats status-check as unconditional success at line 566.
+The native input, permission and current-turn checks in session are bypassed.
+Recommendation: give shadow status delivery a read-only native eligibility check.
+
+Survived:
+- The 50-minute boundary, ended/failed/missing job scope, repeat waits and real relay hooks.
+- Both input boxes, pending owner replies, questions, active work and live permission races.
+- A held action lock and simultaneous status calls.
+- Missing, late and partially re-run check rollups.
+- Missing relay receipts and explicit configuration, separate installation and literal paths.
+- Unaccepted Enter, an abruptly killed sender, GitHub listing failure/timeout and quota resets.
+- Idle session/wake reporting and the bounded retry budget.
+No owner answer was created by a workflow status.
+
+Diff, PR description and commit-message exposure/security review found no additional issue.
+
+verdict: broke
