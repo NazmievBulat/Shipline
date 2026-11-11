@@ -172,7 +172,7 @@ find_orchestrator() {
     log "  orchestrator registration is empty: $registration; nobody was told"
     return 2
   fi
-  found=$(timeout "$LIST_SECONDS" claude agents --json 2>/dev/null 9>&- | jq -r \
+  found=$(timeout "$LIST_SECONDS" claude agents --json 2>/dev/null 6>&- 9>&- | jq -r \
     --arg main "$main" --arg name "$name" '
     [.[] | select(.kind == "interactive" and .cwd == $main and .name == $name)][0]
     | select(. != null) | "\(.status // "unknown")\t\(.name)"') || {
@@ -199,7 +199,7 @@ send_to() {
 Text, between the lines of dashes:
 ----------
 $message
-----------" </dev/null 2>"$STATE/wake.send.err" 9>&-) || true
+----------" </dev/null 2>"$STATE/wake.send.err" 6>&- 9>&-) || true
   { printf '%s\n' "$answer" && cat "$STATE/wake.send.err"; } >"$STATE/wake.send.log" 2>/dev/null
   rm -f "$STATE/wake.send.err"
   jq -R 'fromjson? // empty' <<<"$answer" 2>/dev/null | jq -e -s '
@@ -299,6 +299,56 @@ if [[ ${1:-} == --tick-result ]]; then
   exit 0
 fi
 
+# Phone receipts are shared by the closed-session fallback and the independent usage alarm.
+phone_notes=$main/$SHIPLINE_STATE_FOLDER
+phone_receipts=$phone_notes/wake-phone.sent
+phone_closed=$phone_notes/wake-phone.closed
+lock_phone() {
+  (umask 077; mkdir -p "$phone_receipts"; touch "$phone_notes/wake-phone.lock") || return 1
+  exec 6>"$phone_notes/wake-phone.lock"
+  flock --timeout "$LIST_SECONDS" 6
+}
+
+ring_notice() {
+  local identity=$1 line=${2%%$'\n'*} mode=${3:-closed} receipt body
+  [[ -n $line ]] || return 0
+  receipt=$(printf '%s' "$identity" | sha256sum) || return 1
+  receipt=$phone_receipts/${receipt%% *}
+  [[ ! -e $receipt ]] || return 0
+  body=$line
+  [[ $mode == plain || -e $phone_closed ]] || body=$'Orchestrator is not open.\n'"$line"
+  if ! bash "$here/notify" workflow <<<"$body" 6>&- 7>&- 8>&- 9>&-; then
+    log "  orchestrator notice phone push failed; the next wake retries: $line"
+    return 1
+  fi
+  (umask 077; touch "$receipt" && { [[ $mode == plain ]] || touch "$phone_closed"; }) || return 1
+  log "  orchestrator notice sent to phone: $line"
+}
+
+file_identity() {
+  local event=$1 line=$2 version=${3:-} name=${1##*/}
+  if [[ ( $event == "$phone_notes/ticket-starts-alert.pending/"* ||
+          $event == "$phone_notes/ticket-starts-phone.pending/"* ) &&
+        $name =~ ^([0-9]+)-[01][.]json$ ]]; then
+    # The one-hour notice and two-hour alarm can have identical text when a tick was late.
+    printf 'usage-starts:%s:%s' "${BASH_REMATCH[1]}" "$line"
+  else
+    printf 'file:%s:%s:%s' "$event" "$version" "$line"
+  fi
+}
+
+ring_file() {
+  local event=$1 line=$2 version=""
+  # Another wake may have delivered the snapshot before this caller acquired the lock.
+  [[ -f $event ]] || return 0
+  # Queue filenames identify events: retries may rewrite the same event. Singleton
+  # status/outage files instead change version when a later notice replaces them.
+  if [[ ${3:-} == version ]]; then
+    version=$(stat -c '%i:%y' -- "$event") || return 1
+  fi
+  ring_notice "$(file_identity "$event" "$line" "$version")" "$line"
+}
+
 # The pick queues the phone alarm independently of orchestrator delivery. Process it before
 # check-in pacing and GitHub reads, so neither can silence it. Parallel wakes share this lock;
 # a confirmed push moves its event to a receipt before releasing it, as other notices do.
@@ -309,9 +359,18 @@ if [[ -z $shadow && -d $phone ]]; then
   (umask 077; touch "$main/$SHIPLINE_STATE_FOLDER/ticket-starts-phone.lock")
   exec 7>"$main/$SHIPLINE_STATE_FOLDER/ticket-starts-phone.lock"
   if flock -n 7; then
+    lock_phone || exit 1
     while IFS= read -r -d '' event; do
       line=$(jq -er '.line | strings | select(length > 0)' "$event") || continue
-      if ! bash "$here/notify" workflow <<<"$line" 7>&- 8>&- 9>&-; then
+      mode=plain
+      orchestrator=$(find_orchestrator)
+      orchestrator_result=$?
+      if ((orchestrator_result == 0)); then
+        rm -f -- "$phone_closed"
+      elif ((orchestrator_result != 2)); then
+        mode=closed
+      fi
+      if ! ring_notice "$(file_identity "$event" "$line")" "$line" "$mode"; then
         log "  ticket starts phone push failed; the next wake retries: $line"
         failed=1
         continue
@@ -324,6 +383,7 @@ if [[ -z $shadow && -d $phone ]]; then
       fi
       log "  ticket starts alert sent to phone: $line"
     done < <(find "$phone" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
+    exec 6>&-
   fi
   exec 7>&-
 fi
@@ -797,46 +857,14 @@ for line in "${lost_lines[@]}" "${stuck_lines[@]}" "${answer_lines[@]}"; do
   log "  $line"
 done
 
-# Keep phone acknowledgements separate from every producer's pending/session receipts.
-# Serialize the availability check and pushes so parallel wakes cannot ring the same notice.
-phone_notes=$main/$SHIPLINE_STATE_FOLDER
-phone_receipts=$phone_notes/wake-phone.sent
-phone_closed=$phone_notes/wake-phone.closed
+# Serialize availability checks, delivery and acknowledgements across concurrent wakes.
 if [[ -z $shadow ]]; then
-  (umask 077; mkdir -p "$phone_receipts"; touch "$phone_notes/wake-phone.lock") || exit 1
-  exec 6>"$phone_notes/wake-phone.lock"
-  flock --timeout "$LIST_SECONDS" 6 || exit 1
+  lock_phone || exit 1
   if [[ $tmp_warning == false ]]; then
     receipt=$(printf '%s' 'tmp pressure' | sha256sum)
     rm -f -- "$phone_receipts/${receipt%% *}"
   fi
 fi
-
-ring_notice() {
-  local identity=$1 line=${2%%$'\n'*} receipt body
-  [[ -n $line ]] || return 0
-  receipt=$(printf '%s' "$identity" | sha256sum) || return 1
-  receipt=$phone_receipts/${receipt%% *}
-  [[ ! -e $receipt ]] || return 0
-  body=$line
-  [[ -e $phone_closed ]] || body=$'Orchestrator is not open.\n'"$line"
-  if ! bash "$here/notify" workflow <<<"$body" 6>&- 8>&- 9>&-; then
-    log "  closed orchestrator phone push failed; the next wake retries: $line"
-    return 1
-  fi
-  (umask 077; touch "$receipt" "$phone_closed") || return 1
-  log "  closed orchestrator notice sent to phone: $line"
-}
-
-ring_file() {
-  local event=$1 line=$2 version=""
-  # Queue filenames identify events: retries may rewrite the same event. Singleton
-  # status/outage files instead change version when a later notice replaces them.
-  if [[ ${3:-} == version ]]; then
-    version=$(stat -c '%i:%y' -- "$event") || return 1
-  fi
-  ring_notice "file:$event:$version:$line" "$line"
-}
 
 orchestrator=$(find_orchestrator)
 orchestrator_result=$?
@@ -859,21 +887,24 @@ if ((orchestrator_result)) || [[ -z $orchestrator ]]; then
   done
   while read -r question; do
     [[ -n $question ]] || continue
+    grep -qxF -- "$question" "$ASKED" 2>/dev/null && continue
     read -r session asked _ <<<"$question"
     ring_notice "question:$question" "asking the owner: $session ($(((NOW - asked) / 60)) min)" || failed=1
   done <<<"$untold"
   for session in "${resent[@]}"; do
+    grep -qxF -- "$session" "$PENDING" 2>/dev/null || continue
     ring_notice "reset:$session" \
       "Sent their instruction again: $session." || failed=1
   done
-  if [[ $tmp_alert == true ]]; then
+  if [[ $tmp_alert == true ]] && ! [[ -r $TOLD && $(<"$TOLD") == *"tmp pressure: true" ]]; then
     ring_notice 'tmp pressure' "$tmp_slots" || failed=1
   fi
   exit "$failed"
 fi
 if [[ -z $shadow ]]; then
   rm -f -- "$phone_closed"
-  exec 6>&-
+  # Keep the lock through session delivery and retirement of phone receipts. Otherwise
+  # a parallel caller's earlier snapshot could ring an event just delivered to the session.
 fi
 state=${orchestrator%%$'\t'*}
 name=${orchestrator#*$'\t'}
@@ -949,7 +980,7 @@ if send_to "$name" "$message"; then
   for kind in handback cloud lost stuck analysis answer; do
     declare -n notice_files=${kind}_files notice_lines=${kind}_lines
     for index in "${!notice_files[@]}"; do
-      receipt=$(printf '%s' "file:${notice_files[index]}::${notice_lines[index]}" | sha256sum)
+      receipt=$(file_identity "${notice_files[index]}" "${notice_lines[index]}" | sha256sum)
       rm -f -- "$phone_receipts/${receipt%% *}"
     done
   done

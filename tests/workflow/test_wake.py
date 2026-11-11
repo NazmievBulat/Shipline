@@ -1829,13 +1829,19 @@ def test_another_hold_interrupts_the_unread_stretch(held_starts: Workflow) -> No
     assert held_starts.pushes() == []
 
 
-def test_the_phone_alarm_does_not_need_an_open_orchestrator(held_starts: Workflow) -> None:
+@pytest.mark.parametrize("minutes,rings", [((0, 120, 126), 1), ((0, 61, 120, 126), 2)])
+def test_the_phone_alarm_does_not_need_an_open_orchestrator(
+    held_starts: Workflow, minutes: tuple[int, ...], rings: int,
+) -> None:
     (held_starts.state / "agents.json").write_text("[]")
-    for minute in (0, 120, 126):
+    for minute in minutes:
         _held_pick(held_starts, minute)
         assert _held_wake(held_starts, minute).returncode == 0
     assert held_starts.sent() == []
-    assert len(held_starts.pushes()) == 1
+    assert len(held_starts.pushes()) == rings
+    assert held_starts.pushes()[0].message.startswith("Orchestrator is not open.\nstarts held:")
+    if rings == 2:
+        assert held_starts.pushes()[1].message == "starts held: usage unread for 2 h, 2 tickets waiting"
     held_starts.orchestrator("busy")
     assert _held_wake(held_starts, 132).returncode == 0
     assert "starts held:" in held_starts.sent()[-1]
