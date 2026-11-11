@@ -181,7 +181,7 @@ said_finished() {
   LC_ALL=C grep -qiE "${FINISHED_LINE/WORDS/$1}" <<<"$last"
 }
 
-# Only the last non-empty paragraph can ask the owner. Keep the reply-word patterns here,
+# Only the last non-empty paragraph can ask the owner. Keep the question patterns here,
 # so a draft worker's push and its `asking` note (read by `wake`) use the same test.
 asks_owner() {
   local paragraph request_start='(^|[.!?:;,[:cntrl:]][[:space:]]*|[[:space:]]please[[:space:]]+)'
@@ -195,6 +195,8 @@ asks_owner() {
     { current = current (current == "" ? "" : "\n") $0 }
     END { print (current != "" ? current : last) }
   ' <<<"$1")
+  # The same marker as `question_of` identifies a question even with unquoted reply words.
+  LC_ALL=C grep -qiE '^[[:space:]>*_`-]*owner only:[[:space:]*_`]*(yes|no)[[:space:]*_`.!]*$' <<<"$paragraph" && return 0
   # One record preserves line starts for requests and the paragraph end for question marks.
   LC_ALL=C grep -zqiE "${request_start}${marks}(please[[:space:]]+)?(reply[[:space:]]+(with\>|$word)|choose[[:space:]]+$word|(type|write)[[:space:]]+$quoted)|$question_end" <<<"$paragraph"
 }
