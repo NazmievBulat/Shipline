@@ -1274,8 +1274,9 @@ def test_a_draft_workers_last_paragraph_asks_the_owner(
     ids=["unquoted", "quoted", "digit", "no reply line"],
 )
 @pytest.mark.parametrize("bridge", [False, True])
+@pytest.mark.parametrize("paragraph", ["first", "middle", "last"])
 def test_an_owner_only_line_rings_once_and_keeps_the_asking_note(
-    session: Workflow, owner_only: str, reply: str, bridge: bool
+    session: Workflow, owner_only: str, reply: str, bridge: bool, paragraph: str
 ) -> None:
     if bridge:
         (session.notes(7) / "ticket-7.codex").touch()
@@ -1283,6 +1284,10 @@ def test_an_owner_only_line_rings_once_and_keeps_the_asking_note(
         "Recommended: merge main, keep main's implementation, and keep this fix.\n"
         f"Owner only: {owner_only}\n{reply}"
     ).rstrip()
+    if paragraph != "first":
+        message = f"The implementation is ready.\n\n{message}"
+    if paragraph != "last":
+        message += "\n\nThe change needs approval."
 
     assert session.notify(_stop(message), env=_AT_NINE).returncode == 0
     asked = _asking(session).read_text()
@@ -1316,7 +1321,6 @@ def test_an_owner_only_line_rings_once_and_keeps_the_asking_note(
         "Coverage: type 1 remaining.",
         "Recommended: merge main, keep main's implementation, and keep this fix.\n"
         "I will write the tests and push the branch.",
-        "Owner only: yes\nReply refresh or leave draft.\n\nThe owner answered; tests passed.",
         "The Owner only: yes line will be included in the question.",
         "Owner only: yesterday\nThe tests passed.",
         "Owner only: yes, the owner answered.\nThe tests passed.",
