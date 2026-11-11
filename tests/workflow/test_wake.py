@@ -1016,6 +1016,47 @@ def test_closed_orchestrator_plain_check_ins_do_not_ring(phone: Workflow) -> Non
     assert phone.pushes() == []
 
 
+@pytest.mark.parametrize("hour,minute", [(12, 6), (23, 1)])
+def test_new_tmp_pressure_after_a_quiet_recovery_rings_again(
+    phone: Workflow, hour: int, minute: int,
+) -> None:
+    _close_orchestrator(phone)
+
+    def pressure(used: int) -> None:
+        phone.fake("df", "#!/bin/bash\n"
+                   "echo 'Filesystem Inodes IUsed IFree IUse% Mounted on'\n"
+                   f"echo 'tmpfs 1000 {used} {1000 - used} {used // 10}% /tmp'\n")
+
+    pressure(900)
+    assert _wake(phone, at=_at(hour)).returncode == 0
+    assert len(phone.pushes()) == 1
+    pressure(100)
+    assert _wake(phone, at=_at(hour, minute)).returncode == 0
+    pressure(900)
+    assert _wake(phone, at=_at(hour, 12)).returncode == 0
+    assert len(phone.pushes()) == 2, "a new pressure stretch must ring after recovery"
+    assert phone.pushes()[1].message == "/tmp file slots: 90% used (900/1000); WARNING above 80%"
+    assert _wake(phone, at=_at(hour, 18)).returncode == 0
+    assert len(phone.pushes()) == 2
+
+
+def test_shadow_tmp_recovery_does_not_rearm_the_phone(phone: Workflow) -> None:
+    _close_orchestrator(phone)
+    high = "#!/bin/bash\necho 'Filesystem Inodes IUsed IFree IUse% Mounted on'\n" \
+           "echo 'tmpfs 1000 900 100 90% /tmp'\n"
+    phone.fake("df", high)
+    assert _wake(phone, at=_at(12)).returncode == 0
+    receipts = phone.repo / ".local/workflow/wake-phone.sent"
+    before = set(receipts.iterdir())
+    phone.fake("df", high.replace("900 100 90%", "100 900 10%"))
+    shadow = phone.root / "shadow.log"
+    assert _wake(phone, at={**_at(12, 6), "SHIPLINE_SHADOW": str(shadow)}).returncode == 0
+    assert set(receipts.iterdir()) == before
+    phone.fake("df", high)
+    assert _wake(phone, at=_at(12, 12)).returncode == 0
+    assert len(phone.pushes()) == 1
+
+
 def test_closed_orchestrator_rings_each_pending_message_first_line(phone: Workflow) -> None:
     _close_orchestrator(phone)
     folder = phone.repo / ".local/workflow/stuck.pending"
