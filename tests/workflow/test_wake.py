@@ -1,6 +1,7 @@
 """`wake` gives the orchestrator session a check-in from outside it, and writes what it did."""
 
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -36,6 +37,219 @@ def _wake(
     workflow: Workflow, *woken: str, at: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     return workflow.run_script("wake", *woken, env=at or _at(23, 0))
+
+
+def _idle_holding(workflow: Workflow, hour: int = 10, minute: int = 0) -> Path:
+    """An ordinary idle worker holds two tickets in the latest start snapshot."""
+    workflow.orchestrator("busy")
+    notes = workflow.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    idle = notes / "ticket-7.idle"
+    idle.touch()
+    moment = int(_at(hour, minute)["WORKFLOW_NOW"])
+    os.utime(idle, (moment, moment))
+    (workflow.repo / ".local/workflow/start-status.json").write_text(json.dumps({
+        "12": "12 waits: shares scripts/workflow/wake with 7",
+        "9": "9 waits: shares tests/workflow/test_wake.py with 7",
+    }))
+    return idle
+
+
+@pytest.mark.parametrize("hour", [10, 22])
+def test_idle_worker_holding_tickets_is_reported_after_one_hour(
+    night: Workflow, hour: int,
+) -> None:
+    _idle_holding(night, hour)
+    assert _wake(night, at=_at(hour, 59)).returncode == 0
+    assert night.sent() == []
+    assert _wake(night, at=_at(hour + 1)).returncode == 0
+    [prompt] = night.sent()
+    assert "\nidle and holding: ticket-7 (60 min) holds 9, 12\n" in prompt
+
+
+def test_idle_worker_holding_tickets_is_reported_once_per_idle_stretch(night: Workflow) -> None:
+    idle = _idle_holding(night)
+    for hour, minute in [(11, 0), (11, 6), (11, 30), (12, 0)]:
+        assert _wake(night, at=_at(hour, minute)).returncode == 0
+    assert len(night.sent()) == 1
+    # A complete working turn between wakes creates a new idle stretch too.
+    idle.unlink()
+    idle.touch()
+    moment = int(_at(12)["WORKFLOW_NOW"])
+    os.utime(idle, (moment, moment))
+    assert _wake(night, at=_at(12, 59)).returncode == 0
+    assert len(night.sent()) == 1
+    assert _wake(night, at=_at(13)).returncode == 0
+    assert len(night.sent()) == 2
+    assert "idle and holding: ticket-7 (60 min) holds 9, 12" in night.sent()[-1]
+
+
+@pytest.mark.parametrize("note", ["waiting", "job-wait", "checks-wait"])
+def test_idle_worker_waiting_for_its_own_job_is_not_reported(
+    night: Workflow, note: str,
+) -> None:
+    idle = _idle_holding(night)
+    idle.with_suffix("." + note).touch()
+    assert _wake(night, at=_at(12)).returncode == 0
+    assert night.sent() == []
+
+
+def test_notify_waiting_worker_holding_tickets_is_not_reported(night: Workflow) -> None:
+    idle = _idle_holding(night)
+    idle.unlink()
+    assert night.run_script("notify", "waiting", env={"WORKFLOW_SESSION": "ticket-7"}).returncode == 0
+    assert night.notify({
+        "hook_event_name": "Stop", "last_assistant_message": "Waiting for the job.",
+    }, session="ticket-7").returncode == 0
+    assert idle.with_suffix(".job-wait").exists()
+    assert _wake(night, at=_at(12)).returncode == 0
+    assert night.sent() == []
+
+
+@pytest.mark.parametrize("case", ["busy", "ended", "unrelated", "historical", "hot-path"])
+def test_only_current_file_waits_on_a_running_idle_worker_are_reported(
+    night: Workflow, case: str,
+) -> None:
+    idle = _idle_holding(night)
+    status = night.repo / ".local/workflow/start-status.json"
+    if case == "busy":
+        idle.unlink()
+    elif case == "ended":
+        (night.state / "tmux/ticket-7").unlink()
+    elif case == "historical":
+        pending = status.parent / "ticket-starts.pending"
+        pending.mkdir()
+        (pending / "example.json").write_text(json.dumps({
+            "lines": list(json.loads(status.read_text()).values()),
+        }))
+        status.write_text("{}")
+    else:
+        reason = ("shares scripts/workflow/wake with 8" if case == "unrelated"
+                  else "hot path scripts/workflow/** with 7")
+        status.write_text(json.dumps({"9": f"9 waits: {reason}"}))
+    assert _wake(night, at=_at(12)).returncode == 0
+    assert night.sent() == []
+
+
+def test_idle_holding_notice_retries_failed_delivery(night: Workflow) -> None:
+    _idle_holding(night)
+    (night.state / "send-fails").touch()
+    assert _wake(night, at=_at(11)).returncode == 1
+    (night.state / "send-fails").unlink()
+    assert _wake(night, at=_at(11, 6)).returncode == 0
+    assert "idle and holding: ticket-7 (66 min) holds 9, 12" in night.sent()[-1]
+    sent = len(night.sent())
+    assert _wake(night, at=_at(11, 12)).returncode == 0
+    assert len(night.sent()) == sent
+
+
+def test_shadow_idle_holding_notice_does_not_acknowledge_delivery(night: Workflow) -> None:
+    _idle_holding(night)
+    shadow = night.root / "shadow.log"
+    assert _wake(night, at={**_at(11), "SHIPLINE_SHADOW": str(shadow)}).returncode == 0
+    assert "idle and holding: ticket-7 (60 min) holds 9, 12" in shadow.read_text()
+    assert night.sent() == []
+    assert _wake(night, at=_at(11)).returncode == 0
+    assert "idle and holding: ticket-7 (60 min) holds 9, 12" in night.sent()[-1]
+
+
+def test_changing_waiters_does_not_repeat_the_same_idle_stretch(night: Workflow) -> None:
+    _idle_holding(night)
+    assert _wake(night, at=_at(11)).returncode == 0
+    status = night.repo / ".local/workflow/start-status.json"
+    status.write_text("{}")
+    assert _wake(night, at=_at(11, 6)).returncode == 0
+    status.write_text(json.dumps({"15": "15 waits: shares scripts/workflow/wake with 7"}))
+    assert _wake(night, at=_at(11, 12)).returncode == 0
+    assert len(night.sent()) == 1
+
+
+def test_parallel_wakes_report_an_idle_holding_stretch_once(night: Workflow) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    _idle_holding(night)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        calls = [pool.submit(_wake, night, "ticket-7", at=_at(11)) for _ in range(2)]
+        results = [call.result() for call in calls]
+    assert all(done.returncode == 0 for done in results), [done.stderr for done in results]
+    assert sum("idle and holding:" in message for message in night.sent()) == 1
+
+
+@pytest.mark.parametrize("snapshot", [False, True])
+@pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.parametrize("change", ["waiters-cleared", "holder-exits", "background-job-started", "unchanged"])
+def test_idle_holding_state_changes_while_delivery_lock_is_held(
+    phone: Workflow, change: str, closed: bool, snapshot: bool,
+) -> None:
+    import fcntl
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    idle = _idle_holding(phone)
+    if closed:
+        _close_orchestrator(phone)
+    env = _at(12)
+    if snapshot:
+        cached = phone.root / "sessions.txt"
+        listed = phone.run_script("session", "list")
+        assert listed.returncode == 0, listed.stderr
+        assert "ticket-7" in listed.stdout
+        cached.write_text(listed.stdout)
+        env["WORKFLOW_SESSION_SNAPSHOT"] = str(cached)
+    lock = phone.repo / ".local/workflow/wake-phone.lock"
+    with lock.open("w") as stream, ThreadPoolExecutor(max_workers=1) as pool:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        call = pool.submit(_wake, phone, at=env)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if phone.wake_log.exists() and "every 20 minutes" in phone.wake_log.read_text():
+                break
+            time.sleep(0.02)
+        else:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+            pytest.fail("Wake did not reach delivery before deadline")
+        if change == "waiters-cleared":
+            (lock.parent / "start-status.json").write_text("{}")
+        elif change == "holder-exits":
+            # A terminal/server exit leaves the idle marker behind.
+            result = subprocess.run(
+                ["tmux", "-L", "ticket-7", "kill-server"], env=phone.env,
+                capture_output=True, text=True, timeout=5,
+            )
+            assert result.returncode == 0, result.stderr
+            assert idle.exists()
+        elif change == "background-job-started":
+            idle.with_suffix(".job-wait").touch()
+        fcntl.flock(stream, fcntl.LOCK_UN)
+        done = call.result()
+        assert done.returncode == 0, done.stderr
+    notices = [message for message in phone.sent() if "idle and holding:" in message]
+    notices += [push.message for push in phone.pushes() if "idle and holding:" in push.message]
+    receipt = lock.parent / "wake-idle-holding.sent/ticket-7"
+    if change == "unchanged":
+        assert len(notices) == 1
+        assert "idle and holding: ticket-7 (120 min) holds 9, 12" in notices[0]
+        assert receipt.exists() == (not closed)
+    else:
+        assert notices == [], "Do not report a holder after its session or wait has ended"
+        assert not receipt.exists()
+        assert list((lock.parent / "wake-phone.sent").iterdir()) == []
+
+
+def test_closed_orchestrator_rings_idle_holding_once_then_delivers_to_session(phone: Workflow) -> None:
+    _idle_holding(phone)
+    _close_orchestrator(phone)
+    for minute in (0, 6, 12):
+        assert _wake(phone, at=_at(11, minute)).returncode == 0
+    assert [push.message for push in phone.pushes()] == [
+        "Orchestrator is not open.\nidle and holding: ticket-7 (60 min) holds 9, 12",
+    ]
+    phone.orchestrator("busy")
+    assert _wake(phone, at=_at(11, 18)).returncode == 0
+    assert "idle and holding: ticket-7 (78 min) holds 9, 12" in phone.sent()[-1]
+    assert _wake(phone, at=_at(11, 24)).returncode == 0
+    assert len(phone.sent()) == 1
+    assert len(phone.pushes()) == 1
 
 
 @pytest.mark.parametrize("git_environment", [False, True])
