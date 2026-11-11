@@ -76,6 +76,9 @@
 # notes the question when the stop rings the phone, and drops it when he answers. A question
 # the orchestrator was not yet told of is told at the next look, at any hour and busy or not,
 # once, tried again every 5 minutes until the message is sent.
+# When the orchestrator is not open, each any-hour notice rings through notify once,
+# with its first line. Phone receipts leave session delivery pending. Ordinary summaries
+# stay quiet; the first successful ring of each closed stretch names the closed orchestrator.
 #
 # Each pass reads `session list`, the open pull requests, the usage and the load, and writes what it saw
 # and did to ~/.local/state/workflow/wake.log. It starts no session, merges nothing, pushes
@@ -794,8 +797,75 @@ for line in "${lost_lines[@]}" "${stuck_lines[@]}" "${answer_lines[@]}"; do
   log "  $line"
 done
 
+# Keep phone acknowledgements separate from every producer's pending/session receipts.
+# Serialize the availability check and pushes so parallel wakes cannot ring the same notice.
+phone_notes=$main/$SHIPLINE_STATE_FOLDER
+phone_receipts=$phone_notes/wake-phone.sent
+phone_closed=$phone_notes/wake-phone.closed
+if [[ -z $shadow ]]; then
+  (umask 077; mkdir -p "$phone_receipts"; touch "$phone_notes/wake-phone.lock") || exit 1
+  exec 6>"$phone_notes/wake-phone.lock"
+  flock --timeout "$LIST_SECONDS" 6 || exit 1
+  if [[ $tmp_warning == false ]]; then
+    receipt=$(printf '%s' 'tmp pressure' | sha256sum)
+    rm -f -- "$phone_receipts/${receipt%% *}"
+  fi
+fi
+
+ring_notice() {
+  local identity=$1 line=${2%%$'\n'*} receipt body
+  [[ -n $line ]] || return 0
+  receipt=$(printf '%s' "$identity" | sha256sum) || return 1
+  receipt=$phone_receipts/${receipt%% *}
+  [[ ! -e $receipt ]] || return 0
+  body=$line
+  [[ -e $phone_closed ]] || body=$'Orchestrator is not open.\n'"$line"
+  if ! bash "$here/notify" workflow <<<"$body" 6>&- 8>&- 9>&-; then
+    log "  closed orchestrator phone push failed; the next wake retries: $line"
+    return 1
+  fi
+  (umask 077; touch "$receipt" "$phone_closed") || return 1
+  log "  closed orchestrator notice sent to phone: $line"
+}
+
+ring_file() {
+  local event=$1 line=$2 version
+  # A producer may reuse a filename for a later event with the same words.
+  version=$(stat -c '%i:%y' -- "$event") || return 1
+  ring_notice "file:$event:$version:$line" "$line"
+}
+
 if ! orchestrator=$(find_orchestrator) || [[ -z $orchestrator ]]; then
+  # Shadow delivery must neither ring nor acknowledge anything.
+  [[ -z $shadow ]] || exit "$failed"
+  for kind in handback cloud lost stuck analysis answer; do
+    # These arrays are the same notices that bypass ordinary check-in pacing and idle checks.
+    declare -n notice_files=${kind}_files notice_lines=${kind}_lines
+    for index in "${!notice_files[@]}"; do
+      ring_file "${notice_files[index]}" "${notice_lines[index]}" || failed=1
+    done
+  done
+  for event in "$main_pending" "$service_pending"; do
+    [[ -s $event ]] || continue
+    ring_file "$event" "$(<"$event")" || failed=1
+  done
+  while read -r question; do
+    [[ -n $question ]] || continue
+    read -r session asked _ <<<"$question"
+    ring_notice "question:$question" "asking the owner: $session ($(((NOW - asked) / 60)) min)" || failed=1
+  done <<<"$untold"
+  for session in "${resent[@]}"; do
+    ring_notice "reset:$session" \
+      "Sent their instruction again: $session." || failed=1
+  done
+  if [[ $tmp_alert == true ]]; then
+    ring_notice 'tmp pressure' "$tmp_slots" || failed=1
+  fi
   exit "$failed"
+fi
+if [[ -z $shadow ]]; then
+  rm -f -- "$phone_closed"
+  exec 6>&-
 fi
 state=${orchestrator%%$'\t'*}
 name=${orchestrator#*$'\t'}
@@ -862,6 +932,10 @@ if send_to "$name" "$message"; then
     grep -xF -f <(asking_notes all; echo) >"$ASKED.new"
   mv "$ASKED.new" "$ASKED"
   rm -f "$PENDING"
+  for session in "${resent[@]}"; do
+    receipt=$(printf '%s' "reset:$session" | sha256sum)
+    rm -f -- "$phone_receipts/${receipt%% *}"
+  done
   for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${analysis_files[@]}" \
       "${balance_files[@]}"; do
     rm -f -- "$event"
