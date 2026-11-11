@@ -1040,7 +1040,10 @@ def test_new_tmp_pressure_after_a_quiet_recovery_rings_again(
     assert len(phone.pushes()) == 2
 
 
-def test_shadow_tmp_recovery_does_not_rearm_the_phone(phone: Workflow) -> None:
+@pytest.mark.parametrize("recovery", ["shadow", "unreadable"])
+def test_unconfirmed_tmp_recovery_does_not_rearm_the_phone(
+    phone: Workflow, recovery: str,
+) -> None:
     _close_orchestrator(phone)
     high = "#!/bin/bash\necho 'Filesystem Inodes IUsed IFree IUse% Mounted on'\n" \
            "echo 'tmpfs 1000 900 100 90% /tmp'\n"
@@ -1048,9 +1051,13 @@ def test_shadow_tmp_recovery_does_not_rearm_the_phone(phone: Workflow) -> None:
     assert _wake(phone, at=_at(12)).returncode == 0
     receipts = phone.repo / ".local/workflow/wake-phone.sent"
     before = set(receipts.iterdir())
-    phone.fake("df", high.replace("900 100 90%", "100 900 10%"))
-    shadow = phone.root / "shadow.log"
-    assert _wake(phone, at={**_at(12, 6), "SHIPLINE_SHADOW": str(shadow)}).returncode == 0
+    at = _at(12, 6)
+    if recovery == "shadow":
+        phone.fake("df", high.replace("900 100 90%", "100 900 10%"))
+        at["SHIPLINE_SHADOW"] = str(phone.root / "shadow.log")
+    else:
+        phone.fake("df", "#!/bin/bash\nexit 1\n")
+    assert _wake(phone, at=at).returncode == 0
     assert set(receipts.iterdir()) == before
     phone.fake("df", high)
     assert _wake(phone, at=_at(12, 12)).returncode == 0
