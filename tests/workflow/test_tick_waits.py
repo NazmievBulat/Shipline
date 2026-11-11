@@ -150,6 +150,44 @@ def test_codex_status_recovery_is_bounded_and_does_not_answer(workflow: Workflow
     assert _pending(workflow) == ["stuck? ticket-7 (status message not taken; its text stays in the box)"]
 
 
+def test_codex_status_recovers_after_enter_was_not_taken(workflow: Workflow) -> None:
+    notes = _codex_waiting(workflow)
+    (workflow.state / "swallow-enter-codex-7").write_text("2")
+    first = workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW)})
+    assert first.returncode != 0
+    assert notes.with_suffix(".job-wait").exists()
+
+    _tick(workflow, _NOW + 180)
+    _tick(workflow, _NOW + 360)
+
+    assert _keys(workflow, "codex-7") == [_STATUS, "Enter", "Enter", "Enter"]
+    assert not notes.with_suffix(".job-wait").exists()
+    assert not notes.with_suffix(".codex-answered").exists()
+    assert not notes.with_suffix(".owner-reply").exists()
+
+
+@pytest.mark.parametrize("change", ["native input", "bridge input", "asking", "running"])
+def test_codex_status_rechecks_before_enter(workflow: Workflow, change: str) -> None:
+    notes = _codex_waiting(workflow)
+    if change in ("native input", "bridge input"):
+        target = "codex-7" if change == "native input" else "ticket-7"
+        action = f"printf '%s' 'Owner draft' > {shlex.quote(str(workflow.state / f'input-{target}'))}"
+    elif change == "asking":
+        action = f"touch {shlex.quote(str(notes.with_suffix('.asking')))}"
+    else:
+        screen = shlex.quote(str(workflow.state / "screen/codex-7"))
+        action = f"printf '• Working (1m • esc to interrupt)\\n\\n› \\n' > {screen}"
+    # Only change the state after the status has actually been pasted.
+    typed = shlex.quote(str(workflow.state / "input-codex-7"))
+    (workflow.state / "on-sleep").write_text(f"if [[ -s {typed} ]]; then {action}; fi\n")
+
+    workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW)})
+
+    assert _keys(workflow, "codex-7") == [_STATUS]
+    assert notes.with_suffix(".job-wait").exists()
+    assert not notes.with_suffix(".codex-answered").exists()
+
+
 @pytest.mark.parametrize("name", ["ticket-7", "review-7"])
 def test_a_session_waiting_50_minutes_gets_one_status_check_and_it_is_logged(
     workflow: Workflow, name: str
