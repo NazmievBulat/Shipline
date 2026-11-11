@@ -319,6 +319,7 @@ def diagnose(pull: dict[str, Any], *, folder: Path | None = None) -> Diagnosis:
 
     head = pull["headRefOid"]
     failed_runs = []
+    passed_retry = None
     for workflow in ("ci", "images", "e2e"):
         latest = gate.runs(workflow, head, pull=True)[:1]
         for found in latest:
@@ -328,6 +329,19 @@ def diagnose(pull: dict[str, Any], *, folder: Path | None = None) -> Diagnosis:
                 raise gate.Waiting(f"run {found['id']} of the failed head is still running")
             if found.get("conclusion") not in ("success", "skipped", "neutral"):
                 failed_runs.append(found)
+            elif (
+                found.get("conclusion") == "success"
+                and folder is not None
+                and (claim := marker(folder, found["id"])).exists()
+                and _state(claim) in ("claim", "requested")
+            ):
+                passed_retry = found["id"]
+    if not failed_runs and passed_retry is not None:
+        # Run metadata can finish before the PR check summary drops its old failure.
+        # Neither revoke the passed review nor authorize a merge on conflicting reads.
+        raise gate.Waiting(
+            f"the re-run of run {passed_retry} passed; waiting for pull request checks to catch up"
+        )
     return diagnose_runs(
         head,
         [
