@@ -829,9 +829,12 @@ ring_notice() {
 }
 
 ring_file() {
-  local event=$1 line=$2 version
-  # A producer may reuse a filename for a later event with the same words.
-  version=$(stat -c '%i:%y' -- "$event") || return 1
+  local event=$1 line=$2 version=""
+  # Queue filenames identify events: retries may rewrite the same event. Singleton
+  # status/outage files instead change version when a later notice replaces them.
+  if [[ ${3:-} == version ]]; then
+    version=$(stat -c '%i:%y' -- "$event") || return 1
+  fi
   ring_notice "file:$event:$version:$line" "$line"
 }
 
@@ -847,7 +850,7 @@ if ! orchestrator=$(find_orchestrator) || [[ -z $orchestrator ]]; then
   done
   for event in "$main_pending" "$service_pending"; do
     [[ -s $event ]] || continue
-    ring_file "$event" "$(<"$event")" || failed=1
+    ring_file "$event" "$(<"$event")" version || failed=1
   done
   while read -r question; do
     [[ -n $question ]] || continue
@@ -935,6 +938,15 @@ if send_to "$name" "$message"; then
   for session in "${resent[@]}"; do
     receipt=$(printf '%s' "reset:$session" | sha256sum)
     rm -f -- "$phone_receipts/${receipt%% *}"
+  done
+  # Session delivery retires these event identities too, allowing a producer to reuse
+  # a filename for a later outage. Until then, producer retries keep their phone receipt.
+  for kind in handback cloud lost stuck analysis answer; do
+    declare -n notice_files=${kind}_files notice_lines=${kind}_lines
+    for index in "${!notice_files[@]}"; do
+      receipt=$(printf '%s' "file:${notice_files[index]}::${notice_lines[index]}" | sha256sum)
+      rm -f -- "$phone_receipts/${receipt%% *}"
+    done
   done
   for event in "${cloud_files[@]}" "${start_files[@]}" "${metrics_files[@]}" "${analysis_files[@]}" \
       "${balance_files[@]}"; do

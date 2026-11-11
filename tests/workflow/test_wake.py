@@ -1072,6 +1072,10 @@ def test_closed_orchestrator_rings_any_hour_queue_once(
     event = folder / "example.json"
     event.write_text(json.dumps(payload))
     for minute in (0, 6, 12):
+        # Producers may replace the same event on each retry until session delivery.
+        replacement = folder / ".replacement"
+        replacement.write_text(json.dumps(payload))
+        replacement.replace(event)
         done = _wake(phone, at=_at(12, minute))
         assert done.returncode == 0, done.stderr
     [push] = phone.pushes()
@@ -1082,6 +1086,42 @@ def test_closed_orchestrator_rings_any_hour_queue_once(
     assert line in phone.sent()[0]
     assert not event.exists()
     assert len(phone.pushes()) == 1
+
+
+@pytest.mark.parametrize("filename,line", [
+    ("main-status.pending", "main: red, CI failed"),
+    ("advisory-service.pending", "advisory service unreachable"),
+])
+def test_closed_orchestrator_rings_singleton_status_notices_once(
+    phone: Workflow, filename: str, line: str,
+) -> None:
+    _close_orchestrator(phone)
+    event = phone.repo / ".local/workflow" / filename
+    event.write_text(line + "\nFurther details\n")
+    for minute in (0, 6, 12):
+        done = _wake(phone, at=_at(12, minute))
+        assert done.returncode == 0, done.stderr
+    [push] = phone.pushes()
+    assert push.message == "Orchestrator is not open.\n" + line
+    assert event.exists()
+
+
+def test_parallel_closed_orchestrator_wakes_ring_each_notice_once(phone: Workflow) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    _close_orchestrator(phone)
+    folder = phone.repo / ".local/workflow/stuck.pending"
+    folder.mkdir()
+    (folder / "example.json").write_text(json.dumps({"line": "stuck? ticket-7 (45 min)"}))
+    # Explicit names bypass pacing, making both callers attempt the same pending notices.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        calls = [pool.submit(_wake, phone, "ticket-7", at=_at(12)) for _ in range(2)]
+        results = [call.result() for call in calls]
+    assert all(done.returncode == 0 for done in results), [done.stderr for done in results]
+    assert [push.message for push in phone.pushes()] == [
+        "Orchestrator is not open.\nstuck? ticket-7 (45 min)",
+        "Sent their instruction again: ticket-7.",
+    ]
 
 
 def test_closed_orchestrator_reset_names_ring_once_until_session_delivery(phone: Workflow) -> None:
