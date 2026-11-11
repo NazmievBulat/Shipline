@@ -600,6 +600,54 @@ def test_successful_retry_jobs_wait_for_the_run_metadata_before_handing_back(
     assert (workflow.state / "merged").read_text() == "7"
     assert len(workflow.calls("gh run rerun")) == 1
 
+@pytest.mark.parametrize("claim_state", ["requested", "claim"])
+def test_a_successful_retry_with_late_rollup_keeps_review_authorization(
+    handed: GitHub, claim_state: str
+) -> None:
+    workflow = handed.workflow
+    original = handed.head
+    _github_answers_repairs(workflow)
+    _fail(handed, log=(
+        "CI: server tests\tSet up Go\t2026-11-01T12:00:00Z "
+        "##[error]Failed to run: Error: Unexpected HTTP response: 504, "
+        "Error: Unexpected HTTP response: 504\n"
+    ))
+    run = handed.api[_RUNS.format(head=handed.head)]["workflow_runs"][0]
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("gh run rerun")) == 1
+    assert _note(workflow).exists()
+
+    claim = _folder(workflow) / "check-rerun-20.json"
+    saved = json.loads(claim.read_text())
+    saved["state"] = claim_state  # A restart may leave the pre-request claim.
+    claim.write_text(json.dumps(saved))
+    run.update(run_attempt=2, status="completed", conclusion="success")
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    for job in jobs:
+        job.update(status="completed", conclusion="success")
+    handed.save()  # The PR check summary still reports the previous failure.
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        if not _note(workflow).exists():
+            reason = "; ".join(_handbacks(workflow))
+            pytest.fail("successful retry lost its passed-review handoff: " + reason)
+        assert _started(workflow) == []
+        assert not (workflow.state / "merged").exists()
+        assert not workflow.calls("gh pr ready")
+        assert len(workflow.calls("gh run rerun")) == 1
+        assert handed.head == original
+
+    handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "SUCCESS"
+    handed.save()
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "merged").read_text() == "7"
+    assert _started(workflow) == []
+    assert len(workflow.calls("gh run rerun")) == 1
+
+
 @pytest.mark.parametrize("error", [
     _DOWNLOAD_LINE, "unexpected EOF", "failed to copy: httpReadSeeker: unexpected status",
     "toomanyrequests: download rate limit exceeded",
