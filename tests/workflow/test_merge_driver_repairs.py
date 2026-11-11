@@ -648,6 +648,42 @@ def test_a_successful_retry_with_late_rollup_keeps_review_authorization(
     assert len(workflow.calls("gh run rerun")) == 1
 
 
+@pytest.mark.parametrize("check", [
+    {"__typename": "StatusContext", "context": "example-app-policy", "state": "FAILURE"},
+    {"__typename": "CheckRun", "name": "example-app-policy", "status": "COMPLETED",
+     "conclusion": "FAILURE"},
+    {"__typename": "CheckRun", "name": "CI result", "status": "COMPLETED",
+     "conclusion": "FAILURE",
+     "detailsUrl": "https://github.com/example-org/example-app/actions/runs/30/job/32"},
+], ids=["status-context", "unrelated-job", "same-name-other-run"])
+def test_a_successful_retry_does_not_hide_an_unrelated_failed_check(
+    handed: GitHub, check: dict
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log="##[error]Failed to run: Error: Unexpected HTTP response: 504\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _note(workflow).exists()
+    assert len(workflow.calls("gh run rerun")) == 1
+
+    run = handed.api[_RUNS.format(head=handed.head)]["workflow_runs"][0]
+    run.update(run_attempt=2, status="completed", conclusion="success")
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    for job in jobs:
+        job.update(status="completed", conclusion="success")
+    handed.pulls["7"]["statusCheckRollup"].append(check)
+    handed.save()  # The retry's old failure and an unrelated real failure coexist.
+
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
+    assert not (workflow.state / "merged").exists()
+    assert not workflow.calls("gh pr ready")
+    assert len(workflow.calls("gh run rerun")) == 1
+
+
 @pytest.mark.parametrize("error", [
     _DOWNLOAD_LINE, "unexpected EOF", "failed to copy: httpReadSeeker: unexpected status",
     "toomanyrequests: download rate limit exceeded",
