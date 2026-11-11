@@ -330,6 +330,15 @@ stopped_on_limit() {
 
 on_stop() {
   local message limit_at asked="" sum
+  # Overlapping deliveries of a stop share its question and successful-send receipt.
+  # Do not wait on a live delivery: its network calls already use the hook's time budget.
+  # Keep the lock file in place; flock releases it when this hook exits, even on failure.
+  # A removed worktree has no receipts; keep its existing best-effort ring without notes.
+  if [[ -d $worktree ]]; then
+    (umask 077; mkdir -p "$notes" && touch "$notes/$name.notify.lock") || return 0
+    exec 9>"$notes/$name.notify.lock" || return 0
+    flock --nonblock 9 || return 0
+  fi
   # Permission dialogs and the question tool continue this same turn when answered. A
   # later Stop proves that interaction ended; a refused merge still becomes an owner
   # block below when the last message asks for permission to retry it.
@@ -421,8 +430,10 @@ on_prompt() {
   # itself, when its background job ended, is not an answer: the event then says so, in any
   # of these fields. Claude Code 2.1.303 supplies no provenance fields for a queued
   # task notification: its entire prompt is notification blocks instead. Owner text between
-  # two blocks keeps the prompt his.
+  # two blocks keeps the prompt his. The bridge's recovery sentinel also answers nothing:
+  # preserve the successful push along with the question when it replays a native turn.
   local own_turn='.user_initiated == false or .is_user_input == false or .system == true
+    or (.prompt // "") == "__WORKFLOW_CODEX_TURN__"
     or (.source // "user_input"
     | IN("background_task_output", "auto_continue", "permission_request",
          "quota_auto_resume", "model_switch"))
@@ -430,8 +441,7 @@ on_prompt() {
     | test("^\\s*(?:<task-notification>(?:(?!</task-notification>)[\\s\\S])*</task-notification>\\s*)+$"))'
   if [[ $(jq -r "$own_turn" <<<"$event" 2>/dev/null) != true ]]; then
     rm -f "$pushed" "$notes/$name.owner-blocked" "$notes/$name.interaction-blocked"
-    # The bridge types this itself to relay Codex's next turn: the owner answered nothing.
-    [[ $(field .prompt) == __WORKFLOW_CODEX_TURN__ ]] || rm -f "$asking" "$question"
+    rm -f "$asking" "$question"
     if [[ -e $notes/$name.codex ]] && jq -e '(.source // "user_input") == "user_input"' <<<"$event" >/dev/null; then
       # jq writes the submitted text exactly, including trailing newlines. An automatic
       # wake authorizes no reply and leaves any pending owner's answer alone.
