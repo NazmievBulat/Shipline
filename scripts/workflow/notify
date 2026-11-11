@@ -181,8 +181,8 @@ said_finished() {
   LC_ALL=C grep -qiE "${FINISHED_LINE/WORDS/$1}" <<<"$last"
 }
 
-# Only the last non-empty paragraph can ask the owner. Keep the question patterns here,
-# so a draft worker's push and its `asking` note (read by `wake`) use the same test.
+# An explicit marker anywhere in the message asks the owner; other question patterns use
+# only the last non-empty paragraph. A draft worker's push and its `asking` note use the same test.
 asks_owner() {
   local paragraph request_start='(^|[.!?:;,[:cntrl:]][[:space:]]*|[[:space:]]please[[:space:]]+)'
   # The bridge may quote Codex's words or set them as a quote block, and reply words are
@@ -190,13 +190,13 @@ asks_owner() {
   # ("Next: write `notify` tests"), so only quoted words after them ask.
   local marks="([[:space:]*_>\"'-]|“|‘)*" word="[*_]*([\"'\`0-9]|“|‘)" quoted="[*_]*([\"']|“|‘)"
   local question_end="\?([[:space:]*_\`\"']|”|’)*$"
+  # The same marker as `question_of` identifies a question even with unquoted reply words.
+  LC_ALL=C grep -qiE '^[[:space:]>*_`-]*owner only:[[:space:]*_`]*(yes|no)[[:space:]*_`.!]*$' <<<"$1" && return 0
   paragraph=$(LC_ALL=C awk '
     /^[[:space:]]*$/ { if (current != "") last = current; current = ""; next }
     { current = current (current == "" ? "" : "\n") $0 }
     END { print (current != "" ? current : last) }
   ' <<<"$1")
-  # The same marker as `question_of` identifies a question even with unquoted reply words.
-  LC_ALL=C grep -qiE '^[[:space:]>*_`-]*owner only:[[:space:]*_`]*(yes|no)[[:space:]*_`.!]*$' <<<"$paragraph" && return 0
   # One record preserves line starts for requests and the paragraph end for question marks.
   LC_ALL=C grep -zqiE "${request_start}${marks}(please[[:space:]]+)?(reply[[:space:]]+(with\>|$word)|choose[[:space:]]+$word|(type|write)[[:space:]]+$quoted)|$question_end" <<<"$paragraph"
 }
