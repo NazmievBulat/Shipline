@@ -196,7 +196,13 @@ def test_a_repaired_fix_on_older_main_is_still_handed_back_when_its_own_test_fai
     assert workflow.git("ls-remote", "origin", "refs/heads/ticket/seven").split()[0] == handed.head
 
 @pytest.mark.parametrize("rerun", ["fails again", "passes"])
-@pytest.mark.parametrize("failure", ["runner shut down", "timed out", "layer download"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "runner shut down", "timed out", "layer download",
+        "setup HTTP 500", "setup HTTP 502", "setup HTTP 504", "setup HTTP 599",
+    ],
+)
 def test_a_runner_error_is_rerun_once_then_handed_back_to_a_reviewer(
     handed: GitHub, failure: str, rerun: str
 ) -> None:
@@ -206,6 +212,15 @@ def test_a_runner_error_is_rerun_once_then_handed_back_to_a_reviewer(
         _fail(handed, conclusion="timed_out", log=None)
     elif failure == "layer download":
         _fail(handed, log="failed to solve: failed to compute cache key: short read: unexpected EOF\n")
+    elif failure.startswith("setup HTTP "):
+        status = failure.rsplit(" ", 1)[1]
+        _fail(
+            handed,
+            log=(
+                "CI: server tests\tSet up Go\t##[error]Failed to run: Error: "
+                f"Unexpected HTTP response: {status}, Error: Unexpected HTTP response: {status}\n"
+            ),
+        )
     else:
         _fail(handed, log="##[error]The runner has received a shutdown signal.\n")
 
@@ -369,6 +384,15 @@ def test_a_failed_job_with_nothing_to_read_goes_to_a_reviewer(handed: GitHub) ->
             "tests/test_quote.py::test_reads[ (id) id ]",
         ),
         ("Error: Process completed with exit code 1.\n", "not reported"),
+        (
+            "##[error]Failed to run: Error: Unexpected HTTP response: 404, "
+            "Error: Unexpected HTTP response: 404\n",
+            "not reported",
+        ),
+        (
+            "##[error]Failed to run: Error: Unexpected HTTP response: 5000\n",
+            "not reported",
+        ),
         (
             "FAILED tests/test_dates.py::test_totals[two items] - assert 3 == 4\n",
             "tests/test_dates.py::test_totals[two items]",
@@ -575,6 +599,96 @@ def test_successful_retry_jobs_wait_for_the_run_metadata_before_handing_back(
     assert (workflow.state / "merged").exists(), done.stdout + done.stderr + str(_train(workflow))
     assert (workflow.state / "merged").read_text() == "7"
     assert len(workflow.calls("gh run rerun")) == 1
+
+@pytest.mark.parametrize("claim_state", ["requested", "claim"])
+@pytest.mark.parametrize("run_url", [
+    "", "https://github.com/example-org/example-app/actions/runs/20/job/22",
+], ids=["name-only", "run-url"])
+def test_a_successful_retry_with_late_rollup_keeps_review_authorization(
+    handed: GitHub, claim_state: str, run_url: str
+) -> None:
+    workflow = handed.workflow
+    original = handed.head
+    _github_answers_repairs(workflow)
+    _fail(handed, log=(
+        "CI: server tests\tSet up Go\t2026-11-01T12:00:00Z "
+        "##[error]Failed to run: Error: Unexpected HTTP response: 504, "
+        "Error: Unexpected HTTP response: 504\n"
+    ))
+    run = handed.api[_RUNS.format(head=handed.head)]["workflow_runs"][0]
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls("gh run rerun")) == 1
+    assert _note(workflow).exists()
+
+    claim = _folder(workflow) / "check-rerun-20.json"
+    saved = json.loads(claim.read_text())
+    saved["state"] = claim_state  # A restart may leave the pre-request claim.
+    claim.write_text(json.dumps(saved))
+    run.update(run_attempt=2, status="completed", conclusion="success")
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    for job in jobs:
+        job.update(status="completed", conclusion="success")
+    handed.pulls["7"]["statusCheckRollup"][0]["detailsUrl"] = run_url
+    handed.save()  # The PR check summary still reports the previous failure.
+    for _ in range(2):
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stdout + done.stderr
+        if not _note(workflow).exists():
+            reason = "; ".join(_handbacks(workflow))
+            pytest.fail("successful retry lost its passed-review handoff: " + reason)
+        assert _started(workflow) == []
+        assert not (workflow.state / "merged").exists()
+        assert not workflow.calls("gh pr ready")
+        assert len(workflow.calls("gh run rerun")) == 1
+        assert handed.head == original
+
+    handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "SUCCESS"
+    handed.save()
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (workflow.state / "merged").read_text() == "7"
+    assert _started(workflow) == []
+    assert len(workflow.calls("gh run rerun")) == 1
+
+
+@pytest.mark.parametrize("check", [
+    {"__typename": "StatusContext", "context": "example-app-policy", "state": "FAILURE"},
+    {"__typename": "CheckRun", "name": "example-app-policy", "status": "COMPLETED",
+     "conclusion": "FAILURE"},
+    {"__typename": "CheckRun", "name": "CI result", "status": "COMPLETED",
+     "conclusion": "FAILURE",
+     "detailsUrl": "https://github.com/example-org/example-app/actions/runs/30/job/32"},
+    {"__typename": "CheckRun", "name": "CI result", "status": "COMPLETED",
+     "conclusion": "FAILURE", "detailsUrl": "https://example.com/checks/22"},
+], ids=["status-context", "unrelated-job", "same-name-other-run", "same-name-external-check"])
+def test_a_successful_retry_does_not_hide_an_unrelated_failed_check(
+    handed: GitHub, check: dict
+) -> None:
+    workflow = handed.workflow
+    _github_answers_repairs(workflow)
+    _fail(handed, log="##[error]Failed to run: Error: Unexpected HTTP response: 504\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _note(workflow).exists()
+    assert len(workflow.calls("gh run rerun")) == 1
+
+    run = handed.api[_RUNS.format(head=handed.head)]["workflow_runs"][0]
+    run.update(run_attempt=2, status="completed", conclusion="success")
+    jobs = handed.api["repos/example-org/example-app/actions/runs/20/jobs?per_page=100"]["jobs"]
+    for job in jobs:
+        job.update(status="completed", conclusion="success")
+    handed.pulls["7"]["statusCheckRollup"].append(check)
+    handed.save()  # The retry's old failure and an unrelated real failure coexist.
+
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not _note(workflow).exists()
+    assert _started(workflow) == ["review-7"]
+    assert not (workflow.state / "merged").exists()
+    assert not workflow.calls("gh pr ready")
+    assert len(workflow.calls("gh run rerun")) == 1
+
 
 @pytest.mark.parametrize("error", [
     _DOWNLOAD_LINE, "unexpected EOF", "failed to copy: httpReadSeeker: unexpected status",

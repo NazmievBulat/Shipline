@@ -900,7 +900,8 @@ def test_without_a_registered_open_session_pending_messages_are_kept(
 
     done = _wake(night, "ticket-7", at=_at(10, 0))
 
-    assert done.returncode == 0, done.stderr
+    # A named but closed session tries the phone (no keys here); no registration stays quiet.
+    assert done.returncode == int(bool(registration)), done.stderr
     assert night.sent() == []
     assert night.wake_log.with_name("wake.pending").read_text() == "ticket-7\n"
     assert not night.wake_log.with_name("wake.told").exists()
@@ -930,7 +931,7 @@ def test_the_registered_name_must_be_interactive_in_the_main_checkout(
 
     done = _wake(night, "ticket-7")
 
-    assert done.returncode == 0, done.stderr
+    assert done.returncode == 1  # No phone keys; the message remains pending.
     assert night.sent() == []
     assert night.wake_log.with_name("wake.pending").read_text() == "ticket-7\n"
     assert "named orchestrator (Check-in) is not open" in night.wake_log.read_text()
@@ -950,6 +951,245 @@ def day(night: Workflow) -> Workflow:
     night.running("review-7")
     night.orchestrator("busy")
     return night
+
+
+@pytest.fixture
+def phone(day: Workflow) -> Workflow:
+    from workflow.test_notify import _TOKEN, _USER
+
+    keys = day.root / "home/agents/.env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text(f"PUSHOVER_USER={_USER}\nPUSHOVER_TOKEN={_TOKEN}\n")
+    return day
+
+
+def _close_orchestrator(workflow: Workflow) -> None:
+    (workflow.state / "agents.json").write_text("[]")
+
+
+@pytest.mark.parametrize("hour", [0, 12])
+def test_closed_orchestrator_rings_each_question_once_and_later_delivers(
+    phone: Workflow, hour: int,
+) -> None:
+    _close_orchestrator(phone)
+    # Record the questions without a Stop-hook push, to isolate wake's fallback.
+    notes = phone.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "review-7.idle").touch()
+    (notes / "review-7.asking").write_text(f"{_at(hour)['WORKFLOW_NOW']}\n")
+    for minute in (8, 14, 20):
+        done = _wake(phone, at=_at(hour, minute))
+        assert done.returncode == 0, done.stderr
+    [first] = phone.pushes()
+    assert first.title == "Workflow needs you"
+    assert first.message == "Orchestrator is not open.\nasking the owner: review-7 (8 min)"
+    assert phone.sent() == []
+
+    # A second question in the same session is new even though its first line is unchanged.
+    (notes / "review-7.asking").write_text(f"{_at(hour, 21)['WORKFLOW_NOW']}\n")
+    for minute in (26, 32):
+        assert _wake(phone, at=_at(hour, minute)).returncode == 0
+    assert len(phone.pushes()) == 2
+    assert phone.pushes()[1].message == "asking the owner: review-7 (5 min)"
+
+    phone.orchestrator("busy")
+    assert _wake(phone, at=_at(hour, 38)).returncode == 0
+    assert len(phone.pushes()) == 2
+    [prompt] = phone.sent()
+    assert "asking the owner: review-7 (17 min)" in prompt
+
+    _close_orchestrator(phone)
+    (notes / "review-7.asking").write_text(f"{_at(hour, 39)['WORKFLOW_NOW']}\n")
+    assert _wake(phone, at=_at(hour, 44)).returncode == 0
+    assert len(phone.pushes()) == 3
+    assert phone.pushes()[-1].message.startswith("Orchestrator is not open.\n")
+
+
+def test_closed_orchestrator_plain_check_ins_do_not_ring(phone: Workflow) -> None:
+    _close_orchestrator(phone)
+    for minute in (0, 21, 42):
+        assert _wake(phone, at=_at(23, minute)).returncode == 0
+    assert phone.pushes() == []
+    phone.orchestrator("idle")
+    assert _wake(phone, at=_at(0, 3, day=14)).returncode == 0
+    assert len(phone.sent()) == 1
+    assert phone.pushes() == []
+
+
+@pytest.mark.parametrize("hour,minute", [(12, 6), (23, 1)])
+def test_new_tmp_pressure_after_a_quiet_recovery_rings_again(
+    phone: Workflow, hour: int, minute: int,
+) -> None:
+    _close_orchestrator(phone)
+
+    def pressure(used: int) -> None:
+        phone.fake("df", "#!/bin/bash\n"
+                   "echo 'Filesystem Inodes IUsed IFree IUse% Mounted on'\n"
+                   f"echo 'tmpfs 1000 {used} {1000 - used} {used // 10}% /tmp'\n")
+
+    pressure(900)
+    assert _wake(phone, at=_at(hour)).returncode == 0
+    assert len(phone.pushes()) == 1
+    pressure(100)
+    assert _wake(phone, at=_at(hour, minute)).returncode == 0
+    pressure(900)
+    assert _wake(phone, at=_at(hour, 12)).returncode == 0
+    assert len(phone.pushes()) == 2, "a new pressure stretch must ring after recovery"
+    assert phone.pushes()[1].message == "/tmp file slots: 90% used (900/1000); WARNING above 80%"
+    assert _wake(phone, at=_at(hour, 18)).returncode == 0
+    assert len(phone.pushes()) == 2
+
+
+@pytest.mark.parametrize("recovery", ["shadow", "unreadable"])
+def test_unconfirmed_tmp_recovery_does_not_rearm_the_phone(
+    phone: Workflow, recovery: str,
+) -> None:
+    _close_orchestrator(phone)
+    high = "#!/bin/bash\necho 'Filesystem Inodes IUsed IFree IUse% Mounted on'\n" \
+           "echo 'tmpfs 1000 900 100 90% /tmp'\n"
+    phone.fake("df", high)
+    assert _wake(phone, at=_at(12)).returncode == 0
+    receipts = phone.repo / ".local/workflow/wake-phone.sent"
+    before = set(receipts.iterdir())
+    at = _at(12, 6)
+    if recovery == "shadow":
+        phone.fake("df", high.replace("900 100 90%", "100 900 10%"))
+        at["SHIPLINE_SHADOW"] = str(phone.root / "shadow.log")
+    else:
+        phone.fake("df", "#!/bin/bash\nexit 1\n")
+    assert _wake(phone, at=at).returncode == 0
+    assert set(receipts.iterdir()) == before
+    phone.fake("df", high)
+    assert _wake(phone, at=_at(12, 12)).returncode == 0
+    assert len(phone.pushes()) == 1
+
+
+def test_closed_orchestrator_rings_each_pending_message_first_line(phone: Workflow) -> None:
+    _close_orchestrator(phone)
+    folder = phone.repo / ".local/workflow/stuck.pending"
+    folder.mkdir()
+    lines = ["stuck? ticket-7 (45 min)", "starts held: usage unread for 1 h, 2 tickets waiting"]
+    for index, line in enumerate(lines):
+        (folder / f"{index}.json").write_text(json.dumps({"line": line + "\nMore detail"}))
+    for minute in (0, 6, 12):
+        assert _wake(phone, at=_at(12, minute)).returncode == 0
+    assert [push.message for push in phone.pushes()] == [
+        "Orchestrator is not open.\n" + lines[0], lines[1],
+    ]
+    assert len(list(folder.iterdir())) == 2  # Phone receipts do not consume session delivery.
+    phone.orchestrator("busy")
+    assert _wake(phone, at=_at(12, 18)).returncode == 0
+    assert all(line in phone.sent()[0] for line in lines)
+    assert list(folder.iterdir()) == []
+    assert len(phone.pushes()) == 2
+
+
+def test_closed_orchestrator_failed_push_is_retried_and_shadow_does_not_acknowledge(
+    phone: Workflow,
+) -> None:
+    _close_orchestrator(phone)
+    folder = phone.repo / ".local/workflow/stuck.pending"
+    folder.mkdir()
+    (folder / "example.json").write_text(json.dumps({"line": "stuck? ticket-7 (45 min)"}))
+    shadow = phone.root / "shadow.log"
+    assert _wake(phone, at={**_at(12), "SHIPLINE_SHADOW": str(shadow)}).returncode == 0
+    assert phone.pushes() == []
+    (phone.state / "pushover-fails").touch()
+    assert _wake(phone, at=_at(12)).returncode == 1
+    (phone.state / "pushover-fails").unlink()
+    for minute in (6, 12):
+        assert _wake(phone, at=_at(12, minute)).returncode == 0
+    assert len(phone.pushes()) == 2  # One failed attempt, then one successful delivery.
+    assert all(push.message.startswith("Orchestrator is not open.\n") for push in phone.pushes())
+
+
+@pytest.mark.parametrize("kind,payload,line", [
+    ("merge-handbacks", {"number": 7, "reason": "needs judgment"}, "pull request 7: needs judgment"),
+    ("cloud-events", {"name": "cloud-7", "message": "question", "url": ""}, "cloud-7: question ()"),
+    ("lost-checks", {"number": 7, "check": "CI", "run": 123}, "lost check: CI of run 123 on pull request 7"),
+    ("rule-breaks", {"name": "review-7"}, "rule break: review-7 said review finished without a merge handoff"),
+    ("ticket-starts-alert", {"line": "starts held: usage unread"}, "starts held: usage unread"),
+    ("analyses", {"name": "day-example", "report": "report.md", "url": "", "proposals": []},
+     "Workflow analysis day-example ended without publishing its report (report.md)."),
+])
+def test_closed_orchestrator_rings_any_hour_queue_once(
+    phone: Workflow, kind: str, payload: dict, line: str,
+) -> None:
+    _close_orchestrator(phone)
+    folder = phone.repo / f".local/workflow/{kind}.pending"
+    folder.mkdir()
+    event = folder / "example.json"
+    event.write_text(json.dumps(payload))
+    for minute in (0, 6, 12):
+        # Producers may replace the same event on each retry until session delivery.
+        replacement = folder / ".replacement"
+        replacement.write_text(json.dumps(payload))
+        replacement.replace(event)
+        done = _wake(phone, at=_at(12, minute))
+        assert done.returncode == 0, done.stderr
+    [push] = phone.pushes()
+    assert push.message == "Orchestrator is not open.\n" + line
+    assert event.exists()
+    phone.orchestrator("busy")
+    assert _wake(phone, at=_at(12, 18)).returncode == 0
+    assert line in phone.sent()[0]
+    assert not event.exists()
+    assert len(phone.pushes()) == 1
+
+
+@pytest.mark.parametrize("filename,line", [
+    ("main-status.pending", "main: red, CI failed"),
+    ("advisory-service.pending", "advisory service unreachable"),
+])
+def test_closed_orchestrator_rings_singleton_status_notices_once(
+    phone: Workflow, filename: str, line: str,
+) -> None:
+    _close_orchestrator(phone)
+    event = phone.repo / ".local/workflow" / filename
+    event.write_text(line + "\nFurther details\n")
+    for minute in (0, 6, 12):
+        done = _wake(phone, at=_at(12, minute))
+        assert done.returncode == 0, done.stderr
+    [push] = phone.pushes()
+    assert push.message == "Orchestrator is not open.\n" + line
+    assert event.exists()
+
+
+def test_parallel_closed_orchestrator_wakes_ring_each_notice_once(phone: Workflow) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    _close_orchestrator(phone)
+    folder = phone.repo / ".local/workflow/stuck.pending"
+    folder.mkdir()
+    (folder / "example.json").write_text(json.dumps({"line": "stuck? ticket-7 (45 min)"}))
+    # Explicit names bypass pacing, making both callers attempt the same pending notices.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        calls = [pool.submit(_wake, phone, "ticket-7", at=_at(12)) for _ in range(2)]
+        results = [call.result() for call in calls]
+    assert all(done.returncode == 0 for done in results), [done.stderr for done in results]
+    assert [push.message for push in phone.pushes()] == [
+        "Orchestrator is not open.\nstuck? ticket-7 (45 min)",
+        "Sent their instruction again: ticket-7.",
+    ]
+
+
+def test_closed_orchestrator_reset_names_ring_once_until_session_delivery(phone: Workflow) -> None:
+    _close_orchestrator(phone)
+    assert _wake(phone, "ticket-7", at=_at(12)).returncode == 0
+    assert _wake(phone, at=_at(12, 6)).returncode == 0
+    assert _wake(phone, "audit-9", at=_at(12, 7)).returncode == 0
+    assert _wake(phone, at=_at(12, 13)).returncode == 0
+    assert [push.message for push in phone.pushes()] == [
+        "Orchestrator is not open.\nSent their instruction again: ticket-7.",
+        "Sent their instruction again: audit-9.",
+    ]
+    phone.orchestrator("busy")
+    assert _wake(phone, at=_at(12, 19)).returncode == 0
+    assert "Sent their instruction again: ticket-7 audit-9." in phone.sent()[0]
+    _close_orchestrator(phone)
+    assert _wake(phone, "ticket-7", at=_at(12, 20)).returncode == 0
+    assert len(phone.pushes()) == 3
+    assert phone.pushes()[-1].message.startswith("Orchestrator is not open.\n")
 
 
 def test_a_question_to_the_owner_is_named_once_at_any_hour(day: Workflow) -> None:
@@ -1637,13 +1877,19 @@ def test_another_hold_interrupts_the_unread_stretch(held_starts: Workflow) -> No
     assert held_starts.pushes() == []
 
 
-def test_the_phone_alarm_does_not_need_an_open_orchestrator(held_starts: Workflow) -> None:
+@pytest.mark.parametrize("minutes,rings", [((0, 120, 126), 1), ((0, 61, 120, 126), 2)])
+def test_the_phone_alarm_does_not_need_an_open_orchestrator(
+    held_starts: Workflow, minutes: tuple[int, ...], rings: int,
+) -> None:
     (held_starts.state / "agents.json").write_text("[]")
-    for minute in (0, 120, 126):
+    for minute in minutes:
         _held_pick(held_starts, minute)
         assert _held_wake(held_starts, minute).returncode == 0
     assert held_starts.sent() == []
-    assert len(held_starts.pushes()) == 1
+    assert len(held_starts.pushes()) == rings
+    assert held_starts.pushes()[0].message.startswith("Orchestrator is not open.\nstarts held:")
+    if rings == 2:
+        assert held_starts.pushes()[1].message == "starts held: usage unread for 2 h, 2 tickets waiting"
     held_starts.orchestrator("busy")
     assert _held_wake(held_starts, 132).returncode == 0
     assert "starts held:" in held_starts.sent()[-1]
