@@ -197,6 +197,8 @@ jobs:
           - shard: 6
             workers: 6
             # Projected test time 620.04s; 3720.24 measured worker-s.
+            # tests/workflow/test_break_103.py: not yet measured
+            # tests/workflow/test_break_103_recovery.py: not yet measured
             # tests/runner/test_layout.py: 0.00s
             # tests/runner/test_lend_runners.py: 0.00s
             # tests/runner/test_ordinary_slots.py: 36.69s
@@ -216,6 +218,8 @@ jobs:
               tests/runner/test_layout.py
               tests/runner/test_lend_runners.py
               tests/runner/test_ordinary_slots.py
+              tests/workflow/test_break_103.py
+              tests/workflow/test_break_103_recovery.py
               tests/workflow/test_browser_test_slots.py
               tests/workflow/test_ci.py
               tests/workflow/test_ci_runner_choice.py
