@@ -1,0 +1,46 @@
+PR 97 independent breaking probes
+Reviewed head: 1d4d92e9771d4efe2473a76cd8367cb0639b90e5
+
+Dependencies: requirements-test.txt, installed with --require-hashes into a local venv.
+Command: python -m pytest tests/workflow/test_break_97.py -q --tb=short
+Only this independent test file was run; the existing suite was not run.
+
+Final output summary:
+4 failed, 43 passed in 16.70s
+
+Failures (both unquoted and quoted reply variants):
+test_native_codex_callback_then_bridge_stop_keeps_the_question
+  AssertionError: bridge recovery repeated the phone push without an owner answer
+  assert 2 == 1
+test_two_overlapping_deliveries_of_one_stop_ring_once
+  AssertionError: two concurrent copies of the same Stop sent two phone pushes
+  assert 2 == 1
+
+Survived:
+- yes/no markers, case and supported Markdown, quoted/unquoted/numeric replies;
+- persisted asking time across a background continuation more than a day later;
+- progress reports, answered questions and invalid or earlier-paragraph markers;
+- an owner's answer followed by a new question;
+- GitHub failure/timeout, notification failure/timeout and a successful retry;
+- absent credentials, optional session URL, optional config and notes directory;
+- a held tick lock; two different workers stopping concurrently;
+- the wake reader consuming the actual asking note;
+- shell metacharacters in reply words remaining data.
+
+Baseline controls using main's notify in the independent fixture:
+main control, bridge-recovery, quoted reply: pushes=2
+main control, overlapping-stops, quoted reply: pushes=2
+main control, unquoted reply: pushes=0; asking=False
+PR head, unquoted reply: pushes=1; asking=True
+
+Both once-only failures predate this PR for quoted replies. The marker fix works;
+the documented once-only behavior also fails for the newly recognized replies.
+The bridge recovery is a supported internal prompt and supplies no owner answer.
+The concurrency probe holds two successful notification responses until both
+overlapping Stop hooks have passed the deduplication check, within the hook budget.
+
+Exposure/security review: no finding in the PR diff, commit messages or description.
+No new command evaluation, network calls, permission changes or fork execution.
+Production files and the pull request branch were not changed.
+
+verdict: broke
