@@ -333,10 +333,12 @@ on_stop() {
   # Overlapping deliveries of a stop share its question and successful-send receipt.
   # Do not wait on a live delivery: its network calls already use the hook's time budget.
   # Keep the lock file in place; flock releases it when this hook exits, even on failure.
-  [[ -d $worktree ]] || return 0
-  (umask 077; mkdir -p "$notes" && touch "$notes/$name.notify.lock") || return 0
-  exec 9>"$notes/$name.notify.lock" || return 0
-  flock --nonblock 9 || return 0
+  # A removed worktree has no receipts; keep its existing best-effort ring without notes.
+  if [[ -d $worktree ]]; then
+    (umask 077; mkdir -p "$notes" && touch "$notes/$name.notify.lock") || return 0
+    exec 9>"$notes/$name.notify.lock" || return 0
+    flock --nonblock 9 || return 0
+  fi
   # Permission dialogs and the question tool continue this same turn when answered. A
   # later Stop proves that interaction ended; a refused merge still becomes an owner
   # block below when the last message asks for permission to retry it.
