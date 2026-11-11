@@ -64,6 +64,92 @@ def _waiting(workflow: Workflow, name: str = "ticket-7", since: int = _NOW - 300
 # 1. Cache keep-alive.
 
 
+def _codex_waiting(workflow: Workflow, since: int = _NOW - 3000) -> Path:
+    notes = _waiting(workflow, since=since)
+    notes.with_suffix(".codex").touch()
+    notes.with_suffix(".bridge-stopped").touch()
+    notes.with_suffix(".codex-turn.json").write_text(json.dumps({
+        "last-assistant-message": "Waiting for the background job.", "turn-id": "wait-1",
+    }))
+    workflow.running("codex-7")
+    workflow.screen("• Waiting for the background job.\n\n› \n\n  ? for shortcuts\n", "codex-7")
+    return notes
+
+
+def test_codex_gets_one_native_status_per_wait_without_an_owner_answer(workflow: Workflow) -> None:
+    notes = _codex_waiting(workflow, since=_NOW - 2999)
+    _tick(workflow, _NOW)
+    assert _typed(workflow, "codex-7", "Status") == []
+
+    _tick(workflow, _NOW + 1)
+    _tick(workflow, _NOW + 600)
+
+    assert len(_typed(workflow, "codex-7", "Status")) == 1
+    assert _keys(workflow, "codex-7") == [_STATUS, "Enter"]
+    assert workflow.calls("tmux ticket-7 send-keys") == []
+    assert not notes.with_suffix(".owner-reply").exists()
+    assert not notes.with_suffix(".codex-answered").exists()
+    assert notes.with_suffix(".codex-followed-up").read_bytes() == notes.with_suffix(".codex-turn.json").read_bytes()
+    assert not notes.with_suffix(".job-wait").exists()
+
+    # A later notify waiting stop begins a new stretch.
+    _written(notes.with_suffix(".job-wait"), _NOW + 600)
+    _tick(workflow, _NOW + 3599)
+    assert len(_typed(workflow, "codex-7", "Status")) == 1
+    _tick(workflow, _NOW + 3600)
+    assert len(_typed(workflow, "codex-7", "Status")) == 2
+
+
+@pytest.mark.parametrize("case", [
+    "asking", "owner-blocked", "interaction-blocked", "owner-reply",
+    "running", "native input", "bridge input", "permission", "limit", "question on screen",
+])
+def test_codex_status_leaves_questions_turns_and_input_alone(workflow: Workflow, case: str) -> None:
+    notes = _codex_waiting(workflow)
+    if case in ("asking", "owner-blocked", "interaction-blocked", "owner-reply"):
+        notes.with_suffix(f".{case}").write_text("pending")
+    elif case == "running":
+        workflow.screen("• Working (1m • esc to interrupt)\n\n› \n\n  ? for shortcuts\n", "codex-7")
+    elif case in ("native input", "bridge input"):
+        target = "codex-7" if case == "native input" else "ticket-7"
+        (workflow.state / f"input-{target}").write_text("Owner draft")
+    elif case == "permission":
+        workflow.screen("› \nPress enter to confirm or esc to cancel\n", "codex-7")
+    elif case == "limit":
+        workflow.screen("■ You've hit your usage limit.\n› \n", "codex-7")
+    else:
+        workflow.screen("● Should the limit be 3 or 5? Reply 1 or 2.\n" + _BOX, "ticket-7")
+
+    _tick(workflow, _NOW)
+
+    assert workflow.calls("tmux codex-7 send-keys") == []
+    assert workflow.calls("tmux ticket-7 send-keys") == []
+    assert notes.with_suffix(".job-wait").exists()
+    assert not notes.with_suffix(".codex-answered").exists()
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_codex_wait_state_follows_the_native_turn(workflow: Workflow, running: bool) -> None:
+    _codex_waiting(workflow)
+    if running:
+        workflow.screen("• Working (1m • esc to interrupt)\n\n› \n", "codex-7")
+    listed = workflow.run("list")
+    assert listed.returncode == 0, listed.stderr
+    assert listed.stdout.startswith("ticket-7  " + ("busy" if running else "idle"))
+
+
+def test_codex_status_recovery_is_bounded_and_does_not_answer(workflow: Workflow) -> None:
+    notes = _codex_waiting(workflow)
+    (workflow.state / "swallow-enter-codex-7").write_text("100")
+    for n in range(6):
+        workflow.run_script("tick", env={"WORKFLOW_NOW": str(_NOW + 180 * n)})
+
+    assert _keys(workflow, "codex-7") == [_STATUS] + ["Enter"] * 5
+    assert notes.with_suffix(".job-wait").exists()
+    assert not notes.with_suffix(".codex-answered").exists()
+    assert _pending(workflow) == ["stuck? ticket-7 (status message not taken; its text stays in the box)"]
+
+
 @pytest.mark.parametrize("name", ["ticket-7", "review-7"])
 def test_a_session_waiting_50_minutes_gets_one_status_check_and_it_is_logged(
     workflow: Workflow, name: str

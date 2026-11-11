@@ -38,6 +38,20 @@ def _wake(
     return workflow.run_script("wake", *woken, env=at or _at(23, 0))
 
 
+def test_check_in_lists_a_codex_worker_idle_on_its_own_job(night: Workflow) -> None:
+    night.notes(7).mkdir(parents=True, exist_ok=True)
+    for suffix in ("codex", "job-wait", "bridge-stopped"):
+        (night.notes(7) / f"ticket-7.{suffix}").touch()
+    night.running("codex-7")
+    night.screen("• Waiting for the background job.\n\n› \n", "codex-7")
+    night.orchestrator("idle")
+
+    done = _wake(night)
+
+    assert done.returncode == 0, done.stderr
+    assert "Sessions: ticket-7 idle." in night.sent()[-1]
+
+
 @pytest.mark.parametrize("git_environment", [False, True])
 def test_check_in_names_the_installed_shipline_commit(night: Workflow, git_environment: bool) -> None:
     home = install_shipline(night)
