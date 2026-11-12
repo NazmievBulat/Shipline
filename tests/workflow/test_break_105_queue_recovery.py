@@ -281,7 +281,46 @@ def test_a_run_that_starts_during_capacity_reads_is_left_alone(github, stage):
     assert after == original, "recovery pushed a replacement commit after the retry had started"
 
 
-def test_a_transient_refresh_push_failure_recovers_without_a_review_handoff(github):
+@pytest.mark.parametrize("accepted,published_metadata", [(False, False), (True, False), (True, True)])
+def test_a_transient_refresh_push_failure_recovers_without_a_review_handoff(github, accepted, published_metadata):
+    target = worktree(github)
+    run = queued(github)
+    retry(github, run)
+    github.workflow.fake("git", '''#!/bin/bash
+if [[ $1 == push && -e "@STATE@/breaker-push-unavailable" ]]; then
+  if [[ -e "@STATE@/breaker-push-accepted" ]]; then /usr/bin/git "$@" || exit $?; fi
+  echo 'fatal: unable to access remote: HTTP 503' >&2
+  exit 1
+fi
+exec /usr/bin/git "$@"
+''')
+    unavailable = github.workflow.state / "breaker-push-unavailable"
+    unavailable.touch()
+    if accepted:
+        (github.workflow.state / "breaker-push-accepted").touch()
+    good(recover(github))
+    commit = github.workflow.git("rev-parse", "HEAD", cwd=target)
+    assert commit != github.head
+    assert origin_head(github) == (commit if accepted else github.head)
+    receipt = folder(github) / "merge-refresh-7.json"
+    assert json.loads(receipt.read_text())["commit"] == commit
+    assert receipt.stat().st_mode & 0o077 == 0
+    unavailable.unlink()
+    if accepted and published_metadata:
+        github.pulls["7"]["headRefOid"] = commit
+    for _ in range(3):
+        good(recover(github))
+    after = origin_head(github)
+    before = github.head
+    assert after != before, "the recovered remote never receives the locally created recovery commit"
+    assert after == commit
+    assert github.workflow.git("show", "-s", "--format=%P", after) == before
+    assert not receipt.exists()
+    assert json.loads((folder(github) / "merge-train.json").read_text())["reruns"]["7"] == after
+
+
+@pytest.mark.parametrize("change", ["dirty", "local head", "remote head"])
+def test_a_saved_recovery_does_not_push_after_its_worktree_or_remote_changes(github, change):
     target = worktree(github)
     run = queued(github)
     retry(github, run)
@@ -295,14 +334,21 @@ exec /usr/bin/git "$@"
     unavailable = github.workflow.state / "breaker-push-unavailable"
     unavailable.touch()
     good(recover(github))
-    assert origin_head(github) == github.head
-    assert github.workflow.git("rev-parse", "HEAD", cwd=target) != github.head
+    commit = github.workflow.git("rev-parse", "HEAD", cwd=target)
+    assert commit != github.head
     unavailable.unlink()
-    for _ in range(3):
-        good(recover(github))
-    after = origin_head(github)
-    before = github.head
-    assert after != before, "the recovered remote never receives the locally created recovery commit"
+    if change == "dirty":
+        (target / "shared.txt").write_text("uncommitted\n")
+    else:
+        github.workflow.git("commit", "--allow-empty", "-m", "another change", cwd=target)
+        if change == "remote head":
+            github.workflow.git("push", "origin", "HEAD:ticket/seven", cwd=target)
+            github.workflow.git("reset", "--hard", commit, cwd=target)
+    before = origin_head(github)
+    good(recover(github))
+    assert origin_head(github) == before
+    if change == "dirty":
+        assert (target / "shared.txt").read_text() == "uncommitted\n"
 
 
 def test_sent_notices_are_not_created_again_after_restart(github):

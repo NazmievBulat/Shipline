@@ -494,21 +494,25 @@ def refresh_pull(
 def _commit_and_push(
     pull: dict[str, Any], train: "Train", number: str, message: str, *,
     save: bool = False, base: str | None = None, rerun: bool = False,
+    queue_recovery: bool = False,
 ) -> None:
     git("commit", "--allow-empty", "-m", message)
     clear_generated(Path.cwd())
     note = Handoff.read(train.path.parent, number)
     refresh = None
-    if base is not None and note is not None:
+    if base is not None and (note is not None or queue_recovery):
         refresh = {
             "head": pull["headRefOid"],
             "branch": pull["headRefName"],
-            "round": note.round,
+            "round": note.round if note is not None else None,
             "commit": git("rev-parse", "HEAD"),
             "base": base,
             "failures": 0,
             **({"rerun": True} if rerun else {}),
+            **({"queue_recovery": True} if queue_recovery else {}),
         }
+        if queue_recovery:
+            write_json(train.path.parent / f"merge-refresh-{number}.json", refresh)
     _push_refreshed(pull, train, number, save=save, refresh=refresh)
 
 
@@ -662,7 +666,7 @@ def saved_refresh(folder: Path, number: str, note: Handoff | None) -> dict[str, 
         or pending["branch"] != note.branch
         or pending["round"] != note.round
         or type(pending["failures"]) is not int
-        or not 1 <= pending["failures"] < 3
+        or not (0 if pending.get("queue_recovery") else 1) <= pending["failures"] < 3
     ):
         raise Refused("the saved refresh no longer matches the passed review handoff")
     return pending

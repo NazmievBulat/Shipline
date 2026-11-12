@@ -611,7 +611,7 @@ def rerun_lost(
         raise Refused(f"{what}; the pull request worktree has uncommitted changes")
     _commit_and_push(
         pull, train, number, f"ci: run CI again, {what}",
-        base=base, rerun=True,
+        base=base, rerun=True, queue_recovery=never_started,
     )
     train.reruns[number] = git("rev-parse", "HEAD")
     train.save()
