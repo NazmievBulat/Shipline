@@ -70,7 +70,9 @@ def _queue_notes(github: GitHub) -> list[dict[str, Any]]:
 def _stuck_retry(github: GitHub, run: dict[str, Any]) -> None:
     assert _recover_queue(github).returncode == 0
     run.update(status="completed", conclusion="cancelled")
-    assert _recover_queue(github).returncode == 0
+    # GitHub can keep showing the cancelled first attempt after accepting its rerun.
+    for _ in range(3):
+        assert _recover_queue(github).returncode == 0
     run.update(status="queued", conclusion=None, run_attempt=2)
     github.api[f"{_REPO}/actions/runs/{run['id']}/jobs?per_page=100"] = {
         "jobs": [{"id": 201, "run_attempt": 2, "status": "queued", "created_at": _stamp(3600)}]

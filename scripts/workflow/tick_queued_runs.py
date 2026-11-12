@@ -154,7 +154,11 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
                 save()
             continue
         if run.get("status") != "queued" or entry.get("state") == "refused":
-            if run.get("status") == "completed":
+            awaiting_retry = (
+                entry.get("state") == "rerun requested" and attempt == 1
+                and run.get("conclusion") == "cancelled"
+            )
+            if run.get("status") == "completed" and not awaiting_retry:
                 entry["state"] = "finished"
                 save()
             continue
