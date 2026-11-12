@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import merge_gate as gate
+import train_reads
 from merge_driver import _worktree
 from merge_handoff import write_json
 
@@ -71,6 +72,7 @@ def _request(entry: dict[str, Any], save: Callable[[], None], state: str, *args:
         save()
 
     entry["state"] = state
+    entry["requested_at"] = time.time()
     save()  # A restart never repeats a request GitHub accepted but has not reflected yet.
     try:
         gate.command("gh", *args)
@@ -88,6 +90,12 @@ def _request(entry: dict[str, Any], save: Callable[[], None], state: str, *args:
             entry["state"] = "refused"
             save()
         raise
+    finally:
+        # A following driver must not reuse a pre-cancellation planning response.
+        if gate._planning_reads is not None:
+            gate._planning_reads.invalidate()
+        elif tick := train_reads.tick():
+            train_reads.save(tick / "api.json", {})
 
 
 def _refresh(folder: Path, number: str, pull: dict[str, Any], run: dict[str, Any], workflow: str) -> None:
@@ -210,6 +218,7 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
                 or _unstarted(current) is None):
                 continue
             _notice(folder, number, run, workflow, "stuck", "requesting cancellation and one rerun")
+            entry["head"] = head
             entry["retry_attempt"] = attempt
             _request(entry, save, "cancel requested", "api", "-X", "POST",
                      f"{gate.API}/actions/runs/{key}/cancel")
@@ -235,6 +244,8 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
                 _notice(folder, number, run, workflow, "stuck", reason)
                 continue
             data["heads"][identity] = key
+            entry["pushed_head"] = gate.Train(folder).reruns[number]
+            entry["pushed_at"] = time.time()
             save()
             _notice(folder, number, run, workflow, "stuck", "an empty commit was pushed to run CI again")
 

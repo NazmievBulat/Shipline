@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from workflow_harness import Workflow
+from workflow.test_merge_driver import handed as handed_fixture
 from workflow.test_merge_when_current import (
     GitHub,
     blocked_first,
@@ -23,6 +24,7 @@ from workflow.test_merge_when_current import (
 )
 
 github = github_fixture
+handed = handed_fixture
 
 _REPO = "repos/example-org/example-app"
 
@@ -326,6 +328,83 @@ def test_a_manual_retry_does_not_jump_a_job_waiting_before_that_attempt(github: 
     done = _recover_queue(github)
     assert done.returncode == 0, done.stderr
     assert not github.workflow.calls(f"gh api -X POST {_REPO}/actions/runs/20/cancel")
+
+
+def _cancelled_recovery(handed: GitHub) -> dict[str, Any]:
+    run = _never_started(handed)
+    handed.api[
+        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
+    ]["workflow_runs"] = [run]
+    assert _recover_queue(handed).returncode == 0
+    run.update(status="completed", conclusion="cancelled")
+    handed.pulls["7"]["statusCheckRollup"] = [{
+        "__typename": "CheckRun", "name": "CI result", "status": "COMPLETED",
+        "conclusion": "CANCELLED",
+        "detailsUrl": "https://github.com/example-org/example-app/actions/runs/20/job/21",
+    }]
+    return run
+
+
+@pytest.mark.parametrize("stage", ["cancelled", "rerun metadata", "retry queued"])
+def test_recovery_cancellation_keeps_the_passed_review_handoff(handed: GitHub, stage: str) -> None:
+    run = _cancelled_recovery(handed)
+    if stage != "cancelled":
+        assert _recover_queue(handed).returncode == 0
+    if stage == "retry queued":
+        run.update(status="queued", conclusion=None, run_attempt=2)
+    handed.save()
+    done = handed.workflow.run_python("merge_driver.py")
+    assert done.returncode == 0, done.stdout + done.stderr
+    folder = handed.workflow.repo / ".local/workflow"
+    assert (folder / "merge-wanted-7").exists(), done.stdout + done.stderr
+    assert not (folder / "merge-review-7").exists(), done.stdout + done.stderr
+    assert not (handed.workflow.state / "merged").exists()
+    assert not any(" new-session " in call for call in handed.workflow.calls("tmux"))
+
+
+@pytest.mark.parametrize("problem", ["expired", "head", "run", "attempt", "failure", "check failure", "abandoned"])
+def test_recovery_pending_does_not_hide_other_failures(handed: GitHub, problem: str) -> None:
+    run = _cancelled_recovery(handed)
+    path = handed.workflow.repo / ".local/workflow/never-started-runs.json"
+    data = json.loads(path.read_text())
+    entry = data["runs"]["20"]
+    if problem == "expired":
+        entry["requested_at"] -= 86400
+    elif problem == "head":
+        entry["head"] = handed.base
+    elif problem == "run":
+        data["runs"]["999"] = data["runs"].pop("20")
+    elif problem == "attempt":
+        run["run_attempt"] = 2
+    elif problem == "failure":
+        run["conclusion"] = "failure"
+    elif problem == "check failure":
+        handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    else:
+        entry["state"] = "refused"
+    path.write_text(json.dumps(data))
+    handed.save()
+    done = handed.workflow.run_python("merge_driver.py")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not (path.parent / "merge-wanted-7").exists(), done.stdout + done.stderr
+    assert (path.parent / "merge-review-7").exists(), done.stdout + done.stderr
+
+
+def test_an_empty_commit_keeps_its_handoff_while_github_shows_the_old_head(handed: GitHub) -> None:
+    run = _never_started(handed)
+    _stuck_retry(handed, run)
+    assert _recover_queue(handed).returncode == 0
+    published = _origin(handed)
+    assert published != handed.head
+    handed.save()
+    for _ in range(2):
+        done = handed.workflow.run_python("merge_driver.py")
+        assert done.returncode == 0, done.stdout + done.stderr
+        folder = handed.workflow.repo / ".local/workflow"
+        note = folder / "merge-wanted-7"
+        assert note.exists(), done.stdout + done.stderr
+        assert json.loads(note.read_text())["head"] == published
+        assert not (folder / "merge-review-7").exists()
 
 
 def _ci_run(github: GitHub, head: str) -> dict[str, Any]:

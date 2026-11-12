@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import check_repair
 from merge_health import Health
 from merge_train import Train
 
@@ -161,7 +162,7 @@ def verdict(
     images: bool = False,
     plan: str | None = None,
 ) -> tuple[str, list[str]]:
-    from merge_gate import CI_RESULT, IMAGES_PLAN, cancelled_inherited, lender_replanning
+    from merge_gate import CONFIG, CI_RESULT, IMAGES_PLAN, cancelled_inherited, lender_replanning
 
     label = plan or ("Images" if images else CI_RESULT)
     plan = plan or (IMAGES_PLAN if images else CI_RESULT)
@@ -170,6 +171,12 @@ def verdict(
         job["name"] for job in parts if job.get("conclusion") not in (None, "success", "skipped")
     ]
     settled = (None, "success", "skipped", "cancelled")
+    if (
+        run.get("conclusion") in (None, "cancelled")
+        and all(job.get("conclusion") in settled for job in parts)
+        and check_repair.never_started_pending(CONFIG.state(), run)
+    ):
+        return "pending", [plan]
     if (
         run.get("conclusion") in (None, "cancelled")
         and all(job.get("conclusion") in settled for job in parts)
@@ -674,9 +681,22 @@ def _failed_rollup(pull: dict[str, Any]) -> list[dict[str, Any]]:
             check.get("conclusion")
             in ("FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE")
             and not _lender_cancelled_check(check, pull.get("headRefOid"))
+            and not _never_started_cancelled_check(check, pull.get("headRefOid"))
         )
         or check.get("state") in ("FAILURE", "ERROR")
     ]
+
+
+def _never_started_cancelled_check(check: dict[str, Any], head: str | None) -> bool:
+    from merge_gate import API, CONFIG, api
+
+    match = re.search(r"/actions/runs/(\d+)(?:/|$)", check.get("detailsUrl") or "")
+    folder = CONFIG.state()
+    if (check.get("conclusion") != "CANCELLED" or not match
+        or check_repair.never_started_claim(folder, match[1], head) is None):
+        return False
+    found = api(f"{API}/actions/runs/{match[1]}", paginate=False, fresh=True)
+    return check_repair.never_started_pending(folder, found)
 
 
 def failed_checks(pull: dict[str, Any]) -> bool:

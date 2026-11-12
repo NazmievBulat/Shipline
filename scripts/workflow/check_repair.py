@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -334,7 +335,14 @@ def diagnose(pull: dict[str, Any], *, folder: Path | None = None) -> Diagnosis:
     for workflow in ("ci", "images", "e2e"):
         latest = gate.runs(workflow, head, pull=True)[:1]
         for found in latest:
-            if folder is not None and retry_requested(folder, found):
+            recovering = never_started_pending(folder, found) if folder is not None else False
+            genuine_failure = any(
+                check.get("conclusion") in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STALE")
+                or check.get("state") in ("FAILURE", "ERROR")
+                for check in gate.own_checks(pull)
+            )
+            if (folder is not None and retry_requested(folder, found)
+                and not (recovering and genuine_failure)):
                 raise gate.Waiting(_REQUESTED.format(run=found["id"]))
             if found.get("status") != "completed":
                 raise gate.Waiting(f"run {found['id']} of the failed head is still running")
@@ -474,7 +482,10 @@ def runner_wait(
     """A red scratch run waits for completion, then gets the handoff's one runner retry."""
     import merge_gate as gate
 
-    if retry_requested(folder, found):
+    if retry_requested(folder, found) and not (
+        never_started_pending(folder, found)
+        and any(job.get("conclusion") not in (None, "success", "skipped", "cancelled") for job in parts)
+    ):
         return _REQUESTED.format(run=found["id"])
     if found.get("status") != "completed" or any(
         job.get("status") != "completed" for job in parts
@@ -523,11 +534,54 @@ def _state(claim: Path) -> str:
         return "claim"
 
 
+def never_started_claim(folder: Path, run_id: Any, head: str | None) -> dict[str, Any] | None:
+    """Only a recent, owned cancellation can stand in for a check still pending."""
+    try:
+        note = json.loads((folder / "never-started-runs.json").read_text())["runs"][str(run_id)]
+        limit = max(180, workflow_config.current().merge_train.queued_limit_minutes * 60)
+        if (
+            head is not None and _SHA.fullmatch(head) and note["head"] == head
+            and type(note["retry_attempt"]) is int and note["retry_attempt"] >= 1
+            and note["state"] in ("cancel requested", "cancel retry", "rerun requested")
+            and 0 <= time.time() - note["requested_at"] <= limit
+        ):
+            return note
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def never_started_pending(folder: Path, found: dict[str, Any]) -> bool:
+    note = never_started_claim(folder, found.get("id"), found.get("head_sha"))
+    if note is None:
+        return False
+    attempt = found.get("run_attempt")
+    return (
+        attempt == note["retry_attempt"] and found.get("conclusion") in (None, "cancelled")
+        or attempt == note["retry_attempt"] + 1
+        and found.get("status") != "completed" and found.get("conclusion") is None
+    )
+
+
+def never_started_push_pending(folder: Path, number: str, before: str, after: str) -> bool:
+    """GitHub may briefly show the old head after the recovery's own empty commit push."""
+    try:
+        data = json.loads((folder / "never-started-runs.json").read_text())
+        note = data["runs"][data["heads"][f"{number}-{before}"]]
+        limit = max(180, workflow_config.current().merge_train.queued_limit_minutes * 60)
+        return (
+            note["head"] == before and note["pushed_head"] == after
+            and 0 <= time.time() - note["pushed_at"] <= limit
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def retry_requested(folder: Path, found: dict[str, Any]) -> bool:
     """The run list still shows attempt 1 of a retry already claimed or requested. Its jobs
     may already be the next attempt's; wait for matching run metadata before diagnosing."""
     claim = marker(folder, found["id"])
-    return (
+    return never_started_pending(folder, found) or (
         found.get("run_attempt") == 1
         and claim.exists()
         and _state(claim) in ("claim", "requested")
@@ -550,8 +604,8 @@ def rerun_running(folder: Path, pull: dict[str, Any]) -> str | None:
 
     for workflow in ("ci", "images", "e2e"):
         for found in gate.runs(workflow, pull["headRefOid"], pull=True)[:1]:
-            if marker(folder, found["id"]).exists() and (
-                retry_requested(folder, found) or found.get("conclusion") != "failure"
+            if retry_requested(folder, found) or (
+                marker(folder, found["id"]).exists() and found.get("conclusion") != "failure"
             ):
                 return f"the re-run of run {found['id']} is running"
     return None

@@ -145,6 +145,9 @@ limit, the tick pushes one empty commit from the clean pull request worktree, us
 lost-check push safeguards. A second stuck run on the same head gets no second push.
 Runs on `main` are only reported. Each stuck attempt is named once in the wake, and the
 metrics count these cases with lost checks. A shadow tick changes none of this state.
+The gate keeps the passed review while a matching, recent recovery cancellation or its
+published empty commit waits for GitHub's metadata; an unrelated or failed later attempt
+still reaches the ordinary failure handling.
 How many it tests, the window, starts at 4, grows by one after each
 merge and halves after a failed prefix, never below 1 and never above 4 (`WINDOW_CEILING` in
 `scripts/workflow/merge_gate.py`). A member merges as soon as its own prefix passed and every
