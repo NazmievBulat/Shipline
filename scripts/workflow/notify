@@ -492,6 +492,8 @@ on_recheck() {
   else
     message=$(cat "$saved") || return 0
   fi
+  # Completion takes precedence over quoted question markers, as it does on Stop.
+  session_finished "$message" && return 0
   receipt=""
   [[ ! -r $notes/$name.question-tested ]] || receipt=$(<"$notes/$name.question-tested")
   if [[ $receipt == "$identity false" ]]; then

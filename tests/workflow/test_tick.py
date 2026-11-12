@@ -2075,13 +2075,15 @@ def test_tick_recovers_a_saved_question_once(workflow: Workflow, name: str, code
 
 
 @pytest.mark.parametrize("case", ["progress", "running", "asking", "limit", "hunt", "audit",
-                                  "answered", "followed-up", "shadow"])
+                                  "answered", "followed-up", "shadow", "finished"])
 def test_tick_leaves_other_saved_messages_alone(workflow: Workflow, case: str) -> None:
     name = "audit-7" if case == "audit" else "ticket-7"
     saved = _saved_idle_message(workflow, name, codex=case in ("answered", "followed-up"),
                                 message="Tests passed. I will push next." if case == "progress"
                                 else _SAVED_QUESTION)
     notes = saved.parent
+    if case == "finished":
+        saved.write_text(_SAVED_QUESTION + "\n\nWorker finished.\n")
     if case == "running":
         (notes / f"{name}.idle").unlink()
     elif case == "asking":
