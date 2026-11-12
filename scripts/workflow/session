@@ -320,8 +320,10 @@ list_worktrees() {
 # limit after which its instruction was sent again, the reset of the limit it said it stopped
 # on). None of it is true of the next session.
 forget_notes() {
+  rm -f "$1.stop-message"
   rm -f "$1.url" "$1.idle" "$1.pushed" "$1.area" "$1.limit" "$1.limit-line" "$1.bridge-stopped" "$1.owner-blocked" "$1.interaction-blocked" "$1.limits"
   if [[ ${2:-} != keep-codex ]]; then
+    rm -f "$1.question-tested"
     rm -f "$1.waiting" "$1.checks-wait" "$1.job-wait"
     rm -f "$1.capacity"
     rm -f "$1.started" "$1.codex" "$1.asking" "$1.resent" "$1.codex-delivered" "$1.codex-answered" "$1.codex-followed-up" "$1.codex-quota-delivered" "$1.codex-approval-delivered" "$1.codex-recovery-error" "$1.owner-reply"

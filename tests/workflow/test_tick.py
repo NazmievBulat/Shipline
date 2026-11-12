@@ -7,6 +7,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from workflow_harness import Workflow, instruction
@@ -2092,8 +2093,7 @@ def test_tick_leaves_other_saved_messages_alone(workflow: Workflow, case: str) -
     elif case == "hunt":
         # A hunt's notes never enter the ticket/review recovery pass.
         workflow.running("hunt-example-app")
-        hunt = workflow.hunt_worktree("example-app") / ".local/workflow"
-        hunt.mkdir(parents=True, exist_ok=True)
+        hunt = workflow.add_hunt("example-app") / ".local/workflow"
         (hunt / "hunt-example-app.idle").touch()
         (hunt / "hunt-example-app.stop-message").write_text(_SAVED_QUESTION)
         saved.unlink()
@@ -2103,6 +2103,8 @@ def test_tick_leaves_other_saved_messages_alone(workflow: Workflow, case: str) -
     assert workflow.pushes() == []
     if case != "asking":
         assert not (notes / f"{name}.asking").exists()
+    if case == "hunt":
+        assert not (hunt / "hunt-example-app.asking").exists()
 
 
 def test_tick_tests_a_message_once_per_question_function_version(workflow: Workflow) -> None:
@@ -2133,3 +2135,60 @@ def test_recovered_question_with_a_push_receipt_does_not_ring_again(workflow: Wo
     workflow.run_script("tick", env={"WORKFLOW_NOW": "1790000000"})
     assert (saved.parent / "ticket-7.asking").exists()
     assert workflow.pushes() == []
+
+
+
+def test_tick_recovers_a_stop_missed_by_the_previous_question_test(workflow: Workflow) -> None:
+    saved = _saved_idle_message(workflow)
+    saved.unlink()
+    notify = workflow.script.with_name("notify")
+    current = notify.read_text()
+    notify.write_text(current.replace("asks_owner() {\n", "asks_owner() {\n  return 1\n"))
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _SAVED_QUESTION})
+    assert not (saved.parent / "ticket-7.asking").exists()
+    assert workflow.pushes() == []
+    assert saved.read_text().strip() == _SAVED_QUESTION
+    os.utime(saved, (1_789_999_400, 1_789_999_400))
+    notify.write_text(current)
+    for _ in range(2):
+        done = workflow.run_script("tick", env={"WORKFLOW_NOW": "1790000000"})
+        assert done.returncode == 0, done.stderr
+    assert len(workflow.pushes()) == 1
+    assert (saved.parent / "ticket-7.asking").read_text().split()[0] == "1789999400"
+
+
+def test_overlapping_rechecks_and_a_later_stop_share_the_push_receipt(workflow: Workflow) -> None:
+    saved = _saved_idle_message(workflow)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        calls = [workers.submit(workflow.run_script, "notify", "recheck",
+                                env={"WORKFLOW_SESSION": "ticket-7"}) for _ in range(2)]
+        for call in calls:
+            assert call.result(timeout=30).returncode == 0
+    asked = (saved.parent / "ticket-7.asking").read_text()
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _SAVED_QUESTION})
+    assert (saved.parent / "ticket-7.asking").read_text() == asked
+    assert len(workflow.pushes()) == 1
+
+
+def test_partial_recovery_uses_the_cached_result_without_another_test(workflow: Workflow) -> None:
+    saved = _saved_idle_message(workflow)
+    notify = workflow.script.with_name("notify")
+    notify.write_text(notify.read_text().replace(
+        "asks_owner() {\n", 'asks_owner() {\n  echo tested >> "$notes/$name.question-tests"\n'))
+    env = {"WORKFLOW_SESSION": "ticket-7"}
+    workflow.run_script("notify", "recheck", env=env)
+    (saved.parent / "ticket-7.asking").unlink()
+    workflow.run_script("notify", "recheck", env=env)
+    assert (saved.parent / "ticket-7.asking").exists()
+    assert (saved.parent / "ticket-7.question-tests").read_text().splitlines() == ["tested"]
+    assert len(workflow.pushes()) == 1
+
+
+def test_a_new_saved_message_is_tested_on_the_same_function_version(workflow: Workflow) -> None:
+    saved = _saved_idle_message(workflow, message="The tests passed.")
+    env = {"WORKFLOW_SESSION": "ticket-7"}
+    workflow.run_script("notify", "recheck", env=env)
+    assert workflow.pushes() == []
+    saved.write_text(_SAVED_QUESTION + "\n")
+    workflow.run_script("notify", "recheck", env=env)
+    assert len(workflow.pushes()) == 1

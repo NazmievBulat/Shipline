@@ -20,6 +20,9 @@
 #                       waiting, so the tick can wake it when its checks finish, and every
 #                       session notes when it began to wait, so the tick can keep its cache
 #
+# `notify recheck` tests an idle worker/reviewer's saved message after an update, using
+# the same asks_owner function and successful-send receipt as Stop.
+#
 # `notify workflow` reads a persistent workflow fault from stdin, without WORKFLOW_SESSION.
 # Other modes do nothing unless WORKFLOW_SESSION names a worker (`ticket-N`), an audit (`audit-N`) or
 # a hunt (`hunt-<name>`), so the orchestrator and sessions started by hand never ring. A hook must never block or fail
@@ -114,7 +117,7 @@ if [[ ${1:-} == codex ]]; then
     {hook_event_name: "Stop", last_assistant_message: .["last-assistant-message"],
      turn_id: .["turn-id"], thread_id: .["thread-id"]} |
     select(.last_assistant_message | type == "string")' <<<"${2:-}" 2>/dev/null) || exit 0
-elif [[ ${1:-} != waiting ]]; then
+elif [[ ${1:-} != waiting && ${1:-} != recheck ]]; then
   event=$(cat)
 fi
 # A hook's output reaches the session, so nothing is printed from here on.
@@ -328,17 +331,21 @@ stopped_on_limit() {
   limit_at=$(((limit_at + 60 + 59) / 60 * 60))
 }
 
-on_stop() {
-  local message limit_at asked="" sum
+lock_stop() {
   # Overlapping deliveries of a stop share its question and successful-send receipt.
   # Do not wait on a live delivery: its network calls already use the hook's time budget.
   # Keep the lock file in place; flock releases it when this hook exits, even on failure.
   # A removed worktree has no receipts; keep its existing best-effort ring without notes.
   if [[ -d $worktree ]]; then
-    (umask 077; mkdir -p "$notes" && touch "$notes/$name.notify.lock") || return 0
-    exec 9>"$notes/$name.notify.lock" || return 0
-    flock --nonblock 9 || return 0
+    (umask 077; mkdir -p "$notes" && touch "$notes/$name.notify.lock") || return 1
+    exec 9>"$notes/$name.notify.lock" || return 1
+    flock --nonblock 9 || return 1
   fi
+}
+
+on_stop() {
+  local message limit_at asked="" temporary
+  lock_stop || return 0
   # Permission dialogs and the question tool continue this same turn when answered. A
   # later Stop proves that interaction ended; a refused merge still becomes an owner
   # block below when the last message asks for permission to retry it.
@@ -348,6 +355,13 @@ on_stop() {
   rm -f "$asking" "$question"
   [[ ! -e $notes/$name.codex ]] || note "$notes/$name.bridge-stopped" ""
   message=$(field .last_assistant_message)
+  # Keep even a silent progress stop: a later question-test version may recognize it.
+  # Atomic replacement keeps the tick from reading half a message; it is private like a turn.
+  if [[ $name =~ ^(ticket|review)- && ! -e $notes/$name.codex && -d $worktree ]]; then
+    temporary=$(mktemp "$notes/$name.stop.XXXXXX") || return 0
+    printf '%s\n' "$message" >"$temporary" && mv "$temporary" "$notes/$name.stop-message"
+    rm -f "$temporary"
+  fi
   # Stopped by the usage limit, the session is neither working nor waiting for the owner: the
   # tick sends it its instruction again after the reset. A hunt is not woken. This holds after
   # `notify waiting` too, so the tick never keeps such a session's cache alive.
@@ -387,14 +401,19 @@ on_stop() {
       if said_finished "review sent back" "$message"; then
         [[ $(cd "$main" && timeout "$ANSWER_SECONDS" gh pr view "$number" --json isDraft --jq .isDraft) != true ]] || return 0
       fi
-      # Record the block even when Pushover fails. No automatic check nudge is an answer
-      # to a question, including permission to retry a refused merge.
-      note "$notes/$name.owner-blocked" ""
       ;;
     audit-*) audit_is_blocked "$message" || return 0 ;;
     # A hunt asks the owner nothing. One that stops before its report is done could not go on.
     hunt-*) ! said_finished "hunt finished" "$message" || return 0 ;;
   esac
+  publish_question "$message" "${WORKFLOW_NOW:-$(date +%s)}" "$asked"
+}
+
+# Stop delivery and recovery share the asking note, reviewer block and push receipt.
+publish_question() {
+  local message=$1 at=$2 asked=${3:-} known=${4:-} sum
+  # Even a failed push leaves a reviewer blocked; automatic check nudges answer nothing.
+  [[ $name != review-* ]] || note "$notes/$name.owner-blocked" ""
   # The same words after a turn of the session's own (its job ended) are the same question,
   # asked since the first time; other words are a new one. A Codex bridge counts too: its stop
   # shows Codex's last message.
@@ -403,15 +422,16 @@ on_stop() {
   if [[ -n $asked && ${asked#* } == "$sum" ]]; then
     note "$asking" "$asked"
   else
-    note "$asking" "${WORKFLOW_NOW:-$(date +%s)} $sum"
+    note "$asking" "$at $sum"
   fi
   # A Codex bridge relays and never answers; a hunt asks nothing.
-  if [[ $name =~ ^(ticket|review|audit)- && ! -e $notes/$name.codex ]] && asks_owner "$message"; then
+  if [[ $name =~ ^(ticket|review|audit)- && ! -e $notes/$name.codex ]] &&
+      { [[ $known == question ]] || asks_owner "$message"; }; then
     note "$question" "$(question_of "$message" "$(<"$asking")")"
   fi
   # A session woken by its own job that stops again with the same words rings once.
   [[ ! -e $pushed || $(<"$pushed") != "$message" ]] || return 0
-  if [[ ${1:-} == codex || -e $notes/$name.codex ]]; then
+  if [[ -e $notes/$name.codex ]]; then
     ring "$(field '.last_assistant_message | .[-900:]')" || return 0
   else
     ring "$(beginning_of .last_assistant_message)" || return 0
@@ -419,7 +439,55 @@ on_stop() {
   note "$pushed" "$message"
 }
 
+# Called only for an idle worker/reviewer from the tick. Never replay a Stop: doing so
+# would reset waits and turn progress reports on ready pull requests into questions.
+on_recheck() {
+  local saved="$notes/$name.stop-message" message at version identity current receipt asks=false
+  [[ $name =~ ^(ticket|review)-[0-9]+$ && -d $worktree ]] || return 0
+  lock_stop || return 0
+  [[ -e $idle && ! -e $asking && ! -e $limit ]] || return 0
+  if [[ -e $notes/$name.codex ]]; then
+    saved=$notes/$name.codex-turn.json
+    cmp -s "$saved" "$notes/$name.codex-answered" && return 0
+    cmp -s "$saved" "$notes/$name.codex-followed-up" && return 0
+  fi
+  [[ -r $saved ]] || return 0
+  # Hash the actual installed function, not the whole script: unrelated edits are no
+  # reason to test the same message again. The message hash distinguishes later stops.
+  version=$(declare -f asks_owner | sha256sum) || return 0
+  identity=$(sha256sum "$saved") || return 0
+  identity="${version%% *} ${identity%% *}"
+  at=$(stat -c %Y "$saved") || return 0
+  if [[ -e $notes/$name.codex ]]; then
+    message=$(jq -er '.["last-assistant-message"] | strings' "$saved") || return 0
+  else
+    message=$(cat "$saved") || return 0
+  fi
+  receipt=""
+  [[ ! -r $notes/$name.question-tested ]] || receipt=$(<"$notes/$name.question-tested")
+  if [[ $receipt == "$identity false" ]]; then
+    return 0
+  elif [[ $receipt == "$identity true" ]]; then
+    # Resume a partial recovery without testing again; the push receipt still deduplicates.
+    asks=true
+  else
+    asks_owner "$message" && asks=true
+  fi
+  # A prompt or native callback may have replaced the message while it was tested.
+  current=$(sha256sum "$saved") || return 0
+  [[ -e $idle && ! -e $asking && ! -e $limit && ${identity#* } == "${current%% *}" ]] || return 0
+  if [[ -e $notes/$name.codex ]]; then
+    cmp -s "$saved" "$notes/$name.codex-answered" && return 0
+    cmp -s "$saved" "$notes/$name.codex-followed-up" && return 0
+  fi
+  (umask 077; note "$notes/$name.question-tested" "$identity $asks") || return 0
+  [[ $asks == true ]] || return 0
+  event=$(jq -cn --arg message "$message" '{last_assistant_message: $message}') || return 0
+  publish_question "$message" "$at" "" question
+}
+
 on_prompt() {
+  rm -f "$notes/$name.stop-message"
   rm -f "$idle" "$limit" "$notes/$name.limit-line" "$notes/$name.bridge-stopped"
   # Relay startup/recovery only displays a native turn. Its sentinel starts no new native
   # work and must retain a fast notify waiting, or a wait restored for replay.
@@ -507,6 +575,11 @@ fi
 
 if [[ ${1:-} == waiting ]]; then
   note "$waiting" ""
+  exit 0
+fi
+
+if [[ ${1:-} == recheck ]]; then
+  on_recheck
   exit 0
 fi
 

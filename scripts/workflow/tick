@@ -1043,6 +1043,16 @@ local_duties() {
   local_done=1
   running=$(session list) || tick_failed
 
+  # Recover questions that an older installed stop hook did not recognize. Notify owns
+  # both the installed question test and its once-only ring; shadow ticks never write.
+  if ((shadow == 0)); then
+    while read -r name state _; do
+      [[ $state == idle && $name =~ ^(ticket|review)-[0-9]+$ ]] || continue
+      session_current "$name" || continue
+      WORKFLOW_SESSION=$name bash "$here/notify" recheck 9>&- || tick_failed
+    done <<<"$running"
+  fi
+
   while read -r name state held _; do
     if [[ $state =~ ^(idle|limit)$ && $held =~ ^[0-9]+$ ]] && ((held > SQUEEZE_ABOVE_MB)); then
       session squeeze "$name" || tick_failed
