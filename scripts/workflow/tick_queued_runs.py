@@ -198,7 +198,16 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
             try:
                 _refresh(folder, number, pull, run, workflow)
             except gate.Refused as error:
-                _notice(folder, number, run, workflow, "stuck", str(error))
+                # Push hooks can print paths or credentials. Wake notices name the case,
+                # never copy raw command diagnostics into durable records.
+                reason = "empty commit recovery refused; the clean worktree or push needs attention"
+                if "uncommitted changes" in str(error):
+                    reason = "empty commit refused: the pull request worktree has uncommitted changes"
+                elif "not pushed for twice" in str(error):
+                    reason = "not pushed for twice on the recovery head"
+                elif isinstance(error, gate.Waiting):
+                    reason = "waiting for the empty commit recovery or its published head"
+                _notice(folder, number, run, workflow, "stuck", reason)
                 continue
             data["heads"][identity] = key
             save()
