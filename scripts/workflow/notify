@@ -557,11 +557,12 @@ publish_question() {
 # removed idle. Reclassifying a saved message never fabricates another Stop event.
 on_recheck() {
   local saved="$notes/$name.stop-message" message at identity current receipt asks=false stop_epoch
+  local asked="" sum retry=false
   [[ $name =~ ^(ticket|review)-[0-9]+$ && -d $worktree ]] || return 0
   lock_stop || return 0
   if drain_pending_stop; then return 0; fi
   stop_epoch=$(prompt_epoch)
-  [[ -e $idle && ! -e $asking && ! -e $limit ]] || return 0
+  [[ -e $idle && ! -e $limit ]] || return 0
   if [[ -e $notes/$name.codex ]]; then
     saved=$notes/$name.codex-turn.json
     cmp -s "$saved" "$notes/$name.codex-answered" && return 0
@@ -579,7 +580,17 @@ on_recheck() {
   session_finished "$message" && return 0
   receipt=""
   [[ ! -r $notes/$name.question-tested ]] || receipt=$(<"$notes/$name.question-tested")
-  if [[ $receipt == "$identity false" ]]; then
+  if [[ -e $asking ]]; then
+    # An existing question is delivery work only when these saved words were
+    # already classified and still match its asking note. Keep that classification
+    # across detector updates: retrying a send does not test the message again.
+    asked=$(cat "$asking") || return 0
+    sum=$(cksum <<<"$message")
+    [[ ${asked#* } == "${sum%% *}" && ${receipt#* } == "${identity#* } true" ]] || return 0
+    [[ ! -e $pushed || $(<"$pushed") != "$message" ]] || return 0
+    asks=true
+    retry=true
+  elif [[ $receipt == "$identity false" ]]; then
     return 0
   elif [[ $receipt == "$identity true" ]]; then
     # Resume a partial recovery without testing again; the push receipt still deduplicates.
@@ -589,15 +600,23 @@ on_recheck() {
   fi
   # A prompt or native callback may have replaced the message while it was tested.
   current=$(sha256sum "$saved") || return 0
-  [[ -e $idle && ! -e $asking && ! -e $limit && ${identity#* } == "${current%% *}" ]] || return 0
+  [[ -e $idle && ! -e $limit && ${identity#* } == "${current%% *}" ]] || return 0
+  if [[ $retry == true ]]; then
+    [[ -r $asking && $(<"$asking") == "$asked" ]] || return 0
+  else
+    [[ ! -e $asking ]] || return 0
+  fi
+  stop_is_current || return 0
   if [[ -e $notes/$name.codex ]]; then
     cmp -s "$saved" "$notes/$name.codex-answered" && return 0
     cmp -s "$saved" "$notes/$name.codex-followed-up" && return 0
   fi
-  (umask 077; note "$notes/$name.question-tested" "$identity $asks") || return 0
+  if [[ $retry == false ]]; then
+    (umask 077; note "$notes/$name.question-tested" "$identity $asks") || return 0
+  fi
   [[ $asks == true ]] || return 0
   event=$(jq -cn --arg message "$message" '{last_assistant_message: $message}') || return 0
-  publish_question "$message" "$at" "" question
+  publish_question "$message" "$at" "$asked" question
   drain_pending_stop || true
 }
 

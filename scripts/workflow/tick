@@ -1039,10 +1039,8 @@ paused() {
   fi
   exit 0
 }
-local_duties() {
-  local_done=1
-  running=$(session list) || tick_failed
-
+question_duties() {
+  local name state
   # Recover questions that an older installed stop hook did not recognize. Notify owns
   # both the installed question test and its once-only ring; shadow ticks never write.
   if ((shadow == 0)); then
@@ -1053,6 +1051,12 @@ local_duties() {
       WORKFLOW_SESSION=$name bash "$here/notify" recheck 9>&- || tick_failed
     done <<<"$running"
   fi
+}
+
+local_duties() {
+  local_done=1
+  running=$(session list) || tick_failed
+  question_duties
 
   while read -r name state held _; do
     if [[ $state =~ ^(idle|limit)$ && $held =~ ^[0-9]+$ ]] && ((held > SQUEEZE_ABOVE_MB)); then
@@ -1171,8 +1175,9 @@ if ! python3 "$here/tick_snapshot.py" create "$snapshot" 9>&- || ! pulls=$(label
   # The application an ended hunt left running is stopped all the same.
   session cleanup hunts
   budget_ready || paused
-  # Status and capacity recovery need no pull request listing. Leave the other
+  # Question, status and capacity recovery need no pull request listing. Leave the other
   # local duties on their existing paths, including their protections on failures.
+  question_duties
   status_duties
   capacity_duties
   exit 1

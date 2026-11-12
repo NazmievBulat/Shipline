@@ -209,8 +209,9 @@ def test_partial_recovery_recreates_metadata_without_another_ring(replay):
 
 
 @pytest.mark.parametrize("failure", ["rejected", "timeout", "missing-keys"])
-def test_tick_retries_an_undelivered_recovered_question(replay, failure):
-    notes, _ = seed(replay)
+@pytest.mark.parametrize("name,codex", [("ticket-7", False), ("review-7", False), ("ticket-7", True)])
+def test_tick_retries_an_undelivered_recovered_question(replay, failure, name, codex):
+    notes, _ = seed(replay, name, codex=codex)
     original_curl = (replay.bin / "curl").read_text()
     keys = replay.root / "home/agents/.env"
     key_values = keys.read_text()
@@ -222,15 +223,19 @@ def test_tick_retries_an_undelivered_recovered_question(replay, failure):
         keys.unlink()
     done = replay.run_script("tick", env={"WORKFLOW_NOW": str(NOW), "WORKFLOW_NOTIFY_SECONDS": "0.2"})
     assert done.returncode == 0, done.stderr
-    assert (notes / "ticket-7.asking").exists()
-    assert not (notes / "ticket-7.pushed").exists()
+    asking = (notes / f"{name}.asking").read_text()
+    assert asking.split()[0] == str(SAVED_AT)
+    assert not (notes / f"{name}.pushed").exists()
+    failed_attempts = len(replay.pushes())
     # Service/configuration recovers; no new model turn or Stop will arrive.
     replay.fake("curl", original_curl)
     (replay.state / "pushover-fails").unlink(missing_ok=True)
     keys.write_text(key_values)
     for at in (NOW + 180, NOW + 360):
         assert tick(replay, at).returncode == 0
-    assert (notes / "ticket-7.pushed").exists(), "recovered question never delivered after temporary push failure"
+    assert (notes / f"{name}.pushed").exists(), "recovered question never delivered after temporary push failure"
+    assert (notes / f"{name}.asking").read_text() == asking
+    assert len(replay.pushes()) == failed_attempts + 1
 
 
 def test_shell_syntax_in_saved_words_is_only_data(replay):
@@ -275,3 +280,48 @@ def test_shadow_tick_does_not_recover_or_send(replay):
     for suffix in ("asking", "pushed", "question", "question-tested", "notify.lock"):
         assert not (notes / f"ticket-7.{suffix}").exists()
     assert replay.pushes() == []
+
+
+@pytest.mark.parametrize("codex", [False, True])
+def test_failed_delivery_survives_a_detector_update_without_reclassification(replay, codex):
+    notes, _ = seed(replay, codex=codex)
+    (replay.state / "pushover-fails").touch()
+    assert recheck(replay).returncode == 0
+    asking = (notes / "ticket-7.asking").read_text()
+    receipt = (notes / "ticket-7.question-tested").read_text()
+    assert not (notes / "ticket-7.pushed").exists()
+    notify = replay.script.with_name("notify")
+    notify.write_text(notify.read_text().replace(
+        "asks_owner() {\n", 'asks_owner() {\n  echo tested >> "$notes/$name.retry-tests"; return 1\n'
+    ))
+    (replay.state / "pushover-fails").unlink()
+    for _ in range(2):
+        assert recheck(replay).returncode == 0
+    assert (notes / "ticket-7.pushed").exists()
+    assert (notes / "ticket-7.asking").read_text() == asking
+    assert (notes / "ticket-7.question-tested").read_text() == receipt
+    assert not (notes / "ticket-7.retry-tests").exists()
+    assert len(replay.pushes()) == 2
+
+
+@pytest.mark.parametrize("case", ["prompt", "replacement", "answered", "followed-up", "running", "limit"])
+def test_failed_delivery_is_not_retried_for_an_obsolete_or_ineligible_turn(replay, case):
+    notes, saved = seed(replay, codex=True)
+    (replay.state / "pushover-fails").touch()
+    assert recheck(replay).returncode == 0
+    assert not (notes / "ticket-7.pushed").exists()
+    (replay.state / "pushover-fails").unlink()
+    if case == "prompt":
+        replay.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Use 1."})
+    elif case == "replacement":
+        saved.write_text(json.dumps({"last-assistant-message": QUESTION, "turn-id": "later-turn"}))
+    elif case in ("answered", "followed-up"):
+        (notes / f"ticket-7.codex-{case}").write_bytes(saved.read_bytes())
+    elif case == "running":
+        (notes / "ticket-7.idle").unlink()
+    else:
+        (notes / "ticket-7.limit").write_text(str(NOW + 3600))
+    for _ in range(2):
+        assert recheck(replay).returncode == 0
+    assert not (notes / "ticket-7.pushed").exists()
+    assert len(replay.pushes()) == 1
