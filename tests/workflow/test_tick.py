@@ -2108,6 +2108,8 @@ def test_tick_leaves_other_saved_messages_alone(workflow: Workflow, case: str) -
 
 
 def test_tick_tests_a_message_once_per_question_function_version(workflow: Workflow) -> None:
+    # Four ticks must not also trigger the separate missing-orchestrator phone alert.
+    workflow.orchestrator("busy")
     saved = _saved_idle_message(workflow, message="Saved decision.")
     notify = workflow.script.with_name("notify")
     original = notify.read_text()
