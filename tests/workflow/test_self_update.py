@@ -1122,7 +1122,8 @@ def test_a_tick_stopped_by_a_signal_counts_neither_way(workflow: Workflow) -> No
     home, _ = _harness_shipline(workflow, "in_progress -")
     # The tick is stopped while it waits for the sessions to be listed.
     workflow.socket("ticket-7")
-    workflow.fake("tmux", '#!/bin/bash\ntouch "@STATE@/tmux-entered"\n/bin/sleep 30\n')
+    workflow.fake("tmux", '#!/bin/bash\ntouch "@STATE@/tmux-entered"\n'
+                  'while [[ ! -e "@STATE@/tmux-release" ]]; do /bin/sleep 0.05; done\n')
     env = {**workflow.env, "SHIPLINE_REPO": str(workflow.repo)}
     runs = home / ".local" / "shipline" / "runs"
     tick = subprocess.Popen(
@@ -1139,6 +1140,8 @@ def test_a_tick_stopped_by_a_signal_counts_neither_way(workflow: Workflow) -> No
             assert time.monotonic() < deadline
             time.sleep(0.05)
         tick.terminate()
+        # Bash handles the pending signal after the session-listing child returns.
+        (workflow.state / "tmux-release").touch()
         assert tick.wait(timeout=60) == 143
     finally:
         try:
