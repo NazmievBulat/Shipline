@@ -1,5 +1,6 @@
 """A check GitHub still lists as running after its run completed: the gate runs CI again."""
 
+import fcntl
 import json
 import sys
 import time
@@ -47,6 +48,7 @@ def _never_started(github: GitHub, *, run_id: int = 20, workflow: str = "ci") ->
         )
     github.api[f"{_REPO}/actions/runs?status=queued&per_page=100"]["workflow_runs"].append(run)
     github.api[f"{_REPO}/actions/runs/{run_id}"] = run
+    github.api[f"{_REPO}/actions/runs/{run_id}/cancel"] = {}
     github.api[f"{_REPO}/actions/runs/{run_id}/jobs?per_page=100"] = {"jobs": []}
     return run
 
@@ -144,9 +146,10 @@ def test_any_started_job_prevents_queue_recovery(github: GitHub, job: dict[str, 
     assert not github.workflow.calls("gh api -X POST")
 
 
-def test_a_never_started_main_run_is_only_reported(github: GitHub) -> None:
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "schedule"])
+def test_a_never_started_main_run_is_only_reported(github: GitHub, event: str) -> None:
     run = _never_started(github)
-    run.update(head_branch="main", event="push", head_sha=github.base)
+    run.update(head_branch="main", event=event, head_sha=github.base)
     for _ in range(2):
         done = _recover_queue(github)
         assert done.returncode == 0, done.stderr
@@ -180,6 +183,100 @@ def test_a_new_retry_wait_is_timed_from_its_own_jobs(github: GitHub) -> None:
     done = _recover_queue(github)
     assert done.returncode == 0, done.stderr
     assert _origin(github) == github.head
+
+
+def test_queue_recovery_is_called_by_the_tick(github: GitHub) -> None:
+    _never_started(github)
+    github.save()
+    workflow = github.workflow
+    workflow.list_pull_request(7, draft=False, labels=())
+    (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {github.head}\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls(f"gh api -X POST {_REPO}/actions/runs/20/cancel")) == 1
+
+
+@pytest.mark.parametrize("change", ["head", "branch", "draft", "closed", "event", "workflow"])
+def test_queue_recovery_requires_a_current_open_pull_run(github: GitHub, change: str) -> None:
+    run = _never_started(github)
+    if change == "head":
+        run["head_sha"] = github.base
+    elif change == "branch":
+        run["head_branch"] = "ticket/other"
+    elif change == "draft":
+        github.pulls["7"]["isDraft"] = True
+    elif change == "closed":
+        github.pulls["7"]["state"] = "CLOSED"
+    elif change == "event":
+        run["event"] = "workflow_dispatch"
+    else:
+        run["path"] = ".github/workflows/images.yml"
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert not github.workflow.calls("gh api -X POST")
+
+
+def test_a_dirty_worktree_is_not_used_for_queue_recovery(github: GitHub) -> None:
+    worktree = _queue_worktree(github)
+    (worktree / "shared.txt").write_text("uncommitted\n")
+    run = _never_started(github)
+    _stuck_retry(github, run)
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert _origin(github) == github.head
+    assert (worktree / "shared.txt").read_text() == "uncommitted\n"
+    assert any("uncommitted" in note["line"] for note in _queue_notes(github))
+
+
+def test_missing_queue_timestamps_start_a_durable_observation(github: GitHub) -> None:
+    run = _never_started(github)
+    run.pop("created_at")
+    assert _recover_queue(github).returncode == 0
+    assert not github.workflow.calls("gh api -X POST")
+    path = github.workflow.repo / ".local/workflow/never-started-runs.json"
+    state = json.loads(path.read_text())
+    state["runs"]["20"]["observed"]["1"] -= 3600
+    path.write_text(json.dumps(state))
+    assert _recover_queue(github).returncode == 0
+    assert len(github.workflow.calls(f"gh api -X POST {_REPO}/actions/runs/20/cancel")) == 1
+
+
+def test_queue_cancellation_lost_to_an_outage_can_retry(github: GitHub) -> None:
+    _never_started(github)
+    endpoint = f"{_REPO}/actions/runs/20/cancel"
+    github.api[endpoint] = "HTTP 502: Bad Gateway"
+    assert _recover_queue(github).returncode == 1
+    github.api[endpoint] = {}
+    assert _recover_queue(github).returncode == 0
+    assert _recover_queue(github).returncode == 0
+    assert len(github.workflow.calls(f"gh api -X POST {endpoint}")) == 2
+
+
+def test_an_unreadable_queue_never_authorizes_cancellation(github: GitHub) -> None:
+    _never_started(github)
+    github.api[f"{_REPO}/actions/runs?status=in_progress&per_page=100"] = "HTTP 403: Forbidden"
+    assert _recover_queue(github).returncode == 1
+    assert not github.workflow.calls("gh api -X POST")
+
+
+def test_queue_recovery_leaves_while_the_merge_lock_is_held(github: GitHub) -> None:
+    _never_started(github)
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "merge.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert _recover_queue(github).returncode == 0
+    assert not github.workflow.calls("gh api -X POST")
+
+
+def test_equal_queue_timestamps_do_not_make_two_stuck_runs_block_each_other(github: GitHub) -> None:
+    first = _never_started(github)
+    second = _never_started(github, run_id=30, workflow="e2e")
+    second["created_at"] = first["created_at"]
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert len(github.workflow.calls(f"gh api -X POST {_REPO}/actions/runs/20/cancel")) == 1
+    assert not github.workflow.calls(f"gh api -X POST {_REPO}/actions/runs/30/cancel")
 
 
 def _ci_run(github: GitHub, head: str) -> dict[str, Any]:

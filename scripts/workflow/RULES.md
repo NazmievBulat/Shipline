@@ -136,6 +136,14 @@ and its whole run re-run once, so attempt 2 takes the ordinary runner choice; a 
 limit on a later attempt is reported once in the gate's output and wake, and keeps waiting.
 Image jobs and jobs outside that lane do not trigger this retry; the gate remembers the
 recovery across restarts, and `--train-status` shows it with the prefix.
+The tick also watches a ready pull request's own CI and E2E runs on its current head.
+A run still queued beyond the same limit, with no job started, no repository run executing
+and no older run waiting ahead, is cancelled through the runs API and re-run once.
+Equal queue timestamps are ordered by run ID. If that retry also never starts within the
+limit, the tick pushes one empty commit from the clean pull request worktree, using the
+lost-check push safeguards. A second stuck run on the same head gets no second push.
+Runs on `main` are only reported. Each stuck attempt is named once in the wake, and the
+metrics count these cases with lost checks. A shadow tick changes none of this state.
 How many it tests, the window, starts at 4, grows by one after each
 merge and halves after a failed prefix, never below 1 and never above 4 (`WINDOW_CEILING` in
 `scripts/workflow/merge_gate.py`). A member merges as soon as its own prefix passed and every

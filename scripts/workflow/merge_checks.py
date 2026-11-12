@@ -574,14 +574,16 @@ def note_lost(folder: Path, number: str, head: str, lost: dict[str, Any]) -> Non
 
 def rerun_lost(
     pull: dict[str, Any], train: "Train", number: str, lost: dict[str, Any], *, base: str,
+    never_started: bool = False,
 ) -> int:
     """One empty commit gets GitHub a new check list; only one per head, so a check lost again
     on the commit pushed for it is reported to the orchestrator and not pushed for."""
     from merge_gate import Refused, Waiting, _commit_and_push, git, note_lost
 
     head = pull["headRefOid"]
-    what = f"GitHub lost {lost['check']} of run {lost['run']}"
-    note_lost(train.path.parent, number, head, lost)
+    what = f"GitHub {'never started' if never_started else 'lost'} {lost['check']} of run {lost['run']}"
+    if not never_started:
+        note_lost(train.path.parent, number, head, lost)
     if lost["conclusion"] != "success":
         raise Refused(
             f"{what}, which ended {lost['conclusion']}: treat it as a failed check; "
@@ -606,8 +608,9 @@ def rerun_lost(
     )
     train.reruns[number] = git("rev-parse", "HEAD")
     train.save()
+    when = "" if never_started else " after its run finished"
     print(
-        f"{what} after its run finished; an empty commit was pushed to run CI again: "
+        f"{what}{when}; an empty commit was pushed to run CI again: "
         "wait for the new run, then call this gate again",
         flush=True,
     )

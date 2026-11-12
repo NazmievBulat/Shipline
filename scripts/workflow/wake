@@ -577,10 +577,11 @@ for folder in "$lost" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/lost-chec
 done
 # Scratch queue warnings use the same durable delivery and sent receipts as lost checks.
 queues=$main/$SHIPLINE_STATE_FOLDER/prefix-queues.pending
+never_started=$main/$SHIPLINE_STATE_FOLDER/never-started.pending
 # A repeated image download keeps its handoff; report its runner through the same
 # durable pending/sent delivery, without presenting it as a review hand-back.
 downloads=$main/$SHIPLINE_STATE_FOLDER/runner-downloads.pending
-for folder in "$queues" "$downloads"; do
+for folder in "$queues" "$downloads" "$never_started"; do
   [[ -d $folder ]] || continue
   while IFS= read -r -d '' event; do
     if line=$(jq -er '.line | strings' "$event"); then

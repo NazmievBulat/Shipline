@@ -1283,6 +1283,13 @@ WORKFLOW_PR_SNAPSHOT=$snapshot session cleanup || tick_failed
 
 local_duties
 
+# Recover runs GitHub never dispatched before the gate judges their checks.
+if ((shadow == 0)); then
+  WORKFLOW_BACKGROUND_GITHUB=1 git_step python3 -B "$here/tick_queued_runs.py" \
+    "$main/$SHIPLINE_STATE_FOLDER" "$snapshot" 9>&- || tick_failed
+  budget_ready || paused
+fi
+
 # Refresh main before computing wake tokens: PR checks can finish while main is pending.
 # The tick alone requests one failed-job retry, after verifying home-runner evidence. A shadow
 # tick reads the report as the real tick left it.

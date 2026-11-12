@@ -582,7 +582,9 @@ def read_sources(since: float, until: float) -> Sources:
         hand_backs=_notes(notes / "merge-handbacks.pending", "reason")
         + _notes(notes / "merge-handbacks.sent", "reason"),
         lost=_notes(notes / "lost-checks.pending", "check")
-        + _notes(notes / "lost-checks.sent", "check"),
+        + _notes(notes / "lost-checks.sent", "check")
+        + _notes(notes / "never-started.pending", "check")
+        + _notes(notes / "never-started.sent", "check"),
         hunts=read_hunts(config.main),
         samples=read_samples(),
         wake_log=wake_log,
