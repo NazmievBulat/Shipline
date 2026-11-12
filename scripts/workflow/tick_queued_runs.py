@@ -173,7 +173,7 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
             continue
         owner = next(((key, entry) for key, entry in data["runs"].items()
                       if entry.get("number") == str(number) and entry.get("head") == pending["head"]
-                      and entry.get("state") == "rerun requested"), None)
+                      and entry.get("state") in ("rerun requested", "finished")), None)
         if owner is None:
             continue
         key, entry = owner

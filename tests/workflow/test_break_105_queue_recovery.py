@@ -281,8 +281,12 @@ def test_a_run_that_starts_during_capacity_reads_is_left_alone(github, stage):
     assert after == original, "recovery pushed a replacement commit after the retry had started"
 
 
-@pytest.mark.parametrize("accepted,published_metadata", [(False, False), (True, False), (True, True)])
-def test_a_transient_refresh_push_failure_recovers_without_a_review_handoff(github, accepted, published_metadata):
+@pytest.mark.parametrize("accepted,published_metadata,retired", [
+    (False, False, False), (True, False, False), (True, True, False), (True, True, True),
+])
+def test_a_transient_refresh_push_failure_recovers_without_a_review_handoff(
+    github, accepted, published_metadata, retired,
+):
     target = worktree(github)
     run = queued(github)
     retry(github, run)
@@ -306,6 +310,12 @@ exec /usr/bin/git "$@"
     assert json.loads(receipt.read_text())["commit"] == commit
     assert receipt.stat().st_mode & 0o077 == 0
     unavailable.unlink()
+    if retired:
+        # The replacement push may cancel the old run before the PR API shows
+        # its new head. A later tick must still finalize the saved push receipt.
+        run.update(status="completed", conclusion="cancelled")
+        good(recover(github))
+        assert state(github)["runs"]["120"]["state"] == "finished"
     if accepted and published_metadata:
         github.pulls["7"]["headRefOid"] = commit
     for _ in range(3):
