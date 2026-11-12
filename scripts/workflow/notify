@@ -204,6 +204,30 @@ asks_owner() {
   LC_ALL=C grep -zqiE "${request_start}${marks}(please[[:space:]]+)?(reply[[:space:]]+(with\>|$word)|choose[[:space:]]+$word|(type|write)[[:space:]]+$quoted)|$question_end" <<<"$paragraph"
 }
 
+# The identity shared by ordinary stops and recovery. Only the installed function's
+# definition and the saved file's contents determine whether another test is needed.
+question_identity() {
+  local version message_sum
+  version=$(declare -f asks_owner | sha256sum) || return 1
+  message_sum=$(sha256sum "$1") || return 1
+  printf '%s %s\n' "${version%% *}" "${message_sum%% *}"
+}
+
+# A Stop can need the answer both for draft blocking and question metadata. Its local
+# result also seeds recovery's receipt, so the next tick does not repeat the same test.
+question_in_stop() {
+  local identity
+  if [[ -z $owner_question ]]; then
+    owner_question=false
+    asks_owner "$1" && owner_question=true
+    if [[ ! -e $notes/$name.codex && -r $notes/$name.stop-message ]]; then
+      identity=$(question_identity "$notes/$name.stop-message") &&
+        (umask 077; note "$notes/$name.question-tested" "$identity $owner_question")
+    fi
+  fi
+  [[ $owner_question == true ]]
+}
+
 # What the tick reads to answer a question for the owner, as JSON: the question's `asking` note,
 # `owner_only` from its line `Owner only: yes` or `Owner only: no` (without one, "missing", and
 # the owner answers; with more than one, "yes": one reply cannot answer two questions, and either
@@ -249,7 +273,7 @@ worker_is_blocked() {
   fi
   said_finished "worker finished" "$1" && return 1
   draft=$(cd "$main" && timeout "$ANSWER_SECONDS" gh pr view "$number" --json isDraft --jq .isDraft)
-  [[ $draft != true ]] || asks_owner "$1"
+  [[ $draft != true ]] || question_in_stop "$1"
 }
 
 audit_is_blocked() {
@@ -344,7 +368,7 @@ lock_stop() {
 }
 
 on_stop() {
-  local message limit_at asked="" temporary
+  local message limit_at asked="" temporary owner_question=""
   lock_stop || return 0
   # Permission dialogs and the question tool continue this same turn when answered. A
   # later Stop proves that interaction ended; a refused merge still becomes an owner
@@ -426,7 +450,7 @@ publish_question() {
   fi
   # A Codex bridge relays and never answers; a hunt asks nothing.
   if [[ $name =~ ^(ticket|review|audit)- && ! -e $notes/$name.codex ]] &&
-      { [[ $known == question ]] || asks_owner "$message"; }; then
+      { [[ $known == question ]] || question_in_stop "$message"; }; then
     note "$question" "$(question_of "$message" "$(<"$asking")")"
   fi
   # A session woken by its own job that stops again with the same words rings once.
@@ -442,7 +466,7 @@ publish_question() {
 # Called only for an idle worker/reviewer from the tick. Never replay a Stop: doing so
 # would reset waits and turn progress reports on ready pull requests into questions.
 on_recheck() {
-  local saved="$notes/$name.stop-message" message at version identity current receipt asks=false
+  local saved="$notes/$name.stop-message" message at identity current receipt asks=false
   [[ $name =~ ^(ticket|review)-[0-9]+$ && -d $worktree ]] || return 0
   lock_stop || return 0
   [[ -e $idle && ! -e $asking && ! -e $limit ]] || return 0
@@ -452,11 +476,7 @@ on_recheck() {
     cmp -s "$saved" "$notes/$name.codex-followed-up" && return 0
   fi
   [[ -r $saved ]] || return 0
-  # Hash the actual installed function, not the whole script: unrelated edits are no
-  # reason to test the same message again. The message hash distinguishes later stops.
-  version=$(declare -f asks_owner | sha256sum) || return 0
-  identity=$(sha256sum "$saved") || return 0
-  identity="${version%% *} ${identity%% *}"
+  identity=$(question_identity "$saved") || return 0
   at=$(stat -c %Y "$saved") || return 0
   if [[ -e $notes/$name.codex ]]; then
     message=$(jq -er '.["last-assistant-message"] | strings' "$saved") || return 0

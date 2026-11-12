@@ -2192,3 +2192,18 @@ def test_a_new_saved_message_is_tested_on_the_same_function_version(workflow: Wo
     saved.write_text(_SAVED_QUESTION + "\n")
     workflow.run_script("notify", "recheck", env=env)
     assert len(workflow.pushes()) == 1
+
+
+
+def test_stop_and_ticks_test_progress_once_on_the_same_function_version(workflow: Workflow) -> None:
+    saved = _saved_idle_message(workflow, message="The tests passed.")
+    saved.unlink()
+    notify = workflow.script.with_name("notify")
+    notify.write_text(notify.read_text().replace(
+        "asks_owner() {\n", 'asks_owner() {\n  echo tested >> "$notes/$name.question-tests"\n'))
+    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": "The tests passed."})
+    for _ in range(2):
+        done = workflow.run_script("tick", env={"WORKFLOW_NOW": "1790000000"})
+        assert done.returncode == 0, done.stderr
+    assert (saved.parent / "ticket-7.question-tests").read_text().splitlines() == ["tested"]
+    assert workflow.pushes() == []
