@@ -2025,3 +2025,111 @@ def test_configuration_failures_count_before_tick_startup_and_recover(
         assert workflow.pushes() == []
     else:
         assert len(workflow.pushes()) == 2
+
+
+# Recheck saved idle messages after the installed question test changes.
+_SAVED_QUESTION = "Owner only: yes\nUse the recommended setting.\n\nApproval is needed."
+
+
+def _saved_idle_message(workflow: Workflow, name: str = "ticket-7", *, codex: bool = False,
+                        message: str = _SAVED_QUESTION) -> Path:
+    workflow.add_worktree(7)
+    workflow.running(name)
+    notes = workflow.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / f"{name}.idle").touch()
+    workflow.screen("● Waiting.\n> \n", name)
+    saved = notes / f"{name}.stop-message"
+    if codex:
+        (notes / f"{name}.codex").touch()
+        workflow.running("codex-7")
+        workflow.screen("• Waiting.\n› \n", "codex-7")
+        saved = notes / f"{name}.codex-turn.json"
+        saved.write_text(json.dumps({"last-assistant-message": message, "turn-id": "saved-1"}))
+    else:
+        saved.write_text(message + "\n")
+    os.utime(saved, (1_790_000_000 - 600, 1_790_000_000 - 600))
+    keys = workflow.root / "home" / "agents" / ".env"
+    keys.parent.mkdir(exist_ok=True)
+    keys.write_text("PUSHOVER_USER=exampleUser\nPUSHOVER_TOKEN=exampleToken\n")
+    return saved
+
+
+@pytest.mark.parametrize("name,codex", [("ticket-7", False), ("review-7", False),
+                                        ("ticket-7", True)])
+def test_tick_recovers_a_saved_question_once(workflow: Workflow, name: str, codex: bool) -> None:
+    saved = _saved_idle_message(workflow, name, codex=codex)
+    for at in (1_790_000_000, 1_790_000_060):
+        done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(at)})
+        assert done.returncode == 0, done.stderr
+    asked = (saved.parent / f"{name}.asking").read_text()
+    assert asked.split()[0] == str(1_790_000_000 - 600)
+    [push] = workflow.pushes()
+    assert push.title == f"{name} needs you"
+    assert push.message == _SAVED_QUESTION
+    log = (workflow.root / "home/.local/state/workflow/wake.log").read_text()
+    assert f"asking the owner: {name} (10 min)" in log
+    if name == "review-7":
+        assert (saved.parent / f"{name}.owner-blocked").exists()
+
+
+@pytest.mark.parametrize("case", ["progress", "running", "asking", "limit", "hunt", "audit",
+                                  "answered", "followed-up", "shadow"])
+def test_tick_leaves_other_saved_messages_alone(workflow: Workflow, case: str) -> None:
+    name = "audit-7" if case == "audit" else "ticket-7"
+    saved = _saved_idle_message(workflow, name, codex=case in ("answered", "followed-up"),
+                                message="Tests passed. I will push next." if case == "progress"
+                                else _SAVED_QUESTION)
+    notes = saved.parent
+    if case == "running":
+        (notes / f"{name}.idle").unlink()
+    elif case == "asking":
+        (notes / f"{name}.asking").write_text("1790000000 123\n")
+    elif case == "limit":
+        (notes / f"{name}.limit").write_text("1790003600\n")
+    elif case in ("answered", "followed-up"):
+        (notes / f"{name}.codex-{case}").write_bytes(saved.read_bytes())
+    elif case == "hunt":
+        # A hunt's notes never enter the ticket/review recovery pass.
+        workflow.running("hunt-example-app")
+        hunt = workflow.hunt_worktree("example-app") / ".local/workflow"
+        hunt.mkdir(parents=True, exist_ok=True)
+        (hunt / "hunt-example-app.idle").touch()
+        (hunt / "hunt-example-app.stop-message").write_text(_SAVED_QUESTION)
+        saved.unlink()
+    args = ("--shadow",) if case == "shadow" else ()
+    done = workflow.run_script("tick", *args, env={"WORKFLOW_NOW": "1790000000"})
+    assert done.returncode == 0, done.stderr
+    assert workflow.pushes() == []
+    if case != "asking":
+        assert not (notes / f"{name}.asking").exists()
+
+
+def test_tick_tests_a_message_once_per_question_function_version(workflow: Workflow) -> None:
+    saved = _saved_idle_message(workflow, message="Saved decision.")
+    notify = workflow.script.with_name("notify")
+    original = notify.read_text()
+    instrumented = original.replace("asks_owner() {\n", 'asks_owner() {\n  echo tested >> "$notes/$name.question-tests"\n')
+    notify.write_text(instrumented)
+    for _ in range(2):
+        done = workflow.run_script("tick", env={"WORKFLOW_NOW": "1790000000"})
+        assert done.returncode == 0, done.stderr
+    tested = saved.parent / "ticket-7.question-tests"
+    assert tested.read_text().splitlines() == ["tested"]
+    assert not (saved.parent / "ticket-7.asking").exists()
+    # An unrelated script edit must not invalidate the function's receipt.
+    notify.write_text(instrumented + "\n# Unrelated change.\n")
+    workflow.run_script("tick", env={"WORKFLOW_NOW": "1790000000"})
+    assert tested.read_text().splitlines() == ["tested"]
+    notify.write_text(instrumented.replace("asks_owner() {\n", 'asks_owner() {\n  [[ $1 != "Saved decision." ]] || return 0\n'))
+    workflow.run_script("tick", env={"WORKFLOW_NOW": "1790000000"})
+    assert (saved.parent / "ticket-7.asking").exists()
+    assert len(workflow.pushes()) == 1
+
+
+def test_recovered_question_with_a_push_receipt_does_not_ring_again(workflow: Workflow) -> None:
+    saved = _saved_idle_message(workflow)
+    (saved.parent / "ticket-7.pushed").write_text(_SAVED_QUESTION + "\n")
+    workflow.run_script("tick", env={"WORKFLOW_NOW": "1790000000"})
+    assert (saved.parent / "ticket-7.asking").exists()
+    assert workflow.pushes() == []

@@ -1589,3 +1589,14 @@ def test_workflow_alert_keeps_the_push_time_limit_and_missed_log(session: Workfl
     assert 0 < session.timeout_budget() <= 4
     assert session.calls("interrupted-curl") == ["interrupted-curl"]
     assert "Workflow needs you  Tick failed: cannot fetch main." in session.missed_pushes.read_text()
+
+
+
+def test_stop_saves_its_message_and_prompt_discards_it(session: Workflow) -> None:
+    message = "Tests passed. I will push next."
+    session.notify(_stop(message))
+    saved = session.notes(7) / "ticket-7.stop-message"
+    assert saved.read_text() == message + "\n"
+    assert saved.stat().st_mode & 0o077 == 0
+    session.notify(_PROMPT)
+    assert not saved.exists()
