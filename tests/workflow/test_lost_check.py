@@ -86,9 +86,9 @@ def _queue_worktree(github: GitHub) -> Path:
     return worktree
 
 
-@pytest.mark.parametrize("workflow", ["ci", "e2e"])
-def test_a_never_started_run_is_cancelled_by_api_and_rerun_once(github: GitHub, workflow: str) -> None:
-    run = _never_started(github, workflow=workflow)
+@pytest.mark.parametrize("suite", ["ci", "e2e"])
+def test_a_never_started_run_is_cancelled_by_api_and_rerun_once(github: GitHub, suite: str) -> None:
+    run = _never_started(github, workflow=suite)
     for _ in range(2):
         done = _recover_queue(github)
         assert done.returncode == 0, done.stderr
