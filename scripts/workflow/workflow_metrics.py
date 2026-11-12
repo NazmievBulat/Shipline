@@ -1223,10 +1223,14 @@ def detect(numbers: dict[str, Any], sources: Sources, window: Window) -> list[di
             checks.setdefault(check, set()).add(number)
     for check, count in numbers["quality"]["lost_checks"].items():
         if count >= THRESHOLDS["repeats"]:
+            places = ["main"] if "main" in checks[check] else []
+            pulls = checks[check] - {"main"}
+            if pulls:
+                places.append(f"pull requests {_numbers(pulls)}")
             fire(
                 "lost_check",
                 f"lost check repeated {count} times {within}: {plain(check)}"
-                f" (pull requests {_numbers(checks[check])})",
+                f" ({'; '.join(places)})",
             )
     for job, count in numbers["quality"]["flaky"].items():
         if count >= THRESHOLDS["repeats"]:

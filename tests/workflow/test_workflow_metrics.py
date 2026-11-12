@@ -116,15 +116,17 @@ def _measure(workflow: Workflow, *args: str) -> dict[str, Any]:
     return json.loads(done.stdout)
 
 
-def test_never_started_runs_count_with_lost_checks(workflow: Workflow) -> None:
+@pytest.mark.parametrize("number", ["7", "main"])
+def test_never_started_runs_count_with_lost_checks(workflow: Workflow, number: str) -> None:
     _github(workflow)
     folder = workflow.repo / ".local/workflow"
-    for index, status in enumerate(("pending", "sent")):
+    for index, status in enumerate(("pending", "sent", "pending")):
         _note(folder / f"never-started.{status}/{index}.json", {
-            "number": "7", "check": "CI (never started)", "run": 20,
+            "number": number, "check": "CI (never started)", "run": 20 + index,
         }, NOW - HOUR)
     measured = _measure(workflow)
-    assert measured["last_day"]["quality"]["lost_checks"]["CI (never started)"] == 2
+    assert measured["last_day"]["quality"]["lost_checks"]["CI (never started)"] == 3
+    assert any("CI (never started)" in finding["line"] for finding in measured["findings"])
 
 
 def _detectors(measured: dict[str, Any]) -> list[str]:
