@@ -403,7 +403,7 @@ queue_stop() {
   (umask 077; mkdir -p "$notes") || return 1
   temporary=$(mktemp "$notes/$name.pending.XXXXXX") || return 1
   epoch=$(prompt_epoch)
-  jq -c --arg epoch "$epoch" '{epoch: $epoch, event: .}' <<<"$event" >"$temporary" &&
+  jq -c --arg epoch "$epoch" '{epoch: $epoch, event: {hook_event_name: .hook_event_name, last_assistant_message: .last_assistant_message}}' <<<"$event" >"$temporary" &&
     touch -d "@${WORKFLOW_NOW:-$(date +%s)}" "$temporary" &&
     mv "$temporary" "$notes/$name.stop-pending.json"
   local result=$?
