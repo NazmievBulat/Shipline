@@ -1121,6 +1121,7 @@ def test_git_variables_of_the_caller_do_not_turn_it_on_another_repository(
 def test_a_tick_stopped_by_a_signal_counts_neither_way(workflow: Workflow) -> None:
     home, _ = _harness_shipline(workflow, "in_progress -")
     # The tick is stopped while it waits for the sessions to be listed.
+    workflow.socket("ticket-7")
     workflow.fake("tmux", '#!/bin/bash\ntouch "@STATE@/tmux-entered"\n/bin/sleep 30\n')
     env = {**workflow.env, "SHIPLINE_REPO": str(workflow.repo)}
     runs = home / ".local" / "shipline" / "runs"
@@ -1302,6 +1303,7 @@ def test_a_tick_whose_whole_group_is_stopped_counts_neither_way(
     workflow: Workflow, signal_name: str
 ) -> None:
     home, _ = _harness_shipline(workflow, "in_progress -")
+    workflow.socket("ticket-7")
     workflow.fake("tmux", '#!/bin/bash\ntouch "@STATE@/tmux-entered"\n/bin/sleep 30\n')
     env = {**workflow.env, "SHIPLINE_REPO": str(workflow.repo)}
     runs = home / ".local" / "shipline" / "runs"
