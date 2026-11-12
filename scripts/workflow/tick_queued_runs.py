@@ -142,7 +142,8 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
                 or pull.get("headRefOid") != head):
                 continue
         entry = data["runs"].setdefault(key, {})
-        if entry.get("state") == "cancel requested" and attempt == 1:
+        retry_attempt = entry.get("retry_attempt")
+        if entry.get("state") == "cancel requested" and attempt == retry_attempt:
             if run.get("status") == "completed" and run.get("conclusion") == "cancelled":
                 try:
                     _request(entry, save, "rerun requested", "run", "rerun", key, "-R", gate.REPOSITORY)
@@ -155,7 +156,7 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
             continue
         if run.get("status") != "queued" or entry.get("state") == "refused":
             awaiting_retry = (
-                entry.get("state") == "rerun requested" and attempt == 1
+                entry.get("state") == "rerun requested" and attempt == retry_attempt
                 and run.get("conclusion") == "cancelled"
             )
             if run.get("status") == "completed" and not awaiting_retry:
@@ -184,7 +185,7 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
             continue
         if main:
             _notice(folder, number, run, workflow, "stuck", "still waiting; main is never cancelled")
-        elif attempt == 1 and "state" not in entry:
+        elif "state" not in entry:
             current = gate.read_run(key)
             if (current.get("status") != "queued"
                 or any(current.get(field) != run.get(field) for field in
@@ -192,9 +193,11 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
                 or _unstarted(current) is None):
                 continue
             _notice(folder, number, run, workflow, "stuck", "requesting cancellation and one rerun")
+            entry["retry_attempt"] = attempt
             _request(entry, save, "cancel requested", "api", "-X", "POST",
                      f"{gate.API}/actions/runs/{key}/cancel")
-        elif attempt == 2 and entry.get("state") == "rerun requested":
+        elif (retry_attempt is not None and attempt == retry_attempt + 1
+              and entry.get("state") == "rerun requested"):
             identity = f"{number}-{head}"
             if identity in data["heads"]:
                 _notice(folder, number, run, workflow, "stuck", "not pushed for twice on the same head")

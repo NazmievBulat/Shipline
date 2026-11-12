@@ -68,14 +68,15 @@ def _queue_notes(github: GitHub) -> list[dict[str, Any]]:
 
 
 def _stuck_retry(github: GitHub, run: dict[str, Any]) -> None:
+    attempt = run["run_attempt"]
     assert _recover_queue(github).returncode == 0
     run.update(status="completed", conclusion="cancelled")
     # GitHub can keep showing the cancelled first attempt after accepting its rerun.
     for _ in range(3):
         assert _recover_queue(github).returncode == 0
-    run.update(status="queued", conclusion=None, run_attempt=2)
+    run.update(status="queued", conclusion=None, run_attempt=attempt + 1)
     github.api[f"{_REPO}/actions/runs/{run['id']}/jobs?per_page=100"] = {
-        "jobs": [{"id": 201, "run_attempt": 2, "status": "queued", "created_at": _stamp(3600)}]
+        "jobs": [{"id": 201, "run_attempt": attempt + 1, "status": "queued", "created_at": _stamp(3600)}]
     }
 
 
@@ -104,9 +105,14 @@ def test_a_never_started_run_is_cancelled_by_api_and_rerun_once(github: GitHub, 
     assert len(_queue_notes(github)) == 1
 
 
-def test_a_stuck_retry_gets_one_empty_commit_from_its_clean_worktree(github: GitHub) -> None:
+@pytest.mark.parametrize("attempt", [1, 3])
+def test_a_stuck_retry_gets_one_empty_commit_from_its_clean_worktree(github: GitHub, attempt: int) -> None:
     worktree = _queue_worktree(github)
     run = _never_started(github)
+    run["run_attempt"] = attempt
+    github.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"] = {
+        "jobs": [{"id": 21, "run_attempt": attempt, "status": "queued", "created_at": _stamp(3600)}]
+    }
     _stuck_retry(github, run)
     before = github.head
     done = _recover_queue(github)

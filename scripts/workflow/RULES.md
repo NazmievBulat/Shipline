@@ -138,7 +138,8 @@ Image jobs and jobs outside that lane do not trigger this retry; the gate rememb
 recovery across restarts, and `--train-status` shows it with the prefix.
 The tick also watches a ready pull request's own CI and E2E runs on its current head.
 A run still queued beyond the same limit, with no job started, no repository run executing
-and no older run waiting ahead, is cancelled through the runs API and re-run once.
+and no older run waiting ahead, is cancelled through the runs API and re-run once,
+even if it had a manual rerun before the tick first observed it.
 Equal queue timestamps are ordered by run ID. If that retry also never starts within the
 limit, the tick pushes one empty commit from the clean pull request worktree, using the
 lost-check push safeguards. A second stuck run on the same head gets no second push.
