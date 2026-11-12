@@ -151,6 +151,7 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
             if run.get("status") == "completed" and run.get("conclusion") == "cancelled":
                 try:
                     _request(entry, save, "rerun requested", "run", "rerun", key, "-R", gate.REPOSITORY)
+                    active = None
                 except gate.Refused:
                     _notice(folder, number, run, workflow, "rerun", "rerun could not be requested")
                     raise
@@ -180,7 +181,9 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
         if now - since <= gate.CONFIG.merge_train.queued_limit_minutes * 60:
             continue
         if active is None:
-            active = list(queued)
+            active = gate.api(
+                f"{gate.API}/actions/runs?status=queued&per_page=100", "workflow_runs", fresh=True
+            )
             for status in ACTIVE[1:]:
                 active.extend(gate.api(
                     f"{gate.API}/actions/runs?status={status}&per_page=100", "workflow_runs", fresh=True
@@ -200,6 +203,7 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
             entry["retry_attempt"] = attempt
             _request(entry, save, "cancel requested", "api", "-X", "POST",
                      f"{gate.API}/actions/runs/{key}/cancel")
+            active = None
         elif (retry_attempt is not None and attempt == retry_attempt + 1
               and entry.get("state") == "rerun requested"):
             identity = f"{number}-{head}"
