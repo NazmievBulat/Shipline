@@ -160,6 +160,7 @@ jobs:
             files: >-
               tests/runner/test_programs.py
               tests/workflow/test_break_45.py
+              tests/workflow/test_break_105_queue_recovery.py
               tests/workflow/test_install_hooks.py
               tests/workflow/test_merge_driver.py
               tests/workflow/test_merge_train_metrics.py
