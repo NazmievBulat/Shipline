@@ -216,13 +216,22 @@ question_identity() {
 # A Stop can need the answer both for draft blocking and question metadata. Its local
 # result also seeds recovery's receipt, so the next tick does not repeat the same test.
 question_in_stop() {
-  local identity
+  local identity="" receipt=""
   if [[ -z $owner_question ]]; then
-    owner_question=false
-    asks_owner "$1" && owner_question=true
     if [[ ! -e $notes/$name.codex && -r $notes/$name.stop-message ]]; then
-      identity=$(question_identity "$notes/$name.stop-message") &&
+      identity=$(question_identity "$notes/$name.stop-message") || identity=""
+      [[ ! -r $notes/$name.question-tested ]] || receipt=$(<"$notes/$name.question-tested")
+    fi
+    if [[ -n $identity && $receipt == "$identity true" ]]; then
+      owner_question=true
+    elif [[ -n $identity && $receipt == "$identity false" ]]; then
+      owner_question=false
+    else
+      owner_question=false
+      asks_owner "$1" && owner_question=true
+      if [[ -n $identity ]]; then
         (umask 077; note "$notes/$name.question-tested" "$identity $owner_question")
+      fi
     fi
   fi
   [[ $owner_question == true ]]

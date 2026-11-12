@@ -2201,7 +2201,8 @@ def test_stop_and_ticks_test_progress_once_on_the_same_function_version(workflow
     notify = workflow.script.with_name("notify")
     notify.write_text(notify.read_text().replace(
         "asks_owner() {\n", 'asks_owner() {\n  echo tested >> "$notes/$name.question-tests"\n'))
-    workflow.notify({"hook_event_name": "Stop", "last_assistant_message": "The tests passed."})
+    for _ in range(2):
+        workflow.notify({"hook_event_name": "Stop", "last_assistant_message": "The tests passed."})
     for _ in range(2):
         done = workflow.run_script("tick", env={"WORKFLOW_NOW": "1790000000"})
         assert done.returncode == 0, done.stderr
