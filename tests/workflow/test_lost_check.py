@@ -287,6 +287,19 @@ def test_equal_queue_timestamps_do_not_make_two_stuck_runs_block_each_other(gith
     assert not github.workflow.calls(f"gh api -X POST {_REPO}/actions/runs/30/cancel")
 
 
+def test_a_manual_retry_does_not_jump_a_job_waiting_before_that_attempt(github: GitHub) -> None:
+    run = _never_started(github)
+    run["run_attempt"] = 3
+    github.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"] = {
+        "jobs": [{"id": 21, "run_attempt": 3, "status": "queued", "created_at": _stamp(1800)}]
+    }
+    other = _never_started(github, run_id=30, workflow="e2e")
+    other["created_at"] = _stamp(2700)
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert not github.workflow.calls("gh api -X POST")
+
+
 def _ci_run(github: GitHub, head: str) -> dict[str, Any]:
     runs = f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={head}&event=pull_request&per_page=100"
     return github.api[runs]["workflow_runs"][0]

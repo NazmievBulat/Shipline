@@ -43,15 +43,19 @@ def _unstarted(run: dict[str, Any]) -> list[dict[str, Any]] | None:
     return jobs
 
 
-def _free(run: dict[str, Any], active: list[dict[str, Any]]) -> bool:
-    since = gate._seconds(run.get("created_at"))
+def _free(run: dict[str, Any], active: list[dict[str, Any]], since: float) -> bool:
     for other in active:
         if other["id"] == run["id"] or other.get("status") == "completed":
             continue
+        if other.get("status") == "in_progress":
+            return False
         stamp = gate._seconds(other.get("created_at"))
+        if other.get("run_attempt", 1) > 1:
+            jobs = _unstarted(other)
+            stamps = [gate._seconds(job.get("created_at")) for job in jobs or []]
+            stamp = min((value for value in stamps if value is not None), default=None)
         # Missing queue order or work already executing is no evidence of spare capacity.
-        if (other.get("status") == "in_progress" or since is None or stamp is None
-            or (stamp, other["id"]) < (since, run["id"])):
+        if stamp is None or (stamp, other["id"]) < (since, run["id"]):
             return False
     return True
 
@@ -181,7 +185,7 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
                 active.extend(gate.api(
                     f"{gate.API}/actions/runs?status={status}&per_page=100", "workflow_runs", fresh=True
                 ))
-        if not _free(run, active):
+        if not _free(run, active, since):
             continue
         if main:
             _notice(folder, number, run, workflow, "stuck", "still waiting; main is never cancelled")
