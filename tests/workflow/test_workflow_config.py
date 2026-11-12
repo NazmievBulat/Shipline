@@ -1292,7 +1292,7 @@ if args[:1] == ["api"] and path.startswith(api):
             "id": 501, "head_sha": head, "head_branch": "main", "event": "push",
             "status": "completed", "conclusion": "failure", "run_attempt": 1,
             "updated_at": "2026-10-20T10:00:00Z", "path": ".github/workflows/@CI@"}]}))
-    elif found:
+    elif found or path.startswith(api + "runs?status="):
         print(json.dumps({"workflow_runs": []}))
     elif path.startswith(api + "runs/501/jobs"):
         print(json.dumps({"jobs": [

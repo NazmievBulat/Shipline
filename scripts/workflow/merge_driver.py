@@ -535,6 +535,10 @@ def _drive(folder: Path) -> None:
                     if _drive_gate(folder, number):
                         driven.add(number)
                     refreshed.add(number)
+                elif (pull["headRefName"] == note.branch and check_repair.never_started_push_pending(
+                    folder, number, pull["headRefOid"], note.head
+                )):
+                    print(f"merge handoff {number} waits for GitHub to show the recovery's pushed head", flush=True)
                 else:
                     _hand_back(folder, number, "head changed since the passed review handoff")
             elif gate.failed_checks(pull) or (

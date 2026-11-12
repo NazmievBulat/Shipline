@@ -1729,9 +1729,10 @@ def test_an_answer_the_wake_could_not_send_is_sent_later(day: Workflow) -> None:
 
 
 
-def test_a_prefix_queue_warning_is_told_once_and_kept_until_delivery(night: Workflow) -> None:
+@pytest.mark.parametrize("kind", ["prefix-queues", "never-started"])
+def test_a_prefix_queue_warning_is_told_once_and_kept_until_delivery(night: Workflow, kind: str) -> None:
     night.orchestrator("busy")
-    pending = night.repo / ".local/workflow/prefix-queues.pending"
+    pending = night.repo / f".local/workflow/{kind}.pending"
     pending.mkdir(parents=True)
     event = pending / "100-2.json"
     line = "scratch run 100 attempt 2 has a job queued past 20 minutes; still waiting"
@@ -1745,7 +1746,7 @@ def test_a_prefix_queue_warning_is_told_once_and_kept_until_delivery(night: Work
     assert len(night.sent()) == 2
     assert f"\n{line}\n" in night.sent()[-1]
     assert not event.exists()
-    assert (pending.with_name("prefix-queues.sent") / event.name).exists()
+    assert (pending.with_name(f"{kind}.sent") / event.name).exists()
 
 
 def test_a_runner_download_notice_is_delivered_once_and_retained_on_failure(night: Workflow) -> None:

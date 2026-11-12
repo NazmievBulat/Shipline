@@ -1,5 +1,6 @@
 """A check GitHub still lists as running after its run completed: the gate runs CI again."""
 
+import fcntl
 import json
 import sys
 import time
@@ -8,6 +9,7 @@ from typing import Any
 
 import pytest
 from workflow_harness import Workflow
+from workflow.test_merge_driver import handed as handed_fixture
 from workflow.test_merge_when_current import (
     GitHub,
     blocked_first,
@@ -22,12 +24,418 @@ from workflow.test_merge_when_current import (
 )
 
 github = github_fixture
+handed = handed_fixture
 
 _REPO = "repos/example-org/example-app"
 
 
 def _stamp(seconds_ago: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds_ago))
+
+
+# A run that GitHub never dispatched needs recovery before there is a completed check.
+_ACTIVE = ("queued", "in_progress", "waiting", "pending", "requested")
+
+
+def _never_started(github: GitHub, *, run_id: int = 20, workflow: str = "ci") -> dict[str, Any]:
+    run = {
+        "id": run_id, "head_sha": github.head, "head_branch": "ticket/seven",
+        "event": "pull_request", "status": "queued", "conclusion": None,
+        "path": f".github/workflows/{workflow}.yml", "run_attempt": 1,
+        "created_at": _stamp(3600),
+    }
+    for status in _ACTIVE:
+        github.api.setdefault(
+            f"{_REPO}/actions/runs?status={status}&per_page=100", {"workflow_runs": []}
+        )
+    github.api[f"{_REPO}/actions/runs?status=queued&per_page=100"]["workflow_runs"].append(run)
+    github.api[f"{_REPO}/actions/runs/{run_id}"] = run
+    github.api[f"{_REPO}/actions/runs/{run_id}/cancel"] = {}
+    github.api[f"{_REPO}/actions/runs/{run_id}/jobs?per_page=100"] = {"jobs": []}
+    return run
+
+
+def _recover_queue(github: GitHub):
+    github.save()
+    snapshot = github.workflow.state / "queued-pulls.json"
+    snapshot.write_text(json.dumps(github.pulls))
+    return github.workflow.run_python(
+        "tick_queued_runs.py", str(github.workflow.repo / ".local/workflow"), str(snapshot)
+    )
+
+
+def _queue_notes(github: GitHub) -> list[dict[str, Any]]:
+    folder = github.workflow.repo / ".local/workflow/never-started.pending"
+    return [json.loads(path.read_text()) for path in folder.glob("*.json")]
+
+
+def _stuck_retry(github: GitHub, run: dict[str, Any]) -> None:
+    attempt = run["run_attempt"]
+    assert _recover_queue(github).returncode == 0
+    run.update(status="completed", conclusion="cancelled")
+    # GitHub can keep showing the cancelled first attempt after accepting its rerun.
+    for _ in range(3):
+        assert _recover_queue(github).returncode == 0
+    run.update(status="queued", conclusion=None, run_attempt=attempt + 1)
+    github.api[f"{_REPO}/actions/runs/{run['id']}/jobs?per_page=100"] = {
+        "jobs": [{"id": 201, "run_attempt": attempt + 1, "status": "queued", "created_at": _stamp(3600)}]
+    }
+
+
+def _queue_worktree(github: GitHub) -> Path:
+    workflow = github.workflow
+    workflow.git("checkout", "main")
+    worktree = workflow.repo / ".claude/worktrees/ticket-7"
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    workflow.git("worktree", "add", str(worktree), "ticket/seven")
+    return worktree
+
+
+@pytest.mark.parametrize("suite", ["ci", "e2e"])
+def test_a_never_started_run_is_cancelled_by_api_and_rerun_once(github: GitHub, suite: str) -> None:
+    run = _never_started(github, workflow=suite)
+    for _ in range(2):
+        done = _recover_queue(github)
+        assert done.returncode == 0, done.stderr
+    assert len(github.workflow.calls(f"gh api -X POST {_REPO}/actions/runs/20/cancel")) == 1
+    assert not github.workflow.calls("gh run cancel")
+    run.update(status="completed", conclusion="cancelled")
+    for _ in range(2):
+        done = _recover_queue(github)
+        assert done.returncode == 0, done.stderr
+    assert len(github.workflow.calls("gh run rerun 20 ")) == 1
+    assert len(_queue_notes(github)) == 1
+
+
+@pytest.mark.parametrize("attempt", [1, 3])
+def test_a_stuck_retry_gets_one_empty_commit_from_its_clean_worktree(github: GitHub, attempt: int) -> None:
+    worktree = _queue_worktree(github)
+    run = _never_started(github)
+    run["run_attempt"] = attempt
+    github.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"] = {
+        "jobs": [{"id": 21, "run_attempt": attempt, "status": "queued", "created_at": _stamp(3600)}]
+    }
+    _stuck_retry(github, run)
+    before = github.head
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    pushed = _origin(github)
+    assert pushed != before
+    assert github.workflow.git("rev-parse", f"{pushed}^") == before
+    assert github.workflow.git("rev-parse", f"{pushed}^{{tree}}") == github.workflow.git(
+        "rev-parse", f"{before}^{{tree}}"
+    )
+    assert github.workflow.git("log", "-1", "--format=%s", cwd=worktree) == (
+        "ci: run CI again, GitHub never started CI of run 20"
+    )
+    assert _recover_queue(github).returncode == 0
+    assert _origin(github) == pushed
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress", "waiting", "pending", "requested"])
+def test_a_busy_repository_does_not_cancel_a_never_started_run(github: GitHub, status: str) -> None:
+    run = _never_started(github)
+    other = {**run, "id": 19, "created_at": _stamp(7200), "status": status,
+             "head_branch": "ticket/other", "head_sha": github.base}
+    github.api[f"{_REPO}/actions/runs?status={status}&per_page=100"]["workflow_runs"].append(other)
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert not github.workflow.calls("gh api -X POST")
+    assert not _queue_notes(github)
+
+
+@pytest.mark.parametrize("job", [
+    {"id": 21, "status": "completed", "conclusion": "success"},
+    {"id": 21, "status": "queued", "started_at": "2026-01-01T00:00:00Z"},
+    {"id": 21, "status": "in_progress"},
+])
+def test_any_started_job_prevents_queue_recovery(github: GitHub, job: dict[str, Any]) -> None:
+    _never_started(github)
+    github.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"] = {"jobs": [job]}
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert not github.workflow.calls("gh api -X POST")
+
+
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "schedule"])
+def test_a_never_started_main_run_is_only_reported(github: GitHub, event: str) -> None:
+    run = _never_started(github)
+    run.update(head_branch="main", event=event, head_sha=github.base)
+    for _ in range(2):
+        done = _recover_queue(github)
+        assert done.returncode == 0, done.stderr
+    assert not github.workflow.calls("gh api -X POST")
+    assert not github.workflow.calls("gh run rerun")
+    assert _origin(github) == github.head
+    [note] = _queue_notes(github)
+    assert "main" in note["line"]
+
+
+def test_a_second_stuck_run_on_the_same_head_is_refused_and_reported(github: GitHub) -> None:
+    _queue_worktree(github)
+    first = _never_started(github)
+    _stuck_retry(github, first)
+    assert _recover_queue(github).returncode == 0
+    pushed = _origin(github)
+    first.update(status="completed", conclusion="cancelled")
+    second = _never_started(github, run_id=30, workflow="e2e")
+    _stuck_retry(github, second)
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert _origin(github) == pushed
+    assert any("not pushed for twice" in note["line"] for note in _queue_notes(github))
+
+
+def test_a_new_retry_wait_is_timed_from_its_own_jobs(github: GitHub) -> None:
+    _queue_worktree(github)
+    run = _never_started(github)
+    _stuck_retry(github, run)
+    github.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"]["jobs"][0]["created_at"] = _stamp(60)
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert _origin(github) == github.head
+
+
+def test_queue_recovery_is_called_by_the_tick(github: GitHub) -> None:
+    _never_started(github)
+    github.save()
+    workflow = github.workflow
+    workflow.list_pull_request(7, draft=False, labels=())
+    (workflow.state / "pr/7").write_text(f"OPEN ticket/seven {github.head}\n")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(workflow.calls(f"gh api -X POST {_REPO}/actions/runs/20/cancel")) == 1
+
+
+@pytest.mark.parametrize("change", ["head", "branch", "draft", "closed", "event", "workflow"])
+def test_queue_recovery_requires_a_current_open_pull_run(github: GitHub, change: str) -> None:
+    run = _never_started(github)
+    if change == "head":
+        run["head_sha"] = github.base
+    elif change == "branch":
+        run["head_branch"] = "ticket/other"
+    elif change == "draft":
+        github.pulls["7"]["isDraft"] = True
+    elif change == "closed":
+        github.pulls["7"]["state"] = "CLOSED"
+    elif change == "event":
+        run["event"] = "workflow_dispatch"
+    else:
+        run["path"] = ".github/workflows/images.yml"
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert not github.workflow.calls("gh api -X POST")
+
+
+def test_a_dirty_worktree_is_not_used_for_queue_recovery(github: GitHub) -> None:
+    worktree = _queue_worktree(github)
+    (worktree / "shared.txt").write_text("uncommitted\n")
+    run = _never_started(github)
+    _stuck_retry(github, run)
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert _origin(github) == github.head
+    assert (worktree / "shared.txt").read_text() == "uncommitted\n"
+    assert any("uncommitted" in note["line"] for note in _queue_notes(github))
+
+
+def test_missing_queue_timestamps_start_a_durable_observation(github: GitHub) -> None:
+    run = _never_started(github)
+    run.pop("created_at")
+    assert _recover_queue(github).returncode == 0
+    assert not github.workflow.calls("gh api -X POST")
+    path = github.workflow.repo / ".local/workflow/never-started-runs.json"
+    state = json.loads(path.read_text())
+    state["runs"]["20"]["observed"]["1"] -= 3600
+    path.write_text(json.dumps(state))
+    assert _recover_queue(github).returncode == 0
+    assert len(github.workflow.calls(f"gh api -X POST {_REPO}/actions/runs/20/cancel")) == 1
+
+
+def test_queue_cancellation_lost_to_an_outage_can_retry(github: GitHub) -> None:
+    _never_started(github)
+    endpoint = f"{_REPO}/actions/runs/20/cancel"
+    github.api[endpoint] = "HTTP 502: Bad Gateway"
+    assert _recover_queue(github).returncode == 1
+    github.api[endpoint] = {}
+    assert _recover_queue(github).returncode == 0
+    assert _recover_queue(github).returncode == 0
+    assert len(github.workflow.calls(f"gh api -X POST {endpoint}")) == 2
+
+
+@pytest.mark.parametrize("operation", ["cancel", "rerun"])
+def test_an_accepted_recovery_with_a_lost_response_is_reconciled(github: GitHub, operation: str) -> None:
+    _queue_worktree(github)
+    run = _never_started(github)
+    endpoint = f"{_REPO}/actions/runs/20/cancel"
+    if operation == "cancel":
+        github.api[endpoint] = "HTTP 502: Bad Gateway"
+        assert _recover_queue(github).returncode == 1
+    else:
+        assert _recover_queue(github).returncode == 0
+    run.update(status="completed", conclusion="cancelled")
+    if operation == "rerun":
+        (github.workflow.state / "rerun-unavailable").write_text("HTTP 502: Bad Gateway")
+        assert _recover_queue(github).returncode == 1
+    else:
+        github.api[endpoint] = {}
+        assert _recover_queue(github).returncode == 0
+    # The request reached GitHub, whose next response reveals the accepted new attempt.
+    run.update(status="queued", conclusion=None, run_attempt=2)
+    github.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"] = {
+        "jobs": [{"id": 201, "run_attempt": 2, "status": "queued", "created_at": _stamp(3600)}]
+    }
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert _origin(github) != github.head
+
+
+def test_an_unreadable_queue_never_authorizes_cancellation(github: GitHub) -> None:
+    _never_started(github)
+    github.api[f"{_REPO}/actions/runs?status=in_progress&per_page=100"] = "HTTP 403: Forbidden"
+    assert _recover_queue(github).returncode == 1
+    assert not github.workflow.calls("gh api -X POST")
+
+
+def test_queue_recovery_leaves_while_the_merge_lock_is_held(github: GitHub) -> None:
+    _never_started(github)
+    folder = github.workflow.repo / ".local/workflow"
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "merge.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert _recover_queue(github).returncode == 0
+    assert not github.workflow.calls("gh api -X POST")
+
+
+def test_equal_queue_timestamps_do_not_make_two_stuck_runs_block_each_other(github: GitHub) -> None:
+    first = _never_started(github)
+    second = _never_started(github, run_id=30, workflow="e2e")
+    second["created_at"] = first["created_at"]
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert len(github.workflow.calls(f"gh api -X POST {_REPO}/actions/runs/20/cancel")) == 1
+    assert not github.workflow.calls(f"gh api -X POST {_REPO}/actions/runs/30/cancel")
+
+
+def test_a_manual_retry_does_not_jump_a_job_waiting_before_that_attempt(github: GitHub) -> None:
+    run = _never_started(github)
+    run["run_attempt"] = 3
+    github.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"] = {
+        "jobs": [{"id": 21, "run_attempt": 3, "status": "queued", "created_at": _stamp(1800)}]
+    }
+    other = _never_started(github, run_id=30, workflow="e2e")
+    other["created_at"] = _stamp(2700)
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert not github.workflow.calls(f"gh api -X POST {_REPO}/actions/runs/20/cancel")
+
+
+def _cancelled_recovery(handed: GitHub) -> dict[str, Any]:
+    run = _never_started(handed)
+    handed.api[
+        f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
+    ]["workflow_runs"] = [run]
+    for workflow in ("images", "e2e"):
+        handed.api[
+            f"{_REPO}/actions/workflows/{workflow}.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
+        ] = {"workflow_runs": []}
+    assert _recover_queue(handed).returncode == 0
+    run.update(status="completed", conclusion="cancelled")
+    handed.pulls["7"]["statusCheckRollup"] = [{
+        "__typename": "CheckRun", "name": "CI result", "status": "COMPLETED",
+        "conclusion": "CANCELLED",
+        "detailsUrl": "https://github.com/example-org/example-app/actions/runs/20/job/21",
+    }]
+    return run
+
+
+@pytest.mark.parametrize("stage", [
+    "cancelled", "rerun metadata", "retry queued", "retry passed", "long retry passed", "passed between polls",
+])
+def test_recovery_cancellation_keeps_the_passed_review_handoff(handed: GitHub, stage: str) -> None:
+    run = _cancelled_recovery(handed)
+    if stage != "cancelled":
+        assert _recover_queue(handed).returncode == 0
+    if stage == "retry queued":
+        run.update(status="queued", conclusion=None, run_attempt=2)
+    elif "passed" in stage:
+        run.update(status="completed", conclusion="success", run_attempt=2)
+        handed.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"] = {"jobs": [{
+            "id": 221, "name": "CI result", "status": "completed", "conclusion": "success",
+            "run_attempt": 2,
+        }]}
+        if stage != "retry passed":
+            path = handed.workflow.repo / ".local/workflow/never-started-runs.json"
+            data = json.loads(path.read_text())
+            data["runs"]["20"]["requested_at"] -= 86400
+            path.write_text(json.dumps(data))
+        if stage == "passed between polls":
+            run["updated_at"] = _stamp(1)
+        else:
+            assert _recover_queue(handed).returncode == 0
+    handed.save()
+    done = handed.workflow.run_python("merge_driver.py")
+    assert done.returncode == 0, done.stdout + done.stderr
+    folder = handed.workflow.repo / ".local/workflow"
+    assert (folder / "merge-wanted-7").exists(), done.stdout + done.stderr
+    assert not (folder / "merge-review-7").exists(), done.stdout + done.stderr
+    assert not (handed.workflow.state / "merged").exists()
+    assert not any(" new-session " in call for call in handed.workflow.calls("tmux"))
+
+
+@pytest.mark.parametrize("problem", ["expired", "head", "run", "attempt", "failure", "check failure", "abandoned", "passed expired"])
+def test_recovery_pending_does_not_hide_other_failures(handed: GitHub, problem: str) -> None:
+    run = _cancelled_recovery(handed)
+    path = handed.workflow.repo / ".local/workflow/never-started-runs.json"
+    if problem == "passed expired":
+        assert _recover_queue(handed).returncode == 0
+        run.update(status="completed", conclusion="success", run_attempt=2)
+        handed.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"] = {"jobs": [{
+            "id": 221, "name": "CI result", "status": "completed", "conclusion": "success",
+            "run_attempt": 2,
+        }]}
+        assert _recover_queue(handed).returncode == 0
+    data = json.loads(path.read_text())
+    entry = data["runs"]["20"]
+    if problem == "expired":
+        entry["requested_at"] -= 86400
+    elif problem == "head":
+        entry["head"] = handed.base
+    elif problem == "run":
+        data["runs"]["999"] = data["runs"].pop("20")
+    elif problem == "attempt":
+        run["run_attempt"] = 2
+    elif problem == "failure":
+        run["conclusion"] = "failure"
+    elif problem == "check failure":
+        handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    elif problem == "passed expired":
+        entry["finished_at"] -= 86400
+    else:
+        entry["state"] = "refused"
+    path.write_text(json.dumps(data))
+    handed.save()
+    done = handed.workflow.run_python("merge_driver.py")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not (path.parent / "merge-wanted-7").exists(), done.stdout + done.stderr
+    assert (path.parent / "merge-review-7").exists(), done.stdout + done.stderr
+
+
+def test_an_empty_commit_keeps_its_handoff_while_github_shows_the_old_head(handed: GitHub) -> None:
+    run = _never_started(handed)
+    _stuck_retry(handed, run)
+    assert _recover_queue(handed).returncode == 0
+    published = _origin(handed)
+    assert published != handed.head
+    handed.save()
+    for _ in range(2):
+        done = handed.workflow.run_python("merge_driver.py")
+        assert done.returncode == 0, done.stdout + done.stderr
+        folder = handed.workflow.repo / ".local/workflow"
+        note = folder / "merge-wanted-7"
+        assert note.exists(), done.stdout + done.stderr
+        assert json.loads(note.read_text())["head"] == published
+        assert not (folder / "merge-review-7").exists()
 
 
 def _ci_run(github: GitHub, head: str) -> dict[str, Any]:

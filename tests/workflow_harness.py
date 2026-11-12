@@ -191,6 +191,10 @@ if [[ $1 == api && $2 == repos/*/collaborators/*/permission ]]; then
   exit 0
 fi
 if [ "$1 $2" = "api --paginate" ]; then
+  if [[ $3 == repos/*/actions/runs[?]status=* ]]; then
+    echo '{"workflow_runs": []}'
+    exit 0
+  fi
   number=${3%/reviews}
   number=${number##*/}
   [ ! -e "@STATE@/fail-gh-reviews" ] || exit 1

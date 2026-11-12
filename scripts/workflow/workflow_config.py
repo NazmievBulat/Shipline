@@ -534,7 +534,7 @@ class ConflictReview:
 
 @config_section
 class MergeTrain:
-    queued_limit_minutes: int = option('minutes', 20, 'Minutes a scratch CI run may remain queued before its wait is bounded.', position=0)
+    queued_limit_minutes: int = option('minutes', 20, 'Minutes a CI or E2E run may remain queued before recovery is considered.', position=0)
 
 
 @config_section

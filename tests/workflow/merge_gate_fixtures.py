@@ -249,6 +249,9 @@ def answer(args, cwd, env, out, err):
         if any(f"/actions/workflows/{name}/" in path for name in data.get("missing_workflows", [])):
             sys.exit("gh: Not Found (HTTP 404)")
         if path not in data["api"]:
+            if "/actions/runs?status=" in path:
+                print('{"workflow_runs": []}')
+                sys.exit(0)
             if "event=workflow_dispatch" in path or "/actions/runs?branch=" in path:
                 print('{"workflow_runs": []}')
                 sys.exit(0)

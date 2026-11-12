@@ -47,6 +47,9 @@ elif found := re.fullmatch(runs + r"/(\\d+)/jobs\\?per_page=100", path):
     print(json.dumps({"jobs": jobs[found[1]]}))
 elif urlsplit(path).path == runs:
     asked = parse_qs(urlsplit(path).query)
+    if "status" in asked:
+        print(json.dumps({"workflow_runs": []}))
+        sys.exit(0)
     assert asked["created"] and asked["per_page"] == ["100"], asked
     runs = json.loads((fixtures / "runs.json").read_text())
     print(json.dumps({"total_count": len(runs), "workflow_runs": runs}))
@@ -111,6 +114,19 @@ def _measure(workflow: Workflow, *args: str) -> dict[str, Any]:
     done = workflow.run_script("workflow-metrics", "--json", *args, env=AT)
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
+
+
+@pytest.mark.parametrize("number", ["7", "main"])
+def test_never_started_runs_count_with_lost_checks(workflow: Workflow, number: str) -> None:
+    _github(workflow)
+    folder = workflow.repo / ".local/workflow"
+    for index, status in enumerate(("pending", "sent", "pending")):
+        _note(folder / f"never-started.{status}/{index}.json", {
+            "number": number, "check": "CI (never started)", "run": 20 + index,
+        }, NOW - HOUR)
+    measured = _measure(workflow)
+    assert measured["last_day"]["quality"]["lost_checks"]["CI (never started)"] == 3
+    assert any("CI (never started)" in finding["line"] for finding in measured["findings"])
 
 
 def _detectors(measured: dict[str, Any]) -> list[str]:

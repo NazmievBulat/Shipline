@@ -238,7 +238,7 @@ installation folder, even if the checkout has a file of the same name.
 | `labels.workflow` | name | The label that starts a ticket. | `"workflow"` |
 | `machines` | machines | Machines sampled by flow-page, each with a name and optional SSH address; omitted samples this machine. | `[]` |
 | `merge.scratch_prefix` | name | The beginning of scratch branch names for tested merge prefixes, ended by - or /. | `"workflow/merge-batch-"` |
-| `merge_train.queued_limit_minutes` | minutes | Minutes a scratch CI run may remain queued before its wait is bounded. | `20` |
+| `merge_train.queued_limit_minutes` | minutes | Minutes a CI or E2E run may remain queued before recovery is considered. | `20` |
 | `parity.known` | name | The expected differences file read by tools/parity; @install/ requires an installation folder. | none |
 | `parity.runner_tests` | name | The runner tests folder compared by tools/parity. | `"tests/runner"` |
 | `parity.workflow_tests` | name | The workflow tests folder compared by tools/parity. | `"tests/workflow"` |
