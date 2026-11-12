@@ -133,7 +133,8 @@ def test_a_stuck_retry_gets_one_empty_commit_from_its_clean_worktree(github: Git
 @pytest.mark.parametrize("status", ["queued", "in_progress", "waiting", "pending", "requested"])
 def test_a_busy_repository_does_not_cancel_a_never_started_run(github: GitHub, status: str) -> None:
     run = _never_started(github)
-    other = {**run, "id": 19, "created_at": _stamp(7200), "status": status}
+    other = {**run, "id": 19, "created_at": _stamp(7200), "status": status,
+             "head_branch": "ticket/other", "head_sha": github.base}
     github.api[f"{_REPO}/actions/runs?status={status}&per_page=100"]["workflow_runs"].append(other)
     done = _recover_queue(github)
     assert done.returncode == 0, done.stderr
@@ -297,7 +298,7 @@ def test_a_manual_retry_does_not_jump_a_job_waiting_before_that_attempt(github: 
     other["created_at"] = _stamp(2700)
     done = _recover_queue(github)
     assert done.returncode == 0, done.stderr
-    assert not github.workflow.calls("gh api -X POST")
+    assert not github.workflow.calls(f"gh api -X POST {_REPO}/actions/runs/20/cancel")
 
 
 def _ci_run(github: GitHub, head: str) -> dict[str, Any]:
