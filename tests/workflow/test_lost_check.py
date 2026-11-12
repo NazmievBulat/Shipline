@@ -261,6 +261,33 @@ def test_queue_cancellation_lost_to_an_outage_can_retry(github: GitHub) -> None:
     assert len(github.workflow.calls(f"gh api -X POST {endpoint}")) == 2
 
 
+@pytest.mark.parametrize("operation", ["cancel", "rerun"])
+def test_an_accepted_recovery_with_a_lost_response_is_reconciled(github: GitHub, operation: str) -> None:
+    _queue_worktree(github)
+    run = _never_started(github)
+    endpoint = f"{_REPO}/actions/runs/20/cancel"
+    if operation == "cancel":
+        github.api[endpoint] = "HTTP 502: Bad Gateway"
+        assert _recover_queue(github).returncode == 1
+    else:
+        assert _recover_queue(github).returncode == 0
+    run.update(status="completed", conclusion="cancelled")
+    if operation == "rerun":
+        (github.workflow.state / "rerun-unavailable").write_text("HTTP 502: Bad Gateway")
+        assert _recover_queue(github).returncode == 1
+    else:
+        github.api[endpoint] = {}
+        assert _recover_queue(github).returncode == 0
+    # The request reached GitHub, whose next response reveals the accepted new attempt.
+    run.update(status="queued", conclusion=None, run_attempt=2)
+    github.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"] = {
+        "jobs": [{"id": 201, "run_attempt": 2, "status": "queued", "created_at": _stamp(3600)}]
+    }
+    done = _recover_queue(github)
+    assert done.returncode == 0, done.stderr
+    assert _origin(github) != github.head
+
+
 def test_an_unreadable_queue_never_authorizes_cancellation(github: GitHub) -> None:
     _never_started(github)
     github.api[f"{_REPO}/actions/runs?status=in_progress&per_page=100"] = "HTTP 403: Forbidden"

@@ -79,7 +79,11 @@ def _request(entry: dict[str, Any], save: Callable[[], None], state: str, *args:
         raise
     except gate.Refused as error:
         if gate.transient(str(error)):
-            restore()
+            if state == "cancel requested":
+                entry["state"] = "cancel retry"
+                save()
+            else:
+                restore()
         else:
             entry["state"] = "refused"
             save()
@@ -113,7 +117,7 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
     candidates = {str(run["id"]): run for run in queued if run.get("status") == "queued"}
     # A cancelled run disappears from the queue. Keep watching its claimed first attempt.
     for key, entry in data["runs"].items():
-        if entry.get("state") in ("cancel requested", "rerun requested") and key not in candidates:
+        if entry.get("state") in ("cancel requested", "cancel retry", "rerun requested") and key not in candidates:
             candidates[key] = gate.read_run(key)
     active = None
     for key, listed in candidates.items():
@@ -147,7 +151,12 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
                 continue
         entry = data["runs"].setdefault(key, {})
         retry_attempt = entry.get("retry_attempt")
-        if entry.get("state") == "cancel requested" and attempt == retry_attempt:
+        if (retry_attempt is not None and attempt == retry_attempt + 1
+            and entry.get("state") in ("cancel requested", "cancel retry")):
+            # A rerun may have been accepted even when its response was lost.
+            entry["state"] = "rerun requested"
+            save()
+        if entry.get("state") in ("cancel requested", "cancel retry") and attempt == retry_attempt:
             if run.get("status") == "completed" and run.get("conclusion") == "cancelled":
                 try:
                     _request(entry, save, "rerun requested", "run", "rerun", key, "-R", gate.REPOSITORY)
@@ -158,7 +167,8 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
             elif run.get("status") == "completed":
                 entry["state"] = "finished"
                 save()
-            continue
+            if entry.get("state") != "cancel retry" or run.get("status") != "queued":
+                continue
         if run.get("status") != "queued" or entry.get("state") == "refused":
             awaiting_retry = (
                 entry.get("state") == "rerun requested" and attempt == retry_attempt
@@ -192,7 +202,7 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
             continue
         if main:
             _notice(folder, number, run, workflow, "stuck", "still waiting; main is never cancelled")
-        elif "state" not in entry:
+        elif "state" not in entry or entry["state"] == "cancel retry":
             current = gate.read_run(key)
             if (current.get("status") != "queued"
                 or any(current.get(field) != run.get(field) for field in
