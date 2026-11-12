@@ -6,6 +6,7 @@ stops it."""
 import json
 from datetime import datetime, timezone
 import os
+import signal
 import shutil
 import subprocess
 import time
@@ -1120,7 +1121,7 @@ def test_git_variables_of_the_caller_do_not_turn_it_on_another_repository(
 def test_a_tick_stopped_by_a_signal_counts_neither_way(workflow: Workflow) -> None:
     home, _ = _harness_shipline(workflow, "in_progress -")
     # The tick is stopped while it waits for the sessions to be listed.
-    workflow.fake("tmux", "#!/bin/bash\n/bin/sleep 30\n")
+    workflow.fake("tmux", '#!/bin/bash\ntouch "@STATE@/tmux-entered"\n/bin/sleep 30\n')
     env = {**workflow.env, "SHIPLINE_REPO": str(workflow.repo)}
     runs = home / ".local" / "shipline" / "runs"
     tick = subprocess.Popen(
@@ -1129,18 +1130,21 @@ def test_a_tick_stopped_by_a_signal_counts_neither_way(workflow: Workflow) -> No
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
     try:
         deadline = time.monotonic() + 30
-        while not (runs / str(tick.pid)).exists():
+        while not (runs / str(tick.pid)).exists() or not (workflow.state / "tmux-entered").exists():
             assert time.monotonic() < deadline
             time.sleep(0.05)
-        time.sleep(0.5)
         tick.terminate()
         assert tick.wait(timeout=60) == 143
     finally:
-        tick.kill()
-        subprocess.run(["pkill", "-f", "/bin/sleep 30"], check=False)
+        try:
+            os.killpg(tick.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        tick.wait(timeout=5)
 
     # A shutdown or the owner stopped it; nothing says the version is broken.
     trial = json.loads((home / ".local" / "shipline" / "trial.json").read_text())
@@ -1297,10 +1301,8 @@ def test_a_lock_that_is_a_pipe_does_not_hold_the_tick(shipline: Shipline) -> Non
 def test_a_tick_whose_whole_group_is_stopped_counts_neither_way(
     workflow: Workflow, signal_name: str
 ) -> None:
-    import signal
-
     home, _ = _harness_shipline(workflow, "in_progress -")
-    workflow.fake("tmux", "#!/bin/bash\n/bin/sleep 30\n")
+    workflow.fake("tmux", '#!/bin/bash\ntouch "@STATE@/tmux-entered"\n/bin/sleep 30\n')
     env = {**workflow.env, "SHIPLINE_REPO": str(workflow.repo)}
     runs = home / ".local" / "shipline" / "runs"
     tick = subprocess.Popen(
@@ -1313,16 +1315,18 @@ def test_a_tick_whose_whole_group_is_stopped_counts_neither_way(
     )
     try:
         deadline = time.monotonic() + 30
-        while not (runs / str(tick.pid)).exists():
+        while not (runs / str(tick.pid)).exists() or not (workflow.state / "tmux-entered").exists():
             assert time.monotonic() < deadline
             time.sleep(0.05)
-        time.sleep(0.5)
         # As a terminal that closes, or `timeout`, signals the whole group: the watch too.
         os.killpg(tick.pid, getattr(signal, signal_name))
         assert tick.wait(timeout=60) in (129, 143)
     finally:
-        tick.kill()
-        subprocess.run(["pkill", "-f", "/bin/sleep 30"], check=False)
+        try:
+            os.killpg(tick.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        tick.wait(timeout=5)
 
     trial = json.loads((home / ".local" / "shipline" / "trial.json").read_text())
     assert trial["tick_failures"] == trial["ticks"] == 0
