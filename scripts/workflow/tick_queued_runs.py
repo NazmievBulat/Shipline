@@ -183,6 +183,9 @@ def recover(folder: Path, pulls: dict[str, Any]) -> None:
                 and run.get("conclusion") == "cancelled"
             )
             if run.get("status") == "completed" and not awaiting_retry:
+                if (run.get("conclusion") == "success" and retry_attempt is not None
+                    and attempt == retry_attempt + 1):
+                    entry.setdefault("finished_at", time.time())
                 entry["state"] = "finished"
                 save()
             continue

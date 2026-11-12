@@ -351,8 +351,10 @@ def diagnose(pull: dict[str, Any], *, folder: Path | None = None) -> Diagnosis:
             elif (
                 found.get("conclusion") == "success"
                 and folder is not None
-                and (claim := marker(folder, found["id"])).exists()
-                and _state(claim) in ("claim", "requested")
+                and (never_started_succeeded(folder, found) or (
+                    (claim := marker(folder, found["id"])).exists()
+                    and _state(claim) in ("claim", "requested")
+                ))
             ):
                 passed_retries.append(found)
     if not failed_runs and passed_retries:
@@ -561,6 +563,30 @@ def never_started_pending(folder: Path, found: dict[str, Any]) -> bool:
         or attempt == note["retry_attempt"] + 1
         and found.get("status") != "completed" and found.get("conclusion") is None
     )
+
+
+def never_started_succeeded(folder: Path, found: dict[str, Any]) -> bool:
+    """A successful owned retry may finish before the rollup drops its old cancellation."""
+    from merge_gate import _seconds
+
+    if found.get("status") != "completed" or found.get("conclusion") != "success":
+        return False
+    try:
+        note = json.loads((folder / "never-started-runs.json").read_text())["runs"][str(found["id"])]
+        limit = max(180, workflow_config.current().merge_train.queued_limit_minutes * 60)
+        # A healthy retry can run longer than the queue limit. Its completion, not
+        # the old retry request, starts this final metadata wait.
+        since = note.get("finished_at", _seconds(found.get("updated_at")))
+        return (
+            note["head"] == found.get("head_sha")
+            and type(note["retry_attempt"]) is int
+            and note["retry_attempt"] >= 1
+            and found.get("run_attempt") == note["retry_attempt"] + 1
+            and note["state"] in ("cancel requested", "cancel retry", "rerun requested", "finished")
+            and since is not None and 0 <= time.time() - since <= limit
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def never_started_push_pending(folder: Path, number: str, before: str, after: str) -> bool:

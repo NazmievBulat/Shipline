@@ -335,6 +335,10 @@ def _cancelled_recovery(handed: GitHub) -> dict[str, Any]:
     handed.api[
         f"{_REPO}/actions/workflows/ci.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
     ]["workflow_runs"] = [run]
+    for workflow in ("images", "e2e"):
+        handed.api[
+            f"{_REPO}/actions/workflows/{workflow}.yml/runs?head_sha={handed.head}&event=pull_request&per_page=100"
+        ] = {"workflow_runs": []}
     assert _recover_queue(handed).returncode == 0
     run.update(status="completed", conclusion="cancelled")
     handed.pulls["7"]["statusCheckRollup"] = [{
@@ -345,13 +349,30 @@ def _cancelled_recovery(handed: GitHub) -> dict[str, Any]:
     return run
 
 
-@pytest.mark.parametrize("stage", ["cancelled", "rerun metadata", "retry queued"])
+@pytest.mark.parametrize("stage", [
+    "cancelled", "rerun metadata", "retry queued", "retry passed", "long retry passed", "passed between polls",
+])
 def test_recovery_cancellation_keeps_the_passed_review_handoff(handed: GitHub, stage: str) -> None:
     run = _cancelled_recovery(handed)
     if stage != "cancelled":
         assert _recover_queue(handed).returncode == 0
     if stage == "retry queued":
         run.update(status="queued", conclusion=None, run_attempt=2)
+    elif "passed" in stage:
+        run.update(status="completed", conclusion="success", run_attempt=2)
+        handed.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"] = {"jobs": [{
+            "id": 221, "name": "CI result", "status": "completed", "conclusion": "success",
+            "run_attempt": 2,
+        }]}
+        if stage != "retry passed":
+            path = handed.workflow.repo / ".local/workflow/never-started-runs.json"
+            data = json.loads(path.read_text())
+            data["runs"]["20"]["requested_at"] -= 86400
+            path.write_text(json.dumps(data))
+        if stage == "passed between polls":
+            run["updated_at"] = _stamp(1)
+        else:
+            assert _recover_queue(handed).returncode == 0
     handed.save()
     done = handed.workflow.run_python("merge_driver.py")
     assert done.returncode == 0, done.stdout + done.stderr
@@ -362,10 +383,18 @@ def test_recovery_cancellation_keeps_the_passed_review_handoff(handed: GitHub, s
     assert not any(" new-session " in call for call in handed.workflow.calls("tmux"))
 
 
-@pytest.mark.parametrize("problem", ["expired", "head", "run", "attempt", "failure", "check failure", "abandoned"])
+@pytest.mark.parametrize("problem", ["expired", "head", "run", "attempt", "failure", "check failure", "abandoned", "passed expired"])
 def test_recovery_pending_does_not_hide_other_failures(handed: GitHub, problem: str) -> None:
     run = _cancelled_recovery(handed)
     path = handed.workflow.repo / ".local/workflow/never-started-runs.json"
+    if problem == "passed expired":
+        assert _recover_queue(handed).returncode == 0
+        run.update(status="completed", conclusion="success", run_attempt=2)
+        handed.api[f"{_REPO}/actions/runs/20/jobs?per_page=100"] = {"jobs": [{
+            "id": 221, "name": "CI result", "status": "completed", "conclusion": "success",
+            "run_attempt": 2,
+        }]}
+        assert _recover_queue(handed).returncode == 0
     data = json.loads(path.read_text())
     entry = data["runs"]["20"]
     if problem == "expired":
@@ -380,6 +409,8 @@ def test_recovery_pending_does_not_hide_other_failures(handed: GitHub, problem: 
         run["conclusion"] = "failure"
     elif problem == "check failure":
         handed.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    elif problem == "passed expired":
+        entry["finished_at"] -= 86400
     else:
         entry["state"] = "refused"
     path.write_text(json.dumps(data))
