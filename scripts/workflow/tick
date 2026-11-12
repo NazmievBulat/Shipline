@@ -1047,7 +1047,8 @@ local_duties() {
   # both the installed question test and its once-only ring; shadow ticks never write.
   if ((shadow == 0)); then
     while read -r name state _; do
-      [[ $state == idle && $name =~ ^(ticket|review)-[0-9]+$ ]] || continue
+      [[ $name =~ ^(ticket|review)-[0-9]+$ ]] || continue
+      [[ $state == idle || -r $main/.claude/worktrees/ticket-${name#*-}/$SHIPLINE_STATE_FOLDER/$name.stop-pending.json ]] || continue
       session_current "$name" || continue
       WORKFLOW_SESSION=$name bash "$here/notify" recheck 9>&- || tick_failed
     done <<<"$running"

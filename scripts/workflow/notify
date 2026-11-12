@@ -216,10 +216,19 @@ question_identity() {
 # A Stop can need the answer both for draft blocking and question metadata. Its local
 # result also seeds recovery's receipt, so the next tick does not repeat the same test.
 question_in_stop() {
-  local identity="" receipt=""
+  local identity="" receipt="" saved="$notes/$name.stop-message"
   if [[ -z $owner_question ]]; then
-    if [[ ! -e $notes/$name.codex && -r $notes/$name.stop-message ]]; then
-      identity=$(question_identity "$notes/$name.stop-message") || identity=""
+    if [[ -e $notes/$name.codex ]]; then
+      saved=$notes/$name.codex-turn.json
+      # Native callbacks replace this file without notify.lock. Match the words only
+      # between equal hashes, so A's result can never be stored under a later turn B.
+      identity=$(question_identity "$saved") || identity=""
+      [[ $(jq -er '.["last-assistant-message"] | strings' "$saved" 2>/dev/null) == "$1" ]] || identity=""
+      [[ -n $identity && $(question_identity "$saved") == "$identity" ]] || identity=""
+    elif [[ -r $saved ]]; then
+      identity=$(question_identity "$saved") || identity=""
+    fi
+    if [[ -n $identity ]]; then
       [[ ! -r $notes/$name.question-tested ]] || receipt=$(<"$notes/$name.question-tested")
     fi
     if [[ -n $identity && $receipt == "$identity true" ]]; then
@@ -376,9 +385,74 @@ lock_stop() {
   fi
 }
 
+# A prompt invalidates callbacks and receipts from the preceding turn. The epoch
+# is compared as data, never interpreted; an atomic replacement avoids partial reads.
+prompt_epoch() {
+  if [[ -r $notes/$name.prompt-epoch ]]; then cat "$notes/$name.prompt-epoch"; else echo start; fi
+}
+
+stop_is_current() {
+  [[ -z ${stop_epoch:-} || $stop_epoch == "$(prompt_epoch)" ]]
+}
+
+# A real Stop received during another delivery must survive that delivery's lock.
+# Keep the latest callback atomically; a prompt makes older pending work obsolete.
+queue_stop() {
+  local temporary epoch
+  [[ -d $worktree ]] || return 1
+  (umask 077; mkdir -p "$notes") || return 1
+  temporary=$(mktemp "$notes/$name.pending.XXXXXX") || return 1
+  epoch=$(prompt_epoch)
+  jq -c --arg epoch "$epoch" '{epoch: $epoch, event: .}' <<<"$event" >"$temporary" &&
+    touch -d "@${WORKFLOW_NOW:-$(date +%s)}" "$temporary" &&
+    mv "$temporary" "$notes/$name.stop-pending.json"
+  local result=$?
+  rm -f "$temporary"
+  return "$result"
+}
+
+# The caller holds notify.lock. Claim one callback so a newer delivery cannot be
+# removed with the one being processed. Its saved time remains the time it stopped.
+drain_pending_stop() {
+  local claimed stop_saved_at stop_epoch sum processed message
+  [[ -r $notes/$name.stop-pending.json ]] || return 1
+  claimed=$(mktemp "$notes/$name.claimed.XXXXXX") || return 1
+  if ! mv "$notes/$name.stop-pending.json" "$claimed"; then
+    rm -f "$claimed"
+    return 1
+  fi
+  stop_saved_at=$(stat -c %Y "$claimed") || { rm -f "$claimed"; return 1; }
+  stop_epoch=$(jq -er '.epoch | strings' "$claimed") || { rm -f "$claimed"; return 1; }
+  event=$(jq -ce '.event | select(.hook_event_name == "Stop")' "$claimed") || { rm -f "$claimed"; return 1; }
+  rm -f "$claimed"
+  stop_is_current || return 0
+  message=$(field .last_assistant_message)
+  sum=$(sha256sum <<<"$message")
+  processed="$stop_epoch ${sum%% *}"
+  [[ ! -r $notes/$name.stop-processed || $(<"$notes/$name.stop-processed") != "$processed" ]] || return 0
+  on_stop_locked
+  # Repeated callbacks in the same turn must not consume notify waiting twice.
+  if stop_is_current && { [[ ! -e $asking ]] || [[ -r $pushed && $(<"$pushed") == "$message" ]]; }; then
+    (umask 077; note "$notes/$name.stop-processed" "$processed")
+  fi
+  return 0
+}
+
 on_stop() {
+  if [[ $name =~ ^(ticket|review)- && -d $worktree ]]; then
+    queue_stop || return 0
+    lock_stop || return 0
+    # One callback per hook keeps network delivery within its existing time budget.
+    drain_pending_stop || true
+  else
+    lock_stop || return 0
+    on_stop_locked "$@"
+  fi
+}
+
+on_stop_locked() {
   local message limit_at asked="" temporary owner_question=""
-  lock_stop || return 0
+  stop_is_current || return 0
   # Permission dialogs and the question tool continue this same turn when answered. A
   # later Stop proves that interaction ended; a refused merge still becomes an owner
   # block below when the last message asks for permission to retry it.
@@ -392,7 +466,9 @@ on_stop() {
   # Atomic replacement keeps the tick from reading half a message; it is private like a turn.
   if [[ $name =~ ^(ticket|review)- && ! -e $notes/$name.codex && -d $worktree ]]; then
     temporary=$(mktemp "$notes/$name.stop.XXXXXX") || return 0
-    printf '%s\n' "$message" >"$temporary" && mv "$temporary" "$notes/$name.stop-message"
+    printf '%s\n' "$message" >"$temporary" &&
+      { [[ -z ${stop_saved_at:-} ]] || touch -d "@$stop_saved_at" "$temporary"; } &&
+      mv "$temporary" "$notes/$name.stop-message"
     rm -f "$temporary"
   fi
   # Stopped by the usage limit, the session is neither working nor waiting for the owner: the
@@ -439,12 +515,13 @@ on_stop() {
     # A hunt asks the owner nothing. One that stops before its report is done could not go on.
     hunt-*) ! said_finished "hunt finished" "$message" || return 0 ;;
   esac
-  publish_question "$message" "${WORKFLOW_NOW:-$(date +%s)}" "$asked"
+  publish_question "$message" "${stop_saved_at:-${WORKFLOW_NOW:-$(date +%s)}}" "$asked"
 }
 
 # Stop delivery and recovery share the asking note, reviewer block and push receipt.
 publish_question() {
-  local message=$1 at=$2 asked=${3:-} known=${4:-} sum
+  local message=$1 at=$2 asked=${3:-} known=${4:-} sum delivery_asked
+  stop_is_current || return 0
   # Even a failed push leaves a reviewer blocked; automatic check nudges answer nothing.
   [[ $name != review-* ]] || note "$notes/$name.owner-blocked" ""
   # The same words after a turn of the session's own (its job ended) are the same question,
@@ -462,6 +539,7 @@ publish_question() {
       { [[ $known == question ]] || question_in_stop "$message"; }; then
     note "$question" "$(question_of "$message" "$(<"$asking")")"
   fi
+  delivery_asked=$(<"$asking")
   # A session woken by its own job that stops again with the same words rings once.
   [[ ! -e $pushed || $(<"$pushed") != "$message" ]] || return 0
   if [[ -e $notes/$name.codex ]]; then
@@ -469,15 +547,20 @@ publish_question() {
   else
     ring "$(beginning_of .last_assistant_message)" || return 0
   fi
+  # An owner prompt during the send answers this question. Its late receipt must
+  # not silence a new question with identical words after that answer.
+  stop_is_current && [[ -r $asking && $(<"$asking") == "$delivery_asked" ]] || return 0
   note "$pushed" "$message"
 }
 
-# Called only for an idle worker/reviewer from the tick. Never replay a Stop: doing so
-# would reset waits and turn progress reports on ready pull requests into questions.
+# The tick first drains an actual callback deferred by the lock, even if its prompt
+# removed idle. Reclassifying a saved message never fabricates another Stop event.
 on_recheck() {
-  local saved="$notes/$name.stop-message" message at identity current receipt asks=false
+  local saved="$notes/$name.stop-message" message at identity current receipt asks=false stop_epoch
   [[ $name =~ ^(ticket|review)-[0-9]+$ && -d $worktree ]] || return 0
   lock_stop || return 0
+  if drain_pending_stop; then return 0; fi
+  stop_epoch=$(prompt_epoch)
   [[ -e $idle && ! -e $asking && ! -e $limit ]] || return 0
   if [[ -e $notes/$name.codex ]]; then
     saved=$notes/$name.codex-turn.json
@@ -515,10 +598,18 @@ on_recheck() {
   [[ $asks == true ]] || return 0
   event=$(jq -cn --arg message "$message" '{last_assistant_message: $message}') || return 0
   publish_question "$message" "$at" "" question
+  drain_pending_stop || true
 }
 
 on_prompt() {
-  rm -f "$notes/$name.stop-message"
+  local epoch_file
+  if [[ $name =~ ^(ticket|review)- && -d $worktree ]]; then
+    (umask 077; mkdir -p "$notes")
+    epoch_file=$(mktemp "$notes/$name.prompt.XXXXXX") || return 0
+    printf '%s\n' "$(date +%s%N)" >"$epoch_file" && mv "$epoch_file" "$notes/$name.prompt-epoch"
+    rm -f "$epoch_file"
+  fi
+  rm -f "$notes/$name.stop-message" "$notes/$name.stop-pending.json" "$notes/$name.stop-processed"
   rm -f "$idle" "$limit" "$notes/$name.limit-line" "$notes/$name.bridge-stopped"
   # Relay startup/recovery only displays a native turn. Its sentinel starts no new native
   # work and must retain a fast notify waiting, or a wait restored for replay.

@@ -4,6 +4,7 @@ import errno
 import fcntl
 import json
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -2199,9 +2200,13 @@ def test_a_new_saved_message_is_tested_on_the_same_function_version(workflow: Wo
 
 
 
-def test_stop_and_ticks_test_progress_once_on_the_same_function_version(workflow: Workflow) -> None:
-    saved = _saved_idle_message(workflow, message="The tests passed.")
-    saved.unlink()
+@pytest.mark.parametrize("codex", [False, True])
+def test_stop_and_ticks_test_progress_once_on_the_same_function_version(
+    workflow: Workflow, codex: bool,
+) -> None:
+    saved = _saved_idle_message(workflow, codex=codex, message="The tests passed.")
+    if not codex:
+        saved.unlink()
     notify = workflow.script.with_name("notify")
     notify.write_text(notify.read_text().replace(
         "asks_owner() {\n", 'asks_owner() {\n  echo tested >> "$notes/$name.question-tests"\n'))
@@ -2211,4 +2216,67 @@ def test_stop_and_ticks_test_progress_once_on_the_same_function_version(workflow
         done = workflow.run_script("tick", env={"WORKFLOW_NOW": "1790000000"})
         assert done.returncode == 0, done.stderr
     assert (saved.parent / "ticket-7.question-tests").read_text().splitlines() == ["tested"]
+    assert workflow.pushes() == []
+
+
+
+def test_a_prompt_and_stop_during_recovery_delivery_keep_the_new_question(workflow: Workflow) -> None:
+    saved = _saved_idle_message(workflow)
+    workflow.fake("curl-original", (workflow.bin / "curl").read_text())
+    original = shlex.quote(str(workflow.bin / "curl-original"))
+    workflow.fake("curl", '#!/bin/bash\ntouch "@STATE@/notify-sending"\n'
+                  'while [[ ! -e "@STATE@/notify-release" ]]; do /bin/sleep 0.01; done\n'
+                  f'exec {original} "$@"\n')
+    env = {"WORKFLOW_SESSION": "ticket-7", "WORKFLOW_NOTIFY_SECONDS": "20"}
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        delivery = workers.submit(workflow.run_script, "notify", "recheck", env=env)
+        try:
+            deadline = time.monotonic() + 10
+            while not (workflow.state / "notify-sending").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert (workflow.state / "notify-sending").exists()
+            workflow.notify({"hook_event_name": "UserPromptSubmit", "prompt": "continue"})
+            # Asking the same words again after an owner's reply is a new question.
+            workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _SAVED_QUESTION},
+                            env={"WORKFLOW_NOW": "1790000002"})
+            pending = saved.parent / "ticket-7.stop-pending.json"
+            assert pending.exists()
+        finally:
+            (workflow.state / "notify-release").touch()
+        assert delivery.result(timeout=30).returncode == 0
+    assert not pending.exists()
+    assert saved.read_text().strip() == _SAVED_QUESTION
+    assert (saved.parent / "ticket-7.asking").read_text().split()[0] == "1790000002"
+    assert [push.title for push in workflow.pushes()] == ["ticket-7 needs you"] * 2
+
+
+def test_tick_resumes_a_pending_stop_even_without_an_idle_note(workflow: Workflow) -> None:
+    saved = _saved_idle_message(workflow)
+    saved.unlink()
+    (saved.parent / "ticket-7.idle").unlink()
+    with (saved.parent / "ticket-7.notify.lock").open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        workflow.notify({"hook_event_name": "Stop", "last_assistant_message": _SAVED_QUESTION},
+                        env={"WORKFLOW_NOW": "1789999400"})
+        assert (saved.parent / "ticket-7.stop-pending.json").exists()
+        assert not (saved.parent / "ticket-7.idle").exists()
+    done = workflow.run_script("tick", env={"WORKFLOW_NOW": "1790000000"})
+    assert done.returncode == 0, done.stderr
+    assert (saved.parent / "ticket-7.idle").exists()
+    assert (saved.parent / "ticket-7.asking").read_text().split()[0] == "1789999400"
+    assert saved.stat().st_mtime == 1_789_999_400
+    assert not (saved.parent / "ticket-7.stop-pending.json").exists()
+    assert len(workflow.pushes()) == 1
+
+
+
+def test_duplicate_stops_do_not_consume_a_background_wait_twice(workflow: Workflow) -> None:
+    saved = _saved_idle_message(workflow, message="Waiting for the job.")
+    workflow.notify({"hook_event_name": "UserPromptSubmit", "prompt": "continue"})
+    workflow.run_script("notify", "waiting", env={"WORKFLOW_SESSION": "ticket-7"})
+    for _ in range(2):
+        workflow.notify({"hook_event_name": "Stop", "last_assistant_message": "Waiting for the job."})
+    assert (saved.parent / "ticket-7.job-wait").exists()
+    assert not (saved.parent / "ticket-7.idle").exists()
+    assert not (saved.parent / "ticket-7.asking").exists()
     assert workflow.pushes() == []
