@@ -230,7 +230,10 @@ def test_an_own_failure_is_refused_even_if_outside_check_metadata_is_unreadable(
     assert not (github.workflow.state / "merged").exists()
 
 
-def test_an_outside_check_that_started_after_planning_still_blocks_the_merge(github: GitHub) -> None:
+@pytest.mark.parametrize("in_tick", [False, True], ids=["direct", "tick"])
+def test_an_outside_check_that_started_after_planning_still_blocks_the_merge(
+    github: GitHub, in_tick: bool,
+) -> None:
     two_stale_pulls(github)
     github.ci(github.base, github.head)
     _, run, _ = _outside_check(github)
@@ -242,7 +245,9 @@ def test_an_outside_check_that_started_after_planning_still_blocks_the_merge(git
     }
     line_up(github, ["7", "8"])
     github.save()
-    done = github.workflow.run_script("merge-when-current", "7", env=_tick_context(github))
+    done = github.workflow.run_script(
+        "merge-when-current", "7", env=_tick_context(github) if in_tick else None,
+    )
     assert done.returncode == 1, done.stdout + done.stderr
     assert "merge waiting: check is not passing:" in done.stderr
     assert not (github.workflow.state / "merged").exists()
