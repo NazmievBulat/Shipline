@@ -69,7 +69,7 @@ def test_an_outside_check_that_never_started_does_not_hold_the_merge(
     done = github.run()
     assert done.returncode == 0, done.stdout + done.stderr
     line = "ignored never-started check: .github/dependabot.yml from dependabot on pull request 7"
-    assert line in done.stdout
+    assert line in done.stdout + done.stderr
     assert (github.workflow.state / "merged").read_text() == "7"
     assert [note["line"] for note in _ignored_notes(github)] == [line]
     assert not github.workflow.calls("gh api -X POST")
@@ -122,7 +122,12 @@ def test_an_outside_check_is_ignored_only_with_evidence_it_never_started(
         check.update(__typename="StatusContext", context="external", state="PENDING")
     done = github.run()
     assert done.returncode == 1, done.stdout + done.stderr
-    assert "check is not passing:" in done.stderr
+    if case == "failed":
+        assert "merge refused:" in done.stderr
+        assert "failed checks" in done.stderr
+    else:
+        assert "merge waiting:" in done.stderr
+        assert "check is not passing:" in done.stderr
     assert not (github.workflow.state / "merged").exists()
     assert _ignored_notes(github) == []
     assert _origin(github) == github.head
@@ -148,6 +153,71 @@ def test_an_own_queued_check_past_the_limit_is_still_recovered(github: GitHub) -
     assert _ignored_notes(github) == []
 
 
+def test_the_train_uses_the_same_outside_check_rule_and_keeps_json_output(github: GitHub) -> None:
+    _outside_check(github)
+    github.save()
+    line_up(github, ["7"])
+    train = train_status(github)
+    assert train["first"] == "7"
+    saved = json.loads((github.workflow.repo / ".local/workflow/merge-train.json").read_text())
+    assert saved["pending"] == []
+    assert len(_ignored_notes(github)) == 1
+
+
+def test_the_outside_check_wait_uses_the_configured_queue_limit(github: GitHub) -> None:
+    _outside_check(github)
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config.setdefault("merge_train", {})["queued_limit_minutes"] = 120
+    path.write_text(json.dumps(config))
+    done = github.run()
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "check is not passing:" in done.stderr
+    assert _ignored_notes(github) == []
+
+
+def test_every_ignored_check_is_named_and_check_run_pages_are_read(github: GitHub) -> None:
+    check, run, _ = _outside_check(github)
+    github.pulls["7"]["statusCheckRollup"].append({**check, "name": "dependency policy"})
+    other = {**run, "id": 81, "name": "dependency policy"}
+    github.api[f"{_REPO}/commits/{github.head}/check-runs?per_page=100"] = {
+        "_pages": [{"check_runs": [run]}, {"check_runs": [other]}],
+    }
+    done = github.run()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert {note["check"] for note in _ignored_notes(github)} == {
+        ".github/dependabot.yml", "dependency policy",
+    }
+
+
+def test_an_outside_check_is_reported_again_on_a_new_head(github: GitHub) -> None:
+    _outside_check(github)
+    assert github.run().returncode == 0
+    previous = github.head
+    github.workflow.git("commit", "--allow-empty", "-m", "fix: next head")
+    github.workflow.git("push", "origin", "HEAD:ticket/seven")
+    github.head = github.workflow.git("rev-parse", "HEAD")
+    github.pulls["7"]["headRefOid"] = github.head
+    github.pulls["7"]["statusCheckRollup"] = [
+        {"name": "CI result", "status": "COMPLETED", "conclusion": "SUCCESS"},
+    ]
+    github.ci(github.base, github.head, run_id=50)
+    _outside_check(github)
+    done = github.run()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert {note["head"] for note in _ignored_notes(github)} == {previous, github.head}
+
+
+def test_an_unreadable_outside_check_suite_never_allows_a_merge(github: GitHub) -> None:
+    _outside_check(github)
+    github.api[f"{_REPO}/check-suites/90"] = "HTTP 502: unavailable"
+    done = github.run()
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "HTTP 502" in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+    assert _ignored_notes(github) == []
+
+
 def test_an_ignored_check_is_told_once_per_head_and_delivery_is_durable(github: GitHub) -> None:
     workflow = github.workflow
     _outside_check(github)
@@ -157,10 +227,11 @@ def test_an_ignored_check_is_told_once_per_head_and_delivery_is_durable(github: 
     assert len(_ignored_notes(github)) == 1
     workflow.orchestrator("busy")
     (workflow.state / "send-fails").touch()
-    assert workflow.run_script("wake").returncode == 1
+    now = int(time.time())
+    assert workflow.run_script("wake", env={"WORKFLOW_NOW": str(now)}).returncode == 1
     assert len(_ignored_notes(github)) == 1
     (workflow.state / "send-fails").unlink()
-    assert workflow.run_script("wake").returncode == 0
+    assert workflow.run_script("wake", env={"WORKFLOW_NOW": str(now + 300)}).returncode == 0
     assert _ignored_notes(github) == []
     assert len(_ignored_notes(github, "sent")) == 1
     assert "ignored never-started check: .github/dependabot.yml from dependabot on pull request 7" in workflow.sent()[-1]

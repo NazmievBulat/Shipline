@@ -528,4 +528,6 @@ def _read_pull(number: str) -> dict[str, Any]:
         # tick retries a handed-off pull request instead of revoking its handoff.
         error = done.stderr.strip() or done.stdout.strip()
         raise Waiting(f"cannot read pull request {number}: {error}")
-    return json.loads(done.stdout)
+    pull = json.loads(done.stdout)
+    pull["number"] = int(number)
+    return pull
