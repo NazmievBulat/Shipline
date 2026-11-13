@@ -218,6 +218,20 @@ def test_an_unreadable_outside_check_suite_never_allows_a_merge(github: GitHub) 
     assert _ignored_notes(github) == []
 
 
+def test_an_outside_check_that_started_after_planning_still_blocks_the_merge(github: GitHub) -> None:
+    _, run, _ = _outside_check(github)
+    # The rollup still says queued. Only the first REST read says never started;
+    # every later read reports the start, including the merge's own fresh read.
+    running = {**run, "status": "in_progress", "started_at": _stamp(60)}
+    github.api[f"{_REPO}/commits/{github.head}/check-runs?per_page=100"] = {
+        "_alternate": [{"check_runs": [run]}, *[{"check_runs": [running]} for _ in range(20)]],
+    }
+    done = github.run()
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "merge waiting: check is not passing:" in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
 def test_an_ignored_check_is_told_once_per_head_and_delivery_is_durable(github: GitHub) -> None:
     workflow = github.workflow
     _outside_check(github)

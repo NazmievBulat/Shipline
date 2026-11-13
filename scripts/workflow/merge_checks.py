@@ -665,17 +665,19 @@ def _lender_cancelled_check(check: dict[str, Any], head: str | None) -> bool:
 def own_checks(pull: dict[str, Any]) -> list[dict[str, Any]]:
     """Selected tests decide the PR, except verified outside checks that never started.
 
-    Keep the verdict for this pull snapshot: all gate and train callers use the same rule,
-    and a fresh pull read verifies the evidence again before a merge.
+    Keep the verdict for this pull snapshot within each phase. Leaving train planning
+    verifies the evidence again, without the tick's API cache, before a merge.
     """
-    from merge_gate import CONFIG, IMAGES
+    from merge_gate import CONFIG, IMAGES, _planning_reads
 
     selected = [check for check in pull["statusCheckRollup"] if not (
         "images" in CONFIG.checks.prefix_only
         and (check.get("name", "") == IMAGES or check.get("name", "").startswith(IMAGES + ":"))
     )]
-    if "_ignored_checks" not in pull:
+    planning = _planning_reads is not None
+    if "_ignored_checks" not in pull or pull.get("_ignored_checks_planning") != planning:
         pull["_ignored_checks"] = _ignored_outside_checks(pull, selected)
+        pull["_ignored_checks_planning"] = planning
     return [check for check in selected if check not in pull["_ignored_checks"]]
 
 
