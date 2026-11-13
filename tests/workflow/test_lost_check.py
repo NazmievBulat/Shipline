@@ -231,6 +231,8 @@ def test_an_own_failure_is_refused_even_if_outside_check_metadata_is_unreadable(
 
 
 def test_an_outside_check_that_started_after_planning_still_blocks_the_merge(github: GitHub) -> None:
+    two_stale_pulls(github)
+    github.ci(github.base, github.head)
     _, run, _ = _outside_check(github)
     # The rollup still says queued. Only the first REST read says never started;
     # every later read reports the start, including the merge's own fresh read.
@@ -238,11 +240,15 @@ def test_an_outside_check_that_started_after_planning_still_blocks_the_merge(git
     github.api[f"{_REPO}/commits/{github.head}/check-runs?per_page=100"] = {
         "_alternate": [{"check_runs": [run]}, *[{"check_runs": [running]} for _ in range(20)]],
     }
+    line_up(github, ["7", "8"])
     github.save()
     done = github.workflow.run_script("merge-when-current", "7", env=_tick_context(github))
     assert done.returncode == 1, done.stdout + done.stderr
     assert "merge waiting: check is not passing:" in done.stderr
     assert not (github.workflow.state / "merged").exists()
+    assert len(github.workflow.calls(
+        f"gh api --paginate {_REPO}/commits/{github.head}/check-runs?per_page=100"
+    )) >= 2
 
 
 def test_an_ignored_check_is_told_once_per_head_and_delivery_is_durable(github: GitHub) -> None:
