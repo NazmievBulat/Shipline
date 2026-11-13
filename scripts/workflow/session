@@ -94,7 +94,8 @@
 #   session unprotect <name>
 #   session stop <name>
 #   session cleanup [hunts]     remove the worktrees of merged pull requests and of ended
-#                               hunts and analysts, once no session runs in them; with
+#                               hunts and analysts, once no session runs in them, and cloud
+#                               records of closed or merged pull requests; with
 #                               `hunts`, only those of hunts and analysts, which needs no
 #                               answer from GitHub
 #
@@ -2063,6 +2064,25 @@ cmd_cleanup() {
       fi
     ) 7>>"$main/$SHIPLINE_STATE_FOLDER/start-$number.lock"
   done < <(list_worktrees)
+  [[ $only != hunts ]] || return 0
+  for path in "$main/$SHIPLINE_STATE_FOLDER"/cloud-[0-9]*; do
+    name=${path##*/}
+    [[ $name =~ ^cloud-[0-9]+$ && -e $path ]] || continue
+    number=${name#cloud-}
+    (
+      # A cloud start reserves its record under the same per-ticket lock.
+      flock --nonblock 7 || exit 0
+      [[ -e $path ]] || exit 0
+      if ! read_pull_request "$number"; then
+        echo "cannot read pull request $number; $name is left as it is" >&2
+        exit 0
+      fi
+      [[ $pr_state == CLOSED || $pr_state == MERGED ]] || exit 0
+      # Keep the launch output and exit status for the record.
+      rm -f -- "$path"
+      echo "$name: removed, its pull request is closed or merged"
+    ) 7>>"$main/$SHIPLINE_STATE_FOLDER/start-$number.lock"
+  done
 }
 
 # A bridge has no built-in tools, only the two MCP relay operations. It cannot edit, test,
