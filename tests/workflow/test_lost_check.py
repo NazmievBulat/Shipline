@@ -219,6 +219,17 @@ def test_an_unreadable_outside_check_suite_never_allows_a_merge(github: GitHub) 
     assert _ignored_notes(github) == []
 
 
+def test_an_own_failure_is_refused_even_if_outside_check_metadata_is_unreadable(github: GitHub) -> None:
+    _outside_check(github)
+    github.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    github.api[f"{_REPO}/check-suites/90"] = "HTTP 502: unavailable"
+    done = github.run()
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "merge refused:" in done.stderr
+    assert "failed checks" in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
 def test_an_outside_check_that_started_after_planning_still_blocks_the_merge(github: GitHub) -> None:
     _, run, _ = _outside_check(github)
     # The rollup still says queued. Only the first REST read says never started;

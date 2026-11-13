@@ -662,18 +662,27 @@ def _lender_cancelled_check(check: dict[str, Any], head: str | None) -> bool:
     )
 
 
+def _selected_checks(pull: dict[str, Any]) -> list[dict[str, Any]]:
+    """Deferred image jobs decide only the scratch run."""
+    from merge_gate import CONFIG, IMAGES
+
+    return [check for check in pull["statusCheckRollup"] if not (
+        "images" in CONFIG.checks.prefix_only
+        and (check.get("name", "") == IMAGES or check.get("name", "").startswith(IMAGES + ":"))
+    )]
+
+
 def own_checks(pull: dict[str, Any]) -> list[dict[str, Any]]:
     """Selected tests decide the PR, except verified outside checks that never started.
 
     Keep the verdict for this pull snapshot within each phase. Leaving train planning
     verifies the evidence again, without the tick's API cache, before a merge.
     """
-    from merge_gate import CONFIG, IMAGES, _planning_reads
+    from merge_gate import _planning_reads
 
-    selected = [check for check in pull["statusCheckRollup"] if not (
-        "images" in CONFIG.checks.prefix_only
-        and (check.get("name", "") == IMAGES or check.get("name", "").startswith(IMAGES + ":"))
-    )]
+    selected = _selected_checks(pull)
+    if not any(check.get("status") == "QUEUED" for check in selected):
+        return selected
     planning = _planning_reads is not None
     if "_ignored_checks" not in pull or pull.get("_ignored_checks_planning") != planning:
         pull["_ignored_checks"] = _ignored_outside_checks(pull, selected)
@@ -770,11 +779,13 @@ def _note_ignored_check(pull: dict[str, Any], check: dict[str, Any], app: str) -
 
 
 def _failed_rollup(pull: dict[str, Any]) -> list[dict[str, Any]]:
-    from merge_gate import _lender_cancelled_check, own_checks
+    from merge_gate import _lender_cancelled_check
 
+    # Ignoring a queued check cannot change which checks failed. Do not make a known
+    # failure wait for the outside-app metadata needed only to forgive a queued check.
     return [
         check
-        for check in own_checks(pull)
+        for check in _selected_checks(pull)
         if (
             check.get("conclusion")
             in ("FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE")
