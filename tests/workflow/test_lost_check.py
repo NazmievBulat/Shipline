@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from workflow_harness import Workflow
+from workflow.merge_gate_fixtures import _tick_context
 from workflow.test_merge_driver import handed as handed_fixture
 from workflow.test_merge_when_current import (
     GitHub,
@@ -226,7 +227,8 @@ def test_an_outside_check_that_started_after_planning_still_blocks_the_merge(git
     github.api[f"{_REPO}/commits/{github.head}/check-runs?per_page=100"] = {
         "_alternate": [{"check_runs": [run]}, *[{"check_runs": [running]} for _ in range(20)]],
     }
-    done = github.run()
+    github.save()
+    done = github.workflow.run_script("merge-when-current", "7", env=_tick_context(github))
     assert done.returncode == 1, done.stdout + done.stderr
     assert "merge waiting: check is not passing:" in done.stderr
     assert not (github.workflow.state / "merged").exists()
