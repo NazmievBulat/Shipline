@@ -1,8 +1,11 @@
 """`session stop` ends a session; `session cleanup` removes what a merged pull request left."""
 
+import fcntl
+import json
 import subprocess
 from pathlib import Path
 
+import pytest
 from workflow_harness import Workflow
 
 
@@ -312,6 +315,95 @@ def test_cleanup_keeps_a_worktree_whose_pull_request_cannot_be_read(workflow: Wo
     assert worktree.is_dir()
     assert workflow.is_running("ticket-7")
     assert "cannot read pull request 7" in done.stderr
+
+
+def _cloud_record(workflow: Workflow, status: str = "finished") -> Path:
+    notes = workflow.repo / ".local/workflow"
+    notes.mkdir(parents=True, exist_ok=True)
+    record = notes / "cloud-7"
+    record.write_text(json.dumps({"status": status}) + "\n")
+    record.with_suffix(".exit").write_text("0\n")
+    record.with_suffix(".launch").write_text("Launch output\n")
+    return record
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
+@pytest.mark.parametrize("status", ["finished", "working", "starting"])
+def test_cleanup_removes_an_ended_cloud_record_and_keeps_its_launch_files(
+    workflow: Workflow, state: str, status: str
+) -> None:
+    workflow.add_pull_request(7, state=state)
+    record = _cloud_record(workflow, status)
+
+    done = workflow.run("cleanup")
+
+    assert done.returncode == 0, done.stderr
+    assert not record.exists()
+    assert record.with_suffix(".exit").read_text() == "0\n"
+    assert record.with_suffix(".launch").read_text() == "Launch output\n"
+
+
+@pytest.mark.parametrize("status", ["finished", "working", "starting", "asking", "blocked", "retryable"])
+def test_cleanup_keeps_an_open_cloud_record(workflow: Workflow, status: str) -> None:
+    workflow.add_pull_request(7)
+    record = _cloud_record(workflow, status)
+    original = record.read_bytes()
+
+    done = workflow.run("cleanup")
+
+    assert done.returncode == 0, done.stderr
+    assert record.read_bytes() == original
+    assert record.with_suffix(".exit").read_text() == "0\n"
+    assert record.with_suffix(".launch").read_text() == "Launch output\n"
+
+
+@pytest.mark.parametrize("state", [None, "", "UNKNOWN ticket-7 head\n"])
+def test_cleanup_keeps_a_cloud_record_when_the_pull_request_state_is_unreadable(
+    workflow: Workflow, state: str | None
+) -> None:
+    workflow.add_pull_request(7, state="CLOSED")
+    if state is None:
+        (workflow.state / "fail-gh-view-7").touch()
+    else:
+        (workflow.state / "pr/7").write_text(state)
+    record = _cloud_record(workflow)
+    original = record.read_bytes()
+
+    done = workflow.run("cleanup")
+
+    assert done.returncode == 0, done.stderr
+    assert record.read_bytes() == original
+    assert record.with_suffix(".exit").read_text() == "0\n"
+    assert record.with_suffix(".launch").read_text() == "Launch output\n"
+
+
+def test_cloud_cleanup_waits_for_the_ticket_start_lock(workflow: Workflow) -> None:
+    workflow.add_pull_request(7, state="CLOSED")
+    record = _cloud_record(workflow)
+    with (record.parent / "start-7.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        done = workflow.run("cleanup")
+
+        assert done.returncode == 0, done.stderr
+        assert record.exists()
+        assert workflow.calls("gh") == []
+
+    done = workflow.run("cleanup")
+
+    assert done.returncode == 0, done.stderr
+    assert not record.exists()
+
+
+def test_hunts_cleanup_keeps_cloud_records_without_reading_github(workflow: Workflow) -> None:
+    workflow.add_pull_request(7, state="CLOSED")
+    record = _cloud_record(workflow)
+
+    done = workflow.run("cleanup", "hunts")
+
+    assert done.returncode == 0, done.stderr
+    assert record.exists()
+    assert workflow.calls("gh") == []
 
 
 def test_cleanup_keeps_a_merged_worktree_that_git_will_not_remove(workflow: Workflow) -> None:
