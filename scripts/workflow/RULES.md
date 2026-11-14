@@ -747,7 +747,12 @@ it is doing.
    tick's notes in `.local/workflow/` of the main checkout; the sessions' closing messages, as
    their pull requests' comments and reviews show them (`gh`, reading only); and the earlier
    analyses. It computes no numbers of its own: every number it gives is the metrics report's,
-   and every other claim points to the lines that show it.
+   and every other claim points to the lines that show it. For every GitHub record it cites as
+   evidence for a gap or proposal (a check run, a workflow run, a pull request or a review), it
+   saves the record exactly as `gh api` returned it in its report folder as
+   `evidence/<kind>-<id>.json`, with `kind` one of `check-run`, `workflow-run`, `pull-request`
+   or `review`. It names that file beside the claim in `report.md`. It does not reconstruct or
+   omit fields, and saves no uncited records.
 3. It looks for gaps of these kinds, with the evidence for each:
    - speed: where a pull request's time goes, and what changed since last week;
    - a model doing a job with one right answer: a decision made by hand every day, a wait a
@@ -767,9 +772,11 @@ it is doing.
    proposal there is numbered `1.`, `2.`, `3.`, and the first line of each says the change in
    one sentence, as the wake carries only those lines. Then come the gaps it found with their
    evidence, and what it read and found no gap in.
-6. Within 35 minutes it publishes the report as a document, writes the link alone on the one
-   line of `report.url` in the same folder, and then says `analysis finished` on a line of its
-   own, as the last line. The tick stops it on that line.
+6. Before publishing, it checks that every claim citing a GitHub record names the record's
+   saved evidence file in its report folder. Within 35 minutes it publishes the report as a
+   document, writes the link alone on the one line of `report.url` in the same folder, and then
+   says `analysis finished` on a line of its own, as the last line. The tick stops it on that
+   line.
 
 ## For the orchestrator session
 
@@ -1021,9 +1028,12 @@ The orchestrator session does what needs judgment:
   with each, one after the other.
 - When a check-in carries an analysis (`Workflow analysis day-<date> (report <link>): 1. ...`),
   it opens a draft ticket for each proposal it judges worth it, as in step 5 of the audit
-  rules, naming the report, and gives the owner the link and the tickets it opened. The owner
-  can say which to drop; a dropped ticket's pull request it closes. An analysis that ended
-  without publishing its report it names to the owner, with its folder.
+  rules, naming the report, and gives the owner the link and the tickets it opened. Each
+  ticket names the saved evidence files for the proposal and requires the worker's test for
+  the fix to load a copy of each record as a test fixture, with nothing private in it, in
+  addition to any hand-written case. The owner can say which to drop; a dropped ticket's pull
+  request it closes. An analysis that ended without publishing its report it names to the
+  owner, with its folder.
 - When a hunt has ended, it reads the report in `.local/hunts/<name>` of the main checkout.
   A Codex or Cursor hunter's report it publishes as a document with the pictures; a Claude Code hunter
   published its own (`report.url`). It gives the owner the link and the count of findings.

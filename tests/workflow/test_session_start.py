@@ -914,6 +914,47 @@ _ANALYST = "analyst-day-2026-10-24"
 _ANALYSIS_RULES = "by the section Analyse the workflow of AGENTS.md in this worktree"
 
 
+def _workflow_rules_section(title: str) -> str:
+    root = Path(__file__).resolve().parents[2]
+    rules = (root / "scripts/workflow/RULES.md").read_text()
+    return " ".join(rules.split(f"\n## {title}\n", 1)[1].split("\n## ", 1)[0].split())
+
+
+def test_an_analyst_saves_each_cited_github_record_without_reconstructing_it() -> None:
+    rules = _workflow_rules_section("Analyse the workflow")
+    reading = rules.split("2. ", 1)[1].split("3. ", 1)[0]
+
+    assert "every GitHub record it cites as evidence for a gap or proposal" in reading
+    assert "a check run, a workflow run, a pull request or a review" in reading
+    assert "exactly as `gh api` returned it" in reading
+    assert "in its report folder as `evidence/<kind>-<id>.json`" in reading
+    assert "`check-run`, `workflow-run`, `pull-request` or `review`" in reading
+    assert "names that file beside the claim in `report.md`" in reading
+    assert "does not reconstruct or omit fields" in reading
+    assert "saves no uncited records" in reading
+    assert "The one thing it writes is its report folder" in rules
+
+
+def test_an_analyst_checks_its_evidence_files_before_publishing() -> None:
+    publishing = _workflow_rules_section("Analyse the workflow").split("6. ", 1)[1]
+
+    assert "Before publishing" in publishing
+    assert (
+        "every claim citing a GitHub record names the record's saved evidence file in its"
+        " report folder"
+    ) in publishing
+
+
+def test_an_analysis_ticket_requires_a_fixture_from_the_saved_evidence() -> None:
+    rules = _workflow_rules_section("For the orchestrator session")
+    tickets = rules.split("- When a check-in carries an analysis", 1)[1].split("- When a hunt", 1)[0]
+
+    assert "Each ticket names the saved evidence files for the proposal" in tickets
+    assert "requires the worker's test for the fix to load a copy of each record" in tickets
+    assert "as a test fixture, with nothing private in it" in tickets
+    assert "in addition to any hand-written case" in tickets
+
+
 def _claude_words(workflow: Workflow, name: str) -> list[str]:
     """The words Claude is given, as the shell `tmux` runs the command through reads them."""
     command = _session_arguments(workflow, name)[-1]
