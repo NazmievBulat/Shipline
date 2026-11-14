@@ -772,10 +772,11 @@ it is doing.
    proposal there is numbered `1.`, `2.`, `3.`, and the first line of each says the change in
    one sentence, as the wake carries only those lines. Then come the gaps it found with their
    evidence, and what it read and found no gap in.
-6. Before publishing, it checks that every such claim names a saved evidence file in its
-   report folder. Within 35 minutes it publishes the report as a document, writes the link
-   alone on the one line of `report.url` in the same folder, and then says `analysis finished`
-   on a line of its own, as the last line. The tick stops it on that line.
+6. Before publishing, it checks that every claim citing a GitHub record names the record's
+   saved evidence file in its report folder. Within 35 minutes it publishes the report as a
+   document, writes the link alone on the one line of `report.url` in the same folder, and then
+   says `analysis finished` on a line of its own, as the last line. The tick stops it on that
+   line.
 
 ## For the orchestrator session
 

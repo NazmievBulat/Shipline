@@ -939,7 +939,10 @@ def test_an_analyst_checks_its_evidence_files_before_publishing() -> None:
     publishing = _workflow_rules_section("Analyse the workflow").split("6. ", 1)[1]
 
     assert "Before publishing" in publishing
-    assert "every such claim names a saved evidence file in its report folder" in publishing
+    assert (
+        "every claim citing a GitHub record names the record's saved evidence file in its"
+        " report folder"
+    ) in publishing
 
 
 def test_an_analysis_ticket_requires_a_fixture_from_the_saved_evidence() -> None:
