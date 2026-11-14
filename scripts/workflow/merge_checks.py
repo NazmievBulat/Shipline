@@ -685,9 +685,14 @@ def own_checks(pull: dict[str, Any]) -> list[dict[str, Any]]:
     return [check for check in selected if check not in ignored]
 
 
-def _not_started(stamp: Any) -> bool:
-    # Missing and GitHub's year-one sentinel mean no start; malformed dates prove nothing.
-    return stamp in (None, "", "0001-01-01T00:00:00Z", "0001-01-01T00:00:00+00:00")
+def _started_after(stamp: Any, created: float) -> bool:
+    # Missing and GitHub's year-one sentinel mean no start. GitHub can stamp a queued
+    # check as started when it is created; only a later stamp is a real start, and a
+    # malformed one proves nothing.
+    if stamp in (None, "", "0001-01-01T00:00:00Z", "0001-01-01T00:00:00+00:00"):
+        return False
+    moment = _seconds(stamp)
+    return moment is None or moment > created + 5
 
 
 def _ignored_outside_checks(
@@ -699,7 +704,6 @@ def _ignored_outside_checks(
         check.get("__typename") != "StatusContext"
         and check.get("status") == "QUEUED"
         and not check.get("conclusion")
-        and _not_started(check.get("startedAt"))
         and not check.get("workflowName")
         and not re.search(r"/actions/runs/\d+(?:/|$)", check.get("detailsUrl") or "")
     )]
@@ -726,7 +730,7 @@ def _ignored_outside_checks(
         if (
             not app or app == "github-actions" or not isinstance(suite_id, int)
             or run.get("head_sha") != head or run.get("status") != "queued"
-            or run.get("conclusion") or not _not_started(run.get("started_at"))
+            or run.get("conclusion")
         ):
             continue
         if suite_id not in suites:
@@ -738,7 +742,10 @@ def _ignored_outside_checks(
         # its latest update too protects a fresh retry in an older suite.
         if (
             suite.get("head_sha") != head or (suite.get("app") or {}).get("slug") != app
+            or suite.get("status") != "queued" or suite.get("conclusion")
             or created is None or updated is None or now - max(created, updated) <= limit
+            or _started_after(check.get("startedAt"), created)
+            or _started_after(run.get("started_at"), created)
         ):
             continue
         _note_ignored_check(pull, check, app)

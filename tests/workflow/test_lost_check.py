@@ -79,9 +79,10 @@ def test_an_outside_check_that_never_started_does_not_hold_the_merge(
 
 
 @pytest.mark.parametrize("case", [
-    "recent", "in progress", "failed", "started", "REST started", "REST running",
+    "recent", "in progress", "failed", "suite running", "suite completed", "suite failed", "REST running",
     "REST failed", "own app", "unknown app", "unknown creation", "recent update",
-    "different head", "different suite head", "ambiguous name", "invalid start", "status context",
+    "different head", "different suite head", "ambiguous name", "status context",
+    "started later", "REST started later", "invalid start", "REST invalid start",
 ])
 def test_an_outside_check_is_ignored_only_with_evidence_it_never_started(
     github: GitHub, case: str,
@@ -93,10 +94,12 @@ def test_an_outside_check_is_ignored_only_with_evidence_it_never_started(
         check.update(status="IN_PROGRESS", startedAt=_stamp(3600))
     elif case == "failed":
         check.update(status="COMPLETED", conclusion="FAILURE")
-    elif case == "started":
-        check["startedAt"] = _stamp(3600)
-    elif case == "REST started":
-        run["started_at"] = _stamp(3600)
+    elif case == "suite running":
+        suite["status"] = "in_progress"
+    elif case == "suite completed":
+        suite.update(status="completed", conclusion="success")
+    elif case == "suite failed":
+        suite["conclusion"] = "failure"
     elif case == "REST running":
         run["status"] = "in_progress"
     elif case == "REST failed":
@@ -117,10 +120,16 @@ def test_an_outside_check_is_ignored_only_with_evidence_it_never_started(
         github.api[f"{_REPO}/commits/{github.head}/check-runs?per_page=100"]["check_runs"].append(
             {**run, "id": 81, "app": {"slug": "github-actions"}}
         )
-    elif case == "invalid start":
-        check["startedAt"] = "unreadable"
     elif case == "status context":
         check.update(__typename="StatusContext", context="external", state="PENDING")
+    elif case == "started later":
+        check["startedAt"] = _stamp(1800)
+    elif case == "REST started later":
+        run["started_at"] = _stamp(1800)
+    elif case == "invalid start":
+        check["startedAt"] = "unreadable"
+    elif case == "REST invalid start":
+        run["started_at"] = "unreadable"
     done = github.run()
     assert done.returncode == 1, done.stdout + done.stderr
     if case == "failed":
@@ -131,6 +140,34 @@ def test_an_outside_check_is_ignored_only_with_evidence_it_never_started(
         assert "check is not passing:" in done.stderr
     assert not (github.workflow.state / "merged").exists()
     assert _ignored_notes(github) == []
+    assert _origin(github) == github.head
+
+
+@pytest.mark.parametrize("age", [60, 3600], ids=["before-limit", "after-limit"])
+def test_a_queued_outside_check_stamped_as_started_at_creation_uses_the_queue_limit(
+    github: GitHub, age: int,
+) -> None:
+    check, run, suite = _outside_check(github)
+    created = _stamp(age)
+    details = "https://dependabot-api.githubapp.com"
+    check.update(
+        startedAt=created, completedAt="0001-01-01T00:00:00Z", conclusion="",
+        detailsUrl=details,
+    )
+    run.update(started_at=created, details_url=details)
+    suite.update(created_at=created, updated_at=created)
+    done = github.run()
+    if age == 60:
+        assert done.returncode == 1, done.stdout + done.stderr
+        assert "merge waiting: check is not passing:" in done.stderr
+        assert not (github.workflow.state / "merged").exists()
+        assert _ignored_notes(github) == []
+    else:
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert (github.workflow.state / "merged").read_text() == "7"
+        assert len(_ignored_notes(github)) == 1
+    assert not github.workflow.calls("gh api -X POST")
+    assert not github.workflow.calls("gh run rerun")
     assert _origin(github) == github.head
 
 
