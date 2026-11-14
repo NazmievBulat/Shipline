@@ -829,6 +829,8 @@ def test_pre_train_wait_is_reset_by_a_pass_and_by_a_new_head(workflow: Workflow)
     _stand_in(workflow, "example-checks")
     assert _pre_train_checks(workflow, worktree).stdout == "passed\n"
     _stand_in(workflow, "example-checks", "try later\n", 75)
+    # Start another check cycle after the pass, which would otherwise be reused.
+    (workflow.repo / ".local/workflow/pre-train-pass-7.json").unlink()
     assert "pre-train checks of 7 wait: try later" in _pre_train_checks(workflow, worktree).stdout
     workflow.git("commit", "--allow-empty", "-m", "fix: a different head", cwd=worktree)
     again = _pre_train_checks(workflow, worktree)
