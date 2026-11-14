@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -661,8 +662,8 @@ def _lender_cancelled_check(check: dict[str, Any], head: str | None) -> bool:
     )
 
 
-def own_checks(pull: dict[str, Any]) -> list[dict[str, Any]]:
-    """Selected tests still decide the PR; deferred image jobs decide only its scratch run."""
+def _selected_checks(pull: dict[str, Any]) -> list[dict[str, Any]]:
+    """Deferred image jobs decide only the scratch run."""
     from merge_gate import CONFIG, IMAGES
 
     return [check for check in pull["statusCheckRollup"] if not (
@@ -671,12 +672,115 @@ def own_checks(pull: dict[str, Any]) -> list[dict[str, Any]]:
     )]
 
 
-def _failed_rollup(pull: dict[str, Any]) -> list[dict[str, Any]]:
-    from merge_gate import _lender_cancelled_check, own_checks
+def own_checks(pull: dict[str, Any]) -> list[dict[str, Any]]:
+    """Selected tests decide the PR, except verified outside checks that never started.
 
+    The API shares reads only during tick planning. Foreground evaluations read again,
+    including after a direct call's train planning, so a start still blocks the merge.
+    """
+    selected = _selected_checks(pull)
+    if not any(check.get("status") == "QUEUED" for check in selected):
+        return selected
+    ignored = _ignored_outside_checks(pull, selected)
+    return [check for check in selected if check not in ignored]
+
+
+def _not_started(stamp: Any) -> bool:
+    # Missing and GitHub's year-one sentinel mean no start; malformed dates prove nothing.
+    return stamp in (None, "", "0001-01-01T00:00:00Z", "0001-01-01T00:00:00+00:00")
+
+
+def _ignored_outside_checks(
+    pull: dict[str, Any], selected: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    from merge_gate import API, CONFIG, api
+
+    candidates = [check for check in selected if (
+        check.get("__typename") != "StatusContext"
+        and check.get("status") == "QUEUED"
+        and not check.get("conclusion")
+        and _not_started(check.get("startedAt"))
+        and not check.get("workflowName")
+        and not re.search(r"/actions/runs/\d+(?:/|$)", check.get("detailsUrl") or "")
+    )]
+    if not candidates:
+        return []
+    head = pull["headRefOid"]
+    runs = api(f"{API}/commits/{head}/check-runs?per_page=100", "check_runs")
+    suites: dict[int, dict[str, Any]] = {}
+    ignored = []
+    now = float(os.environ.get("WORKFLOW_NOW") or time.time())
+    limit = CONFIG.merge_train.queued_limit_minutes * 60
+    for check in candidates:
+        # The rollup has no check id or app. Never choose by name alone when two apps
+        # posted indistinguishable checks, nor trust a rollup that lags behind a start.
+        matches = [run for run in runs if (
+            run.get("name") == check.get("name")
+            and (run.get("details_url") or "") == (check.get("detailsUrl") or "")
+        )]
+        if len(matches) != 1:
+            continue
+        run = matches[0]
+        app = (run.get("app") or {}).get("slug")
+        suite_id = (run.get("check_suite") or {}).get("id")
+        if (
+            not app or app == "github-actions" or not isinstance(suite_id, int)
+            or run.get("head_sha") != head or run.get("status") != "queued"
+            or run.get("conclusion") or not _not_started(run.get("started_at"))
+        ):
+            continue
+        if suite_id not in suites:
+            suites[suite_id] = api(f"{API}/check-suites/{suite_id}", paginate=False)
+        suite = suites[suite_id]
+        created = _seconds(suite.get("created_at"))
+        updated = _seconds(suite.get("updated_at"))
+        # GitHub exposes creation time on the suite, not the check run. Waiting since
+        # its latest update too protects a fresh retry in an older suite.
+        if (
+            suite.get("head_sha") != head or (suite.get("app") or {}).get("slug") != app
+            or created is None or updated is None or now - max(created, updated) <= limit
+        ):
+            continue
+        _note_ignored_check(pull, check, app)
+        ignored.append(check)
+    return ignored
+
+
+def _note_ignored_check(pull: dict[str, Any], check: dict[str, Any], app: str) -> None:
+    from merge_gate import CONFIG, write_json
+
+    number, head = str(pull["number"]), pull["headRefOid"]
+    line = f"ignored never-started check: {check['name']} from {app} on pull request {number}"
+    print(line, file=sys.stderr, flush=True)
+    # One receipt per app/check/head; different ignored checks on a head each get named.
+    identity = hashlib.sha256(json.dumps([app, check["name"]]).encode()).hexdigest()
+    name = f"{number}-{head}-{identity}.json"
+    folder = CONFIG.state()
+    if any((folder / f"ignored-checks.{kind}" / name).exists() for kind in ("pending", "sent")):
+        return
+    if os.environ.get("SHIPLINE_SHADOW"):
+        notes = os.environ.get("SHIPLINE_SHADOW_NOTES")
+        if not notes:
+            return
+        folder = Path(notes)
+    if any((folder / f"ignored-checks.{kind}" / name).exists() for kind in ("pending", "sent")):
+        return
+    try:
+        write_json(folder / "ignored-checks.pending" / name, {
+            "number": number, "head": head, "check": check["name"], "app": app, "line": line,
+        })
+    except OSError as error:
+        print(f"could not note the ignored check for the wake: {error}", file=sys.stderr, flush=True)
+
+
+def _failed_rollup(pull: dict[str, Any]) -> list[dict[str, Any]]:
+    from merge_gate import _lender_cancelled_check
+
+    # Ignoring a queued check cannot change which checks failed. Do not make a known
+    # failure wait for the outside-app metadata needed only to forgive a queued check.
     return [
         check
-        for check in own_checks(pull)
+        for check in _selected_checks(pull)
         if (
             check.get("conclusion")
             in ("FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE")

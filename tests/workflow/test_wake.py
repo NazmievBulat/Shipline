@@ -1729,7 +1729,7 @@ def test_an_answer_the_wake_could_not_send_is_sent_later(day: Workflow) -> None:
 
 
 
-@pytest.mark.parametrize("kind", ["prefix-queues", "never-started"])
+@pytest.mark.parametrize("kind", ["prefix-queues", "never-started", "ignored-checks"])
 def test_a_prefix_queue_warning_is_told_once_and_kept_until_delivery(night: Workflow, kind: str) -> None:
     night.orchestrator("busy")
     pending = night.repo / f".local/workflow/{kind}.pending"

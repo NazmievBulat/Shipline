@@ -195,6 +195,10 @@ if [ "$1 $2" = "api --paginate" ]; then
     echo '{"workflow_runs": []}'
     exit 0
   fi
+  if [[ $3 == repos/*/commits/*/check-runs[?]per_page=100 ]]; then
+    echo '{"check_runs": []}'
+    exit 0
+  fi
   number=${3%/reviews}
   number=${number##*/}
   [ ! -e "@STATE@/fail-gh-reviews" ] || exit 1

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from workflow_harness import Workflow
+from workflow.merge_gate_fixtures import _tick_context
 from workflow.test_merge_driver import handed as handed_fixture
 from workflow.test_merge_when_current import (
     GitHub,
@@ -31,6 +32,249 @@ _REPO = "repos/example-org/example-app"
 
 def _stamp(seconds_ago: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds_ago))
+
+
+def _outside_check(github: GitHub) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    check = {
+        "__typename": "CheckRun", "name": ".github/dependabot.yml", "status": "QUEUED",
+        "conclusion": None, "startedAt": "0001-01-01T00:00:00Z", "detailsUrl": "",
+        "workflowName": "",
+    }
+    github.pulls["7"]["statusCheckRollup"].append(check)
+    run = {
+        "id": 80, "name": check["name"], "head_sha": github.head, "status": "queued",
+        "conclusion": None, "started_at": None, "details_url": "",
+        "app": {"slug": "dependabot"}, "check_suite": {"id": 90},
+    }
+    suite = {
+        "id": 90, "head_sha": github.head, "status": "queued", "conclusion": None,
+        "created_at": _stamp(3600), "updated_at": _stamp(3600),
+        "app": {"slug": "dependabot"},
+    }
+    github.api[f"{_REPO}/commits/{github.head}/check-runs?per_page=100"] = {"check_runs": [run]}
+    github.api[f"{_REPO}/check-suites/90"] = suite
+    return check, run, suite
+
+
+def _ignored_notes(github: GitHub, kind: str = "pending") -> list[dict[str, Any]]:
+    pending = github.workflow.repo / f".local/workflow/ignored-checks.{kind}"
+    return [json.loads(path.read_text()) for path in pending.glob("*.json")]
+
+
+@pytest.mark.parametrize("started", [None, "0001-01-01T00:00:00Z"])
+def test_an_outside_check_that_never_started_does_not_hold_the_merge(
+    github: GitHub, started: str | None,
+) -> None:
+    check, _, _ = _outside_check(github)
+    check["startedAt"] = started
+    done = github.run()
+    assert done.returncode == 0, done.stdout + done.stderr
+    line = "ignored never-started check: .github/dependabot.yml from dependabot on pull request 7"
+    assert line in done.stdout + done.stderr
+    assert (github.workflow.state / "merged").read_text() == "7"
+    assert [note["line"] for note in _ignored_notes(github)] == [line]
+    assert not github.workflow.calls("gh api -X POST")
+    assert not github.workflow.calls("gh run rerun")
+    assert _origin(github) == github.head
+
+
+@pytest.mark.parametrize("case", [
+    "recent", "in progress", "failed", "started", "REST started", "REST running",
+    "REST failed", "own app", "unknown app", "unknown creation", "recent update",
+    "different head", "different suite head", "ambiguous name", "invalid start", "status context",
+])
+def test_an_outside_check_is_ignored_only_with_evidence_it_never_started(
+    github: GitHub, case: str,
+) -> None:
+    check, run, suite = _outside_check(github)
+    if case == "recent":
+        suite.update(created_at=_stamp(60), updated_at=_stamp(60))
+    elif case == "in progress":
+        check.update(status="IN_PROGRESS", startedAt=_stamp(3600))
+    elif case == "failed":
+        check.update(status="COMPLETED", conclusion="FAILURE")
+    elif case == "started":
+        check["startedAt"] = _stamp(3600)
+    elif case == "REST started":
+        run["started_at"] = _stamp(3600)
+    elif case == "REST running":
+        run["status"] = "in_progress"
+    elif case == "REST failed":
+        run.update(status="completed", conclusion="failure")
+    elif case == "own app":
+        run["app"] = suite["app"] = {"slug": "github-actions"}
+    elif case == "unknown app":
+        run["app"] = {}
+    elif case == "unknown creation":
+        suite["created_at"] = None
+    elif case == "recent update":
+        suite["updated_at"] = _stamp(60)
+    elif case == "different head":
+        run["head_sha"] = github.base
+    elif case == "different suite head":
+        suite["head_sha"] = github.base
+    elif case == "ambiguous name":
+        github.api[f"{_REPO}/commits/{github.head}/check-runs?per_page=100"]["check_runs"].append(
+            {**run, "id": 81, "app": {"slug": "github-actions"}}
+        )
+    elif case == "invalid start":
+        check["startedAt"] = "unreadable"
+    elif case == "status context":
+        check.update(__typename="StatusContext", context="external", state="PENDING")
+    done = github.run()
+    assert done.returncode == 1, done.stdout + done.stderr
+    if case == "failed":
+        assert "merge refused:" in done.stderr
+        assert "failed checks" in done.stderr
+    else:
+        assert "merge waiting:" in done.stderr
+        assert "check is not passing:" in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+    assert _ignored_notes(github) == []
+    assert _origin(github) == github.head
+
+
+def test_ignoring_an_outside_check_keeps_own_lost_check_recovery(github: GitHub) -> None:
+    _outside_check(github)
+    _lose(github)
+    done = github.run()
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "GitHub lost CI: server tests of run 20" in done.stdout
+    assert _origin(github) != github.head
+    assert not (github.workflow.state / "merged").exists()
+
+
+def test_an_own_queued_check_past_the_limit_is_still_recovered(github: GitHub) -> None:
+    _lose(github)
+    check = github.pulls["7"]["statusCheckRollup"][-1]
+    check.update(status="QUEUED", startedAt="0001-01-01T00:00:00Z")
+    done = github.run()
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "GitHub lost CI: server tests of run 20" in done.stdout
+    assert _ignored_notes(github) == []
+
+
+def test_the_train_uses_the_same_outside_check_rule_and_keeps_json_output(github: GitHub) -> None:
+    _outside_check(github)
+    github.save()
+    line_up(github, ["7"])
+    train = train_status(github)
+    assert train["first"] == "7"
+    saved = json.loads((github.workflow.repo / ".local/workflow/merge-train.json").read_text())
+    assert saved["pending"] == []
+    assert len(_ignored_notes(github)) == 1
+
+
+def test_the_outside_check_wait_uses_the_configured_queue_limit(github: GitHub) -> None:
+    _outside_check(github)
+    path = github.workflow.repo / "shipline.json"
+    config = json.loads(path.read_text())
+    config.setdefault("merge_train", {})["queued_limit_minutes"] = 120
+    path.write_text(json.dumps(config))
+    done = github.run()
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "check is not passing:" in done.stderr
+    assert _ignored_notes(github) == []
+
+
+def test_every_ignored_check_is_named_and_check_run_pages_are_read(github: GitHub) -> None:
+    check, run, _ = _outside_check(github)
+    github.pulls["7"]["statusCheckRollup"].append({**check, "name": "dependency policy"})
+    other = {**run, "id": 81, "name": "dependency policy"}
+    github.api[f"{_REPO}/commits/{github.head}/check-runs?per_page=100"] = {
+        "_pages": [{"check_runs": [run]}, {"check_runs": [other]}],
+    }
+    done = github.run()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert {note["check"] for note in _ignored_notes(github)} == {
+        ".github/dependabot.yml", "dependency policy",
+    }
+
+
+def test_an_outside_check_is_reported_again_on_a_new_head(github: GitHub) -> None:
+    _outside_check(github)
+    assert github.run().returncode == 0
+    previous = github.head
+    github.workflow.git("commit", "--allow-empty", "-m", "fix: next head")
+    github.workflow.git("push", "origin", "HEAD:ticket/seven")
+    github.head = github.workflow.git("rev-parse", "HEAD")
+    github.pulls["7"]["headRefOid"] = github.head
+    github.pulls["7"]["statusCheckRollup"] = [
+        {"name": "CI result", "status": "COMPLETED", "conclusion": "SUCCESS"},
+    ]
+    github.ci(github.base, github.head, run_id=50)
+    _outside_check(github)
+    done = github.run()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert {note["head"] for note in _ignored_notes(github)} == {previous, github.head}
+
+
+def test_an_unreadable_outside_check_suite_never_allows_a_merge(github: GitHub) -> None:
+    _outside_check(github)
+    github.api[f"{_REPO}/check-suites/90"] = "HTTP 502: unavailable"
+    done = github.run()
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "HTTP 502" in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+    assert _ignored_notes(github) == []
+
+
+def test_an_own_failure_is_refused_even_if_outside_check_metadata_is_unreadable(github: GitHub) -> None:
+    _outside_check(github)
+    github.pulls["7"]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    github.api[f"{_REPO}/check-suites/90"] = "HTTP 502: unavailable"
+    done = github.run()
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "merge refused:" in done.stderr
+    assert "failed checks" in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+
+
+@pytest.mark.parametrize("in_tick", [False, True], ids=["direct", "tick"])
+def test_an_outside_check_that_started_after_planning_still_blocks_the_merge(
+    github: GitHub, in_tick: bool,
+) -> None:
+    two_stale_pulls(github)
+    github.ci(github.base, github.head)
+    _, run, _ = _outside_check(github)
+    # The rollup still says queued. Only the first REST read says never started;
+    # every later read reports the start, including the merge's own fresh read.
+    running = {**run, "status": "in_progress", "started_at": _stamp(60)}
+    github.api[f"{_REPO}/commits/{github.head}/check-runs?per_page=100"] = {
+        "_alternate": [{"check_runs": [run]}, *[{"check_runs": [running]} for _ in range(20)]],
+    }
+    line_up(github, ["7", "8"])
+    github.save()
+    done = github.workflow.run_script(
+        "merge-when-current", "7", env=_tick_context(github) if in_tick else None,
+    )
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "merge waiting: check is not passing:" in done.stderr
+    assert not (github.workflow.state / "merged").exists()
+    assert len(github.workflow.calls(
+        f"gh api --paginate {_REPO}/commits/{github.head}/check-runs?per_page=100"
+    )) >= 2
+
+
+def test_an_ignored_check_is_told_once_per_head_and_delivery_is_durable(github: GitHub) -> None:
+    workflow = github.workflow
+    _outside_check(github)
+    for _ in range(2):
+        done = github.run()
+        assert done.returncode == 0, done.stdout + done.stderr
+    assert len(_ignored_notes(github)) == 1
+    workflow.orchestrator("busy")
+    (workflow.state / "send-fails").touch()
+    now = int(time.time())
+    assert workflow.run_script("wake", env={"WORKFLOW_NOW": str(now)}).returncode == 1
+    assert len(_ignored_notes(github)) == 1
+    (workflow.state / "send-fails").unlink()
+    assert workflow.run_script("wake", env={"WORKFLOW_NOW": str(now + 300)}).returncode == 0
+    assert _ignored_notes(github) == []
+    assert len(_ignored_notes(github, "sent")) == 1
+    assert "ignored never-started check: .github/dependabot.yml from dependabot on pull request 7" in workflow.sent()[-1]
+    assert github.run().returncode == 0
+    assert _ignored_notes(github) == []
 
 
 # A run that GitHub never dispatched needs recovery before there is a completed check.
