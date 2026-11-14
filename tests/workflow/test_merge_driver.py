@@ -83,6 +83,100 @@ _PYTEST_OWNERSHIP = (
 )
 
 
+def _pre_train_setup(workflow: Workflow) -> Path:
+    from workflow.test_commands import _configure
+
+    _configure(workflow, pre_train_checks="example-checks --fast")
+    workflow.fake("example-checks", "#!/bin/bash\n"
+                  "echo example-checks >> '@STATE@/calls.log'\necho 'checks passed'\n")
+    return workflow.add_worktree(7)
+
+
+def test_pre_train_pass_is_reused_on_the_same_head_and_main(workflow: Workflow) -> None:
+    from workflow.test_commands import _pre_train_checks
+
+    worktree = _pre_train_setup(workflow)
+    first = _pre_train_checks(workflow, worktree)
+    second = _pre_train_checks(workflow, worktree)
+
+    assert first.returncode == second.returncode == 0, first.stderr + second.stderr
+    assert workflow.calls("example-checks") == ["example-checks"]
+    head = workflow.git("rev-parse", "HEAD", cwd=worktree)
+    main = workflow.git("rev-parse", "origin/main")
+    assert f"pre-train checks: passed on {head} against {main}, reused" in second.stdout
+    assert "checks passed" not in second.stdout
+    record = _folder(workflow) / "pre-train-pass-7.json"
+    assert record.stat().st_mode & 0o077 == 0
+    assert set(json.loads(record.read_text())) == {"head", "main", "command"}
+
+
+@pytest.mark.parametrize("changed", ["head", "main", "command", "command options"])
+def test_pre_train_pass_is_invalidated_by_its_inputs(workflow: Workflow, changed: str) -> None:
+    from workflow.test_commands import _configure, _pre_train_checks
+
+    worktree = _pre_train_setup(workflow)
+    first = _pre_train_checks(workflow, worktree)
+    assert first.returncode == 0, first.stderr
+    if changed == "head":
+        workflow.git("commit", "--allow-empty", "-m", "fix: changed head", cwd=worktree)
+    elif changed == "main":
+        workflow.git("commit", "--allow-empty", "-m", "fix: changed main")
+        workflow.git("push", "origin", "main")
+        # A stale local tracking ref must not allow reuse against a newer remote main.
+        old = json.loads((_folder(workflow) / "pre-train-pass-7.json").read_text())["main"]
+        workflow.git("update-ref", "refs/remotes/origin/main", old)
+    elif changed == "command":
+        _configure(workflow, pre_train_checks="example-checks --slow")
+    else:
+        _configure(workflow, pre_train_checks={
+            "run": "example-checks --fast", "form": "exit", "wait_exit": [42],
+        })
+
+    second = _pre_train_checks(workflow, worktree)
+    third = _pre_train_checks(workflow, worktree)
+
+    assert second.returncode == third.returncode == 0, second.stderr + third.stderr
+    assert workflow.calls("example-checks") == ["example-checks"] * 2
+    assert "checks passed" in second.stdout
+    assert ", reused" in third.stdout
+
+
+@pytest.mark.parametrize("recorded", ["wait", "machine error", "failure"])
+def test_pre_train_recorded_failure_is_never_reused_as_a_pass(
+    workflow: Workflow, recorded: str,
+) -> None:
+    from workflow.test_commands import _pre_train_checks
+
+    worktree = _pre_train_setup(workflow)
+    assert _pre_train_checks(workflow, worktree).returncode == 0
+    folder = _folder(workflow)
+    if recorded == "failure":
+        # A miss followed by a hard failure must also invalidate an older success.
+        workflow.git("commit", "--allow-empty", "-m", "fix: changed head", cwd=worktree)
+        workflow.fake("example-checks", "#!/bin/bash\n"
+                      "echo example-checks >> '@STATE@/calls.log'\nexit 1\n")
+        failed = _pre_train_checks(workflow, worktree)
+        assert "refused: pre-train checks failed" in failed.stdout, failed.stderr
+        assert not (folder / "pre-train-pass-7.json").exists()
+        workflow.git("reset", "--hard", "HEAD^", cwd=worktree)
+    else:
+        path = folder / ("pre-train-wait-7.json" if recorded == "wait" else "machine-errors")
+        path.write_text(json.dumps({
+            "head": workflow.git("rev-parse", "HEAD", cwd=worktree),
+            "outcome": "exit 75: try later", "event": "example-event",
+        }))
+    workflow.fake("example-checks", "#!/bin/bash\n"
+                  "echo example-checks >> '@STATE@/calls.log'\necho 'checks passed'\n")
+
+    retried = _pre_train_checks(workflow, worktree)
+
+    assert retried.returncode == 0, retried.stderr
+    assert "checks passed" in retried.stdout
+    assert ", reused" not in retried.stdout
+    assert len(workflow.calls("example-checks")) == (3 if recorded == "failure" else 2)
+    assert not (folder / "pre-train-wait-7.json").exists()
+
+
 @pytest.mark.parametrize("code", [1, 75, 124])
 def test_machine_checks_keep_the_handoff_on_repeated_ticks_and_then_merge(
     handed: GitHub, code: int,
