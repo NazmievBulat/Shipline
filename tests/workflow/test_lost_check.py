@@ -82,6 +82,7 @@ def test_an_outside_check_that_never_started_does_not_hold_the_merge(
     "recent", "in progress", "failed", "suite running", "suite completed", "suite failed", "REST running",
     "REST failed", "own app", "unknown app", "unknown creation", "recent update",
     "different head", "different suite head", "ambiguous name", "status context",
+    "started later", "REST started later", "invalid start", "REST invalid start",
 ])
 def test_an_outside_check_is_ignored_only_with_evidence_it_never_started(
     github: GitHub, case: str,
@@ -121,6 +122,14 @@ def test_an_outside_check_is_ignored_only_with_evidence_it_never_started(
         )
     elif case == "status context":
         check.update(__typename="StatusContext", context="external", state="PENDING")
+    elif case == "started later":
+        check["startedAt"] = _stamp(1800)
+    elif case == "REST started later":
+        run["started_at"] = _stamp(1800)
+    elif case == "invalid start":
+        check["startedAt"] = "unreadable"
+    elif case == "REST invalid start":
+        run["started_at"] = "unreadable"
     done = github.run()
     assert done.returncode == 1, done.stdout + done.stderr
     if case == "failed":
