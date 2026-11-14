@@ -88,6 +88,7 @@ def _pre_train_setup(workflow: Workflow) -> Path:
 
     _configure(workflow, pre_train_checks="example-checks --fast")
     workflow.fake("example-checks", "#!/bin/bash\n"
+                  "git rev-parse origin/main > '@STATE@/checked-main'\n"
                   "echo example-checks >> '@STATE@/calls.log'\necho 'checks passed'\n")
     return workflow.add_worktree(7)
 
@@ -139,6 +140,8 @@ def test_pre_train_pass_is_invalidated_by_its_inputs(workflow: Workflow, changed
     assert workflow.calls("example-checks") == ["example-checks"] * 2
     assert "checks passed" in second.stdout
     assert ", reused" in third.stdout
+    if changed == "main":
+        assert (workflow.state / "checked-main").read_text().strip() == workflow.git("rev-parse", "main")
 
 
 @pytest.mark.parametrize("recorded", ["wait", "machine error", "failure"])
@@ -177,11 +180,75 @@ def test_pre_train_recorded_failure_is_never_reused_as_a_pass(
     assert not (folder / "pre-train-wait-7.json").exists()
 
 
+def test_waiting_gate_calls_reuse_the_pre_train_pass(handed: GitHub) -> None:
+    from workflow.test_commands import _configure
+
+    workflow = handed.workflow
+    _configure(workflow, pre_train_checks="example-checks")
+    workflow.fake("example-checks", "#!/bin/bash\n"
+                  "echo example-checks >> '@STATE@/calls.log'\n")
+    handed.pulls["7"]["statusCheckRollup"][0].update(status="QUEUED", conclusion=None)
+    handed.save()
+
+    first = workflow.run_script("merge-when-current", "--drive", "7", cwd=workflow.worktree(7))
+    second = workflow.run_script("merge-when-current", "--drive", "7", cwd=workflow.worktree(7))
+
+    assert first.returncode == second.returncode == 3, (
+        first.stdout + first.stderr + second.stdout + second.stderr
+    )
+    assert workflow.calls("example-checks") == ["example-checks"]
+    assert ", reused" in second.stdout
+    assert _note(workflow).exists()
+    assert not (workflow.state / "merged").exists()
+
+
+@pytest.mark.parametrize("newer", ["wait", "failure", "unfinished"])
+def test_an_older_pre_train_pass_cannot_cache_over_a_newer_outcome(
+    workflow: Workflow, newer: str,
+) -> None:
+    from workflow.test_commands import _gate
+
+    worktree = _pre_train_setup(workflow)
+    done = _gate(workflow, f'''
+        import subprocess
+        folder = g.CONFIG.state()
+        folder.mkdir(parents=True, exist_ok=True)
+        original = g.repository_command
+        entered = False
+
+        def checks(*args, **kwargs):
+            global entered
+            if not entered:
+                entered = True
+                try:
+                    g.pre_train_checks("7", folder, locked=False)
+                except (g.Refused, g.TimedOut):
+                    pass
+                return subprocess.CompletedProcess([], 0, "older pass\\n", "")
+            if {newer == 'unfinished'!r}:
+                raise g.TimedOut("deadline", "", 1)
+            return subprocess.CompletedProcess([], {75 if newer == 'wait' else 1}, "newer outcome\\n", "")
+
+        g.repository_command = checks
+        g.pre_train_checks("7", folder, locked=False)
+        record = folder / "pre-train-pass-7.json"
+        assert not record.exists() or "head" not in g.json.loads(record.read_text())
+        g.repository_command = original
+        g.pre_train_checks("7", folder, locked=False)
+    ''', worktree)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert workflow.calls("example-checks") == ["example-checks"]
+    assert ", reused" not in done.stdout
+
+
 @pytest.mark.parametrize("code", [1, 75, 124])
 def test_machine_checks_keep_the_handoff_on_repeated_ticks_and_then_merge(
     handed: GitHub, code: int,
 ) -> None:
     workflow = handed.workflow
+    # Force a fresh check after the fixture's successful handoff.
+    (_folder(workflow) / "pre-train-pass-7.json").unlink(missing_ok=True)
     workflow.orchestrator("busy")
     before = _note(workflow).read_bytes()
     workflow.fake("pre-train-checks", "#!/bin/bash\necho 'checking...'\n"
@@ -215,6 +282,7 @@ def test_a_local_test_or_inventory_failure_still_hands_back(
     handed: GitHub, output: str, code: int,
 ) -> None:
     workflow = handed.workflow
+    (_folder(workflow) / "pre-train-pass-7.json").unlink(missing_ok=True)
     # Test names on stdout must win over machine diagnostics on stderr.
     workflow.fake("pre-train-checks", "#!/bin/bash\n"
                   + f"printf '%s\\n' {shlex.quote(output)}\n"
@@ -229,6 +297,7 @@ def test_a_local_test_or_inventory_failure_still_hands_back(
 
 def test_machine_context_is_not_persisted_or_sent(handed: GitHub) -> None:
     workflow = handed.workflow
+    (_folder(workflow) / "pre-train-pass-7.json").unlink(missing_ok=True)
     workflow.orchestrator("busy")
     context = "credential=example-sensitive-value"
     output = f"{context} OSError: No space left on device; {context}"

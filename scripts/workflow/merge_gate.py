@@ -682,34 +682,88 @@ def clear_generated(worktree: Path) -> None:
         raise Refused(str(error)) from error
 
 
+@contextmanager
+def _pre_train_lock(folder: Path, number: str) -> Iterator[None]:
+    # Clean passing handoffs need no merge lock. Serialize their receipts with wait/failure
+    # writers separately; those take merge.lock first, never while holding this lock.
+    with os.fdopen(os.open(
+        folder / f"pre-train-checks-{number}.lock", os.O_CREAT | os.O_RDWR, 0o600,
+    ), "r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> str | None:
     """A failed local inventory must neither join nor stay approved for a prefix.
 
     A repository that names no `pre_train_checks` command has none to fail. A caller that does
     not hold the merge lock (a handoff) takes it only to record or clear an outcome. A first
     wait keeps its line entry but withdraws batch approval until the next call passes.
-    Machine errors keep waiting on the same head without spending that retry."""
+    Machine errors keep waiting on the same head without spending that retry. A pass is reused
+    only for the same head, remote main and configured command, with no recorded wait or
+    machine error. An in-flight event prevents an older pass from replacing a newer outcome."""
     path = folder / f"pre-train-wait-{number}.json"
-    try:
-        observed = json.loads(path.read_text())
-    except FileNotFoundError:
-        observed = None
+    passed = folder / f"pre-train-pass-{number}.json"
+    words = CONFIG.command("pre_train_checks")
+    identity = None
+    pending = {"event": uuid.uuid4().hex}
+    if words is not None:
+        head = git("rev-parse", "HEAD")
+        main = git("ls-remote", "--exit-code", "origin", "refs/heads/main").split()
+        if len(main) != 2 or main[1] != "refs/heads/main" or not re.fullmatch(r"[0-9a-f]{40}", main[0]):
+            raise Refused("could not read main for pre-train checks")
+        identity = {
+            "head": head, "main": main[0],
+            # Keep command text and resolved installation paths out of the saved record.
+            "command": hashlib.sha256(json.dumps(
+                [CONFIG.commands.pre_train_checks, words], sort_keys=True,
+            ).encode()).hexdigest(),
+        }
+    with _pre_train_lock(folder, number):
+        observed = json.loads(path.read_text()) if path.exists() else None
+        try:
+            cached = json.loads(passed.read_text())
+        except (FileNotFoundError, ValueError):
+            cached = None
+        if (
+            identity is not None and cached == identity and observed is None
+            and not (folder / "machine-errors").exists()
+        ):
+            print(
+                f"pre-train checks: passed on {head} against {main[0]}, reused", flush=True,
+            )
+            return None
+        if identity is not None:
+            # Invalidate the old pass before running, including a command that cannot start
+            # or times out. Concurrent calls may publish only their own still-current event.
+            write_json(passed, pending)
+        else:
+            passed.unlink(missing_ok=True)
+    if identity is not None:
+        # The command may read origin/main itself. On a miss, test against a fetched main,
+        # rather than label checks run against a stale tracking ref with the remote's head.
+        git("fetch", "origin", "main")
+        identity["main"] = git("rev-parse", "origin/main")
     try:
         done = repository_command("pre_train_checks")
     except TimedOut as error:
         if not machine_error(error.output, Path.cwd()):
             raise
         done = subprocess.CompletedProcess([], 124, error.output, "")
-    if (
-        (done is None or done.returncode == 0)
-        and not path.exists()
-        and not (folder / "machine-errors").exists()
+    if done is None or done.returncode == 0:
+        with _pre_train_lock(folder, number):
+            if not path.exists() and not (folder / "machine-errors").exists():
+                current = json.loads(passed.read_text()) if passed.exists() else None
+                if identity is not None and current == pending:
+                    write_json(passed, identity)
+                if done is not None:
+                    print(done.stdout, end="", flush=True)
+                    print(done.stderr, end="", file=sys.stderr, flush=True)
+                return None
+    with (
+        nullcontext() if locked else handoff_lock(folder, number),
+        _pre_train_lock(folder, number),
     ):
-        if done is not None:
-            print(done.stdout, end="", flush=True)
-            print(done.stderr, end="", file=sys.stderr, flush=True)
-        return None
-    with nullcontext() if locked else handoff_lock(folder, number):
         previous = json.loads(path.read_text()) if path.exists() else None
         error = (
             machine_error(done.stdout + "\n" + done.stderr, Path.cwd())
@@ -722,7 +776,11 @@ def pre_train_checks(number: str, folder: Path, *, locked: bool = True) -> str |
             # newer wait while this command runs or while this handoff waits for the lock.
             if previous == observed:
                 path.unlink(missing_ok=True)
+                current = json.loads(passed.read_text()) if passed.exists() else None
+                if identity is not None and current == pending:
+                    write_json(passed, identity)
         else:
+            passed.unlink(missing_ok=True)
             head = git("rev-parse", "HEAD")
             output = done.stdout + done.stderr
             first_line = error or next(iter(output.splitlines()), f"command exited {done.returncode}")

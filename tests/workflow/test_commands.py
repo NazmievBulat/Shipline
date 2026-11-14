@@ -473,6 +473,7 @@ def test_a_delayed_passing_handoff_cannot_override_a_newer_wait(handed: GitHub, 
             if checked and not injected:
                 injected = True
                 Path({str(workflow.state / "checks-wait")!r}).touch()
+                (folder / "pre-train-pass-7.json").unlink(missing_ok=True)
                 # A driven gate completes these checks while the older passing handoff
                 # is between its own checks and its final admission under merge.lock.
                 for _ in range({waits}):
@@ -535,6 +536,7 @@ def test_a_passing_handoff_blocked_at_the_lock_preserves_a_newer_wait(
                 if {replacement == 'identical first wait'!r}:
                     g.pre_train_checks(number, folder, locked=False)
                 waiting.touch()
+                (folder / "pre-train-pass-7.json").unlink(missing_ok=True)
                 try:
                     g.pre_train_checks(number, folder, locked=False)
                 except g.Refused:
