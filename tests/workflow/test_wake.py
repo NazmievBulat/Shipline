@@ -1594,6 +1594,24 @@ def test_an_unpushed_commit_does_not_clear_a_new_bridge_question(day: Workflow) 
     assert (notes / "ticket-7.asking").exists()
 
 
+def test_head_cleanup_leaves_a_distinct_new_native_question_for_recovery(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(10))
+    day.push_from_elsewhere(7)
+    message = "Approve the next summary?\nReply 3 or 4."
+    (notes / "ticket-7.codex-turn.json").write_text(json.dumps({"last-assistant-message": message}))
+    _stop(day, "ticket-7", message, _at(10, 1))
+
+    assert _wake(day, "ticket-7", at=_at(10, 2)).returncode == 0
+    assert not (notes / "ticket-7.asking").exists()
+    assert day.run_script("notify", "recheck", env={"WORKFLOW_SESSION": "ticket-7"}).returncode == 0
+
+    assert (notes / "ticket-7.asking").exists()
+    assert json.loads((notes / "ticket-7.question").read_text())["reply_words"] == ["3", "4"]
+
+
 def test_an_unread_head_keeps_a_bridge_question_until_a_change_is_known(day: Workflow) -> None:
     notes = day.notes(7)
     notes.mkdir(parents=True, exist_ok=True)

@@ -690,7 +690,7 @@ fi
 # explicit replies keep its question visible while unrelated work runs. With `all`, also
 # an ordinary session working again on its own job, whose question is still open.
 asking_notes() {
-  local note name asked identity metadata recorded expected remote state branch current explicit native
+  local note name asked identity metadata recorded expected remote state branch current explicit native native_message native_sum
   shopt -s nullglob
   {
     for note in "$main"/.claude/worktrees/*/"$SHIPLINE_STATE_FOLDER"/*.asking; do
@@ -721,10 +721,14 @@ asking_notes() {
             flock --nonblock 8 || exit 0
             [[ -r $note && -r $metadata && $(<"$metadata") == "$recorded" ]] &&
               jq -e --arg asked "$(<"$note")" '.asked == $asked' <<<"$recorded" >/dev/null || exit 0
-            # Recovery must not resurrect the saved turn after its head became obsolete.
+            # Only the obsolete question is followed-up. A distinct question from a
+            # newer native turn must remain available for recovery on the new head.
             if [[ -n $native && -r ${note%.asking}.codex-turn.json &&
                   $(<"${note%.asking}.codex-turn.json") == "$native" ]]; then
-              cp "${note%.asking}.codex-turn.json" "${note%.asking}.codex-followed-up"
+              native_message=$(jq -er '.["last-assistant-message"] | strings' <<<"$native") || native_message=""
+              native_sum=$(cksum <<<"$native_message")
+              [[ $(jq -r '.asked | split(" ")[1]' <<<"$recorded") != "${native_sum%% *}" ]] ||
+                cp "${note%.asking}.codex-turn.json" "${note%.asking}.codex-followed-up"
             fi
             rm -f "$note" "$metadata" "${note%.asking}.pushed"
           ); fi
