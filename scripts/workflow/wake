@@ -704,7 +704,10 @@ asking_notes() {
         recorded=$(<"$metadata")
         expected=$(jq -r '.head // empty' <<<"$recorded")
         native=""
-        [[ ! -r ${note%.asking}.codex-turn.json ]] || native=$(<"${note%.asking}.codex-turn.json")
+        # read preserves trailing newlines, so the receipt can reproduce the exact
+        # captured bytes without rereading a file native callbacks replace freely.
+        [[ ! -r ${note%.asking}.codex-turn.json ]] ||
+          IFS= read -r -d '' native <"${note%.asking}.codex-turn.json" || true
         # Use the pull request's head, including a push made outside this worktree.
         # An unread or budget-limited head leaves the question open; shadows write nothing.
         remote=""
@@ -723,12 +726,14 @@ asking_notes() {
               jq -e --arg asked "$(<"$note")" '.asked == $asked' <<<"$recorded" >/dev/null || exit 0
             # Only the obsolete question is followed-up. A distinct question from a
             # newer native turn must remain available for recovery on the new head.
-            if [[ -n $native && -r ${note%.asking}.codex-turn.json &&
-                  $(<"${note%.asking}.codex-turn.json") == "$native" ]]; then
+            if [[ -n $native ]]; then
               native_message=$(jq -er '.["last-assistant-message"] | strings' <<<"$native") || native_message=""
               native_sum=$(cksum <<<"$native_message")
-              [[ $(jq -r '.asked | split(" ")[1]' <<<"$recorded") != "${native_sum%% *}" ]] ||
-                cp "${note%.asking}.codex-turn.json" "${note%.asking}.codex-followed-up"
+              if [[ $(jq -r '.asked | split(" ")[1]' <<<"$recorded") == "${native_sum%% *}" ]]; then
+                temporary=$(mktemp "${note%.asking}.followed-up.XXXXXX") || exit 0
+                printf '%s' "$native" >"$temporary" && mv "$temporary" "${note%.asking}.codex-followed-up"
+                rm -f "$temporary"
+              fi
             fi
             rm -f "$note" "$metadata" "${note%.asking}.pushed"
           ); fi

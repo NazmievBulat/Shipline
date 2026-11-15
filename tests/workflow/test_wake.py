@@ -2,6 +2,8 @@
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -1606,6 +1608,39 @@ def test_head_cleanup_leaves_a_distinct_new_native_question_for_recovery(day: Wo
 
     assert _wake(day, "ticket-7", at=_at(10, 2)).returncode == 0
     assert not (notes / "ticket-7.asking").exists()
+    assert day.run_script("notify", "recheck", env={"WORKFLOW_SESSION": "ticket-7"}).returncode == 0
+
+    assert (notes / "ticket-7.asking").exists()
+    assert json.loads((notes / "ticket-7.question").read_text())["reply_words"] == ["3", "4"]
+
+
+def test_a_native_callback_during_head_cleanup_remains_recoverable(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    message = "Approve the summary?\nReply 1 or 2."
+    native = notes / "ticket-7.codex-turn.json"
+    original = json.dumps({"last-assistant-message": message})
+    native.write_text(original)
+    _stop(day, "ticket-7", message, _at(10))
+    day.push_from_elsewhere(7)
+    replacement = day.state / "next-native-turn.json"
+    replacement.write_text(json.dumps({"last-assistant-message": "Approve the next summary?\nReply 3 or 4."}))
+    injected = day.state / "native-callback-injected"
+    jq = shutil.which("jq", path=day.env["PATH"])
+    assert jq is not None
+    # Replace the live turn while cleanup parses the already captured old turn.
+    day.fake("jq", f'''#!/bin/bash
+if [[ "$1" == -er && "$2" == '.["last-assistant-message"] | strings' && ! -e "{injected}" ]]; then
+  cp "{replacement}" "{native}"
+  touch "{injected}"
+fi
+exec {shlex.quote(jq)} "$@"
+''')
+
+    assert _wake(day, "ticket-7", at=_at(10, 2)).returncode == 0
+    assert injected.exists()
+    assert (notes / "ticket-7.codex-followed-up").read_text() == original
     assert day.run_script("notify", "recheck", env={"WORKFLOW_SESSION": "ticket-7"}).returncode == 0
 
     assert (notes / "ticket-7.asking").exists()
