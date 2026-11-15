@@ -568,6 +568,8 @@ def _failed_names(run: int, attempt: int, job: dict[str, Any]) -> dict[str, Any]
     except Refused:
         readable, diagnostics = False, ""
 
+    log_text = _COLOUR.sub("", diagnostics)
+
     def tests_in(text: str) -> list[str]:
         clean = _COLOUR.sub("", text)
         return sorted({
@@ -592,7 +594,7 @@ def _failed_names(run: int, attempt: int, job: dict[str, Any]) -> dict[str, Any]
     names = [f"test {NOT_PLAIN.sub('?', name)}" for name in tests]
     if not names:
         steps = sorted({
-            fields[1] for line in diagnostics.splitlines()
+            fields[1] for line in log_text.splitlines()
             if len(fields := line.split("\t", 2)) == 3 and fields[1].strip()
         }) or sorted({
             step["name"] for step in job.get("steps", [])

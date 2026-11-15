@@ -1050,6 +1050,10 @@ def test_flaky_repeat_names_the_step_or_unreadable_log(workflow: Workflow, reada
     (fixtures / "logs.json").write_text(json.dumps(logs))
     jobs = json.loads((fixtures / "jobs.json").read_text())
     jobs["104-1"][0]["steps"] = [{"name": "Install dependencies", "conclusion": "failure"}]
+    jobs["104-1"][0]["check_run_url"] = "https://api.github.com/repos/example-org/example-app/check-runs/2041"
+    (fixtures / "annotations.json").write_text(json.dumps([
+        {"annotation_level": "failure", "message": "Details\tunrelated text\texit code 1"},
+    ]))
     (fixtures / "jobs.json").write_text(json.dumps(jobs))
     _github(workflow, fixtures)
     quality = _measure(workflow)["last_days"]["quality"]
