@@ -735,6 +735,15 @@ the section Analyse the workflow of AGENTS.md in this worktree". It runs Claude 
 effort in a copy of `main` on no branch, and has 40 minutes: the tick stops it then, whatever
 it is doing.
 
+The metrics report's quality table groups flaky repeats by workflow, check and failing test.
+The "Flaky repeats in N days" section prints one line per group, with its count and each run,
+attempt and job id; different failing tests have separate lines. It reads the failed jobs of
+earlier attempts when a run passes on rerun, using only their failed logs and failure
+annotations. When no test is named, the line names the failed step; unavailable logs say
+"log unreadable", and a missing step name says "failing step unnamed". Extracted names from
+readable diagnostics are cached with completed jobs for eight days. The flaky-test detector
+uses these groups and the existing repeat threshold, with the same run evidence in its finding.
+
 1. It is read-only. It opens no ticket and no pull request, commits and pushes nothing,
    changes no label, comments nowhere, starts, stops and types into no session, and asks the
    owner nothing. The one thing it writes is its report folder, `$WORKFLOW_ANALYSIS_REPORT`:

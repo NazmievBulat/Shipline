@@ -1,8 +1,8 @@
 """`workflow-metrics` computes the daily numbers and fires the fixed gap detectors."""
 
 import json
-import shutil
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -49,7 +49,8 @@ if arguments[:2] == ["run", "view"]:
     sys.exit(0)
 path = arguments[-1]
 if "/annotations?" in path:
-    print("[]")
+    annotations = fixtures / "annotations.json"
+    print(annotations.read_text() if annotations.exists() else "[]")
     sys.exit(0)
 jobs = json.loads((fixtures / "jobs.json").read_text())
 runs = "repos/example-org/example-app/actions/runs"
@@ -1053,7 +1054,69 @@ def test_flaky_repeat_names_the_step_or_unreadable_log(workflow: Workflow, reada
     _github(workflow, fixtures)
     quality = _measure(workflow)["last_days"]["quality"]
     name = "CI: tests (1 of 2): step Install dependencies"
-    if not readable:
-        name += " (log unreadable)"
     assert quality["flaky"][name] == 1
-    assert quality["flaky_repeats"][name] == [{"run": 104, "attempt": 1, "job": 1041}]
+    repeat = {"run": 104, "attempt": 1, "job": 1041}
+    if not readable:
+        repeat["log_unreadable"] = True
+    assert quality["flaky_repeats"][name] == [repeat]
+    report = workflow.run_script("workflow-metrics", env=AT)
+    assert report.returncode == 0, report.stderr
+    assert ("job 1041 (log unreadable)" in report.stdout) is (not readable)
+
+
+@pytest.mark.parametrize("diagnostic,expected", [
+    ("FAILED tests/test_example.py::test_total[two items] - AssertionError",
+     "tests/test_example.py::test_total[two items]"),
+    ("FAIL src/example.test.ts > adds items", "src/example.test.ts ? adds items"),
+    ("1) [chromium] › e2e/example.spec.ts:12:5 › opens the page",
+     "[chromium] ? e2e/example.spec.ts:12:5 ? opens the page"),
+])
+def test_flaky_repeat_can_read_test_from_failure_annotation(
+    workflow: Workflow, diagnostic: str, expected: str,
+) -> None:
+    fixtures = _flaky_fixtures(workflow)
+    logs = json.loads((fixtures / "logs.json").read_text())
+    logs["1041"] = None
+    (fixtures / "logs.json").write_text(json.dumps(logs))
+    jobs = json.loads((fixtures / "jobs.json").read_text())
+    jobs["104-1"][0]["check_run_url"] = "https://api.github.com/repos/example-org/example-app/check-runs/2041"
+    (fixtures / "jobs.json").write_text(json.dumps(jobs))
+    (fixtures / "annotations.json").write_text(json.dumps([
+        {"annotation_level": "failure", "message": diagnostic},
+        {"annotation_level": "notice", "message": "FAILED tests/test_example.py::test_ignored"},
+    ]))
+    _github(workflow, fixtures)
+    quality = _measure(workflow)["last_days"]["quality"]
+    assert quality["flaky"][f"CI: tests (1 of 2): test {expected}"] == 1
+    assert quality["flaky_repeats"][f"CI: tests (1 of 2): test {expected}"][0]["log_unreadable"] is True
+    assert not any("test_ignored" in name for name in quality["flaky"])
+    assert any("/check-runs/2041/annotations" in call for call in workflow.calls("gh"))
+
+
+def test_flaky_repeat_keeps_all_tests_and_attempts_without_counting_summary_twice(workflow: Workflow) -> None:
+    fixtures = _flaky_fixtures(workflow)
+    runs = json.loads((fixtures / "runs.json").read_text())
+    next(run for run in runs if run["id"] == 104)["run_attempt"] = 3
+    (fixtures / "runs.json").write_text(json.dumps(runs))
+    jobs = json.loads((fixtures / "jobs.json").read_text())
+    jobs["104-3"] = jobs["104-2"]
+    jobs["104-2"] = [{**jobs["104-1"][0], "id": 1042}]
+    (fixtures / "jobs.json").write_text(json.dumps(jobs))
+    logs = json.loads((fixtures / "logs.json").read_text())
+    logs["1041"] += "\nFAILED tests/test_example.py::test_one - AssertionError"
+    logs["1042"] = "FAILED tests/test_example.py::test_one - error\nFAILED tests/test_example.py::test_two - error"
+    (fixtures / "logs.json").write_text(json.dumps(logs))
+    _github(workflow, fixtures)
+    measured = _measure(workflow)
+    quality = measured["last_days"]["quality"]
+    first = "CI: tests (1 of 2): test tests/test_example.py::test_one"
+    assert quality["flaky"][first] == 3
+    assert quality["flaky"]["CI: tests (1 of 2): test tests/test_example.py::test_two"] == 1
+    assert quality["flaky_repeats"][first] == [
+        {"run": 104, "attempt": 1, "job": 1041},
+        {"run": 104, "attempt": 2, "job": 1042},
+        {"run": 106, "attempt": 1, "job": 1061},
+    ]
+    finding = next(finding["line"] for finding in measured["findings"] if finding["detector"] == "flaky_test")
+    assert first in finding and "3 times" in finding
+    assert "run 104 attempt 2 job 1042" in finding
