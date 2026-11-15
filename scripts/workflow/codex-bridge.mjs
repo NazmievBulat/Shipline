@@ -7,6 +7,44 @@ import { fileURLToPath } from "node:url"
 import { createInterface } from "node:readline"
 import { setTimeout as delay } from "node:timers/promises"
 
+// The hook and wake own question state; these local modes only parse text as data.
+// Keep reply phrases literal, including punctuation that could otherwise be a regexp.
+function replyWords(message) {
+  const words = new Set()
+  const token = /^[\s*_]*(?:"([^"\n]+)"|'([^'\n]+)'|“([^”\n]+)”|‘([^’\n]+)’|`([^`\n]+)`|([\p{L}\p{N}][\p{L}\p{N}_-]*))/u
+  for (const request of message.matchAll(/\b(reply|type|write|answer|say|choose)\s+(?:with\s+)?/gi)) {
+    let rest = message.slice(request.index + request[0].length).split("\n")[0]
+    while (true) {
+      const match = rest.match(token)
+      if (!match) break
+      const word = match.slice(1).find((value) => value !== undefined)
+      // Progress instructions such as "write tests" supply no explicit reply word.
+      if (match[6] && !/^\d+$/.test(word) && request[1].toLowerCase() !== "reply") break
+      if (word.length <= 60) words.add(word)
+      rest = rest.slice(match[0].length).replace(/^[*_]+/, "")
+      rest = rest.replace(/^\s*\(recommended\)/i, "")
+      const separator = rest.match(/^\s*(?:(?:,\s*)?(?:or|and)\b|[,/])\s*/i)
+      if (!separator) break
+      rest = rest.slice(separator[0].length)
+      if (/^(?:reply|type|write|answer|say|choose)\b/i.test(rest)) break
+    }
+  }
+  return [...words]
+}
+if (process.argv[2] === "--reply-words") {
+  process.stdout.write(JSON.stringify(replyWords(readFileSync(0, "utf8"))))
+  process.exit(0)
+}
+if (process.argv[2] === "--answers-question") {
+  const { reply_words: words, prompt } = JSON.parse(readFileSync(0, "utf8"))
+  const answered = words.some((word) => {
+    const literal = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    return new RegExp(`(?<![\\p{L}\\p{N}_-])${literal}(?![\\p{L}\\p{N}_-])`, "iu").test(prompt)
+  })
+  process.stdout.write(String(answered))
+  process.exit(0)
+}
+
 const [worktree, name] = process.argv.slice(2)
 if (!worktree || !/^(ticket|review)-[0-9]+$/.test(name ?? "")) process.exit(2)
 const socket = `codex-${name.split("-").at(-1)}`

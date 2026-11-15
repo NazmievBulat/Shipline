@@ -1143,13 +1143,60 @@ def test_a_bridge_question_matches_quoted_reply_phrases(
     assert _asking(session).exists() is not answered
 
 
-def test_a_bridge_question_without_reply_words_accepts_any_owner_prompt(session: Workflow) -> None:
+@pytest.mark.parametrize("message", ["Which summary do you prefer?", "Please write tests first. Which summary do you prefer?"])
+def test_a_bridge_question_without_reply_words_accepts_any_owner_prompt(
+    session: Workflow, message: str,
+) -> None:
     (session.notes(7) / "ticket-7.codex").touch()
-    session.notify(_stop("Which summary do you prefer?"))
+    session.notify(_stop(message))
 
     session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Use the shorter summary."})
 
     assert not _asking(session).exists()
+
+
+@pytest.mark.parametrize("reply_line", [
+    "Reply 1 / Reply 2", "Reply `1` or `2`.", "Reply 1 or 2.",
+    "Reply **1** (recommended) or **2**.",
+])
+def test_bridge_reply_words_do_not_include_the_reply_instruction(
+    session: Workflow, reply_line: str,
+) -> None:
+    (session.notes(7) / "ticket-7.codex").touch()
+    session.notify(_stop(f"Approve the summary?\n{reply_line}"))
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "How should I reply later?"})
+    assert _asking(session).exists()
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Please use 2."})
+    assert not _asking(session).exists()
+
+
+def test_quoted_bridge_reply_words_are_literal(session: Workflow) -> None:
+    (session.notes(7) / "ticket-7.codex").touch()
+    session.notify(_stop('Which next step?\nReply "ship (now)" or "wait".'))
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "ship now"})
+    assert _asking(session).exists()
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Please ship (now)."})
+    assert not _asking(session).exists()
+
+
+def test_a_bridge_delivery_retry_keeps_the_original_head(session: Workflow) -> None:
+    notes = session.notes(7)
+    (notes / "ticket-7.codex").touch()
+    keys = session.root / "home" / "agents" / ".env"
+    contents = keys.read_text()
+    keys.unlink()
+    message = "Approve the summary?\nReply 1 or 2."
+    session.notify(_stop(message), env=_AT_NINE)
+    metadata = (notes / "ticket-7.question").read_text()
+    session.push_from_elsewhere(7)
+    keys.write_text(contents)
+
+    session.notify(_stop(message), env=_AT_TEN)
+
+    assert (notes / "ticket-7.question").read_text() == metadata
+    assert len(session.pushes()) == 1
+    assert _asked_at(session) == _AT_NINE["WORKFLOW_NOW"]
 
 
 def test_a_session_stopped_on_the_usage_limit_notes_no_question(session: Workflow) -> None:
@@ -1592,7 +1639,7 @@ def test_the_answer_drops_the_question_note_and_a_new_stop_writes_its_own(
 
 
 @pytest.mark.parametrize("case", ["codex", "not a question", "hunt"])
-def test_no_question_note_for_a_bridge_a_stop_that_asks_nothing_or_a_hunt(
+def test_no_automatic_reply_for_a_bridge_a_stop_that_asks_nothing_or_a_hunt(
     session: Workflow, case: str
 ) -> None:
     name = "ticket-7"
@@ -1611,6 +1658,12 @@ def test_no_question_note_for_a_bridge_a_stop_that_asks_nothing_or_a_hunt(
 
     if case == "hunt":
         assert not (session.hunt_worktree("plan-1") / ".local/workflow/hunt-plan-1.question").exists()
+    elif case == "codex":
+        question = _question(session)
+        assert question is not None
+        assert question["reply_words"] == ["1", "2"]
+        assert "owner_only" not in question
+        assert "reply" not in question
     else:
         assert _question(session) is None
 

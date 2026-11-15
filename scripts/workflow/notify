@@ -152,6 +152,15 @@ asking=$notes/$name.asking
 # Whether that question is one the owner keeps for himself, and its recommended reply, for the
 # tick, which answers it for him after a while when it is not (`question_of`).
 question=$notes/$name.question
+bridge_head=""
+
+# A bridge question with explicit replies survives unrelated owner prompts and turns.
+# Match the asking identity so metadata left by an older question cannot retain a new one.
+bridge_question_open() {
+  [[ -e $notes/$name.codex && -r $asking && -r $question ]] &&
+    jq -e --arg asked "$(<"$asking")" \
+      '.asked == $asked and (.reply_words | type == "array" and length > 0)' "$question" >/dev/null
+}
 
 # Only the worker's per-process callback may publish turns. Global callbacks from a
 # review or hunt must not mark the enclosing Claude session idle or ring its phone.
@@ -280,7 +289,7 @@ question_of() {
 # worker, or one GitHub does not answer for, is blocked until it says "worker finished": a
 # wrong ring is better than a missed one.
 worker_is_blocked() {
-  local draft
+  local draft snapshot
   # A bridge can stop on a live Codex permission panel, before any turn completes.
   # The relay already recognized it; permission prompts always ring. The bridge may put
   # words of its own around the panel, so its heading is looked for.
@@ -290,7 +299,14 @@ worker_is_blocked() {
     [[ -z $heading || $1 != *"$heading"* ]] || return 0
   fi
   said_finished "worker finished" "$1" && return 1
-  draft=$(cd "$main" && timeout "$ANSWER_SECONDS" gh pr view "$number" --json isDraft --jq .isDraft)
+  if [[ -e $notes/$name.codex ]]; then
+    # Capture the actual PR head with the existing draft read: local commits may be unpushed.
+    snapshot=$(cd "$main" && timeout "$ANSWER_SECONDS" gh pr view "$number" \
+      --json isDraft,headRefOid --jq '[.isDraft, .headRefOid] | @tsv')
+    read -r draft bridge_head <<<"$snapshot"
+  else
+    draft=$(cd "$main" && timeout "$ANSWER_SECONDS" gh pr view "$number" --json isDraft --jq .isDraft)
+  fi
   [[ $draft != true ]] || question_in_stop "$1"
 }
 
@@ -451,15 +467,16 @@ on_stop() {
 }
 
 on_stop_locked() {
-  local message limit_at asked="" temporary owner_question=""
+  local message limit_at asked="" temporary owner_question="" open_bridge_question=false sum
   stop_is_current || return 0
   # Permission dialogs and the question tool continue this same turn when answered. A
   # later Stop proves that interaction ended; a refused merge still becomes an owner
   # block below when the last message asks for permission to retry it.
   rm -f "$notes/$name.interaction-blocked"
-  # Whatever this stop is, an earlier question is answered or asked again below.
+  bridge_question_open && open_bridge_question=true
+  # A bridge progress turn cannot answer an earlier question with explicit replies.
   [[ ! -r $asking ]] || read -r asked <"$asking" || true
-  rm -f "$asking" "$question"
+  [[ $open_bridge_question == true ]] || rm -f "$asking" "$question"
   [[ ! -e $notes/$name.codex ]] || note "$notes/$name.bridge-stopped" ""
   message=$(field .last_assistant_message)
   # Keep even a silent progress stop: a later question-test version may recognize it.
@@ -494,6 +511,15 @@ on_stop_locked() {
   fi
   rm -f "$job_wait"
   note "$idle" ""
+  if [[ $open_bridge_question == true ]]; then
+    # A repeat of the question can retry a failed phone push; unrelated progress cannot
+    # replace either the original question or its head baseline.
+    sum=$(cksum <<<"$message")
+    if [[ ${asked#* } == "${sum%% *}" ]]; then
+      publish_question "$message" "${stop_saved_at:-${WORKFLOW_NOW:-$(date +%s)}}" "$asked"
+    fi
+    return 0
+  fi
   # A busy provider is retried by the tick, without a quota reset or an owner question.
   if [[ -e $notes/$name.codex || ${1:-} == codex ||
         ( $name == hunt-* && -f $main/.local/hunts/${name#hunt-}/codex.log ) ]] &&
@@ -520,8 +546,13 @@ on_stop_locked() {
 
 # Stop delivery and recovery share the asking note, reviewer block and push receipt.
 publish_question() {
-  local message=$1 at=$2 asked=${3:-} known=${4:-} sum delivery_asked
+  local message=$1 at=$2 asked=${3:-} known=${4:-} sum delivery_asked words="" metadata=""
   stop_is_current || return 0
+  # Parse before publishing the asking note: a prompt must never see a new question
+  # waiting for its reply metadata. Delivery retries retain the original head baseline.
+  if [[ -e $notes/$name.codex ]] && ! bridge_question_open; then
+    words=$(node "$here/codex-bridge.mjs" --reply-words <<<"$message") || words='[]'
+  fi
   # Even a failed push leaves a reviewer blocked; automatic check nudges answer nothing.
   [[ $name != review-* ]] || note "$notes/$name.owner-blocked" ""
   # The same words after a turn of the session's own (its job ended) are the same question,
@@ -530,10 +561,17 @@ publish_question() {
   sum=$(cksum <<<"$message")
   sum=${sum%% *}
   if [[ -n $asked && ${asked#* } == "$sum" ]]; then
-    note "$asking" "$asked"
+    delivery_asked=$asked
   else
-    note "$asking" "$at $sum"
+    delivery_asked="$at $sum"
   fi
+  if [[ -n $words ]]; then
+    metadata=$(jq -cn --arg asked "$delivery_asked" --arg head "$bridge_head" \
+      --argjson words "$words" '{asked: $asked, head: $head, reply_words: $words}')
+  fi
+  stop_is_current || return 0
+  [[ -z $metadata ]] || (umask 077; note "$question" "$metadata")
+  note "$asking" "$delivery_asked"
   # A Codex bridge relays and never answers; a hunt asks nothing.
   if [[ $name =~ ^(ticket|review|audit)- && ! -e $notes/$name.codex ]] &&
       { [[ $known == question ]] || question_in_stop "$message"; }; then
@@ -649,8 +687,11 @@ on_prompt() {
     or ((.prompt // "")
     | test("^\\s*(?:<task-notification>(?:(?!</task-notification>)[\\s\\S])*</task-notification>\\s*)+$"))'
   if [[ $(jq -r "$own_turn" <<<"$event" 2>/dev/null) != true ]]; then
-    rm -f "$pushed" "$notes/$name.owner-blocked" "$notes/$name.interaction-blocked"
-    rm -f "$asking" "$question"
+    if ! bridge_question_open || [[ $(jq --arg prompt "$(field .prompt)" \
+        '. + {prompt: $prompt}' "$question" | node "$here/codex-bridge.mjs" --answers-question) == true ]]; then
+      rm -f "$pushed" "$notes/$name.owner-blocked" "$notes/$name.interaction-blocked"
+      rm -f "$asking" "$question"
+    fi
     if [[ -e $notes/$name.codex ]] && jq -e '(.source // "user_input") == "user_input"' <<<"$event" >/dev/null; then
       # jq writes the submitted text exactly, including trailing newlines. An automatic
       # wake authorizes no reply and leaves any pending owner's answer alone.

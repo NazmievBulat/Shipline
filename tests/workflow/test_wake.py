@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -1565,6 +1567,8 @@ def test_a_changed_pull_request_head_clears_the_bridge_question(day: Workflow) -
     notes.mkdir(parents=True, exist_ok=True)
     (notes / "ticket-7.codex").touch()
     _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(10))
+    native = json.dumps({"last-assistant-message": "Approve the summary?\nReply 1 or 2."})
+    (notes / "ticket-7.codex-turn.json").write_text(native)
     # The worktree has not moved: the question follows the pull request's head.
     day.push_from_elsewhere(7)
 
@@ -1572,6 +1576,81 @@ def test_a_changed_pull_request_head_clears_the_bridge_question(day: Workflow) -
 
     assert "asking the owner:" not in day.sent()[-1]
     assert not (notes / "ticket-7.asking").exists()
+    assert (notes / "ticket-7.codex-followed-up").read_text() == native
+    day.run_script("notify", "recheck", env={"WORKFLOW_SESSION": "ticket-7"})
+    assert not (notes / "ticket-7.asking").exists()
+
+
+def test_an_unpushed_commit_does_not_clear_a_new_bridge_question(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    day.git("commit", "--quiet", "--allow-empty", "-m", "feat: prepare summary", cwd=day.worktree(7))
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(10))
+
+    assert _wake(day, "ticket-7", at=_at(10, 4)).returncode == 0
+
+    assert "asking the owner: ticket-7 (4 min)" in day.sent()[-1]
+    assert (notes / "ticket-7.asking").exists()
+
+
+def test_an_unread_head_keeps_a_bridge_question_until_a_change_is_known(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    unavailable = day.state / "fail-gh-view-7"
+    unavailable.touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(10))
+    assert _wake(day, "ticket-7", at=_at(10, 1)).returncode == 0
+    assert "asking the owner:" in day.sent()[-1]
+    unavailable.unlink()
+    assert _wake(day, "ticket-7", at=_at(10, 2)).returncode == 0
+    assert "asking the owner:" in day.sent()[-1]
+    day.push_from_elsewhere(7)
+
+    assert _wake(day, "ticket-7", at=_at(10, 4)).returncode == 0
+
+    assert not (notes / "ticket-7.asking").exists()
+
+
+def test_a_delayed_head_read_cannot_remove_a_new_bridge_question(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(10))
+    day.push_from_elsewhere(7)
+    entered, release = day.state / "head-read-entered", day.state / "head-read-release"
+    day.fake("gh-original", (day.bin / "gh").read_text())
+    day.fake("gh", f'''#!/bin/bash
+if [[ "$1 $2 $4 $5" == "pr view --json state,headRefName,headRefOid" && ! -e "{release}" ]]; then
+  answer=$("{day.bin / "gh-original"}" "$@") || exit 1
+  touch "{entered}"
+  for attempt in {{1..300}}; do
+    [[ ! -e "{release}" ]] || break
+    sleep 0.01
+  done
+  printf '%s\\n' "$answer"
+  exit 0
+fi
+exec "{day.bin / "gh-original"}" "$@"
+''')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(_wake, day, "ticket-7", at=_at(10, 1))
+        try:
+            until = time.monotonic() + 3
+            while not entered.exists() and time.monotonic() < until:
+                time.sleep(0.01)
+            assert entered.exists(), "wake did not start its head read"
+            day.notify({"hook_event_name": "UserPromptSubmit", "prompt": "1"}, session="ticket-7")
+            _stop(day, "ticket-7", "Approve the next summary?\nReply 1 or 2.", _at(10, 2))
+            asked = (notes / "ticket-7.asking").read_text()
+            metadata = (notes / "ticket-7.question").read_text()
+        finally:
+            release.touch()
+        result = pending.result(timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert (notes / "ticket-7.asking").read_text() == asked
+    assert (notes / "ticket-7.question").read_text() == metadata
 
 
 def test_a_question_of_a_session_that_ended_brings_no_check_in_by_day(day: Workflow) -> None:

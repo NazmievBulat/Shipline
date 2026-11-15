@@ -258,6 +258,13 @@ if [ "$asked" = "pr view --json state,headRefName,headRefOid --jq" ] && [ -f "@S
   exit 0
 fi
 # Like the real one, it knows the repository only from the folder it is called in.
+if [ "$asked $7" = 'pr view --json isDraft,headRefOid --jq [.isDraft, .headRefOid] | @tsv' ] \
+  && [ -f "@STATE@/draft/$3" ] && git rev-parse --git-dir >/dev/null 2>&1; then
+  [ ! -e "@STATE@/fail-gh-view-$3" ] || exit 1
+  read -r _ _ head < "@STATE@/pr/$3"
+  printf '%s\\t%s\\n' "$(cat "@STATE@/draft/$3")" "$head"
+  exit 0
+fi
 if [ "$asked $7" = "pr view --json isDraft --jq .isDraft" ] && [ -f "@STATE@/draft/$3" ] \
   && git rev-parse --git-dir >/dev/null 2>&1; then
   cat "@STATE@/draft/$3"
