@@ -1057,7 +1057,9 @@ def test_flaky_repeat_names_the_step_or_unreadable_log(workflow: Workflow, reada
     (fixtures / "jobs.json").write_text(json.dumps(jobs))
     _github(workflow, fixtures)
     quality = _measure(workflow)["last_days"]["quality"]
-    name = "CI: tests (1 of 2): step Install dependencies"
+    name = "CI: tests (1 of 2): " + (
+        "step Install dependencies" if readable else "failing step unnamed"
+    )
     assert quality["flaky"][name] == 1
     repeat = {"run": 104, "attempt": 1, "job": 1041}
     if not readable:
@@ -1071,9 +1073,9 @@ def test_flaky_repeat_names_the_step_or_unreadable_log(workflow: Workflow, reada
 @pytest.mark.parametrize("diagnostic,expected", [
     ("FAILED tests/test_example.py::test_total[two items] - AssertionError",
      "tests/test_example.py::test_total[two items]"),
-    ("FAIL src/example.test.ts > adds items", "src/example.test.ts ? adds items"),
+    ("FAIL src/example.test.ts > adds items", "src/example.test.ts %3E adds items"),
     ("1) [chromium] › e2e/example.spec.ts:12:5 › opens the page",
-     "[chromium] ? e2e/example.spec.ts:12:5 ? opens the page"),
+     "[chromium] %E2%80%BA e2e/example.spec.ts:12:5 %E2%80%BA opens the page"),
 ])
 def test_flaky_repeat_can_read_test_from_failure_annotation(
     workflow: Workflow, diagnostic: str, expected: str,
@@ -1124,3 +1126,25 @@ def test_flaky_repeat_keeps_all_tests_and_attempts_without_counting_summary_twic
     finding = next(finding["line"] for finding in measured["findings"] if finding["detector"] == "flaky_test")
     assert first in finding and "3 times" in finding
     assert "run 104 attempt 2 job 1042" in finding
+
+
+
+def test_distinct_test_ids_do_not_collide_when_escaped(workflow: Workflow) -> None:
+    fixtures = _flaky_fixtures(workflow)
+    logs = json.loads((fixtures / "logs.json").read_text())
+    tests = [f"tests/test_example.py::test_total[{value}]" for value in ("a*b", "a?b", "a%2Ab")]
+    logs["1041"] = "\n".join(f"FAILED {test} - AssertionError" for test in tests)
+    logs["1061"] = f"FAILED {tests[0]} - AssertionError"
+    (fixtures / "logs.json").write_text(json.dumps(logs))
+    _github(workflow, fixtures)
+    quality = _measure(workflow)["last_days"]["quality"]
+    prefix = "CI: tests (1 of 2): test tests/test_example.py::test_total"
+    assert quality["flaky"] == {
+        f"{prefix}[a%2Ab]": 2,
+        f"{prefix}[a%3Fb]": 1,
+        f"{prefix}[a%252Ab]": 1,
+    }
+    assert quality["flaky_repeats"][f"{prefix}[a%2Ab]"] == [
+        {"run": 104, "attempt": 1, "job": 1041},
+        {"run": 106, "attempt": 1, "job": 1061},
+    ]

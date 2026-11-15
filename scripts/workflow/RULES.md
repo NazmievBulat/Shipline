@@ -739,10 +739,13 @@ The metrics report's quality table groups flaky repeats by workflow, check and f
 The "Flaky repeats in N days" section prints one line per group, with its count and each run,
 attempt and job id; different failing tests have separate lines. It reads the failed jobs of
 earlier attempts when a run passes on rerun, using only their failed logs and failure
-annotations. When no test is named, the line names the failed step; unavailable logs say
+annotations. When no test is named, the line names the step printed by the failed log;
+unavailable logs say
 "log unreadable", and a missing step name says "failing step unnamed". Extracted names from
 readable diagnostics are cached with completed jobs for eight days. The flaky-test detector
 uses these groups and the existing repeat threshold, with the same run evidence in its finding.
+Diagnostic names preserve their identity by percent-escaping unsafe characters and literal
+percent signs; distinct test ids therefore remain distinct groups.
 
 1. It is read-only. It opens no ticket and no pull request, commits and pushes nothing,
    changes no label, comments nowhere, starts, stops and types into no session, and asks the

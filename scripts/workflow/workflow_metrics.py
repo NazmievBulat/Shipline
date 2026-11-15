@@ -136,8 +136,8 @@ HUNT_HEADER = re.compile(
     r"\A# Hunt [^\n]+\n\nArea: [^\n]+\n\n## Settings\n\n```json\n.*?\n```\n\n",
     re.DOTALL,
 )
-# What of a name read from GitHub may reach a finding, and so the orchestrator's message: words
-# and plain marks, no quotes, backticks, angle brackets or new lines, at most this long.
+# Ordinary GitHub labels reach findings as words and plain marks, at most this long.
+# Diagnostic identities use the same character set with reversible escaping below.
 NOT_PLAIN = re.compile(r"[^\w .,:;()\[\]/+!#&=%-]")
 PLAIN_LENGTH = 80
 
@@ -548,6 +548,15 @@ def _own_run(run: dict[str, Any]) -> bool:
     return run.get("path") in paths and head.casefold() == REPOSITORY.casefold()
 
 
+def _diagnostic_name(text: str) -> str:
+    """Reversible plain-character escaping: distinct diagnostic names stay distinct."""
+    return "".join(
+        "".join(f"%{byte:02X}" for byte in char.encode("utf-8"))
+        if char == "%" or NOT_PLAIN.fullmatch(char) else char
+        for char in text
+    )
+
+
 def _failed_names(run: int, attempt: int, job: dict[str, Any]) -> dict[str, Any]:
     """Read only this failed job's diagnostics; keep extracted names, never raw logs."""
     from check_repair import _COLOUR, _TESTS
@@ -591,16 +600,13 @@ def _failed_names(run: int, attempt: int, job: dict[str, Any]) -> dict[str, Any]
         tests = tests_in(diagnostics)
     # All failures, including multiple tests in the same job. A summary often repeats a
     # test already printed above it, so a test counts once per failed job attempt.
-    names = [f"test {NOT_PLAIN.sub('?', name)}" for name in tests]
+    names = [f"test {_diagnostic_name(name)}" for name in tests]
     if not names:
         steps = sorted({
             fields[1] for line in log_text.splitlines()
             if len(fields := line.split("\t", 2)) == 3 and fields[1].strip()
-        }) or sorted({
-            step["name"] for step in job.get("steps", [])
-            if step.get("conclusion") == "failure"
         })
-        names = [f"step {plain(step)}" for step in steps] or ["failing step unnamed"]
+        names = [f"step {_diagnostic_name(step)}" for step in steps] or ["failing step unnamed"]
     found = {"names": names, "log_unreadable": not readable}
     # A temporary read failure may recover on the next report. Completed readable logs
     # and annotation test names are immutable and share the jobs' eight-day cache.
@@ -879,7 +885,7 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
     for run in filter(_own_run, completed):
         for job in run.get("earlier_jobs", []):
             for failure in job["failures"]:
-                name = f"{plain(run['name'])}: {plain(job['name'])}: {failure}"
+                name = f"{_diagnostic_name(run['name'])}: {_diagnostic_name(job['name'])}: {failure}"
                 repeat = {"run": run["id"], "attempt": job["attempt"], "job": job["id"]}
                 if job["log_unreadable"]:
                     repeat["log_unreadable"] = True
