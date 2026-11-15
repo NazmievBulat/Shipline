@@ -1,6 +1,7 @@
 """`workflow-metrics` computes the daily numbers and fires the fixed gap detectors."""
 
 import json
+import shutil
 import os
 import subprocess
 import time
@@ -38,7 +39,18 @@ if arguments[:2] == ["api", "graphql"]:
     pages = json.loads((fixtures / "pulls.json").read_text())
     print(json.dumps(pages[1] if after == ["after=page-2"] else pages[0]))
     sys.exit(0)
+if arguments[:2] == ["run", "view"]:
+    job = arguments[arguments.index("--job") + 1]
+    logs = json.loads((fixtures / "logs.json").read_text())
+    if logs.get(job) is None:
+        print("log unavailable", file=sys.stderr)
+        sys.exit(1)
+    print(logs[job])
+    sys.exit(0)
 path = arguments[-1]
+if "/annotations?" in path:
+    print("[]")
+    sys.exit(0)
 jobs = json.loads((fixtures / "jobs.json").read_text())
 runs = "repos/example-org/example-app/actions/runs"
 if found := re.fullmatch(runs + r"/(\\d+)/attempts/(\\d+)/jobs\\?per_page=100", path):
@@ -59,8 +71,8 @@ else:
 """
 
 
-def _github(workflow: Workflow) -> None:
-    workflow.fake("gh", _FAKE_GH.replace("@FIXTURES@", str(FIXTURES)))
+def _github(workflow: Workflow, fixtures: Path = FIXTURES) -> None:
+    workflow.fake("gh", _FAKE_GH.replace("@FIXTURES@", str(fixtures)))
 
 
 def _note(path: Path, value: dict[str, Any], at: float) -> None:
@@ -222,7 +234,7 @@ def test_the_fixtures_give_the_expected_table_and_fire_only_their_detectors(
     quality = week["quality"]
     assert quality["send_back_rounds_per_review"] == pytest.approx(1 / 3)
     assert quality["failed_scratch_runs"] == 1
-    assert quality["flaky"] == {"CI: tests (1 of 2)": 1}
+    assert quality["flaky"] == {"CI: tests (1 of 2): test tests/test_example.py::test_one": 1}
     assert quality["lost_checks"] == {"CI result": 3}
     assert quality["weaker_tests_items"] == 2
     assert quality["hunt_findings"] == 3
@@ -993,3 +1005,55 @@ def test_main_reports_are_read_as_the_gate_writes_them(workflow: Workflow) -> No
         )
         == "0.2"
     )
+
+
+@pytest.mark.parametrize("other", ["test_one", "test_two"])
+def test_flaky_repeats_group_by_test_with_run_evidence(workflow: Workflow, other: str) -> None:
+    fixtures = _flaky_fixtures(workflow, other=other)
+    _github(workflow, fixtures)
+    quality = _measure(workflow)["last_days"]["quality"]
+    first = "CI: tests (1 of 2): test tests/test_example.py::test_one"
+    second = f"CI: tests (1 of 2): test tests/test_example.py::{other}"
+    assert quality["flaky"] == ({first: 2} if first == second else {first: 1, second: 1})
+    assert quality["flaky_repeats"][first][0] == {"run": 104, "attempt": 1, "job": 1041}
+    report = workflow.run_script("workflow-metrics", env=AT)
+    assert report.returncode == 0, report.stderr
+    assert f"{first}: {2 if first == second else 1} repeat" in report.stdout
+    assert "run 104 attempt 1" in report.stdout and "run 106 attempt 1" in report.stdout
+    # Completed diagnostics are cached; a second report does not fetch them again.
+    calls = workflow.calls("gh")
+    assert sum("--log-failed" in call for call in calls) == 2
+
+
+def _flaky_fixtures(workflow: Workflow, *, other: str = "test_one") -> Path:
+    fixtures = workflow.state / "metrics-fixtures"
+    shutil.copytree(FIXTURES, fixtures)
+    runs = json.loads((fixtures / "runs.json").read_text())
+    next(run for run in runs if run["id"] == 106)["run_attempt"] = 2
+    (fixtures / "runs.json").write_text(json.dumps(runs))
+    jobs = json.loads((fixtures / "jobs.json").read_text())
+    jobs["106-2"] = jobs["106-1"]
+    jobs["106-1"] = [{**jobs["104-1"][0], "id": 1061}]
+    (fixtures / "jobs.json").write_text(json.dumps(jobs))
+    logs = json.loads((fixtures / "logs.json").read_text())
+    logs["1061"] = f"tests (1 of 2)\tTests\t2026-10-23T20:08:00Z FAILED tests/test_example.py::{other} - AssertionError"
+    (fixtures / "logs.json").write_text(json.dumps(logs))
+    return fixtures
+
+
+@pytest.mark.parametrize("readable", [True, False])
+def test_flaky_repeat_names_the_step_or_unreadable_log(workflow: Workflow, readable: bool) -> None:
+    fixtures = _flaky_fixtures(workflow)
+    logs = json.loads((fixtures / "logs.json").read_text())
+    logs["1041"] = "tests (1 of 2)\tInstall dependencies\t2026-10-23T13:41:00Z failed" if readable else None
+    (fixtures / "logs.json").write_text(json.dumps(logs))
+    jobs = json.loads((fixtures / "jobs.json").read_text())
+    jobs["104-1"][0]["steps"] = [{"name": "Install dependencies", "conclusion": "failure"}]
+    (fixtures / "jobs.json").write_text(json.dumps(jobs))
+    _github(workflow, fixtures)
+    quality = _measure(workflow)["last_days"]["quality"]
+    name = "CI: tests (1 of 2): step Install dependencies"
+    if not readable:
+        name += " (log unreadable)"
+    assert quality["flaky"][name] == 1
+    assert quality["flaky_repeats"][name] == [{"run": 104, "attempt": 1, "job": 1041}]

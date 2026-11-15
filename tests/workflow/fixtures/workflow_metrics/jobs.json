@@ -60,7 +60,8 @@
    "status": "completed",
    "conclusion": "failure",
    "started_at": "2026-10-23T13:40:00Z",
-   "completed_at": "2026-10-23T13:46:00Z"
+   "completed_at": "2026-10-23T13:46:00Z",
+   "id": 1041
   },
   {
    "name": "tests (2 of 2)",
