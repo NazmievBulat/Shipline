@@ -1433,13 +1433,15 @@ def test_an_owner_only_line_rings_once_and_keeps_the_asking_note(
     ],
 )
 @pytest.mark.parametrize("bridge", [False, True])
-def test_a_draft_workers_progress_report_is_idle_without_an_owner_question(
+def test_draft_progress_is_silent_and_keeps_an_unanswered_bridge_question(
     session: Workflow, report: str, bridge: bool
 ) -> None:
     if bridge:
         (session.notes(7) / "ticket-7.codex").touch()
-    # Even an automatic continuation must drop a previous question when it now reports.
+    # An ordinary worker's progress replaces its question. A bridge cannot answer
+    # an explicit question through its own progress, including an automatic continuation.
     session.notify(_stop('Reply "1"'))
+    asked = _asking(session).read_text()
     session.notify({**_PROMPT, "source": "background_task_output"})
     before = len(session.pushes())
 
@@ -1447,6 +1449,9 @@ def test_a_draft_workers_progress_report_is_idle_without_an_owner_question(
 
     assert len(session.pushes()) == before
     assert _idle(session).exists()
+    if bridge:
+        assert _asking(session).read_text() == asked
+        session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "1"})
     assert not _asking(session).exists()
 
 
