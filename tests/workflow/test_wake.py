@@ -1542,6 +1542,38 @@ def test_a_codex_bridge_whose_codex_asks_is_named(day: Workflow) -> None:
     assert "\nasking the owner: ticket-7 (4 min)\n" in prompt
 
 
+def test_an_unrelated_bridge_prompt_keeps_the_question_in_wake(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 to approve.\nReply 2 to revise.", _at(10))
+    asked = (notes / "ticket-7.asking").read_text()
+
+    for minute, prompt in [(1, "What is the status?"), (2, "Show example-app's checks.")]:
+        day.notify({"hook_event_name": "UserPromptSubmit", "prompt": prompt}, session="ticket-7")
+        assert _wake(day, "ticket-7", at=_at(10, minute)).returncode == 0
+        assert f"\nasking the owner: ticket-7 ({minute} min)\n" in day.sent()[-1]
+        assert (notes / "ticket-7.asking").read_text() == asked
+    day.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Please use 2."}, session="ticket-7")
+    assert _wake(day, "ticket-7", at=_at(10, 4)).returncode == 0
+    assert "asking the owner:" not in day.sent()[-1]
+    assert not (notes / "ticket-7.asking").exists()
+
+
+def test_a_changed_pull_request_head_clears_the_bridge_question(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(10))
+    # The worktree has not moved: the question follows the pull request's head.
+    day.push_from_elsewhere(7)
+
+    assert _wake(day, "ticket-7", at=_at(10, 4)).returncode == 0
+
+    assert "asking the owner:" not in day.sent()[-1]
+    assert not (notes / "ticket-7.asking").exists()
+
+
 def test_a_question_of_a_session_that_ended_brings_no_check_in_by_day(day: Workflow) -> None:
     _stop(day, "review-7", "Reply 1 or 2", _at(10, 0))
     (day.state / "tmux" / "review-7").unlink()

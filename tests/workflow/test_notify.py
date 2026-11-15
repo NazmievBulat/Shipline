@@ -1095,6 +1095,63 @@ def test_a_codex_bridge_notes_the_question_codex_asked(session: Workflow) -> Non
     assert _asked_at(session) == "1792000000"
 
 
+@pytest.mark.parametrize("prompt", ["What about example-app?", "Use port 1200.", "ticket-1 is ready."])
+def test_an_unrelated_bridge_prompt_keeps_the_open_question(
+    session: Workflow, prompt: str,
+) -> None:
+    notes = session.notes(7)
+    (notes / "ticket-7.codex").touch()
+    session.notify(_stop("Approve the summary?\nReply 1 to approve.\nReply 2 to revise."), env=_AT_NINE)
+    asked = _asking(session).read_text()
+    pushed = (notes / "ticket-7.pushed").read_text()
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": prompt})
+
+    assert _asking(session).read_text() == asked
+    assert (notes / "ticket-7.pushed").read_text() == pushed
+    assert (notes / "ticket-7.owner-reply").read_text() == prompt
+    # A new progress turn about that prompt still has not answered the old question.
+    session.notify(_stop("The status is available."), env=_AT_TEN)
+    assert _asking(session).read_text() == asked
+
+
+@pytest.mark.parametrize("prompt", ["1", "Please use 2 for this.", "I choose 1."])
+def test_a_bridge_prompt_with_a_reply_word_clears_the_question(
+    session: Workflow, prompt: str,
+) -> None:
+    (session.notes(7) / "ticket-7.codex").touch()
+    session.notify(_stop("Approve the summary?\nReply **1** or **2**."))
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": prompt})
+
+    assert not _asking(session).exists()
+    assert not (session.notes(7) / "ticket-7.question").exists()
+
+
+@pytest.mark.parametrize("prompt,answered", [
+    ("Please MERGE IT now.", True), ("Keep it in draft.", False),
+    ("refresh", False), ("leave draft", True),
+])
+def test_a_bridge_question_matches_quoted_reply_phrases(
+    session: Workflow, prompt: str, answered: bool,
+) -> None:
+    (session.notes(7) / "ticket-7.codex").touch()
+    session.notify(_stop('Which next step?\nReply "merge it" or "leave draft".'))
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": prompt})
+
+    assert _asking(session).exists() is not answered
+
+
+def test_a_bridge_question_without_reply_words_accepts_any_owner_prompt(session: Workflow) -> None:
+    (session.notes(7) / "ticket-7.codex").touch()
+    session.notify(_stop("Which summary do you prefer?"))
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Use the shorter summary."})
+
+    assert not _asking(session).exists()
+
+
 def test_a_session_stopped_on_the_usage_limit_notes_no_question(session: Workflow) -> None:
     session.usage(100, "2026-10-14T05:10:00+00:00")
 
