@@ -12,21 +12,30 @@ import { setTimeout as delay } from "node:timers/promises"
 function replyWords(message) {
   const words = new Set()
   const token = /^[\s*_]*(?:"([^"\n]+)"|'([^'\n]+)'|“([^”\n]+)”|‘([^’\n]+)’|`([^`\n]+)`|([\p{L}\p{N}][\p{L}\p{N}_-]*))/u
-  for (const request of message.matchAll(/\b(reply|type|write|answer|say|choose)\s+(?:with\s+)?/gi)) {
+  // Use the same request boundaries as asks_owner: narrative mentions such as
+  // "Can I say 3 things?" do not tell the owner how to answer.
+  const requestStart = /(?:^|[.!?:;,/\n]\s*|\splease\s+)[\s*_>"'“‘-]*(?:please\s+)?(reply|type|write|answer|say|choose)\s+(?:with\s+)?/gi
+  for (const request of message.matchAll(requestStart)) {
+    let verb = request[1].toLowerCase()
     let rest = message.slice(request.index + request[0].length).split("\n")[0]
     while (true) {
       const match = rest.match(token)
       if (!match) break
       const word = match.slice(1).find((value) => value !== undefined)
-      // Progress instructions such as "write tests" supply no explicit reply word.
-      if (match[6] && !/^\d+$/.test(word) && request[1].toLowerCase() !== "reply") break
+      // As in asks_owner, type/write need quotes; only reply and numeric choose
+      // supply bare reply words. "Write 3 tests" supplies no answer instruction.
+      if (match[6] && verb !== "reply" && !(verb === "choose" && /^\d+$/.test(word))) break
       if (word.length <= 60) words.add(word)
       rest = rest.slice(match[0].length).replace(/^[*_]+/, "")
       rest = rest.replace(/^\s*\(recommended\)/i, "")
       const separator = rest.match(/^\s*(?:(?:,\s*)?(?:or|and)\b|[,/])\s*/i)
       if (!separator) break
       rest = rest.slice(separator[0].length)
-      if (/^(?:reply|type|write|answer|say|choose)\b/i.test(rest)) break
+      const nextRequest = rest.match(/^(reply|type|write|answer|say|choose)\s+(?:with\s+)?/i)
+      if (nextRequest) {
+        verb = nextRequest[1].toLowerCase()
+        rest = rest.slice(nextRequest[0].length)
+      }
     }
   }
   return [...words]

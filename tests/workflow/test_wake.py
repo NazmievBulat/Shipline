@@ -1664,7 +1664,7 @@ def test_head_cleanup_leaves_a_distinct_new_native_question_for_recovery(day: Wo
     day.push_from_elsewhere(7)
     message = "Approve the next summary?\nReply 3 or 4."
     (notes / "ticket-7.codex-turn.json").write_text(json.dumps({"last-assistant-message": message}))
-    _stop(day, "ticket-7", message, _at(10, 1))
+    # The native callback arrived, but the bridge has not relayed its Stop yet.
 
     assert _wake(day, "ticket-7", at=_at(10, 2)).returncode == 0
     assert not (notes / "ticket-7.asking").exists()

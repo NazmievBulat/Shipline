@@ -512,13 +512,14 @@ on_stop_locked() {
   rm -f "$job_wait"
   note "$idle" ""
   if [[ $open_bridge_question == true ]]; then
-    # A repeat of the question can retry a failed phone push; unrelated progress cannot
-    # replace either the original question or its head baseline.
+    # A repeat can retry a failed push; progress cannot answer the original question.
+    # A genuine new question replaces it even after an answer without a reply word.
     sum=$(cksum <<<"$message")
     if [[ ${asked#* } == "${sum%% *}" ]]; then
       publish_question "$message" "${stop_saved_at:-${WORKFLOW_NOW:-$(date +%s)}}" "$asked"
+      return 0
     fi
-    return 0
+    question_in_stop "$message" || return 0
   fi
   # A busy provider is retried by the tick, without a quota reset or an owner question.
   if [[ -e $notes/$name.codex || ${1:-} == codex ||
@@ -548,18 +549,27 @@ on_stop_locked() {
 publish_question() {
   local message=$1 at=$2 asked=${3:-} known=${4:-} sum delivery_asked words="" metadata=""
   stop_is_current || return 0
+  sum=$(cksum <<<"$message")
+  sum=${sum%% *}
   # Parse before publishing the asking note: a prompt must never see a new question
   # waiting for its reply metadata. Delivery retries retain the original head baseline.
-  if [[ -e $notes/$name.codex ]] && ! bridge_question_open; then
+  if [[ -e $notes/$name.codex ]] &&
+      { ! bridge_question_open || [[ ${asked#* } != "$sum" ]]; }; then
     words=$(node "$here/codex-bridge.mjs" --reply-words <<<"$message") || words='[]'
+    # Workers captured the head while checking the draft state. Review bridges
+    # need the same baseline when publishing their own new question.
+    if [[ $name != ticket-* ]]; then
+      local snapshot draft
+      snapshot=$(cd "$main" && timeout "$ANSWER_SECONDS" gh pr view "$number" \
+        --json isDraft,headRefOid --jq '[.isDraft, .headRefOid] | @tsv')
+      read -r draft bridge_head <<<"$snapshot"
+    fi
   fi
   # Even a failed push leaves a reviewer blocked; automatic check nudges answer nothing.
   [[ $name != review-* ]] || note "$notes/$name.owner-blocked" ""
   # The same words after a turn of the session's own (its job ended) are the same question,
   # asked since the first time; other words are a new one. A Codex bridge counts too: its stop
   # shows Codex's last message.
-  sum=$(cksum <<<"$message")
-  sum=${sum%% *}
   if [[ -n $asked && ${asked#* } == "$sum" ]]; then
     delivery_asked=$asked
   else

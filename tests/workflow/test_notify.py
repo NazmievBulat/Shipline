@@ -1130,8 +1130,11 @@ def test_a_bridge_prompt_with_a_reply_word_clears_the_question(
 
 @pytest.mark.parametrize("name", ["ticket-7", "review-7"])
 @pytest.mark.parametrize("draft", [True, False])
+@pytest.mark.parametrize("reply_line,words", [
+    ('\nReply "alpha" or "beta".', ["alpha", "beta"]), ("", []),
+])
 def test_a_new_bridge_question_replaces_an_unanswered_explicit_question(
-    session: Workflow, name: str, draft: bool,
+    session: Workflow, name: str, draft: bool, reply_line: str, words: list[str],
 ) -> None:
     notes = session.notes(7)
     (notes / f"{name}.codex").touch()
@@ -1141,7 +1144,7 @@ def test_a_new_bridge_question_replaces_an_unanswered_explicit_question(
     session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "yes, approve it"},
                    session=name)
     head = session.push_from_elsewhere(7)
-    message = 'Which name?\nReply "alpha" or "beta".'
+    message = f"Which name?{reply_line}"
 
     done = session.notify(_stop(message), session=name, env=_AT_TEN)
 
@@ -1149,7 +1152,7 @@ def test_a_new_bridge_question_replaces_an_unanswered_explicit_question(
     assert _asking(session, name).read_text().split()[0] == _AT_TEN["WORKFLOW_NOW"]
     metadata = json.loads((notes / f"{name}.question").read_text())
     assert metadata["asked"] == _asking(session, name).read_text().strip()
-    assert metadata["reply_words"] == ["alpha", "beta"]
+    assert metadata["reply_words"] == words
     assert metadata["head"] == head
     assert len(session.pushes()) == 2
     assert session.pushes()[-1].message == message
@@ -1196,7 +1199,7 @@ def test_a_bridge_question_matches_quoted_reply_phrases(
 @pytest.mark.parametrize("message", [
     "Which summary do you prefer?", "Please write tests first. Which summary do you prefer?",
     "Can I say 3 things?", "Can I write 3 tests?", "Can I choose 3 names?",
-    'Can I say "alpha" in the summary?',
+    'Can I say "alpha" in the summary?', "Write 3 tests first. Which summary do you prefer?",
 ])
 def test_a_bridge_question_without_reply_words_accepts_any_owner_prompt(
     session: Workflow, message: str,
@@ -1210,8 +1213,9 @@ def test_a_bridge_question_without_reply_words_accepts_any_owner_prompt(
 
 
 @pytest.mark.parametrize("reply_line", [
-    "Reply 1 / Reply 2", "Reply `1` or `2`.", "Reply 1 or 2.",
+    "Reply 1 / Reply 2", "Reply 1 or Reply 2.", "Reply `1` or `2`.", "Reply 1 or 2.",
     "Reply **1** (recommended) or **2**.",
+    "Choose 1 or 2.", 'Type "1" or "2".', 'Write "1" or "2".',
 ])
 def test_bridge_reply_words_do_not_include_the_reply_instruction(
     session: Workflow, reply_line: str,
