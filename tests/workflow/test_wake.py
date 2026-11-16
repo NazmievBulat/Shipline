@@ -1564,6 +1564,23 @@ def test_an_unrelated_bridge_prompt_keeps_the_question_in_wake(day: Workflow) ->
     assert not (notes / "ticket-7.asking").exists()
 
 
+def test_a_replacement_bridge_question_is_named_with_its_own_age(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(9))
+    day.notify({"hook_event_name": "UserPromptSubmit", "prompt": "yes, approve it"},
+               session="ticket-7")
+    _stop(day, "ticket-7", 'Which name?\nReply "alpha" or "beta".', _at(10))
+
+    done = _wake(day, "ticket-7", at=_at(10, 4))
+
+    assert done.returncode == 0, done.stderr
+    assert "\nasking the owner: ticket-7 (4 min)\n" in day.sent()[-1]
+    assert "asking the owner: ticket-7 (64 min)" not in day.sent()[-1]
+    assert "asking the owner: ticket-7 (4 min)" in day.wake_log.read_text()
+
+
 def test_the_bridge_pane_keeps_asking_through_unrelated_prompts(day: Workflow) -> None:
     pane = (Path(__file__).parent / "fixtures/bridge_asking/pane.txt").read_text()
     turns = pane.split("❯ ")[1:]

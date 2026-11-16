@@ -1128,6 +1128,56 @@ def test_a_bridge_prompt_with_a_reply_word_clears_the_question(
     assert not (session.notes(7) / "ticket-7.question").exists()
 
 
+@pytest.mark.parametrize("name", ["ticket-7", "review-7"])
+@pytest.mark.parametrize("draft", [True, False])
+def test_a_new_bridge_question_replaces_an_unanswered_explicit_question(
+    session: Workflow, name: str, draft: bool,
+) -> None:
+    notes = session.notes(7)
+    (notes / f"{name}.codex").touch()
+    session.set_draft(7, draft=draft)
+    session.notify(_stop("Approve the summary?\nReply 1 to approve.\nReply 2 to revise."),
+                   session=name, env=_AT_NINE)
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "yes, approve it"},
+                   session=name)
+    head = session.push_from_elsewhere(7)
+    message = 'Which name?\nReply "alpha" or "beta".'
+
+    done = session.notify(_stop(message), session=name, env=_AT_TEN)
+
+    assert done.returncode == 0, done.stderr
+    assert _asking(session, name).read_text().split()[0] == _AT_TEN["WORKFLOW_NOW"]
+    metadata = json.loads((notes / f"{name}.question").read_text())
+    assert metadata["asked"] == _asking(session, name).read_text().strip()
+    assert metadata["reply_words"] == ["alpha", "beta"]
+    assert metadata["head"] == head
+    assert len(session.pushes()) == 2
+    assert session.pushes()[-1].message == message
+    assert (notes / f"{name}.pushed").read_text().strip() == message
+    # Delivery retries retain the new identity and do not ring again.
+    session.notify(_stop(message), session=name, env=_AT_NINE)
+    assert len(session.pushes()) == 2
+    assert json.loads((notes / f"{name}.question").read_text()) == metadata
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "alpha"}, session=name)
+    assert not _asking(session, name).exists()
+    assert not (notes / f"{name}.question").exists()
+
+
+def test_a_ready_bridge_progress_turn_keeps_the_open_question(session: Workflow) -> None:
+    notes = session.notes(7)
+    (notes / "ticket-7.codex").touch()
+    session.set_draft(7, draft=False)
+    session.notify(_stop("Approve the summary?\nReply 1 or 2."), env=_AT_NINE)
+    asked = _asking(session).read_text()
+    metadata = (notes / "ticket-7.question").read_text()
+
+    session.notify(_stop("The status is available."), env=_AT_TEN)
+
+    assert _asking(session).read_text() == asked
+    assert (notes / "ticket-7.question").read_text() == metadata
+    assert len(session.pushes()) == 1
+
+
 @pytest.mark.parametrize("prompt,answered", [
     ("Please MERGE IT now.", True), ("Keep it in draft.", False),
     ("refresh", False), ("leave draft", True),
@@ -1143,7 +1193,11 @@ def test_a_bridge_question_matches_quoted_reply_phrases(
     assert _asking(session).exists() is not answered
 
 
-@pytest.mark.parametrize("message", ["Which summary do you prefer?", "Please write tests first. Which summary do you prefer?"])
+@pytest.mark.parametrize("message", [
+    "Which summary do you prefer?", "Please write tests first. Which summary do you prefer?",
+    "Can I say 3 things?", "Can I write 3 tests?", "Can I choose 3 names?",
+    'Can I say "alpha" in the summary?',
+])
 def test_a_bridge_question_without_reply_words_accepts_any_owner_prompt(
     session: Workflow, message: str,
 ) -> None:
