@@ -17,6 +17,7 @@ function replyWords(message) {
   const requestStart = /(?:^|[.!?:;,/\n]\s*|\splease\s+)[\s*_>"'“‘-]*(?:please\s+)?(reply|type|write|answer|say|choose)\s+(?:with\s+)?/gi
   for (const request of message.matchAll(requestStart)) {
     let verb = request[1].toLowerCase()
+    let first = true
     let rest = message.slice(request.index + request[0].length).split("\n")[0]
     while (true) {
       const match = rest.match(token)
@@ -27,11 +28,15 @@ function replyWords(message) {
       if (match[6] && verb !== "reply" && !(verb === "choose" && /^\d+$/.test(word))) break
       let tail = rest.slice(match[0].length).replace(/^[*_]+/, "")
       tail = tail.replace(/^\s*\(recommended\)/i, "")
-      // Bare choices end at a separator or an explanation of that choice.
+      // An initial bare choice ends at a separator or an explanation of it.
       // Descriptions such as "reply with your choice" name no literal answer.
-      if (match[6] && /^\s+[\p{L}\p{N}_-]/u.test(tail) &&
+      // Later alternatives retain the existing "refresh or leave draft" format.
+      if (first && match[6] && /^\s+[\p{L}\p{N}_-]/u.test(tail) &&
           !/^\s+(?:or|and|to|for|if)\b/i.test(tail)) break
-      if (word.length <= 60) words.add(word)
+      if (word.length <= 60) {
+        words.add(word)
+        first = false
+      }
       rest = tail
       const separator = rest.match(/^\s*(?:(?:,\s*)?(?:or|and)\b|[,/])\s*/i)
       if (!separator) break
@@ -39,6 +44,7 @@ function replyWords(message) {
       const nextRequest = rest.match(/^(reply|type|write|answer|say|choose)\s+(?:with\s+)?/i)
       if (nextRequest) {
         verb = nextRequest[1].toLowerCase()
+        first = true
         rest = rest.slice(nextRequest[0].length)
       }
     }

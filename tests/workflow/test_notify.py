@@ -1217,13 +1217,19 @@ def test_a_bridge_question_without_reply_words_accepts_any_owner_prompt(
     assert not _asking(session).exists()
 
 
-def test_bare_bridge_reply_choices_still_accept_the_named_word(session: Workflow) -> None:
+@pytest.mark.parametrize("reply_line,words,prompt", [
+    ("Reply refresh or wait.", ["refresh", "wait"], "Please refresh."),
+    ("Reply refresh or leave draft.", ["refresh", "leave"], "Please leave draft."),
+])
+def test_bare_bridge_reply_choices_still_accept_the_named_word(
+    session: Workflow, reply_line: str, words: list[str], prompt: str,
+) -> None:
     notes = session.notes(7)
     (notes / "ticket-7.codex").touch()
-    session.notify(_stop("Which next step?\nReply refresh or wait."))
-    assert json.loads((notes / "ticket-7.question").read_text())["reply_words"] == ["refresh", "wait"]
+    session.notify(_stop(f"Which next step?\n{reply_line}"))
+    assert json.loads((notes / "ticket-7.question").read_text())["reply_words"] == words
 
-    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Please refresh."})
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": prompt})
 
     assert not _asking(session).exists()
 
