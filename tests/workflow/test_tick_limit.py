@@ -271,6 +271,38 @@ def test_a_session_stopped_on_the_limit_is_squeezed_like_an_idle_one(
     assert (group / "memory.reclaim").read_text() == ""
 
 
+def test_a_busy_reading_after_limit_resend_starts_a_new_squeeze_stretch(
+    workflow: Workflow,
+) -> None:
+    workflow.add_worktree(7)
+    group = workflow.running("ticket-7", held=400 * _MB)
+    limited = _stopped("4:10pm (America/New_York)")
+    workflow.screen(limited, "ticket-7")
+    (workflow.state / "screen-after-enter-ticket-7").write_text("● Working.\n" + _BOX)
+
+    first = workflow.run_script("tick", env=_at(16, 10))
+
+    assert first.returncode == 0, first.stderr
+    assert (group / "memory.reclaim").read_text() == str(400 * _MB)
+    assert "ticket-7 was sent its instruction again" in first.stdout
+    # The tick's screen-history pass observed busy after its earlier squeeze pass.
+    seen = workflow.repo / ".local/workflow/ticket-7.screen-seen"
+    assert seen.read_text().split()[0].endswith("/busy")
+
+    # The session reaches the same limit screen before the next tick observes it.
+    workflow.screen(limited, "ticket-7")
+    (group / "memory.current").write_text(str(320 * _MB))
+    (group / "memory.reclaim").write_text("")
+    second = workflow.run_script("tick", env=_at(16, 13))
+    assert second.returncode == 0, second.stderr
+    assert (group / "memory.reclaim").read_text() == str(320 * _MB)
+
+    (group / "memory.reclaim").write_text("")
+    third = workflow.run_script("tick", env=_at(16, 16))
+    assert third.returncode == 0, third.stderr
+    assert (group / "memory.reclaim").read_text() == ""
+
+
 def test_a_worker_stopped_on_the_limit_after_it_said_worker_finished_is_not_stopped(
     workflow: Workflow,
 ) -> None:
