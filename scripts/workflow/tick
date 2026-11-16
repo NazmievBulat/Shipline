@@ -15,7 +15,7 @@
 #   2. `session cleanup`: the worktrees of merged pull requests and of ended hunts and analysts
 #      are removed; an ended analysis is noted for the wake's next check-in first.
 #   3. A session that is idle or stopped on the usage limit and holds more than 300 MB is
-#      squeezed.
+#      squeezed once per idle stretch.
 #   4. A worker, independent reviewer or audit that the usage limit stopped is sent its instruction again when
 #      the time the limit resets has passed, once for each reset.
 #      A Codex worker, conflict reviewer or hunter stopped on model capacity is told to
@@ -108,7 +108,7 @@
 # shadow tick out, and never the real one, nor a decision of `decide`.
 set -uo pipefail
 
-# A session that holds more than this while idle is squeezed.
+# A session that holds more than this while idle is squeezed once per idle stretch.
 SQUEEZE_ABOVE_MB=300
 # The usage limit counts over 5 hours, so the time on a limit line is at most this far ahead.
 LIMIT_WINDOW_SECONDS=$((5 * 3600))
@@ -1053,14 +1053,48 @@ question_duties() {
   fi
 }
 
+# A sum of what the screen shows above the box. Left out is what changes while nothing happens:
+# the box and the status line under it, the spinner's line (its mark, word and clock), and any
+# elapsed time printed elsewhere ("Running… (3m 2s)").
+screen_sum() {
+  local screen top sum
+  screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 1
+  top=$(LC_ALL=C awk '/^─/ { above = last; last = NR }
+    END { print above ? above : (last ? last : NR + 1) }' <<<"$screen")
+  sum=$(LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" |
+    { LC_ALL=C grep -vE '^[[:space:]]*(·|✢|✳|✶|✻|✽|\*)[[:space:]]+[^[:space:]]+…' || true; } |
+    LC_ALL=C sed -E 's/[0-9]+(\.[0-9]+)?(ms|s|m|h)\b//g' | cksum) || return 1
+  echo "${sum%% *}"
+}
+
 local_duties() {
+  local squeeze_note squeeze_sum
   local_done=1
   running=$(session list) || tick_failed
   question_duties
 
   while read -r name state held _; do
-    if [[ $state =~ ^(idle|limit)$ && $held =~ ^[0-9]+$ ]] && ((held > SQUEEZE_ABOVE_MB)); then
-      session squeeze "$name" || tick_failed
+    session_current "$name" || continue
+    squeeze_note=$main/$SHIPLINE_STATE_FOLDER/$name.squeezed
+    # A busy reading ends the idle stretch even if the screen did not change.
+    if [[ $state == busy ]]; then
+      ((shadow)) || rm -f "$squeeze_note" || tick_failed
+      continue
+    fi
+    [[ $state =~ ^(idle|limit)$ ]] || continue
+    squeeze_sum=$(screen_sum "$name") || continue
+    [[ ! -r $squeeze_note || $(<"$squeeze_note") != "$squeeze_sum" ]] || continue
+    # Observe screen changes even below the threshold: memory can refill later, after
+    # the screen has returned to what it showed at the previous squeeze.
+    ((shadow)) || rm -f "$squeeze_note" || { tick_failed; continue; }
+    if [[ $held =~ ^[0-9]+$ ]] && ((held > SQUEEZE_ABOVE_MB)); then
+      if session squeeze "$name"; then
+        # Only a successful reclaim consumes this stretch. Keep its receipt across ticks;
+        # a shadow squeeze leaves the real receipt alone, as other shadow notes do.
+        (umask 077; write_session_note "$name" "$squeeze_note" "$squeeze_sum") || tick_failed
+      else
+        tick_failed
+      fi
     fi
   done <<<"$running"
 
@@ -1532,20 +1566,6 @@ fi
 # When a note was last written, in seconds.
 written_at() {
   stat -c %Y "$1" 2>/dev/null 9>&-
-}
-
-# A sum of what the screen shows above the box. Left out is what changes while nothing happens:
-# the box and the status line under it, the spinner's line (its mark, word and clock), and any
-# elapsed time printed elsewhere ("Running… (3m 2s)").
-screen_sum() {
-  local screen top sum
-  screen=$(tmux -L "$1" capture-pane -p -t "=$1:" 2>/dev/null 9>&-) || return 1
-  top=$(LC_ALL=C awk '/^─/ { above = last; last = NR }
-    END { print above ? above : (last ? last : NR + 1) }' <<<"$screen")
-  sum=$(LC_ALL=C sed -n "1,$((top - 1))p" <<<"$screen" |
-    { LC_ALL=C grep -vE '^[[:space:]]*(·|✢|✳|✶|✻|✽|\*)[[:space:]]+[^[:space:]]+…' || true; } |
-    LC_ALL=C sed -E 's/[0-9]+(\.[0-9]+)?(ms|s|m|h)\b//g' | cksum) || return 1
-  echo "${sum%% *}"
 }
 
 # A session that would be told something: not given a message already in this tick, not

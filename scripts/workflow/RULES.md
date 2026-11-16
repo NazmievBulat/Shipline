@@ -791,10 +791,12 @@ and is run every 3 minutes by a systemd user timer
 stops an idle audit whose screen has the line "audit finished", a reviewer with
 "review finished" (or "review sent back" once its pull request is draft), and an idle worker
 with "worker finished" (unless its pull request is still a draft), runs
-`session cleanup`, squeezes an idle session that holds more than 300 MB, gives the next
-waiting draft ticket the label `workflow` when its turn has come (below), and starts a worker
-for each draft pull request labelled `workflow` that has no session. A session that the usage
-limit stopped is not working and not waiting for the owner: `session list` shows it as
+`session cleanup`, squeezes an idle session that holds more than 300 MB once per idle stretch,
+gives the next waiting draft ticket the label `workflow` when its turn has come (below), and
+starts a worker for each draft pull request labelled `workflow` that has no session. The last
+squeeze is noted across tick restarts; a busy reading or changed screen begins a new idle
+stretch. A session that the usage limit stopped is not working and not waiting for the owner:
+`session list` shows it as
 `limit`, with the limit and the time it resets. That is Claude's own line ("You've hit your
 session limit" or "You've hit your weekly limit"), or a closing message of the session whose
 first line names the usage limit, says it was reached and says the session is stopping, when

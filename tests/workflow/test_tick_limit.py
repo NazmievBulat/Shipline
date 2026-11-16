@@ -264,6 +264,11 @@ def test_a_session_stopped_on_the_limit_is_squeezed_like_an_idle_one(
 
     assert done.returncode == 0, done.stderr
     assert (group / "memory.reclaim").read_text() == str(900 * _MB)
+    (group / "memory.reclaim").write_text("")
+    (group / "memory.current").write_text(str(320 * _MB))
+    again = workflow.run_script("tick", env=_at(15, 10))
+    assert again.returncode == 0, again.stderr
+    assert (group / "memory.reclaim").read_text() == ""
 
 
 def test_a_worker_stopped_on_the_limit_after_it_said_worker_finished_is_not_stopped(

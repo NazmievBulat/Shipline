@@ -274,6 +274,20 @@ def test_shadow_squeeze_does_not_consume_the_idle_stretch(workflow: Workflow) ->
     assert "ticket-7 squeezed" not in log.read_text()
 
 
+def test_idle_spinner_and_clock_changes_do_not_allow_another_squeeze(workflow: Workflow) -> None:
+    workflow.add_worktree(7)
+    group = workflow.running("ticket-7", held=400 * _MB)
+    _idle(workflow, "ticket-7")
+    box = "─" * 40 + "\n> \n" + "─" * 40 + "\n"
+    for seconds in (2, 20):
+        workflow.screen(f"● Waiting (Running… {seconds}s).\n✻ Thinking… {seconds}s\n" + box,
+                        "ticket-7")
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stderr
+        assert bool(_reclaimed(group)) == (seconds == 2)
+        (group / "memory.reclaim").write_text("")
+
+
 @pytest.mark.parametrize(
     ("held", "idle"),
     [(300 * _MB, True), (5000 * _MB, False)],
@@ -309,6 +323,9 @@ def test_a_tick_whose_only_problem_is_a_partial_reclaim_succeeds(workflow: Workf
     assert done.stderr == ""
     assert "ticket-7 squeezed: 301 MB held" in done.stdout
     assert _reclaimed(group) == ""
+    again = workflow.run_script("tick")
+    assert again.returncode == 0, again.stderr
+    assert "squeezed:" not in again.stdout
 
 
 def test_a_tick_whose_squeeze_is_refused_for_another_reason_fails(workflow: Workflow) -> None:
@@ -321,6 +338,11 @@ def test_a_tick_whose_squeeze_is_refused_for_another_reason_fails(workflow: Work
 
     assert done.returncode == 1
     assert f"{group}/memory.reclaim: {os.strerror(errno.EACCES)}" in done.stderr
+    refused = workflow.root / "python-hooks/refused.json"
+    refused.write_text("{}")
+    retried = workflow.run_script("tick")
+    assert retried.returncode == 0, retried.stderr
+    assert _reclaimed(group) == str(301 * _MB)
 
 
 def test_a_session_whose_memory_cannot_be_read_is_not_squeezed(workflow: Workflow) -> None:
