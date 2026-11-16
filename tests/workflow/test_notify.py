@@ -1226,7 +1226,7 @@ def test_bare_bridge_reply_choices_still_accept_the_named_word(
 ) -> None:
     notes = session.notes(7)
     (notes / "ticket-7.codex").touch()
-    session.notify(_stop(f"Which next step?\n{reply_line}"))
+    session.notify(_stop(f"Which next step?\nOwner only: yes\n{reply_line}"))
     assert json.loads((notes / "ticket-7.question").read_text())["reply_words"] == words
 
     session.notify({"hook_event_name": "UserPromptSubmit", "prompt": prompt})
