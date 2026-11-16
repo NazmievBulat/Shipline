@@ -1,5 +1,6 @@
 """`tick` and a session the usage limit stopped: squeezed, and woken once after the reset."""
 
+import shlex
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -271,14 +272,32 @@ def test_a_session_stopped_on_the_limit_is_squeezed_like_an_idle_one(
     assert (group / "memory.reclaim").read_text() == ""
 
 
+@pytest.mark.parametrize("same_screen", [False, True])
 def test_a_busy_reading_after_limit_resend_starts_a_new_squeeze_stretch(
-    workflow: Workflow,
+    workflow: Workflow, same_screen: bool,
 ) -> None:
     workflow.add_worktree(7)
     group = workflow.running("ticket-7", held=400 * _MB)
     limited = _stopped("4:10pm (America/New_York)")
     workflow.screen(limited, "ticket-7")
     (workflow.state / "screen-after-enter-ticket-7").write_text("● Working.\n" + _BOX)
+    if same_screen:
+        # Let resend observe the running turn, then restore the limit before the tick's
+        # screen-history pass. Its cached busy reading must count without a new checksum.
+        saved = workflow.state / "limit-screen"
+        saved.write_text(limited)
+        real = workflow.script.with_name("session.real")
+        workflow.script.rename(real)
+        screen = workflow.state / "screen/ticket-7"
+        workflow.script.write_text(
+            '#!/bin/bash\n'
+            f'bash {shlex.quote(str(real))} "$@"\n'
+            'result=$?\n'
+            'if [[ $1 == resend ]]; then\n'
+            f'  cp -- {shlex.quote(str(saved))} {shlex.quote(str(screen))} || exit 1\n'
+            'fi\n'
+            'exit "$result"\n'
+        )
 
     first = workflow.run_script("tick", env=_at(16, 10))
 

@@ -1067,6 +1067,12 @@ screen_sum() {
   echo "${sum%% *}"
 }
 
+# A busy reading or changed screen ends the previous squeeze stretch, including
+# one observed after local duties. Shadow ticks leave the real receipt alone.
+forget_squeeze() {
+  ((shadow)) || rm -f "$main/$SHIPLINE_STATE_FOLDER/$1.squeezed"
+}
+
 local_duties() {
   local squeeze_note squeeze_sum
   local_done=1
@@ -1078,7 +1084,7 @@ local_duties() {
     squeeze_note=$main/$SHIPLINE_STATE_FOLDER/$name.squeezed
     # A busy reading ends the idle stretch even if the screen did not change.
     if [[ $state == busy ]]; then
-      ((shadow)) || rm -f "$squeeze_note" || tick_failed
+      forget_squeeze "$name" || tick_failed
       continue
     fi
     [[ $state =~ ^(idle|limit)$ ]] || continue
@@ -1086,7 +1092,7 @@ local_duties() {
     [[ ! -r $squeeze_note || $(<"$squeeze_note") != "$squeeze_sum" ]] || continue
     # Observe screen changes even below the threshold: memory can refill later, after
     # the screen has returned to what it showed at the previous squeeze.
-    ((shadow)) || rm -f "$squeeze_note" || { tick_failed; continue; }
+    forget_squeeze "$name" || { tick_failed; continue; }
     if [[ $held =~ ^[0-9]+$ ]] && ((held > SQUEEZE_ABOVE_MB)); then
       if session squeeze "$name"; then
         # Only a successful reclaim consumes this stretch. Keep its receipt across ticks;
@@ -1697,8 +1703,15 @@ screen_seen() {
 while read -r name state _; do
   [[ $name =~ ^(ticket|review|audit)-[0-9]+$ || $name == hunt-* || $name == analyst-* ]] || continue
   session_current "$name" || continue
+  # Local duties can have resumed a limited session since the squeeze pass. Count that
+  # busy reading even when it returns to its earlier screen before the next tick.
+  [[ $state != busy ]] || forget_squeeze "$name" || tick_failed
   # The state goes with the sum: a session that turns busy starts its 45 minutes then.
   sum=$(screen_sum "$name")/$state || continue
+  squeeze_note=$main/$SHIPLINE_STATE_FOLDER/$name.squeezed
+  if [[ -r $squeeze_note && $(<"$squeeze_note") != "${sum%/*}" ]]; then
+    forget_squeeze "$name" || tick_failed
+  fi
   seen=$(screen_seen "$name")
   { read -r last_sum last_since <"$seen"; } 2>/dev/null || last_sum=""
   if [[ $last_sum != "$sum" || ! $last_since =~ ^[0-9]+$ ]]; then
