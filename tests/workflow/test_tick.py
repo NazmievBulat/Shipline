@@ -195,6 +195,85 @@ def test_an_idle_session_that_holds_more_than_300_megabytes_is_squeezed(
     assert _reclaimed(group) == str(301 * _MB)
 
 
+def test_idle_refills_are_not_squeezed_again_after_tick_restarts(workflow: Workflow) -> None:
+    workflow.add_worktree(42)
+    group = workflow.running("ticket-42", held=400 * _MB)
+    _idle(workflow, "ticket-42")
+    workflow.screen("● Waiting.\n> \n", "ticket-42")
+    fixture = Path(__file__).with_name("fixtures") / "idle-refill.log"
+    rows = [line.split() for line in fixture.read_text().splitlines()]
+    assert len(rows) == 12
+    squeezed = []
+    for index, row in enumerate(rows):
+        hour, minute, second = map(int, row[0].split(":"))
+        at = 1_790_000_000 + hour * 3600 + minute * 60 + second
+        (group / "memory.current").write_text(str((400 if index == 0 else 320) * _MB))
+        (group / "memory.reclaim").write_text("")
+        # Each call starts a fresh tick process; only saved notes carry across calls.
+        done = workflow.run_script("tick", env={"WORKFLOW_NOW": str(at)})
+        assert done.returncode == 0, done.stderr
+        if _reclaimed(group):
+            squeezed.append(row[0])
+        (group / "memory.current").write_text(str(int(row[3]) * _MB))
+    assert squeezed == [rows[0][0]]
+
+
+@pytest.mark.parametrize("activity", ["busy", "screen", "screen-while-small"])
+def test_activity_allows_one_squeeze_in_the_next_idle_stretch(
+    workflow: Workflow, activity: str,
+) -> None:
+    workflow.add_worktree(7)
+    group = workflow.running("ticket-7", held=400 * _MB)
+    _idle(workflow, "ticket-7")
+    before = "● Waiting.\n> \n"
+    workflow.screen(before, "ticket-7")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stderr
+    assert _reclaimed(group) == str(400 * _MB)
+    (group / "memory.reclaim").write_text("")
+
+    if activity == "busy":
+        (workflow.notes(7) / "ticket-7.idle").unlink()
+    else:
+        workflow.screen("● More work completed.\n> \n", "ticket-7")
+    if activity == "screen-while-small":
+        (group / "memory.current").write_text(str(6 * _MB))
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stderr
+    if activity in ("busy", "screen-while-small"):
+        assert _reclaimed(group) == ""
+        _idle(workflow, "ticket-7")
+        # A busy spell or observed change counts even if the screen later looks the same.
+        workflow.screen(before, "ticket-7")
+        (group / "memory.current").write_text(str(320 * _MB))
+        done = workflow.run_script("tick")
+        assert done.returncode == 0, done.stderr
+    assert _reclaimed(group)
+    (group / "memory.reclaim").write_text("")
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stderr
+    assert _reclaimed(group) == ""
+
+
+def test_shadow_squeeze_does_not_consume_the_idle_stretch(workflow: Workflow) -> None:
+    workflow.add_worktree(7)
+    group = workflow.running("ticket-7", held=400 * _MB)
+    _idle(workflow, "ticket-7")
+    workflow.screen("● Waiting.\n> \n", "ticket-7")
+    done = workflow.run_script("tick", "--shadow")
+    assert done.returncode == 0, done.stderr
+    assert _reclaimed(group) == ""
+    done = workflow.run_script("tick")
+    assert done.returncode == 0, done.stderr
+    assert _reclaimed(group) == str(400 * _MB)
+    (group / "memory.reclaim").write_text("")
+    log = workflow.repo / ".local/shipline/shadow.log"
+    log.write_text("")
+    done = workflow.run_script("tick", "--shadow")
+    assert done.returncode == 0, done.stderr
+    assert "ticket-7 squeezed" not in log.read_text()
+
+
 @pytest.mark.parametrize(
     ("held", "idle"),
     [(300 * _MB, True), (5000 * _MB, False)],
