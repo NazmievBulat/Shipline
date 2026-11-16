@@ -1564,6 +1564,49 @@ def test_an_unrelated_bridge_prompt_keeps_the_question_in_wake(day: Workflow) ->
     assert not (notes / "ticket-7.asking").exists()
 
 
+def test_the_bridge_pane_keeps_asking_through_unrelated_prompts(day: Workflow) -> None:
+    pane = (Path(__file__).parent / "fixtures/bridge_asking/pane.txt").read_text()
+    turns = pane.split("❯ ")[1:]
+    assert len(turns) == 4
+    assert all(turn.startswith("__WORKFLOW_CODEX_TURN__\n") for turn in turns[:2])
+    question = turns[1].split("\n", 1)[1].split("\n✻ ", 1)[0]
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", question, _at(10))
+    asked = (notes / "ticket-7.asking").read_text()
+    metadata = (notes / "ticket-7.question").read_text()
+    assert json.loads(metadata)["reply_words"] == ["1", "2"]
+
+    # Replay the owner prompts and the intervening bridge response in pane order.
+    for minute, turn in enumerate(turns[2:], start=1):
+        prompt, _, response = turn.partition("\n")
+        done = day.notify(
+            {"hook_event_name": "UserPromptSubmit", "prompt": prompt}, session="ticket-7",
+        )
+        assert done.returncode == 0, done.stderr
+        assert (notes / "ticket-7.asking").read_text() == asked
+        assert (notes / "ticket-7.owner-reply").read_text() == prompt
+        if response.strip():
+            _stop(day, "ticket-7", response.split("\n✻ ", 1)[0], _at(10, minute))
+        assert (notes / "ticket-7.asking").read_text() == asked
+        assert (notes / "ticket-7.question").read_text() == metadata
+        done = _wake(day, "ticket-7", at=_at(10, minute))
+        assert done.returncode == 0, done.stderr
+        line = f"asking the owner: ticket-7 ({minute} min)"
+        assert f"\n{line}\n" in day.sent()[-1]
+        assert line in day.wake_log.read_text()
+
+    done = day.notify(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "Please use 2."}, session="ticket-7",
+    )
+    assert done.returncode == 0, done.stderr
+    assert not (notes / "ticket-7.asking").exists()
+    assert not (notes / "ticket-7.question").exists()
+    assert _wake(day, "ticket-7", at=_at(10, 3)).returncode == 0
+    assert "asking the owner:" not in day.sent()[-1]
+
+
 def test_a_changed_pull_request_head_clears_the_bridge_question(day: Workflow) -> None:
     notes = day.notes(7)
     notes.mkdir(parents=True, exist_ok=True)
