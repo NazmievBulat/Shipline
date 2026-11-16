@@ -1070,6 +1070,49 @@ def test_flaky_repeat_names_the_step_or_unreadable_log(workflow: Workflow, reada
     assert ("job 1041 (log unreadable)" in report.stdout) is (not readable)
 
 
+@pytest.mark.parametrize("log,identity,unreadable", [
+    ("Docker images: image tests\tTest images\t2026-11-14T05:42:46Z Process completed with exit code 1.",
+     "step Test images", False),
+    ("Process completed with exit code 1.", "failing step unnamed", False),
+    (None, "failing step unnamed", True),
+])
+def test_check_run_without_a_named_test_uses_only_available_log_evidence(
+    workflow: Workflow, log: str | None, identity: str, unreadable: bool,
+) -> None:
+    fixtures = workflow.state / "metrics-fixtures"
+    shutil.copytree(FIXTURES, fixtures)
+    check = json.loads((fixtures / "check-run.json").read_text())
+    jobs = json.loads((fixtures / "jobs.json").read_text())
+    jobs["104-1"][0].update({
+        "id": check["id"],
+        "name": check["name"],
+        "status": check["status"],
+        "conclusion": check["conclusion"],
+        "check_run_url": check["url"],
+    })
+    (fixtures / "jobs.json").write_text(json.dumps(jobs))
+    (fixtures / "logs.json").write_text(json.dumps({str(check["id"]): log}))
+    (fixtures / "annotations.json").write_text(json.dumps(check["annotations"]))
+    _github(workflow, fixtures)
+
+    quality = _measure(workflow)["last_days"]["quality"]
+    name = f"CI: {check['name']}: {identity}"
+    repeat = {"run": 104, "attempt": 1, "job": check["id"]}
+    if unreadable:
+        repeat["log_unreadable"] = True
+    assert quality["flaky"] == {name: 1}
+    assert quality["flaky_repeats"] == {name: [repeat]}
+    assert any(
+        f"/check-runs/{check['id']}/annotations?" in call for call in workflow.calls("gh")
+    )
+    report = workflow.run_script("workflow-metrics", env=AT)
+    assert report.returncode == 0, report.stderr
+    assert f"{name}: 1 repeat" in report.stdout
+    evidence = f"run 104 attempt 1 job {check['id']}"
+    assert evidence in report.stdout
+    assert (f"{evidence} (log unreadable)" in report.stdout) is unreadable
+
+
 @pytest.mark.parametrize("diagnostic,expected", [
     ("FAILED tests/test_example.py::test_total[two items] - AssertionError",
      "tests/test_example.py::test_total[two items]"),
