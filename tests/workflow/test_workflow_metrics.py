@@ -1120,8 +1120,9 @@ def test_check_run_without_a_named_test_uses_only_available_log_evidence(
     ("1) [chromium] › e2e/example.spec.ts:12:5 › opens the page",
      "[chromium] %E2%80%BA e2e/example.spec.ts:12:5 %E2%80%BA opens the page"),
 ])
+@pytest.mark.parametrize("field", ["title", "message"])
 def test_flaky_repeat_can_read_test_from_failure_annotation(
-    workflow: Workflow, diagnostic: str, expected: str,
+    workflow: Workflow, diagnostic: str, expected: str, field: str,
 ) -> None:
     fixtures = _flaky_fixtures(workflow)
     logs = json.loads((fixtures / "logs.json").read_text())
@@ -1131,8 +1132,8 @@ def test_flaky_repeat_can_read_test_from_failure_annotation(
     jobs["104-1"][0]["check_run_url"] = "https://api.github.com/repos/example-org/example-app/check-runs/2041"
     (fixtures / "jobs.json").write_text(json.dumps(jobs))
     (fixtures / "annotations.json").write_text(json.dumps([
-        {"annotation_level": "failure", "message": diagnostic},
-        {"annotation_level": "notice", "message": "FAILED tests/test_example.py::test_ignored"},
+        {"annotation_level": "failure", field: diagnostic},
+        {"annotation_level": "notice", field: "FAILED tests/test_example.py::test_ignored"},
     ]))
     _github(workflow, fixtures)
     quality = _measure(workflow)["last_days"]["quality"]

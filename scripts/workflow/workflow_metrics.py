@@ -592,7 +592,8 @@ def _failed_names(run: int, attempt: int, job: dict[str, Any]) -> dict[str, Any]
         try:
             annotations = api(f"{API}/check-runs/{check[1]}/annotations?per_page=100")
             diagnostics += "\n" + "\n".join(
-                str(note.get("message") or "") for note in annotations
+                "\n".join(str(note.get(field) or "") for field in ("title", "message"))
+                for note in annotations
                 if note.get("annotation_level") == "failure"
             )
         except Refused:
