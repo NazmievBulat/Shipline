@@ -25,9 +25,14 @@ function replyWords(message) {
       // As in asks_owner, type/write need quotes; only reply and numeric choose
       // supply bare reply words. "Write 3 tests" supplies no answer instruction.
       if (match[6] && verb !== "reply" && !(verb === "choose" && /^\d+$/.test(word))) break
+      let tail = rest.slice(match[0].length).replace(/^[*_]+/, "")
+      tail = tail.replace(/^\s*\(recommended\)/i, "")
+      // Bare choices end at a separator or an explanation of that choice.
+      // Descriptions such as "reply with your choice" name no literal answer.
+      if (match[6] && /^\s+[\p{L}\p{N}_-]/u.test(tail) &&
+          !/^\s+(?:or|and|to|for|if)\b/i.test(tail)) break
       if (word.length <= 60) words.add(word)
-      rest = rest.slice(match[0].length).replace(/^[*_]+/, "")
-      rest = rest.replace(/^\s*\(recommended\)/i, "")
+      rest = tail
       const separator = rest.match(/^\s*(?:(?:,\s*)?(?:or|and)\b|[,/])\s*/i)
       if (!separator) break
       rest = rest.slice(separator[0].length)

@@ -1200,14 +1200,30 @@ def test_a_bridge_question_matches_quoted_reply_phrases(
     "Which summary do you prefer?", "Please write tests first. Which summary do you prefer?",
     "Can I say 3 things?", "Can I write 3 tests?", "Can I choose 3 names?",
     'Can I say "alpha" in the summary?', "Write 3 tests first. Which summary do you prefer?",
+    "Please reply with your choice.", "reply\nwith your choice.",
+    "Please reply with your decision.",
+    "Please reply when you are ready. Which summary do you prefer?",
 ])
 def test_a_bridge_question_without_reply_words_accepts_any_owner_prompt(
     session: Workflow, message: str,
 ) -> None:
     (session.notes(7) / "ticket-7.codex").touch()
     session.notify(_stop(message))
+    assert _asking(session).exists()
+    assert json.loads((session.notes(7) / "ticket-7.question").read_text())["reply_words"] == []
 
     session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Use the shorter summary."})
+
+    assert not _asking(session).exists()
+
+
+def test_bare_bridge_reply_choices_still_accept_the_named_word(session: Workflow) -> None:
+    notes = session.notes(7)
+    (notes / "ticket-7.codex").touch()
+    session.notify(_stop("Which next step?\nReply refresh or wait."))
+    assert json.loads((notes / "ticket-7.question").read_text())["reply_words"] == ["refresh", "wait"]
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Please refresh."})
 
     assert not _asking(session).exists()
 
