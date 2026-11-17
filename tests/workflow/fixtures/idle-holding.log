@@ -1,0 +1,18 @@
+2026-03-11 03:39:21  every 20 minutes
+  usage: 5-hour window 0% used, not started, weekly 17%
+  sessions: ticket-40 idle, ticket-48 idle; pull requests: drafts 40, 48; waiting tickets 22, 31, 38, 39, 45, 46
+  told Orch: Wake check-in, 03:39. Sessions: ticket-40 idle, ticket-48 idle. Open pull requests: drafts 40, 48; waiting tickets 22, 31, 38, 39, 45, 46.
+idle and holding: ticket-40 (375 min) holds 31, 45, 46
+2026-03-12 09:03:19  every 20 minutes
+  usage: 5-hour window 0% used, not started, weekly 20%
+  sessions: ticket-40 idle; pull requests: drafts 40; waiting tickets 22, 31, 38, 39, 45, 46
+  told Orch: Wake check-in, 09:03. Sessions: ticket-40 idle. Open pull requests: drafts 40; waiting tickets 22, 31, 38, 39, 45, 46.
+idle and holding: ticket-40 (61 min) holds 31, 45, 46
+2026-03-12 21:03:40  every 20 minutes
+  nothing changed since the last check-in; Orch not told
+2026-03-13 08:00:12  every 20 minutes
+  nothing changed since the last check-in; Orch not told
+2026-03-14 08:00:30  every 20 minutes
+  usage: 5-hour window 0% used, not started, weekly 24%
+  sessions: ticket-40 idle; pull requests: drafts 40; waiting tickets 22, 31, 38, 39, 45, 46
+  told Orch: Wake check-in, 08:00. Sessions: ticket-40 idle. Open pull requests: drafts 40; waiting tickets 22, 31, 38, 39, 45, 46.
