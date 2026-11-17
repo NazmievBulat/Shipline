@@ -163,6 +163,93 @@ def test_second_repository_stall_retries_failed_delivery(night: Workflow) -> Non
     assert len(night.sent()) == sent
 
 
+def test_second_repository_read_failure_does_not_acknowledge_a_stall(night: Workflow) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(22)["WORKFLOW_NOW"]))
+    (night.state / "second-list-fails").touch()
+    assert _wake(night, at=_at(22)).returncode == 0
+    assert "stalled:" not in night.sent()[-1]
+    (night.state / "second-list-fails").unlink()
+    assert _wake(night, at=_at(22, 20)).returncode == 0
+    assert "stalled:" in night.sent()[-1]
+    assert (night.state / "second-list-calls").read_text().splitlines() == ["list"] * 2
+
+
+def test_shadow_second_repository_stall_does_not_acknowledge_delivery(night: Workflow) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(23)["WORKFLOW_NOW"]))
+    shadow = night.root / "shadow.log"
+    assert _wake(night, at={**_at(23), "SHIPLINE_SHADOW": str(shadow)}).returncode == 0
+    assert "stalled: example-org/example-tool#201" in shadow.read_text()
+    assert night.sent() == []
+    assert _wake(night).returncode == 0
+    assert "stalled:" in night.sent()[-1]
+
+
+def test_parallel_wakes_name_a_second_repository_head_once(night: Workflow) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(23)["WORKFLOW_NOW"]))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        calls = [pool.submit(_wake, night, "ticket-7") for _ in range(2)]
+        results = [call.result() for call in calls]
+    assert all(done.returncode == 0 for done in results), [done.stderr for done in results]
+    assert sum("stalled:" in prompt for prompt in night.sent()) == 1
+
+
+def test_second_repository_stall_keeps_ordinary_night_and_idle_rules(night: Workflow) -> None:
+    response = _second_repository(night)
+    _second_head(response, hours=7, now=int(_at(10)["WORKFLOW_NOW"]))
+    night.orchestrator("idle")
+    assert _wake(night, at=_at(10)).returncode == 0
+    assert not (night.state / "second-list-calls").exists()
+    night.orchestrator("busy")
+    assert _wake(night, at=_at(22)).returncode == 0
+    assert night.sent() == []
+    night.orchestrator("idle")
+    assert _wake(night, at=_at(23)).returncode == 0
+    assert "stalled:" in night.sent()[-1]
+
+
+@pytest.mark.parametrize("commit", [None, {"oid": "b" * 40, "committedDate": "2026-10-13T00:00:00Z"},
+                                   {"oid": "a" * 40, "committedDate": "unknown"}])
+def test_second_repository_missing_or_mismatched_dates_are_quiet(
+    night: Workflow, commit: dict[str, str] | None,
+) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(23)["WORKFLOW_NOW"]))
+    data = json.loads(response.read_text())
+    data["data"]["repository"]["pullRequests"]["nodes"][0]["commits"]["nodes"] = (
+        [{"commit": commit}] if commit else []
+    )
+    response.write_text(json.dumps(data))
+    assert _wake(night).returncode == 0
+    assert "stalled:" not in night.sent()[-1]
+
+
+def test_second_repository_list_pages_need_no_per_ticket_reads(night: Workflow) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(23)["WORKFLOW_NOW"]))
+    first = json.loads(response.read_text())
+    first["data"]["repository"]["pullRequests"]["pageInfo"] = {
+        "hasNextPage": True, "endCursor": "example-cursor",
+    }
+    second = json.loads(response.read_text())
+    second["data"]["repository"]["pullRequests"]["nodes"][0]["number"] = 202
+    response.write_text(json.dumps(first) + "\n" + json.dumps(second))
+    assert _wake(night).returncode == 0
+    [prompt] = night.sent()
+    assert "stalled: example-org/example-tool#201" in prompt
+    assert "stalled: example-org/example-tool#202" in prompt
+    assert (night.state / "second-list-calls").read_text().splitlines() == ["list"]
+
+
 def test_check_in_lists_a_codex_worker_idle_on_its_own_job(night: Workflow) -> None:
     night.notes(7).mkdir(parents=True, exist_ok=True)
     for suffix in ("codex", "job-wait", "bridge-stopped"):

@@ -42,6 +42,8 @@
 # (priority high)`, `608 waits: shares scripts/workflow/merge_gate.py with 563`, and, for a hot
 # path of shipline.json, `612 waits: hot path web/src/pages/** with 598`. Such a line counts as
 # a change for a check-in, and does not by itself make the wake look in the day.
+# With ticket_repository configured, open ticket/ pull requests there whose head commit
+# is over six hours old ride the same ordinary check-in, once per head, as a stalled line.
 # A start held only by unread usage for over an hour is an exception: at any hour, busy or
 # not, `starts held: usage unread for <n> h, <k> tickets waiting`, once per stretch, followed
 # by `starts resumed` when it ends. After two hours, notify rings once for the same stretch.
@@ -884,6 +886,40 @@ pull_requests_line() {
     | if length == 0 then "none" else join("; ") end' 9>&-
 }
 
+# One list query also reads each head's commit date. Pagination belongs to this list;
+# there are no per-ticket reads. Use the budgeted command without HTTP retries, so a
+# failed list never turns a check-in into repeated reads of the second repository.
+stalled_tickets() {
+  [[ -n $SHIPLINE_TICKET_REPOSITORY ]] || return 0
+  ((github_ready)) || return 75
+  WORKFLOW_BACKGROUND_GITHUB=1 python3 - "$here" "$SHIPLINE_TICKET_REPOSITORY" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from workflow_commands import CommandTimeout, READ_TIMEOUT, run
+
+owner, name = sys.argv[2].split("/")
+query = """query($owner: String!, $name: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: 100, after: $endCursor, states: OPEN) {
+      nodes {
+        number headRefName headRefOid
+        commits(last: 1) { nodes { commit { oid committedDate } } }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"""
+try:
+    result = run("gh", "api", "graphql", "--paginate", "-f", "owner=" + owner,
+                 "-f", "name=" + name, "-f", "query=" + query, timeout=READ_TIMEOUT)
+except (CommandTimeout, OSError):
+    sys.exit("second repository list failed or timed out")
+sys.stdout.write(result.stdout)
+sys.stderr.write(result.stderr)
+sys.exit(result.returncode)
+PY
+}
+
 # Each running session as "ticket-94 limit", without its memory.
 sessions_line() {
   [[ -z ${unread:-} ]] || { echo "could not be read" && return; }
@@ -897,6 +933,25 @@ sessions_line() {
 asking_line=$(awk -v now="$NOW" 'NF >= 2 {
   printf "%s%s (%d min)", (n++ ? ", " : ""), $1, (now - $2) / 60 }' <<<"$asking")
 pulls=$(pull_requests_line) || pulls="could not be read"
+stalled_snapshot=""
+if [[ -n $SHIPLINE_TICKET_REPOSITORY ]]; then
+  if listed=$(stalled_tickets 9>&-) && stalled_snapshot=$(jq -rs --arg repo "$SHIPLINE_TICKET_REPOSITORY" \
+      --argjson now "$NOW" '
+    [ .[] | .data.repository.pullRequests.nodes[]
+      | select(.headRefName | startswith("ticket/"))
+      | . as $pr | .commits.nodes[-1].commit
+      | select(.oid == $pr.headRefOid)
+      | ((.committedDate | fromdateiso8601?) // empty) as $at
+      | select($now - $at > 21600)
+      | {number: $pr.number, head: $pr.headRefOid, hours: (($now - $at) / 3600 | floor)} ]
+    | sort_by(.number) | .[]
+    | "\($repo)#\(.number) \(.head)\tstalled: \($repo)#\(.number) (last commit \(.hours) h ago)"' <<<"$listed"); then
+    :
+  else
+    log "  second repository tickets could not be read"
+    stalled_snapshot=""
+  fi
+fi
 [[ ! -r $main_report ]] || pulls+="; $(<"$main_report")"
 usage=$(usage_line)
 usage+="; $tmp_slots; $(bash "$here/session" load 2>/dev/null || echo "load could not be read")"
@@ -928,6 +983,18 @@ fi
 # A parallel wake may have delivered this stretch while this one waited for the lock.
 # Recheck running sessions, idle markers and waits before sending an earlier snapshot.
 read_idle_holding fresh
+
+# Receipts are read under the delivery lock, including for parallel check-ins. The
+# displayed age is not an identity: getting another hour older must never repeat it.
+stalled_sent=$main/$SHIPLINE_STATE_FOLDER/wake-stalled.sent
+stalled_ids=() stalled_lines=()
+while IFS=$'\t' read -r identity line; do
+  [[ -n $identity && -n $line ]] || continue
+  grep -qxF -- "$identity" "$stalled_sent" 2>/dev/null && continue
+  stalled_ids+=("$identity")
+  stalled_lines+=("$line")
+  log "  $line"
+done <<<"$stalled_snapshot"
 
 orchestrator=$(find_orchestrator)
 orchestrator_result=$?
@@ -986,7 +1053,7 @@ if ((${#resent[@]} == 0 && ${#handback_files[@]} == 0 && ${#cloud_files[@]} == 0
   fi
   if [[ -r $TOLD && $(<"$TOLD") == "$seen" ]] &&
       ((${#start_files[@]} == 0 && ${#metrics_files[@]} == 0 && ${#balance_files[@]} == 0 &&
-        ${#decision_events[@]} == 0)) && [[ -z $saved_line ]]; then
+        ${#decision_events[@]} == 0 && ${#stalled_lines[@]} == 0)) && [[ -z $saved_line ]]; then
     log "  nothing changed since the last check-in; $name not told"
     exit "$failed"
   fi
@@ -995,7 +1062,7 @@ fi
 # The sessions asking the owner stand on a line of their own, so the orchestrator sees them.
 between_lines=" "
 [[ -z $asking_line ]] || between_lines=$'\n'"asking the owner: $asking_line"$'\n'
-for line in "${lost_lines[@]}" "${stuck_lines[@]}" "${answer_lines[@]}" "${holding_lines[@]}"; do
+for line in "${lost_lines[@]}" "${stuck_lines[@]}" "${answer_lines[@]}" "${holding_lines[@]}" "${stalled_lines[@]}"; do
   [[ $between_lines == *$'\n' ]] || between_lines=$'\n'
   between_lines+="$line"$'\n'
 done
@@ -1032,6 +1099,9 @@ if send_to "$name" "$message"; then
     rm -f "$saved_pending" "$saved_progress" "$saved_retry"
   fi
   echo "$seen" >"$TOLD"
+  if ((${#stalled_ids[@]})); then
+    (umask 077; printf '%s\n' "${stalled_ids[@]}" >>"$stalled_sent") || failed=1
+  fi
   if ((${#holding_names[@]})); then
     (umask 077; mkdir -p "$holding_sent")
     for index in "${!holding_names[@]}"; do

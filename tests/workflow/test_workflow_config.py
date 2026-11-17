@@ -112,6 +112,7 @@ _DEFAULTS = {
     "hot_paths": [],
     "conflict_review": None,
     "dependency_watch": None,
+    "ticket_repository": None,
     "merge_train": {"queued_limit_minutes": 20},
     "cloud_pre_push": {"suites": {}},
 }
@@ -170,6 +171,8 @@ def test_ticket_repository_is_optional_and_exported(tmp_path: Path) -> None:
     assert config.ticket_repository == "example-org/example-tool"
     assert _as_json(config)["ticket_repository"] == "example-org/example-tool"
     assert "SHIPLINE_TICKET_REPOSITORY=example-org/example-tool\n" in workflow_config.shell(config)
+    _write(repo, {"ticket_repository": None})
+    assert workflow_config.load(repo).ticket_repository is None
 
 
 @pytest.mark.parametrize("value", ["", "example-tool", "../..", "org/..", "./repo",
@@ -2355,12 +2358,14 @@ def test_generated_config_keeps_original_values_and_documents_command_waits(tmp_
     original["commands"]["pre_train_checks"].update(waits)
     original["hunts"].update(settings={"FEATURE_EXAMPLE": "off"},
                              area_settings={"phone": {"FEATURE_EXAMPLE": "on"}})
+    original["ticket_repository"] = "example-org/example-tool"
     generated = json.loads((_WORKFLOW.parents[1] / "examples/shipline.json").read_text())
     assert generated == original
     _write(repo, generated)
     expected = json.loads((_CONFIG_FIXTURES / "example.json").read_text())
     expected["values"]["commands"]["pre_train_checks"].update(waits)
     expected["values"]["hunts"].update(original["hunts"])
+    expected["values"]["ticket_repository"] = original["ticket_repository"]
     assert _as_json(workflow_config.load(repo)) == expected["values"]
 
 
