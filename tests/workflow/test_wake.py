@@ -226,6 +226,32 @@ def test_idle_hold_quotes_only_the_current_question(night: Workflow, source: str
         assert "Reply 1 or 2" not in line
 
 
+def test_idle_hold_keeps_the_bridge_question_after_a_failed_push_and_progress(night: Workflow) -> None:
+    idle = _idle_holding(night)
+    notes = night.notes(7)
+    (notes / "ticket-7.codex").touch()
+    message = "Approve the shared-file change?\nReply 1 or 2."
+    native = notes / "ticket-7.codex-turn.json"
+    native.write_text(json.dumps({"last-assistant-message": message}))
+    (night.state / "pushover-fails").touch()
+    _stop(night, "ticket-7", message, _at(10))
+    assert not (notes / "ticket-7.pushed").exists()
+    (night.state / "pushover-fails").unlink()
+    done = night.notify(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "What is the status?"}, session="ticket-7",
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads((notes / "ticket-7.codex-followed-up").read_text())["last-assistant-message"] == message
+    progress = "The checks are still running."
+    native.write_text(json.dumps({"last-assistant-message": progress}))
+    _stop(night, "ticket-7", progress, _at(10, 2))
+    moment = int(_at(10, 2)["WORKFLOW_NOW"])
+    os.utime(idle, (moment, moment))
+    done = _wake(night, at=_at(11, 2))
+    assert done.returncode == 0, done.stderr
+    assert "idle and holding: ticket-7 (60 min) holds 9, 12; question: Approve the shared-file change?\n" in night.sent()[-1]
+
+
 @pytest.mark.parametrize("stamp", ["2026-03-08", "2026-11-01"])
 def test_idle_hold_morning_uses_local_calendar_across_clock_changes(night: Workflow, stamp: str) -> None:
     idle = _idle_holding(night)
@@ -462,7 +488,7 @@ def test_closed_orchestrator_gets_one_idle_hold_push_each_morning(phone: Workflo
     _close_orchestrator(phone)
     assert _wake(phone, at=_at(11)).returncode == 0
     assert _wake(phone, at=_at(23)).returncode == 0
-    assert _wake(phone, at=_at(7, 50, day=14)).returncode == 0
+    assert _wake(phone, at=_at(7, 59, day=14)).returncode == 0
     assert len(phone.pushes()) == 1
     for minute in (0, 6, 12):
         assert _wake(phone, at=_at(8, minute, day=14)).returncode == 0

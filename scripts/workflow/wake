@@ -809,9 +809,9 @@ holding_question() {
   [[ -r $notes.asking ]] || return 0
   IFS= read -r asked <"$notes.asking" || return 0
   [[ $asked =~ ^[0-9]+\ [0-9]+$ ]] || return 0
-  for saved in "$notes.pushed" "$notes.stop-message" "$notes.codex-turn.json"; do
+  for saved in "$notes.pushed" "$notes.stop-message" "$notes.codex-turn.json" "$notes.codex-followed-up"; do
     [[ -r $saved ]] || continue
-    if [[ $saved == "$notes.codex-turn.json" ]]; then
+    if [[ $saved == "$notes.codex-turn.json" || $saved == "$notes.codex-followed-up" ]]; then
       message=$(jq -er '.["last-assistant-message"] | strings' "$saved" 2>/dev/null) || continue
     else
       message=$(<"$saved")
@@ -859,6 +859,9 @@ read_idle_holding() {
     previous=""
     [[ ! -r $holding_sent/$name ]] || previous=$(<"$holding_sent/$name")
     reminder_at=$((at + 3600))
+    # Phone delivery leaves session delivery pending. Re-arm its morning boundary too,
+    # so a retry just before the morning cannot postpone the first notice after it.
+    ((reminder_at >= holding_morning)) || reminder_at=$holding_morning
     if [[ ${previous%%$'\n'*} == "$version" ]]; then
       [[ $previous != "$version"$'\n'"$holding_day" ]] || continue
       # A missed morning is not an overnight alarm. Old single-line receipts also wait
