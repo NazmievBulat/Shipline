@@ -1101,7 +1101,11 @@ The orchestrator session does what needs judgment:
   at any hour; a message that could not be sent is tried again every 5 minutes until it is. Every 20 minutes from 20:00 to 8:00 it looks again and gives the orchestrator a
   check-in when it is idle and a session, a pull request or its checks, or whether it may
   start sessions changed since the last one. When `/tmp` has used more than 80% of its file
-  slots, it tells the orchestrator once, at any hour and busy or not. A session whose
+  slots, it tells the orchestrator once, at any hour and busy or not. A ticket idle for an
+  hour that holds other tickets' file-sharing starts is named
+  `idle and holding: ticket-7 (60 min) holds 9, 12`, once per idle stretch and again in the
+  first check-in from 08:00 each local day (the night window's end), with the first line of
+  its open question when there is one. An ended hold is not named again. A session whose
   stop rang the phone (see "Phone pushes") is named on a line of its own with how long it has
   waited, `asking the owner: review-156 (8 min)`, until he answers; a new question reaches the
   orchestrator once, at any hour and busy or not. In a Codex bridge, a question with explicit
