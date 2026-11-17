@@ -1095,6 +1095,190 @@ def test_a_codex_bridge_notes_the_question_codex_asked(session: Workflow) -> Non
     assert _asked_at(session) == "1792000000"
 
 
+@pytest.mark.parametrize("prompt", ["What about example-app?", "Use port 1200.", "ticket-1 is ready."])
+def test_an_unrelated_bridge_prompt_keeps_the_open_question(
+    session: Workflow, prompt: str,
+) -> None:
+    notes = session.notes(7)
+    (notes / "ticket-7.codex").touch()
+    session.notify(_stop("Approve the summary?\nReply 1 to approve.\nReply 2 to revise."), env=_AT_NINE)
+    asked = _asking(session).read_text()
+    pushed = (notes / "ticket-7.pushed").read_text()
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": prompt})
+
+    assert _asking(session).read_text() == asked
+    assert (notes / "ticket-7.pushed").read_text() == pushed
+    assert (notes / "ticket-7.owner-reply").read_text() == prompt
+    # A new progress turn about that prompt still has not answered the old question.
+    session.notify(_stop("The status is available."), env=_AT_TEN)
+    assert _asking(session).read_text() == asked
+
+
+@pytest.mark.parametrize("prompt", ["1", "Please use 2 for this.", "I choose 1."])
+def test_a_bridge_prompt_with_a_reply_word_clears_the_question(
+    session: Workflow, prompt: str,
+) -> None:
+    (session.notes(7) / "ticket-7.codex").touch()
+    session.notify(_stop("Approve the summary?\nReply **1** or **2**."))
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": prompt})
+
+    assert not _asking(session).exists()
+    assert not (session.notes(7) / "ticket-7.question").exists()
+
+
+@pytest.mark.parametrize("name", ["ticket-7", "review-7"])
+@pytest.mark.parametrize("draft", [True, False])
+@pytest.mark.parametrize("reply_line,words", [
+    ('\nReply "alpha" or "beta".', ["alpha", "beta"]), ("", []),
+])
+def test_a_new_bridge_question_replaces_an_unanswered_explicit_question(
+    session: Workflow, name: str, draft: bool, reply_line: str, words: list[str],
+) -> None:
+    notes = session.notes(7)
+    (notes / f"{name}.codex").touch()
+    session.set_draft(7, draft=draft)
+    session.notify(_stop("Approve the summary?\nReply 1 to approve.\nReply 2 to revise."),
+                   session=name, env=_AT_NINE)
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "yes, approve it"},
+                   session=name)
+    head = session.push_from_elsewhere(7)
+    message = f"Which name?{reply_line}"
+
+    done = session.notify(_stop(message), session=name, env=_AT_TEN)
+
+    assert done.returncode == 0, done.stderr
+    assert _asking(session, name).read_text().split()[0] == _AT_TEN["WORKFLOW_NOW"]
+    metadata = json.loads((notes / f"{name}.question").read_text())
+    assert metadata["asked"] == _asking(session, name).read_text().strip()
+    assert metadata["reply_words"] == words
+    assert metadata["head"] == head
+    assert len(session.pushes()) == 2
+    assert session.pushes()[-1].message == message
+    assert (notes / f"{name}.pushed").read_text().strip() == message
+    # Delivery retries retain the new identity and do not ring again.
+    session.notify(_stop(message), session=name, env=_AT_NINE)
+    assert len(session.pushes()) == 2
+    assert json.loads((notes / f"{name}.question").read_text()) == metadata
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "alpha"}, session=name)
+    assert not _asking(session, name).exists()
+    assert not (notes / f"{name}.question").exists()
+
+
+def test_a_ready_bridge_progress_turn_keeps_the_open_question(session: Workflow) -> None:
+    notes = session.notes(7)
+    (notes / "ticket-7.codex").touch()
+    session.set_draft(7, draft=False)
+    session.notify(_stop("Approve the summary?\nReply 1 or 2."), env=_AT_NINE)
+    asked = _asking(session).read_text()
+    metadata = (notes / "ticket-7.question").read_text()
+
+    session.notify(_stop("The status is available."), env=_AT_TEN)
+
+    assert _asking(session).read_text() == asked
+    assert (notes / "ticket-7.question").read_text() == metadata
+    assert len(session.pushes()) == 1
+
+
+@pytest.mark.parametrize("prompt,answered", [
+    ("Please MERGE IT now.", True), ("Keep it in draft.", False),
+    ("refresh", False), ("leave draft", True),
+])
+def test_a_bridge_question_matches_quoted_reply_phrases(
+    session: Workflow, prompt: str, answered: bool,
+) -> None:
+    (session.notes(7) / "ticket-7.codex").touch()
+    session.notify(_stop('Which next step?\nReply "merge it" or "leave draft".'))
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": prompt})
+
+    assert _asking(session).exists() is not answered
+
+
+@pytest.mark.parametrize("message", [
+    "Which summary do you prefer?", "Please write tests first. Which summary do you prefer?",
+    "Can I say 3 things?", "Can I write 3 tests?", "Can I choose 3 names?",
+    'Can I say "alpha" in the summary?', "Write 3 tests first. Which summary do you prefer?",
+    "Please reply with your choice.", "reply\nwith your choice.",
+    "Please reply with your decision.",
+    "Please reply when you are ready. Which summary do you prefer?",
+])
+def test_a_bridge_question_without_reply_words_accepts_any_owner_prompt(
+    session: Workflow, message: str,
+) -> None:
+    (session.notes(7) / "ticket-7.codex").touch()
+    session.notify(_stop(message))
+    assert _asking(session).exists()
+    assert json.loads((session.notes(7) / "ticket-7.question").read_text())["reply_words"] == []
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Use the shorter summary."})
+
+    assert not _asking(session).exists()
+
+
+@pytest.mark.parametrize("reply_line,words,prompt", [
+    ("Reply refresh or wait.", ["refresh", "wait"], "Please refresh."),
+    ("Reply refresh or leave draft.", ["refresh", "leave"], "Please leave draft."),
+])
+def test_bare_bridge_reply_choices_still_accept_the_named_word(
+    session: Workflow, reply_line: str, words: list[str], prompt: str,
+) -> None:
+    notes = session.notes(7)
+    (notes / "ticket-7.codex").touch()
+    session.notify(_stop(f"Which next step?\nOwner only: yes\n{reply_line}"))
+    assert json.loads((notes / "ticket-7.question").read_text())["reply_words"] == words
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": prompt})
+
+    assert not _asking(session).exists()
+
+
+@pytest.mark.parametrize("reply_line", [
+    "Reply 1 / Reply 2", "Reply 1 or Reply 2.", "Reply `1` or `2`.", "Reply 1 or 2.",
+    "Reply **1** (recommended) or **2**.",
+    "Choose 1 or 2.", 'Type "1" or "2".', 'Write "1" or "2".',
+])
+def test_bridge_reply_words_do_not_include_the_reply_instruction(
+    session: Workflow, reply_line: str,
+) -> None:
+    (session.notes(7) / "ticket-7.codex").touch()
+    session.notify(_stop(f"Approve the summary?\n{reply_line}"))
+
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "How should I reply later?"})
+    assert _asking(session).exists()
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Please use 2."})
+    assert not _asking(session).exists()
+
+
+def test_quoted_bridge_reply_words_are_literal(session: Workflow) -> None:
+    (session.notes(7) / "ticket-7.codex").touch()
+    session.notify(_stop('Which next step?\nReply "ship (now)" or "wait".'))
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "ship now"})
+    assert _asking(session).exists()
+    session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Please ship (now)."})
+    assert not _asking(session).exists()
+
+
+def test_a_bridge_delivery_retry_keeps_the_original_head(session: Workflow) -> None:
+    notes = session.notes(7)
+    (notes / "ticket-7.codex").touch()
+    keys = session.root / "home" / "agents" / ".env"
+    contents = keys.read_text()
+    keys.unlink()
+    message = "Approve the summary?\nReply 1 or 2."
+    session.notify(_stop(message), env=_AT_NINE)
+    metadata = (notes / "ticket-7.question").read_text()
+    session.push_from_elsewhere(7)
+    keys.write_text(contents)
+
+    session.notify(_stop(message), env=_AT_TEN)
+
+    assert (notes / "ticket-7.question").read_text() == metadata
+    assert len(session.pushes()) == 1
+    assert _asked_at(session) == _AT_NINE["WORKFLOW_NOW"]
+
+
 def test_a_session_stopped_on_the_usage_limit_notes_no_question(session: Workflow) -> None:
     session.usage(100, "2026-10-14T05:10:00+00:00")
 
@@ -1329,13 +1513,15 @@ def test_an_owner_only_line_rings_once_and_keeps_the_asking_note(
     ],
 )
 @pytest.mark.parametrize("bridge", [False, True])
-def test_a_draft_workers_progress_report_is_idle_without_an_owner_question(
+def test_draft_progress_is_silent_and_keeps_an_unanswered_bridge_question(
     session: Workflow, report: str, bridge: bool
 ) -> None:
     if bridge:
         (session.notes(7) / "ticket-7.codex").touch()
-    # Even an automatic continuation must drop a previous question when it now reports.
+    # An ordinary worker's progress replaces its question. A bridge cannot answer
+    # an explicit question through its own progress, including an automatic continuation.
     session.notify(_stop('Reply "1"'))
+    asked = _asking(session).read_text()
     session.notify({**_PROMPT, "source": "background_task_output"})
     before = len(session.pushes())
 
@@ -1343,6 +1529,9 @@ def test_a_draft_workers_progress_report_is_idle_without_an_owner_question(
 
     assert len(session.pushes()) == before
     assert _idle(session).exists()
+    if bridge:
+        assert _asking(session).read_text() == asked
+        session.notify({"hook_event_name": "UserPromptSubmit", "prompt": "1"})
     assert not _asking(session).exists()
 
 
@@ -1535,7 +1724,7 @@ def test_the_answer_drops_the_question_note_and_a_new_stop_writes_its_own(
 
 
 @pytest.mark.parametrize("case", ["codex", "not a question", "hunt"])
-def test_no_question_note_for_a_bridge_a_stop_that_asks_nothing_or_a_hunt(
+def test_no_automatic_reply_for_a_bridge_a_stop_that_asks_nothing_or_a_hunt(
     session: Workflow, case: str
 ) -> None:
     name = "ticket-7"
@@ -1554,6 +1743,12 @@ def test_no_question_note_for_a_bridge_a_stop_that_asks_nothing_or_a_hunt(
 
     if case == "hunt":
         assert not (session.hunt_worktree("plan-1") / ".local/workflow/hunt-plan-1.question").exists()
+    elif case == "codex":
+        question = _question(session)
+        assert question is not None
+        assert question["reply_words"] == ["1", "2"]
+        assert "owner_only" not in question
+        assert "reply" not in question
     else:
         assert _question(session) is None
 

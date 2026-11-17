@@ -1104,7 +1104,14 @@ The orchestrator session does what needs judgment:
   slots, it tells the orchestrator once, at any hour and busy or not. A session whose
   stop rang the phone (see "Phone pushes") is named on a line of its own with how long it has
   waited, `asking the owner: review-156 (8 min)`, until he answers; a new question reaches the
-  orchestrator once, at any hour and busy or not. A `stuck?`, `wait loop finds itself?` or
+  orchestrator once, at any hour and busy or not. In a Codex bridge, a question with explicit
+  reply words keeps its asking note and stays on that line through unrelated owner prompts
+  and progress turns. A new owner question replaces it, rings the phone and starts its own
+  waiting time with its own reply words. A prompt carrying a reply word, alone or in a
+  sentence, clears it; a changed pull request head clears it too. Reply words match whole
+  words or quoted phrases, without regard to case. Without reply words, any owner prompt
+  still answers the question.
+  A `stuck?`, `wait loop finds itself?` or
   `idle, no rule:` line of the tick reaches it the same way, once, and so does `owner question
   without the Owner only line: ticket-426` (or `without a reply word`). A question the tick
   answered for the owner (see "Asking the owner") is named `answered for the owner: ticket-426,

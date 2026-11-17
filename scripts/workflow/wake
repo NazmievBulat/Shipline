@@ -686,16 +686,74 @@ if [[ $tmp_warning == true ]] && ! [[ -r $TOLD && $(<"$TOLD") == *"tmp pressure:
 fi
 
 # The sessions that ended their turn asking the owner, as "<session> <asked at>", from the notes
-# of `notify`: a session idle, with a question it has not had an answer to. With `all`, also a
-# session working again on its own job, whose question is still open.
+# of `notify`: a session idle, with a question it has not had an answer to. A bridge's
+# explicit replies keep its question visible while unrelated work runs. With `all`, also
+# an ordinary session working again on its own job, whose question is still open.
 asking_notes() {
-  local note name asked identity
+  local note name asked identity metadata recorded expected remote state branch current explicit native native_message native_sum
   shopt -s nullglob
   {
     for note in "$main"/.claude/worktrees/*/"$SHIPLINE_STATE_FOLDER"/*.asking; do
       name=${note##*/}
       name=${name%.asking}
-      [[ ${1:-} == all || -e ${note%.asking}.idle ]] || continue
+      explicit=false
+      metadata=${note%.asking}.question
+      recorded=""
+      if [[ -e ${note%.asking}.codex && -r $metadata ]] &&
+          jq -e --arg asked "$(<"$note")" '.asked == $asked and (.reply_words | type == "array")' "$metadata" >/dev/null; then
+        recorded=$(<"$metadata")
+        expected=$(jq -r '.head // empty' <<<"$recorded")
+        native=""
+        # read preserves trailing newlines, so the receipt can reproduce the exact
+        # captured bytes without rereading a file native callbacks replace freely.
+        [[ ! -r ${note%.asking}.codex-turn.json ]] ||
+          IFS= read -r -d '' native <"${note%.asking}.codex-turn.json" || true
+        # Use the pull request's head, including a push made outside this worktree.
+        # An unread or budget-limited head leaves the question open; shadows write nothing.
+        remote=""
+        if ((github_ready)); then
+          remote=$(WORKFLOW_BACKGROUND_GITHUB=1 timeout 5 python3 "$here/github_budget.py" call wake \
+            pr view "${name#*-}" --json state,headRefName,headRefOid \
+            --jq '.state + " " + .headRefName + " " + .headRefOid' 9>&-) || remote=""
+        fi
+        read -r state branch current <<<"$remote"
+        if [[ $current =~ ^[0-9a-f]{40,64}$ && -n $expected && $current != "$expected" ]]; then
+          if [[ -z $shadow ]]; then (
+            umask 077
+            exec 8>"${note%.asking}.notify.lock" || exit 0
+            flock --nonblock 8 || exit 0
+            [[ -r $note && -r $metadata && $(<"$metadata") == "$recorded" ]] &&
+              jq -e --arg asked "$(<"$note")" '.asked == $asked' <<<"$recorded" >/dev/null || exit 0
+            # Only the obsolete question is followed-up. A distinct question from a
+            # newer native turn must remain available for recovery on the new head.
+            if [[ -n $native ]]; then
+              native_message=$(jq -er '.["last-assistant-message"] | strings' <<<"$native") || native_message=""
+              native_sum=$(cksum <<<"$native_message")
+              if [[ $(jq -r '.asked | split(" ")[1]' <<<"$recorded") == "${native_sum%% *}" ]]; then
+                temporary=$(mktemp "${note%.asking}.followed-up.XXXXXX") || exit 0
+                printf '%s' "$native" >"$temporary" && mv "$temporary" "${note%.asking}.codex-followed-up"
+                rm -f "$temporary"
+              fi
+            fi
+            rm -f "$note" "$metadata" "${note%.asking}.pushed"
+          ); fi
+          continue
+        fi
+        # If GitHub was unread when the question was asked, start its head baseline on
+        # the first successful read. Never infer a change from a local unpushed commit.
+        if [[ -z $expected && $current =~ ^[0-9a-f]{40,64}$ && -z $shadow ]]; then (
+          umask 077
+          exec 8>"${note%.asking}.notify.lock" || exit 0
+          flock --nonblock 8 || exit 0
+          [[ -r $note && -r $metadata && $(<"$metadata") == "$recorded" ]] &&
+            jq -e --arg asked "$(<"$note")" '.asked == $asked' <<<"$recorded" >/dev/null || exit 0
+          temporary=$(mktemp "${metadata}.XXXXXX") || exit 0
+          jq --arg head "$current" '. + {head: $head}' <<<"$recorded" >"$temporary" && mv "$temporary" "$metadata"
+          rm -f "$temporary"
+        ); fi
+        [[ $(jq '.reply_words | length > 0' <<<"$recorded") != true ]] || explicit=true
+      fi
+      [[ ${1:-} == all || -e ${note%.asking}.idle || $explicit == true ]] || continue
       asked=""
       read -r asked _ <"$note" 2>/dev/null || true
       [[ $asked =~ ^[0-9]+$ ]] && printf '%s %s\n' "$name" "$asked"
