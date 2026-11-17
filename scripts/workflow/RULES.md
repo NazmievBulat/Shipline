@@ -731,9 +731,10 @@ day's metrics report is written, as `analyst-day-<date>` over the last day, and 
 above 85% unless it resets within the hour). By hand it is
 `shipline session start analyst <name> [1-7]`, the number being the days it reads. Its
 sentence is "Analyse the workflow over the last day (or the last N days), as analyst-<name>, by
-the section Analyse the workflow of AGENTS.md in this worktree". It runs Claude Opus at medium
-effort in a copy of `main` on no branch, and has 40 minutes: the tick stops it then, whatever
-it is doing.
+the section Analyse the workflow of <rules-file>". `<rules-file>` is the path to the installed
+tool's `scripts/workflow/RULES.md`, relative to the analyst's worktree, resolved from the
+running session script. It runs Claude Opus at medium effort in a copy of `main` on no branch,
+and has 40 minutes: the tick stops it then, whatever it is doing.
 
 The metrics report's quality table groups flaky repeats by workflow, check and failing test.
 The "Flaky repeats in N days" section prints one line per group, with its count and each run,

@@ -911,7 +911,7 @@ def test_the_memory_limits_can_be_set_for_a_test(workflow: Workflow) -> None:
 
 
 _ANALYST = "analyst-day-2026-10-24"
-_ANALYSIS_RULES = "by the section Analyse the workflow of AGENTS.md in this worktree"
+_ANALYSIS_RULES = "by the section Analyse the workflow of ../../../scripts/workflow/RULES.md"
 
 
 def _workflow_rules_section(title: str) -> str:
@@ -966,6 +966,53 @@ def _claude_words(workflow: Workflow, name: str) -> list[str]:
     )
     assert read.stderr == ""
     return read.stdout.splitlines()
+
+
+@pytest.mark.parametrize("layout", ["bundled", "installed", "installed with spaces"])
+def test_an_analyst_s_sentence_names_the_file_that_holds_its_rules(
+    workflow: Workflow, layout: str
+) -> None:
+    if layout != "bundled":
+        home = install_shipline(workflow)
+        if layout == "installed with spaces":
+            workflow.home = home.rename(home.with_name("installed tool"))
+    (workflow.repo / "AGENTS.md").write_text("# Repository rules\n")
+    workflow.git("add", "AGENTS.md")
+    workflow.git("commit", "--quiet", "-m", "chore: repository rules")
+    workflow.git("push", "--quiet", "origin", "main")
+
+    done = workflow.run("start", "analyst", "day-2026-10-24")
+
+    assert done.returncode == 0, done.stderr
+    worktree = workflow.analyst_worktree("day-2026-10-24")
+    assert "Analyse the workflow" not in (worktree / "AGENTS.md").read_text()
+    sentence = _claude_words(workflow, _ANALYST)[-1]
+    prefix = (
+        f"Analyse the workflow over the last day, as {_ANALYST}, "
+        "by the section Analyse the workflow of "
+    )
+    assert sentence.startswith(prefix)
+    assert not any(character in sentence for character in "\"'$`\\\r\n")
+    rules_file = worktree / sentence.removeprefix(prefix)
+    assert rules_file.is_file(), sentence
+    assert rules_file.resolve() == workflow.script.with_name("RULES.md").resolve()
+    assert "\n## Analyse the workflow\n" in rules_file.read_text()
+
+
+@pytest.mark.parametrize("character", ["\"", "'", "$", "`", "\\", "\n", "\r"])
+def test_an_analyst_refuses_a_rules_path_its_sentence_cannot_hold(
+    workflow: Workflow, character: str
+) -> None:
+    home = install_shipline(workflow)
+    workflow.home = home.rename(home.with_name(f"installed{character}tool"))
+
+    done = workflow.run("start", "analyst", "day-2026-10-24")
+
+    assert done.returncode != 0
+    assert "the path to the analyst rules contains characters its sentence cannot hold" in done.stderr
+    assert not workflow.analyst_worktree("day-2026-10-24").exists()
+    assert not workflow.analysis_report("day-2026-10-24").exists()
+    assert not workflow.calls(f"tmux {_ANALYST} new-session")
 
 
 @pytest.mark.parametrize(

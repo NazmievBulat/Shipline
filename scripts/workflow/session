@@ -154,9 +154,10 @@ HUNT_REF=${WORKFLOW_HUNT_REF:-origin/main}
 # An analyst reads logs and the metrics report and writes one report: Opus, at medium effort.
 ANALYST_EFFORT=medium
 ANALYST_MODEL=opus
-# The end of the sentence an analyst is started with, as a hunt's. No quotation mark, dollar,
-# backtick or backslash.
-ANALYST_RULES="by the section Analyse the workflow of AGENTS.md in this worktree"
+# The end of the sentence an analyst is started with, followed by the path to these scripts'
+# RULES.md, relative to its worktree. The path is checked before it is added: no quotation
+# mark, dollar, backtick or backslash.
+ANALYST_RULES="by the section Analyse the workflow of"
 # The logs the tick and the wake keep (`wake`).
 WORKFLOW_LOGS=$HOME/.local/state/workflow
 
@@ -1147,13 +1148,18 @@ retry_later() {
 }
 
 # An analyst reads the workflow's logs and the day's metrics report and writes its report: a
-# copy of `main` on no branch, for the rules, with nothing set up in it, as nothing is tested or
+# copy of `main` on no branch, with nothing set up in it, as nothing is tested or
 # pushed from there. It may read and write the analyses, the state folder and the logs, which
 # are outside its worktree; its rules have it write only its report.
 cmd_start_analyst() {
   local analysis=$1 days=$2 name="analyst-$1" span="the last $2 days" prompt worktree report command
+  local rules_file
+  rules_file=$(python3 -c 'import os, sys; print(os.path.relpath(*sys.argv[1:]))' \
+    "$script_dir/RULES.md" "$(worktree_of "$name")")
+  [[ $rules_file != *[\"\'\$\`\\]* && $rules_file != *$'\n'* && $rules_file != *$'\r'* ]] ||
+    die "the path to the analyst rules contains characters its sentence cannot hold"
   ((days != 1)) || span="the last day"
-  prompt="Analyse the workflow over $span, as $name, $ANALYST_RULES"
+  prompt="Analyse the workflow over $span, as $name, $ANALYST_RULES $rules_file"
 
   cmd_cleanup hunts
 
