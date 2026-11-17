@@ -1,0 +1,62 @@
+{
+  "data": {
+    "repository": {
+      "pullRequests": {
+        "nodes": [
+          {
+            "number": 201,
+            "isDraft": true,
+            "headRefName": "ticket/example-201",
+            "headRefOid": "4bd7e606f1bff6f38cc6e994db6287476ed38437",
+            "commits": {
+              "nodes": [
+                {
+                  "commit": {
+                    "oid": "4bd7e606f1bff6f38cc6e994db6287476ed38437",
+                    "committedDate": "2026-11-15T09:05:58Z"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "number": 202,
+            "isDraft": true,
+            "headRefName": "ticket/example-202",
+            "headRefOid": "5b1af6c48681c9520c3f167237ecfdc53e08a2ff",
+            "commits": {
+              "nodes": [
+                {
+                  "commit": {
+                    "oid": "5b1af6c48681c9520c3f167237ecfdc53e08a2ff",
+                    "committedDate": "2026-11-15T08:07:18Z"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "number": 203,
+            "isDraft": true,
+            "headRefName": "ticket/example-203",
+            "headRefOid": "b46a7a5ea7c2de52c091757b5acc2b349d00ae39",
+            "commits": {
+              "nodes": [
+                {
+                  "commit": {
+                    "oid": "b46a7a5ea7c2de52c091757b5acc2b349d00ae39",
+                    "committedDate": "2026-11-16T08:03:24Z"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "pageInfo": {
+          "hasNextPage": false,
+          "endCursor": null
+        }
+      }
+    }
+  }
+}
