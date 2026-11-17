@@ -97,7 +97,7 @@ def test_second_repository_stall_is_named_once_per_head(night: Workflow, draft: 
     assert (night.state / "second-list-calls").read_text().splitlines() == ["list"] * 4
 
 
-@pytest.mark.parametrize("hours", [5, 6])
+@pytest.mark.parametrize("hours", [-1, 5, 6])
 def test_second_repository_fresh_head_is_quiet(night: Workflow, hours: int) -> None:
     response = _second_repository(night)
     night.orchestrator("idle")
@@ -128,7 +128,7 @@ def test_second_repository_is_not_read_without_a_setting(night: Workflow) -> Non
     assert "stalled:" not in night.sent()[-1]
 
 
-def test_second_repository_fixture_uses_the_head_commit_date(night: Workflow) -> None:
+def test_second_repository_stalls_from_fixture(night: Workflow) -> None:
     _second_repository(night)
     night.orchestrator("idle")
     at = {"WORKFLOW_NOW": str(int(datetime(2026, 11, 16, 7, tzinfo=ZoneInfo("UTC")).timestamp())),
@@ -137,7 +137,7 @@ def test_second_repository_fixture_uses_the_head_commit_date(night: Workflow) ->
     [prompt] = night.sent()
     assert "stalled: example-org/example-tool#201 (last commit 21 h ago)" in prompt
     assert "stalled: example-org/example-tool#202 (last commit 22 h ago)" in prompt
-    assert "example-tool#203" not in prompt
+    assert "stalled: example-org/example-tool#203 (last commit 22 h ago)" in prompt
 
 
 @pytest.mark.parametrize("branch", ["fix/example", "ticketish/example"])

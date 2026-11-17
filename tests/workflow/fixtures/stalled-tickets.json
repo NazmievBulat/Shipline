@@ -39,13 +39,13 @@
             "number": 203,
             "isDraft": true,
             "headRefName": "ticket/example-203",
-            "headRefOid": "b46a7a5ea7c2de52c091757b5acc2b349d00ae39",
+            "headRefOid": "2a9a2d6f825fd942b330f5e6dc5fb06917cba493",
             "commits": {
               "nodes": [
                 {
                   "commit": {
-                    "oid": "b46a7a5ea7c2de52c091757b5acc2b349d00ae39",
-                    "committedDate": "2026-11-16T08:03:24Z"
+                    "oid": "2a9a2d6f825fd942b330f5e6dc5fb06917cba493",
+                    "committedDate": "2026-11-15T08:55:44Z"
                   }
                 }
               ]
