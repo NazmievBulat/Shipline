@@ -2,13 +2,14 @@
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -100,6 +101,218 @@ def test_idle_worker_holding_tickets_is_reported_once_per_idle_stretch(night: Wo
     assert _wake(night, at=_at(13)).returncode == 0
     assert len(night.sent()) == 2
     assert "idle and holding: ticket-7 (60 min) holds 9, 12" in night.sent()[-1]
+
+
+@pytest.mark.parametrize("first_hour", [7, 11])
+def test_idle_hold_is_named_again_at_the_first_morning_look(
+    night: Workflow, first_hour: int,
+) -> None:
+    _idle_holding(night, first_hour - 1)
+    assert _wake(night, at=_at(first_hour)).returncode == 0
+    # Midnight is not a new morning, nor is a routine look just before 08:00.
+    for hour, minute in [(0, 0), (7, 59)]:
+        assert _wake(night, at=_at(hour, minute, day=14)).returncode == 0
+    assert len(night.sent()) == 1
+    assert _wake(night, at=_at(8, day=14)).returncode == 0
+    assert len(night.sent()) == 2
+    assert "idle and holding: ticket-7 (" in night.sent()[-1]
+    for hour, minute in [(8, 1), (8, 6), (9, 0), (19, 0), (23, 0)]:
+        assert _wake(night, at=_at(hour, minute, day=14)).returncode == 0
+    assert len(night.sent()) == 2
+
+
+def test_idle_hold_first_seen_in_the_morning_is_named_once(night: Workflow) -> None:
+    _idle_holding(night, 7)
+    for hour, minute in [(8, 0), (8, 6), (9, 0), (11, 0)]:
+        assert _wake(night, at=_at(hour, minute)).returncode == 0
+    assert len(night.sent()) == 1
+
+
+@pytest.mark.parametrize("end", ["waiters-cleared", "holder-exits", "background-job", "busy"])
+def test_ended_hold_is_not_named_again_next_morning(night: Workflow, end: str) -> None:
+    idle = _idle_holding(night)
+    assert _wake(night, at=_at(11)).returncode == 0
+    if end == "waiters-cleared":
+        (night.repo / ".local/workflow/start-status.json").write_text("{}")
+    elif end == "holder-exits":
+        (night.state / "tmux/ticket-7").unlink()
+    elif end == "background-job":
+        idle.with_suffix(".job-wait").touch()
+    else:
+        idle.unlink()
+    assert _wake(night, at=_at(8, day=14)).returncode == 0
+    assert len(night.sent()) == 1
+
+
+def test_morning_hold_retries_failed_delivery_and_reports_at_a_late_first_look(night: Workflow) -> None:
+    _idle_holding(night)
+    assert _wake(night, at=_at(11)).returncode == 0
+    (night.state / "send-fails").touch()
+    assert _wake(night, at=_at(10, day=14)).returncode == 1
+    (night.state / "send-fails").unlink()
+    assert _wake(night, at=_at(10, 6, day=14)).returncode == 0
+    assert "idle and holding: ticket-7 (1446 min) holds 9, 12" in night.sent()[-1]
+    delivered = len(night.sent())
+    assert _wake(night, at=_at(10, 12, day=14)).returncode == 0
+    assert len(night.sent()) == delivered
+
+
+def test_parallel_morning_wakes_report_the_hold_once(night: Workflow) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    _idle_holding(night)
+    assert _wake(night, at=_at(11)).returncode == 0
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        calls = [pool.submit(_wake, night, "ticket-7", at=_at(8, day=14)) for _ in range(2)]
+        results = [call.result() for call in calls]
+    assert all(done.returncode == 0 for done in results), [done.stderr for done in results]
+    assert sum("idle and holding:" in message for message in night.sent()) == 2
+
+
+def test_old_idle_hold_receipt_rearms_in_the_morning_only(night: Workflow) -> None:
+    _idle_holding(night)
+    assert _wake(night, at=_at(11)).returncode == 0
+    receipt = night.repo / ".local/workflow/wake-idle-holding.sent/ticket-7"
+    receipt.write_text(receipt.read_text().splitlines()[0] + "\n")
+    assert _wake(night, at=_at(23)).returncode == 0
+    assert _wake(night, at=_at(7, 59, day=14)).returncode == 0
+    assert len(night.sent()) == 1
+    assert _wake(night, at=_at(8, day=14)).returncode == 0
+    assert len(night.sent()) == 2
+    assert _wake(night, at=_at(8, 6, day=14)).returncode == 0
+    assert len(night.sent()) == 2
+
+
+def test_shadow_morning_hold_does_not_acknowledge_real_delivery(night: Workflow) -> None:
+    _idle_holding(night)
+    assert _wake(night, at=_at(11)).returncode == 0
+    shadow = night.root / "shadow.log"
+    done = _wake(night, at={**_at(8, day=14), "SHIPLINE_SHADOW": str(shadow)})
+    assert done.returncode == 0, done.stderr
+    assert "idle and holding:" in shadow.read_text()
+    assert len(night.sent()) == 1
+    assert _wake(night, at=_at(8, day=14)).returncode == 0
+    assert len(night.sent()) == 2
+
+
+@pytest.mark.parametrize("source", ["pushed", "stop-message", "codex-turn.json", "answered", "unrelated"])
+def test_idle_hold_quotes_only_the_current_question(night: Workflow, source: str) -> None:
+    idle = _idle_holding(night)
+    notes = night.notes(7)
+    message = "Approve the shared-file change?\nReply 1 or 2"
+    _stop(night, "ticket-7", message, _at(10))
+    for suffix in ("pushed", "stop-message", "codex-turn.json"):
+        saved = notes / f"ticket-7.{suffix}"
+        if saved.exists():
+            saved.unlink()
+    if source == "codex-turn.json":
+        (notes / f"ticket-7.{source}").write_text(json.dumps({"last-assistant-message": message}))
+    elif source in ("pushed", "stop-message"):
+        (notes / f"ticket-7.{source}").write_text(message + "\n")
+    elif source == "answered":
+        (notes / "ticket-7.asking").unlink()
+        (notes / "ticket-7.pushed").write_text(message + "\n")
+    else:
+        (notes / "ticket-7.stop-message").write_text("An unrelated progress report.\n")
+    moment = int(_at(10)["WORKFLOW_NOW"])
+    os.utime(idle, (moment, moment))
+    done = _wake(night, at=_at(11))
+    assert done.returncode == 0, done.stderr
+    line = next(line for line in night.sent()[-1].splitlines() if line.startswith("idle and holding:"))
+    if source in ("answered", "unrelated"):
+        assert "; question:" not in line
+    else:
+        assert line.endswith("; question: Approve the shared-file change?")
+        assert "Reply 1 or 2" not in line
+
+
+def test_idle_hold_keeps_the_bridge_question_after_a_failed_push_and_progress(night: Workflow) -> None:
+    idle = _idle_holding(night)
+    notes = night.notes(7)
+    (notes / "ticket-7.codex").touch()
+    message = "Approve the shared-file change?\nReply 1 or 2."
+    native = notes / "ticket-7.codex-turn.json"
+    native.write_text(json.dumps({"last-assistant-message": message}))
+    (night.state / "pushover-fails").touch()
+    _stop(night, "ticket-7", message, _at(10))
+    assert not (notes / "ticket-7.pushed").exists()
+    (night.state / "pushover-fails").unlink()
+    done = night.notify(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "What is the status?"}, session="ticket-7",
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads((notes / "ticket-7.codex-followed-up").read_text())["last-assistant-message"] == message
+    progress = "The checks are still running."
+    native.write_text(json.dumps({"last-assistant-message": progress}))
+    _stop(night, "ticket-7", progress, _at(10, 2))
+    moment = int(_at(10, 2)["WORKFLOW_NOW"])
+    os.utime(idle, (moment, moment))
+    done = _wake(night, at=_at(11, 2))
+    assert done.returncode == 0, done.stderr
+    assert "idle and holding: ticket-7 (60 min) holds 9, 12; question: Approve the shared-file change?\n" in night.sent()[-1]
+
+
+@pytest.mark.parametrize("stamp", ["2026-03-08", "2026-11-01"])
+def test_idle_hold_morning_uses_local_calendar_across_clock_changes(night: Workflow, stamp: str) -> None:
+    idle = _idle_holding(night)
+
+    def clock(day: str, hour: int, minute: int = 0) -> dict[str, str]:
+        moment = datetime.fromisoformat(day).replace(hour=hour, minute=minute, tzinfo=_NEW_YORK)
+        return {"WORKFLOW_NOW": str(int(moment.timestamp())), "TZ": "America/New_York"}
+
+    day = datetime.fromisoformat(stamp)
+    prior = (day - timedelta(days=1)).date().isoformat()
+    moment = int(clock(prior, 22)["WORKFLOW_NOW"])
+    os.utime(idle, (moment, moment))
+    assert _wake(night, at=clock(prior, 23)).returncode == 0
+    assert _wake(night, at=clock(stamp, 7, 59)).returncode == 0
+    assert len(night.sent()) == 1
+    assert _wake(night, at=clock(stamp, 8)).returncode == 0
+    assert len(night.sent()) == 2
+    assert _wake(night, at=clock(stamp, 9)).returncode == 0
+    assert len(night.sent()) == 2
+
+
+def test_idle_holding_log_mornings_include_the_open_question(night: Workflow) -> None:
+    evidence = (Path(__file__).parent / "fixtures/idle-holding.log").read_text()
+    entries = re.findall(
+        r"^(2026-03-\d+ \d+:\d+:\d+)  every 20 minutes\n(.*?)(?=^2026-|\Z)",
+        evidence, re.M | re.S,
+    )
+    assert len(entries) == 5
+    night.add_worktree(40)
+    night.running("ticket-40")
+    night.orchestrator("busy")
+    notes = night.notes(40)
+    notes.mkdir(parents=True, exist_ok=True)
+    question = "Approve the shared-file change?"
+    first = int(datetime.fromisoformat(entries[0][0]).replace(tzinfo=_NEW_YORK).timestamp())
+    _stop(night, "ticket-40", question + "\nReply 1 or 2", {"WORKFLOW_NOW": str(first - 375 * 60)})
+    (night.repo / ".local/workflow/start-status.json").write_text(json.dumps({
+        str(number): f"{number} waits: shares scripts/workflow/wake with 40"
+        for number in (31, 45, 46)
+    }))
+    notices = []
+    for stamp, body in entries:
+        moment = int(datetime.fromisoformat(stamp).replace(tzinfo=_NEW_YORK).timestamp())
+        reported = re.search(r"idle and holding: ticket-40 \((\d+) min\)", body)
+        if reported:
+            idle = notes / "ticket-40.idle"
+            idle.touch()
+            since = moment - int(reported[1]) * 60
+            os.utime(idle, (since, since))
+        before = len(night.sent())
+        done = _wake(night, at={"WORKFLOW_NOW": str(moment), "TZ": "America/New_York"})
+        assert done.returncode == 0, done.stderr
+        notices.append([message for message in night.sent()[before:] if "idle and holding:" in message])
+    assert [len(messages) for messages in notices] == [1, 1, 0, 1, 1]
+    for messages in notices:
+        for message in messages:
+            assert re.search(
+                rf"idle and holding: ticket-40 \(\d+ min\) holds 31, 45, 46; question: {re.escape(question)}\n",
+                message,
+            )
+            assert "Reply 1 or 2" not in message
 
 
 @pytest.mark.parametrize("note", ["waiting", "job-wait", "checks-wait"])
@@ -268,6 +481,24 @@ def test_closed_orchestrator_rings_idle_holding_once_then_delivers_to_session(ph
     assert _wake(phone, at=_at(11, 24)).returncode == 0
     assert len(phone.sent()) == 1
     assert len(phone.pushes()) == 1
+
+
+def test_closed_orchestrator_gets_one_idle_hold_push_each_morning(phone: Workflow) -> None:
+    _idle_holding(phone)
+    _close_orchestrator(phone)
+    assert _wake(phone, at=_at(11)).returncode == 0
+    assert _wake(phone, at=_at(23)).returncode == 0
+    assert _wake(phone, at=_at(7, 59, day=14)).returncode == 0
+    assert len(phone.pushes()) == 1
+    for minute in (0, 6, 12):
+        assert _wake(phone, at=_at(8, minute, day=14)).returncode == 0
+    assert len(phone.pushes()) == 2
+    assert "idle and holding: ticket-7 (1320 min) holds 9, 12" in phone.pushes()[-1].message
+    phone.orchestrator("busy")
+    assert _wake(phone, at=_at(8, 18, day=14)).returncode == 0
+    assert "idle and holding:" in phone.sent()[-1]
+    assert _wake(phone, at=_at(8, 24, day=14)).returncode == 0
+    assert len(phone.sent()) == 1
 
 
 @pytest.mark.parametrize("git_environment", [False, True])

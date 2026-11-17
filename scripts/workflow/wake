@@ -46,7 +46,8 @@
 # not, `starts held: usage unread for <n> h, <k> tickets waiting`, once per stretch, followed
 # by `starts resumed` when it ends. After two hours, notify rings once for the same stretch.
 # A ticket idle for an hour that holds other tickets' file-sharing starts is also told at
-# any hour, once per idle stretch: `idle and holding: ticket-7 (60 min) holds 9, 12`.
+# any hour, once per idle stretch and again at the first look from 08:00 each local day:
+# `idle and holding: ticket-7 (60 min) holds 9, 12`, with its open question's first line.
 # A session waiting for its own background job is left alone.
 #
 # So do the orchestrator's decisions (`decide` records them): each ticket still held with its
@@ -792,13 +793,42 @@ fi
 # Use the latest pick, not queued start-log changes that may no longer describe a wait.
 # notify removes the idle marker on a prompt and replaces it on the next idle stop, so its
 # inode and precise modification time identify a stretch even when work fits between wakes.
+# A morning runs from the local night window's end until the next one, not from midnight.
+# Calendar arithmetic keeps the boundary at the same local hour across daylight saving.
+holding_day=$(date -d "@$NOW" +%F)
+if ((hour < NIGHT_UNTIL_HOUR)); then
+  holding_day=$(date -d "$holding_day yesterday" +%F)
+fi
+holding_morning=$(date -d "$holding_day $NIGHT_UNTIL_HOUR:00" +%s)
 holding_sent=$main/$SHIPLINE_STATE_FOLDER/wake-idle-holding.sent
+
+# notify's asking checksum identifies the question, including across bridge progress turns.
+# A push can fail, so also try the saved Stop and native turn; never quote unrelated progress.
+holding_question() {
+  local notes=$1 asked saved message sum
+  [[ -r $notes.asking ]] || return 0
+  IFS= read -r asked <"$notes.asking" || return 0
+  [[ $asked =~ ^[0-9]+\ [0-9]+$ ]] || return 0
+  for saved in "$notes.pushed" "$notes.stop-message" "$notes.codex-turn.json" "$notes.codex-followed-up"; do
+    [[ -r $saved ]] || continue
+    if [[ $saved == "$notes.codex-turn.json" || $saved == "$notes.codex-followed-up" ]]; then
+      message=$(jq -er '.["last-assistant-message"] | strings' "$saved" 2>/dev/null) || continue
+    else
+      message=$(<"$saved")
+    fi
+    sum=$(cksum <<<"$message")
+    [[ ${sum%% *} == "${asked#* }" ]] || continue
+    [[ -r $notes.asking && $(<"$notes.asking") == "$asked" ]] || return 0
+    awk 'NF { print; exit }' <<<"$message"
+    return 0
+  done
+}
 holding_names=()
 holding_versions=()
 holding_lines=()
 holding_at=0
 read_idle_holding() {
-  local groups holder tickets name notes idle at version current_sessions
+  local groups holder tickets name notes idle at version current_sessions previous reminder_at question line
   holding_names=()
   holding_versions=()
   holding_lines=()
@@ -826,11 +856,26 @@ read_idle_holding() {
     [[ -f $idle && ! -e $notes.waiting && ! -e $notes.job-wait && ! -e $notes.checks-wait ]] || continue
     IFS=$'\t' read -r at version < <(stat -c $'%Y\t%i:%y' -- "$idle") || continue
     ((NOW - at >= 3600)) || continue
-    [[ ! -r $holding_sent/$name || $(<"$holding_sent/$name") != "$version" ]] || continue
-    ((at + 3600 <= holding_at)) || holding_at=$((at + 3600))
+    previous=""
+    [[ ! -r $holding_sent/$name ]] || previous=$(<"$holding_sent/$name")
+    reminder_at=$((at + 3600))
+    # Phone delivery leaves session delivery pending. Re-arm its morning boundary too,
+    # so a retry just before the morning cannot postpone the first notice after it.
+    ((reminder_at >= holding_morning)) || reminder_at=$holding_morning
+    if [[ ${previous%%$'\n'*} == "$version" ]]; then
+      [[ $previous != "$version"$'\n'"$holding_day" ]] || continue
+      # A missed morning is not an overnight alarm. Old single-line receipts also wait
+      # until the first daytime look before receiving their first morning date.
+      ((hour >= NIGHT_UNTIL_HOUR && hour < NIGHT_FROM_HOUR)) || continue
+      reminder_at=$holding_morning
+    fi
+    ((reminder_at <= holding_at)) || holding_at=$reminder_at
     holding_names+=("$name")
-    holding_versions+=("$version")
-    holding_lines+=("idle and holding: $name ($(((NOW - at) / 60)) min) holds $tickets")
+    holding_versions+=("$version"$'\n'"$holding_day")
+    line="idle and holding: $name ($(((NOW - at) / 60)) min) holds $tickets"
+    question=$(holding_question "$notes")
+    [[ -z $question ]] || line+="; question: $question"
+    holding_lines+=("$line")
   done <<<"$groups"
 }
 read_idle_holding
