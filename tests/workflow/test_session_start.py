@@ -911,7 +911,7 @@ def test_the_memory_limits_can_be_set_for_a_test(workflow: Workflow) -> None:
 
 
 _ANALYST = "analyst-day-2026-10-24"
-_ANALYSIS_RULES = "by the section Analyse the workflow of AGENTS.md in this worktree"
+_ANALYSIS_RULES = "by the section Analyse the workflow of ../../../scripts/workflow/RULES.md"
 
 
 def _workflow_rules_section(title: str) -> str:

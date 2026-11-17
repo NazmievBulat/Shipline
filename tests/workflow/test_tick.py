@@ -1232,7 +1232,7 @@ def test_the_tick_starts_one_analyst_a_day_from_0800_utc_after_the_metrics_run(
     assert _started(workflow) == ["analyst-day-2026-10-24"]
     assert _analyst_words(workflow, "analyst-day-2026-10-24")[-1] == (
         "Analyse the workflow over the last day, as analyst-day-2026-10-24, "
-        "by the section Analyse the workflow of AGENTS.md in this worktree"
+        "by the section Analyse the workflow of ../../../scripts/workflow/RULES.md"
     )
     assert workflow.analysis_report("day-2026-10-24").is_dir()
 
