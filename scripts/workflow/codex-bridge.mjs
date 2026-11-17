@@ -7,6 +7,64 @@ import { fileURLToPath } from "node:url"
 import { createInterface } from "node:readline"
 import { setTimeout as delay } from "node:timers/promises"
 
+// The hook and wake own question state; these local modes only parse text as data.
+// Keep reply phrases literal, including punctuation that could otherwise be a regexp.
+function replyWords(message) {
+  const words = new Set()
+  const token = /^[\s*_]*(?:"([^"\n]+)"|'([^'\n]+)'|“([^”\n]+)”|‘([^’\n]+)’|`([^`\n]+)`|([\p{L}\p{N}][\p{L}\p{N}_-]*))/u
+  // Use the same request boundaries as asks_owner: narrative mentions such as
+  // "Can I say 3 things?" do not tell the owner how to answer.
+  const requestStart = /(?:^|[.!?:;,/\n]\s*|\splease\s+)[\s*_>"'“‘-]*(?:please\s+)?(reply|type|write|answer|say|choose)\s+(?:with\s+)?/gi
+  for (const request of message.matchAll(requestStart)) {
+    let verb = request[1].toLowerCase()
+    let first = true
+    let rest = message.slice(request.index + request[0].length).split("\n")[0]
+    while (true) {
+      const match = rest.match(token)
+      if (!match) break
+      const word = match.slice(1).find((value) => value !== undefined)
+      // As in asks_owner, type/write need quotes; only reply and numeric choose
+      // supply bare reply words. "Write 3 tests" supplies no answer instruction.
+      if (match[6] && verb !== "reply" && !(verb === "choose" && /^\d+$/.test(word))) break
+      let tail = rest.slice(match[0].length).replace(/^[*_]+/, "")
+      tail = tail.replace(/^\s*\(recommended\)/i, "")
+      // An initial bare choice ends at a separator or an explanation of it.
+      // Descriptions such as "reply with your choice" name no literal answer.
+      // Later alternatives retain the existing "refresh or leave draft" format.
+      if (first && match[6] && /^\s+[\p{L}\p{N}_-]/u.test(tail) &&
+          !/^\s+(?:or|and|to|for|if)\b/i.test(tail)) break
+      if (word.length <= 60) {
+        words.add(word)
+        first = false
+      }
+      rest = tail
+      const separator = rest.match(/^\s*(?:(?:,\s*)?(?:or|and)\b|[,/])\s*/i)
+      if (!separator) break
+      rest = rest.slice(separator[0].length)
+      const nextRequest = rest.match(/^(reply|type|write|answer|say|choose)\s+(?:with\s+)?/i)
+      if (nextRequest) {
+        verb = nextRequest[1].toLowerCase()
+        first = true
+        rest = rest.slice(nextRequest[0].length)
+      }
+    }
+  }
+  return [...words]
+}
+if (process.argv[2] === "--reply-words") {
+  process.stdout.write(JSON.stringify(replyWords(readFileSync(0, "utf8"))))
+  process.exit(0)
+}
+if (process.argv[2] === "--answers-question") {
+  const { reply_words: words, prompt } = JSON.parse(readFileSync(0, "utf8"))
+  const answered = words.some((word) => {
+    const literal = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    return new RegExp(`(?<![\\p{L}\\p{N}_-])${literal}(?![\\p{L}\\p{N}_-])`, "iu").test(prompt)
+  })
+  process.stdout.write(String(answered))
+  process.exit(0)
+}
+
 const [worktree, name] = process.argv.slice(2)
 if (!worktree || !/^(ticket|review)-[0-9]+$/.test(name ?? "")) process.exit(2)
 const socket = `codex-${name.split("-").at(-1)}`

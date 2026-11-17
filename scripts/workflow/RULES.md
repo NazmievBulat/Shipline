@@ -735,6 +735,18 @@ the section Analyse the workflow of AGENTS.md in this worktree". It runs Claude 
 effort in a copy of `main` on no branch, and has 40 minutes: the tick stops it then, whatever
 it is doing.
 
+The metrics report's quality table groups flaky repeats by workflow, check and failing test.
+The "Flaky repeats in N days" section prints one line per group, with its count and each run,
+attempt and job id; different failing tests have separate lines. It reads the failed jobs of
+earlier attempts when a run passes on rerun, using only their failed logs and failure
+annotations. When no test is named, the line names the step printed by the failed log;
+unavailable logs say
+"log unreadable", and a missing step name says "failing step unnamed". Extracted names from
+readable diagnostics are cached with completed jobs for eight days. The flaky-test detector
+uses these groups and the existing repeat threshold, with the same run evidence in its finding.
+Diagnostic names preserve their identity by percent-escaping unsafe characters and literal
+percent signs; distinct test ids therefore remain distinct groups.
+
 1. It is read-only. It opens no ticket and no pull request, commits and pushes nothing,
    changes no label, comments nowhere, starts, stops and types into no session, and asks the
    owner nothing. The one thing it writes is its report folder, `$WORKFLOW_ANALYSIS_REPORT`:
@@ -791,10 +803,12 @@ and is run every 3 minutes by a systemd user timer
 stops an idle audit whose screen has the line "audit finished", a reviewer with
 "review finished" (or "review sent back" once its pull request is draft), and an idle worker
 with "worker finished" (unless its pull request is still a draft), runs
-`session cleanup`, squeezes an idle session that holds more than 300 MB, gives the next
-waiting draft ticket the label `workflow` when its turn has come (below), and starts a worker
-for each draft pull request labelled `workflow` that has no session. A session that the usage
-limit stopped is not working and not waiting for the owner: `session list` shows it as
+`session cleanup`, squeezes an idle session that holds more than 300 MB once per idle stretch,
+gives the next waiting draft ticket the label `workflow` when its turn has come (below), and
+starts a worker for each draft pull request labelled `workflow` that has no session. The last
+squeeze is noted across tick restarts; a busy reading or changed screen begins a new idle
+stretch. A session that the usage limit stopped is not working and not waiting for the owner:
+`session list` shows it as
 `limit`, with the limit and the time it resets. That is Claude's own line ("You've hit your
 session limit" or "You've hit your weekly limit"), or a closing message of the session whose
 first line names the usage limit, says it was reached and says the session is stopping, when
@@ -1090,7 +1104,14 @@ The orchestrator session does what needs judgment:
   slots, it tells the orchestrator once, at any hour and busy or not. A session whose
   stop rang the phone (see "Phone pushes") is named on a line of its own with how long it has
   waited, `asking the owner: review-156 (8 min)`, until he answers; a new question reaches the
-  orchestrator once, at any hour and busy or not. A `stuck?`, `wait loop finds itself?` or
+  orchestrator once, at any hour and busy or not. In a Codex bridge, a question with explicit
+  reply words keeps its asking note and stays on that line through unrelated owner prompts
+  and progress turns. A new owner question replaces it, rings the phone and starts its own
+  waiting time with its own reply words. A prompt carrying a reply word, alone or in a
+  sentence, clears it; a changed pull request head clears it too. Reply words match whole
+  words or quoted phrases, without regard to case. Without reply words, any owner prompt
+  still answers the question.
+  A `stuck?`, `wait loop finds itself?` or
   `idle, no rule:` line of the tick reaches it the same way, once, and so does `owner question
   without the Owner only line: ticket-426` (or `without a reply word`). A question the tick
   answered for the owner (see "Asking the owner") is named `answered for the owner: ticket-426,

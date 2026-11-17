@@ -2,8 +2,12 @@
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -1540,6 +1544,226 @@ def test_a_codex_bridge_whose_codex_asks_is_named(day: Workflow) -> None:
 
     [prompt] = day.sent()
     assert "\nasking the owner: ticket-7 (4 min)\n" in prompt
+
+
+def test_an_unrelated_bridge_prompt_keeps_the_question_in_wake(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 to approve.\nReply 2 to revise.", _at(10))
+    asked = (notes / "ticket-7.asking").read_text()
+
+    for minute, prompt in [(1, "What is the status?"), (2, "Show example-app's checks.")]:
+        day.notify({"hook_event_name": "UserPromptSubmit", "prompt": prompt}, session="ticket-7")
+        assert _wake(day, "ticket-7", at=_at(10, minute)).returncode == 0
+        assert f"\nasking the owner: ticket-7 ({minute} min)\n" in day.sent()[-1]
+        assert (notes / "ticket-7.asking").read_text() == asked
+    day.notify({"hook_event_name": "UserPromptSubmit", "prompt": "Please use 2."}, session="ticket-7")
+    assert _wake(day, "ticket-7", at=_at(10, 4)).returncode == 0
+    assert "asking the owner:" not in day.sent()[-1]
+    assert not (notes / "ticket-7.asking").exists()
+
+
+def test_a_replacement_bridge_question_is_named_with_its_own_age(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(9))
+    day.notify({"hook_event_name": "UserPromptSubmit", "prompt": "yes, approve it"},
+               session="ticket-7")
+    _stop(day, "ticket-7", 'Which name?\nReply "alpha" or "beta".', _at(10))
+
+    done = _wake(day, "ticket-7", at=_at(10, 4))
+
+    assert done.returncode == 0, done.stderr
+    assert "\nasking the owner: ticket-7 (4 min)\n" in day.sent()[-1]
+    assert "asking the owner: ticket-7 (64 min)" not in day.sent()[-1]
+    assert "asking the owner: ticket-7 (4 min)" in day.wake_log.read_text()
+
+
+def test_the_bridge_pane_keeps_asking_through_unrelated_prompts(day: Workflow) -> None:
+    pane = (Path(__file__).parent / "fixtures/bridge_asking/pane.txt").read_text()
+    turns = pane.split("❯ ")[1:]
+    assert len(turns) == 4
+    assert all(turn.startswith("__WORKFLOW_CODEX_TURN__\n") for turn in turns[:2])
+    question = turns[1].split("\n", 1)[1].split("\n✻ ", 1)[0]
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", question, _at(10))
+    asked = (notes / "ticket-7.asking").read_text()
+    metadata = (notes / "ticket-7.question").read_text()
+    assert json.loads(metadata)["reply_words"] == ["1", "2"]
+
+    # Replay the owner prompts and the intervening bridge response in pane order.
+    for minute, turn in enumerate(turns[2:], start=1):
+        prompt, _, response = turn.partition("\n")
+        done = day.notify(
+            {"hook_event_name": "UserPromptSubmit", "prompt": prompt}, session="ticket-7",
+        )
+        assert done.returncode == 0, done.stderr
+        assert (notes / "ticket-7.asking").read_text() == asked
+        assert (notes / "ticket-7.owner-reply").read_text() == prompt
+        if response.strip():
+            _stop(day, "ticket-7", response.split("\n✻ ", 1)[0], _at(10, minute))
+        assert (notes / "ticket-7.asking").read_text() == asked
+        assert (notes / "ticket-7.question").read_text() == metadata
+        done = _wake(day, "ticket-7", at=_at(10, minute))
+        assert done.returncode == 0, done.stderr
+        line = f"asking the owner: ticket-7 ({minute} min)"
+        assert f"\n{line}\n" in day.sent()[-1]
+        assert line in day.wake_log.read_text()
+
+    done = day.notify(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "Please use 2."}, session="ticket-7",
+    )
+    assert done.returncode == 0, done.stderr
+    assert not (notes / "ticket-7.asking").exists()
+    assert not (notes / "ticket-7.question").exists()
+    assert _wake(day, "ticket-7", at=_at(10, 3)).returncode == 0
+    assert "asking the owner:" not in day.sent()[-1]
+
+
+def test_a_changed_pull_request_head_clears_the_bridge_question(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(10))
+    native = json.dumps({"last-assistant-message": "Approve the summary?\nReply 1 or 2."})
+    (notes / "ticket-7.codex-turn.json").write_text(native)
+    # The worktree has not moved: the question follows the pull request's head.
+    day.push_from_elsewhere(7)
+
+    assert _wake(day, "ticket-7", at=_at(10, 4)).returncode == 0
+
+    assert "asking the owner:" not in day.sent()[-1]
+    assert not (notes / "ticket-7.asking").exists()
+    assert (notes / "ticket-7.codex-followed-up").read_text() == native
+    day.run_script("notify", "recheck", env={"WORKFLOW_SESSION": "ticket-7"})
+    assert not (notes / "ticket-7.asking").exists()
+
+
+def test_an_unpushed_commit_does_not_clear_a_new_bridge_question(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    day.git("commit", "--quiet", "--allow-empty", "-m", "feat: prepare summary", cwd=day.worktree(7))
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(10))
+
+    assert _wake(day, "ticket-7", at=_at(10, 4)).returncode == 0
+
+    assert "asking the owner: ticket-7 (4 min)" in day.sent()[-1]
+    assert (notes / "ticket-7.asking").exists()
+
+
+def test_head_cleanup_leaves_a_distinct_new_native_question_for_recovery(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(10))
+    day.push_from_elsewhere(7)
+    message = "Approve the next summary?\nReply 3 or 4."
+    (notes / "ticket-7.codex-turn.json").write_text(json.dumps({"last-assistant-message": message}))
+    # The native callback arrived, but the bridge has not relayed its Stop yet.
+
+    assert _wake(day, "ticket-7", at=_at(10, 2)).returncode == 0
+    assert not (notes / "ticket-7.asking").exists()
+    assert day.run_script("notify", "recheck", env={"WORKFLOW_SESSION": "ticket-7"}).returncode == 0
+
+    assert (notes / "ticket-7.asking").exists()
+    assert json.loads((notes / "ticket-7.question").read_text())["reply_words"] == ["3", "4"]
+
+
+def test_a_native_callback_during_head_cleanup_remains_recoverable(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    message = "Approve the summary?\nReply 1 or 2."
+    native = notes / "ticket-7.codex-turn.json"
+    original = json.dumps({"last-assistant-message": message})
+    native.write_text(original)
+    _stop(day, "ticket-7", message, _at(10))
+    day.push_from_elsewhere(7)
+    replacement = day.state / "next-native-turn.json"
+    replacement.write_text(json.dumps({"last-assistant-message": "Approve the next summary?\nReply 3 or 4."}))
+    injected = day.state / "native-callback-injected"
+    jq = shutil.which("jq", path=day.env["PATH"])
+    assert jq is not None
+    # Replace the live turn while cleanup parses the already captured old turn.
+    day.fake("jq", f'''#!/bin/bash
+if [[ "$1" == -er && "$2" == '.["last-assistant-message"] | strings' && ! -e "{injected}" ]]; then
+  cp "{replacement}" "{native}"
+  touch "{injected}"
+fi
+exec {shlex.quote(jq)} "$@"
+''')
+
+    assert _wake(day, "ticket-7", at=_at(10, 2)).returncode == 0
+    assert injected.exists()
+    assert (notes / "ticket-7.codex-followed-up").read_text() == original
+    assert day.run_script("notify", "recheck", env={"WORKFLOW_SESSION": "ticket-7"}).returncode == 0
+
+    assert (notes / "ticket-7.asking").exists()
+    assert json.loads((notes / "ticket-7.question").read_text())["reply_words"] == ["3", "4"]
+
+
+def test_an_unread_head_keeps_a_bridge_question_until_a_change_is_known(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    unavailable = day.state / "fail-gh-view-7"
+    unavailable.touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(10))
+    assert _wake(day, "ticket-7", at=_at(10, 1)).returncode == 0
+    assert "asking the owner:" in day.sent()[-1]
+    unavailable.unlink()
+    assert _wake(day, "ticket-7", at=_at(10, 2)).returncode == 0
+    assert "asking the owner:" in day.sent()[-1]
+    day.push_from_elsewhere(7)
+
+    assert _wake(day, "ticket-7", at=_at(10, 4)).returncode == 0
+
+    assert not (notes / "ticket-7.asking").exists()
+
+
+def test_a_delayed_head_read_cannot_remove_a_new_bridge_question(day: Workflow) -> None:
+    notes = day.notes(7)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "ticket-7.codex").touch()
+    _stop(day, "ticket-7", "Approve the summary?\nReply 1 or 2.", _at(10))
+    day.push_from_elsewhere(7)
+    entered, release = day.state / "head-read-entered", day.state / "head-read-release"
+    day.fake("gh-original", (day.bin / "gh").read_text())
+    day.fake("gh", f'''#!/bin/bash
+if [[ "$1 $2 $4 $5" == "pr view --json state,headRefName,headRefOid" && ! -e "{release}" ]]; then
+  answer=$("{day.bin / "gh-original"}" "$@") || exit 1
+  touch "{entered}"
+  for attempt in {{1..300}}; do
+    [[ ! -e "{release}" ]] || break
+    sleep 0.01
+  done
+  printf '%s\\n' "$answer"
+  exit 0
+fi
+exec "{day.bin / "gh-original"}" "$@"
+''')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(_wake, day, "ticket-7", at=_at(10, 1))
+        try:
+            until = time.monotonic() + 3
+            while not entered.exists() and time.monotonic() < until:
+                time.sleep(0.01)
+            assert entered.exists(), "wake did not start its head read"
+            day.notify({"hook_event_name": "UserPromptSubmit", "prompt": "1"}, session="ticket-7")
+            _stop(day, "ticket-7", "Approve the next summary?\nReply 1 or 2.", _at(10, 2))
+            asked = (notes / "ticket-7.asking").read_text()
+            metadata = (notes / "ticket-7.question").read_text()
+        finally:
+            release.touch()
+        result = pending.result(timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert (notes / "ticket-7.asking").read_text() == asked
+    assert (notes / "ticket-7.question").read_text() == metadata
 
 
 def test_a_question_of_a_session_that_ended_brings_no_check_in_by_day(day: Workflow) -> None:

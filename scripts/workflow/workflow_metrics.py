@@ -136,8 +136,8 @@ HUNT_HEADER = re.compile(
     r"\A# Hunt [^\n]+\n\nArea: [^\n]+\n\n## Settings\n\n```json\n.*?\n```\n\n",
     re.DOTALL,
 )
-# What of a name read from GitHub may reach a finding, and so the orchestrator's message: words
-# and plain marks, no quotes, backticks, angle brackets or new lines, at most this long.
+# Ordinary GitHub labels reach findings as words and plain marks, at most this long.
+# Diagnostic identities use the same character set with reversible escaping below.
 NOT_PLAIN = re.compile(r"[^\w .,:;()\[\]/+!#&=%-]")
 PLAIN_LENGTH = 80
 
@@ -539,9 +539,89 @@ def _jobs(path: str, name: str) -> list[dict[str, Any]]:
     return jobs
 
 
+def _own_run(run: dict[str, Any]) -> bool:
+    from merge_gate import REPOSITORY, WORKFLOW_FILES
+
+    # A fork can choose its workflow and job names. Keep the report's existing boundary.
+    paths = {f".github/workflows/{WORKFLOW_FILES[kind]}" for kind in ("ci", "e2e", "images")}
+    head = (run.get("head_repository") or {}).get("full_name") or ""
+    return run.get("path") in paths and head.casefold() == REPOSITORY.casefold()
+
+
+def _diagnostic_name(text: str) -> str:
+    """Reversible plain-character escaping: distinct diagnostic names stay distinct."""
+    return "".join(
+        "".join(f"%{byte:02X}" for byte in char.encode("utf-8"))
+        if char == "%" or NOT_PLAIN.fullmatch(char) else char
+        for char in text
+    )
+
+
+def _failed_names(run: int, attempt: int, job: dict[str, Any]) -> dict[str, Any]:
+    """Read only this failed job's diagnostics; keep extracted names, never raw logs."""
+    from check_repair import _COLOUR, _TESTS
+    from merge_gate import API, REPOSITORY, Refused, api, read_github
+
+    cached = JOBS / f"failures-{run}-{attempt}-{job['id']}.json"
+    try:
+        return json.loads(cached.read_text())
+    except OSError, ValueError:
+        pass
+    try:
+        done = read_github(
+            "run", "view", str(run), "-R", REPOSITORY, "--attempt", str(attempt),
+            "--job", str(job["id"]), "--log-failed",
+        )
+        readable = done.returncode == 0 and bool(done.stdout.strip())
+        diagnostics = done.stdout if readable else ""
+    except Refused:
+        readable, diagnostics = False, ""
+
+    log_text = _COLOUR.sub("", diagnostics)
+
+    def tests_in(text: str) -> list[str]:
+        clean = _COLOUR.sub("", text)
+        return sorted({
+            match[1].strip() for pattern in _TESTS for match in pattern.finditer(clean)
+        })
+
+    tests = tests_in(diagnostics)
+    # An Actions job's check-run id comes from its URL, not from its job id.
+    check = re.search(r"/check-runs/(\d+)$", job.get("check_run_url") or "")
+    if check and not tests:
+        try:
+            annotations = api(f"{API}/check-runs/{check[1]}/annotations?per_page=100")
+            diagnostics += "\n" + "\n".join(
+                "\n".join(str(note.get(field) or "") for field in ("title", "message"))
+                for note in annotations
+                if note.get("annotation_level") == "failure"
+            )
+        except Refused:
+            pass
+        tests = tests_in(diagnostics)
+    # All failures, including multiple tests in the same job. A summary often repeats a
+    # test already printed above it, so a test counts once per failed job attempt.
+    names = [f"test {_diagnostic_name(name)}" for name in tests]
+    if not names:
+        steps = sorted({
+            fields[1] for line in log_text.splitlines()
+            if len(fields := line.split("\t", 2)) == 3 and fields[1].strip()
+        })
+        names = [f"step {_diagnostic_name(step)}" for step in steps] or ["failing step unnamed"]
+    found = {"names": names, "log_unreadable": not readable}
+    # A temporary read failure may recover on the next report. Completed readable logs
+    # and annotation test names are immutable and share the jobs' eight-day cache.
+    if readable or tests:
+        JOBS.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=JOBS, delete=False) as output:
+            json.dump(found, output)
+        os.replace(output.name, cached)
+    return found
+
+
 def workflow_runs(since: float, until: float) -> list[dict[str, Any]]:
     """Every run of the repository created in the window, with the jobs of the completed ones,
-    and of a re-run that passed, the jobs of the attempt before it."""
+    and of a re-run that passed, the failed jobs of each earlier attempt."""
     from ci_minutes import discover
     from merge_gate import API
 
@@ -562,11 +642,23 @@ def workflow_runs(since: float, until: float) -> list[dict[str, Any]]:
             f"{API}/actions/runs/{run['id']}/attempts/{attempt}/jobs?per_page=100",
             f"{run['id']}-{attempt}.json",
         )
-        if attempt > 1 and run.get("conclusion") == "success":
-            run["earlier_jobs"] = _jobs(
-                f"{API}/actions/runs/{run['id']}/attempts/{attempt - 1}/jobs?per_page=100",
-                f"{run['id']}-{attempt - 1}.json",
-            )
+        if attempt > 1 and run.get("conclusion") == "success" and _own_run(run):
+            run["earlier_jobs"] = []
+            seen: set[int] = set()
+            for earlier in range(1, attempt):
+                jobs = _jobs(
+                    f"{API}/actions/runs/{run['id']}/attempts/{earlier}/jobs?per_page=100",
+                    f"{run['id']}-{earlier}.json",
+                )
+                for job in jobs:
+                    if job.get("conclusion") == "failure" and job["id"] not in seen:
+                        seen.add(job["id"])
+                        diagnosis = _failed_names(run["id"], earlier, job)
+                        run["earlier_jobs"].append({
+                            **job, "attempt": earlier,
+                            "failures": diagnosis["names"],
+                            "log_unreadable": diagnosis["log_unreadable"],
+                        })
     return sorted(runs, key=lambda run: run["id"])
 
 
@@ -728,7 +820,7 @@ def _minutes(start: str | None, end: str | None) -> float | None:
 
 def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]:
     from ci_minutes import summarize
-    from merge_gate import REPOSITORY, WORKFLOW_FILES
+    from merge_gate import WORKFLOW_FILES
 
     runs = [run for run in sources.runs if window.holds(instant(run["created_at"]))]
     completed = [run for run in runs if run.get("status") == "completed"]
@@ -737,12 +829,6 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
         f".github/workflows/{WORKFLOW_FILES['e2e']}": "E2E",
         f".github/workflows/{WORKFLOW_FILES['images']}": "Images",
     }
-
-    def own(run: dict[str, Any]) -> bool:
-        """One of the three workflows, from the repository's own branches: a fork's pull request
-        runs its own copy of them under the same path, and names its run and its jobs."""
-        head = (run.get("head_repository") or {}).get("full_name") or ""
-        return run.get("path") in names and head.casefold() == REPOSITORY.casefold()
 
     workflows: dict[str, Any] = {}
     for name in ("CI", "E2E", "Images"):
@@ -765,7 +851,7 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
     shares = []
     # Only the three workflows Shipline knows, of its own branches: another one's names are
     # anybody's.
-    for run in filter(own, completed):
+    for run in filter(_own_run, completed):
         # Jobs that ran: a skipped job takes no time, and a clock can run backwards.
         timed = [
             (minutes, job["name"])
@@ -796,11 +882,15 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
         if names.get(run.get("path", "")) == "CI" and run.get("event") == "pull_request"
     )
     cancelled = [run["id"] for run in completed if run.get("conclusion") == "cancelled"]
-    flaky: Counter[str] = Counter()
-    for run in filter(own, completed):
+    flaky: dict[str, list[dict[str, Any]]] = {}
+    for run in filter(_own_run, completed):
         for job in run.get("earlier_jobs", []):
-            if job.get("conclusion") == "failure":
-                flaky[f"{run['name']}: {job['name']}"] += 1
+            for failure in job["failures"]:
+                name = f"{_diagnostic_name(run['name'])}: {_diagnostic_name(job['name'])}: {failure}"
+                repeat = {"run": run["id"], "attempt": job["attempt"], "job": job["id"]}
+                if job["log_unreadable"]:
+                    repeat["log_unreadable"] = True
+                flaky.setdefault(name, []).append(repeat)
     minutes = summarize(completed, iso(window.since), iso(window.until))
     scratch = workflow_config.current().merge.scratch_prefix
     return {
@@ -815,7 +905,8 @@ def run_numbers(window: Window, sources: Sources, merges: int) -> dict[str, Any]
         "runner_minutes": minutes["runner_minutes"],
         "categories_minutes": minutes["categories_minutes"],
         "job_shares": [share for share in shares if share["share"] > THRESHOLDS["job_share"]],
-        "flaky": dict(flaky),
+        "flaky": {name: len(repeats) for name, repeats in flaky.items()},
+        "flaky_repeats": flaky,
         "failed_scratch_runs": sum(
             1
             for run in completed
@@ -1150,6 +1241,7 @@ def window_numbers(window: Window, sources: Sources) -> dict[str, Any]:
     quality, not_found = quality_numbers(window, sources)
     quality["failed_scratch_runs"] = runs.pop("failed_scratch_runs")
     quality["flaky"] = runs.pop("flaky")
+    quality["flaky_repeats"] = runs.pop("flaky_repeats")
     if not sources.wake_log:
         not_found.append("wake log")
     if not samples:
@@ -1234,7 +1326,10 @@ def detect(numbers: dict[str, Any], sources: Sources, window: Window) -> list[di
             )
     for job, count in numbers["quality"]["flaky"].items():
         if count >= THRESHOLDS["repeats"]:
-            fire("flaky_test", f"flaky test repeated {count} times {within}: {plain(job)}")
+            fire(
+                "flaky_test", f"flaky test repeated {count} times {within}: {job}"
+                f" ({_repeat_runs(numbers['quality']['flaky_repeats'][job])})",
+            )
     causes: dict[str, list[str]] = {}
     for episode in numbers["main"]["red_episodes"]:
         causes.setdefault(episode["cause"], []).append(episode["since"])
@@ -1433,6 +1528,14 @@ def _counts(found: dict[str, int]) -> str:
     )
 
 
+def _repeat_runs(repeats: list[dict[str, Any]]) -> str:
+    return ", ".join(
+        f"run {repeat['run']} attempt {repeat['attempt']} job {repeat['job']}"
+        + (" (log unreadable)" if repeat.get("log_unreadable") else "")
+        for repeat in repeats
+    )
+
+
 def markdown(measured: dict[str, Any]) -> str:
     day, long = measured["last_day"], measured["last_days"]
     windows = [day, long]
@@ -1610,6 +1713,12 @@ def markdown(measured: dict[str, Any]) -> str:
         windows,
         days,
     )
+    lines += [f"## Flaky repeats in {days} days", ""]
+    lines += [
+        f"- {name}: {len(repeats)} repeats ({_repeat_runs(repeats)})"
+        for name, repeats in sorted(long["quality"]["flaky_repeats"].items())
+    ] or ["None."]
+    lines.append("")
     lines += _table(
         "Decisions",
         [
