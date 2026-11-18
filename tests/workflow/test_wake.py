@@ -1250,6 +1250,9 @@ def test_analyst_session_changes_alone_give_no_check_in(
     night.orchestrator("idle")
     if not worker_running:
         (night.state / "tmux/ticket-7").unlink()
+        # The session stand-in reuses the stopped worker's fake process ID.
+        pid = (night.state / "pid/ticket-7").read_text().strip()
+        shutil.rmtree(night.root / "proc" / pid)
     assert _wake(night, at=_at(3)).returncode == 0
     told = (night.root / "home/.local/state/workflow/wake.told").read_text()
     worktree = night.add_analyst(name)
