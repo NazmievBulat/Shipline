@@ -920,6 +920,28 @@ def _workflow_rules_section(title: str) -> str:
     return " ".join(rules.split(f"\n## {title}\n", 1)[1].split("\n## ", 1)[0].split())
 
 
+def test_an_analyst_reads_declined_proposals_and_names_new_evidence_to_reopen_one() -> None:
+    rules = _workflow_rules_section("Analyse the workflow")
+    reading = rules.split("2. ", 1)[1].split("3. ", 1)[0]
+    proposals = rules.split("4. ", 1)[1].split("5. ", 1)[0]
+
+    assert "earlier analyses" in reading
+    assert "`.local/analyses/declined-proposals.md` in the main checkout" in reading
+    assert "does not propose a declined change again unless" in proposals
+    assert "cites new evidence that meets the entry's reopening condition" in proposals
+    assert "says which evidence meets which condition" in proposals
+
+
+def test_the_orchestrator_records_each_declined_analysis_proposal() -> None:
+    rules = _workflow_rules_section("For the orchestrator session")
+    analysis = rules.split("- When a check-in carries an analysis", 1)[1].split("- When a hunt", 1)[0]
+
+    assert "records each declined proposal" in analysis
+    assert "`.local/analyses/declined-proposals.md` of the main checkout" in analysis
+    assert "its first line, the reports that made it, the reason" in analysis
+    assert "what new evidence would reopen it" in analysis
+
+
 def test_an_analyst_saves_each_cited_github_record_without_reconstructing_it() -> None:
     rules = _workflow_rules_section("Analyse the workflow")
     reading = rules.split("2. ", 1)[1].split("3. ", 1)[0]
