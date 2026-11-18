@@ -1240,6 +1240,62 @@ def test_nothing_new_is_not_told_twice(night: Workflow) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("name", "worker_running"),
+    [("day-2026-10-13", True), ("week-2026-10-13", True), ("example", False)],
+)
+def test_analyst_session_changes_alone_give_no_check_in(
+    night: Workflow, name: str, worker_running: bool,
+) -> None:
+    night.orchestrator("idle")
+    if not worker_running:
+        (night.state / "tmux/ticket-7").unlink()
+        # The session stand-in reuses the stopped worker's fake process ID.
+        pid = (night.state / "pid/ticket-7").read_text().strip()
+        shutil.rmtree(night.root / "proc" / pid)
+    assert _wake(night, at=_at(3)).returncode == 0
+    told = (night.root / "home/.local/state/workflow/wake.told").read_text()
+    worktree = night.add_analyst(name)
+    night.running(f"analyst-{name}")
+
+    assert _wake(night, at=_at(3, 21)).returncode == 0
+    assert len(night.sent()) == 1
+    (worktree / f".local/workflow/analyst-{name}.idle").touch()
+    assert _wake(night, at=_at(3, 42)).returncode == 0
+    (night.state / f"tmux/analyst-{name}").unlink()
+    assert _wake(night, at=_at(4, 3)).returncode == 0
+
+    assert len(night.sent()) == 1
+    assert (night.root / "home/.local/state/workflow/wake.told").read_text() == told
+    assert "nothing changed since the last check-in" in night.wake_log.read_text()
+
+
+@pytest.mark.parametrize("change", ["worker", "pull-request"])
+def test_analyst_start_with_another_change_is_told_and_listed(
+    night: Workflow, change: str,
+) -> None:
+    night.orchestrator("idle")
+    assert _wake(night, at=_at(3)).returncode == 0
+    night.add_analyst("day-2026-10-13")
+    night.running("analyst-day-2026-10-13")
+    if change == "worker":
+        night.notes(7).mkdir(parents=True, exist_ok=True)
+        (night.notes(7) / "ticket-7.idle").touch()
+    else:
+        night.list_pull_request(7, draft=False)
+
+    assert _wake(night, at=_at(3, 21)).returncode == 0
+
+    assert len(night.sent()) == 2
+    assert "analyst-day-2026-10-13 busy" in night.sent()[-1]
+    if change == "worker":
+        assert "ticket-7 idle" in night.sent()[-1]
+    else:
+        assert "ready medium 7 (checks passing), 9 (checks passing)" in night.sent()[-1]
+    assert _wake(night, at=_at(3, 42)).returncode == 0
+    assert len(night.sent()) == 2
+
+
 def test_the_check_in_groups_the_ready_pull_requests_by_priority(night: Workflow) -> None:
     night.orchestrator("idle")
     night.list_pull_request(7, draft=False, labels=("workflow", "priority:+low"))
@@ -2277,6 +2333,29 @@ def _analysis(workflow: Workflow, url: str, proposals: list[str]) -> Path:
     # A note the tick is still writing is not read.
     (pending / ".day-2026-10-14.json").write_text("{")
     return event
+
+
+def test_analysis_notice_is_told_after_an_ignored_analyst_start(night: Workflow) -> None:
+    night.orchestrator("idle")
+    assert _wake(night, at=_at(3)).returncode == 0
+    night.add_analyst("day-2026-10-13")
+    night.running("analyst-day-2026-10-13")
+    assert _wake(night, at=_at(3, 21)).returncode == 0
+    assert len(night.sent()) == 1
+    night.orchestrator("busy")
+    event = _analysis(night, "https://docs.example.com/analysis-1", ["1. Example proposal"])
+
+    assert _wake(night, at=_at(3, 26)).returncode == 0
+
+    assert len(night.sent()) == 2
+    assert "analyst-day-2026-10-13 busy" in night.sent()[-1]
+    assert (
+        "Workflow analysis day-2026-10-13 (report https://docs.example.com/analysis-1): "
+        "1. Example proposal." in night.sent()[-1]
+    )
+    assert not event.exists()
+    assert _wake(night, at=_at(3, 31)).returncode == 0
+    assert len(night.sent()) == 2
 
 
 def test_a_finished_analysis_is_told_once_by_day_with_its_link_and_proposals(
