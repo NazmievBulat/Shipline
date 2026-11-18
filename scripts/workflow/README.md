@@ -253,6 +253,7 @@ installation folder, even if the checkout has a file of the same name.
 | `runner.planner_label` | name | The planner runner label; derived as `<label>-planner` when omitted. | none |
 | `runner.prefix` | name | The word naming runner images, services, network and containers; omitted means no runner figures. | none |
 | `state_folder` | name | The folder of workflow notes in the main checkout and each worktree. | `".local/workflow"` |
+| `ticket_repository` | repository | An optional second GitHub repository as owner/name whose open ticket/ pull requests the wake names once per head when their last commit is more than 6 hours old. | none |
 | `workflows.ci` | name | The CI workflow file under .github/workflows/. | `"ci.yml"` |
 | `workflows.ci_name` | name | The CI workflow run name used by the runner-minutes report. | `"CI"` |
 | `workflows.e2e` | name | The browser workflow file under .github/workflows/. | `"e2e.yml"` |

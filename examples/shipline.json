@@ -185,6 +185,7 @@
     "prefix": "example-app"
   },
   "state_folder": ".local/shipline",
+  "ticket_repository": "example-org/example-tool",
   "workflows": {
     "ci": "build.yml",
     "ci_name": "Build",

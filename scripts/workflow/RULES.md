@@ -1128,6 +1128,14 @@ The orchestrator session does what needs judgment:
   merges and pushes nothing. What it saw and did is in `~/.local/state/workflow/wake.log`. A
   check-in is answered by the rules of this section: nothing is started above 85% of the
   5-hour window unless it resets within the hour.
+- When `ticket_repository` names a second repository as `owner/name`, the wake's ordinary
+  check-in also names each open `ticket/` pull request there, draft or ready, whose head
+  commit is more than 6 hours old: `stalled: example-org/example-tool#201 (last commit 7 h ago)`.
+  It names a head once after successful delivery; a new commit starts a new six-hour wait.
+  These lines count as a change but keep the check-in's night hours and idle requirement.
+  The wake reads the open pull requests and their head commit dates in one list query,
+  paginated when needed, without a separate call for each ticket. Without the setting it
+  makes no call to a second repository. It starts, stops and reviews none of those tickets.
 - It answers "what is everyone doing" for the owner. A pull request handed to the tick, or
   an audit that waits in the merge train, is waiting for its turn, not stuck:
   `merge-when-current --train-status` names the first and the order. A reviewer that handed
