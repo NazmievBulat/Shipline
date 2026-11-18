@@ -1240,15 +1240,23 @@ def test_nothing_new_is_not_told_twice(night: Workflow) -> None:
     )
 
 
-@pytest.mark.parametrize("name", ["day-2026-10-13", "week-2026-10-13", "example"])
-def test_analyst_session_changes_alone_give_no_check_in(night: Workflow, name: str) -> None:
+@pytest.mark.parametrize(
+    ("name", "worker_running"),
+    [("day-2026-10-13", True), ("week-2026-10-13", True), ("example", False)],
+)
+def test_analyst_session_changes_alone_give_no_check_in(
+    night: Workflow, name: str, worker_running: bool,
+) -> None:
     night.orchestrator("idle")
+    if not worker_running:
+        (night.state / "tmux/ticket-7").unlink()
     assert _wake(night, at=_at(3)).returncode == 0
     told = (night.root / "home/.local/state/workflow/wake.told").read_text()
     worktree = night.add_analyst(name)
     night.running(f"analyst-{name}")
 
     assert _wake(night, at=_at(3, 21)).returncode == 0
+    assert len(night.sent()) == 1
     (worktree / f".local/workflow/analyst-{name}.idle").touch()
     assert _wake(night, at=_at(3, 42)).returncode == 0
     (night.state / f"tmux/analyst-{name}").unlink()
@@ -1268,6 +1276,7 @@ def test_analyst_start_with_another_change_is_told_and_listed(
     night.add_analyst("day-2026-10-13")
     night.running("analyst-day-2026-10-13")
     if change == "worker":
+        night.notes(7).mkdir(parents=True, exist_ok=True)
         (night.notes(7) / "ticket-7.idle").touch()
     else:
         night.list_pull_request(7, draft=False)

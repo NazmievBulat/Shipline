@@ -1067,7 +1067,10 @@ installed=$(
   git -C "$here/../.." rev-parse --short HEAD 2>/dev/null
 ) || installed=unknown
 [[ $installed =~ ^[0-9a-f]+$ ]] || installed=unknown
-seen="sessions: $(sessions_line "$sessions"); pull requests: $pulls; starts: $gate; shipline: $installed; tmp pressure: $tmp_warning"
+# The tick manages analysts and reports their analysis separately. Their sessions alone
+# give no reason for a check-in; a delivered check-in still lists every session below.
+compared_sessions=$(awk '$1 !~ /^analyst-/' <<<"$sessions")
+seen="sessions: $(sessions_line "$compared_sessions"); pull requests: $pulls; starts: $gate; shipline: $installed; tmp pressure: $tmp_warning"
 
 reason="every 20 minutes"
 ((${#resent[@]} == 0)) || reason="after a reset"
