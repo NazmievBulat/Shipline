@@ -1,0 +1,62 @@
+{
+  "data": {
+    "repository": {
+      "pullRequests": {
+        "nodes": [
+          {
+            "number": 201,
+            "isDraft": true,
+            "headRefName": "ticket/example-201",
+            "headRefOid": "1111111111111111111111111111111111111111",
+            "commits": {
+              "nodes": [
+                {
+                  "commit": {
+                    "oid": "1111111111111111111111111111111111111111",
+                    "committedDate": "2026-11-15T09:05:58Z"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "number": 202,
+            "isDraft": true,
+            "headRefName": "ticket/example-202",
+            "headRefOid": "2222222222222222222222222222222222222222",
+            "commits": {
+              "nodes": [
+                {
+                  "commit": {
+                    "oid": "2222222222222222222222222222222222222222",
+                    "committedDate": "2026-11-15T08:07:18Z"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "number": 203,
+            "isDraft": true,
+            "headRefName": "ticket/example-203",
+            "headRefOid": "3333333333333333333333333333333333333333",
+            "commits": {
+              "nodes": [
+                {
+                  "commit": {
+                    "oid": "3333333333333333333333333333333333333333",
+                    "committedDate": "2026-11-15T08:55:44Z"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "pageInfo": {
+          "hasNextPage": false,
+          "endCursor": null
+        }
+      }
+    }
+  }
+}

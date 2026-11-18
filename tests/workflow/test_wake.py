@@ -44,6 +44,217 @@ def _wake(
     return workflow.run_script("wake", *woken, env=at or _at(23, 0))
 
 
+def _second_repository(workflow: Workflow, *, configured: bool = True) -> Path:
+    """One list response, with commit dates at the recorded heads."""
+    if configured:
+        config = workflow.repo / "shipline.json"
+        values = json.loads(config.read_text())
+        values["ticket_repository"] = "example-org/example-tool"
+        config.write_text(json.dumps(values))
+    response = workflow.state / "second-repository.json"
+    response.write_text((Path(__file__).with_name("fixtures") / "stalled-tickets.json").read_text())
+    workflow.fake("gh-before-stalled", (workflow.bin / "gh").read_text())
+    workflow.fake("gh", f'''#!{sys.executable}
+import os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if args[:2] == ["api", "graphql"]:
+    with Path({str(workflow.state / "second-list-calls")!r}).open("a") as log:
+        log.write("list\\n")
+    if Path({str(workflow.state / "second-list-fails")!r}).exists():
+        sys.exit(1)
+    print(Path({str(response)!r}).read_text())
+else:
+    os.execv({str(workflow.bin / "gh-before-stalled")!r}, ["gh", *args])
+''')
+    return response
+
+
+def _second_head(response: Path, *, hours: float, now: int, head: str = "a" * 40,
+                 draft: bool = True, branch: str = "ticket/example") -> None:
+    date = datetime.fromtimestamp(now - int(hours * 3600), ZoneInfo("UTC"))
+    response.write_text(json.dumps({"data": {"repository": {"pullRequests": {
+        "nodes": [{"number": 201, "isDraft": draft, "headRefName": branch,
+                   "headRefOid": head, "commits": {"nodes": [{"commit": {
+                       "oid": head, "committedDate": date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   }}]}}], "pageInfo": {"hasNextPage": False, "endCursor": None},
+    }}}}))
+
+
+@pytest.mark.parametrize("draft", [True, False])
+def test_second_repository_stall_is_named_once_per_head(night: Workflow, draft: bool) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    now = int(_at(22)["WORKFLOW_NOW"])
+    _second_head(response, hours=7, now=now, draft=draft)
+    assert _wake(night, at=_at(22)).returncode == 0
+    assert "\nstalled: example-org/example-tool#201 (last commit 7 h ago)\n" in night.sent()[-1]
+    assert _wake(night, at=_at(23)).returncode == 0
+    assert len(night.sent()) == 1
+    # Another reason for a check-in must not repeat the same stalled head.
+    assert _wake(night, "ticket-7", at=_at(23, 20)).returncode == 0
+    assert "stalled:" not in night.sent()[-1]
+    # A new commit starts a new six-hour wait.
+    _second_head(response, hours=5, now=now, head="b" * 40, draft=draft)
+    assert _wake(night, at=_at(23, 40)).returncode == 0
+    assert sum("stalled:" in prompt for prompt in night.sent()) == 2
+    assert "last commit 6 h ago" in night.sent()[-1]
+    assert (night.state / "second-list-calls").read_text().splitlines() == ["list"] * 4
+
+
+@pytest.mark.parametrize("hours", [-1, 5, 6])
+def test_second_repository_fresh_head_is_quiet(night: Workflow, hours: int) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=hours, now=int(_at(23)["WORKFLOW_NOW"]))
+    assert _wake(night).returncode == 0
+    assert "stalled:" not in night.sent()[-1]
+
+
+def test_second_repository_new_commit_resets_the_wait(night: Workflow) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    now = int(_at(22)["WORKFLOW_NOW"])
+    _second_head(response, hours=7, now=now)
+    assert _wake(night, at=_at(22)).returncode == 0
+    _second_head(response, hours=0, now=now, head="b" * 40)
+    assert _wake(night, at=_at(23)).returncode == 0
+    assert sum("stalled:" in prompt for prompt in night.sent()) == 1
+    assert _wake(night, at=_at(5, day=14)).returncode == 0
+    assert "last commit 7 h ago" in night.sent()[-1]
+    assert sum("stalled:" in prompt for prompt in night.sent()) == 2
+
+
+def test_second_repository_is_not_read_without_a_setting(night: Workflow) -> None:
+    _second_repository(night, configured=False)
+    night.orchestrator("idle")
+    assert _wake(night).returncode == 0
+    assert not (night.state / "second-list-calls").exists()
+    assert "stalled:" not in night.sent()[-1]
+
+
+def test_second_repository_stalls_from_fixture(night: Workflow) -> None:
+    _second_repository(night)
+    night.orchestrator("idle")
+    at = {"WORKFLOW_NOW": str(int(datetime(2026, 11, 16, 7, tzinfo=ZoneInfo("UTC")).timestamp())),
+          "TZ": "UTC"}
+    assert _wake(night, at=at).returncode == 0
+    [prompt] = night.sent()
+    assert "stalled: example-org/example-tool#201 (last commit 21 h ago)" in prompt
+    assert "stalled: example-org/example-tool#202 (last commit 22 h ago)" in prompt
+    assert "stalled: example-org/example-tool#203 (last commit 22 h ago)" in prompt
+
+
+@pytest.mark.parametrize("branch", ["fix/example", "ticketish/example"])
+def test_second_repository_only_ticket_branches_are_named(night: Workflow, branch: str) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(23)["WORKFLOW_NOW"]), branch=branch)
+    assert _wake(night).returncode == 0
+    assert "stalled:" not in night.sent()[-1]
+
+
+def test_second_repository_stall_retries_failed_delivery(night: Workflow) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(22)["WORKFLOW_NOW"]))
+    (night.state / "send-fails").touch()
+    assert _wake(night, at=_at(22)).returncode == 1
+    (night.state / "send-fails").unlink()
+    assert _wake(night, at=_at(22, 20)).returncode == 0
+    assert "stalled:" in night.sent()[-1]
+    sent = len(night.sent())
+    assert _wake(night, at=_at(23)).returncode == 0
+    assert len(night.sent()) == sent
+
+
+def test_second_repository_read_failure_does_not_acknowledge_a_stall(night: Workflow) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(22)["WORKFLOW_NOW"]))
+    (night.state / "second-list-fails").touch()
+    assert _wake(night, at=_at(22)).returncode == 0
+    assert "stalled:" not in night.sent()[-1]
+    (night.state / "second-list-fails").unlink()
+    assert _wake(night, at=_at(22, 20)).returncode == 0
+    assert "stalled:" in night.sent()[-1]
+    assert (night.state / "second-list-calls").read_text().splitlines() == ["list"] * 2
+
+
+def test_shadow_second_repository_stall_does_not_acknowledge_delivery(night: Workflow) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(23)["WORKFLOW_NOW"]))
+    shadow = night.root / "shadow.log"
+    assert _wake(night, at={**_at(23), "SHIPLINE_SHADOW": str(shadow)}).returncode == 0
+    assert "stalled: example-org/example-tool#201" in shadow.read_text()
+    assert night.sent() == []
+    assert _wake(night).returncode == 0
+    assert "stalled:" in night.sent()[-1]
+
+
+def test_parallel_wakes_name_a_second_repository_head_once(night: Workflow) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(23)["WORKFLOW_NOW"]))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        calls = [pool.submit(_wake, night, "ticket-7") for _ in range(2)]
+        results = [call.result() for call in calls]
+    assert all(done.returncode == 0 for done in results), [done.stderr for done in results]
+    assert sum("stalled:" in prompt for prompt in night.sent()) == 1
+
+
+def test_second_repository_stall_keeps_ordinary_night_and_idle_rules(night: Workflow) -> None:
+    response = _second_repository(night)
+    _second_head(response, hours=7, now=int(_at(10)["WORKFLOW_NOW"]))
+    night.orchestrator("idle")
+    assert _wake(night, at=_at(10)).returncode == 0
+    assert not (night.state / "second-list-calls").exists()
+    night.orchestrator("busy")
+    assert _wake(night, at=_at(22)).returncode == 0
+    assert night.sent() == []
+    night.orchestrator("idle")
+    assert _wake(night, at=_at(23)).returncode == 0
+    assert "stalled:" in night.sent()[-1]
+
+
+@pytest.mark.parametrize("commit", [None, {"oid": "b" * 40, "committedDate": "2026-10-13T00:00:00Z"},
+                                   {"oid": "a" * 40, "committedDate": "unknown"}])
+def test_second_repository_missing_or_mismatched_dates_are_quiet(
+    night: Workflow, commit: dict[str, str] | None,
+) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(23)["WORKFLOW_NOW"]))
+    data = json.loads(response.read_text())
+    data["data"]["repository"]["pullRequests"]["nodes"][0]["commits"]["nodes"] = (
+        [{"commit": commit}] if commit else []
+    )
+    response.write_text(json.dumps(data))
+    assert _wake(night).returncode == 0
+    assert "stalled:" not in night.sent()[-1]
+
+
+def test_second_repository_list_pages_need_no_per_ticket_reads(night: Workflow) -> None:
+    response = _second_repository(night)
+    night.orchestrator("idle")
+    _second_head(response, hours=7, now=int(_at(23)["WORKFLOW_NOW"]))
+    first = json.loads(response.read_text())
+    first["data"]["repository"]["pullRequests"]["pageInfo"] = {
+        "hasNextPage": True, "endCursor": "example-cursor",
+    }
+    second = json.loads(response.read_text())
+    second["data"]["repository"]["pullRequests"]["nodes"][0]["number"] = 202
+    response.write_text(json.dumps(first) + "\n" + json.dumps(second))
+    assert _wake(night).returncode == 0
+    [prompt] = night.sent()
+    assert "stalled: example-org/example-tool#201" in prompt
+    assert "stalled: example-org/example-tool#202" in prompt
+    assert (night.state / "second-list-calls").read_text().splitlines() == ["list"]
+
+
 def test_check_in_lists_a_codex_worker_idle_on_its_own_job(night: Workflow) -> None:
     night.notes(7).mkdir(parents=True, exist_ok=True)
     for suffix in ("codex", "job-wait", "bridge-stopped"):

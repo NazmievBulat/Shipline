@@ -573,6 +573,7 @@ class Config:
     review: Review = section(position=16)
     runner: Runner = section(position=8)
     state_folder: str = option('name', '.local/workflow', 'The folder of workflow notes in the main checkout and each worktree.', example='.local/shipline', shell=(2, 'STATE_FOLDER'), convert=lambda value: _relative(value, "state_folder"), position=1)
+    ticket_repository: str | None = option('repository', None, 'An optional second GitHub repository as owner/name whose open ticket/ pull requests the wake names once per head when their last commit is more than 6 hours old.', example='example-org/example-tool', optional=True, shell=(52, 'TICKET_REPOSITORY'), position=26)
     workflows: Workflows = section(position=6)
     worktree_setup: str = option('name', 'scripts/setup-worktree', 'The command that prepares a new worktree, run only when present.', example='tools/prepare-worktree', shell=(3, 'WORKTREE_SETUP'), convert=lambda value: _relative(value, "worktree_setup"), position=2)
     # The file as read, without defaults. Context fields are not config declarations.
@@ -802,6 +803,13 @@ def _merged(defaults: dict[str, Any], given: Any, where: str) -> dict[str, Any]:
                     f"{FILE}: {name} must be a whole number from 0 to {MOST_MINUTES}, "
                     f"not {json.dumps(value)}"
                 )
+            merged[key] = value
+        elif DECLARATIONS[name].kind == "repository":
+            value = given[key]
+            if value is not None and (
+                not isinstance(value, str) or not _REPOSITORY.fullmatch(value)
+            ):
+                raise ConfigError(f"{FILE}: {name} must be owner/name, not {json.dumps(value)}")
             merged[key] = value
         else:
             value = given[key]
