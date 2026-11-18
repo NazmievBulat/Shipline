@@ -759,7 +759,8 @@ percent signs; distinct test ids therefore remain distinct groups.
    log (`journalctl --user -u workflow-tick`); the gate's refusals and hand-backs and the
    tick's notes in `.local/workflow/` of the main checkout; the sessions' closing messages, as
    their pull requests' comments and reviews show them (`gh`, reading only); and the earlier
-   analyses. It computes no numbers of its own: every number it gives is the metrics report's,
+   analyses and `.local/analyses/declined-proposals.md` in the main checkout. It computes no
+   numbers of its own: every number it gives is the metrics report's,
    and every other claim points to the lines that show it. For every GitHub record it cites as
    evidence for a gap or proposal (a check run, a workflow run, a pull request or a review), it
    saves the record exactly as `gh api` returned it in its report folder as
@@ -780,7 +781,9 @@ percent signs; distinct test ids therefore remain distinct groups.
    that would show its cost (a number of the report's quality part, such as sent-back reviews,
    red runs on `main`, hunt findings or weaker tests). A proposal that raises throughput by
    running fewer tests, skipping a job, shortening a review or widening a skip rule is refused:
-   quality signals are a constraint, not a trade.
+   quality signals are a constraint, not a trade. It does not propose a declined change again
+   unless it cites new evidence that meets the entry's reopening condition in
+   `.local/analyses/declined-proposals.md`, and says which evidence meets which condition.
 5. It writes `report.md` in its report folder. Its first section is headed `## Proposals`; each
    proposal there is numbered `1.`, `2.`, `3.`, and the first line of each says the change in
    one sentence, as the wake carries only those lines. Then come the gaps it found with their
@@ -1047,8 +1050,10 @@ The orchestrator session does what needs judgment:
   ticket names the saved evidence files for the proposal and requires the worker's test for
   the fix to load a copy of each record as a test fixture, with nothing private in it, in
   addition to any hand-written case. The owner can say which to drop; a dropped ticket's pull
-  request it closes. An analysis that ended without publishing its report it names to the
-  owner, with its folder.
+  request it closes. It records each declined proposal in
+  `.local/analyses/declined-proposals.md` of the main checkout: its first line, the reports
+  that made it, the reason, and what new evidence would reopen it. An analysis that ended
+  without publishing its report it names to the owner, with its folder.
 - When a hunt has ended, it reads the report in `.local/hunts/<name>` of the main checkout.
   A Codex or Cursor hunter's report it publishes as a document with the pictures; a Claude Code hunter
   published its own (`report.url`). It gives the owner the link and the count of findings.
