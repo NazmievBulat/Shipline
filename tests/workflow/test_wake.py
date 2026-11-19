@@ -1068,6 +1068,35 @@ def test_a_merge_hand_back_is_told_once_at_any_hour_and_retained_on_failed_deliv
     assert len(night.sent()) == 2  # one failed attempt, then one delivered message
 
 
+def test_a_refused_reviewer_start_stands_on_a_line_of_its_own_once_at_any_hour(
+    night: Workflow,
+) -> None:
+    night.orchestrator("busy")
+    pending = night.repo / ".local/workflow/merge-handbacks.pending"
+    pending.mkdir(parents=True)
+    refused = pending / "refused-event"
+    refused.write_text(
+        json.dumps(
+            {
+                "number": "9",
+                "reason": "reviewer start refused: the worktree has uncommitted changes\n  more",
+            }
+        )
+    )
+    other = pending / "other-event"
+    other.write_text(json.dumps({"number": "8", "reason": "head changed after review"}))
+
+    for minute in (0, 5, 10):
+        assert _wake(night, at=_at(12, minute)).returncode == 0
+
+    [message] = night.sent()
+    lines = message.splitlines()
+    assert "reviewer start refused: review-9: the worktree has uncommitted changes more" in lines
+    assert not any("pull request 9" in line for line in lines)
+    assert "Merge hand-backs for judgment: pull request 8: head changed after review" in message
+    assert not refused.exists() and not other.exists()
+
+
 def test_an_unreachable_advisory_service_is_told_once_at_any_hour(night: Workflow) -> None:
     night.orchestrator("busy")
     pending = night.repo / ".local/workflow/advisory-service.pending"

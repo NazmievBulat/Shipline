@@ -561,8 +561,14 @@ for folder in "$answered" ${SHIPLINE_SHADOW_NOTES:+"$SHIPLINE_SHADOW_NOTES/answe
   done < <(find "$folder" -type f -name '*.json' ! -name '.*' -print0 | sort -z)
 done
 if [[ -d $handbacks ]]; then
+  # A reviewer start that `reviewer_start.py` refused is told on a line of its own, as
+  # `reviewer start refused: review-N: <reason>`: the tick does not try it again unchanged.
   while IFS= read -r -d '' event; do
-    if line=$(jq -er '"pull request \(.number): \(.reason)"' "$event"); then
+    if line=$(jq -er '
+        if (.reason | type) == "string" and (.reason | startswith("reviewer start refused: "))
+        then "reviewer start refused: review-\(.number): \(.reason
+          | ltrimstr("reviewer start refused: ") | gsub("\\s+"; " ") | rtrimstr(" "))"
+        else "pull request \(.number): \(.reason)" end' "$event"); then
       handback_files+=("$event")
       handback_lines+=("$line")
     fi
@@ -1168,13 +1174,22 @@ fi
 # The sessions asking the owner stand on a line of their own, so the orchestrator sees them.
 between_lines=" "
 [[ -z $asking_line ]] || between_lines=$'\n'"asking the owner: $asking_line"$'\n'
-for line in "${lost_lines[@]}" "${stuck_lines[@]}" "${answer_lines[@]}" "${holding_lines[@]}" "${stalled_lines[@]}"; do
+refused_lines=()
+judgment_lines=()
+for line in "${handback_lines[@]}"; do
+  if [[ $line == "reviewer start refused: "* ]]; then
+    refused_lines+=("$line")
+  else
+    judgment_lines+=("$line")
+  fi
+done
+for line in "${refused_lines[@]}" "${lost_lines[@]}" "${stuck_lines[@]}" "${answer_lines[@]}" "${holding_lines[@]}" "${stalled_lines[@]}"; do
   [[ $between_lines == *$'\n' ]] || between_lines=$'\n'
   between_lines+="$line"$'\n'
 done
 message="Wake check-in, $(date -d "@$NOW" '+%H:%M')${resent[*]:+, after a reset}. shipline: $installed. Usage: $usage.${resent[*]:+ Sent their instruction again: ${resent[*]}.} Sessions: $(sessions_line "$sessions"). Open pull requests: $pulls.${between_lines}Log: ~/.local/state/workflow/wake.log. Do what needs judgment by AGENTS.md, For the orchestrator session; start nothing above 85% of the 5-hour window unless it resets within the hour; never merge, never force-push, never edit code."
-if ((${#handback_lines[@]})); then
-  message+=" Merge hand-backs for judgment: ${handback_lines[*]}"
+if ((${#judgment_lines[@]})); then
+  message+=" Merge hand-backs for judgment: ${judgment_lines[*]}"
 fi
 if ((${#cloud_lines[@]})); then
   message+=" Cloud worker reports: ${cloud_lines[*]}"
