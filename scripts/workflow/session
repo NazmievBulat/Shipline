@@ -493,7 +493,7 @@ setup_worktree() {
 # under the main checkout's `leftovers`, the move is noted in wake.log, and the start goes on.
 # Any tracked change leaves everything where it is, for the refusal below.
 set_aside_untracked() {
-  local worktree=$1 entry folder message count stamp suffix=1 paths=()
+  local worktree=$1 entry parent folder message count stamp suffix=1 moved=0 paths=()
   while IFS= read -r -d '' entry; do
     [[ $entry == '?? '* ]] || return 0
     entry=${entry#'?? '}
@@ -512,16 +512,29 @@ set_aside_untracked() {
     folder=$main/$SHIPLINE_STATE_FOLDER/leftovers/$name-$stamp-$suffix
   done
   for entry in "${paths[@]}"; do
-    (umask 077; mkdir -p -- "$folder/$(dirname -- "$entry")") &&
-      mv -- "$worktree/$entry" "$folder/$entry" ||
-      die "cannot move $entry out of $worktree into $folder"
+    # Not `dirname`: its command substitution would drop a folder name's trailing newline.
+    parent=.
+    [[ $entry != */* ]] || parent=${entry%/*}
+    if ! (umask 077; mkdir -p -- "$folder/$parent") || ! mv -- "$worktree/$entry" "$folder/$entry"; then
+      # Name what was already moved, so a half-done move is never silent.
+      message="cannot move $entry out of $worktree into $folder"
+      ((moved == 0)) || message+="; $moved of $count untracked paths were moved there before it"
+      log_leftovers "$stamp" "$message"
+      die "$message"
+    fi
+    moved=$((moved + 1))
   done
   ((count == 1)) && message="1 untracked path" || message="$count untracked paths"
   message="moved $message out of $worktree to $folder; untracked files are not review evidence"
   echo "$name: $message" >&2
+  log_leftovers "$stamp" "$message"
+}
+
+# One line in wake.log about the leftovers of this start: its time, then the message.
+log_leftovers() {
   (umask 077
     mkdir -p "$WORKFLOW_LOGS"
-    printf '%s %s: %s\n' "$stamp" "$name" "$message" >>"$WORKFLOW_LOGS/wake.log"
+    printf '%s %s: %s\n' "$1" "$name" "$2" >>"$WORKFLOW_LOGS/wake.log"
   )
 }
 

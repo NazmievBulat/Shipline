@@ -1,6 +1,7 @@
 """Worker/reviewer handoffs and Codex completion use real git and fake external commands."""
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -446,6 +447,63 @@ def test_leftovers_of_a_second_start_in_the_same_second_get_their_own_folder(
     assert (earlier / "stray.txt").read_text() == "earlier\n"
     assert (earlier.with_name("review-7-1792497600-2") / "stray.txt").read_text() == "later\n"
     assert "moved 1 untracked path out of" in done.stderr
+
+
+def test_leftovers_named_like_options_or_with_newlines_and_symlinks_move_as_they_are(
+    workflow: Workflow,
+) -> None:
+    worktree = workflow.add_worktree(7, draft=False)
+    (worktree / "-rf").write_text("dash\n")
+    (worktree / "--force").write_text("options\n")
+    (worktree / "new\nline").write_text("newline\n")
+    (worktree / "link").symlink_to("/nonexistent/target")
+    # An untracked file in a tracked folder whose name ends with a newline.
+    folder_name = worktree / "ends\n"
+    folder_name.mkdir()
+    (folder_name / "kept").write_text("tracked\n")
+    workflow.git("add", "ends\n/kept", cwd=worktree)
+    workflow.git("commit", "--quiet", "-m", "test: a folder name with a newline", cwd=worktree)
+    workflow.git("push", "--quiet", "origin", f"HEAD:{workflow.branch(7)}", cwd=worktree)
+    (folder_name / "left").write_text("left\n")
+    done = workflow.run("start", "review", "7", env={"WORKFLOW_NOW": "1792497600"})
+    assert done.returncode == 0, done.stderr
+    folder = workflow.repo / ".local/workflow/leftovers/review-7-1792497600"
+    assert (folder / "-rf").read_text() == "dash\n"
+    assert (folder / "--force").read_text() == "options\n"
+    assert (folder / "new\nline").read_text() == "newline\n"
+    assert str((folder / "link").readlink()) == "/nonexistent/target"
+    assert (folder / "ends\n/left").read_text() == "left\n"
+    assert (folder_name / "kept").read_text() == "tracked\n"
+    assert workflow.git("status", "--porcelain", cwd=worktree) == ""
+    assert "moved 5 untracked paths out of" in done.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root moves a folder it cannot write")
+def test_a_move_that_fails_midway_names_what_was_already_moved(workflow: Workflow) -> None:
+    worktree = workflow.add_worktree(7, draft=False)
+    (worktree / "a.txt").write_text("first\n")
+    locked = worktree / "locked"
+    locked.mkdir()
+    (locked / "inside").write_text("locked\n")
+    (worktree / "z.txt").write_text("last\n")
+    # Moving a folder to another parent rewrites its `..`, which needs write permission on it.
+    locked.chmod(0o555)
+    try:
+        done = workflow.run("start", "review", "7", env={"WORKFLOW_NOW": "1792497600"})
+    finally:
+        locked.chmod(0o755)
+    folder = workflow.repo / ".local/workflow/leftovers/review-7-1792497600"
+    assert done.returncode == 1
+    assert not workflow.is_running("review-7")
+    message = (
+        f"cannot move locked out of {worktree} into {folder}; "
+        "1 of 3 untracked paths were moved there before it"
+    )
+    assert message in done.stderr
+    assert f"1792497600 review-7: {message}" in workflow.wake_log.read_text().splitlines()
+    assert (folder / "a.txt").read_text() == "first\n"
+    assert (locked / "inside").read_text() == "locked\n"
+    assert (worktree / "z.txt").read_text() == "last\n"
 
 
 def test_a_recorded_hand_back_keeps_its_untracked_files(workflow: Workflow) -> None:

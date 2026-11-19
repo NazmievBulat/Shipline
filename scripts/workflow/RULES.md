@@ -828,11 +828,13 @@ squeezes it as it does an idle one and, when that time has passed, types the ins
 Claude worker, reviewer or audit into it again, once for each reset. Ready labelled pull
 requests get a fresh `review-N` once the worker
 has finished and stopped. Untracked files left in the worktree (a browser tool's logs, say)
-are not review evidence: without a hand-back, they are moved with their paths into
-`leftovers/review-N-<time>` of the main checkout's notes, `wake.log` names the move, and the
-reviewer starts. Any tracked change refuses the start; the wake tells the orchestrator
-`reviewer start refused: review-N: <reason>` on a line of its own, at any hour and busy or
-not, once, and the start is not tried again until the worktree or the head changes.
+are not review evidence: without a hand-back, when every change there is an untracked path
+outside the notes folder, they are moved with their paths into `leftovers/review-N-<time>` of
+the main checkout's notes, `wake.log` names the move, and the reviewer starts; a move that
+fails stops the start and names what it had already moved. Any tracked change refuses the start and moves nothing; the
+wake tells the orchestrator `reviewer start refused: review-N: <reason>` on a line of its own,
+at any hour and busy or not, once, and the start is not tried again until the worktree or the
+head changes.
 Sent-back drafts get a worker that reads the independent review.
 Codex responses reach the owner through their Haiku bridges; the tick reads completion
 from the bridge and stops it together with Codex. It never starts an audit,
