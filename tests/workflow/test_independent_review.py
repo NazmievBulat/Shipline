@@ -1,9 +1,16 @@
 """Worker/reviewer handoffs and Codex completion use real git and fake external commands."""
 
 import json
+from pathlib import Path
 
 import pytest
 from workflow_harness import SESSION_LINK, Workflow, instruction
+
+
+def _edit_tracked(worktree: Path) -> None:
+    """A change to a tracked file: local work that needs judgment, unlike an untracked file."""
+    with (worktree / ".gitignore").open("a") as tracked:
+        tracked.write("# a worker's unfinished edit\n")
 
 
 def _idle(workflow: Workflow, name: str) -> None:
@@ -381,13 +388,80 @@ def test_reviewer_preserves_clean_unpushed_descendants(workflow: Workflow) -> No
     assert workflow.git("log", "-1", "--format=%s", cwd=worktree) == "fix: not pushed"
 
 
-def test_reviewer_refuses_uncommitted_changes(workflow: Workflow) -> None:
+@pytest.mark.parametrize("change", ["modified", "staged", "deleted", "renamed"])
+def test_reviewer_refuses_uncommitted_changes(workflow: Workflow, change: str) -> None:
     worktree = workflow.add_worktree(7, draft=False)
+    if change == "modified":
+        _edit_tracked(worktree)
+    elif change == "staged":
+        _edit_tracked(worktree)
+        workflow.git("add", ".gitignore", cwd=worktree)
+    elif change == "deleted":
+        (worktree / ".gitignore").unlink()
+    else:
+        workflow.git("mv", ".gitignore", "kept ignore", cwd=worktree)
+    # An untracked file beside a tracked change stays where it is too.
     (worktree / "stray.txt").write_text("left by a worker\n")
     done = workflow.run("start", "review", "7")
-    assert done.returncode != 0
+    assert done.returncode == 3
     assert "uncommitted changes" in done.stderr
     assert not workflow.is_running("review-7")
+    assert (worktree / "stray.txt").read_text() == "left by a worker\n"
+    assert not (workflow.repo / ".local/workflow/leftovers").exists()
+
+
+def test_reviewer_sets_aside_untracked_leftovers_and_starts(workflow: Workflow) -> None:
+    worktree = workflow.add_worktree(7, draft=False)
+    tool = worktree / ".playwright-mcp"
+    tool.mkdir()
+    (tool / "console-1.log").write_text("console\n")
+    (tool / "page snapshot.yml").write_text("snapshot\n")
+    (worktree / "odd name -x.txt").write_text("odd\n")
+    done = workflow.run("start", "review", "7", env={"WORKFLOW_NOW": "1792497600"})
+    assert done.returncode == 0, done.stderr
+    assert workflow.is_running("review-7")
+    folder = workflow.repo / ".local/workflow/leftovers/review-7-1792497600"
+    assert (folder / ".playwright-mcp/console-1.log").read_text() == "console\n"
+    assert (folder / ".playwright-mcp/page snapshot.yml").read_text() == "snapshot\n"
+    assert (folder / "odd name -x.txt").read_text() == "odd\n"
+    assert not tool.exists()
+    assert not (worktree / "odd name -x.txt").exists()
+    assert workflow.git("status", "--porcelain", cwd=worktree) == ""
+    line = f"review-7: moved 2 untracked paths out of {worktree} to {folder}"
+    assert line in done.stderr
+    [logged] = [entry for entry in workflow.wake_log.read_text().splitlines() if line in entry]
+    assert logged.startswith("1792497600 review-7: ")
+
+
+def test_leftovers_of_a_second_start_in_the_same_second_get_their_own_folder(
+    workflow: Workflow,
+) -> None:
+    worktree = workflow.add_worktree(7, draft=False)
+    earlier = workflow.repo / ".local/workflow/leftovers/review-7-1792497600"
+    earlier.mkdir(parents=True)
+    (earlier / "stray.txt").write_text("earlier\n")
+    (worktree / "stray.txt").write_text("later\n")
+    done = workflow.run("start", "review", "7", env={"WORKFLOW_NOW": "1792497600"})
+    assert done.returncode == 0, done.stderr
+    assert (earlier / "stray.txt").read_text() == "earlier\n"
+    assert (earlier.with_name("review-7-1792497600-2") / "stray.txt").read_text() == "later\n"
+    assert "moved 1 untracked path out of" in done.stderr
+
+
+def test_a_recorded_hand_back_keeps_its_untracked_files(workflow: Workflow) -> None:
+    worktree = workflow.add_worktree(7, draft=False)
+    head = workflow.git("rev-parse", "HEAD", cwd=worktree)
+    notes = workflow.repo / ".local/workflow"
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "merge-review-7").write_text(
+        json.dumps({"head": head, "local_head": head, "reason": "needs judgment"})
+    )
+    (worktree / "stray.txt").write_text("evidence of the hand-back\n")
+    done = workflow.run("start", "review", "7")
+    assert done.returncode == 0, done.stderr
+    assert workflow.is_running("review-7")
+    assert (worktree / "stray.txt").read_text() == "evidence of the hand-back\n"
+    assert not (notes / "leftovers").exists()
 
 
 @pytest.mark.parametrize("allowed", [None, "2", "3"])
@@ -506,7 +580,7 @@ def test_tick_keeps_an_unpushed_commit_for_the_next_reviewer(workflow: Workflow)
 
 def test_dirty_start_is_attempted_and_reported_once(workflow: Workflow) -> None:
     worktree = workflow.add_worktree(7, draft=False)
-    (worktree / "stray.txt").write_text("left by a worker")
+    _edit_tracked(worktree)
     workflow.orchestrator(status="busy")
     original = workflow.script.with_name("session-real")
     workflow.script.rename(original)
@@ -520,8 +594,14 @@ def test_dirty_start_is_attempted_and_reported_once(workflow: Workflow) -> None:
         workflow.run_script("tick", env={"WORKFLOW_NOW": str(1792497600 + tick * 360)})
     assert not workflow.is_running("review-7")
     assert sum("reviewer start refused" in message for message in workflow.sent()) == 1
+    # On a line of its own, so the orchestrator sees it among the rest of the check-in.
+    [message] = [message for message in workflow.sent() if "reviewer start refused" in message]
+    assert f"reviewer start refused: review-7: {worktree} has uncommitted changes" in (
+        message.splitlines()
+    )
+    assert "Merge hand-backs for judgment" not in message
     assert attempts.read_text().splitlines() == ["attempt"]
-    assert (worktree / "stray.txt").read_text() == "left by a worker"
+    assert "a worker's unfinished edit" in (worktree / ".gitignore").read_text()
 
 
 def test_round_allowance_is_delivered_once_and_cleared(workflow: Workflow) -> None:
@@ -563,7 +643,7 @@ def test_reviewer_refuses_diverged_local_commits(workflow: Workflow) -> None:
 
 def test_interrupted_refusal_notice_is_recovered_without_another_start(workflow: Workflow) -> None:
     worktree = workflow.add_worktree(7, draft=False)
-    (worktree / "stray.txt").write_text("left by a worker")
+    _edit_tracked(worktree)
     workflow.run_script("tick", env={"WORKFLOW_NOW": "1792497200"})
     notes = workflow.repo / ".local/workflow"
     record = json.loads((notes / "review-7.start-refused").read_text())
@@ -597,7 +677,7 @@ def test_head_change_replaces_an_undelivered_allowance_notice(workflow: Workflow
 @pytest.mark.parametrize("changed", ["published", "local"])
 def test_head_change_permits_one_new_start_attempt(workflow: Workflow, changed: str) -> None:
     worktree = workflow.add_worktree(7, draft=False)
-    (worktree / "stray.txt").write_text("unfinished")
+    _edit_tracked(worktree)
     workflow.run_script("tick")
     notes = workflow.repo / ".local/workflow"
     old = json.loads((notes / "review-7.start-refused").read_text())
@@ -634,10 +714,9 @@ def test_written_allowance_clears_notice_even_with_a_running_reviewer(workflow: 
 
 def test_cleaning_a_dirty_worktree_allows_automatic_recovery(workflow: Workflow) -> None:
     worktree = workflow.add_worktree(7, draft=False)
-    stray = worktree / "stray.txt"
-    stray.write_text("unfinished")
+    _edit_tracked(worktree)
     workflow.run_script("tick")
-    stray.unlink()
+    workflow.git("checkout", "--", ".gitignore", cwd=worktree)
     done = workflow.run_script("tick")
     assert done.returncode == 0, done.stderr
     assert workflow.is_running("review-7")
@@ -646,12 +725,11 @@ def test_cleaning_a_dirty_worktree_allows_automatic_recovery(workflow: Workflow)
 
 def test_manual_recovery_withdraws_the_pending_refusal_notice(workflow: Workflow) -> None:
     worktree = workflow.add_worktree(7, draft=False)
-    stray = worktree / "stray.txt"
-    stray.write_text("unfinished")
+    _edit_tracked(worktree)
     workflow.run_script("tick")
     notes = workflow.repo / ".local/workflow"
     record = json.loads((notes / "review-7.start-refused").read_text())
-    stray.unlink()
+    workflow.git("checkout", "--", ".gitignore", cwd=worktree)
     done = workflow.run("start", "review", "7")
     assert done.returncode == 0, done.stderr
     assert workflow.is_running("review-7")

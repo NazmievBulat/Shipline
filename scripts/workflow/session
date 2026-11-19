@@ -487,6 +487,44 @@ setup_worktree() {
   fi
 }
 
+# Untracked files a worker's tools leave behind (a browser tool's logs and page snapshots) are
+# never review evidence: the reviewer reviews the pushed branch. When every change in the
+# worktree is an untracked path, they are moved, with their paths, into a folder of their own
+# under the main checkout's `leftovers`, the move is noted in wake.log, and the start goes on.
+# Any tracked change leaves everything where it is, for the refusal below.
+set_aside_untracked() {
+  local worktree=$1 entry folder message count stamp suffix=1 paths=()
+  while IFS= read -r -d '' entry; do
+    [[ $entry == '?? '* ]] || return 0
+    entry=${entry#'?? '}
+    entry=${entry%/}
+    # The workflow's own notes stay where its sessions look for them.
+    [[ $entry != "$SHIPLINE_STATE_FOLDER" && $entry != "$SHIPLINE_STATE_FOLDER/"* &&
+       $SHIPLINE_STATE_FOLDER != "$entry/"* ]] || return 0
+    paths+=("$entry")
+  done < <(git -C "$worktree" status --porcelain -z)
+  count=${#paths[@]}
+  ((count)) || return 0
+  stamp=${WORKFLOW_NOW:-$(date +%s)}
+  folder=$main/$SHIPLINE_STATE_FOLDER/leftovers/$name-$stamp
+  while [[ -e $folder ]]; do
+    suffix=$((suffix + 1))
+    folder=$main/$SHIPLINE_STATE_FOLDER/leftovers/$name-$stamp-$suffix
+  done
+  for entry in "${paths[@]}"; do
+    (umask 077; mkdir -p -- "$folder/$(dirname -- "$entry")") &&
+      mv -- "$worktree/$entry" "$folder/$entry" ||
+      die "cannot move $entry out of $worktree into $folder"
+  done
+  ((count == 1)) && message="1 untracked path" || message="$count untracked paths"
+  message="moved $message out of $worktree to $folder; untracked files are not review evidence"
+  echo "$name: $message" >&2
+  (umask 077
+    mkdir -p "$WORKFLOW_LOGS"
+    printf '%s %s: %s\n' "$stamp" "$name" "$message" >>"$WORKFLOW_LOGS/wake.log"
+  )
+}
+
 prepare_worktree() {
   local worktree=$1 current other
   # Forget a worktree whose folder was deleted by hand, so it is made again.
@@ -515,6 +553,8 @@ prepare_worktree() {
     # The tick can hand back a mechanical merge that stopped at conflicts. Preserve that
     # merge for judgment; only a recorded hand-back at the published head permits it.
     local merge_conflict=false recorded_dirty=false
+    [[ -e $main/$SHIPLINE_STATE_FOLDER/merge-review-${name#review-} ]] ||
+      set_aside_untracked "$worktree"
     if [[ -n $(git -C "$worktree" status --porcelain) ]]; then
       if [[ -e $main/$SHIPLINE_STATE_FOLDER/merge-review-${name#review-} &&
             -n $(git -C "$worktree" diff --name-only --diff-filter=U) ]] &&
